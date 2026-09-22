@@ -1,25 +1,57 @@
 # Agentic Harness (Rust)
 
-An interactive CLI agentic harness built in Rust with tool calling, lifecycle hooks, and configuration support.
+An interactive CLI agentic harness built in Rust with tool calling, lifecycle hooks, and ACP protocol support for headless orchestration.
 
 ## Features
 
 - **Interactive CLI**: REPL-based interface for conversing with the agent
+- **ACP Protocol**: JSON-RPC 2.0 over stdio for headless orchestration (c8ctl-nano compatible)
 - **Tool Calling**: Agent can invoke registered tools during conversation
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
 - **Configuration**: TOML-based config file at `~/.config/agentic-harness/config.toml`
 - **Commands**: `/help`, `/compact`, `/settings`, `/tools`, `/exit`
 
+## Two Execution Modes
+
+### Interactive CLI Mode
+
+```bash
+cargo run
+```
+
+Starts the interactive REPL where you can chat with the agent and use slash commands.
+
+### ACP Headless Mode (c8ctl-nano compatible)
+
+```bash
+cargo run --bin agentic-harness-acp
+```
+
+Speaks the Agent Communication Protocol (ACP) over stdio using newline-delimited JSON-RPC 2.0 messages. Compatible with c8ctl-nano's `spawnCaptureAcp` executor.
+
+**Protocol methods supported:**
+- `initialize` → returns protocol version and capabilities
+- `session/new` → creates a new session, returns sessionId
+- `session/prompt` → processes a prompt, supports tool calls
+- `session/cancel` → cancels the current turn
+
+**Slash commands work via ACP too:**
+- `/compact` - reduces conversation history
+- `/settings` - returns current settings as JSON
+- `/tools` - lists registered tools
+
 ## Architecture
 
 ```
 src/
-├── main.rs      # CLI entry point, REPL loop, command handling
-├── agent.rs     # Agent core: conversation management, tool execution loop
-├── hooks.rs     # Lifecycle hook registry and event system
-├── tools.rs     # Tool registration and dispatch system
-├── llm.rs       # LLM client interface + mock implementation
-└── config.rs    # Configuration file loading and management
+├── main.rs              # Interactive CLI entry point
+├── bin/agentic-harness-acp.rs  # ACP protocol binary
+├── agent.rs             # Agent core: conversation management, tool execution loop
+├── acp.rs               # ACP JSON-RPC protocol handler
+├── hooks.rs             # Lifecycle hook registry and event system
+├── tools.rs             # Tool registration and dispatch system
+├── llm.rs               # LLM client interface + mock implementation
+└── config.rs            # Configuration file loading and management
 ```
 
 ## Lifecycle Hooks
