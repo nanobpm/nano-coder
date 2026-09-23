@@ -1,8 +1,13 @@
 use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::tools::ToolDefinition;
+
 /// LLM message role
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
@@ -21,263 +26,240 @@ impl std::fmt::Display for Role {
     }
 }
 
-/// LLM message
-#[derive(Debug, Clone)]
+/// Provider-neutral conversation message. Assistant messages carry the tool
+/// calls they requested so the next request can replay them faithfully.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// For tool results: the tool failed (or never finished).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
+    /// Provider-specific reasoning blocks that must be replayed with this
+    /// assistant message (Anthropic `thinking` blocks with signatures).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_blocks: Vec<Value>,
 }
 
 impl Message {
-    pub fn system(content: &str) -> Self {
+    fn new(role: Role, content: &str) -> Self {
         Self {
-            role: Role::System,
+            role,
             content: content.to_string(),
+            tool_calls: vec![],
+            is_error: false,
+            thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
         }
+    }
+
+    pub fn system(content: &str) -> Self {
+        Self::new(Role::System, content)
     }
 
     pub fn user(content: &str) -> Self {
-        Self {
-            role: Role::User,
-            content: content.to_string(),
-            tool_call_id: None,
-            name: None,
-        }
+        Self::new(Role::User, content)
     }
 
     pub fn assistant(content: &str) -> Self {
+        Self::new(Role::Assistant, content)
+    }
+
+    pub fn assistant_with_tools(content: &str, tool_calls: Vec<ToolCall>) -> Self {
         Self {
-            role: Role::Assistant,
-            content: content.to_string(),
-            tool_call_id: None,
-            name: None,
+            tool_calls,
+            ..Self::new(Role::Assistant, content)
         }
     }
 
     pub fn tool_result(tool_call_id: &str, name: &str, content: &str) -> Self {
         Self {
-            role: Role::Tool,
-            content: content.to_string(),
             tool_call_id: Some(tool_call_id.to_string()),
             name: Some(name.to_string()),
+            ..Self::new(Role::Tool, content)
         }
     }
 
-    pub fn to_json(&self) -> Value {
-        let mut obj = json!({
-            "role": self.role.to_string(),
-            "content": self.content,
-        });
-        if let Some(id) = &self.tool_call_id {
-            obj["tool_call_id"] = json!(id);
-        }
-        if let Some(name) = &self.name {
-            obj["name"] = json!(name);
-        }
-        obj
+    pub fn tool_error(tool_call_id: &str, name: &str, content: &str) -> Self {
+        Self { is_error: true, ..Self::tool_result(tool_call_id, name, content) }
     }
 }
 
 /// LLM response
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LLMResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<TokenUsage>,
+    pub stop_reason: Option<String>,
+    /// Reasoning text the model produced before answering, if any.
+    pub thinking: String,
+    /// Opaque reasoning blocks to replay with the assistant message.
+    pub thinking_blocks: Vec<Value>,
 }
 
 /// Token usage information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenUsage {
-    pub prompt_tokens: i32,
-    pub completion_tokens: i32,
-    pub total_tokens: i32,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
 }
 
-/// Tool call requested by LLM
-#[derive(Debug, Clone)]
+/// Tool call requested by LLM. `arguments` is the decoded JSON object; if the
+/// model produced invalid JSON it is kept verbatim as a `Value::String`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
 }
 
+impl ToolCall {
+    pub fn decode_arguments(raw: &str) -> Value {
+        if raw.trim().is_empty() {
+            return json!({});
+        }
+        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    }
+
+    pub fn encoded_arguments(&self) -> String {
+        match &self.arguments {
+            Value::String(raw) => raw.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// Everything a provider needs to produce one completion.
+#[derive(Debug, Clone)]
+pub struct ChatRequest<'a> {
+    pub messages: &'a [Message],
+    pub tools: &'a [ToolDefinition],
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<i64>,
+}
+
+/// Incremental output while a response streams in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StreamEvent<'a> {
+    Text(&'a str),
+    Thinking(&'a str),
+}
+
+/// Receives stream events as they arrive.
+pub type StreamSink<'a> = &'a (dyn Fn(StreamEvent<'_>) + Send + Sync);
+
+/// Report a complete (non-streamed) response to a stream sink.
+pub fn report_whole(sink: StreamSink<'_>, response: &LLMResponse) {
+    if !response.thinking.is_empty() {
+        sink(StreamEvent::Thinking(&response.thinking));
+    }
+    if !response.content.is_empty() {
+        sink(StreamEvent::Text(&response.content));
+    }
+}
+
 /// LLM client trait
-pub trait LLMClient {
-    fn chat(&self, messages: &[Message], tools: Option<&Value>) -> Result<LLMResponse>;
+#[async_trait]
+pub trait LLMClient: Send + Sync {
+    async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse>;
+    /// Like `chat`, reporting text and reasoning to `sink` as it streams.
+    /// The default does not stream: it reports the whole response at the end.
+    async fn chat_stream(&self, request: &ChatRequest<'_>, sink: StreamSink<'_>) -> Result<LLMResponse> {
+        let response = self.chat(request).await?;
+        report_whole(sink, &response);
+        Ok(response)
+    }
+    /// Model IDs offered by the endpoint, where it can list them.
+    async fn list_models(&self) -> Result<Vec<String>> {
+        anyhow::bail!("provider {:?} cannot list models", self.provider_name())
+    }
     fn model_name(&self) -> &str;
+    fn provider_name(&self) -> &str;
 }
 
-/// Mock LLM client for demonstration
-pub struct MockLLMClient {
-    model: String,
-    call_count: std::sync::Arc<std::sync::atomic::AtomicI32>,
+/// Splits `<think>...</think>` sections out of streamed content (servers that
+/// return reasoning inline rather than in a separate field).
+#[derive(Debug, Default)]
+pub struct ThinkSplitter {
+    in_think: bool,
+    /// A possible partial tag held back until more text arrives.
+    pending: String,
 }
 
-impl MockLLMClient {
-    pub fn new(model: &str) -> Self {
-        Self {
-            model: model.to_string(),
-            call_count: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
-        }
-    }
-
-    fn next_call_id(&self) -> i32 {
-        self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
-    }
-
-    /// Check if we should call a tool (user asked, haven't called tool for this query yet)
-    fn should_call_tool(&self, messages: &[Message], user_content: &str) -> bool {
-        // Count user messages and tool results
-        let user_count = messages.iter().filter(|m| m.role == Role::User).count();
-        let tool_count = messages.iter().filter(|m| m.role == Role::Tool).count();
-
-        // Only call a tool if there are more user messages than tool results
-        // (meaning this is a new query that hasn't had a tool called yet)
-        if user_count <= tool_count {
-            return false;
-        }
-
-        // Check if the query matches any tool triggers
-        let content = user_content.to_lowercase();
-        content.contains("time") || content.contains("clock") ||
-        content.contains("weather") ||
-        content.contains("file") || content.contains("read") || content.contains("list") ||
-        content.contains("bash") || content.contains("command") || content.contains("run")
-    }
-}
-
-impl LLMClient for MockLLMClient {
-    fn chat(&self, messages: &[Message], _tools: Option<&Value>) -> Result<LLMResponse> {
-        let call_id = self.next_call_id();
-
-        // Find last user message
-        let last_user = messages.iter().rev().find(|m| m.role == Role::User);
-
-        // If there's a tool result and no new user query, respond with text
-        if last_user.is_none() {
-            let last_tool = messages.iter().rev().find(|m| m.role == Role::Tool);
-            if let Some(tool_msg) = last_tool {
-                let name = tool_msg.name.as_deref().unwrap_or("unknown");
-                return Ok(LLMResponse {
-                    content: format!("Based on the {} tool result: {}", name, tool_msg.content),
-                    tool_calls: vec![],
-                    usage: Some(TokenUsage {
-                        prompt_tokens: 50,
-                        completion_tokens: 30,
-                        total_tokens: 80,
-                    }),
-                });
+impl ThinkSplitter {
+    /// Feed content; `emit` receives `(is_thinking, text)` pieces.
+    pub fn push(&mut self, text: &str, emit: &mut dyn FnMut(bool, &str)) {
+        self.pending.push_str(text);
+        loop {
+            let tag = if self.in_think { "</think>" } else { "<think>" };
+            if let Some(at) = self.pending.find(tag) {
+                if at > 0 {
+                    emit(self.in_think, &self.pending[..at]);
+                }
+                self.pending.drain(..at + tag.len());
+                self.in_think = !self.in_think;
+                continue;
             }
-        }
-
-        // Check if we should call a tool
-        if let Some(user_msg) = last_user {
-            if self.should_call_tool(messages, &user_msg.content) {
-                let content = user_msg.content.to_lowercase();
-
-                // If user asks about time, use time tool
-                if content.contains("time") || content.contains("clock") {
-                    return Ok(LLMResponse {
-                        content: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: format!("call_{}", call_id),
-                            name: "get_time".to_string(),
-                            arguments: json!({}),
-                        }],
-                        usage: Some(TokenUsage {
-                            prompt_tokens: 50,
-                            completion_tokens: 20,
-                            total_tokens: 70,
-                        }),
-                    });
-                }
-
-                // If user asks about weather, use weather tool
-                if content.contains("weather") {
-                    let city = if content.contains("nyc") || content.contains("new york") {
-                        "New York"
-                    } else if content.contains("london") {
-                        "London"
-                    } else {
-                        "San Francisco"
-                    };
-                    return Ok(LLMResponse {
-                        content: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: format!("call_{}", call_id),
-                            name: "get_weather".to_string(),
-                            arguments: json!({ "city": city }),
-                        }],
-                        usage: Some(TokenUsage {
-                            prompt_tokens: 50,
-                            completion_tokens: 20,
-                            total_tokens: 70,
-                        }),
-                    });
-                }
-
-                // If user asks about files, use file tool
-                if content.contains("file") || content.contains("read") || content.contains("list") {
-                    return Ok(LLMResponse {
-                        content: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: format!("call_{}", call_id),
-                            name: "list_files".to_string(),
-                            arguments: json!({}),
-                        }],
-                        usage: Some(TokenUsage {
-                            prompt_tokens: 50,
-                            completion_tokens: 20,
-                            total_tokens: 70,
-                        }),
-                    });
-                }
-
-                // If user asks to run a bash command
-                if content.contains("bash") || content.contains("command") || content.contains("run") {
-                    // Extract the command from the user's message
-                    let cmd = if content.contains("echo") {
-                        "echo hello world"
-                    } else if content.contains("pwd") {
-                        "pwd"
-                    } else {
-                        "ls -la"
-                    };
-                    return Ok(LLMResponse {
-                        content: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: format!("call_{}", call_id),
-                            name: "bash".to_string(),
-                            arguments: json!({ "command": cmd }),
-                        }],
-                        usage: Some(TokenUsage {
-                            prompt_tokens: 50,
-                            completion_tokens: 20,
-                            total_tokens: 70,
-                        }),
-                    });
-                }
+            // Hold back a suffix that could be the start of the tag.
+            let keep = (1..tag.len())
+                .rev()
+                .find(|&n| self.pending.len() >= n && self.pending.is_char_boundary(self.pending.len() - n) && tag.starts_with(&self.pending[self.pending.len() - n..]))
+                .unwrap_or(0);
+            let split = self.pending.len() - keep;
+            if split > 0 {
+                emit(self.in_think, &self.pending[..split]);
+                self.pending.drain(..split);
             }
+            return;
         }
-
-        // Default: respond with text
-        Ok(LLMResponse {
-            content: format!("This is a mock response from {} (call #{}). I'm simulating an LLM agent. Try asking me about the time, weather, or files to see tool calls in action.", self.model, call_id),
-            tool_calls: vec![],
-            usage: Some(TokenUsage {
-                prompt_tokens: 50,
-                completion_tokens: 30,
-                total_tokens: 80,
-            }),
-        })
     }
 
-    fn model_name(&self) -> &str {
-        &self.model
+    pub fn finish(&mut self, emit: &mut dyn FnMut(bool, &str)) {
+        if !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            emit(self.in_think, &rest);
+        }
+    }
+
+    /// Split a complete content string into `(content, thinking)`.
+    pub fn split_all(text: &str) -> (String, String) {
+        if !text.contains("<think>") {
+            return (text.to_string(), String::new());
+        }
+        let (mut content, mut thinking) = (String::new(), String::new());
+        let mut splitter = Self::default();
+        let mut emit = |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
+        splitter.push(text, &mut emit);
+        splitter.finish(&mut emit);
+        (content.trim_start().to_string(), thinking.trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_think_tags_across_chunks() {
+        let mut splitter = ThinkSplitter::default();
+        let (mut content, mut thinking) = (String::new(), String::new());
+        let mut emit = |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
+        for chunk in ["<th", "ink>plan ", "it</thi", "nk>Answer <b>", "</b> done"] {
+            splitter.push(chunk, &mut emit);
+        }
+        splitter.finish(&mut emit);
+        assert_eq!(thinking, "plan it");
+        assert_eq!(content, "Answer <b></b> done");
+        assert_eq!(ThinkSplitter::split_all("<think>x</think>\n\nhi"), ("hi".into(), "x".into()));
+        assert_eq!(ThinkSplitter::split_all("plain"), ("plain".into(), String::new()));
     }
 }

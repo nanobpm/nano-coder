@@ -1,1 +1,7 @@
 /target
+
+# TLC output
+tla/states/
+tla/*_TTrace_*
+tla/*.bin
+states/

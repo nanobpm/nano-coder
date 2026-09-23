@@ -76,9 +76,4 @@ impl HookRegistry {
         }
     }
 
-    /// Check if any hooks are registered for an event
-    pub fn has_hooks(&self, event: &HookEvent) -> bool {
-        let hooks = self.hooks.lock().unwrap();
-        hooks.get(event).map_or(false, |handlers| !handlers.is_empty())
-    }
 }
