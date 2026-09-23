@@ -38,6 +38,9 @@ pub enum Record {
     TurnEnd {
         input_id: String,
         response: String,
+        /// Reported with `report_outcome` during the turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<crate::goal::Outcome>,
         recorded_at: DateTime<Utc>,
     },
     /// The conversation was replaced wholesale (compaction, system-prompt reset).
@@ -72,6 +75,8 @@ pub struct Restored {
     pub conversation: Vec<Message>,
     /// Responses for completed inputs, by input ID.
     pub completed: HashMap<String, String>,
+    /// Outcomes reported by completed inputs, by input ID.
+    pub outcomes: HashMap<String, crate::goal::Outcome>,
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
@@ -196,10 +201,14 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
             }
             Record::Message(message) => restored.conversation.push(message),
-            Record::TurnEnd { input_id, response, .. } => {
+            Record::TurnEnd { input_id, response, outcome, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
                     restored.pending_input = None;
                 }
+                match outcome {
+                    Some(outcome) => restored.outcomes.insert(input_id.clone(), outcome),
+                    None => restored.outcomes.remove(&input_id),
+                };
                 restored.completed.insert(input_id, response);
             }
             Record::Replace { messages, pending_position, .. } => {
@@ -224,7 +233,7 @@ mod tests {
     }
 
     fn turn_end(id: &str) -> Record {
-        Record::TurnEnd { input_id: id.into(), response: "hello".into(), recorded_at: Utc::now() }
+        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, recorded_at: Utc::now() }
     }
 
     #[test]

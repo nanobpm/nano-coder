@@ -83,7 +83,7 @@ fn tool_kind(name: &str) -> &'static str {
         "bash" => "execute",
         "read_file" => "read",
         "write_file" | "edit_file" => "edit",
-        name if crate::plan::is_plan_tool(name) => "think",
+        name if crate::plan::is_plan_tool(name) || name == crate::goal::TOOL_NAME => "think",
         _ => "other",
     }
 }
@@ -446,13 +446,18 @@ async fn run_turn(
             }
         }
     };
-    let (response, stop) = match outcome {
-        Ok(outcome) => (outcome.response, outcome.stop_reason),
-        Err(e) => (format!("Error: {e:#}"), StopReason::EndTurn),
+    let (response, stop, reported) = match outcome {
+        Ok(outcome) => (outcome.response, outcome.stop_reason, outcome.outcome),
+        Err(e) => (format!("Error: {e:#}"), StopReason::EndTurn, None),
     };
     // A prompt sent as a notification runs but gets no reply.
     if let Some(id) = &id {
-        write_line(&result(Some(id), json!({ "stopReason": stop.as_acp(), "response": response })));
+        let mut reply = json!({ "stopReason": stop.as_acp(), "response": response });
+        // Extension: the model's explicit completed/blocked report.
+        if let Some(reported) = reported {
+            reply["_meta"] = json!({ "outcome": reported });
+        }
+        write_line(&result(Some(id), reply));
     }
 
     // Steers folded into this turn are answered by it.

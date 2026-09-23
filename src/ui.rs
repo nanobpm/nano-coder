@@ -259,6 +259,16 @@ impl Renderer {
                 let text = format!("{RED}●{RESET} {BOLD}{}{RESET}\n{}", call.name, self.tool_result(false, output));
                 self.out(&mut state, &text);
             }
+            // The outcome's summary follows as the answer; show just its status.
+            AgentEvent::ToolCall { call } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {
+                self.finish_thinking(&mut state);
+                self.newline(&mut state);
+                state.streamed_thinking = false;
+                let status = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
+                let mark = if status == "blocked" { format!("{RED}■ blocked{RESET}") } else { format!("{GREEN}✔ {status}{RESET}") };
+                self.out(&mut state, &format!("{mark}\n"));
+            }
+            AgentEvent::ToolResult { call, ok: true, .. } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::Plan { plan } => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);

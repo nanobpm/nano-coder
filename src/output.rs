@@ -9,6 +9,24 @@ pub const DEFAULT_MAX_OUTPUT_LENGTH: usize = 40_000;
 /// Largest `max_output_length` a model may request.
 pub const MAX_OUTPUT_LENGTH: usize = 1_000_000;
 
+/// Where complete copies of truncated tool output are kept.
+pub fn spill_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("agentic-harness-{}", std::process::id()))
+}
+
+/// Bound `text` to `limit` characters; when it is longer, save it whole in
+/// `dir` as `name` and point at that file from the truncation marker, so
+/// the model can search or page through the rest.
+pub fn bound_and_spill(text: &str, limit: usize, dir: &std::path::Path, name: &str) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let path = dir.join(name);
+    let saved = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text)).is_ok();
+    let display = path.display().to_string();
+    bound_parts(text, Some(text), text.len() as u64, limit, saved.then_some(display.as_str())).0
+}
+
 /// Bound a complete in-memory string to `limit` characters.
 pub fn bound_output(text: &str, limit: usize) -> (String, bool) {
     bound_parts(text, None, text.len() as u64, limit, None)
@@ -95,6 +113,17 @@ mod tests {
         let (bounded, truncated) = bound_parts(&text, Some(&text), 1000, 3, Some("/tmp/out"));
         assert!(truncated);
         assert_eq!(bounded, "é...994 bytes truncated; complete output in /tmp/out...éé");
+    }
+
+    #[test]
+    fn spills_long_output_to_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(bound_and_spill("short", 10, dir.path(), "a.txt"), "short");
+        assert!(!dir.path().join("a.txt").exists());
+        let bounded = bound_and_spill("abcdefghij", 4, dir.path(), "b.txt");
+        let path = dir.path().join("b.txt");
+        assert_eq!(bounded, format!("ab...6 bytes truncated; complete output in {}...ij", path.display()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "abcdefghij");
     }
 
     #[test]

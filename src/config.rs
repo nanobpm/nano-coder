@@ -47,6 +47,10 @@ pub struct Config {
     pub project_instruction_files: Vec<String>,
     /// Offer the `plan_*` tools and restate the plan after compaction.
     pub plan_tools: bool,
+    /// Offer the `report_outcome` tool (an explicit completed/blocked signal).
+    pub outcome_tool: bool,
+    /// Append `<system-reminder>` notes to tool results (e.g. a stale plan).
+    pub reminders: bool,
 }
 
 impl Default for Config {
@@ -71,6 +75,8 @@ impl Default for Config {
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
             plan_tools: true,
+            outcome_tool: true,
+            reminders: true,
         }
     }
 }

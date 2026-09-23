@@ -10,7 +10,10 @@ use crate::config::Config;
 use crate::context::{self, Activity, SharedStats};
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
+use crate::goal::{self, Outcome};
+use crate::output;
 use crate::plan::{self, Plan};
+use crate::reminders::{self, Reminders};
 use crate::llm::{ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::providers;
 use crate::session::{self, PendingInput, Record, SessionLog};
@@ -52,6 +55,8 @@ impl StopReason {
 pub struct TurnOutcome {
     pub response: String,
     pub stop_reason: StopReason,
+    /// Reported by the model with `report_outcome`.
+    pub outcome: Option<Outcome>,
 }
 
 struct ControlInner {
@@ -205,6 +210,8 @@ pub struct Agent {
     session_id: Option<String>,
     /// Responses for inputs already processed, by input ID (deduplication).
     completed_inputs: HashMap<String, String>,
+    /// Outcomes reported by completed inputs, by input ID.
+    completed_outcomes: HashMap<String, Outcome>,
     /// An input that was accepted but whose turn never finished (crash, kill, or error).
     pending_input: Option<PendingInput>,
     input_counter: u64,
@@ -227,6 +234,9 @@ pub struct Agent {
     instructions: Option<ProjectInstructions>,
     /// The agent's task plan (see `plan.rs`).
     plan: Plan,
+    reminders: Reminders,
+    /// Tool results longer than this are cut, with the whole kept on disk.
+    tool_output_limit: usize,
 }
 
 impl Agent {
@@ -241,6 +251,7 @@ impl Agent {
             session: None,
             session_id: None,
             completed_inputs: HashMap::new(),
+            completed_outcomes: HashMap::new(),
             pending_input: None,
             input_counter: 0,
             event_sink: None,
@@ -253,6 +264,8 @@ impl Agent {
             streaming: false,
             instructions: None,
             plan: Plan::default(),
+            reminders: Reminders::default(),
+            tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
         }
     }
 
@@ -469,6 +482,7 @@ impl Agent {
         self.load_project_instructions();
         self.conversation = vec![Message::system(&self.system_prompt())];
         self.completed_inputs.clear();
+        self.completed_outcomes.clear();
         self.pending_input = None;
         self.plan = Plan::default();
         self.session = None;
@@ -496,6 +510,7 @@ impl Agent {
             _ => self.conversation.insert(0, system),
         }
         self.completed_inputs = restored.completed;
+        self.completed_outcomes = restored.outcomes;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
         self.session = Some(log);
@@ -622,6 +637,7 @@ impl Agent {
     }
 
     fn plan_changed(&mut self) -> Result<()> {
+        self.reminders.plan_changed();
         self.record_plan()?;
         self.emit(AgentEvent::Plan { plan: &self.plan });
         self.refresh_stats();
@@ -633,6 +649,9 @@ impl Agent {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
+        }
+        if self.config.outcome_tool {
+            tools.push(goal::definition());
         }
         tools
     }
@@ -660,13 +679,18 @@ impl Agent {
     /// `control()` during the turn are added before the next model call;
     /// `control().cancel()` stops the turn at the next opportunity.
     pub async fn run_turn(&mut self, input_id: Option<&str>, user_input: &str) -> Result<TurnOutcome> {
-        let end_turn = |response: String| TurnOutcome { response, stop_reason: StopReason::EndTurn };
+        let end_turn = |(response, outcome): (String, Option<Outcome>)| TurnOutcome {
+            response,
+            stop_reason: StopReason::EndTurn,
+            outcome,
+        };
         if let Some(id) = input_id
             && let Some(response) = self.completed_inputs.get(id) {
                 eprintln!("[agent] input {id:?} already processed; returning recorded response");
-                return Ok(end_turn(response.clone()));
+                return Ok(end_turn((response.clone(), self.completed_outcomes.get(id).cloned())));
             }
         self.control.start_turn();
+        self.reminders.start_turn();
         let resuming = self
             .pending_input
             .clone()
@@ -700,7 +724,16 @@ impl Agent {
                 }) {
                     // The final answer was recorded but the turn end was not.
                     let response = last.content.clone();
-                    return self.finish_turn(input_id, response).map(end_turn);
+                    let outcome = Outcome::reported_in(&self.conversation[pending.position..]);
+                    return self.finish_turn(input_id, response, outcome).map(end_turn);
+                } else if self.config.outcome_tool
+                    && self.conversation.last().is_some_and(|m| m.role == Role::Tool)
+                    && let Some(outcome) = Outcome::reported_in(&self.conversation[pending.position..])
+                {
+                    // The outcome was reported but the answer it implies was not recorded.
+                    let response = outcome.response();
+                    self.push(Message::assistant(&response))?;
+                    return self.finish_turn(input_id, response, Some(outcome)).map(end_turn);
                 }
             }
             None => {
@@ -730,6 +763,7 @@ impl Agent {
         let mut final_response = None;
         let mut last_content = String::new();
         let mut cancelled = false;
+        let mut reported: Option<Outcome> = None;
 
         for iteration in 1..=max_iterations {
             if self.control.is_cancelled() {
@@ -864,8 +898,16 @@ impl Agent {
                 self.emit(AgentEvent::ToolCall { call: tool_call });
                 self.set_activity(Activity::Tool(tool_call.name.clone()));
 
-                let result = if self.config.plan_tools && plan::is_plan_tool(&tool_call.name) {
+                let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
+                let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
+                let result = if is_plan_tool {
                     self.run_plan_tool(tool_call)
+                } else if is_outcome_tool {
+                    Outcome::from_args(&tool_call.arguments).map(|outcome| {
+                        let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
+                        reported = Some(outcome);
+                        Value::String(text)
+                    })
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
                     self.tools.execute_blocking(&tool_call.name, tool_call.arguments.clone()).await
@@ -894,6 +936,17 @@ impl Agent {
                 {
                     result_text.push_str(&nested);
                 }
+                // bash and read_file bound their own output (and bash keeps the whole).
+                if !matches!(tool_call.name.as_str(), "bash" | "read_file") {
+                    let name = format!("tool-{}-{}.txt", sanitize(&tool_call.id), sanitize(&tool_call.name));
+                    result_text = output::bound_and_spill(&result_text, self.tool_output_limit, &output::spill_dir(), &name);
+                }
+                if self.config.reminders && !is_plan_tool && !is_outcome_tool {
+                    for note in self.reminders.after_tool_call(&self.plan) {
+                        result_text.push_str("\n\n");
+                        result_text.push_str(&reminders::wrap(&note));
+                    }
+                }
                 let message = if ok {
                     Message::tool_result(&tool_call.id, &tool_call.name, &result_text)
                 } else {
@@ -903,6 +956,14 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &result_text });
             }
             self.refresh_stats();
+            if let Some(outcome) = &reported {
+                // Every call in the batch has its result; the summary is the answer.
+                let response = outcome.response();
+                self.push(Message::assistant(&response))?;
+                self.emit_assistant_text(&response);
+                final_response = Some(response);
+                break;
+            }
         }
         self.set_activity(Activity::Idle);
         self.refresh_stats();
@@ -923,21 +984,32 @@ impl Agent {
                     .to_string()
             }
         };
-        let response = self.finish_turn(input_id, response)?;
-        Ok(TurnOutcome { response, stop_reason })
+        let outcome = reported.filter(|_| stop_reason == StopReason::EndTurn);
+        let (response, outcome) = self.finish_turn(input_id, response, outcome)?;
+        Ok(TurnOutcome { response, stop_reason, outcome })
     }
 
-    fn finish_turn(&mut self, input_id: String, response: String) -> Result<String> {
+    fn finish_turn(
+        &mut self,
+        input_id: String,
+        response: String,
+        outcome: Option<Outcome>,
+    ) -> Result<(String, Option<Outcome>)> {
         if let Some(log) = &mut self.session {
             log.append(&Record::TurnEnd {
                 input_id: input_id.clone(),
                 response: response.clone(),
+                outcome: outcome.clone(),
                 recorded_at: Utc::now(),
             })?;
         }
+        match &outcome {
+            Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
+            None => self.completed_outcomes.remove(&input_id),
+        };
         self.completed_inputs.insert(input_id, response.clone());
         self.pending_input = None;
-        Ok(response)
+        Ok((response, outcome))
     }
 
     /// Summarize older messages into one, keeping recent messages (and the
@@ -1087,6 +1159,11 @@ impl Agent {
         Ok(Value::String(outcome.text))
     }
 
+    #[cfg(test)]
+    fn set_tool_output_limit(&mut self, limit: usize) {
+        self.tool_output_limit = limit;
+    }
+
     fn dropped_note(&self, count: usize) -> String {
         format!("[{count} earlier messages were removed to fit the context window; no summary is available]")
     }
@@ -1101,6 +1178,11 @@ impl Agent {
     pub fn conversation(&self) -> &[Message] {
         &self.conversation
     }
+}
+
+/// Keep only characters that are safe in a file name.
+fn sanitize(text: &str) -> String {
+    text.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(64).collect()
 }
 
 #[cfg(test)]
@@ -1533,6 +1615,91 @@ mod tests {
         let (mut agent, seen) = agent(Vec::new(), dir);
         agent.config.plan_tools = !off;
         (agent, seen)
+    }
+
+    fn report(id: &str, status: &str, summary: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}) }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reporting_an_outcome_ends_the_turn_and_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = LLMResponse {
+            tool_calls: vec![
+                report("o1", "completed", "Opened PR #5"),
+                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}) },
+            ],
+            ..Default::default()
+        };
+        // No further responses: another model call would panic.
+        let (mut first, _) = agent(vec![batch], dir.path());
+        let id = first.new_session().unwrap();
+        let outcome = first.run_turn(Some("msg-1"), "ship it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "Opened PR #5");
+        assert_eq!(outcome.outcome, Some(Outcome { status: goal::Status::Completed, summary: "Opened PR #5".into() }));
+        let tail = &first.conversation()[first.conversation_length() - 3..];
+        assert_eq!(tail[1], Message::tool_result("c1", "echo", "pong"), "later calls in the batch still run");
+        assert_eq!(tail[2], Message::assistant("Opened PR #5"));
+        drop(first);
+
+        let (mut resumed, seen) = agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        let again = resumed.run_turn(Some("msg-1"), "ship it").await.unwrap();
+        assert_eq!(again.outcome, outcome.outcome);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_finishes_a_reported_outcome_without_calling_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "lost-outcome",
+            vec![
+                Record::Message(Message::user("run it")),
+                Record::Message(Message::assistant_with_tools("", vec![report("o1", "blocked", "need a token")])),
+                Record::Message(Message::tool_result("o1", goal::TOOL_NAME, "Recorded outcome: blocked.")),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![], dir.path());
+        agent.load_session("lost-outcome").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.response, "Blocked: need a token");
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Blocked));
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_plan_gets_a_reminder_in_a_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut responses = vec![
+            call("p1", "plan_add", json!({"items": ["Find it", "Fix it"]})),
+            call("p2", "plan_update", json!({"id": 1, "status": "in_progress"})),
+        ];
+        responses.extend((0..reminders::PLAN_STALE_AFTER).map(|i| tool_call(&format!("c{i}"))));
+        responses.push(text("done"));
+        let (mut agent, seen) = agent(responses, dir.path());
+        agent.send_message("go").await.unwrap();
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        let results: Vec<&Message> = last.iter().filter(|m| m.name.as_deref() == Some("echo")).collect();
+        assert!(results[..results.len() - 1].iter().all(|m| m.content == "pong"));
+        let reminded = &results.last().unwrap().content;
+        assert!(reminded.starts_with("pong\n\n<system-reminder>\n") && reminded.contains("#1 \"Find it\" is still in progress"), "{reminded}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_tool_output_is_cut_and_kept_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(100);
+        let (mut agent, seen) = agent(vec![call("big1", "echo", json!({"text": long})), text("ok")], dir.path());
+        agent.set_tool_output_limit(10);
+        agent.send_message("go").await.unwrap();
+        let result = seen.lock().unwrap()[1].last().unwrap().content.clone();
+        let path = output::spill_dir().join("tool-big1-echo.txt");
+        assert!(result.contains(&format!("complete output in {}", path.display())), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), long);
+        let _ = std::fs::remove_file(path);
     }
 
     fn record_events(agent: &mut Agent) -> Arc<Mutex<Vec<Value>>> {

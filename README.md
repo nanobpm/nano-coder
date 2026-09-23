@@ -83,6 +83,11 @@ echoes it in `_meta.plan`, and the model is told about it with the first prompt 
 `_meta.planInPrompt: true` says the client already put the plan in the prompt). `initialize`
 advertises this as `agentCapabilities._meta.planSeed`. See [Task Plans](#task-plans).
 
+**Outcomes.** When the model calls `report_outcome`, the `session/prompt` result carries
+`_meta.outcome`: `{"status": "completed" | "blocked", "summary": "..."}`. A client can use it
+instead of guessing from the stop reason: `blocked` means the model needs help (an
+escalation). Redelivering the input returns the same outcome. See [Outcomes](#outcomes).
+
 **Slash commands work via ACP too:**
 - `/compact [focus]` - summarizes the conversation; the result has `compacted`, `before`,
   `after`, `tokensBefore`, `tokensAfter`, `summarized` and `fallback`
@@ -110,7 +115,7 @@ src/
 │   └── mock.rs      # Offline scripted client
 ├── bash.rs      # bash tool: timeout, file capture, bounded output
 ├── files.rs     # read_file / write_file / edit_file tools
-├── output.rs    # Head/tail output bounding
+├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
@@ -118,6 +123,8 @@ src/
 ├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, steering on the status line)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
+├── goal.rs      # report_outcome tool (completed / blocked)
+├── reminders.rs # <system-reminder> notes appended to tool results
 ├── settings.rs  # /settings menu and config-file writer
 └── config.rs    # Configuration file loading and management
 ```
@@ -153,6 +160,12 @@ The harness exposes 6 lifecycle hook events:
 - `edit_file` - Replace exact text (`path`, `old_string`, `new_string`, optional `replace_all`).
   Fails unless `old_string` matches exactly once (or `replace_all` is set).
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
+- `report_outcome` - Report the task `completed` or `blocked`, with a `summary`; ends the turn
+  (see [Outcomes](#outcomes)).
+
+Any other tool's result longer than 40,000 characters is cut the same way as bash output,
+with the whole result saved under the temp directory (`agentic-harness-<pid>/tool-<id>-<name>.txt`)
+and its path in the marker. `read_file` pages instead.
 
 Relative paths resolve against the working directory (ACP `session/new` `cwd`). Writes are
 atomic (temp file + rename). There is no permission prompt: run workers in a disposable
@@ -223,6 +236,8 @@ verbosity = "normal"                    # quiet | normal | verbose | debug (or -
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
 project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
+outcome_tool = true                     # offer report_outcome (see Outcomes)
+reminders = true                        # append <system-reminder> notes to tool results
 ```
 
 The default model is `gpt-4o-mini` on the `mock` provider, so the harness still works offline.
@@ -428,6 +443,27 @@ In the terminal, normal verbosity shows plan changes as a checklist instead of t
 (verbose shows both). The status line shows `plan 2/5`, and `/context` and `/plan` show more.
 To turn plans off, set `plan_tools = false`.
 
+**Reminders.** A tool result can end with a `<system-reminder>` note that the model sees with
+the result:
+- after 12 tool calls with no plan change while items are open, naming the item in progress
+  (or the next one) and asking for `plan_update`; again every 12 calls;
+- once per session, after 10 tool calls in one turn with no plan, suggesting `plan_add`.
+
+Plan and outcome calls don't count. Set `reminders = false` to turn them off.
+
+## Outcomes
+
+`report_outcome` is the model's explicit end-of-task signal: `status` is `completed` (the
+whole task is done and checked; the summary lists PRs or commits) or `blocked` (after three
+or more different failed attempts, or when only a person can unblock it; the summary says
+what is needed). The call ends the turn. Other calls in the same response still run, then the
+summary becomes the final answer (`Blocked: ...` for blocked), and the outcome is returned
+in ACP `_meta.outcome` and recorded in the session log's `turn_end` record. If the harness
+stops after the call but before the turn ends, resuming the input finishes it with the
+recorded outcome without calling the model again. In the terminal the call shows as
+`✔ completed` or `■ blocked` followed by the summary. Set `outcome_tool = false` to leave the
+tool out.
+
 ## Sessions
 
 When `persist_sessions` is on, each conversation is written to `<session_dir>/<id>.jsonl`.
@@ -497,4 +533,6 @@ impl LLMClient for MyClient {
 
 Retry classification, output bounding, bash result formatting and the session-log design
 are adapted from [unreal-agent](https://github.com/unreallabsai/unreal-agent)
-(MIT, Copyright (c) 2026 Unreal Labs).
+(MIT, Copyright (c) 2026 Unreal Labs). System reminders and the outcome tool follow ideas in
+[grok-build](https://github.com/xai-org/grok-build)'s `<system-reminder>` notes and
+`update_goal` tool.

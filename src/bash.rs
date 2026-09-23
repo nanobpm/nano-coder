@@ -36,7 +36,7 @@ impl Default for BashConfig {
         Self {
             shell: "bash".into(),
             working_dir: None,
-            output_dir: std::env::temp_dir().join(format!("agentic-harness-{}", std::process::id())),
+            output_dir: output::spill_dir(),
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             cancel: None,
         }
