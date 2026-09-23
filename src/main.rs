@@ -76,6 +76,34 @@ fn register_builtin_tools(agent: &mut Agent) {
         let text = args["text"].as_str().unwrap_or("");
         Ok(json!({ "echo": text }))
     }));
+
+    // bash tool
+    let bash_def = ToolDefinition::new(
+        "bash",
+        "Execute a bash command and return output",
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Bash command to execute" }
+            },
+            "required": ["command"]
+        }),
+    );
+    agent.tools().register(bash_def, Box::new(|args| {
+        let cmd = args["command"].as_str().unwrap_or("");
+        match std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+        {
+            Ok(output) => Ok(json!({
+                "exit_code": output.status.code(),
+                "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+                "stderr": String::from_utf8_lossy(&output.stderr).to_string()
+            })),
+            Err(e) => Err(anyhow::anyhow!("Failed to execute command: {}", e)),
+        }
+    }));
 }
 
 fn register_hooks(agent: &mut Agent) {

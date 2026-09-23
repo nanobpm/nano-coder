@@ -146,7 +146,8 @@ impl MockLLMClient {
         let content = user_content.to_lowercase();
         content.contains("time") || content.contains("clock") ||
         content.contains("weather") ||
-        content.contains("file") || content.contains("read") || content.contains("list")
+        content.contains("file") || content.contains("read") || content.contains("list") ||
+        content.contains("bash") || content.contains("command") || content.contains("run")
     }
 }
 
@@ -228,6 +229,31 @@ impl LLMClient for MockLLMClient {
                             id: format!("call_{}", call_id),
                             name: "list_files".to_string(),
                             arguments: json!({}),
+                        }],
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 50,
+                            completion_tokens: 20,
+                            total_tokens: 70,
+                        }),
+                    });
+                }
+
+                // If user asks to run a bash command
+                if content.contains("bash") || content.contains("command") || content.contains("run") {
+                    // Extract the command from the user's message
+                    let cmd = if content.contains("echo") {
+                        "echo hello world"
+                    } else if content.contains("pwd") {
+                        "pwd"
+                    } else {
+                        "ls -la"
+                    };
+                    return Ok(LLMResponse {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall {
+                            id: format!("call_{}", call_id),
+                            name: "bash".to_string(),
+                            arguments: json!({ "command": cmd }),
                         }],
                         usage: Some(TokenUsage {
                             prompt_tokens: 50,
