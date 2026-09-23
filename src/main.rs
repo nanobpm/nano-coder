@@ -2,9 +2,11 @@ use anyhow::Result;
 use chrono::Local;
 use dialoguer::{Input, Select};
 use serde_json::json;
+use std::env;
 use std::io::{self, Write};
 
 mod agent;
+mod acp;
 mod config;
 mod hooks;
 mod llm;
@@ -213,6 +215,10 @@ async fn run_settings(agent: &mut Agent) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Detect execution mode from command-line args
+    let args: Vec<String> = env::args().collect();
+    let acp_mode = args.contains(&"--acp".to_string());
+
     // Load config
     let config_mgr = ConfigManager::new()?;
     let config = config_mgr.get().clone();
@@ -225,35 +231,43 @@ async fn main() -> Result<()> {
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
 
-    println!("Agentic Harness v0.1.0");
-    println!("Model: {}", agent.config().model);
-    println!("Type /help for commands\n");
+    if acp_mode {
+        // ACP headless mode
+        eprintln!("ACP harness ready (model: {})", agent.config().model);
+        acp::run_acp(&mut agent)?;
+    } else {
+        // Interactive CLI mode
+        println!("Agentic Harness v0.1.0");
+        println!("Model: {}", agent.config().model);
+        println!("Type /help for commands\n");
 
-    // Main loop
-    let mut running = true;
-    while running {
-        io::stdout().write_all(b"> ").unwrap();
-        io::stdout().flush().unwrap();
+        // Main loop
+        let mut running = true;
+        while running {
+            io::stdout().write_all(b"> ").unwrap();
+            io::stdout().flush().unwrap();
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            continue;
-        }
-
-        match run_command(&mut agent, &input).await {
-            Ok(continue_running) => {
-                running = continue_running;
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                break;
             }
-            Err(e) => {
-                eprintln!("Error: {}", e);
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                continue;
+            }
+
+            match run_command(&mut agent, &input).await {
+                Ok(continue_running) => {
+                    running = continue_running;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
             }
         }
+
+        println!("\nGoodbye!");
     }
 
-    println!("\nGoodbye!");
     Ok(())
 }

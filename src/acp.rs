@@ -101,13 +101,10 @@ pub fn handle_message(agent: &mut Agent, msg: Value) -> Option<Value> {
                 }));
             }
 
-            // Send prompt to agent (async via tokio)
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            let response = match rt.block_on(agent.send_message(&prompt_text)) {
+            // Send prompt to agent (async)
+            let response = match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(agent.send_message(&prompt_text))
+            }) {
                 Ok(resp) => resp,
                 Err(e) => format!("Error: {}", e),
             };
