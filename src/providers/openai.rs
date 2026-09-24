@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{HttpTransport, ResolvedProvider};
 use crate::llm::{
-    ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter, TokenUsage, ToolCall,
+    ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter, TokenUsage, ToolCall,
     report_whole,
 };
 
@@ -365,6 +365,10 @@ impl LLMClient for OpenAiClient {
         .await
     }
 
+    async fn detect_context_window(&self) -> Option<DetectedWindow> {
+        detect_window(&self.transport).await
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.transport.provider();
         let mut request = self.transport.http().get(format!("{}/models", provider.base_url));
@@ -397,6 +401,129 @@ impl LLMClient for OpenAiClient {
     fn provider_name(&self) -> &str {
         &self.transport.provider().name
     }
+}
+
+/// Per-request timeout for context-window probes.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ask an OpenAI-compatible endpoint for the loaded model's context window.
+///
+/// `/models` covers vLLM (`max_model_len`), DwarfStar ds4, OpenRouter, Together
+/// and Kimi (`context_length`), Groq (`context_window`) and Mistral
+/// (`max_context_length`). Servers whose `/models` lacks it are recognised by
+/// `owned_by` or name and asked their own API: llama.cpp `/props`, LM Studio
+/// `/api/v0/models`, Ollama `/api/ps` and `/api/show`.
+pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedWindow> {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    if let Some(found) = entry.and_then(window_in_entry) {
+        return Some(found);
+    }
+    let owner = entry.and_then(|e| e.get("owned_by")).and_then(Value::as_str).unwrap_or_default();
+    let is_ollama = provider.name == "ollama" || root.ends_with(":11434") || matches!(owner, "library" | "ollama");
+    if owner == "llamacpp" || provider.name == "llamacpp" {
+        let url = format!("{root}/props?model={}", urlencode(model));
+        let props = probe(transport, reqwest::Method::GET, &url, None).await?;
+        return props
+            .pointer("/default_generation_settings/n_ctx")
+            .or_else(|| props.get("n_ctx"))
+            .and_then(as_tokens)
+            .map(|tokens| DetectedWindow { tokens, source: "llama.cpp /props n_ctx".into() });
+    }
+    if owner == "organization_owner" || provider.name == "lmstudio" {
+        let listed = probe(transport, reqwest::Method::GET, &format!("{root}/api/v0/models"), None).await?;
+        return model_entry(&listed, model)
+            .and_then(|m| m.get("loaded_context_length"))
+            .and_then(as_tokens)
+            .map(|tokens| DetectedWindow { tokens, source: "LM Studio loaded_context_length".into() });
+    }
+    if is_ollama {
+        return ollama_window(transport, root, model).await;
+    }
+    None
+}
+
+/// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from the
+/// model's parameters. The model's maximum (`model_info`) is not used: Ollama
+/// runs with a smaller default unless `num_ctx` says otherwise.
+async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Option<DetectedWindow> {
+    let same = |name: &str| name == model || name.strip_suffix(":latest") == Some(model);
+    if let Some(ps) = probe(transport, reqwest::Method::GET, &format!("{root}/api/ps"), None).await {
+        let loaded = ps.get("models").and_then(Value::as_array).into_iter().flatten().find(|m| {
+            ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same))
+        });
+        if let Some(tokens) = loaded.and_then(|m| m.get("context_length")).and_then(as_tokens) {
+            return Some(DetectedWindow { tokens, source: "Ollama /api/ps context_length".into() });
+        }
+    }
+    let show = probe(transport, reqwest::Method::POST, &format!("{root}/api/show"), Some(json!({ "model": model }))).await?;
+    let parameters = show.get("parameters").and_then(Value::as_str)?;
+    parameters
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse::<usize>().ok().filter(|&n| n > 0))
+        .map(|tokens| DetectedWindow { tokens, source: "Ollama num_ctx".into() })
+}
+
+async fn probe(transport: &HttpTransport, method: reqwest::Method, url: &str, body: Option<Value>) -> Option<Value> {
+    let provider = transport.provider();
+    let mut request = transport.http().request(method, url).timeout(PROBE_TIMEOUT);
+    for (name, value) in &provider.headers {
+        request = request.header(name, value);
+    }
+    if let Some(key) = &provider.api_key {
+        request = request.bearer_auth(key);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// The `/models` entry for `model`; a server listing a single model (such as
+/// ds4, which accepts aliases) is taken to be serving it.
+fn model_entry<'a>(models: &'a Value, model: &str) -> Option<&'a Value> {
+    let items = models.get("data").unwrap_or(models).as_array()?;
+    items
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+        .or(if items.len() == 1 { items.first() } else { None })
+}
+
+fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
+    [
+        "/max_model_len",
+        "/loaded_context_length",
+        "/context_length",
+        "/top_provider/context_length",
+        "/context_window",
+        "/max_context_length",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        let tokens = entry.pointer(pointer).and_then(as_tokens)?;
+        Some(DetectedWindow { tokens, source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")) })
+    })
+}
+
+fn as_tokens(value: &Value) -> Option<usize> {
+    value.as_u64().filter(|&n| n > 0).map(|n| n as usize)
+}
+
+fn urlencode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -629,5 +756,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((response.content.as_str(), response.thinking.as_str()), ("hi", "hmm"));
+    }
+
+    async fn detect(provider_name: &str, responses: Vec<(u16, &'static str, String)>) -> (Option<DetectedWindow>, Vec<String>) {
+        let (url, captured) = test_server::serve(responses).await;
+        let mut user = HashMap::new();
+        user.insert(
+            provider_name.to_string(),
+            ProviderConfig { kind: Some(ProviderKind::Openai), base_url: Some(format!("{url}/v1")), ..Default::default() },
+        );
+        let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
+        let found = OpenAiClient::new(resolved).unwrap().detect_context_window().await;
+        let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        (found, paths)
+    }
+
+    fn window(tokens: usize, source: &str) -> Option<DetectedWindow> {
+        Some(DetectedWindow { tokens, source: source.into() })
+    }
+
+    #[tokio::test]
+    async fn detects_window_from_models_listing() {
+        let models = json!({"data": [
+            {"id": "other", "max_model_len": 1},
+            {"id": "qwen3:8b", "owned_by": "vllm", "max_model_len": 32768}
+        ]});
+        let (found, paths) = detect("local", vec![(200, "", models.to_string())]).await;
+        assert_eq!(found, window(32768, "/models max_model_len"));
+        assert_eq!(paths, ["/v1/models"]);
+
+        // ds4 lists one model (and accepts aliases for it).
+        let models = json!({"data": [{"id": "qwen3.8-flash-next", "top_provider": {"context_length": 8192}}]});
+        let (found, _) = detect("local", vec![(200, "", models.to_string())]).await;
+        assert_eq!(found, window(8192, "/models top_provider.context_length"));
+    }
+
+    #[tokio::test]
+    async fn asks_llama_cpp_for_its_loaded_context() {
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp", "meta": {"n_ctx_train": 262144}}]});
+        let props = json!({"default_generation_settings": {"n_ctx": 65536}});
+        let (found, paths) = detect("local", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(found, window(65536, "llama.cpp /props n_ctx"));
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
+    }
+
+    #[tokio::test]
+    async fn recognizes_llama_cpp_by_provider_name() {
+        // A llama.cpp `/models` response without the `llamacpp` owner is still
+        // probed when the provider is named `llamacpp`.
+        let models = json!({"data": [{"id": "qwen3:8b"}]});
+        let props = json!({"default_generation_settings": {"n_ctx": 65536}});
+        let (found, paths) = detect("llamacpp", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(found, window(65536, "llama.cpp /props n_ctx"));
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
+    }
+
+    #[tokio::test]
+    async fn recognizes_lm_studio_by_provider_name() {
+        // LM Studio configured under the natural `lmstudio` name is asked its
+        // own API even when the `/models` owner is not `organization_owner`.
+        let models = json!({"data": [{"id": "qwen3:8b"}]});
+        let listed = json!({"data": [{"id": "qwen3:8b", "loaded_context_length": 12288}]});
+        let (found, paths) = detect("lmstudio", vec![(200, "", models.to_string()), (200, "", listed.to_string())]).await;
+        assert_eq!(found, window(12288, "LM Studio loaded_context_length"));
+        assert_eq!(paths, ["/v1/models", "/api/v0/models"]);
+    }
+
+    #[tokio::test]
+    async fn uses_ollama_num_ctx_not_the_model_maximum() {
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let ps = json!({"models": []});
+        let show = json!({"parameters": "temperature 0.6\nnum_ctx                        16384", "model_info": {"qwen3.context_length": 40960}});
+        let (found, paths) = detect(
+            "ollama",
+            vec![(200, "", models.to_string()), (200, "", ps.to_string()), (200, "", show.to_string())],
+        )
+        .await;
+        assert_eq!(found, window(16384, "Ollama num_ctx"));
+        assert_eq!(paths, ["/v1/models", "/api/ps", "/api/show"]);
+
+        let ps = json!({"models": [{"name": "qwen3:8b", "context_length": 8192}]});
+        let (found, _) = detect("ollama", vec![(200, "", models.to_string()), (200, "", ps.to_string())]).await;
+        assert_eq!(found, window(8192, "Ollama /api/ps context_length"));
+    }
+
+    #[tokio::test]
+    async fn reports_nothing_when_the_endpoint_does_not_say() {
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "system"}, {"id": "b"}]});
+        let (found, paths) = detect("hosted", vec![(200, "", models.to_string())]).await;
+        assert_eq!(found, None);
+        assert_eq!(paths, ["/v1/models"], "unknown servers get no extra probes");
+        let (found, _) = detect("hosted", vec![(404, "", "{}".into())]).await;
+        assert_eq!(found, None);
     }
 }

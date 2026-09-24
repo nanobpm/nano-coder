@@ -187,8 +187,20 @@ pub trait LLMClient: Send + Sync {
     async fn list_models(&self) -> Result<Vec<String>> {
         anyhow::bail!("provider {:?} cannot list models", self.provider_name())
     }
+    /// The context window the endpoint reports for the current model, if any.
+    async fn detect_context_window(&self) -> Option<DetectedWindow> {
+        None
+    }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+}
+
+/// A context window reported by the provider's endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedWindow {
+    pub tokens: usize,
+    /// Where it came from, e.g. `/v1/models max_model_len`.
+    pub source: String,
 }
 
 /// Splits `<think>...</think>` sections out of streamed content (servers that

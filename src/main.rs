@@ -382,7 +382,6 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         "/context" => {
             let stats = agent.context_stats().lock().unwrap().clone();
-            let config = agent.config();
             println!("Model:        {}/{}", stats.provider, stats.model);
             println!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
@@ -418,9 +417,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 ),
                 None => println!("Auto-compact: off"),
             }
-            if config.context_window.is_some() {
-                println!("(context window set by context_window in config)");
-            }
+            println!("(context window {})", agent.context_window_with_source().1);
             Ok(true)
         }
         "/settings" if terminal.outstanding => {
@@ -470,7 +467,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
-            agent.set_model(cmd["/model ".len()..].trim())?;
+            agent.set_model(cmd["/model ".len()..].trim()).await?;
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             Ok(true)
         }
@@ -621,6 +618,8 @@ async fn main() -> Result<()> {
 
     // Create agent with the configured provider
     let mut agent = Agent::from_config(config)?;
+
+    agent.detect_context_window().await;
 
     // Register tools and hooks
     register_builtin_tools(&mut agent);

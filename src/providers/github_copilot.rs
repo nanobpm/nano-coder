@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::openai;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
-use crate::llm::{ChatRequest, LLMClient, LLMResponse, Role, StreamSink, report_whole};
+use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -27,6 +27,11 @@ const DEFAULT_API_BASE: &str = "https://api.individual.githubcopilot.com";
 const MODELS_API_VERSION: &str = "2025-05-01";
 /// Refresh the session token this long before it expires.
 const REFRESH_MARGIN_SECS: i64 = 300;
+
+/// Per-request timeout for the context-window detection probe, matching the
+/// OpenAI-compatible probe so a stalled `/models` call cannot consume the whole
+/// startup/model-switch budget.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 const EDITOR_HEADERS: [(&str, &str); 4] = [
     ("User-Agent", "GitHubCopilotChat/0.35.0"),
@@ -252,6 +257,25 @@ pub struct GithubCopilotClient {
 }
 
 impl GithubCopilotClient {
+    async fn models_json(&self, timeout: Option<std::time::Duration>) -> Result<Value> {
+        let session = self.session_token(false).await?;
+        let url = format!("{}/models", self.api_base(&session));
+        let mut request = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
+            .bearer_auth(&session.token)
+            .header("Accept", "application/json")
+            .header("X-GitHub-Api-Version", MODELS_API_VERSION);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let value: Value = response.json().await?;
+        if !status.is_success() {
+            bail!("listing Copilot models failed (HTTP {status}): {value}");
+        }
+        Ok(value)
+    }
+
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let domain = domain();
         let oauth = provider
@@ -358,20 +382,28 @@ impl LLMClient for GithubCopilotClient {
         }
     }
 
+    async fn detect_context_window(&self) -> Option<DetectedWindow> {
+        // Bound the whole probe: `models_json` first does a token exchange whose
+        // request carries the transport's normal (long) timeout, so a stalled
+        // exchange could otherwise blow past the probe budget even though the
+        // `/models` call itself is capped at `PROBE_TIMEOUT`.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
+            let model = &self.transport.provider().model;
+            let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+            // Copilot enforces the prompt budget, which is below the full window.
+            ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
+                let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
+                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
-        let session = self.session_token(false).await?;
-        let url = format!("{}/models", self.api_base(&session));
-        let response = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
-            .bearer_auth(&session.token)
-            .header("Accept", "application/json")
-            .header("X-GitHub-Api-Version", MODELS_API_VERSION)
-            .send()
-            .await?;
-        let status = response.status();
-        let value: Value = response.json().await?;
-        if !status.is_success() {
-            bail!("listing Copilot models failed (HTTP {status}): {value}");
-        }
+        let value = self.models_json(None).await?;
         let mut models: Vec<String> = value
             .get("data")
             .and_then(Value::as_array)
@@ -506,5 +538,63 @@ mod tests {
         let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
         let err = format!("{:#}", client.chat(&request).await.unwrap_err());
         assert!(err.contains("--login github-copilot"), "{err}");
+    }
+
+    async fn detect_window(models: Value) -> Option<DetectedWindow> {
+        let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        client(&auth).detect_context_window().await
+    }
+
+    #[tokio::test]
+    async fn detects_context_window_field_fallbacks() {
+        // `max_prompt_tokens` is Copilot's enforced prompt budget and wins over
+        // `max_context_window_tokens` when both are present.
+        let window = detect_window(json!({
+            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+                "max_prompt_tokens": 111,
+                "max_context_window_tokens": 999,
+            } } }]
+        }))
+        .await
+        .unwrap();
+        assert_eq!(window.tokens, 111);
+        assert_eq!(window.source, "Copilot /models max_prompt_tokens");
+
+        // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
+        let window = detect_window(json!({
+            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+                "max_context_window_tokens": 222,
+            } } }]
+        }))
+        .await
+        .unwrap();
+        assert_eq!(window.tokens, 222);
+        assert_eq!(window.source, "Copilot /models max_context_window_tokens");
+
+        // Neither field present: no detection rather than a bogus default.
+        assert!(
+            detect_window(json!({ "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {} } }] }))
+                .await
+                .is_none()
+        );
+
+        // A non-positive budget is ignored, not treated as a window.
+        assert!(
+            detect_window(json!({
+                "data": [{ "id": "gpt-4.1", "capabilities": { "limits": { "max_prompt_tokens": 0 } } }]
+            }))
+            .await
+            .is_none()
+        );
+
+        // A matching id must exist; a different model is not silently used.
+        assert!(
+            detect_window(json!({
+                "data": [{ "id": "other", "capabilities": { "limits": { "max_prompt_tokens": 111 } } }]
+            }))
+            .await
+            .is_none()
+        );
     }
 }

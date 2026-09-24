@@ -15,7 +15,7 @@ use crate::goal::{self, Outcome};
 use crate::output;
 use crate::plan::{self, Plan};
 use crate::reminders::{self, Reminders};
-use crate::llm::{ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
+use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::providers;
 use crate::session::{self, PendingInput, Record, SessionLog};
 use crate::tools::ToolRegistry;
@@ -225,6 +225,8 @@ pub struct Agent {
     calibration: Option<(usize, usize)>,
     /// Window learned from a context-overflow error (until the model changes).
     learned_window: Option<usize>,
+    /// Window reported by the endpoint (see `detect_context_window`).
+    detected_window: Option<DetectedWindow>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -241,6 +243,9 @@ pub struct Agent {
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
 }
+
+/// Upper bound on context-window detection at startup and model switches.
+const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
@@ -263,6 +268,7 @@ impl Agent {
             stats: SharedStats::default(),
             calibration: None,
             learned_window: None,
+            detected_window: None,
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -309,14 +315,36 @@ impl Agent {
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
-    pub fn set_model(&mut self, spec: &str) -> Result<()> {
+    pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         self.client = Self::client_for(&self.config, spec)?;
         self.config.model = spec.to_string();
         self.calibration = None;
         self.learned_window = None;
+        self.detected_window = None;
         self.compact_floor = 0;
-        self.refresh_stats();
+        self.detect_context_window().await;
         Ok(())
+    }
+
+    /// Ask the endpoint for the model's context window, unless config sets it.
+    pub async fn detect_context_window(&mut self) {
+        self.detected_window = None;
+        if self.configured_window().is_none() {
+            let probe = self.client.detect_context_window();
+            self.detected_window = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+        }
+        self.refresh_stats();
+    }
+
+    /// `context_window` from config or the provider entry.
+    fn configured_window(&self) -> Option<(usize, &'static str)> {
+        let (user, default_provider) = self.config.effective_providers();
+        let (configured, _) = providers::context_window(&self.config.model, &user, &default_provider);
+        match (self.config.context_window, configured) {
+            (Some(window), _) => Some((window, "context_window in config")),
+            (None, Some(window)) => Some((window, "provider context_window")),
+            (None, None) => None,
+        }
     }
 
     /// Context statistics, updated as the agent works.
@@ -325,18 +353,31 @@ impl Agent {
     }
 
     /// Context window for the current model: learned from an overflow error,
-    /// else `context_window` from config, the provider, or the model name.
+    /// else `context_window` from config or the provider, the window the
+    /// endpoint reports, or one known for the model name.
     pub fn context_window(&self) -> usize {
+        self.context_window_with_source().0
+    }
+
+    /// The context window and where it came from, for `/context`.
+    pub fn context_window_with_source(&self) -> (usize, String) {
         let (user, default_provider) = self.config.effective_providers();
-        let (configured, model) = providers::context_window(&self.config.model, &user, &default_provider);
-        let window = self
-            .config
-            .context_window
-            .or(configured)
-            .or_else(|| context::window_for_model(&model))
-            .or_else(|| context::window_for_model(self.client.model_name()))
-            .unwrap_or(context::DEFAULT_CONTEXT_WINDOW);
-        self.learned_window.map_or(window, |learned| learned.min(window))
+        let (_, model) = providers::context_window(&self.config.model, &user, &default_provider);
+        let (window, source) = if let Some((window, source)) = self.configured_window() {
+            (window, source.to_string())
+        } else if let Some(detected) = &self.detected_window {
+            (detected.tokens, format!("reported by the endpoint ({})", detected.source))
+        } else if let Some(window) =
+            context::window_for_model(&model).or_else(|| context::window_for_model(self.client.model_name()))
+        {
+            (window, "known for the model name".to_string())
+        } else {
+            (context::DEFAULT_CONTEXT_WINDOW, "default".to_string())
+        };
+        match self.learned_window {
+            Some(learned) if learned < window => (learned, "learned from a context-overflow error".to_string()),
+            _ => (window, source),
+        }
     }
 
     /// Estimated tokens the next request would send, anchored to the last
@@ -1494,6 +1535,34 @@ mod tests {
         let error = agent.send_message("ping").await.unwrap_err();
         assert!(format!("{error:#}").contains("prompt is too long"));
         assert_eq!(agent.context_stats().lock().unwrap().activity, Activity::Idle);
+    }
+
+    #[tokio::test]
+    async fn detected_window_sits_between_config_and_model_name() {
+        struct Reports;
+        #[async_trait]
+        impl LLMClient for Reports {
+            async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!()
+            }
+            async fn detect_context_window(&self) -> Option<DetectedWindow> {
+                Some(DetectedWindow { tokens: 65_536, source: "test".into() })
+            }
+            fn model_name(&self) -> &str {
+                "claude-test"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+        let mut agent = Agent::new(Box::new(Reports), Config::default());
+        assert_eq!(agent.context_window_with_source().1, "known for the model name");
+        agent.detect_context_window().await;
+        assert_eq!(agent.context_window_with_source(), (65_536, "reported by the endpoint (test)".into()));
+        agent.config_mut().context_window = Some(32_000);
+        agent.detect_context_window().await;
+        assert_eq!(agent.context_window_with_source(), (32_000, "context_window in config".into()));
+        assert!(agent.detected_window.is_none(), "no probe when config sets the window");
     }
 
     #[test]

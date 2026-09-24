@@ -432,8 +432,22 @@ count, and what the agent is doing. It uses a terminal scroll region, follows re
 off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set.
 
 The context window comes from, in order: `context_window` in the config, `context_window`
-on the provider, a built-in table of known models, then 128k. If a provider rejects a
-request as too long, the harness takes the limit from the error, compacts, and retries once.
+on the provider, the window the endpoint reports, a built-in table of known models, then
+128k. `/context` shows which one applied. If a provider rejects a request as too long, the
+harness takes the limit from the error, compacts, and retries once.
+
+The endpoint is asked at startup and on `/model` (at most 5 seconds; skipped when config
+sets the window). The window a server has *loaded* is preferred over the model's maximum:
+
+| Server | Source |
+|---|---|
+| vLLM | `/v1/models` `max_model_len` |
+| DwarfStar ds4, OpenRouter, Together, Kimi | `/models` `context_length` |
+| Groq / Mistral | `/models` `context_window` / `max_context_length` |
+| llama.cpp | `/props` `n_ctx` (per slot) |
+| LM Studio | `/api/v0/models` `loaded_context_length` |
+| Ollama | `/api/ps` for a loaded model, else `num_ctx`; never the model maximum, since Ollama runs with a smaller default |
+| GitHub Copilot | `/models` `max_prompt_tokens` |
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model
