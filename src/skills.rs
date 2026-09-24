@@ -325,10 +325,10 @@ impl Skills {
         list_files(&skill.dir, &skill.dir, 0, &mut files);
         files.retain(|f| f != SKILL_FILE);
         if !files.is_empty() {
-            out.push_str("\n\nOther files in this skill (paths relative to its directory; read them with read_file when the skill refers to them):");
+            out.push_str("\n\nOther files in this skill (absolute paths; read them with read_file when the skill refers to them):");
             let total = files.len();
             for file in files.iter().take(MAX_LISTED_FILES) {
-                out.push_str(&format!("\n- {file}"));
+                out.push_str(&format!("\n- {}", skill.dir.join(file).display()));
             }
             if total > MAX_LISTED_FILES {
                 out.push_str(&format!("\n- ... and {} more", total - MAX_LISTED_FILES));
@@ -765,7 +765,9 @@ mod tests {
 
         let loaded = skills.load(&json!({ "name": "review" })).unwrap();
         assert!(loaded.contains("Do the review thing.") && !loaded.contains("description:"));
-        assert!(loaded.contains("- scripts/check.sh"), "{loaded}");
+        let expected_script = skills.skills[0].dir.join("scripts/check.sh");
+        assert!(loaded.contains(&format!("- {}", expected_script.display())), "{loaded}");
+        assert!(expected_script.is_absolute(), "listed skill file paths must be absolute");
         assert!(skills.load(&json!({ "name": "nope" })).unwrap_err().to_string().contains("available: review, deploy, notes"));
     }
 
