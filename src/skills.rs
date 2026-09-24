@@ -311,7 +311,12 @@ impl Skills {
         let Some(skill) = self.skills.iter().find(|s| s.name == name) else {
             bail!("no skill named {name:?}; available: {}", self.names().join(", "));
         };
-        let text = std::fs::read(skill.dir.join(SKILL_FILE)).with_context(|| format!("reading {}", skill.dir.join(SKILL_FILE).display()))?;
+        // Re-check containment at read time: discovery canonicalized `skill.dir`,
+        // but the `SKILL.md` beneath it could since have been swapped for a symlink
+        // escaping the directory, so resolve it with `within` before reading.
+        let skill_file = within(&skill.dir, &skill.dir.join(SKILL_FILE))
+            .with_context(|| format!("{} is not a regular file inside the skill directory", skill.dir.join(SKILL_FILE).display()))?;
+        let text = std::fs::read(&skill_file).with_context(|| format!("reading {}", skill_file.display()))?;
         let text = String::from_utf8_lossy(&text);
         let (_, body) = front_matter(&text);
         let body = cap(body.trim(), MAX_SKILL_BYTES);
@@ -464,11 +469,21 @@ fn cap(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
+    let total = text.len();
+    // Reserve room for the truncation notice so the returned string, notice
+    // included, never exceeds `max`. The notice's own length depends on `end`,
+    // so start at `max` and shrink until the whole formatted string fits.
     let mut end = max;
-    while !text.is_char_boundary(end) {
+    loop {
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let out = format!("{}\n\n[... truncated: {end} of {total} bytes shown; read the rest with read_file]", &text[..end]);
+        if out.len() <= max || end == 0 {
+            return out;
+        }
         end -= 1;
     }
-    format!("{}\n\n[... truncated: {end} of {} bytes shown; read the rest with read_file]", &text[..end], text.len())
 }
 
 fn list_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
@@ -726,6 +741,14 @@ mod tests {
 
     fn config() -> SkillsConfig {
         SkillsConfig { allowed_hosts: vec!["file".into()], ..Default::default() }
+    }
+
+    #[test]
+    fn cap_keeps_truncated_body_within_max() {
+        let max = 256;
+        let out = cap(&"x".repeat(max * 4), max);
+        assert!(out.len() <= max, "capped body is {} bytes, exceeds max {max}", out.len());
+        assert!(out.contains("truncated"), "expected a truncation notice: {out}");
     }
 
     #[test]
