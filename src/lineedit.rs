@@ -26,6 +26,9 @@ pub struct EditView {
     menu_hidden: bool,
     /// Draw the command menu (key-by-key terminal input only).
     menu_enabled: bool,
+    /// Visible width of the prompt before the line (it starts with a
+    /// timestamp when timestamps are on).
+    prompt_width: usize,
 }
 
 pub type SharedView = Arc<Mutex<EditView>>;
@@ -39,11 +42,8 @@ impl EditView {
             menu_rows: 0,
             menu_hidden: false,
             menu_enabled: false,
+            prompt_width: 2,
         }))
-    }
-
-    pub fn line(&self) -> &str {
-        &self.line
     }
 
     pub fn set_mode(&mut self, mode: EditMode) {
@@ -117,6 +117,26 @@ impl EditView {
         }
     }
 
+    /// The prompt (`HH:MM:SS > ` or `> `) followed by the line so far.
+    pub fn prompt(&mut self) -> String {
+        let stamp = crate::ui::stamp();
+        self.prompt_width = crate::ui::visible_width(&stamp) + 2;
+        format!("{stamp}> {}", self.line)
+    }
+
+    /// On Enter: rewrite the prompt's timestamp with the time the line was
+    /// sent. Same width, so nothing reflows.
+    fn restamp_prompt(&self) {
+        let stamp = crate::ui::stamp();
+        if !self.menu_enabled || self.mode != EditMode::Prompt || stamp.is_empty() || self.prompt_width <= 2 {
+            return;
+        }
+        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80);
+        let up = rows_above_cursor(self.prompt_width + self.line.chars().count(), cols);
+        let up = if up > 0 { format!("\x1b[{up}A") } else { String::new() };
+        write(&format!("\x1b7{up}\r{stamp}\x1b8"));
+    }
+
     /// The prompt and line were printed again (after other output): the old
     /// menu rows scrolled away, so draw it afresh.
     pub fn prompt_redrawn(&mut self) {
@@ -174,6 +194,7 @@ impl EditView {
             self.menu_rows = 0;
         }
         self.menu_hidden = false;
+        self.restamp_prompt();
         let line = std::mem::take(&mut self.line);
         match self.on_status() {
             Some(status) => status.set_input(None),
@@ -208,6 +229,16 @@ fn menu_sequence(old_rows: usize, lines: &[String]) -> (String, usize) {
     }
     seq.push_str("\x1b8");
     (seq, if lines.is_empty() { 0 } else { rows })
+}
+
+/// How many rows above the cursor the prompt starts, when `chars`
+/// characters have been printed from column 0 of a `cols`-wide terminal.
+/// A row filled exactly leaves the cursor on it (pending wrap).
+fn rows_above_cursor(chars: usize, cols: usize) -> usize {
+    if chars == 0 || cols == 0 {
+        return 0;
+    }
+    if chars.is_multiple_of(cols) { chars / cols - 1 } else { chars / cols }
 }
 
 fn write(text: &str) {
@@ -409,6 +440,14 @@ mod tests {
         let (seq, rows) = menu_sequence(2, &[]);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
         assert_eq!(menu_sequence(0, &[]), (String::new(), 0));
+    }
+
+    #[test]
+    fn finds_the_prompt_row_of_a_wrapped_line() {
+        assert_eq!(rows_above_cursor(11, 80), 0);
+        assert_eq!(rows_above_cursor(80, 80), 0, "pending wrap stays on the row");
+        assert_eq!(rows_above_cursor(81, 80), 1);
+        assert_eq!(rows_above_cursor(200, 80), 2);
     }
 
     #[test]

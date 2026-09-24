@@ -244,7 +244,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
-        let conversation = vec![Message::system(&config.system_prompt)];
+        let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
         Self {
             client,
             tools: ToolRegistry::new(),
@@ -484,7 +484,7 @@ impl Agent {
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
         self.load_project_instructions();
-        self.conversation = vec![Message::system(&self.system_prompt())];
+        self.conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) }];
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
@@ -508,7 +508,7 @@ impl Agent {
         self.conversation = restored.conversation;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
-        let system = Message::system(&self.system_prompt());
+        let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
         match self.conversation.first_mut() {
             Some(first) if first.role == Role::System => *first = system,
             _ => self.conversation.insert(0, system),
@@ -552,7 +552,8 @@ impl Agent {
         Ok(())
     }
 
-    fn push(&mut self, message: Message) -> Result<()> {
+    fn push(&mut self, mut message: Message) -> Result<()> {
+        message.timestamp.get_or_insert_with(session::now);
         if let Some(log) = &mut self.session {
             log.append(&Record::Message(message.clone()))?;
         }
@@ -566,12 +567,16 @@ impl Agent {
 
     /// Replace the conversation; `pending_position` keeps the in-flight input
     /// alive with its user message at that index.
-    fn replace_keeping_pending(&mut self, messages: Vec<Message>, pending_position: Option<usize>) -> Result<()> {
+    fn replace_keeping_pending(&mut self, mut messages: Vec<Message>, pending_position: Option<usize>) -> Result<()> {
+        let now = session::now();
+        for message in &mut messages {
+            message.timestamp.get_or_insert(now);
+        }
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
                 pending_position,
-                recorded_at: Utc::now(),
+                recorded_at: now,
             })?;
         }
         self.conversation = messages;
@@ -646,7 +651,7 @@ impl Agent {
 
     fn record_plan(&mut self) -> Result<()> {
         if let Some(log) = &mut self.session {
-            log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: Utc::now() })?;
+            log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: session::now() })?;
         }
         Ok(())
     }
@@ -764,7 +769,7 @@ impl Agent {
                     log.append(&Record::Input {
                         id: input_id.clone(),
                         text: user_input.to_string(),
-                        recorded_at: Utc::now(),
+                        recorded_at: session::now(),
                     })?;
                 }
                 self.push(Message::user(user_input))?;
@@ -1021,7 +1026,7 @@ impl Agent {
                 input_id: input_id.clone(),
                 response: response.clone(),
                 outcome: outcome.clone(),
-                recorded_at: Utc::now(),
+                recorded_at: session::now(),
             })?;
         }
         match &outcome {
@@ -1236,6 +1241,11 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
 
+    /// `message` without its timestamp, for comparing with a constructed one.
+    fn unstamped(message: &Message) -> Message {
+        Message { timestamp: None, ..message.clone() }
+    }
+
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let client = Scripted { responses: Mutex::new(responses), seen: seen.clone() };
@@ -1272,7 +1282,7 @@ mod tests {
         let second = &seen.lock().unwrap()[1];
         assert_eq!(second[2].role, Role::Assistant);
         assert_eq!(second[2].tool_calls[0].id, "c1");
-        assert_eq!(second[3], Message::tool_result("c1", "echo", "pong"));
+        assert_eq!(unstamped(&second[3]), Message::tool_result("c1", "echo", "pong"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1299,7 +1309,7 @@ mod tests {
         let id = "sess-crash";
         let mut log = SessionLog::create(dir.path(), id).unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
-        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: Utc::now() })
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() })
             .unwrap();
         log.append(&Record::Message(Message::user("run it"))).unwrap();
         log.append(&Record::Message(Message::assistant_with_tools(
@@ -1311,7 +1321,7 @@ mod tests {
 
         let (mut agent, seen) = agent(vec![text("recovered")], dir.path());
         agent.load_session(id).unwrap();
-        assert_eq!(agent.conversation()[3], Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
+        assert_eq!(unstamped(&agent.conversation()[3]), Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
         // Redelivering the interrupted input resumes without duplicating the user message.
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "recovered");
         let request = &seen.lock().unwrap()[0];
@@ -1321,7 +1331,7 @@ mod tests {
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
         let mut log = SessionLog::create(dir, id).unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
-        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: Utc::now() })
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() })
             .unwrap();
         for record in records {
             log.append(&record).unwrap();
@@ -1336,7 +1346,7 @@ mod tests {
         agent.load_session("lost-user").unwrap();
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "answer");
         let request = &seen.lock().unwrap()[0];
-        assert_eq!(request.last(), Some(&Message::user("run it")));
+        assert_eq!(request.last().map(unstamped).as_ref(), Some(&Message::user("run it")));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1380,7 +1390,7 @@ mod tests {
         assert_eq!(conversation[1].role, Role::User);
         assert!(conversation[1].content.starts_with(context::SUMMARY_PREFIX));
         assert!(conversation[1].content.ends_with("SUMMARY: pinged once"));
-        assert_eq!(conversation[2], Message::assistant("done"));
+        assert_eq!(unstamped(&conversation[2]), Message::assistant("done"));
         assert_eq!(agent.context_stats().lock().unwrap().compactions, 1);
 
         drop(agent);
@@ -1410,7 +1420,7 @@ mod tests {
         assert_eq!(requests.len(), 3, "call, summary, call");
         let last = &requests[2];
         assert!(last[1].content.starts_with(context::SUMMARY_PREFIX));
-        assert_eq!(last[2], Message::user("go"), "the in-flight input is restated");
+        assert_eq!(unstamped(&last[2]), Message::user("go"), "the in-flight input is restated");
         assert_eq!(last[3].tool_calls[0].id, "b1");
         assert_eq!(last[4].role, Role::Tool);
         assert!(last[4].content.contains("characters omitted"), "oversized result clipped");
@@ -1419,7 +1429,7 @@ mod tests {
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert!(restored.pending_input.is_none());
         assert_eq!(restored.completed["in-1"], "done");
-        assert_eq!(restored.conversation.last(), Some(&Message::assistant("done")));
+        assert_eq!(restored.conversation.last().map(unstamped), Some(Message::assistant("done")));
     }
 
     /// Replays scripted results, including errors.
@@ -1685,8 +1695,8 @@ mod tests {
         assert_eq!(outcome.response, "Opened PR #5");
         assert_eq!(outcome.outcome, Some(Outcome { status: goal::Status::Completed, summary: "Opened PR #5".into() }));
         let tail = &first.conversation()[first.conversation_length() - 3..];
-        assert_eq!(tail[1], Message::tool_result("c1", "echo", "pong"), "later calls in the batch still run");
-        assert_eq!(tail[2], Message::assistant("Opened PR #5"));
+        assert_eq!(unstamped(&tail[1]), Message::tool_result("c1", "echo", "pong"), "later calls in the batch still run");
+        assert_eq!(unstamped(&tail[2]), Message::assistant("Opened PR #5"));
         drop(first);
 
         let (mut resumed, seen) = agent(vec![], dir.path());

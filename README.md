@@ -254,6 +254,7 @@ auto_compact = true                     # summarize automatically when the conte
 auto_compact_threshold = 0.8            # fraction of the context window
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
+timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
 project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
@@ -418,6 +419,10 @@ Streaming uses server-sent events. Set `stream = false` on a provider whose endp
 support it. ACP mode doesn't stream text, but sends each response's reasoning as an
 `agent_thought_chunk` update.
 
+Every message (your prompt, answers, tool calls and results, thinking, notes) starts with
+the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
+shows when the message was sent. Turn this off with `timestamps = false`.
+
 ## Status Line and Compaction
 
 In an interactive terminal the bottom row shows the provider/model, context usage
@@ -546,6 +551,8 @@ When `persist_sessions` is on, each conversation is written to `<session_dir>/<i
 The file is an append-only log whose first record is a versioned header, followed by
 `input`, `message`, `turn_end` and `replace` (compaction / system-prompt reset) records.
 Resume a session with `--resume <id>` or ACP `session/load`.
+Record times and each message's `timestamp` are RFC 3339 with the local UTC offset
+(for example `2026-09-24T13:02:12.44+12:00`). Older logs with UTC times still load.
 
 - An unsupported format version is an explicit error on resume.
 - Only records ending in a newline count as committed. A half-written last line from a

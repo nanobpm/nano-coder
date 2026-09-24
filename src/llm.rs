@@ -45,6 +45,10 @@ pub struct Message {
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thinking_blocks: Vec<Value>,
+    /// When the message was added to the conversation, with the local UTC
+    /// offset. Kept in the session log; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 impl Message {
@@ -57,6 +61,7 @@ impl Message {
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
+            timestamp: None,
         }
     }
 

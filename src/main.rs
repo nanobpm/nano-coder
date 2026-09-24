@@ -517,11 +517,12 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
             if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("\n{}", outcome.response);
+                println!("\n{}", ui::stamp_block(&outcome.response));
             } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                println!("\x1b[2m{}\x1b[0m", outcome.response);
+                println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
             } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                println!("\x1b[2m{}\x1b[0m", outcome.response.lines().last().unwrap_or_default());
+                let last = outcome.response.lines().last().unwrap_or_default();
+                println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
             }
             println!();
             Ok(true)
@@ -616,6 +617,7 @@ async fn main() -> Result<()> {
         config.verbosity = level;
     }
     ui::set_verbosity(config.verbosity);
+    ui::set_timestamps(config.timestamps);
 
     // Create agent with the configured provider
     let mut agent = Agent::from_config(config)?;
@@ -700,8 +702,8 @@ async fn main() -> Result<()> {
             let prompt = |terminal: &Terminal| {
                 if terminal.queued.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
-                    let line = view.line().to_string();
-                    io::stdout().write_all(format!("> {line}").as_bytes()).unwrap();
+                    let prompt = view.prompt();
+                    io::stdout().write_all(prompt.as_bytes()).unwrap();
                     io::stdout().flush().unwrap();
                     view.prompt_redrawn();
                 }

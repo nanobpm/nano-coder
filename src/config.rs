@@ -40,6 +40,8 @@ pub struct Config {
     pub auto_compact_threshold: f64,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
+    /// Start each message in the interactive CLI with the local time.
+    pub timestamps: bool,
     /// Add AGENTS.md (and the like) from the git root down to the working
     /// directory to the system prompt, and nested ones as files are touched.
     pub project_instructions: bool,
@@ -74,6 +76,7 @@ impl Default for Config {
             auto_compact: true,
             auto_compact_threshold: 0.8,
             verbosity: crate::ui::Verbosity::Normal,
+            timestamps: true,
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
             plan_tools: true,
