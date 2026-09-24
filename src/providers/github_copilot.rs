@@ -530,4 +530,62 @@ mod tests {
         let err = format!("{:#}", client.chat(&request).await.unwrap_err());
         assert!(err.contains("--login github-copilot"), "{err}");
     }
+
+    async fn detect_window(models: Value) -> Option<DetectedWindow> {
+        let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        client(&auth).detect_context_window().await
+    }
+
+    #[tokio::test]
+    async fn detects_context_window_field_fallbacks() {
+        // `max_prompt_tokens` is Copilot's enforced prompt budget and wins over
+        // `max_context_window_tokens` when both are present.
+        let window = detect_window(json!({
+            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+                "max_prompt_tokens": 111,
+                "max_context_window_tokens": 999,
+            } } }]
+        }))
+        .await
+        .unwrap();
+        assert_eq!(window.tokens, 111);
+        assert_eq!(window.source, "Copilot /models max_prompt_tokens");
+
+        // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
+        let window = detect_window(json!({
+            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+                "max_context_window_tokens": 222,
+            } } }]
+        }))
+        .await
+        .unwrap();
+        assert_eq!(window.tokens, 222);
+        assert_eq!(window.source, "Copilot /models max_context_window_tokens");
+
+        // Neither field present: no detection rather than a bogus default.
+        assert!(
+            detect_window(json!({ "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {} } }] }))
+                .await
+                .is_none()
+        );
+
+        // A non-positive budget is ignored, not treated as a window.
+        assert!(
+            detect_window(json!({
+                "data": [{ "id": "gpt-4.1", "capabilities": { "limits": { "max_prompt_tokens": 0 } } }]
+            }))
+            .await
+            .is_none()
+        );
+
+        // A matching id must exist; a different model is not silently used.
+        assert!(
+            detect_window(json!({
+                "data": [{ "id": "other", "capabilities": { "limits": { "max_prompt_tokens": 111 } } }]
+            }))
+            .await
+            .is_none()
+        );
+    }
 }
