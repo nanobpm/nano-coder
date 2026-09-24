@@ -157,8 +157,12 @@ impl Skills {
     }
 
     fn add_dir(&mut self, dir: &Path, source: Source, seen: &mut HashSet<String>) {
+        // Canonicalize the configured directory and keep discovery inside it, so
+        // a `SKILL.md` symlink or a skill-directory symlink cannot pull a file
+        // from outside the configured root into the prompt.
+        let Ok(root) = dir.canonicalize() else { return };
         let mut found = Vec::new();
-        scan(dir, 0, &mut found);
+        scan(&root, &root, 0, &mut found);
         for skill_dir in found {
             if let Some(skill) = read_skill(&skill_dir, None, source.clone()) {
                 self.push(skill, seen);
@@ -254,7 +258,9 @@ impl Skills {
             "\n\n# Skills\n\nSkills are instructions for specific kinds of task. When a task matches a skill below, \
              call `{TOOL_NAME}` with its name and follow what it says before you start. Load only the skills that apply.\n"
         );
-        let mut budget = MAX_INDEX_BYTES;
+        // Account for the heading already in `out` so the whole rendered index
+        // (heading + lines + omitted summary) stays within MAX_INDEX_BYTES.
+        let mut budget = MAX_INDEX_BYTES.saturating_sub(out.len());
         let mut omitted = Vec::new();
         for skill in &self.skills {
             let line = format!("\n- `{}`: {}", skill.name, skill.description);
@@ -267,6 +273,14 @@ impl Skills {
         }
         if !omitted.is_empty() {
             out.push_str(&format!("\n- Also (descriptions omitted for space): {}", omitted.join(", ")));
+        }
+        // Enforce the hard cap even if the omitted summary overruns the budget.
+        if out.len() > MAX_INDEX_BYTES {
+            let mut end = MAX_INDEX_BYTES;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
         }
         out
     }
@@ -330,9 +344,11 @@ pub fn definition() -> ToolDefinition {
 }
 
 /// Collect folders containing `SKILL.md` under `dir`. A skill's own
-/// subfolders are not searched.
-fn scan(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if dir.join(SKILL_FILE).is_file() {
+/// subfolders are not searched. `root` (already canonical) bounds discovery:
+/// a directory or `SKILL.md` whose real path escapes it (e.g. via a symlink)
+/// is skipped, so discovery cannot follow a symlink outside the configured root.
+fn scan(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if within(root, &dir.join(SKILL_FILE)).is_some_and(|p| p.is_file()) {
         out.push(dir.to_path_buf());
         return;
     }
@@ -343,12 +359,12 @@ fn scan(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .map(|e| e.path())
+        .filter_map(|e| within(root, &e.path()))
         .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
     for sub in dirs {
-        scan(&sub, depth + 1, out);
+        scan(root, &sub, depth + 1, out);
     }
 }
 
@@ -457,9 +473,13 @@ fn list_files(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
         .collect();
     paths.sort();
     for path in paths {
-        if path.is_dir() {
-            list_files(root, &path, depth + 1, out);
-        } else if let Ok(rel) = path.strip_prefix(root) {
+        // Only recurse into / advertise entries whose real target stays inside
+        // the skill directory: a sibling symlink pointing outside the (locked)
+        // checkout must not be listed and later opened by `read_file`.
+        let Some(real) = within(root, &path) else { continue };
+        if real.is_dir() {
+            list_files(root, &real, depth + 1, out);
+        } else if let Ok(rel) = real.strip_prefix(root) {
             out.push(rel.display().to_string());
         }
     }
