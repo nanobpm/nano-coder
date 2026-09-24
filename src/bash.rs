@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::output::{self, MAX_OUTPUT_LENGTH};
+use crate::sandbox::{self, SandboxConfig};
 use crate::tools::ToolDefinition;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
@@ -29,6 +30,8 @@ pub struct BashConfig {
     pub default_timeout: Duration,
     /// Set to kill the running command (turn cancellation).
     pub cancel: Option<Arc<AtomicBool>>,
+    /// OS sandbox for the command (see `sandbox.rs`).
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for BashConfig {
@@ -39,6 +42,7 @@ impl Default for BashConfig {
             output_dir: output::spill_dir(),
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             cancel: None,
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -120,19 +124,29 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     let err_path = config.output_dir.join(format!("bash-{call}.stderr"));
     let create = |path: &Path| File::create(path).map_err(|e| format!("create {}: {e}", path.display()));
 
-    let mut command = Command::new(&config.shell);
+    let cwd = match &config.working_dir {
+        Some(dir) => dir.clone(),
+        None => std::env::current_dir().map_err(|e| format!("working directory: {e}"))?,
+    };
+    // Keeps the Linux ruleset open until the child has been spawned.
+    let mut sandboxed = None;
+    let mut plain;
+    let command = if config.sandbox.active() {
+        &mut sandboxed.insert(sandbox::command(&config.sandbox, &config.shell, &arguments.command, &cwd)?).command
+    } else {
+        plain = Command::new(&config.shell);
+        plain.arg("-c").arg(&arguments.command);
+        &mut plain
+    };
     command
-        .arg("-c")
-        .arg(&arguments.command)
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(create(&out_path)?)
         .stderr(create(&err_path)?)
         // Own process group so a timeout kills the whole pipeline.
         .process_group(0);
-    if let Some(dir) = &config.working_dir {
-        command.current_dir(dir);
-    }
     let mut child = command.spawn().map_err(|e| format!("spawn {}: {e}", config.shell))?;
+    drop(sandboxed);
 
     let started = Instant::now();
     let mut poll = Duration::from_millis(5);
@@ -158,6 +172,10 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
 
     let (stdout, out_truncated) = read_bounded(&out_path, arguments.limit)?;
     let (stderr, err_truncated) = read_bounded(&err_path, arguments.limit)?;
+    let sandbox_denied = config.sandbox.active()
+        && ["Operation not permitted", "Read-only file system", "Permission denied"]
+            .iter()
+            .any(|d| stderr.contains(d) || stdout.contains(d));
     for (path, truncated) in [(&out_path, out_truncated), (&err_path, err_truncated)] {
         if !truncated {
             let _ = fs::remove_file(path);
@@ -181,6 +199,9 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     } else if let Some(code) = status.code() {
         if code != 0 {
             parts.push(format!("Exit code: {code}"));
+            if sandbox_denied {
+                parts.push(format!("Note: {}.", config.sandbox.describe(&cwd)));
+            }
         }
     } else if let Some(signal) = status.signal() {
         parts.push(format!("Terminated by signal {signal}"));

@@ -13,6 +13,7 @@ use crate::instructions::ProjectInstructions;
 use crate::skills::{self, Skills};
 use crate::goal::{self, Outcome};
 use crate::output;
+use crate::permissions::Policy;
 use crate::plan::{self, Plan};
 use crate::reminders::{self, Reminders};
 use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
@@ -242,6 +243,8 @@ pub struct Agent {
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
+    /// Checked before every tool call (see `permissions.rs`).
+    policy: Policy,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -250,7 +253,9 @@ const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
+        let policy = Policy::new(&config.permissions, &config.sandbox);
         Self {
+            policy,
             client,
             tools: ToolRegistry::new(),
             hooks: HookRegistry::new(),
@@ -281,6 +286,10 @@ impl Agent {
 
     /// Build an agent whose client is resolved from `config.model`.
     pub fn from_config(config: Config) -> Result<Self> {
+        let policy = Policy::new(&config.permissions, &config.sandbox);
+        if !policy.errors.is_empty() {
+            anyhow::bail!("invalid [permissions] rules: {}", policy.errors.join("; "));
+        }
         let client = Self::client_for(&config, &config.model)?;
         Ok(Self::new(client, config))
     }
@@ -975,6 +984,8 @@ impl Agent {
                         reported = Some(outcome);
                         Value::String(text)
                     })
+                } else if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
+                    Err(anyhow::anyhow!(reason))
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
                     self.tools.execute_blocking(&tool_call.name, tool_call.arguments.clone()).await

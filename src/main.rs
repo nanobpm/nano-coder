@@ -22,10 +22,13 @@ mod plan;
 mod lineedit;
 mod llm;
 mod output;
+mod permissions;
 mod providers;
 mod reminders;
+mod sandbox;
 mod settings;
 mod session;
+mod shell;
 mod skills;
 mod status;
 mod tools;
@@ -70,6 +73,7 @@ fn register_builtin_tools(agent: &mut Agent) {
     let bash_config = bash::BashConfig {
         default_timeout: std::time::Duration::from_secs(agent.config().bash_timeout_secs.max(1)),
         cancel: Some(agent.control().cancel_flag()),
+        sandbox: agent.config().sandbox.clone(),
         ..Default::default()
     };
     agent.tools().register(bash::definition(), Box::new(move |args| {
@@ -547,10 +551,24 @@ struct Args {
     resume: Option<String>,
     config: Option<std::path::PathBuf>,
     verbosity: Option<ui::Verbosity>,
+    sandbox: Option<sandbox::SandboxMode>,
+    allow: Vec<String>,
+    deny: Vec<String>,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args { acp: false, login: None, list_models: None, model: None, resume: None, config: None, verbosity: None };
+    let mut args = Args {
+        acp: false,
+        login: None,
+        list_models: None,
+        model: None,
+        resume: None,
+        config: None,
+        verbosity: None,
+        sandbox: None,
+        allow: Vec::new(),
+        deny: Vec::new(),
+    };
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
         let mut value = |name: &str| iter.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
@@ -564,9 +582,15 @@ fn parse_args() -> Result<Args> {
             "--verbosity" | "-v" => {
                 args.verbosity = Some(value("--verbosity")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
             }
+            "--sandbox" => {
+                args.sandbox = Some(value("--sandbox")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
+            }
+            "--allow" => args.allow.push(value("--allow")?),
+            "--deny" => args.deny.push(value("--deny")?),
             "-h" | "--help" => {
                 println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
                 println!("                  [--verbosity quiet|normal|verbose|debug]");
+                println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
                 println!("       nano-coder --login github-copilot");
                 println!("       nano-coder --list-models PROVIDER[/model]");
                 std::process::exit(0);
@@ -613,6 +637,15 @@ async fn main() -> Result<()> {
     if let Some(level) = args.verbosity {
         config.verbosity = level;
     }
+    let env_sandbox = env::var("NANO_CODER_SANDBOX").ok().filter(|m| !m.is_empty());
+    if let Some(mode) = env_sandbox.map(|m| m.parse::<sandbox::SandboxMode>()).transpose().map_err(|e| anyhow::anyhow!("NANO_CODER_SANDBOX: {e}"))? {
+        config.sandbox.mode = mode;
+    }
+    if let Some(mode) = args.sandbox {
+        config.sandbox.mode = mode;
+    }
+    config.permissions.allow.extend(args.allow.iter().cloned());
+    config.permissions.deny.extend(args.deny.iter().cloned());
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
