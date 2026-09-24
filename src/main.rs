@@ -519,9 +519,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if ui::verbosity() == ui::Verbosity::Quiet {
                 println!("\n{}", ui::stamp_block(&outcome.response));
             } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                println!("\x1b[2m{}\x1b[0m", outcome.response);
+                println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
             } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                println!("\x1b[2m{}\x1b[0m", outcome.response.lines().last().unwrap_or_default());
+                let last = outcome.response.lines().last().unwrap_or_default();
+                println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
             }
             println!();
             Ok(true)

@@ -294,15 +294,17 @@ impl Renderer {
             }
             AgentEvent::TextDelta { text } => {
                 self.finish_thinking(&mut state);
-                if !state.streamed_text && !text.is_empty() {
-                    self.newline(&mut state);
-                    let stamp = stamp();
-                    state.stream_pad = visible_width(&stamp);
-                    self.out(&mut state, &stamp);
+                if !text.is_empty() {
+                    if !state.streamed_text {
+                        self.newline(&mut state);
+                        let stamp = stamp();
+                        state.stream_pad = visible_width(&stamp);
+                        self.out(&mut state, &stamp);
+                    }
+                    state.streamed_text = true;
+                    let pad = state.stream_pad;
+                    self.out_aligned(&mut state, text, pad);
                 }
-                state.streamed_text = true;
-                let pad = state.stream_pad;
-                self.out_aligned(&mut state, text, pad);
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
