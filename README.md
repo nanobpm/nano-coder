@@ -390,12 +390,7 @@ on retry fail immediately: authentication and permission errors, invalid request
 ## Output and Verbosity
 
 In the interactive CLI, answers stream in as the model writes them. Output detail is set
-with `/verbosity`, `--verbosity`, or `verbosity` in the config (default `normal`).
-
-Every message (your prompt, answers, tool calls and results, thinking, notes) starts with
-the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
-shows when the message was sent. Turn this off with `timestamps = false`.
-
+with `/verbosity`, `--verbosity`, or `verbosity` in the config (default `normal`):
 
 | Level | Shows |
 |-------|-------|
@@ -423,6 +418,10 @@ Backspace, Ctrl-U (clear), Ctrl-W (delete word) and Ctrl-D (exit on an empty lin
 Streaming uses server-sent events. Set `stream = false` on a provider whose endpoint doesn't
 support it. ACP mode doesn't stream text, but sends each response's reasoning as an
 `agent_thought_chunk` update.
+
+Every message (your prompt, answers, tool calls and results, thinking, notes) starts with
+the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
+shows when the message was sent. Turn this off with `timestamps = false`.
 
 ## Status Line and Compaction
 
