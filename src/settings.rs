@@ -76,7 +76,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
         match selection {
             0 => {
                 if let Some(spec) = pick_model(agent, None).await? {
-                    switch_model(agent, &spec, &mut changes);
+                    switch_model(agent, &spec, &mut changes).await;
                 }
             }
             1 => {
@@ -85,7 +85,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                     if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()?
                         && let Some(spec) = pick_model(agent, Some(&name)).await?
                     {
-                        switch_model(agent, &spec, &mut changes);
+                        switch_model(agent, &spec, &mut changes).await;
                     }
                 }
             }
@@ -139,8 +139,8 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
     }
 }
 
-fn switch_model(agent: &mut Agent, spec: &str, changes: &mut Changes) {
-    match agent.set_model(spec) {
+async fn switch_model(agent: &mut Agent, spec: &str, changes: &mut Changes) {
+    match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());

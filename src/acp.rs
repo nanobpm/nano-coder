@@ -337,7 +337,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
             }
 
             if let Some(spec) = command.strip_prefix("/model ") {
-                return Some(match agent.set_model(spec.trim()) {
+                return Some(match agent.set_model(spec.trim()).await {
                     Ok(()) => result(
                         id,
                         json!({ "stopReason": "end_turn", "provider": agent.provider_name(), "model": agent.model_name() }),

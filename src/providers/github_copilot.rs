@@ -19,7 +19,7 @@ use serde_json::Value;
 use super::openai;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
-use crate::llm::{ChatRequest, LLMClient, LLMResponse, Role, StreamSink, report_whole};
+use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -252,6 +252,23 @@ pub struct GithubCopilotClient {
 }
 
 impl GithubCopilotClient {
+    async fn models_json(&self) -> Result<Value> {
+        let session = self.session_token(false).await?;
+        let url = format!("{}/models", self.api_base(&session));
+        let response = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
+            .bearer_auth(&session.token)
+            .header("Accept", "application/json")
+            .header("X-GitHub-Api-Version", MODELS_API_VERSION)
+            .send()
+            .await?;
+        let status = response.status();
+        let value: Value = response.json().await?;
+        if !status.is_success() {
+            bail!("listing Copilot models failed (HTTP {status}): {value}");
+        }
+        Ok(value)
+    }
+
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let domain = domain();
         let oauth = provider
@@ -358,20 +375,19 @@ impl LLMClient for GithubCopilotClient {
         }
     }
 
+    async fn detect_context_window(&self) -> Option<DetectedWindow> {
+        let models = self.models_json().await.ok()?;
+        let model = &self.transport.provider().model;
+        let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+        // Copilot enforces the prompt budget, which is below the full window.
+        ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
+            let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
+            Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
+        })
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
-        let session = self.session_token(false).await?;
-        let url = format!("{}/models", self.api_base(&session));
-        let response = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
-            .bearer_auth(&session.token)
-            .header("Accept", "application/json")
-            .header("X-GitHub-Api-Version", MODELS_API_VERSION)
-            .send()
-            .await?;
-        let status = response.status();
-        let value: Value = response.json().await?;
-        if !status.is_success() {
-            bail!("listing Copilot models failed (HTTP {status}): {value}");
-        }
+        let value = self.models_json().await?;
         let mut models: Vec<String> = value
             .get("data")
             .and_then(Value::as_array)
