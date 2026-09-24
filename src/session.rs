@@ -14,12 +14,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::Message;
 
 pub const FORMAT_VERSION: u32 = 1;
+
+/// The current time with the local UTC offset, for records and messages.
+pub fn now() -> DateTime<FixedOffset> {
+    Local::now().fixed_offset()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -27,12 +32,12 @@ pub enum Record {
     Session {
         version: u32,
         id: String,
-        created_at: DateTime<Utc>,
+        created_at: DateTime<FixedOffset>,
     },
     Input {
         id: String,
         text: String,
-        recorded_at: DateTime<Utc>,
+        recorded_at: DateTime<FixedOffset>,
     },
     Message(Message),
     TurnEnd {
@@ -41,7 +46,7 @@ pub enum Record {
         /// Reported with `report_outcome` during the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::goal::Outcome>,
-        recorded_at: DateTime<Utc>,
+        recorded_at: DateTime<FixedOffset>,
     },
     /// The conversation was replaced wholesale (compaction, system-prompt reset).
     Replace {
@@ -50,12 +55,12 @@ pub enum Record {
         /// mid-turn): the index of its user message in `messages`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_position: Option<usize>,
-        recorded_at: DateTime<Utc>,
+        recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
     Plan {
         plan: crate::plan::Plan,
-        recorded_at: DateTime<Utc>,
+        recorded_at: DateTime<FixedOffset>,
     },
 }
 
@@ -134,7 +139,7 @@ impl SessionLog {
         file.write_all(&encode(&Record::Session {
             version: FORMAT_VERSION,
             id: id.to_string(),
-            created_at: Utc::now(),
+            created_at: now(),
         })?)?;
         file.sync_data()?;
         Ok(Self { path, file })
@@ -225,12 +230,24 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reads_utc_records_and_unstamped_messages_from_older_logs() {
+        let input: Record = serde_json::from_str(r#"{"type":"input","data":{"id":"i","text":"hi","recorded_at":"2026-01-01T00:00:00Z"}}"#).unwrap();
+        let Record::Input { recorded_at, .. } = input else { panic!() };
+        assert_eq!(recorded_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        let message: Record = serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi"}}"#).unwrap();
+        assert_eq!(message, Record::Message(Message::user("hi")));
+        // New records carry the local offset.
+        let now = serde_json::to_string(&now()).unwrap();
+        assert!(now.contains('+') || now.contains("-0") || now.contains("-1"), "{now}");
+    }
+
     fn input(id: &str) -> Record {
-        Record::Input { id: id.into(), text: "hi".into(), recorded_at: Utc::now() }
+        Record::Input { id: id.into(), text: "hi".into(), recorded_at: now() }
     }
 
     fn turn_end(id: &str) -> Record {
-        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, recorded_at: Utc::now() }
+        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, recorded_at: now() }
     }
 
     #[test]
@@ -261,7 +278,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s2").unwrap();
         log.append(&Record::Message(Message::user("a"))).unwrap();
-        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, recorded_at: Utc::now() })
+        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
@@ -272,10 +289,10 @@ mod tests {
     fn replace_can_keep_the_pending_input() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s3").unwrap();
-        log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: Utc::now() }).unwrap();
+        log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
         log.append(&Record::Message(Message::user("go"))).unwrap();
         let messages = vec![Message::system("sys"), Message::user("summary"), Message::user("go")];
-        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), recorded_at: Utc::now() })
+        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();

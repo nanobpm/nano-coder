@@ -616,6 +616,7 @@ async fn main() -> Result<()> {
         config.verbosity = level;
     }
     ui::set_verbosity(config.verbosity);
+    ui::set_timestamps(config.timestamps);
 
     // Create agent with the configured provider
     let mut agent = Agent::from_config(config)?;
@@ -700,8 +701,8 @@ async fn main() -> Result<()> {
             let prompt = |terminal: &Terminal| {
                 if terminal.queued.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
-                    let line = view.line().to_string();
-                    io::stdout().write_all(format!("> {line}").as_bytes()).unwrap();
+                    let prompt = view.prompt();
+                    io::stdout().write_all(prompt.as_bytes()).unwrap();
                     io::stdout().flush().unwrap();
                     view.prompt_redrawn();
                 }

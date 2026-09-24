@@ -89,6 +89,39 @@ pub fn set_verbosity(level: Verbosity) {
     LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
+static TIMESTAMPS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_timestamps(on: bool) {
+    TIMESTAMPS.store(on, Ordering::Relaxed);
+}
+
+/// `text` (one or more lines) with `stamp()` on its first line and the
+/// other lines indented to match.
+fn stamp_block(text: &str) -> String {
+    let stamp = stamp();
+    if stamp.is_empty() {
+        return text.to_string();
+    }
+    let pad = " ".repeat(strip_ansi(&stamp).chars().count());
+    let mut out = String::new();
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        out.push_str(if i == 0 { &stamp } else { &pad });
+        out.push_str(line);
+    }
+    out
+}
+
+/// Width of `text` on screen, ignoring colour codes.
+pub fn visible_width(text: &str) -> usize {
+    strip_ansi(text).chars().count()
+}
+
+/// Local time (`HH:MM:SS`) in dim text plus a space, to start a message
+/// line; empty when timestamps are off.
+pub fn stamp() -> String {
+    if TIMESTAMPS.load(Ordering::Relaxed) { format!("{DIM}{}{RESET} ", chrono::Local::now().format("%H:%M:%S")) } else { String::new() }
+}
+
 const THINK: &str = "\x1b[38;5;245m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
@@ -102,6 +135,8 @@ const PREVIEW_LINES: usize = 10;
 struct ThinkBlock {
     text: String,
     started: Instant,
+    /// `stamp()` from when the block started.
+    stamp: String,
     /// Printed in full (otherwise shown as one updating line).
     expanded: bool,
     last_draw: Option<Instant>,
@@ -190,7 +225,7 @@ impl Renderer {
     pub fn note(&self, text: &str) {
         let mut state = self.state.lock().unwrap();
         if state.streamed_text && !state.at_line_start {
-            state.deferred.push(text.to_string());
+            state.deferred.push(format!("{}{DIM}{text}", stamp()));
             return;
         }
         self.note_now(&mut state, text);
@@ -205,7 +240,7 @@ impl Renderer {
     fn note_now(&self, state: &mut State, text: &str) {
         self.finish_thinking(state);
         self.newline(state);
-        self.out(state, &format!("{DIM}{text}{RESET}\n"));
+        self.out(state, &format!("{}{DIM}{text}{RESET}\n", stamp()));
     }
 
     pub fn event(&self, event: &AgentEvent) {
@@ -235,13 +270,18 @@ impl Renderer {
             }
             AgentEvent::TextDelta { text } => {
                 self.finish_thinking(&mut state);
+                if !state.streamed_text && !text.is_empty() {
+                    self.newline(&mut state);
+                    self.out(&mut state, &stamp());
+                }
                 state.streamed_text = true;
                 self.out(&mut state, text);
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
-                if !state.streamed_text {
-                    self.out(&mut state, text);
+                if !state.streamed_text && !text.is_empty() {
+                    self.newline(&mut state);
+                    self.out(&mut state, &stamp_block(text));
                 }
                 self.newline(&mut state);
                 state.streamed_text = false;
@@ -256,7 +296,7 @@ impl Renderer {
             AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
             AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
                 self.newline(&mut state);
-                let text = format!("{RED}●{RESET} {BOLD}{}{RESET}\n{}", call.name, self.tool_result(false, output));
+                let text = stamp_block(&format!("{RED}●{RESET} {BOLD}{}{RESET}\n{}", call.name, self.tool_result(false, output)));
                 self.out(&mut state, &text);
             }
             // The outcome's summary follows as the answer; show just its status.
@@ -266,38 +306,40 @@ impl Renderer {
                 state.streamed_thinking = false;
                 let status = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
                 let mark = if status == "blocked" { format!("{RED}■ blocked{RESET}") } else { format!("{GREEN}✔ {status}{RESET}") };
-                self.out(&mut state, &format!("{mark}\n"));
+                self.out(&mut state, &format!("{}{mark}\n", stamp()));
             }
             AgentEvent::ToolResult { call, ok: true, .. } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::Plan { plan } => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
                 let text = plan_checklist(plan, self.width().saturating_sub(4));
-                self.out(&mut state, &text);
+                self.out(&mut state, &format!("{}{text}", stamp()));
             }
             AgentEvent::ToolCall { call } => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
                 state.streamed_thinking = false;
-                let summary = tool_summary(call, self.width().saturating_sub(call.name.len() + 4));
-                self.out(&mut state, &format!("{GREEN}●{RESET} {BOLD}{}{RESET} {summary}\n", call.name));
+                let stamp = stamp();
+                let used = strip_ansi(&stamp).chars().count() + call.name.len() + 4;
+                let summary = tool_summary(call, self.width().saturating_sub(used));
+                self.out(&mut state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{}{RESET} {summary}\n", call.name));
             }
             AgentEvent::ToolResult { ok, output, .. } => {
                 self.newline(&mut state);
-                let text = self.tool_result(*ok, output);
+                let text = stamp_block(&self.tool_result(*ok, output));
                 self.out(&mut state, &text);
             }
             AgentEvent::Compacted if state.in_turn => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
-                self.out(&mut state, &format!("{DIM}⟳ context compacted{RESET}\n"));
+                self.out(&mut state, &format!("{}{DIM}⟳ context compacted{RESET}\n", stamp()));
             }
             AgentEvent::UserMessage { .. } | AgentEvent::Context | AgentEvent::Compacted => {}
         }
     }
 
     fn tool_result(&self, ok: bool, output: &str) -> String {
-        let width = self.width().saturating_sub(8);
+        let width = self.width().saturating_sub(8 + strip_ansi(&stamp()).chars().count());
         let lines: Vec<&str> = output.trim_end().lines().collect();
         let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
         if lines.is_empty() {
@@ -322,10 +364,11 @@ impl Renderer {
         if state.thinking.is_none() {
             self.newline(state);
             let expanded = self.expanded.load(Ordering::Relaxed);
-            state.thinking = Some(ThinkBlock { text: String::new(), started: Instant::now(), expanded, last_draw: None });
+            let stamp = stamp();
             if expanded {
-                self.out(state, &format!("{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n"));
+                self.out(state, &format!("{stamp}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n"));
             }
+            state.thinking = Some(ThinkBlock { text: String::new(), started: Instant::now(), stamp, expanded, last_draw: None });
         }
         let print = {
             let block = state.thinking.as_mut().unwrap();
@@ -349,7 +392,8 @@ impl Renderer {
     fn collapsed_line(&self, block: &ThinkBlock) -> String {
         let prefix = "∴ Thinking: ";
         let suffix = "  (ctrl+o to expand)";
-        let room = self.width().saturating_sub(prefix.chars().count() + suffix.len() + 1);
+        let stamp_width = strip_ansi(&block.stamp).chars().count();
+        let room = self.width().saturating_sub(stamp_width + prefix.chars().count() + suffix.len() + 1);
         let flat: String = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
         let count = flat.chars().count();
         let tail: String = if count > room {
@@ -358,7 +402,7 @@ impl Renderer {
         } else {
             flat
         };
-        format!("\r\x1b[2K{THINK}{prefix}{DIM}{tail}{suffix}{RESET}")
+        format!("\r\x1b[2K{}{THINK}{prefix}{DIM}{tail}{suffix}{RESET}", block.stamp)
     }
 
     fn finish_thinking(&self, state: &mut State) {
@@ -369,7 +413,8 @@ impl Renderer {
             let seconds = block.started.elapsed().as_secs_f64();
             let clear = if self.tty { "\r\x1b[2K" } else { "" };
             let line = format!(
-                "{clear}{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {} chars (ctrl+o to expand){RESET}\n",
+                "{clear}{}{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {} chars (ctrl+o to expand){RESET}\n",
+                block.stamp,
                 block.text.trim().chars().count()
             );
             self.out(state, &line);
@@ -386,8 +431,9 @@ impl Renderer {
             block.expanded = expanded;
             if expanded {
                 let text = format!(
-                    "{}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n{THINK}{}{RESET}",
+                    "{}{}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n{THINK}{}{RESET}",
                     if self.tty { "\r\x1b[2K" } else { "\n" },
+                    block.stamp,
                     block.text.trim_start()
                 );
                 self.out(&mut state, &text);
@@ -500,6 +546,14 @@ fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stamps_the_first_line_and_aligns_the_rest() {
+        let block = strip_ansi(&stamp_block("● Plan\n  ☐ one\n"));
+        let time = &block[..8];
+        assert!(chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").is_ok(), "{block:?}");
+        assert_eq!(&block[8..], " ● Plan\n           ☐ one\n");
+    }
 
     #[test]
     fn parses_and_orders_verbosity() {
