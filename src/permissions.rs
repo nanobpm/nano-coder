@@ -10,6 +10,7 @@
 //! script and run it. The OS sandbox (`sandbox.rs`) and scoped credentials
 //! are the security boundary.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -262,7 +263,13 @@ impl Policy {
             return Ok(());
         }
         if self.builtin {
-            let guard = Guard { cwd, home: dirs::home_dir(), protected: &self.protected_branches };
+            let guard = Guard {
+                cwd,
+                home: dirs::home_dir(),
+                protected: &self.protected_branches,
+                assigned: assignments(&commands_with_assignments(command)),
+                base: std::cell::RefCell::new(Some(cwd.to_path_buf())),
+            };
             guard.check(command, &commands)?;
         }
         Ok(())
@@ -523,6 +530,42 @@ struct Guard<'a> {
     cwd: &'a Path,
     home: Option<PathBuf>,
     protected: &'a [String],
+    /// Variables assigned in the command line itself: `Some(value)` when
+    /// assigned once to a literal, `None` when the value is not known.
+    assigned: HashMap<String, Option<String>>,
+    /// Directory relative paths resolve against, following `cd`/`pushd`
+    /// earlier in the command; `None` once it can't be determined.
+    base: std::cell::RefCell<Option<PathBuf>>,
+}
+
+/// Parsed commands with their assignment words intact (expansion drops them).
+fn commands_with_assignments(command: &str) -> Vec<Simple> {
+    shell::parse(command).unwrap_or_default()
+}
+
+fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    for cmd in commands {
+        let mut words = cmd.words.iter().peekable();
+        if words.peek().is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly")) {
+            words.next();
+        }
+        for word in words {
+            if word.quoted || !ASSIGNMENT.is_match(&word.text) {
+                if word.text.starts_with('-') {
+                    continue;
+                }
+                break;
+            }
+            let (name, value) = word.text.split_once('=').unwrap_or((&word.text, ""));
+            let append = name.ends_with('+');
+            let name = name.trim_end_matches('+').to_string();
+            let literal = (!word.dynamic && !word.glob && !append).then(|| value.to_string());
+            let known = if out.contains_key(&name) { None } else { literal };
+            out.insert(name, known);
+        }
+    }
+    out
 }
 
 const SAFE_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"];
@@ -546,7 +589,7 @@ static FORK_BOMB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\s*\(\s*\)\s*
 /// Directories whose contents are the operating system.
 const SYSTEM_DIRS: &[&str] = &[
     "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec", "/usr/share", "/etc", "/private/etc",
-    "/System", "/boot", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/dev", "/var/lib", "/private/var/db",
+    "/System", "/boot", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/dev", "/var/lib", "/private/var/lib", "/private/var/db",
 ];
 
 impl Guard<'_> {
@@ -567,12 +610,44 @@ impl Guard<'_> {
             scan_sql |= cmd.words.iter().any(|w| DB_CLIENTS.contains(&basename(&w.text)))
                 || (INTERPRETERS.iter().any(|i| program.starts_with(i))
                     && args.iter().any(|a| matches!(a.text.as_str(), "-c" | "-e" | "-E" | "-r" | "--eval" | "eval")));
-            self.command(program, args)?;
+            match program {
+                "cd" | "pushd" => self.change_dir(args),
+                "popd" => *self.base.borrow_mut() = None,
+                _ => self.command(program, args)?,
+            }
         }
         if scan_sql && let Some(found) = DESTRUCTIVE_SQL.find(raw) {
             return Err(format!("it runs destructive database statements (`{}`)", found.as_str().trim()));
         }
         Ok(())
+    }
+
+    fn change_dir(&self, args: &[Word]) {
+        let target = args.iter().find(|a| !(a.text.starts_with('-') && a.text.len() > 1 && !a.quoted));
+        let next = match target {
+            None => self.home.clone(),
+            Some(word) if word.text == "-" => None,
+            Some(word) => self.resolve_dir(word),
+        };
+        *self.base.borrow_mut() = next;
+    }
+
+    fn resolve_dir(&self, word: &Word) -> Option<PathBuf> {
+        let (text, known) = if word.dynamic { self.substitute(&word.text) } else { (word.text.clone(), true) };
+        if !known || word.glob {
+            return None;
+        }
+        let text = self.expand_home(text)?;
+        let base = self.base.borrow().clone()?;
+        Some(normalize(&base.join(text)))
+    }
+
+    fn expand_home(&self, text: String) -> Option<String> {
+        if text == "~" || text.starts_with("~/") {
+            let home = self.home.as_ref()?.display().to_string();
+            return Some(format!("{home}{}", &text[1..]));
+        }
+        Some(text)
     }
 
     fn command(&self, program: &str, args: &[Word]) -> Result<(), String> {
@@ -696,7 +771,17 @@ impl Guard<'_> {
     /// Refuse to delete, move or recursively re-permission a path whose loss
     /// would be catastrophic.
     fn protect(&self, word: &Word, protect_cwd: bool, action: &str) -> Result<(), String> {
-        let Some((path, glob)) = self.resolve(word) else { return Ok(()) };
+        let path = match self.resolve(word) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return Ok(()),
+            Err(()) => {
+                return Err(format!(
+                    "`{action} {}` runs after a `cd` to a directory nano-coder can't determine; use an absolute path",
+                    word.text
+                ));
+            }
+        };
+        let (path, glob) = path;
         let danger = |p: &Path| -> Option<String> {
             let home = self.home.as_deref();
             if p == Path::new("/") {
@@ -716,10 +801,13 @@ impl Guard<'_> {
                     return Some(format!("a top-level folder of your home directory (~/{})", p.file_name()?.to_string_lossy()));
                 }
             }
-            if p.components().count() <= 2 {
+            // Inside the workspace is fine even when the workspace lives
+            // somewhere like /var/lib/jenkins.
+            let in_workspace = p.starts_with(self.cwd) && p != self.cwd;
+            if !in_workspace && p.components().count() <= 2 {
                 return Some("a top-level system directory".into());
             }
-            if SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
+            if !in_workspace && SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
                 return Some("a system directory".into());
             }
             if p.file_name().is_some_and(|n| n == ".git") {
@@ -742,16 +830,19 @@ impl Guard<'_> {
     /// Resolve a path word lexically: known variables and `~` are substituted,
     /// unknown ones become empty (as they would when unset), and a trailing
     /// all-wildcard component (`*`, `.*`) is reported as a glob over its parent.
-    fn resolve(&self, word: &Word) -> Option<(PathBuf, bool)> {
-        let mut text = if word.dynamic { self.substitute(&word.text) } else { word.text.clone() };
-        if text == "~" || text.starts_with("~/") {
-            let home = self.home.as_ref()?.display().to_string();
-            text = format!("{home}{}", &text[1..]);
-        }
+    /// `Err` when the path is relative to a directory that can't be determined.
+    fn resolve(&self, word: &Word) -> Result<Option<(PathBuf, bool)>, ()> {
+        let text = if word.dynamic { self.substitute(&word.text).0 } else { word.text.clone() };
+        let Some(text) = self.expand_home(text) else { return Ok(None) };
         if text.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let path = real(&normalize(&self.cwd.join(&text)));
+        let base = match self.base.borrow().clone() {
+            Some(base) => base,
+            None if text.starts_with('/') => PathBuf::from("/"),
+            None => return Err(()),
+        };
+        let path = real(&normalize(&base.join(&text)));
         // Treat the first wildcard component as "everything in its parent".
         if word.glob {
             let mut prefix = PathBuf::new();
@@ -759,28 +850,43 @@ impl Guard<'_> {
                 let part = component.as_os_str().to_string_lossy();
                 if part.contains(['*', '?', '[']) {
                     let all = part.chars().all(|c| matches!(c, '*' | '?' | '.'));
-                    let parent = real(&normalize(&self.cwd.join(&prefix)));
-                    return if all { Some((parent, true)) } else { Some((path, false)) };
+                    let parent = real(&normalize(&base.join(&prefix)));
+                    return Ok(Some(if all { (parent, true) } else { (path, false) }));
                 }
                 prefix.push(component.as_os_str());
             }
         }
-        Some((path, false))
+        Ok(Some((path, false)))
     }
 
-    fn substitute(&self, text: &str) -> String {
+    /// Substitute variables; the flag is false when a variable's value is not
+    /// known (unset ones become empty, as the shell would make them).
+    fn substitute(&self, text: &str) -> (String, bool) {
+        let known = std::cell::Cell::new(true);
         static VAR: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[?\-=+][^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$\([^)]*\)|\$\(\.\.\.\)").unwrap()
         });
-        VAR.replace_all(text, |caps: &regex::Captures| {
+        let text = VAR.replace_all(text, |caps: &regex::Captures| {
             let name = caps.get(1).or(caps.get(3)).map(|m| m.as_str());
-            let Some(name) = name else { return String::new() };
-            let value = match name {
-                "PWD" => Some(self.cwd.display().to_string()),
-                "HOME" => self.home.as_ref().map(|h| h.display().to_string()),
+            let Some(name) = name else {
+                known.set(false);
+                return String::new();
+            };
+            let value = match (name, self.assigned.get(name)) {
+                (_, Some(Some(literal))) => Some(literal.clone()),
+                // Assigned at run time (`DIR=$(mktemp -d)`): unknown, but not empty.
+                (_, Some(None)) => {
+                    known.set(false);
+                    Some(format!("__{name}__"))
+                }
+                ("PWD", None) => self.base.borrow().as_ref().map(|b| b.display().to_string()),
+                ("HOME", None) => self.home.as_ref().map(|h| h.display().to_string()),
                 _ => std::env::var(name).ok(),
             }
             .filter(|v| !v.is_empty());
+            if value.is_none() {
+                known.set(false);
+            }
             let modifier = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             match (value, modifier) {
                 (Some(v), m) if !m.trim_start_matches(':').starts_with('+') => v,
@@ -790,17 +896,18 @@ impl Guard<'_> {
                 _ => String::new(),
             }
         })
-        .into_owned()
+        .into_owned();
+        (text, known.get())
     }
 
     fn git(&self, args: &[Word]) -> Result<(), String> {
-        let mut dir = self.cwd.to_path_buf();
+        let mut dir = self.base.borrow().clone().unwrap_or_else(|| self.cwd.to_path_buf());
         let mut i = 0;
         while let Some(arg) = args.get(i) {
             match arg.text.as_str() {
                 "-C" => {
                     if let Some(d) = args.get(i + 1) {
-                        dir = self.cwd.join(&d.text);
+                        dir = dir.join(&d.text);
                     }
                     i += 2;
                 }
@@ -814,6 +921,7 @@ impl Guard<'_> {
         }
         let mut force = false;
         let mut delete = false;
+        let mut all = false;
         let mut positional = Vec::new();
         let mut j = i + 1;
         while let Some(arg) = args.get(j) {
@@ -822,6 +930,7 @@ impl Guard<'_> {
                 "--mirror" => return Err("`git push --mirror` overwrites every ref on the remote".into()),
                 "--force" | "--force-if-includes" => force = true,
                 "--delete" => delete = true,
+                "--all" | "--branches" => all = true,
                 "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" => j += 1,
                 t if t.starts_with("--force-with-lease") => force = true,
                 t if t.starts_with("--") => {}
@@ -836,11 +945,19 @@ impl Guard<'_> {
         let refspecs = positional.get(1..).unwrap_or_default();
         let branch = |r: &str| r.trim_start_matches("refs/heads/").to_string();
         let mut targets = Vec::new();
+        if all {
+            // `--all` names no refspec; with one positional it is the remote.
+            targets.extend(self.protected.iter().map(|b| (b.clone(), false, false)));
+        }
         for spec in refspecs {
             let plus = spec.starts_with('+');
             let spec = spec.trim_start_matches('+');
             let (src, dst) = spec.split_once(':').unwrap_or((spec, spec));
             let dst = if dst.is_empty() { src } else { dst };
+            if dst.contains('*') {
+                targets.extend(self.protected.iter().map(|b| (b.clone(), plus, src.is_empty())));
+                continue;
+            }
             let dst = if dst == "HEAD" { current_branch(&dir).unwrap_or_default() } else { branch(dst) };
             targets.push((dst, plus, src.is_empty()));
         }
@@ -979,6 +1096,43 @@ mod tests {
     }
 
     #[test]
+    fn follows_cd_and_assignments_in_the_command() {
+        for command in [
+            "cd .. && rm -rf project",
+            "cd ~ && rm -rf Documents",
+            "cd / && rm -rf usr",
+            "cd /work && rm -rf *",
+            "cd \"$UNSET_NANO_VAR\" && rm -rf *",
+            "cd - && rm -rf build",
+            "pushd .. && rm -rf project",
+            "DIR=/; rm -rf \"$DIR\"",
+            "export DIR=..; rm -rf $DIR/*",
+        ] {
+            blocked(command);
+        }
+        for command in [
+            "cd build && rm -rf *",
+            "cd sub/dir && rm -rf ../out",
+            "DIR=build; rm -rf \"$DIR\"/*",
+            "OUT=$(mktemp -d); rm -rf \"$OUT\"/*",
+            "cd \"$UNSET_NANO_VAR\" && rm -rf /tmp/scratch",
+        ] {
+            allowed(command);
+        }
+    }
+
+    #[test]
+    fn workspace_under_a_system_directory() {
+        let cwd = Path::new("/var/lib/jenkins/workspace/job");
+        let policy = Policy::default();
+        let run = |c: &str| policy.check_in("bash", &json!({ "command": c }), cwd);
+        run("rm -rf target node_modules").unwrap();
+        run("find build -delete").unwrap();
+        assert!(run("rm -rf *").is_err());
+        assert!(run("rm -rf /var/lib/dpkg").is_err());
+    }
+
+    #[test]
     fn allows_ordinary_deletes() {
         for command in [
             "rm -rf build target/debug node_modules",
@@ -1057,11 +1211,16 @@ mod tests {
             "git push origin --delete main",
             "git push origin :main",
             "git push --mirror",
+            "git push --force --all",
+            "git push -f --all origin",
+            "git push --all --delete origin",
+            "git push origin '+refs/heads/*:refs/heads/*'",
             "git -C repo push --force-with-lease origin feature:main",
         ] {
             blocked(command);
         }
         allowed("git push origin main");
+        allowed("git push --all origin");
         allowed("git push --force-with-lease origin nano/feature");
         allowed("git push -u origin HEAD:refs/heads/feature");
         allowed("git push origin --delete old-feature");

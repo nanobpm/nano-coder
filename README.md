@@ -224,7 +224,8 @@ that cannot be parsed, or a script computed at run time (`bash -c "$CMD"`,
 - recursive `rm` (and `mv`, `find -delete`, `chmod -R`/`chown -R`) on `/`, your home directory
   or its top-level folders, the working directory or its parents, top-level and system
   directories, and `.git`. `rm -rf *` counts as the working directory. An unset variable counts
-  as empty, so `rm -rf "$DIR/"*` is blocked unless written `"${DIR:?}/"*`
+  as empty, so `rm -rf "$DIR/"*` is blocked unless written `"${DIR:?}/"*`. Paths follow a `cd` and
+  variable assignments earlier in the same command (`cd .. && rm -rf project` is blocked)
 - `mkfs`, `fdisk`, `wipefs`, destructive `diskutil`, `dd of=/dev/...` and redirects to
   devices, fork bombs, `shutdown`/`reboot`
 - destructive SQL (`DROP DATABASE|SCHEMA|TABLE`, `TRUNCATE`, `DELETE FROM` without `WHERE`,
@@ -233,7 +234,8 @@ that cannot be parsed, or a script computed at run time (`bash -c "$CMD"`,
   interpreter code (`python -c`), plus `dropdb`, `rails db:drop`, `prisma migrate reset`,
   `manage.py flush`
 - `terraform destroy`, `pulumi destroy`, `kubectl delete namespace|--all`, `aws s3 rb`
-- `git push --force` (or `+refspec`) to, or deleting, a protected branch, and `git push --mirror`
+- `git push --force` (or `+refspec`, `--all`, wildcard refspecs) to, or deleting, a protected
+  branch, and `git push --mirror`
 
 Add an allow rule for anything legitimate they block, e.g.
 `allow = ["Bash(sqlite3 test.db *)"]`, or set `builtin_rules = false`.
