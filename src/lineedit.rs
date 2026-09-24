@@ -108,7 +108,9 @@ impl EditView {
         match is_command.then(|| crate::commands::complete(&self.line)).flatten() {
             Some(done) => {
                 let rest = done[self.line.len()..].to_string();
-                self.insert(&rest);
+                if !rest.is_empty() {
+                    self.insert(&rest);
+                }
             }
             None if is_command => {}
             None => self.insert(" "),
