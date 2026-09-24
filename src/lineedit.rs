@@ -84,8 +84,10 @@ impl EditView {
             return;
         }
         let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        // Leave the prompt row and the status line.
-        let max_rows = (rows as usize).saturating_sub(3).min(16);
+        // Reserve the prompt row, plus the status row only when a status line
+        // is present (none under AGENTIC_NO_STATUS or a short terminal).
+        let reserved = if self.status.is_some() { 2 } else { 1 };
+        let max_rows = (rows as usize).saturating_sub(reserved).min(16);
         let lines = if self.menu_hidden { Vec::new() } else { crate::commands::menu(&self.line, cols as usize, max_rows) };
         let (seq, used) = menu_sequence(self.menu_rows, &lines);
         self.menu_rows = used;

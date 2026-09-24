@@ -21,6 +21,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
     Command { name: "/exit", args: "", description: "Exit the agent" },
+    Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
 ];
 
 /// Commands whose name starts with `prefix`.
