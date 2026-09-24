@@ -244,7 +244,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
-        let conversation = vec![Message::system(&config.system_prompt)];
+        let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
         Self {
             client,
             tools: ToolRegistry::new(),
@@ -508,7 +508,7 @@ impl Agent {
         self.conversation = restored.conversation;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
-        let system = Message::system(&self.system_prompt());
+        let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
         match self.conversation.first_mut() {
             Some(first) if first.role == Role::System => *first = system,
             _ => self.conversation.insert(0, system),

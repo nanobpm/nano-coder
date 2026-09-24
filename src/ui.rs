@@ -97,15 +97,20 @@ pub fn set_timestamps(on: bool) {
 
 /// `text` (one or more lines) with `stamp()` on its first line and the
 /// other lines indented to match.
-fn stamp_block(text: &str) -> String {
-    let stamp = stamp();
+pub fn stamp_block(text: &str) -> String {
+    stamp_block_with(&stamp(), text)
+}
+
+/// Like [`stamp_block`] but with a caller-supplied `stamp` (e.g. the stamp
+/// captured when a block first started streaming).
+fn stamp_block_with(stamp: &str, text: &str) -> String {
     if stamp.is_empty() {
         return text.to_string();
     }
-    let pad = " ".repeat(strip_ansi(&stamp).chars().count());
+    let pad = " ".repeat(strip_ansi(stamp).chars().count());
     let mut out = String::new();
     for (i, line) in text.split_inclusive('\n').enumerate() {
-        out.push_str(if i == 0 { &stamp } else { &pad });
+        out.push_str(if i == 0 { stamp } else { &pad });
         out.push_str(line);
     }
     out
@@ -152,6 +157,9 @@ struct State {
     /// The cursor is at the start of a line.
     at_line_start: bool,
     in_turn: bool,
+    /// Width of the current streamed answer's stamp, so continuation lines
+    /// can be indented to align under it.
+    stream_pad: usize,
     /// Notes held back until the streamed line they would interrupt ends.
     deferred: Vec<String>,
 }
@@ -199,6 +207,22 @@ impl Renderer {
     fn newline(&self, state: &mut State) {
         if !state.at_line_start {
             self.out(state, "\n");
+        }
+    }
+
+    /// Write a streamed fragment, indenting any line that begins after a
+    /// newline by `pad` spaces so continuation lines align under the stamp.
+    fn out_aligned(&self, state: &mut State, text: &str, pad: usize) {
+        if pad == 0 {
+            self.out(state, text);
+            return;
+        }
+        let indent = " ".repeat(pad);
+        for seg in text.split_inclusive('\n') {
+            if state.at_line_start {
+                self.out(state, &indent);
+            }
+            self.out(state, seg);
         }
     }
 
@@ -272,10 +296,13 @@ impl Renderer {
                 self.finish_thinking(&mut state);
                 if !state.streamed_text && !text.is_empty() {
                     self.newline(&mut state);
-                    self.out(&mut state, &stamp());
+                    let stamp = stamp();
+                    state.stream_pad = visible_width(&stamp);
+                    self.out(&mut state, &stamp);
                 }
                 state.streamed_text = true;
-                self.out(&mut state, text);
+                let pad = state.stream_pad;
+                self.out_aligned(&mut state, text, pad);
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
@@ -312,8 +339,10 @@ impl Renderer {
             AgentEvent::Plan { plan } => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
-                let text = plan_checklist(plan, self.width().saturating_sub(4));
-                self.out(&mut state, &format!("{}{text}", stamp()));
+                let stamp = stamp();
+                let width = self.width().saturating_sub(4 + visible_width(&stamp));
+                let text = plan_checklist(plan, width);
+                self.out(&mut state, &stamp_block_with(&stamp, &text));
             }
             AgentEvent::ToolCall { call } => {
                 self.finish_thinking(&mut state);
@@ -375,16 +404,17 @@ impl Renderer {
             let first = block.text.is_empty();
             block.text.push_str(text);
             if block.expanded {
-                Some(format!("{THINK}{}{RESET}", if first { text.trim_start() } else { text }))
+                let pad = strip_ansi(&block.stamp).chars().count();
+                Some((format!("{THINK}{}{RESET}", if first { text.trim_start() } else { text }), pad))
             } else if self.tty && block.last_draw.is_none_or(|t| t.elapsed() >= REDRAW_EVERY) {
                 block.last_draw = Some(Instant::now());
-                Some(self.collapsed_line(block))
+                Some((self.collapsed_line(block), 0))
             } else {
                 None
             }
         };
-        if let Some(print) = print {
-            self.out(state, &print);
+        if let Some((print, pad)) = print {
+            self.out_aligned(state, &print, pad);
         }
     }
 
@@ -430,12 +460,12 @@ impl Renderer {
         if let Some(block) = state.thinking.as_mut() {
             block.expanded = expanded;
             if expanded {
-                let text = format!(
-                    "{}{}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n{THINK}{}{RESET}",
-                    if self.tty { "\r\x1b[2K" } else { "\n" },
-                    block.stamp,
+                let body = format!(
+                    "{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n{THINK}{}{RESET}",
                     block.text.trim_start()
                 );
+                let stamp = block.stamp.clone();
+                let text = format!("{}{}", if self.tty { "\r\x1b[2K" } else { "\n" }, stamp_block_with(&stamp, &body));
                 self.out(&mut state, &text);
             } else {
                 self.newline(&mut state);
@@ -458,7 +488,7 @@ impl Renderer {
             )
         };
         self.out(&mut state, "\r\x1b[2K");
-        self.out(&mut state, &note);
+        self.out(&mut state, &stamp_block(&note));
         true
     }
 }

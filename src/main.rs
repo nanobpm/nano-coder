@@ -517,7 +517,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
             if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("\n{}", outcome.response);
+                println!("\n{}", ui::stamp_block(&outcome.response));
             } else if outcome.stop_reason == agent::StopReason::Cancelled {
                 println!("\x1b[2m{}\x1b[0m", outcome.response);
             } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
