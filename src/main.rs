@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 mod agent;
 mod acp;
 mod bash;
+mod commands;
 mod config;
 mod context;
 mod files;
@@ -367,20 +368,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
     match cmd {
         "/exit" | "/quit" => Ok(false),
         "/help" => {
-            println!("Commands:");
-            println!("  /help      - Show this help");
-            println!("  /compact [focus] - Summarize older messages to free context (optional focus)");
-            println!("  /context   - Show context-window use and token totals");
-            println!("  /settings  - View/edit settings");
-            println!("  /verbosity [quiet|normal|verbose|debug] - Show or set output detail");
-            println!("  /plan      - Show the agent's task plan with notes");
-            println!("  /tools     - List available tools");
-            println!("  /skills    - List skills the agent can load");
-            println!("  /model [provider/model] - Show or switch the model");
-            println!("  /providers - List configured providers");
-            println!("  /session   - Show the session ID and log path");
-            println!("  /exit      - Exit the agent");
-            println!("Keys: Enter during a turn steers it, Esc Esc or Ctrl-C cancels it, Ctrl-O expands/collapses thinking");
+            println!("{}", commands::help_text());
             Ok(true)
         }
         _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
@@ -706,9 +694,11 @@ async fn main() -> Result<()> {
             }
             let prompt = |terminal: &Terminal| {
                 if terminal.queued.is_empty() {
-                    let line = terminal.view.lock().unwrap().line().to_string();
+                    let mut view = terminal.view.lock().unwrap();
+                    let line = view.line().to_string();
                     io::stdout().write_all(format!("> {line}").as_bytes()).unwrap();
                     io::stdout().flush().unwrap();
+                    view.prompt_redrawn();
                 }
             };
             prompt(&terminal);
