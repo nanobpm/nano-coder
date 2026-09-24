@@ -20,13 +20,26 @@ pub struct EditView {
     line: String,
     mode: EditMode,
     status: Option<Arc<StatusLine>>,
+    /// Rows below the prompt used by the command menu.
+    menu_rows: usize,
+    /// Esc hid the menu; it comes back when the line changes.
+    menu_hidden: bool,
+    /// Draw the command menu (key-by-key terminal input only).
+    menu_enabled: bool,
 }
 
 pub type SharedView = Arc<Mutex<EditView>>;
 
 impl EditView {
     pub fn shared(status: Option<Arc<StatusLine>>) -> SharedView {
-        Arc::new(Mutex::new(Self { line: String::new(), mode: EditMode::Prompt, status }))
+        Arc::new(Mutex::new(Self {
+            line: String::new(),
+            mode: EditMode::Prompt,
+            status,
+            menu_rows: 0,
+            menu_hidden: false,
+            menu_enabled: false,
+        }))
     }
 
     pub fn line(&self) -> &str {
@@ -53,6 +66,75 @@ impl EditView {
             Some(status) => status.set_input(Some(&self.line)),
             None => write(text),
         }
+        self.line_changed();
+    }
+
+    fn line_changed(&mut self) {
+        self.menu_hidden = false;
+        self.draw_menu();
+    }
+
+    fn menu_visible(&self) -> bool {
+        self.menu_rows > 0
+    }
+
+    /// Redraw the command menu below the prompt for the current line.
+    fn draw_menu(&mut self) {
+        if !self.menu_enabled || self.mode != EditMode::Prompt {
+            return;
+        }
+        let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
+        // Reserve the prompt row, plus the status row only when a status line
+        // is present (none under AGENTIC_NO_STATUS or a short terminal).
+        let reserved = if self.status.is_some() { 2 } else { 1 };
+        let max_rows = (rows as usize).saturating_sub(reserved).min(16);
+        let lines = if self.menu_hidden { Vec::new() } else { crate::commands::menu(&self.line, cols as usize, max_rows) };
+        let (seq, used) = menu_sequence(self.menu_rows, &lines);
+        self.menu_rows = used;
+        if !seq.is_empty() {
+            write(&seq);
+        }
+    }
+
+    /// Hide the menu (Esc) until the line changes.
+    fn hide_menu(&mut self) {
+        self.menu_hidden = true;
+        self.draw_menu();
+    }
+
+    /// Tab: complete a `/command`; elsewhere a space.
+    fn tab(&mut self) {
+        let is_command = self.line.starts_with('/') && !self.line.contains(char::is_whitespace);
+        match is_command.then(|| crate::commands::complete(&self.line)).flatten() {
+            Some(done) => {
+                let rest = done[self.line.len()..].to_string();
+                if !rest.is_empty() {
+                    self.insert(&rest);
+                }
+            }
+            None if is_command => {}
+            None => self.insert(" "),
+        }
+    }
+
+    /// The prompt and line were printed again (after other output): the old
+    /// menu rows scrolled away, so draw it afresh.
+    pub fn prompt_redrawn(&mut self) {
+        self.menu_rows = 0;
+        self.draw_menu();
+    }
+
+    /// The terminal was resized: the old menu rows may no longer fit under the
+    /// new scroll region, so blank the rows we reserved and redraw the menu
+    /// sized to the new terminal. Call after the status line re-establishes the
+    /// scroll region for the new size.
+    pub fn resize(&mut self) {
+        if self.menu_rows > 0 {
+            let (seq, _) = menu_sequence(self.menu_rows, &[]);
+            write(&seq);
+            self.menu_rows = 0;
+        }
+        self.draw_menu();
     }
 
     /// Remove the last `n` characters.
@@ -67,6 +149,9 @@ impl EditView {
         match self.on_status() {
             Some(status) => status.set_input((!self.line.is_empty()).then_some(self.line.as_str())),
             None => write(&"\x08 \x08".repeat(erased.chars().count())),
+        }
+        if !erased.is_empty() {
+            self.line_changed();
         }
     }
 
@@ -83,6 +168,12 @@ impl EditView {
     }
 
     fn take(&mut self) -> String {
+        if self.menu_visible() {
+            let (seq, _) = menu_sequence(self.menu_rows, &[]);
+            write(&seq);
+            self.menu_rows = 0;
+        }
+        self.menu_hidden = false;
         let line = std::mem::take(&mut self.line);
         match self.on_status() {
             Some(status) => status.set_input(None),
@@ -90,6 +181,33 @@ impl EditView {
         }
         line
     }
+}
+
+/// Terminal output that shows `lines` below the cursor's row (which holds
+/// the prompt), given that `old_rows` rows are already in use there, and
+/// the number of rows in use afterwards. The cursor ends where it started.
+/// Rows are reserved with IND (ESC D), which scrolls at the bottom of the
+/// scroll region and keeps the column; the status line below the region is
+/// never touched.
+fn menu_sequence(old_rows: usize, lines: &[String]) -> (String, usize) {
+    if old_rows == 0 && lines.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut seq = String::new();
+    if lines.len() > old_rows {
+        seq.push_str(&"\x1bD".repeat(lines.len()));
+        seq.push_str(&format!("\x1b[{}A", lines.len()));
+    }
+    let rows = old_rows.max(lines.len());
+    seq.push_str("\x1b7");
+    for i in 0..rows {
+        seq.push_str("\x1b[1B\r\x1b[2K");
+        if let Some(line) = lines.get(i) {
+            seq.push_str(line);
+        }
+    }
+    seq.push_str("\x1b8");
+    (seq, if lines.is_empty() { 0 } else { rows })
 }
 
 fn write(text: &str) {
@@ -191,6 +309,8 @@ impl LineReader {
     /// return value is a `Key::Line` or `Key::Eof`.
     pub fn read_line(&mut self, view: &SharedView, send: &dyn Fn(Key)) -> Key {
         let _mode = KeyMode::enter();
+        view.lock().unwrap().menu_enabled = true;
+        let shared = view;
         loop {
             let Some(byte) = self.next_byte() else { return Key::Eof };
             let mut view = view.lock().unwrap();
@@ -220,6 +340,7 @@ impl LineReader {
                 }
                 0x17 => view.erase_word(),
                 0x1b => {
+                    let menu = view.menu_visible();
                     drop(view);
                     match self.byte_within(ESCAPE_SEQUENCE_WAIT_MS) {
                         // Skip escape sequences (arrow keys and the like).
@@ -230,6 +351,7 @@ impl LineReader {
                                 }
                             }
                         }
+                        None if menu => shared.lock().unwrap().hide_menu(),
                         None => send(Key::Escape),
                         // Esc Esc typed faster than the wait: two presses.
                         Some(0x1b) => {
@@ -240,7 +362,7 @@ impl LineReader {
                         Some(_) => {}
                     }
                 }
-                b'\t' => view.insert(" "),
+                b'\t' => view.tab(),
                 byte if byte < 0x20 => {}
                 byte => {
                     self.utf8.push(byte);
@@ -273,5 +395,35 @@ mod tests {
         assert_eq!(view.line, "run a\u{a0}");
         view.erase_word();
         assert_eq!(view.line, "run ");
+    }
+
+    #[test]
+    fn menu_rows_are_reserved_drawn_and_cleared() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let (seq, rows) = menu_sequence(0, &lines);
+        assert_eq!(rows, 2);
+        assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
+        // Narrowing reuses the rows and blanks the extra one.
+        let (seq, rows) = menu_sequence(2, &lines[..1]);
+        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+        let (seq, rows) = menu_sequence(2, &[]);
+        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
+        assert_eq!(menu_sequence(0, &[]), (String::new(), 0));
+    }
+
+    #[test]
+    fn tab_completes_commands_and_is_a_space_elsewhere() {
+        let view = EditView::shared(None);
+        let mut view = view.lock().unwrap();
+        view.mode = EditMode::Turn; // not drawn: no terminal in tests
+        view.line = "/comp".into();
+        view.tab();
+        assert_eq!(view.line, "/compact ");
+        view.line = "/s".into();
+        view.tab();
+        assert_eq!(view.line, "/s", "ambiguous: unchanged");
+        view.line = "fix it".into();
+        view.tab();
+        assert_eq!(view.line, "fix it ");
     }
 }

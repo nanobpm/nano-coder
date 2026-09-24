@@ -136,6 +136,7 @@ src/
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
 ├── goal.rs      # report_outcome tool (completed / blocked)
+├── commands.rs  # Slash-command table for /help and the as-you-type menu
 ├── skills.rs    # SKILL.md discovery, ai.lock sources and the load_skill tool
 ├── reminders.rs # <system-reminder> notes appended to tool results
 ├── settings.rs  # /settings menu and config-file writer
@@ -187,6 +188,10 @@ atomic (temp file + rename). There is no permission prompt: run workers in a dis
 workspace.
 
 ## Commands
+
+Typing `/` at the prompt lists the commands under it, and each further character narrows the
+list. Tab completes the command, or the part all matches share. Esc hides the list. The
+list is built from the same table as `/help` (`src/commands.rs`).
 
 - `/help` - Show available commands
 - `/compact [focus]` - Summarize older messages with the current model, keeping the latest
