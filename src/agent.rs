@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::context::{self, Activity, SharedStats};
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
+use crate::skills::{self, Skills};
 use crate::goal::{self, Outcome};
 use crate::output;
 use crate::plan::{self, Plan};
@@ -232,6 +233,8 @@ pub struct Agent {
     streaming: bool,
     /// AGENTS.md and similar files for the working directory.
     instructions: Option<ProjectInstructions>,
+    /// Skills offered through `load_skill` (see `skills.rs`).
+    skills: Skills,
     /// The agent's task plan (see `plan.rs`).
     plan: Plan,
     reminders: Reminders,
@@ -263,6 +266,7 @@ impl Agent {
             compact_floor: 0,
             streaming: false,
             instructions: None,
+            skills: Skills::default(),
             plan: Plan::default(),
             reminders: Reminders::default(),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
@@ -586,19 +590,30 @@ impl Agent {
         self.replace_conversation(vec![Message::system(&self.system_prompt())])
     }
 
-    /// The configured system prompt plus any project instructions.
+    /// The configured system prompt plus any project instructions and the
+    /// skill index.
     pub fn system_prompt(&self) -> String {
         let extra = self.instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        format!("{}{extra}", self.config.system_prompt)
+        format!("{}{extra}{}", self.config.system_prompt, self.skills.render_index())
     }
 
-    /// Discover instruction files for the current working directory.
+    /// Discover instruction files and skills for the current working directory.
     fn load_project_instructions(&mut self) {
         let enabled = self.config.project_instructions && std::env::var_os("AGENTIC_NO_PROJECT_INSTRUCTIONS").is_none();
+        let cwd = std::env::current_dir().ok();
         self.instructions = enabled
-            .then(|| std::env::current_dir().ok())
+            .then(|| cwd.clone())
             .flatten()
             .map(|cwd| ProjectInstructions::discover(&cwd, &self.config.project_instruction_files));
+        let skills_enabled = self.config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
+        self.skills = match cwd.filter(|_| skills_enabled) {
+            Some(cwd) => Skills::discover(&cwd, &self.config.skills),
+            None => Skills::default(),
+        };
+    }
+
+    pub fn skills(&self) -> &Skills {
+        &self.skills
     }
 
     /// Load instructions into a conversation that was started without a
@@ -652,6 +667,9 @@ impl Agent {
         }
         if self.config.outcome_tool {
             tools.push(goal::definition());
+        }
+        if !self.skills.is_empty() {
+            tools.push(skills::definition());
         }
         tools
     }
@@ -900,8 +918,11 @@ impl Agent {
 
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
+                let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let result = if is_plan_tool {
                     self.run_plan_tool(tool_call)
+                } else if is_skill_tool {
+                    self.skills.load(&tool_call.arguments).map(Value::String)
                 } else if is_outcome_tool {
                     Outcome::from_args(&tool_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
@@ -936,8 +957,8 @@ impl Agent {
                 {
                     result_text.push_str(&nested);
                 }
-                // bash and read_file bound their own output (and bash keeps the whole).
-                if !matches!(tool_call.name.as_str(), "bash" | "read_file") {
+                // bash, read_file and load_skill bound their own output (and bash keeps the whole).
+                if !matches!(tool_call.name.as_str(), "bash" | "read_file") && !is_skill_tool {
                     let name = format!("tool-{}-{}.txt", sanitize(&tool_call.id), sanitize(&tool_call.name));
                     result_text = output::bound_and_spill(&result_text, self.tool_output_limit, &output::spill_dir(), &name);
                 }
@@ -1221,6 +1242,7 @@ mod tests {
         let config = Config {
             session_dir: Some(dir.to_path_buf()),
             project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
             ..Config::default()
         };
         let agent = Agent::new(Box::new(client), config);
@@ -1557,6 +1579,30 @@ mod tests {
 
     fn call(id: &str, name: &str, arguments: Value) -> LLMResponse {
         LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments }], ..Default::default() }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn indexes_skills_in_the_system_prompt_and_loads_them_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".agents/skills/release")).unwrap();
+        std::fs::write(
+            repo.join(".agents/skills/release/SKILL.md"),
+            "---\nname: release\ndescription: Cut a release.\n---\nBump the version, then tag it.\n",
+        )
+        .unwrap();
+        let (mut agent, seen) = agent(vec![call("s1", "load_skill", json!({"name": "release"})), text("done")], dir.path());
+        agent.new_session().unwrap();
+        assert!(!agent.tool_definitions().iter().any(|d| d.name == "load_skill"), "no skills, no tool");
+        agent.skills = Skills::discover_in(&repo, &agent.config.skills, &skills::Locations::default());
+        agent.set_system_prompt("base").unwrap();
+        assert!(agent.tool_definitions().iter().any(|d| d.name == "load_skill"));
+        agent.send_message("ship it").await.unwrap();
+
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert!(last[0].content.contains("- `release`: Cut a release.") && !last[0].content.contains("Bump the version"));
+        assert!(last[3].content.contains("Skill: release") && last[3].content.contains("Bump the version, then tag it."));
     }
 
     #[tokio::test(flavor = "multi_thread")]

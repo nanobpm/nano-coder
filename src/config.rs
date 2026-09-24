@@ -51,6 +51,8 @@ pub struct Config {
     pub outcome_tool: bool,
     /// Append `<system-reminder>` notes to tool results (e.g. a stale plan).
     pub reminders: bool,
+    /// Agent skills (`SKILL.md` folders and `ai.lock` entries).
+    pub skills: crate::skills::SkillsConfig,
 }
 
 impl Default for Config {
@@ -77,6 +79,7 @@ impl Default for Config {
             plan_tools: true,
             outcome_tool: true,
             reminders: true,
+            skills: crate::skills::SkillsConfig::default(),
         }
     }
 }

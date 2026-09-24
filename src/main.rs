@@ -25,6 +25,7 @@ mod providers;
 mod reminders;
 mod settings;
 mod session;
+mod skills;
 mod status;
 mod tools;
 mod ui;
@@ -374,6 +375,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             println!("  /verbosity [quiet|normal|verbose|debug] - Show or set output detail");
             println!("  /plan      - Show the agent's task plan with notes");
             println!("  /tools     - List available tools");
+            println!("  /skills    - List skills the agent can load");
             println!("  /model [provider/model] - Show or switch the model");
             println!("  /providers - List configured providers");
             println!("  /session   - Show the session ID and log path");
@@ -411,6 +413,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 println!("Instructions: {}", files.join(", "));
             }
+            let skills = agent.skills();
+            if !skills.is_empty() || !skills.warnings.is_empty() {
+                println!("Skills:       {} (/skills to list them)", skills.skills.len());
+            }
             if let Some((done, total)) = stats.plan {
                 println!("Plan:         {done}/{total} done (/plan to show it)");
             }
@@ -447,6 +453,19 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             println!("Available tools:");
             for def in agent.tool_definitions() {
                 println!("  {} - {}", def.name, def.description);
+            }
+            Ok(true)
+        }
+        "/skills" => {
+            let skills = agent.skills();
+            if skills.is_empty() {
+                println!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", "));
+            }
+            for skill in &skills.skills {
+                println!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display());
+            }
+            for warning in &skills.warnings {
+                println!("Warning: {warning}");
             }
             Ok(true)
         }
@@ -637,13 +656,20 @@ async fn main() -> Result<()> {
         }
 
         // Interactive CLI mode
-        println!("Agentic Harness v0.1.0");
+        println!("nano-coder v{}", env!("CARGO_PKG_VERSION"));
         println!("Model: {} (provider: {})", agent.model_name(), agent.provider_name());
         if let Some(id) = agent.session_id() {
             println!("Session: {id} (resume with --resume {id})");
         }
         for file in agent.project_instruction_files() {
             println!("Instructions: {file}");
+        }
+        let skills = agent.skills();
+        if !skills.is_empty() {
+            println!("Skills: {}", skills.names().join(", "));
+        }
+        for warning in &skills.warnings {
+            println!("Skills warning: {warning}");
         }
         println!("Type /help for commands\n");
 

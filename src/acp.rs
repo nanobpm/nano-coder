@@ -152,6 +152,15 @@ fn new_session(agent: &mut Agent, params: &Value) -> anyhow::Result<String> {
 }
 
 /// Make `params.cwd` the working directory for tools (one session per process).
+/// `_meta` for session/new and session/load: loaded instruction files and skills.
+fn session_meta(agent: &Agent) -> Value {
+    let mut meta = json!({ "projectInstructions": agent.project_instruction_files(), "skills": agent.skills().names() });
+    if !agent.skills().warnings.is_empty() {
+        meta["skillWarnings"] = json!(agent.skills().warnings);
+    }
+    meta
+}
+
 fn apply_cwd(params: &Value) -> Result<(), String> {
     let Some(cwd) = params.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()) else {
         return Ok(());
@@ -231,7 +240,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
             Err(e) => error(id, -32602, e),
             Ok(()) => match new_session(agent, params) {
                 Ok(session_id) => {
-                    let mut meta = json!({ "projectInstructions": agent.project_instruction_files() });
+                    let mut meta = session_meta(agent);
                     if !agent.plan().is_empty() {
                         meta["plan"] = json!(agent.plan());
                     }
@@ -255,7 +264,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                         id,
                         json!({
                             "sessionId": session_id,
-                            "_meta": { "projectInstructions": agent.project_instruction_files() },
+                            "_meta": session_meta(agent),
                         }),
                     )
                 }

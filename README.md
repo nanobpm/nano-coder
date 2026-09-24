@@ -20,11 +20,12 @@ cargo install nano-coder             # or build from source
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/exit`
+- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
 - **Project instructions**: `AGENTS.md` (or `CLAUDE.md`, `.github/copilot-instructions.md`) from the repository is added to the system prompt
+- **Skills**: `SKILL.md` folders from the repository, `~/.agents/skills`, and an spm `ai.lock`, loaded on demand with `load_skill`
 
 ## Two Execution Modes
 
@@ -83,6 +84,8 @@ events c8ctl-nano's transcript producer records into the engine's AgentInstance 
 **Project instructions.** `session/new` and `session/load` results include
 `_meta.projectInstructions`: the absolute paths of the instruction files that were added to
 the system prompt for the session's `cwd` (see [Project Instructions](#project-instructions)).
+`_meta.skills` lists the skills found for it, and `_meta.skillWarnings` (when present) explains
+any that could not be loaded (see [Skills](#skills)).
 
 **Plans.** Each plan change sends a `plan` update: ACP `entries` (`content`, `priority`,
 `status`) plus `_meta.plan`, the full plan with ids, notes and dependencies. To continue a job
@@ -133,6 +136,7 @@ src/
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
 ├── goal.rs      # report_outcome tool (completed / blocked)
+├── skills.rs    # SKILL.md discovery, ai.lock sources and the load_skill tool
 ├── reminders.rs # <system-reminder> notes appended to tool results
 ├── settings.rs  # /settings menu and config-file writer
 └── config.rs    # Configuration file loading and management
@@ -171,6 +175,8 @@ The harness exposes 6 lifecycle hook events:
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
 - `report_outcome` - Report the task `completed` or `blocked`, with a `summary`; ends the turn
   (see [Outcomes](#outcomes)).
+- `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
+  when skills were found (see [Skills](#skills)).
 
 Any other tool's result longer than 40,000 characters is cut the same way as bash output,
 with the whole result saved under the temp directory (`nano-coder-<pid>/tool-<id>-<name>.txt`)
@@ -199,6 +205,7 @@ workspace.
     (`--config` or `~/.config/nano-coder/config.toml`), keeping comments and
     other settings. Leaving with unsaved changes asks whether to save
 - `/tools` - List registered tools
+- `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
 - `/model [provider/model]` - Show or switch the model (conversation is kept)
 - `/providers` - List providers, endpoints and whether their API key is available
@@ -247,6 +254,14 @@ project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instruct
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
+
+[skills]                                # see Skills
+enabled = true
+dirs = [".agents/skills", ".github/skills", ".claude/skills"]   # relative to the git root
+user_dirs = ["~/.agents/skills"]
+ai_lock = true                          # load skills pinned in ai.lock
+fetch = true                            # fetch ai.lock commits missing from the spm store
+allowed_hosts = ["github.com"]          # hosts ai.lock entries may be fetched from ("*" = any)
 ```
 
 The default model is `gpt-4o-mini` on the `mock` provider, so the harness still works offline.
@@ -423,6 +438,39 @@ the `bash` tool touches don't trigger this.
 Instructions are read again when a session is resumed, so edits to `AGENTS.md` take effect.
 `/context` lists the loaded files. To turn loading off, set `project_instructions = false`,
 or set `AGENTIC_NO_PROJECT_INSTRUCTIONS`.
+
+## Skills
+
+A skill is a folder with a `SKILL.md`: YAML front matter with a `name` and a `description`,
+then instructions, plus any scripts or reference files it needs. Only the name and description
+of each skill go into the system prompt, under a "Skills" heading (8 KiB at most). When a task
+matches one, the model calls `load_skill`, which returns the instructions (32 KiB at most),
+the skill's directory, and a list of its other files for `read_file`.
+
+Skills are found in this order, and the first skill with a given name wins:
+
+1. **Repository**: `.agents/skills`, `.github/skills` and `.claude/skills` under the git root,
+   at any depth up to four folders (`skills/<group>/<skill>/SKILL.md` works).
+2. **`ai.lock`**: skills pinned by [spm](https://github.com/camunda/spm-cli). Each locked
+   skill is loaded, and so is each skill bundled in a locked plugin (its
+   `.claude-plugin/plugin.json` `skills` folder, default `skills/`). Hooks, commands and MCP
+   servers in plugins are not loaded.
+3. **User**: `~/.agents/skills`.
+
+nano-coder reads `ai.lock` itself and never runs `spm install`, which edits the workspace
+(`.gitignore`, vendor folders). Changes like that would end up in commits and PRs. Each
+pinned commit is read from spm's store (`$SPM_HOME/store`, default `~/.spm/store`) if it is
+there. Otherwise it is fetched once into the nano-coder cache (`<cache dir>/nano-coder/skills`).
+`ai.lock` is committed to the repository, so its entries are checked the way spm checks them:
+a full 40-character commit, a store key that matches the URL and commit, and paths that stay
+inside the checkout. Fetches are limited to `skills.allowed_hosts` (`"file"` allows
+`file://`). With `fetch = false`, only commits already in the spm store or the cache are used.
+An `ai.json` without an `ai.lock` is skipped with a warning, because unpinned references are
+never resolved.
+
+Skills are found again when a session starts or is resumed. Problems are listed at startup
+and by `/skills` (and returned as `_meta.skillWarnings` over ACP); they never stop a session.
+To turn skills off, set `skills.enabled = false` or set `NANO_CODER_NO_SKILLS`.
 
 ## Task Plans
 
