@@ -120,6 +120,19 @@ impl EditView {
         self.draw_menu();
     }
 
+    /// The terminal was resized: the old menu rows may no longer fit under the
+    /// new scroll region, so blank the rows we reserved and redraw the menu
+    /// sized to the new terminal. Call after the status line re-establishes the
+    /// scroll region for the new size.
+    pub fn resize(&mut self) {
+        if self.menu_rows > 0 {
+            let (seq, _) = menu_sequence(self.menu_rows, &[]);
+            write(&seq);
+            self.menu_rows = 0;
+        }
+        self.draw_menu();
+    }
+
     /// Remove the last `n` characters.
     fn erase(&mut self, n: usize) {
         let mut erased = String::new();

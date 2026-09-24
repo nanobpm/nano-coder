@@ -675,16 +675,18 @@ async fn main() -> Result<()> {
         agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
         agent.set_streaming(true);
         agent.refresh_stats();
+        let view = lineedit::EditView::shared(status.clone());
         if let Some(status) = status.clone()
             && let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         {
+            let view = view.clone();
             tokio::spawn(async move {
                 while resized.recv().await.is_some() {
                     status.resize();
+                    view.lock().unwrap().resize();
                 }
             });
         }
-        let view = lineedit::EditView::shared(status.clone());
         let mut terminal = Terminal::start(config_path, view, renderer);
         let mut running = true;
         let mut exit_armed = false;
