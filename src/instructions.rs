@@ -35,7 +35,7 @@ pub struct ProjectInstructions {
     initial: HashSet<PathBuf>,
 }
 
-fn git_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn git_root(start: &Path) -> Option<PathBuf> {
     start.ancestors().find(|dir| dir.join(".git").exists()).map(Path::to_path_buf)
 }
 
