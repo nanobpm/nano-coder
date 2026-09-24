@@ -383,14 +383,23 @@ impl LLMClient for GithubCopilotClient {
     }
 
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
-        let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
-        let model = &self.transport.provider().model;
-        let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
-        // Copilot enforces the prompt budget, which is below the full window.
-        ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
-            let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
-            Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
+        // Bound the whole probe: `models_json` first does a token exchange whose
+        // request carries the transport's normal (long) timeout, so a stalled
+        // exchange could otherwise blow past the probe budget even though the
+        // `/models` call itself is capped at `PROBE_TIMEOUT`.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
+            let model = &self.transport.provider().model;
+            let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+            // Copilot enforces the prompt budget, which is below the full window.
+            ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
+                let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
+                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
+            })
         })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {

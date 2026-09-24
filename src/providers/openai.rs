@@ -464,7 +464,7 @@ async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Op
     let parameters = show.get("parameters").and_then(Value::as_str)?;
     parameters
         .lines()
-        .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse().ok())
+        .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse::<usize>().ok().filter(|&n| n > 0))
         .map(|tokens| DetectedWindow { tokens, source: "Ollama num_ctx".into() })
 }
 
