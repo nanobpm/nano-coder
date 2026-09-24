@@ -425,7 +425,7 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
     }
     let owner = entry.and_then(|e| e.get("owned_by")).and_then(Value::as_str).unwrap_or_default();
     let is_ollama = provider.name == "ollama" || root.ends_with(":11434") || matches!(owner, "library" | "ollama");
-    if owner == "llamacpp" {
+    if owner == "llamacpp" || provider.name == "llamacpp" {
         let url = format!("{root}/props?model={}", urlencode(model));
         let props = probe(transport, reqwest::Method::GET, &url, None).await?;
         return props
@@ -434,7 +434,7 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
             .and_then(as_tokens)
             .map(|tokens| DetectedWindow { tokens, source: "llama.cpp /props n_ctx".into() });
     }
-    if owner == "organization_owner" {
+    if owner == "organization_owner" || provider.name == "lmstudio" {
         let listed = probe(transport, reqwest::Method::GET, &format!("{root}/api/v0/models"), None).await?;
         return model_entry(&listed, model)
             .and_then(|m| m.get("loaded_context_length"))
@@ -798,6 +798,28 @@ mod tests {
         let (found, paths) = detect("local", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
         assert_eq!(found, window(65536, "llama.cpp /props n_ctx"));
         assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
+    }
+
+    #[tokio::test]
+    async fn recognizes_llama_cpp_by_provider_name() {
+        // A llama.cpp `/models` response without the `llamacpp` owner is still
+        // probed when the provider is named `llamacpp`.
+        let models = json!({"data": [{"id": "qwen3:8b"}]});
+        let props = json!({"default_generation_settings": {"n_ctx": 65536}});
+        let (found, paths) = detect("llamacpp", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(found, window(65536, "llama.cpp /props n_ctx"));
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
+    }
+
+    #[tokio::test]
+    async fn recognizes_lm_studio_by_provider_name() {
+        // LM Studio configured under the natural `lmstudio` name is asked its
+        // own API even when the `/models` owner is not `organization_owner`.
+        let models = json!({"data": [{"id": "qwen3:8b"}]});
+        let listed = json!({"data": [{"id": "qwen3:8b", "loaded_context_length": 12288}]});
+        let (found, paths) = detect("lmstudio", vec![(200, "", models.to_string()), (200, "", listed.to_string())]).await;
+        assert_eq!(found, window(12288, "LM Studio loaded_context_length"));
+        assert_eq!(paths, ["/v1/models", "/api/v0/models"]);
     }
 
     #[tokio::test]

@@ -28,6 +28,11 @@ const MODELS_API_VERSION: &str = "2025-05-01";
 /// Refresh the session token this long before it expires.
 const REFRESH_MARGIN_SECS: i64 = 300;
 
+/// Per-request timeout for the context-window detection probe, matching the
+/// OpenAI-compatible probe so a stalled `/models` call cannot consume the whole
+/// startup/model-switch budget.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 const EDITOR_HEADERS: [(&str, &str); 4] = [
     ("User-Agent", "GitHubCopilotChat/0.35.0"),
     ("Editor-Version", "vscode/1.107.0"),
@@ -252,15 +257,17 @@ pub struct GithubCopilotClient {
 }
 
 impl GithubCopilotClient {
-    async fn models_json(&self) -> Result<Value> {
+    async fn models_json(&self, timeout: Option<std::time::Duration>) -> Result<Value> {
         let session = self.session_token(false).await?;
         let url = format!("{}/models", self.api_base(&session));
-        let response = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
+        let mut request = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
             .bearer_auth(&session.token)
             .header("Accept", "application/json")
-            .header("X-GitHub-Api-Version", MODELS_API_VERSION)
-            .send()
-            .await?;
+            .header("X-GitHub-Api-Version", MODELS_API_VERSION);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
         let status = response.status();
         let value: Value = response.json().await?;
         if !status.is_success() {
@@ -376,7 +383,7 @@ impl LLMClient for GithubCopilotClient {
     }
 
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
-        let models = self.models_json().await.ok()?;
+        let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
         let model = &self.transport.provider().model;
         let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
         // Copilot enforces the prompt budget, which is below the full window.
@@ -387,7 +394,7 @@ impl LLMClient for GithubCopilotClient {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let value = self.models_json().await?;
+        let value = self.models_json(None).await?;
         let mut models: Vec<String> = value
             .get("data")
             .and_then(Value::as_array)
