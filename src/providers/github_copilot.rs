@@ -77,7 +77,7 @@ pub struct StoredCredentials {
 }
 
 pub fn credentials_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("agentic-harness").join("github-copilot.json"))
+    dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("github-copilot.json"))
 }
 
 pub fn load_credentials() -> Option<StoredCredentials> {
@@ -211,7 +211,7 @@ pub async fn exchange(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str
     let text = response.text().await?;
     if !(200..300).contains(&status) {
         bail!(
-            "Copilot token exchange failed (HTTP {status}): {}. Run `agentic-harness --login github-copilot` \
+            "Copilot token exchange failed (HTTP {status}): {}. Run `nano-coder --login github-copilot` \
              or set GITHUB_COPILOT_OAUTH_TOKEN; the account must have an active Copilot subscription.",
             text.chars().take(300).collect::<String>()
         );
@@ -260,7 +260,7 @@ impl GithubCopilotClient {
             .or_else(|| load_credentials().filter(|c| c.domain == domain).map(|c| c.oauth_token))
             .ok_or_else(|| {
                 anyhow!(
-                    "not logged in to GitHub Copilot: run `agentic-harness --login github-copilot` \
+                    "not logged in to GitHub Copilot: run `nano-coder --login github-copilot` \
                      or set GITHUB_COPILOT_OAUTH_TOKEN"
                 )
             })?;

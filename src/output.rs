@@ -11,7 +11,7 @@ pub const MAX_OUTPUT_LENGTH: usize = 1_000_000;
 
 /// Where complete copies of truncated tool output are kept.
 pub fn spill_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("agentic-harness-{}", std::process::id()))
+    std::env::temp_dir().join(format!("nano-coder-{}", std::process::id()))
 }
 
 /// Bound `text` to `limit` characters; when it is longer, save it whole in

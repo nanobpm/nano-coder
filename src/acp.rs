@@ -216,6 +216,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
             id,
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
+                "agentInfo": { "name": "nano-coder", "version": env!("CARGO_PKG_VERSION") },
                 "agentCapabilities": {
                     "loadSession": agent.config().persist_sessions,
                     "tools": true,

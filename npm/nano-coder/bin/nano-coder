@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+// Launcher used only when the postinstall step could not replace this file with
+// the native binary (e.g. `npm install --ignore-scripts`). It adds a Node process
+// in front of nano-coder; the native install avoids that overhead.
+'use strict';
+const { spawnSync } = require('node:child_process');
+const { binaryPath } = require('../lib/platform.js');
+
+let bin;
+try {
+  bin = binaryPath();
+} catch (err) {
+  console.error(`nano-coder: ${err.message}`);
+  process.exit(1);
+}
+const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
+if (r.error) {
+  console.error(`nano-coder: failed to run ${bin}: ${r.error.message}`);
+  process.exit(1);
+}
+if (r.signal) process.kill(process.pid, r.signal);
+process.exit(r.status ?? 1);

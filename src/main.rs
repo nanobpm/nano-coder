@@ -560,10 +560,10 @@ fn parse_args() -> Result<Args> {
                 args.verbosity = Some(value("--verbosity")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
             }
             "-h" | "--help" => {
-                println!("Usage: agentic-harness [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
-                println!("                       [--verbosity quiet|normal|verbose|debug]");
-                println!("       agentic-harness --login github-copilot");
-                println!("       agentic-harness --list-models PROVIDER[/model]");
+                println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
+                println!("                  [--verbosity quiet|normal|verbose|debug]");
+                println!("       nano-coder --login github-copilot");
+                println!("       nano-coder --list-models PROVIDER[/model]");
                 std::process::exit(0);
             }
             other => anyhow::bail!("unknown argument {other:?} (see --help)"),

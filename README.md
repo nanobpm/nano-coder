@@ -1,6 +1,15 @@
-# Agentic Harness (Rust)
+# nano-coder
 
-An interactive CLI agentic harness built in Rust with tool calling, lifecycle hooks, and ACP protocol support for headless orchestration.
+**A 6MB coding agent. Run a fleet on your laptop.**
+
+nano-coder is a coding agent for the terminal, written in Rust. It uses about 6MB of resident memory, where Node-based agent CLIs take 150–660MB, so you can run dense fleets of agent workers on one machine. It runs interactively, or headless over ACP as a worker for [nano-workforce](https://github.com/nanobpm/nano-workforce) via c8ctl-nano.
+
+## Install
+
+```sh
+npm install -g @nanobpm/nano-coder   # prebuilt binaries for macOS and Linux (x64, arm64)
+cargo install nano-coder             # or build from source
+```
 
 ## Features
 
@@ -10,7 +19,7 @@ An interactive CLI agentic harness built in Rust with tool calling, lifecycle ho
 - **Tool Calling**: Agent can invoke registered tools during conversation, including a real `bash` tool with timeouts and bounded output
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
-- **Configuration**: TOML-based config file at `~/.config/agentic-harness/config.toml`
+- **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
@@ -164,7 +173,7 @@ The harness exposes 6 lifecycle hook events:
   (see [Outcomes](#outcomes)).
 
 Any other tool's result longer than 40,000 characters is cut the same way as bash output,
-with the whole result saved under the temp directory (`agentic-harness-<pid>/tool-<id>-<name>.txt`)
+with the whole result saved under the temp directory (`nano-coder-<pid>/tool-<id>-<name>.txt`)
 and its path in the marker. `read_file` pages instead.
 
 Relative paths resolve against the working directory (ACP `session/new` `cwd`). Writes are
@@ -187,7 +196,7 @@ workspace.
   - **Context**: auto-compaction on/off, threshold, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
-    (`--config` or `~/.config/agentic-harness/config.toml`), keeping comments and
+    (`--config` or `~/.config/nano-coder/config.toml`), keeping comments and
     other settings. Leaving with unsaved changes asks whether to save
 - `/tools` - List registered tools
 - `/plan` - Show the agent's task plan with all notes
@@ -200,7 +209,7 @@ workspace.
 
 ```bash
 cargo build --release
-./target/release/agentic-harness
+./target/release/nano-coder
 ```
 
 Or run directly:
@@ -217,7 +226,7 @@ Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model pro
 
 ## Configuration
 
-Create `~/.config/agentic-harness/config.toml` (every field is optional):
+Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`) are still used if the new ones don't exist:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"   # provider/model
@@ -228,7 +237,7 @@ max_iterations = 50                     # LLM calls per user input
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
-# session_dir = "/path/to/sessions"    # default: <platform data dir>/agentic-harness/sessions
+# session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 # context_window = 128000               # override the window (providers can set it too)
@@ -286,7 +295,7 @@ extra_body = { think = false }          # merged into every request body
 drop_params = ["temperature"]           # for models that reject temperature
 
 [providers.openrouter]
-headers = { "HTTP-Referer" = "https://example.com", "X-Title" = "rusty-harness" }
+headers = { "HTTP-Referer" = "https://example.com", "X-Title" = "nano-coder" }
 extra_body = { provider = { sort = "throughput" } }
 
 [providers.work]
@@ -319,13 +328,13 @@ Copilot policy, it can break without notice, and misuse could get an account fla
 never used unless you select it.
 
 ```bash
-agentic-harness --login github-copilot          # interactive; saves the OAuth token (0600)
-agentic-harness --list-models github-copilot
-agentic-harness --model github-copilot/gpt-4.1
+nano-coder --login github-copilot          # interactive; saves the OAuth token (0600)
+nano-coder --list-models github-copilot
+nano-coder --model github-copilot/gpt-4.1
 ```
 
 Headless workers can't do the device flow; set `GITHUB_COPILOT_OAUTH_TOKEN` to a token from a
-previous login instead (credentials live in `<data dir>/agentic-harness/github-copilot.json`).
+previous login instead (credentials live in `<data dir>/nano-coder/github-copilot.json`).
 Tool follow-ups are sent with `X-Initiator: agent`, so a turn is billed like one VS Code
 request. `GITHUB_COPILOT_DOMAIN` selects a GHE.com host. Models that Copilot serves only
 through its Responses API are not supported.

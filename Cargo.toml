@@ -1,7 +1,19 @@
 [package]
-name = "agentic-harness"
+name = "nano-coder"
 version = "0.1.0"
 edition = "2024"
+description = "A 6MB coding agent for the terminal and for agent fleets: multi-provider, ACP, resumable sessions, plans."
+license = "Apache-2.0"
+repository = "https://github.com/nanobpm/nano-coder"
+homepage = "https://github.com/nanobpm/nano-coder"
+readme = "README.md"
+keywords = ["ai", "agent", "coding-agent", "acp", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["tla/", "target/", "npm/", "scripts/", ".github/", "TLA-plan.md", "RELEASING.md"]
+
+[[bin]]
+name = "nano-coder"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

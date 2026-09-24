@@ -25,7 +25,7 @@ pub struct Config {
     pub max_iterations: usize,
     /// Persist conversations as JSONL session logs.
     pub persist_sessions: bool,
-    /// Session log directory (default: platform data dir/agentic-harness/sessions).
+    /// Session log directory (default: platform data dir/nano-coder/sessions).
     pub session_dir: Option<PathBuf>,
     /// Default timeout for the bash tool, in seconds.
     pub bash_timeout_secs: u64,
@@ -114,6 +114,17 @@ pub struct ConfigManager {
     config: Config,
 }
 
+pub const APP_NAME: &str = "nano-coder";
+/// Directory name used before the rename to nano-coder; still read when present.
+const LEGACY_APP_NAME: &str = "agentic-harness";
+
+/// `<base>/nano-coder`, or the pre-rename `<base>/agentic-harness` when only that exists.
+pub fn app_dir(base: &Path) -> PathBuf {
+    let current = base.join(APP_NAME);
+    let legacy = base.join(LEGACY_APP_NAME);
+    if !current.exists() && legacy.exists() { legacy } else { current }
+}
+
 impl ConfigManager {
     pub fn new() -> Result<Self> {
         Self::from_path(Self::default_config_path()?)
@@ -121,7 +132,7 @@ impl ConfigManager {
 
     fn default_config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Could not determine home directory")?;
-        Ok(home.join(".config").join("agentic-harness").join("config.toml"))
+        Ok(app_dir(&home.join(".config")).join("config.toml"))
     }
 
     pub fn load_from_file(path: &Path) -> Result<Config> {
@@ -150,6 +161,16 @@ impl ConfigManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn app_dir_prefers_current_and_falls_back_to_legacy() {
+        let base = tempfile::tempdir().unwrap();
+        assert_eq!(super::app_dir(base.path()), base.path().join("nano-coder"));
+        std::fs::create_dir(base.path().join("agentic-harness")).unwrap();
+        assert_eq!(super::app_dir(base.path()), base.path().join("agentic-harness"));
+        std::fs::create_dir(base.path().join("nano-coder")).unwrap();
+        assert_eq!(super::app_dir(base.path()), base.path().join("nano-coder"));
+    }
+
     use super::*;
 
     #[test]

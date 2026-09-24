@@ -88,10 +88,7 @@ pub struct SessionLog {
 }
 
 pub fn default_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("agentic-harness")
-        .join("sessions")
+    crate::config::app_dir(&dirs::data_local_dir().unwrap_or_else(std::env::temp_dir)).join("sessions")
 }
 
 pub fn new_session_id() -> String {
