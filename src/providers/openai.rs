@@ -122,7 +122,9 @@ pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
     };
     let (content, inline_thinking) = ThinkSplitter::split_all(&content);
     let reasoning = reasoning_of(&message).unwrap_or_default();
-    let thinking_blocks = reasoning_blocks(replay, reasoning);
+    // Replay only the provider's actual `reasoning_content`, never the generic
+    // `reasoning` fallback, which must not be echoed back under Kimi's field.
+    let thinking_blocks = reasoning_blocks(replay, reasoning_content_of(&message).unwrap_or_default());
     let mut thinking = reasoning.to_string();
     if !inline_thinking.is_empty() {
         if !thinking.is_empty() {
@@ -195,6 +197,16 @@ fn reasoning_of(value: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
+/// The provider's actual `reasoning_content` field only (never the generic
+/// `reasoning` fallback). Replay must echo this verbatim, so a value the
+/// response never supplied under `reasoning_content` must not be sent back.
+fn reasoning_content_of(value: &Value) -> Option<&str> {
+    value
+        .get(REASONING_BLOCK)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
 /// Accumulates a streamed Chat Completions response.
 #[derive(Default)]
 pub(crate) struct StreamAccumulator {
@@ -229,8 +241,12 @@ impl StreamAccumulator {
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
         if let Some(reasoning) = reasoning_of(&delta) {
             self.thinking.push_str(reasoning);
-            self.reasoning.push_str(reasoning);
             sink(StreamEvent::Thinking(reasoning));
+        }
+        // Accumulate replay reasoning from the actual `reasoning_content` field
+        // only, so the generic `reasoning` fallback is never replayed.
+        if let Some(reasoning_content) = reasoning_content_of(&delta) {
+            self.reasoning.push_str(reasoning_content);
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             let (content, thinking) = (&mut self.content, &mut self.thinking);
@@ -438,6 +454,19 @@ mod tests {
         assert_eq!(body["messages"][2]["tool_calls"][0]["function"]["arguments"], "{}");
         assert_eq!(body["messages"][3]["tool_call_id"], "c1");
         assert_eq!(body["tools"][0]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn replay_ignores_generic_reasoning_field() {
+        // With replay enabled but only the generic `reasoning` field present,
+        // the value is shown as thinking but never stored as a replay block.
+        let response = parse_response(
+            &json!({ "choices": [{"message": {"content": "hi", "reasoning": "generic"}}] }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(response.thinking, "generic");
+        assert!(response.thinking_blocks.is_empty());
     }
 
     #[test]
