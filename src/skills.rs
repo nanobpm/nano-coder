@@ -138,9 +138,13 @@ impl Skills {
         let mut this = Self::default();
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let root = crate::instructions::git_root(&cwd).unwrap_or(cwd);
+        // Confine workspace skill discovery to the repository root: a configured
+        // directory that canonicalizes outside it (e.g. `.agents/skills` committed
+        // as a symlink to an external directory) must be rejected.
+        let confine = root.canonicalize().ok();
         let mut seen = HashSet::new();
         for dir in &config.dirs {
-            this.add_dir(&root.join(dir), Source::Workspace, &mut seen);
+            this.add_dir(&root.join(dir), Source::Workspace, confine.as_deref(), &mut seen);
         }
         if config.ai_lock {
             this.add_lock(&root, config, locations, &mut seen);
@@ -151,16 +155,22 @@ impl Skills {
                 (Some(_), None) => continue,
                 (None, _) => PathBuf::from(dir),
             };
-            this.add_dir(&path, Source::User, &mut seen);
+            this.add_dir(&path, Source::User, None, &mut seen);
         }
         this
     }
 
-    fn add_dir(&mut self, dir: &Path, source: Source, seen: &mut HashSet<String>) {
+    fn add_dir(&mut self, dir: &Path, source: Source, confine: Option<&Path>, seen: &mut HashSet<String>) {
         // Canonicalize the configured directory and keep discovery inside it, so
         // a `SKILL.md` symlink or a skill-directory symlink cannot pull a file
         // from outside the configured root into the prompt.
         let Ok(root) = dir.canonicalize() else { return };
+        // For workspace dirs a confinement boundary (the repository root) is set:
+        // reject a configured directory whose canonical target escapes it, so a
+        // symlinked skills root cannot bypass repository containment.
+        if confine.is_some_and(|c| !root.starts_with(c)) {
+            return;
+        }
         let mut found = Vec::new();
         scan(&root, &root, 0, &mut found);
         for skill_dir in found {
