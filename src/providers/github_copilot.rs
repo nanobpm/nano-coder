@@ -320,7 +320,7 @@ impl LLMClient for GithubCopilotClient {
                 })
                 .await;
             match result {
-                Ok(value) => return openai::parse_response(&value),
+                Ok(value) => return openai::parse_response(&value, self.transport.provider().replay_reasoning),
                 // The session token was revoked or expired early: re-exchange once.
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
                 Err(e) => return Err(e),

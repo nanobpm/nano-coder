@@ -83,7 +83,13 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
             ),
             Role::Assistant => {
                 // Reasoning blocks must precede the text and tool use they led to.
-                let mut blocks = message.thinking_blocks.clone();
+                // Blocks from other providers (e.g. OpenAI-style reasoning) are not replayable here.
+                let mut blocks: Vec<Value> = message
+                    .thinking_blocks
+                    .iter()
+                    .filter(|b| matches!(b.get("type").and_then(Value::as_str), Some("thinking" | "redacted_thinking")))
+                    .cloned()
+                    .collect();
                 if !message.content.is_empty() {
                     blocks.push(json!({"type": "text", "text": message.content}));
                 }
@@ -451,5 +457,15 @@ mod tests {
         let encoded = encode_messages(&[Message::user("hello"), assistant]);
         assert_eq!(encoded[1]["content"][0], json!({"type": "thinking", "thinking": "Plan.", "signature": "sig"}));
         assert_eq!(encoded[1]["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn skips_reasoning_blocks_from_openai_compatible_providers() {
+        let assistant = Message {
+            thinking_blocks: vec![json!({"type": "reasoning_content", "text": "from kimi"})],
+            ..Message::assistant("hi")
+        };
+        let encoded = encode_messages(&[Message::user("hello"), assistant]);
+        assert_eq!(encoded[1]["content"], json!([{"type": "text", "text": "hi"}]));
     }
 }
