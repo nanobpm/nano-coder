@@ -114,7 +114,14 @@ jobs:
         id: auth
         if: env.HAS_TOKEN != 'true'
         uses: rust-lang/crates-io-auth-action@v1
-      - run: cargo publish --locked
+      - name: Publish (skipped if this version is already on crates.io)
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if curl -sf -A "nano-coder-release (github.com/nanobpm/nano-coder)" "https://crates.io/api/v1/crates/nano-coder/$v" >/dev/null; then
+            echo "nano-coder $v already published; skipping"
+          else
+            cargo publish --locked
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
 
@@ -147,8 +154,18 @@ jobs:
           set -euo pipefail
           flags=(--access public --provenance)
           [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
+          publish() {
+            local id
+            id=$(node -p "const p=require('./$1/package.json'); p.name+'@'+p.version")
+            if npm view "$id" version >/dev/null 2>&1; then
+              echo "$id already published; skipping"
+            else
+              (cd "$1" && npm publish "${flags[@]}")
+            fi
+          }
           for d in npm-dist/*/; do
-            [ "$d" = "npm-dist/nano-coder/" ] && continue
-            (cd "$d" && npm publish "${flags[@]}")
+            d=${d%/}
+            [ "$d" = "npm-dist/nano-coder" ] && continue
+            publish "$d"
           done
-          (cd npm-dist/nano-coder && npm publish "${flags[@]}")
+          publish npm-dist/nano-coder

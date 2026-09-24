@@ -10,6 +10,9 @@
 To check a release without publishing, run the workflow manually (`workflow_dispatch`) with
 `dry_run` left on. It builds everything and runs `npm publish --dry-run`.
 
+Publishing skips any crate or npm package whose version is already on the registry, so a
+failed release can be re-run, and a tag can be pushed for a version that was published locally.
+
 ## Registry auth
 
 Both registries use trusted publishing (GitHub OIDC), so no long-lived tokens are needed once
@@ -22,6 +25,8 @@ first release needs one of these:
 - **Local:** `cargo login` then `cargo publish`; for npm, run
   `node scripts/npm-packages.mjs --version X.Y.Z --binaries <dir> --out npm-dist` and
   `npm publish --access public` in each `npm-dist/*` directory (platform packages first).
+  0.1.0 was published this way, using the binaries from a `dry_run` workflow run
+  (`gh run download <run-id> -p 'bin-*'`).
 
 Then configure trusted publishing and remove the tokens:
 
