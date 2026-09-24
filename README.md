@@ -268,8 +268,10 @@ Built-in presets:
 | `groq` | openai | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
 | `together` | openai | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
 | `deepseek` | openai | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `kimi` | openai | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
 | `mistral` | openai | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
+| `qwen` | openai | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
@@ -307,7 +309,19 @@ timeout_secs = 300
 max_retries = 3
 ```
 
-Other per-provider fields: `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
+`qwen` is Qwen Cloud (Alibaba Cloud Model Studio), e.g. `--model qwen/qwen3.8-max`. The
+preset uses the Singapore endpoint. API keys are bound to a region, so for another region
+or your workspace domain override `base_url`, e.g.
+`https://dashscope-us.aliyuncs.com/compatible-mode/v1` or
+`https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`.
+
+`kimi` is the Kimi API from platform.kimi.ai, e.g. `--model kimi/kimi-k3` or
+`kimi/kimi-k2.7-code`. The preset drops `temperature` (K3 fixes it) and sets
+`replay_reasoning = true`, which sends each assistant message's `reasoning_content` back
+as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
+make K3 think less.
+
+Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
 `retryable_statuses`.
 

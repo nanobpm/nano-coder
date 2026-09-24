@@ -76,6 +76,10 @@ pub struct ProviderConfig {
     pub retry_initial_backoff_ms: Option<u64>,
     pub retry_max_backoff_ms: Option<u64>,
     pub retryable_statuses: Option<Vec<u16>>,
+    /// Send each assistant message's `reasoning_content` back to the provider,
+    /// for thinking models that require it in multi-turn and tool-call
+    /// conversations (e.g. Kimi K3). Default false.
+    pub replay_reasoning: Option<bool>,
 }
 
 impl ProviderConfig {
@@ -96,7 +100,7 @@ impl ProviderConfig {
         take!(
             kind, base_url, api_key, api_key_env, api_key_command, default_model, extra_body, drop_params,
             max_tokens_param, context_window, stream, timeout_secs, max_retries, retry_initial_backoff_ms,
-            retry_max_backoff_ms, retryable_statuses
+            retry_max_backoff_ms, retryable_statuses, replay_reasoning
         );
         self.headers.extend(other.headers.clone());
         self
@@ -123,6 +127,17 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     add("groq", ProviderConfig::preset(Openai, "https://api.groq.com/openai/v1", Some("GROQ_API_KEY")));
     add("together", ProviderConfig::preset(Openai, "https://api.together.xyz/v1", Some("TOGETHER_API_KEY")));
     add("deepseek", ProviderConfig::preset(Openai, "https://api.deepseek.com/v1", Some("DEEPSEEK_API_KEY")));
+    add(
+        "kimi",
+        ProviderConfig {
+            max_tokens_param: Some("max_completion_tokens".into()),
+            // K3 fixes temperature and rejects other values; it also needs its
+            // reasoning replayed with each assistant message.
+            drop_params: Some(vec!["temperature".into()]),
+            replay_reasoning: Some(true),
+            ..ProviderConfig::preset(Openai, "https://api.moonshot.ai/v1", Some("MOONSHOT_API_KEY"))
+        },
+    );
     add("mistral", ProviderConfig::preset(Openai, "https://api.mistral.ai/v1", Some("MISTRAL_API_KEY")));
     add(
         "gemini",
@@ -136,6 +151,10 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
             default_model: Some("gpt-4.1".into()),
             ..Default::default()
         },
+    );
+    add(
+        "qwen",
+        ProviderConfig::preset(Openai, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", Some("DASHSCOPE_API_KEY")),
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
     add("llamacpp", ProviderConfig::preset(Openai, "http://localhost:8080/v1", None));
@@ -210,6 +229,7 @@ pub struct ResolvedProvider {
     pub timeout: Duration,
     pub retry: RetryPolicy,
     pub retryable_statuses: Vec<u16>,
+    pub replay_reasoning: bool,
 }
 
 pub fn resolve(
@@ -270,6 +290,7 @@ pub fn resolve(
         drop_params: config.drop_params.clone().unwrap_or_default(),
         max_tokens_param: config.max_tokens_param.clone().unwrap_or_else(|| "max_tokens".into()),
         stream: config.stream.unwrap_or(true),
+        replay_reasoning: config.replay_reasoning.unwrap_or(false),
         timeout: Duration::from_secs(config.timeout_secs.unwrap_or(600)),
         retry: RetryPolicy {
             max_retries: config.max_retries.unwrap_or(defaults.max_retries),
@@ -761,6 +782,21 @@ mod tests {
             parse_model_spec("meta-llama/llama-4", &providers, "together"),
             ("together", Some("meta-llama/llama-4"))
         );
+    }
+
+    #[test]
+    fn qwen_and_kimi_presets() {
+        let user = HashMap::new();
+        let qwen = resolve("qwen/qwen3.8-max", &user, "mock").unwrap();
+        assert_eq!(qwen.base_url, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1");
+        assert!(!qwen.replay_reasoning);
+        let kimi = resolve("kimi/kimi-k3", &user, "mock").unwrap();
+        assert_eq!((kimi.base_url.as_str(), kimi.model.as_str()), ("https://api.moonshot.ai/v1", "kimi-k3"));
+        assert!(kimi.replay_reasoning);
+        assert_eq!(kimi.drop_params, vec!["temperature"]);
+        assert_eq!(kimi.max_tokens_param, "max_completion_tokens");
+        assert_eq!(presets()["kimi"].api_key_env.as_deref(), Some("MOONSHOT_API_KEY"));
+        assert_eq!(presets()["qwen"].api_key_env.as_deref(), Some("DASHSCOPE_API_KEY"));
     }
 
     #[test]

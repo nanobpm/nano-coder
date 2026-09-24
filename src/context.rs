@@ -114,6 +114,7 @@ pub fn window_for_model(model: &str) -> Option<usize> {
         ("grok", 256_000),
         ("mistral-large", 128_000),
         ("codestral", 256_000),
+        ("kimi-k3", 1_000_000),
         ("kimi", 256_000),
         ("gpt-oss", 131_072),
         ("mock", 16_000),

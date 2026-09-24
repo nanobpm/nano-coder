@@ -31,7 +31,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         let provider = transport.provider();
         let mut body = json!({
             "model": provider.model,
-            "messages": request.messages.iter().map(encode_message).collect::<Vec<_>>(),
+            "messages": request.messages.iter().map(|m| encode_message(m, provider.replay_reasoning)).collect::<Vec<_>>(),
         });
         if !request.tools.is_empty() {
             body["tools"] = request
@@ -58,8 +58,8 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         transport.finish_body(body)
 }
 
-fn encode_message(message: &Message) -> Value {
-    match message.role {
+fn encode_message(message: &Message, replay_reasoning: bool) -> Value {
+    let mut encoded = match message.role {
         Role::Assistant if !message.tool_calls.is_empty() => json!({
             "role": "assistant",
             "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
@@ -75,11 +75,36 @@ fn encode_message(message: &Message) -> Value {
             "content": message.content,
         }),
         _ => json!({ "role": message.role.to_string(), "content": message.content }),
+    };
+    if replay_reasoning && message.role == Role::Assistant {
+        let reasoning = message
+            .thinking_blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some(REASONING_BLOCK))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        if !reasoning.is_empty() {
+            encoded["reasoning_content"] = json!(reasoning);
+        }
+    }
+    encoded
+}
+
+/// `thinking_blocks` entry holding a response's `reasoning_content`, kept only
+/// for providers with `replay_reasoning`.
+const REASONING_BLOCK: &str = "reasoning_content";
+
+fn reasoning_blocks(replay: bool, reasoning: &str) -> Vec<Value> {
+    if replay && !reasoning.is_empty() {
+        vec![json!({ "type": REASONING_BLOCK, "text": reasoning })]
+    } else {
+        vec![]
     }
 }
 
 /// Parse a Chat Completions response.
-pub fn parse_response(value: &Value) -> Result<LLMResponse> {
+/// `replay` keeps the reasoning in `thinking_blocks` so it can be sent back.
+pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
     let choice = value
         .get("choices")
         .and_then(|c| c.get(0))
@@ -96,7 +121,9 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
         _ => String::new(),
     };
     let (content, inline_thinking) = ThinkSplitter::split_all(&content);
-    let mut thinking = reasoning_of(&message).unwrap_or_default().to_string();
+    let reasoning = reasoning_of(&message).unwrap_or_default();
+    let thinking_blocks = reasoning_blocks(replay, reasoning);
+    let mut thinking = reasoning.to_string();
     if !inline_thinking.is_empty() {
         if !thinking.is_empty() {
             thinking.push('\n');
@@ -144,7 +171,7 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
             .and_then(Value::as_str)
             .map(str::to_string),
         thinking,
-        thinking_blocks: vec![],
+        thinking_blocks,
     })
 }
 
@@ -173,6 +200,9 @@ fn reasoning_of(value: &Value) -> Option<&str> {
 pub(crate) struct StreamAccumulator {
     content: String,
     thinking: String,
+    /// Reasoning from the `reasoning_content` field only (not inline `<think>`).
+    reasoning: String,
+    replay: bool,
     splitter: ThinkSplitter,
     /// Tool calls by stream index: (id, name, raw arguments).
     calls: Vec<(String, String, String)>,
@@ -181,6 +211,10 @@ pub(crate) struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    pub fn new(replay: bool) -> Self {
+        Self { replay, ..Default::default() }
+    }
+
     pub fn push(&mut self, data: &str, sink: StreamSink<'_>) -> Result<()> {
         let value: Value = serde_json::from_str(data).map_err(|e| anyhow!("invalid stream event ({e}): {data}"))?;
         if let Some(error) = value.get("error").filter(|e| !e.is_null()) {
@@ -195,6 +229,7 @@ impl StreamAccumulator {
         let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
         if let Some(reasoning) = reasoning_of(&delta) {
             self.thinking.push_str(reasoning);
+            self.reasoning.push_str(reasoning);
             sink(StreamEvent::Thinking(reasoning));
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
@@ -244,7 +279,7 @@ impl StreamAccumulator {
             usage: self.usage,
             stop_reason: self.finish_reason,
             thinking: self.thinking.trim().to_string(),
-            thinking_blocks: vec![],
+            thinking_blocks: reasoning_blocks(self.replay, &self.reasoning),
         }
     }
 }
@@ -272,10 +307,11 @@ pub(crate) async fn stream_chat(
     sink: StreamSink<'_>,
 ) -> Result<LLMResponse> {
     let body = transport.stream_body(body, json!({ "stream": true, "stream_options": { "include_usage": true } }));
-    let mut accumulator = StreamAccumulator::default();
+    let replay = transport.provider().replay_reasoning;
+    let mut accumulator = StreamAccumulator::new(replay);
     let whole = transport.post_stream_to(url, &body, auth, &mut |data| accumulator.push(data, sink)).await?;
     if let Some(value) = whole {
-        let response = parse_response(&value)?;
+        let response = parse_response(&value, replay)?;
         report_whole(sink, &response);
         return Ok(response);
     }
@@ -294,7 +330,7 @@ impl LLMClient for OpenAiClient {
                 None => builder,
             })
             .await?;
-        parse_response(&value)
+        parse_response(&value, self.transport.provider().replay_reasoning)
     }
 
     async fn chat_stream(&self, request: &ChatRequest<'_>, sink: StreamSink<'_>) -> Result<LLMResponse> {
@@ -412,7 +448,7 @@ mod tests {
                 {"id": "b", "type": "function", "function": {"name": "bash", "arguments": "{oops"}}
             ]}}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        }))
+        }), false)
         .unwrap();
         assert_eq!(response.tool_calls[0].arguments["command"], "ls");
         assert_eq!(response.tool_calls[1].arguments, Value::String("{oops".into()));
@@ -511,9 +547,46 @@ mod tests {
         assert_eq!(response.usage.unwrap().total_tokens, 17);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
         assert_eq!(*seen.lock().unwrap(), vec!["R:Let me ", "R:check.", "R:more", "T:Checking"]);
+        assert!(response.thinking_blocks.is_empty(), "reasoning is kept only with replay_reasoning");
         let captured = captured.lock().unwrap();
         assert_eq!(captured[0].body["stream"], true);
         assert_eq!(captured[0].body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn replays_reasoning_content_when_enabled() {
+        let events = [
+            json!({"choices":[{"delta":{"role":"assistant","reasoning_content":"Need ls."}}]}),
+            json!({"choices":[{"delta":{"content":"<think>inline</think>ok"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ];
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+        let (url, _) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", body)]).await;
+        let mut resolved = provider(&url, "");
+        resolved.replay_reasoning = true;
+        let client = OpenAiClient::new(resolved.clone()).unwrap();
+        let messages = [Message::user("hello")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let response = client.chat_stream(&request, &|_| {}).await.unwrap();
+        // Only the provider's reasoning field is replayed, not inline <think> text.
+        assert_eq!(response.thinking_blocks, vec![json!({"type": "reasoning_content", "text": "Need ls."})]);
+
+        let assistant = Message {
+            tool_calls: response.tool_calls.clone(),
+            thinking_blocks: response.thinking_blocks.clone(),
+            ..Message::assistant(&response.content)
+        };
+        let history = [Message::user("hello"), assistant, Message {
+            thinking_blocks: vec![json!({"type": "thinking", "thinking": "t", "signature": "s"})],
+            ..Message::assistant("done")
+        }];
+        let request = ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None };
+        let body = client.build_body(&request);
+        assert_eq!(body["messages"][1]["reasoning_content"], "Need ls.");
+        assert!(body["messages"][2].get("reasoning_content").is_none(), "Anthropic blocks are not replayed");
+        resolved.replay_reasoning = false;
+        let body = OpenAiClient::new(resolved).unwrap().build_body(&request);
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 
     #[tokio::test]
