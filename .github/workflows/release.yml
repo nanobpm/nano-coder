@@ -110,18 +110,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Trusted publishing token
-        id: auth
-        if: env.HAS_TOKEN != 'true'
-        uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish (skipped if this version is already on crates.io)
+      - name: Already published?
+        id: exists
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           if curl -sf -A "nano-coder-release (github.com/nanobpm/nano-coder)" "https://crates.io/api/v1/crates/nano-coder/$v" >/dev/null; then
             echo "nano-coder $v already published; skipping"
-          else
-            cargo publish --locked
+            echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Trusted publishing token
+        id: auth
+        if: steps.exists.outputs.skip != 'true' && env.HAS_TOKEN != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+      - if: steps.exists.outputs.skip != 'true'
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
 
