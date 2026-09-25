@@ -257,7 +257,13 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     let (user, _) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut labels: Vec<String> = vec!["New provider".into()];
-    labels.extend(all.keys().cloned());
+    for name in all.keys() {
+        if user.contains_key(name) {
+            labels.push(format!("✓ {name}"));
+        } else {
+            labels.push(name.clone());
+        }
+    }
     labels.push("Cancel".into());
     let choice = Select::new().with_prompt("Provider to add or edit").items(&labels).default(0).interact()?;
     let name = match choice {
@@ -275,7 +281,7 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
                 .interact_text()?;
             name.trim().to_string()
         }
-        i if i < labels.len() - 1 => labels[i].clone(),
+        i if i < labels.len() - 1 => labels[i].trim_start_matches("✓ ").to_string(),
         _ => return Ok(None),
     };
     let current = all.get(&name).cloned().unwrap_or_default();

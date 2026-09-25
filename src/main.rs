@@ -263,7 +263,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to steer, Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
-    // Blank line separates user input from LLM output.
+    // Blank line after LLM output.
     println!();
     renderer.begin_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
@@ -514,14 +514,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
             if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("\n{}", ui::stamp_block(&outcome.response));
+                println!("{}", ui::stamp_block(&outcome.response));
             } else if outcome.stop_reason == agent::StopReason::Cancelled {
                 println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
             } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
                 let last = outcome.response.lines().last().unwrap_or_default();
                 println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
             }
-            println!();
             Ok(true)
         }
     }
@@ -700,6 +699,7 @@ async fn main() -> Result<()> {
             }
             let prompt = |terminal: &Terminal| {
                 if terminal.queued.is_empty() {
+                    println!();
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
                     io::stdout().write_all(prompt.as_bytes()).unwrap();
