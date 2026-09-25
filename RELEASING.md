@@ -1,39 +1,59 @@
 # Releasing nano-coder
 
-1. Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, and merge that.
-2. Tag the merge commit `vX.Y.Z` and push the tag. `.github/workflows/release.yml` then:
-   - builds `nano-coder` for macOS (arm64, x64) and Linux (arm64, x64, glibc ≥ 2.35);
-   - creates a GitHub release with tarballs and `SHA256SUMS`;
+Releases are cut automatically from `main` by
+[semantic-release](https://semantic-release.gitbook.io/) in `.github/workflows/release.yml`.
+
+## Commit messages
+
+PRs are squash-merged, and the PR title becomes the commit subject, so PR titles must follow
+[Conventional Commits](https://www.conventionalcommits.org/). The `PR title` check enforces it.
+
+| Title | Release |
+|---|---|
+| `fix: ...`, `perf: ...` | patch (0.2.0 → 0.2.1) |
+| `feat: ...` | minor (0.2.0 → 0.3.0) |
+| `feat!: ...`, or a `BREAKING CHANGE:` footer | major (0.2.0 → 1.0.0) |
+| `docs:`, `refactor:`, `test:`, `ci:`, `build:`, `chore:` | no release |
+
+A scope is optional: `fix(sandbox): ...`.
+
+## What happens on a push to main
+
+1. semantic-release reads the commits since the last `v*` tag. If none calls for a release,
+   the workflow stops.
+2. Otherwise it sets the version in `Cargo.toml` and `Cargo.lock`
+   (`scripts/set-version.mjs`), commits `chore(release): X.Y.Z [skip ci]` to `main`, tags
+   `vX.Y.Z`, and creates the GitHub release with generated notes. Released PRs and issues get
+   a comment.
+3. From the tag, the workflow:
+   - builds `nano-coder` for macOS (arm64, x64) and Linux (arm64, x64, glibc ≥ 2.35) and
+     attaches the tarballs and `SHA256SUMS` to the release;
    - publishes the crate `nano-coder` to crates.io;
    - publishes `@nanobpm/nano-coder-<os>-<cpu>` for each platform, then `@nanobpm/nano-coder`.
 
-To check a release without publishing, run the workflow manually (`workflow_dispatch`) with
-`dry_run` left on. It builds everything and runs `npm publish --dry-run`.
-
 Publishing skips any crate or npm package whose version is already on the registry, so a
-failed release can be re-run, and a tag can be pushed for a version that was published locally.
+failed publish job can simply be re-run.
+
+To preview, run the workflow manually (`workflow_dispatch`) with `dry_run` left on. It
+reports the next version, builds everything and runs `npm publish --dry-run`, but pushes,
+tags and publishes nothing.
+
+Don't bump versions or push `v*` tags by hand: semantic-release owns both.
 
 ## Registry auth
 
-Both registries use trusted publishing (GitHub OIDC), so no long-lived tokens are needed once
-it is set up. A trusted publisher can only be added to a package that already exists, so the
-first release needs one of these:
+Both registries use trusted publishing (GitHub OIDC); there are no registry tokens. The
+publishers are configured for repository `nanobpm/nano-coder`, workflow `release.yml`, so the
+workflow file must keep that name:
 
-- **Secrets:** add `CARGO_REGISTRY_TOKEN` (crates.io token with publish-new scope) and
-  `NPM_TOKEN` (npm automation token with publish rights on the `@nanobpm` scope) as repository
-  secrets. When they are set the workflow uses them.
-- **Local:** `cargo login` then `cargo publish`; for npm, run
-  `node scripts/npm-packages.mjs --version X.Y.Z --binaries <dir> --out npm-dist` and
-  `npm publish --access public` in each `npm-dist/*` directory (platform packages first).
-  0.1.0 was published this way, using the binaries from a `dry_run` workflow run
-  (`gh run download <run-id> -p 'bin-*'`).
+- crates.io → `nano-coder` → Settings → Trusted Publishing.
+- npmjs.com → each of the five `@nanobpm/nano-coder*` packages → Settings → Trusted
+  Publisher (or `npm trust github @nanobpm/<pkg> --file release.yml --repo nanobpm/nano-coder`).
 
-Then configure trusted publishing and remove the tokens:
-
-- crates.io → `nano-coder` → Settings → Trusted Publishing: repository `nanobpm/nano-coder`,
-  workflow `release.yml`.
-- npmjs.com → each of the five packages → Settings → Trusted Publisher: GitHub Actions,
-  repository `nanobpm/nano-coder`, workflow `release.yml`.
+A new platform package doesn't exist on npm yet, so it can't have a trusted publisher. Publish
+its first version locally (`node scripts/npm-packages.mjs --version X.Y.Z --binaries <dir>
+--out npm-dist`, then `npm publish --access public` in its directory, with binaries from a
+`dry_run` run: `gh run download <run-id> -p 'bin-*'`), then add the publisher.
 
 ## Adding a platform
 
