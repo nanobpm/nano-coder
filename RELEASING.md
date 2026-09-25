@@ -49,6 +49,33 @@ tags and publishes nothing.
 
 Don't bump versions or push `v*` tags by hand: semantic-release owns both.
 
+## Branch protection and the release app
+
+The `main` ruleset (Settings → Rules) requires a pull request, allows only squash merges,
+blocks force-pushes and deletion, and requires the `test (ubuntu-24.04)`, `test (macos-14)`
+and `commitlint` checks. The only actor allowed to bypass it is the **release GitHub App**,
+which semantic-release uses to push the `chore(release)` commit and tag. The workflow's own
+`GITHUB_TOKEN` can't bypass a repository ruleset, and deploy keys are disabled in the org.
+
+The workflow needs repository variable `RELEASE_APP_CLIENT_ID` and secret
+`RELEASE_APP_PRIVATE_KEY`. To set up (or rotate) the app:
+
+1. Create it at <https://github.com/organizations/nanobpm/settings/apps/new>: any unique
+   name (e.g. `nanobpm-release`), homepage `https://github.com/nanobpm/nano-coder`, webhook
+   **off**; repository permissions **Contents**, **Issues** and **Pull requests**:
+   Read and write; installable only on this account.
+2. On the app page note the **Client ID**, then **Generate a private key** (downloads a
+   `.pem`).
+3. **Install App** → nanobpm → *Only select repositories* → `nano-coder`.
+4. Store the credentials, then delete the `.pem`:
+
+   ```sh
+   gh variable set RELEASE_APP_CLIENT_ID -R nanobpm/nano-coder --body <client-id>
+   gh secret set RELEASE_APP_PRIVATE_KEY -R nanobpm/nano-coder < <app>.private-key.pem
+   ```
+5. Add the app to the ruleset's bypass list (Settings → Rules → `main` → Bypass list → add
+   the app, *Always allow*).
+
 ## Registry auth
 
 Both registries use trusted publishing (GitHub OIDC); there are no registry tokens. The

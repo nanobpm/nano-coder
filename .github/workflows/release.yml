@@ -8,8 +8,10 @@ name: Release
 # crates.io (`nano-coder`) and npm (`@nanobpm/nano-coder` plus one
 # `@nanobpm/nano-coder-<os>-<cpu>` package per platform).
 #
-# Auth: trusted publishing (OIDC) on both registries; the publisher config names
-# this file, so keep it called release.yml. See RELEASING.md.
+# Auth: main is protected by a ruleset that only the release GitHub App may
+# bypass, so semantic-release pushes with that app's token (vars.RELEASE_APP_CLIENT_ID,
+# secrets.RELEASE_APP_PRIVATE_KEY). Registries use trusted publishing (OIDC); the
+# publisher config names this file, so keep it called release.yml. See RELEASING.md.
 
 on:
   push:
@@ -31,23 +33,32 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-24.04
+    # Pushing, tagging, releasing and commenting use the app token below.
     permissions:
-      contents: write        # push the release commit and tag, create the release
-      issues: write          # comment on released issues
-      pull-requests: write   # comment on released pull requests
+      contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
       released: ${{ steps.v.outputs.released }}
     steps:
+      - name: Release app token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
       - name: semantic-release
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
           RELEASE_VERSION_FILE: ${{ runner.temp }}/next-version
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
         run: |
