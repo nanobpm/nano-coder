@@ -693,13 +693,16 @@ async fn main() -> Result<()> {
         let mut terminal = Terminal::start(config_path, view, renderer);
         let mut running = true;
         let mut exit_armed = false;
+        let mut separate = false;
         while running {
             if let Some(status) = &status {
                 status.draw();
             }
-            let prompt = |terminal: &Terminal| {
+            let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() {
-                    println!();
+                    if separate {
+                        println!();
+                    }
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
                     io::stdout().write_all(prompt.as_bytes()).unwrap();
@@ -707,13 +710,14 @@ async fn main() -> Result<()> {
                     view.prompt_redrawn();
                 }
             };
-            prompt(&terminal);
+            prompt(&terminal, separate);
+            separate = false;
 
             let input = loop {
                 match terminal.next().await {
                     TermInput::ToggleThinking => {
                         if terminal.renderer.toggle_thinking() {
-                            prompt(&terminal);
+                            prompt(&terminal, false);
                         }
                     }
                     other => break other,
@@ -743,6 +747,7 @@ async fn main() -> Result<()> {
                     eprintln!("Error: {:#}", e);
                 }
             }
+            separate = true;
         }
 
         println!("\nGoodbye!");
