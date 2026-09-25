@@ -5,8 +5,17 @@ Releases are cut automatically from `main` by
 
 ## Commit messages
 
-PRs are squash-merged, and the PR title becomes the commit subject, so PR titles must follow
-[Conventional Commits](https://www.conventionalcommits.org/). The `PR title` check enforces it.
+The repository only allows squash merges, and the PR title becomes the commit subject on
+`main`. PR titles and every commit in a PR must follow
+[Conventional Commits](https://www.conventionalcommits.org/): the `Commit messages` check runs
+[commitlint](https://commitlint.js.org/) (`commitlint.config.mjs`, the conventional preset) on
+both. Subjects start lowercase (`feat: add ...`, not `feat: Add ...`).
+
+To check messages as you commit (needs Node), enable the hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
 
 | Title | Release |
 |---|---|
