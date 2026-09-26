@@ -1,6 +1,6 @@
 [package]
 name = "nano-coder"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "A 6MB coding agent for the terminal and for agent fleets: multi-provider, ACP, resumable sessions, plans."
 license = "Apache-2.0"
