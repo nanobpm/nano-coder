@@ -24,9 +24,29 @@ pub fn terminal_size() -> Option<(u16, u16)> {
 }
 
 fn write_raw(bytes: &str) {
-    let mut out = io::stdout().lock();
-    let _ = out.write_all(bytes.as_bytes());
-    let _ = out.flush();
+    with_term_lock(|| {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(bytes.as_bytes());
+        let _ = out.flush();
+    });
+}
+
+/// A process-wide lock serialising every write to the terminal. Escape
+/// sequences are emitted from more than one thread — the renderer and line
+/// editor on the main task, the status line from the SIGWINCH handler — and a
+/// multi-write logical unit (the region reset before a redraw, a streamed
+/// fragment and its deferred notes) must not interleave with another thread's
+/// sequence, or the cursor-save/restore and cursor-addressing tear and scatter
+/// output across the screen. `std::io::Stdout`'s own lock only makes a single
+/// `write_all` atomic; this lock spans a whole unit.
+static TERM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `f` while holding the terminal write lock. Callers that emit escape
+/// sequences directly hold it across the whole logical unit. The lock is not
+/// reentrant: `f` must not call back into any terminal write helper.
+pub fn with_term_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = TERM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 /// The last scrollable row: the terminal's bottom row is reserved for the
@@ -35,18 +55,21 @@ fn scroll_region_bottom(rows: u16) -> u16 {
     rows.max(2) - 1
 }
 
-/// Bytes that clean up after a resize from `old_rows` to `rows`: drop the
-/// scroll region, erase the old *and* new bottom rows that could still hold a
-/// stale status line, then re-pin the region. This runs unconditionally for
-/// both grow and shrink. The old row is clamped to the new height because a row
-/// that scrolled off the top is no longer reachable by cursor addressing.
-fn resize_sequence(old_rows: u16, rows: u16) -> String {
-    let bottom = rows.max(2);
-    let old_bottom = old_rows.min(rows);
-    format!(
-        "\x1b7\x1b[r\x1b[{old_bottom};1H\x1b[2K\x1b[{bottom};1H\x1b[2K\x1b[1;{}r\x1b8",
-        scroll_region_bottom(rows)
-    )
+/// Bytes that clean up after a resize to `rows`: save the cursor (it sits at
+/// the conversation end), drop the scroll region, erase from the cursor to the
+/// end of the display, re-pin the region for the new height and restore the
+/// cursor. A terminal's resize reflows the whole grid and can relocate a
+/// previously-drawn status bar to a mid-screen row the app never addresses;
+/// erasing below the conversation cursor wipes any such stranded bar while
+/// leaving the conversation above and the scrollback untouched. Runs
+/// unconditionally for both grow and shrink; it addresses no absolute row, so
+/// it is safe whether the terminal grew or shrank.
+///
+/// DECSTBM homes the cursor, so the cursor must be restored after resetting
+/// the region and before erasing — otherwise `ESC[J` erases from row 1 and
+/// wipes the whole visible conversation.
+fn resize_sequence(rows: u16) -> String {
+    format!("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
 }
 
 impl StatusLine {
@@ -79,19 +102,23 @@ impl StatusLine {
         // bottom row is cleared even when the SIGWINCH resize() later no-ops.
         let Some((rows, cols)) = terminal_size() else { return };
         let mut size = self.size.lock().unwrap();
-        match *size {
+        // When the size changed, prepend the resize cleanup so the whole draw —
+        // region reset, erase-below and the fresh bar — is emitted as one
+        // atomic write. Splitting it into separate writes lets output from
+        // another thread interleave between them and tear the escape sequences.
+        let prefix = match *size {
             None => return, // torn down
             Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
-                write_raw(&resize_sequence(old_rows, rows));
                 *size = Some((rows, cols));
+                resize_sequence(rows)
             }
-            Some(_) => {}
-        }
+            Some(_) => String::new(),
+        };
         let line = match self.input.lock().unwrap().as_deref() {
             Some(text) => render_input(text, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
-        write_raw(&format!("\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
+        write_raw(&format!("{prefix}\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
     }
 
     /// Show `text` as a line being typed (None: back to the stats).
@@ -100,18 +127,11 @@ impl StatusLine {
         self.draw();
     }
 
-    /// Re-establish the region after the terminal was resized.
+    /// Re-establish the region after the terminal was resized. `draw()` already
+    /// detects a size change and emits the region reset, erase-below and fresh
+    /// bar as one atomic write, so this simply delegates to it — keeping the
+    /// SIGWINCH path a single, un-interleavable terminal write.
     pub fn resize(&self) {
-        let Some((rows, cols)) = terminal_size() else { return };
-        {
-            let mut size = self.size.lock().unwrap();
-            let Some((old_rows, old_cols)) = *size else { return };
-            if (old_rows, old_cols) == (rows, cols) {
-                return;
-            }
-            write_raw(&resize_sequence(old_rows, rows));
-            *size = Some((rows, cols));
-        }
         self.draw();
     }
 
@@ -337,24 +357,30 @@ mod tests {
     }
 
     #[test]
-    fn resize_sequence_erases_old_and_new_bottom_rows_on_grow() {
-        // Grow 24 -> 40: reset the region, erase both the old (24) and new (40)
-        // bottom rows so no stale bar survives, then re-pin for the new size.
-        let seq = resize_sequence(24, 40);
+    fn resize_sequence_erases_below_cursor_and_repins() {
+        // On resize the cursor sits at the conversation end (draws save/restore
+        // it there). Reset the region, erase from the cursor to the end of the
+        // display so any bar the terminal's resize reflow relocated below the
+        // conversation is wiped, then re-pin for the new size. The conversation
+        // above the cursor and the scrollback are left untouched.
+        let seq = resize_sequence(40);
+        assert!(seq.starts_with("\x1b7"), "cursor not saved first: {seq:?}");
         assert!(seq.contains("\x1b[r"), "region not reset to full screen: {seq:?}");
-        assert!(seq.contains("\x1b[24;1H\x1b[2K"), "old bottom row not erased: {seq:?}");
-        assert!(seq.contains("\x1b[40;1H\x1b[2K"), "new bottom row not erased: {seq:?}");
-        assert!(seq.ends_with("\x1b[1;39r\x1b8"), "region not re-pinned: {seq:?}");
+        // DECSTBM homes the cursor: it must be restored before erasing, or the
+        // erase starts at row 1 and wipes the conversation.
+        assert!(seq.contains("\x1b[r\x1b8\x1b[J"), "erase not from the restored cursor: {seq:?}");
+        assert!(seq.ends_with("\x1b[1;39r\x1b8"), "region not re-pinned / cursor not restored: {seq:?}");
     }
 
     #[test]
-    fn resize_sequence_clamps_old_row_when_shrinking() {
-        // Shrink 40 -> 24: the old bottom row (40) is off-screen and no longer
-        // addressable, so clamp to the new height rather than moving there.
-        let seq = resize_sequence(40, 24);
-        assert!(!seq.contains("40;1H"), "addressed an off-screen row: {seq:?}");
-        assert!(seq.contains("\x1b[24;1H\x1b[2K"), "bottom row not erased: {seq:?}");
-        assert!(seq.ends_with("\x1b[1;23r\x1b8"), "region not re-pinned: {seq:?}");
+    fn resize_sequence_addresses_no_absolute_row() {
+        // Erase-below is cursor-relative, so the sequence must never move to an
+        // absolute row — a row addressed after a shrink could be off-screen,
+        // and one after a grow could clobber conversation content.
+        for rows in [40, 24, 70, 110, 2, 1] {
+            let seq = resize_sequence(rows);
+            assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
+        }
     }
 
     #[test]
