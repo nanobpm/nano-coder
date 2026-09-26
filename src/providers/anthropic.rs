@@ -141,6 +141,7 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
                 id: block.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
                 name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                item_id: None,
             }),
             _ => {}
         }
@@ -266,6 +267,7 @@ impl StreamAccumulator {
                         Value::Object(map) => Value::Object(map),
                         _ => json!({}),
                     },
+                    item_id: None,
                 }),
             }
         }
@@ -385,8 +387,8 @@ mod tests {
             Message::assistant_with_tools(
                 "checking",
                 vec![
-                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}) },
-                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad") },
+                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None },
+                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad"), item_id: None },
                 ],
             ),
             Message::tool_result("t1", "get_time", "noon"),

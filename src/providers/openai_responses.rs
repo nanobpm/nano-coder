@@ -14,6 +14,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use super::{HttpTransport, StreamAction};
+use super::github_copilot::is_reasoning_model;
 use crate::llm::{
     ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
 };
@@ -43,12 +44,20 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
                     input.extend(reasoning_items(&message.thinking_blocks).cloned());
                 }
                 for call in &message.tool_calls {
-                    input.push(json!({
+                    let mut function_call = json!({
                         "type": "function_call",
                         "call_id": call.id,
                         "name": call.name,
                         "arguments": call.encoded_arguments(),
-                    }));
+                    });
+                    // Reasoning models pair the preserved reasoning item with
+                    // its call by the original `fc_*` output-item id, so replay
+                    // it when we have it (while `call_id` still pairs the call
+                    // with its `function_call_output`).
+                    if let Some(item_id) = &call.item_id {
+                        function_call["id"] = json!(item_id);
+                    }
+                    input.push(function_call);
                 }
             }
             Role::Tool => input.push(json!({
@@ -84,7 +93,12 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
             .collect();
     }
     if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
+        // Reasoning models (GPT‑5+, Grok, …) reject a non-default `temperature`
+        // and fail the request before generating, so omit it for them; the
+        // agent always supplies a value, so this is the only place to drop it.
+        if !is_reasoning_model(&provider.model) {
+            body["temperature"] = json!(temperature);
+        }
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
@@ -164,6 +178,10 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
                 ),
+                item_id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             }),
             _ => {}
         }
@@ -201,6 +219,7 @@ fn parse_usage(usage: Option<&Value>) -> Option<TokenUsage> {
 #[derive(Default)]
 struct PartialCall {
     id: String,
+    item_id: Option<String>,
     name: String,
     arguments: String,
 }
@@ -270,16 +289,19 @@ impl StreamAccumulator {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    call.item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                     call.name = str_of(&item, "name");
                 }
             }
             Some("response.output_item.done") => {
-                if self.replay {
-                    if let Some(item) = event.get("item") {
-                        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                            self.reasoning.push(item.clone());
-                        }
-                    }
+                if self.replay
+                    && let Some(item) = event.get("item")
+                    && item.get("type").and_then(Value::as_str) == Some("reasoning")
+                {
+                    self.reasoning.push(item.clone());
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -328,6 +350,7 @@ impl StreamAccumulator {
                 },
                 name: call.name,
                 arguments: ToolCall::decode_arguments(&call.arguments),
+                item_id: call.item_id,
             })
             .collect();
         LLMResponse {
@@ -392,6 +415,11 @@ mod tests {
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
     }
 
+    fn copilot_transport(model: &str) -> HttpTransport {
+        let user: HashMap<String, ProviderConfig> = HashMap::new();
+        HttpTransport::new(resolve(&format!("github-copilot/{model}"), &user, "mock").unwrap()).unwrap()
+    }
+
     fn replay_transport() -> HttpTransport {
         let mut user: HashMap<String, ProviderConfig> = HashMap::new();
         user.insert(
@@ -415,6 +443,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "get_time".into(),
                     arguments: json!({"tz": "utc"}),
+                    item_id: None,
                 }],
             ),
             Message::tool_result("call_1", "get_time", "noon"),
@@ -529,6 +558,7 @@ mod tests {
                         id: "c1".into(),
                         name: "bash".into(),
                         arguments: json!({}),
+                        item_id: None,
                     }],
                 )
             },
@@ -579,5 +609,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("boom"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn omits_temperature_for_reasoning_models_only() {
+        let messages = vec![Message::user("hi")];
+        let request = |t| ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: Some(t),
+            max_tokens: None,
+        };
+        // gpt-6-astra is a reasoning model: temperature is dropped so the
+        // Responses endpoint does not reject the request before generating.
+        let body = build_body(&copilot_transport("gpt-6-astra"), &request(0.7));
+        assert!(body.get("temperature").is_none(), "reasoning model kept temperature: {body}");
+        // gpt-4.1 routes through Responses but accepts a custom temperature.
+        let body = build_body(&copilot_transport("gpt-4.1"), &request(0.7));
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn preserves_function_call_item_id_across_replay() {
+        // A Responses function_call carries both the `call_id` and its `fc_*`
+        // output-item id; parsing keeps each in its own field.
+        let value = json!({
+            "status": "completed",
+            "output": [
+                { "type": "function_call", "id": "fc_123", "call_id": "call_1", "name": "bash", "arguments": "{}" }
+            ]
+        });
+        let response = parse_response(&value, false).unwrap();
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("fc_123"));
+
+        // Replaying that call includes the `fc_*` id on the `function_call`
+        // item, while `function_call_output` still pairs by `call_id`.
+        let messages = vec![
+            Message::assistant_with_tools("", response.tool_calls.clone()),
+            Message::tool_result("call_1", "bash", "ok"),
+        ];
+        let body = build_body(
+            &transport(),
+            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["id"], "fc_123");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn copilot_reasoning_model_replays_reasoning_by_default() {
+        let messages = vec![Message::user("hi")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        // A reasoning Copilot model opts into replayable reasoning items by
+        // default (no user config needed).
+        let body = build_body(&copilot_transport("gpt-6-astra"), &request);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["store"], json!(false));
+        // A non-reasoning Copilot model does not.
+        let body = build_body(&copilot_transport("gpt-4.1"), &request);
+        assert!(body.get("include").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn stream_captures_function_call_item_id() {
+        let events = [
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "fc_9", "call_id": "c9", "name": "bash"}}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{}"}),
+            json!({"type": "response.completed", "response": {"status": "completed"}}),
+        ];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        let response = accumulator.finish();
+        assert_eq!(response.tool_calls[0].id, "c9");
+        assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("fc_9"));
     }
 }

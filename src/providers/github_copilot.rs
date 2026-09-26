@@ -103,6 +103,33 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
     CopilotApi::Completions
 }
 
+/// Whether a Copilot model reasons, and so (1) needs its reasoning items
+/// replayed across tool calls and (2) rejects a non-default `temperature`.
+///
+/// Reasoning models are the Responses-routed families — OpenAI GPT‑5 and newer,
+/// Grok, OSWE and MAI‑Code — with `gpt-4.x` (and earlier `gpt-*`) the one
+/// non-reasoning exception, since those still accept a custom `temperature`.
+/// Non-Responses models (older Claude, the o‑series, Gemini, …) are not treated
+/// as reasoning models here: the Responses path is the only one this catalog
+/// routes reasoning models through.
+pub(crate) fn is_reasoning_model(model_id: &str) -> bool {
+    if copilot_api_for_model(model_id) != CopilotApi::Responses {
+        return false;
+    }
+    if let Some(rest) = model_id.strip_prefix("gpt-") {
+        // gpt-5, gpt-5.6, gpt-6-astra … reason; gpt-4.1 and earlier do not.
+        return leading_major_version(rest).is_some_and(|major| major >= 5);
+    }
+    true
+}
+
+/// The leading integer of a version tail such as `"5.6"`, `"6-astra"` or `"4.1"`
+/// (`5`, `6`, `4`). `None` when the tail does not start with a digit.
+fn leading_major_version(tail: &str) -> Option<u32> {
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// GitHub host (`github.com`, or a GHE.com domain via `GITHUB_COPILOT_DOMAIN`).
 pub fn domain() -> String {
     std::env::var("GITHUB_COPILOT_DOMAIN")
@@ -592,6 +619,24 @@ mod tests {
         assert_eq!(copilot_api_for_model("gemini-2.5-pro"), Completions);
     }
 
+    #[test]
+    fn classifies_reasoning_models() {
+        // GPT‑5 and newer, Grok, OSWE and MAI‑Code reason.
+        assert!(is_reasoning_model("gpt-6-astra"));
+        assert!(is_reasoning_model("gpt-5.6-sol"));
+        assert!(is_reasoning_model("gpt-5"));
+        assert!(is_reasoning_model("grok-code-fast-1"));
+        assert!(is_reasoning_model("oswe-preview"));
+        assert!(is_reasoning_model("mai-code-1"));
+        // gpt-4.x (and earlier gpt-*) accept a custom temperature — not reasoning.
+        assert!(!is_reasoning_model("gpt-4.1"));
+        assert!(!is_reasoning_model("gpt-4o-mini"));
+        // Models that never route through Responses are not treated as reasoning.
+        assert!(!is_reasoning_model("o4-mini"));
+        assert!(!is_reasoning_model("claude-sonnet-4.5"));
+        assert!(!is_reasoning_model("gemini-2.5-pro"));
+    }
+
     #[tokio::test]
     async fn routes_completions_model_to_chat_completions() {
         let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
@@ -764,7 +809,7 @@ mod tests {
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
-            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}) }]),
+            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}), item_id: None }]),
             Message::tool_result("c", "t", "ok"),
         ];
         let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };
