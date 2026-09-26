@@ -93,12 +93,15 @@ const TOOL_CACHES: &[&str] = &[
 const DEVICE_NODES: &[&str] =
     &["/dev/null", "/dev/zero", "/dev/tty", "/dev/stdout", "/dev/stderr", "/dev/ptmx", "/dev/dtracehelper"];
 
-/// Device *directories*: on Linux the path-beneath rule grants the full write
-/// set to the whole subtree below each, so granting `/dev/shm` would let a
-/// `read-only` sandbox write arbitrary host-side files there. They are only
-/// added when the sandbox already permits workspace writes, never in read-only
-/// mode (whose boundary is temp dirs only).
-const DEVICE_DIRS: &[&str] = &["/dev/fd", "/dev/pts", "/dev/shm"];
+/// Device *directory* granted as a whole subtree. Only `/dev/fd` qualifies:
+/// its entries are symlinks to the process's *own* already-open file
+/// descriptors, so `> /dev/fd/N` writes to an existing fd and cannot create new
+/// host files. `/dev/pts` (other sessions' terminals) and `/dev/shm` (a
+/// host-shared tmpfs any process can read and write) are deliberately excluded:
+/// they are shared/device-backed trees outside the workspace, so a recursive
+/// grant would let even a workspace-mode sandbox write far past its boundary. A
+/// caller that genuinely needs one can grant it explicitly via `writable`.
+const DEVICE_DIRS: &[&str] = &["/dev/fd"];
 
 impl SandboxConfig {
     pub fn active(&self) -> bool {
@@ -568,12 +571,16 @@ mod tests {
         // Node devices remain available so `> /dev/null` still works.
         assert!(ro.allows_write(Path::new("/dev/null"), workspace.path()));
 
-        // Workspace mode may still grant them.
+        // Workspace mode may still grant the safe fd subtree…
         let ws = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
         let ws_roots = ws.writable_roots(workspace.path());
-        if Path::new("/dev/shm").exists() {
-            assert!(ws_roots.iter().any(|r| r == Path::new("/dev/shm")), "workspace mode dropped /dev/shm: {ws_roots:?}");
+        if Path::new("/dev/fd").exists() {
+            assert!(ws_roots.iter().any(|r| r == Path::new("/dev/fd")), "workspace mode dropped /dev/fd: {ws_roots:?}");
         }
+        // …but never the host-shared `/dev/shm` / `/dev/pts` trees, in any mode.
+        assert!(!ws_roots.iter().any(|r| r == Path::new("/dev/shm")), "workspace mode granted shared /dev/shm: {ws_roots:?}");
+        assert!(!ws_roots.iter().any(|r| r == Path::new("/dev/pts")), "workspace mode granted shared /dev/pts: {ws_roots:?}");
+        assert!(!ws.allows_write(Path::new("/dev/shm/x"), workspace.path()));
     }
 
     #[test]
