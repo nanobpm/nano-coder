@@ -938,6 +938,17 @@ impl Agent {
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
                 let stats = self.stats.clone();
                 let rate_meter = Arc::new(Mutex::new(RateMeter::default()));
+                // A fresh generation has no measured rate yet. Clear any rate
+                // carried over from the previous response and redraw, so the
+                // status bar never shows a stale tokens/sec until the new
+                // meter's first throttled sample. `set_activity(Thinking)` does
+                // not clear it (it clears only on non-Thinking transitions), so
+                // when a queued steer keeps activity at `Thinking` across
+                // requests the old rate would otherwise linger.
+                let had_rate = stats.lock().unwrap().tokens_per_sec.take().is_some();
+                if had_rate && let Some(sink) = event_sink {
+                    sink(session_id, &AgentEvent::Context);
+                }
                 let on_stream = |event: StreamEvent<'_>| {
                     let Some(sink) = event_sink else { return };
                     let text = match event {
@@ -2181,6 +2192,40 @@ mod tests {
         let n = conversation.len();
         assert_eq!(conversation[n - 3].content, "first draft");
         assert_eq!(conversation[n - 2].content, "make it shorter");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_generation_clears_stale_output_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        // A shared slot lets the on_call hook reach the agent's live stats.
+        let stats_slot: Arc<Mutex<Option<SharedStats>>> = Arc::new(Mutex::new(None));
+        let observed: Arc<Mutex<Vec<Option<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = stats_slot.clone();
+        let seen_rates = observed.clone();
+        let (mut agent, _) = interfering(
+            vec![text("first draft"), text("revised")],
+            dir.path(),
+            move |call, control| {
+                let stats = slot.lock().unwrap().clone().unwrap();
+                if call == 1 {
+                    // Simulate a rate left over from this response, then queue a
+                    // steer so the turn continues into a second generation
+                    // without transitioning through `Activity::Idle`.
+                    stats.lock().unwrap().tokens_per_sec = Some(123.0);
+                    control.steer("make it shorter", None);
+                } else {
+                    // The second generation must start with a cleared rate,
+                    // even though the activity never left `Thinking`.
+                    seen_rates.lock().unwrap().push(stats.lock().unwrap().tokens_per_sec);
+                }
+            },
+            None,
+        );
+        *stats_slot.lock().unwrap() = Some(agent.context_stats());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "write").await.unwrap();
+        assert_eq!(outcome.response, "revised");
+        assert_eq!(observed.lock().unwrap().as_slice(), [None], "stale rate cleared at generation start");
     }
 
     #[tokio::test(flavor = "multi_thread")]
