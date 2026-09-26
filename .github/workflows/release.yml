@@ -1,49 +1,99 @@
 name: Release
 
-# Tag `vX.Y.Z` (matching Cargo.toml) to build binaries, create a GitHub release,
-# and publish to crates.io (`nano-coder`) and npm (`@nanobpm/nano-coder` plus one
+# Every push to main runs semantic-release. When the Conventional Commits since
+# the last tag call for a release (fix: -> patch, feat: -> minor, `!`/BREAKING
+# CHANGE -> major), it sets the version in Cargo.toml/Cargo.lock, commits
+# `chore(release): X.Y.Z`, tags `vX.Y.Z` and creates the GitHub release. The jobs
+# below then build binaries, attach them to the release, and publish to
+# crates.io (`nano-coder`) and npm (`@nanobpm/nano-coder` plus one
 # `@nanobpm/nano-coder-<os>-<cpu>` package per platform).
 #
-# Auth: trusted publishing (OIDC) on both registries — no long-lived tokens.
-# Trusted publishers can only be configured once a package exists, so the FIRST
-# release needs either a maintainer publishing locally or these repo secrets,
-# which are used when present:
-#   CARGO_REGISTRY_TOKEN — crates.io API token (publish-new scope)
-#   NPM_TOKEN            — npm automation token with publish rights on @nanobpm
-# See RELEASING.md.
+# Auth: main is protected by a ruleset that only the release GitHub App may
+# bypass, so semantic-release pushes with that app's token (vars.RELEASE_APP_CLIENT_ID,
+# secrets.RELEASE_APP_PRIVATE_KEY). Registries use trusted publishing (OIDC); the
+# publisher config names this file, so keep it called release.yml. See RELEASING.md.
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Build and pack only; publish nothing
+        description: Work out the next version, build and pack; release and publish nothing
         type: boolean
         default: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  version:
+  release:
     runs-on: ubuntu-24.04
+    # Pushing, tagging, releasing and commenting use the app token below.
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
+      released: ${{ steps.v.outputs.released }}
     steps:
+      - name: Release app token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - uses: actions/checkout@v5
-      - id: v
-        shell: bash
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: semantic-release
+        env:
+          GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_VERSION_FILE: ${{ runner.temp }}/next-version
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$crate" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version $crate"; exit 1
+          flags=()
+          [ "$DRY_RUN" = "true" ] && flags+=(--dry-run --no-ci)
+          npx --yes \
+            -p semantic-release@25 \
+            -p @semantic-release/exec@7 \
+            -p @semantic-release/git@11 \
+            -p @semantic-release/github@12 \
+            semantic-release "${flags[@]}"
+      - id: v
+        shell: bash
+        env:
+          RELEASE_VERSION_FILE: ${{ runner.temp }}/next-version
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          next="$(cat "$RELEASE_VERSION_FILE" 2>/dev/null || true)"
+          if [ -n "$next" ] && [ "$DRY_RUN" != "true" ]; then
+            git fetch --tags --quiet
+            git rev-parse -q --verify "refs/tags/v$next" >/dev/null || { echo "::error::tag v$next missing"; exit 1; }
+            echo "released=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "version=$crate" >> "$GITHUB_OUTPUT"
+          if [ -z "$next" ] && [ "$DRY_RUN" = "true" ]; then
+            # Nothing to release: dry-run the current version.
+            next="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "next version: ${next:-none}"
 
   build:
-    needs: version
+    needs: release
+    if: needs.release.outputs.version != ''
     name: build ${{ matrix.npm }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -57,6 +107,10 @@ jobs:
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, npm: linux-arm64 }
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release.outputs.released == 'true' && format('v{0}', needs.release.outputs.version) || github.sha }}
+      # No-op for a release (the tag already has it); sets the dry-run version.
+      - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -73,15 +127,15 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/${{ matrix.target }}/release/nano-coder dist/nano-coder-${{ matrix.npm }}
-          tar -C target/${{ matrix.target }}/release -czf dist/nano-coder-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz nano-coder
+          tar -C target/${{ matrix.target }}/release -czf dist/nano-coder-${{ needs.release.outputs.version }}-${{ matrix.target }}.tar.gz nano-coder
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.npm }}
           path: dist/*
 
   github-release:
-    needs: [version, build]
-    if: github.ref_type == 'tag'
+    needs: [release, build]
+    if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -91,24 +145,24 @@ jobs:
           pattern: bin-*
           merge-multiple: true
           path: dist
-      - name: Create release
+      - name: Attach binaries
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist && sha256sum *.tar.gz > SHA256SUMS
-          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --generate-notes *.tar.gz SHA256SUMS
+          gh release upload "v${{ needs.release.outputs.version }}" --repo "${GITHUB_REPOSITORY}" --clobber *.tar.gz SHA256SUMS
 
   crates-io:
-    needs: [version, build]
-    if: github.ref_type == 'tag' || !inputs.dry_run
+    needs: [release, build]
+    if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
-    env:
-      HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: v${{ needs.release.outputs.version }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Already published?
         id: exists
@@ -120,15 +174,15 @@ jobs:
           fi
       - name: Trusted publishing token
         id: auth
-        if: steps.exists.outputs.skip != 'true' && env.HAS_TOKEN != 'true'
+        if: steps.exists.outputs.skip != 'true'
         uses: rust-lang/crates-io-auth-action@v1
       - if: steps.exists.outputs.skip != 'true'
         run: cargo publish --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   npm:
-    needs: [version, build]
+    needs: [release, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -138,7 +192,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
       # Trusted publishing needs npm >= 11.5.1.
       - run: npm install -g npm@11.5.1
       - uses: actions/download-artifact@v4
@@ -146,12 +199,14 @@ jobs:
           pattern: bin-*
           merge-multiple: true
           path: bins
-      - run: node scripts/npm-packages.mjs --version ${{ needs.version.outputs.version }} --binaries bins --out npm-dist
+      # semantic-release bumped Cargo.toml on a new tag/commit we haven't checked out (and
+      # on a dry run there is no tag at all), so set the version here before packing.
+      - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
+      - run: node scripts/npm-packages.mjs --version ${{ needs.release.outputs.version }} --binaries bins --out npm-dist
       - name: Publish (platform packages first, then the main package)
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DRY_RUN: ${{ github.ref_type != 'tag' && inputs.dry_run && 'true' || 'false' }}
+          DRY_RUN: ${{ needs.release.outputs.released != 'true' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           flags=(--access public --provenance)

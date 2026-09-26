@@ -1,0 +1,29 @@
+name: Commit messages
+
+# Every commit in a PR, and the PR title (which becomes the squash-merge commit
+# subject), must follow Conventional Commits as configured in
+# commitlint.config.mjs. semantic-release reads them to pick the next version.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - run: npm install --no-save --no-package-lock --no-audit --no-fund @commitlint/cli@21 @commitlint/config-conventional@21
+      - name: PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$TITLE" | npx commitlint --verbose
+      - name: Commits
+        run: npx commitlint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}" --verbose

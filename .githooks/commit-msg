@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lint the commit message with commitlint (Conventional Commits).
+# Enable once per clone: git config core.hooksPath .githooks
+exec npx --yes -p @commitlint/cli@21 -p @commitlint/config-conventional@21 commitlint --edit "$1"
