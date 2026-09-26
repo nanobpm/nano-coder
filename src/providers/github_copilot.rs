@@ -422,7 +422,10 @@ impl LLMClient for GithubCopilotClient {
                         CopilotApi::Completions => {
                             openai::parse_response(&value, self.transport.provider().replay_reasoning)
                         }
-                        CopilotApi::Responses => openai_responses::parse_response(&value),
+                        CopilotApi::Responses => openai_responses::parse_response(
+                            &value,
+                            self.transport.provider().replay_reasoning,
+                        ),
                         CopilotApi::Messages => anthropic::parse_response(&value),
                     };
                 }

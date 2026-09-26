@@ -21,6 +21,7 @@ use crate::llm::{
 /// Responses API request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
     let provider = transport.provider();
+    let replay = provider.replay_reasoning;
     let mut instructions: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
     for message in request.messages {
@@ -34,6 +35,12 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
             Role::Assistant => {
                 if !message.content.is_empty() {
                     input.push(json!({ "role": "assistant", "content": message.content }));
+                }
+                // Reasoning models require the assistant's raw reasoning items to
+                // be replayed immediately before the function call they precede,
+                // so a tool turn keeps the required reasoning context.
+                if replay {
+                    input.extend(reasoning_items(&message.thinking_blocks).cloned());
                 }
                 for call in &message.tool_calls {
                     input.push(json!({
@@ -52,6 +59,13 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         }
     }
     let mut body = json!({ "model": provider.model, "input": input });
+    if replay {
+        // Ask the Responses API to return replayable reasoning items and keep
+        // them out of server-side state, so the raw items we replay above stay
+        // valid on the next turn.
+        body["include"] = json!(["reasoning.encrypted_content"]);
+        body["store"] = json!(false);
+    }
     if !instructions.is_empty() {
         body["instructions"] = json!(instructions.join("\n\n"));
     }
@@ -98,21 +112,41 @@ fn reasoning_text(item: &Value) -> String {
         .collect()
 }
 
+/// The raw `reasoning` items among `thinking_blocks`, preserved verbatim so
+/// they can be replayed to the Responses API before their function call.
+fn reasoning_items(blocks: &[Value]) -> impl Iterator<Item = &Value> {
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("reasoning"))
+}
+
 /// Parse a complete (non-streamed) Responses payload.
-pub(crate) fn parse_response(value: &Value) -> Result<LLMResponse> {
+/// `replay` preserves the raw reasoning items so they can be replayed on the
+/// next turn (required by reasoning models that use tools).
+pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
+    if value.get("status").and_then(Value::as_str) == Some("failed") {
+        let error = value.get("error").cloned().unwrap_or_else(|| value.clone());
+        return Err(anyhow!("response failed: {error}"));
+    }
     let output = value
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("response has no output: {value}"))?;
     let mut content = String::new();
     let mut thinking = String::new();
+    let mut thinking_blocks = Vec::new();
     let mut tool_calls = Vec::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
                 content.push_str(&parts_text(item.get("content").unwrap_or(&Value::Null)))
             }
-            Some("reasoning") => thinking.push_str(&reasoning_text(item)),
+            Some("reasoning") => {
+                thinking.push_str(&reasoning_text(item));
+                if replay {
+                    thinking_blocks.push(item.clone());
+                }
+            }
             Some("function_call") => tool_calls.push(ToolCall {
                 id: item
                     .get("call_id")
@@ -143,7 +177,7 @@ pub(crate) fn parse_response(value: &Value) -> Result<LLMResponse> {
             .and_then(Value::as_str)
             .map(str::to_string),
         thinking,
-        thinking_blocks: Vec::new(),
+        thinking_blocks,
     })
 }
 
@@ -177,11 +211,20 @@ struct StreamAccumulator {
     content: String,
     thinking: String,
     calls: Vec<(u64, PartialCall)>,
+    reasoning: Vec<Value>,
+    replay: bool,
     usage: Option<TokenUsage>,
     stop_reason: Option<String>,
 }
 
 impl StreamAccumulator {
+    fn new(replay: bool) -> Self {
+        Self {
+            replay,
+            ..Self::default()
+        }
+    }
+
     fn call(&mut self, index: u64) -> &mut PartialCall {
         if !self.calls.iter().any(|(i, _)| *i == index) {
             self.calls.push((index, PartialCall::default()));
@@ -230,11 +273,20 @@ impl StreamAccumulator {
                     call.name = str_of(&item, "name");
                 }
             }
+            Some("response.output_item.done") => {
+                if self.replay {
+                    if let Some(item) = event.get("item") {
+                        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                            self.reasoning.push(item.clone());
+                        }
+                    }
+                }
+            }
             Some("response.function_call_arguments.delta") => {
                 let piece = str_of(&event, "delta");
                 self.call(index).arguments.push_str(&piece);
             }
-            Some("response.completed" | "response.incomplete" | "response.failed") => {
+            Some("response.completed" | "response.incomplete") => {
                 if let Some(response) = event.get("response") {
                     if let Some(usage) = parse_usage(response.get("usage")) {
                         self.usage = Some(usage);
@@ -243,6 +295,14 @@ impl StreamAccumulator {
                         self.stop_reason = Some(status.to_string());
                     }
                 }
+            }
+            Some("response.failed") => {
+                let error = event
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .cloned()
+                    .unwrap_or_else(|| event.clone());
+                return Err(anyhow!("response failed: {error}"));
             }
             Some("error" | "response.error") => {
                 let error = event.get("error").cloned().unwrap_or(event.clone());
@@ -276,7 +336,7 @@ impl StreamAccumulator {
             usage: self.usage,
             stop_reason: self.stop_reason,
             thinking: self.thinking,
-            thinking_blocks: Vec::new(),
+            thinking_blocks: self.reasoning,
         }
     }
 }
@@ -291,7 +351,8 @@ pub(crate) async fn stream(
     sink: StreamSink<'_>,
 ) -> Result<LLMResponse> {
     let body = transport.stream_body(body, json!({ "stream": true }));
-    let mut accumulator = StreamAccumulator::default();
+    let replay = transport.provider().replay_reasoning;
+    let mut accumulator = StreamAccumulator::new(replay);
     let whole = transport
         .post_stream_to(url, &body, auth, &mut |action| match action {
             StreamAction::Data(data) => {
@@ -305,13 +366,13 @@ pub(crate) async fn stream(
                 Ok(visible.load(Ordering::Relaxed))
             }
             StreamAction::Reset => {
-                accumulator = StreamAccumulator::default();
+                accumulator = StreamAccumulator::new(replay);
                 Ok(false)
             }
         })
         .await?;
     if let Some(value) = whole {
-        let response = parse_response(&value)?;
+        let response = parse_response(&value, replay)?;
         report_whole(sink, &response);
         return Ok(response);
     }
@@ -328,6 +389,18 @@ mod tests {
 
     fn transport() -> HttpTransport {
         let user: HashMap<String, ProviderConfig> = HashMap::new();
+        HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
+    }
+
+    fn replay_transport() -> HttpTransport {
+        let mut user: HashMap<String, ProviderConfig> = HashMap::new();
+        user.insert(
+            "openai".into(),
+            ProviderConfig {
+                replay_reasoning: Some(true),
+                ..Default::default()
+            },
+        );
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
     }
 
@@ -389,7 +462,7 @@ mod tests {
             ],
             "usage": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15 }
         });
-        let response = parse_response(&value).unwrap();
+        let response = parse_response(&value, false).unwrap();
         assert_eq!(response.content, "hello");
         assert_eq!(response.thinking, "think");
         assert_eq!(response.stop_reason.as_deref(), Some("completed"));
@@ -424,5 +497,87 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "bash");
         assert_eq!(response.tool_calls[0].arguments["cmd"], "ls");
         assert_eq!(response.usage.unwrap().total_tokens, 7);
+    }
+
+    #[test]
+    fn replays_reasoning_items_before_tool_call() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "plan" }],
+            "encrypted_content": "enc",
+        });
+        let value = json!({
+            "status": "completed",
+            "output": [
+                reasoning,
+                { "type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}" }
+            ]
+        });
+        // Parse with replay preserves the raw reasoning item.
+        let response = parse_response(&value, true).unwrap();
+        assert_eq!(response.thinking_blocks, vec![reasoning.clone()]);
+
+        // The next turn replays that item immediately before its function call.
+        let messages = vec![
+            Message::user("go"),
+            Message {
+                thinking_blocks: response.thinking_blocks.clone(),
+                ..Message::assistant_with_tools(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: json!({}),
+                    }],
+                )
+            },
+            Message::tool_result("c1", "bash", "ok"),
+        ];
+        let body = build_body(
+            &replay_transport(),
+            &ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+            },
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["store"], json!(false));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1], reasoning);
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
+    }
+
+    #[test]
+    fn parse_response_propagates_failed_status() {
+        let value = json!({
+            "status": "failed",
+            "output": [],
+            "error": { "message": "content policy" }
+        });
+        let error = parse_response(&value, false).unwrap_err().to_string();
+        assert!(error.contains("failed"), "unexpected error: {error}");
+        assert!(
+            error.contains("content policy"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn stream_failed_event_is_an_error() {
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        let event = json!({
+            "type": "response.failed",
+            "response": { "status": "failed", "error": { "message": "boom" } }
+        });
+        let error = accumulator
+            .push(&event.to_string(), sink)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("boom"), "unexpected error: {error}");
     }
 }
