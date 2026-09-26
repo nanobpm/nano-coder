@@ -46,9 +46,21 @@ impl RateMeter {
     /// Minimum spacing between rate updates (~4 Hz) to avoid flicker/overhead.
     const THROTTLE: Duration = Duration::from_millis(250);
 
+    /// Minimum span the streamed deltas must cover before any rate is
+    /// published. This is what actually distinguishes an incremental stream
+    /// from a whole-response burst: `LLMClient::streams()` was only a
+    /// *configured* capability, not proof this call streamed. A provider with
+    /// `stream = true` that returns a single plain-JSON body still hands the
+    /// whole response to `report_whole` in one delta, and a genuinely
+    /// word-by-word client that never advertised streaming should still be
+    /// metered. Gating on the real delivery span covers both: a burst lands all
+    /// its deltas within microseconds (< `MIN_SPAN`) → no rate, whatever the
+    /// provider config; a real stream spans `MIN_SPAN` → a rate is published.
+    const MIN_SPAN: Duration = Duration::from_millis(250);
+
     /// Record `bytes` of streamed output produced at `now`. Returns the current
     /// rate (tokens/sec) when enough time has passed to refresh the display,
-    /// otherwise `None` (first token, zero elapsed, or throttled).
+    /// otherwise `None` (first token, sub-`MIN_SPAN` span, or throttled).
     fn record(&mut self, bytes: usize, now: Instant) -> Option<f64> {
         // Ignore zero-byte deltas: some producers emit empty text/thinking
         // deltas, and starting the clock on one would depress the later rate
@@ -58,8 +70,11 @@ impl RateMeter {
         }
         let start = *self.first_token_at.get_or_insert(now);
         self.bytes += bytes;
-        let elapsed = now.duration_since(start).as_secs_f64();
-        if elapsed <= 0.0 {
+        let elapsed = now.duration_since(start);
+        // A whole-response burst delivers every delta within microseconds of
+        // the first, so its span never reaches `MIN_SPAN` and no misleading
+        // near-infinite rate is published.
+        if elapsed < Self::MIN_SPAN {
             return None;
         }
         let due = self.last_emit.is_none_or(|t| now.duration_since(t) >= Self::THROTTLE);
@@ -67,22 +82,23 @@ impl RateMeter {
             return None;
         }
         self.last_emit = Some(now);
-        Some(self.bytes.div_ceil(4) as f64 / elapsed)
+        Some(self.bytes.div_ceil(4) as f64 / elapsed.as_secs_f64())
     }
 
-    /// Compute a final rate at turn end, ignoring the throttle, so streams that
-    /// arrive as a single delta (elapsed zero at `record` time, hence never
-    /// published) still report a rate. Uses the exact completion-token count
-    /// when known, otherwise the streamed-byte estimate. Returns `None` when no
-    /// output was streamed or no measurable time elapsed.
+    /// Compute a final rate at turn end, ignoring the throttle, so a slow
+    /// stream whose last delta was throttled still reports a rate. Uses the
+    /// exact completion-token count when known, otherwise the streamed-byte
+    /// estimate. Returns `None` when no output was streamed or the deltas never
+    /// spanned `MIN_SPAN` (a whole-response burst), so the same runtime
+    /// delivery-mode gate applies here as in `record`.
     fn finish(&self, tokens: Option<u64>, now: Instant) -> Option<f64> {
         let start = self.first_token_at?;
-        let elapsed = now.duration_since(start).as_secs_f64();
-        if elapsed <= 0.0 {
+        let elapsed = now.duration_since(start);
+        if elapsed < Self::MIN_SPAN {
             return None;
         }
         let tokens = tokens.map_or_else(|| self.bytes.div_ceil(4) as f64, |t| t as f64);
-        Some(tokens / elapsed)
+        Some(tokens / elapsed.as_secs_f64())
     }
 }
 
@@ -950,13 +966,14 @@ impl Agent {
                     sink(session_id, &AgentEvent::Context);
                 }
                 // A live tokens/sec meter is only meaningful when the provider
-                // delivers output incrementally. When `chat_stream` falls back
-                // to `report_whole` (provider `stream = false`), the entire
-                // response is handed to `on_stream` in one delta at completion,
-                // so timing it would divide the whole output by mere callback
-                // overhead and publish a meaningless huge rate. Gate every meter
-                // update on the provider actually streaming.
-                let meter_live = self.streaming && event_sink.is_some() && self.client.streams();
+                // delivers output incrementally. Whether it does is not a static
+                // capability — a provider configured with `stream = true` can
+                // still hand the whole response to `report_whole` in one delta —
+                // so we do not gate on any advertised flag here. Instead the
+                // `RateMeter` itself gates each sample on the actual delivery
+                // span (`MIN_SPAN`): a whole-response burst never spans it and
+                // publishes nothing, while a genuinely incremental stream does.
+                let meter_live = self.streaming && event_sink.is_some();
                 let on_stream = |event: StreamEvent<'_>| {
                     let Some(sink) = event_sink else { return };
                     let text = match event {
@@ -1016,10 +1033,11 @@ impl Agent {
                 match result {
                     None => break None,
                     Some(Ok(response)) => {
-                        // A stream that arrives as a single delta has zero
-                        // elapsed at `record` time and never publishes a rate;
-                        // sample the meter once here (using exact usage when
-                        // available) so one-shot streams still report one.
+                        // A slow stream whose last delta was throttled never
+                        // published its final rate; sample the meter once here
+                        // (using exact usage when available) so it still reports
+                        // one. `finish` applies the same `MIN_SPAN` gate, so a
+                        // whole-response burst still publishes nothing.
                         let tokens = response.usage.as_ref().and_then(|u| u64::try_from(u.completion_tokens).ok());
                         if let Some(rate) = meter_live
                             .then(|| rate_meter.lock().unwrap().finish(tokens, Instant::now()))
@@ -1464,8 +1482,9 @@ mod tests {
 
     #[test]
     fn rate_meter_finish_publishes_one_shot_stream() {
-        // A whole completion in a single delta: `record` sees zero elapsed and
-        // never publishes, but `finish` samples the meter at turn end.
+        // A stream whose single delta arrived early but whose generation spanned
+        // real time: `record` published nothing (throttled/first token), yet the
+        // deltas covered ≥ `MIN_SPAN`, so `finish` samples a rate at turn end.
         let mut meter = RateMeter::default();
         let t0 = Instant::now();
         assert_eq!(meter.record(400, t0), None);
@@ -1477,6 +1496,29 @@ mod tests {
         assert!((est - 50.0).abs() < 0.01, "got {est}");
         // No output streamed → no rate.
         assert_eq!(RateMeter::default().finish(Some(10), t0), None);
+    }
+
+    #[test]
+    fn rate_meter_stays_silent_for_whole_response_burst() {
+        // A whole-response burst: `report_whole` (or a `stream = true` endpoint
+        // that returns a single plain-JSON body) hands the entire output to the
+        // meter in one or more deltas that all land within microseconds. Because
+        // the deltas never span `MIN_SPAN`, neither `record` nor `finish` may
+        // publish a rate — dividing the whole output by mere callback overhead
+        // would report a meaningless near-infinite value.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        // Several deltas, all effectively simultaneous.
+        assert_eq!(meter.record(400, t0), None);
+        assert_eq!(meter.record(400, t0 + Duration::from_micros(5)), None);
+        assert_eq!(meter.record(400, t0 + Duration::from_micros(9)), None);
+        // Even a final sample (with exact usage) stays silent: the span is
+        // below `MIN_SPAN`, so no bogus rate is published.
+        assert_eq!(meter.finish(Some(300), t0 + Duration::from_micros(12)), None);
+        // Just under the threshold still publishes nothing...
+        assert_eq!(meter.finish(Some(300), t0 + Duration::from_millis(249)), None);
+        // ...but once the deltas genuinely span `MIN_SPAN`, a rate appears.
+        assert!(meter.finish(Some(300), t0 + Duration::from_millis(250)).is_some());
     }
 
     #[test]
@@ -1860,14 +1902,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn non_streaming_provider_publishes_no_output_rate() {
-        // A provider whose `chat_stream` falls back to `report_whole` (default
-        // trait impl, `streams()` == false) hands the whole response to the sink
-        // in one delta at completion. Timing that would divide the entire output
-        // by mere callback overhead and publish a meaningless huge rate, so the
-        // meter must stay silent even with the streaming UI enabled.
+        // A provider whose `chat_stream` falls back to `report_whole` (the
+        // default trait impl) hands the whole response to the sink in one delta
+        // at completion. That burst's deltas span far less than `MIN_SPAN`, so
+        // the meter must stay silent — timing it would divide the entire output
+        // by mere callback overhead and publish a meaningless huge rate — even
+        // with the streaming UI enabled.
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![text("the whole answer at once")], dir.path());
-        assert!(!agent.client.streams(), "test client uses the non-streaming default");
         agent.set_streaming(true);
         let deltas = Arc::new(Mutex::new(0usize));
         let seen = deltas.clone();

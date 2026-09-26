@@ -383,10 +383,6 @@ impl LLMClient for OpenAiClient {
         .await
     }
 
-    fn streams(&self) -> bool {
-        self.transport.provider().stream
-    }
-
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         detect_window(&self.transport).await
     }
