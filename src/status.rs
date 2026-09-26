@@ -35,13 +35,6 @@ fn scroll_region_bottom(rows: u16) -> u16 {
     rows.max(2) - 1
 }
 
-/// Bytes that reset the scroll region to the whole screen and re-pin it for a
-/// terminal `rows` tall, preserving the cursor. Used when a draw() notices the
-/// size changed under it.
-fn repin_sequence(rows: u16) -> String {
-    format!("\x1b7\x1b[r\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
-}
-
 /// Bytes that clean up after a resize from `old_rows` to `rows`: drop the
 /// scroll region, erase the old *and* new bottom rows that could still hold a
 /// stale status line, then re-pin the region. This runs unconditionally for
@@ -81,13 +74,15 @@ impl StatusLine {
         // triggered by a Context event, the renderer or lineedit before the
         // SIGWINCH handler has run must not write the status line to a
         // mid-screen row — that is what scatters copies across the screen on
-        // resize. When the size has changed, re-pin the scroll region first.
+        // resize. When the size has changed, erase the old and new bottom rows
+        // and re-pin the scroll region first, so the stale bar left at the old
+        // bottom row is cleared even when the SIGWINCH resize() later no-ops.
         let Some((rows, cols)) = terminal_size() else { return };
         let mut size = self.size.lock().unwrap();
         match *size {
             None => return, // torn down
-            Some(cached) if cached != (rows, cols) => {
-                write_raw(&repin_sequence(rows));
+            Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
+                write_raw(&resize_sequence(old_rows, rows));
                 *size = Some((rows, cols));
             }
             Some(_) => {}
@@ -313,12 +308,6 @@ mod tests {
         assert!(!seq.contains("40;1H"), "addressed an off-screen row: {seq:?}");
         assert!(seq.contains("\x1b[24;1H\x1b[2K"), "bottom row not erased: {seq:?}");
         assert!(seq.ends_with("\x1b[1;23r\x1b8"), "region not re-pinned: {seq:?}");
-    }
-
-    #[test]
-    fn repin_sequence_resets_then_pins_the_region() {
-        let seq = repin_sequence(30);
-        assert_eq!(seq, "\x1b7\x1b[r\x1b[1;29r\x1b8");
     }
 
     #[test]
