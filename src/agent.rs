@@ -974,7 +974,11 @@ impl Agent {
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
-                let result = if is_plan_tool {
+                let result = if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
+                    // The policy is consulted before dispatching to any handler, so deny
+                    // rules and the pre-tool check also cover plan, skill and outcome tools.
+                    Err(anyhow::anyhow!(reason))
+                } else if is_plan_tool {
                     self.run_plan_tool(tool_call)
                 } else if is_skill_tool {
                     self.skills.load(&tool_call.arguments).map(Value::String)
@@ -984,8 +988,6 @@ impl Agent {
                         reported = Some(outcome);
                         Value::String(text)
                     })
-                } else if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
-                    Err(anyhow::anyhow!(reason))
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
                     self.tools.execute_blocking(&tool_call.name, tool_call.arguments.clone()).await

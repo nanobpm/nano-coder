@@ -319,28 +319,48 @@ impl Parser {
         Ok(())
     }
 
-    /// Skip a balanced `${...}` or `$((...))` body, returning its text.
+    /// Skip a balanced `${...}` or `$((...))` body, returning its text. Command
+    /// substitutions (`$(...)`, backticks) nested in the body are still parsed,
+    /// since bash evaluates them; otherwise a destructive command hidden inside
+    /// an expansion (`${X:-$(rm -rf /)}`, `$(( $(rm -rf /) ))`) would go unseen.
     fn balanced(&mut self, open: char, close: char) -> Result<String, String> {
         let start = self.pos;
         let mut level = 1;
         while let Some(c) = self.peek() {
-            self.pos += 1;
             match c {
-                '\\' => self.pos += 1,
+                '\\' => self.pos += 2,
                 '\'' if open == '{' => {
+                    self.pos += 1;
                     while self.peek().is_some_and(|c| c != '\'') {
                         self.pos += 1;
                     }
                     self.pos += 1;
                 }
-                c if c == open => level += 1,
+                '`' => {
+                    self.pos += 1;
+                    self.backtick()?;
+                }
+                '$' if self.peek_at(1) == Some('(') && self.peek_at(2) == Some('(') => {
+                    self.pos += 3;
+                    self.balanced('(', ')')?;
+                    self.eat(')');
+                }
+                '$' if self.peek_at(1) == Some('(') => {
+                    self.pos += 2;
+                    self.substitution()?;
+                }
+                c if c == open => {
+                    self.pos += 1;
+                    level += 1;
+                }
                 c if c == close => {
+                    self.pos += 1;
                     level -= 1;
                     if level == 0 {
                         return Ok(self.chars[start..self.pos - 1].iter().collect());
                     }
                 }
-                _ => {}
+                _ => self.pos += 1,
             }
         }
         Err(format!("unterminated {open}"))
@@ -554,6 +574,24 @@ mod tests {
                 vec!["dd", "of=/dev/sda"],
                 vec!["echo", "$(...)", "$(...)", "$(( 1 + 2 ))", "/dev/fd/63"],
             ]
+        );
+    }
+
+    #[test]
+    fn nested_command_substitutions_are_inspected() {
+        // Command substitutions hidden inside arithmetic or parameter expansions
+        // are parsed, so the destructive command is seen rather than skipped.
+        assert_eq!(
+            words(r#"echo $(( $(rm -rf /) ))"#),
+            vec![vec!["rm", "-rf", "/"], vec!["echo", "$(( $(rm -rf /) ))"]]
+        );
+        assert_eq!(
+            words(r#"echo "${X:-$(rm -rf /)}""#),
+            vec![vec!["rm", "-rf", "/"], vec!["echo", "${X:-$(rm -rf /)}"]]
+        );
+        assert_eq!(
+            words(r#"echo "${X:-`mkfs /dev/sda`}""#),
+            vec![vec!["mkfs", "/dev/sda"], vec!["echo", "${X:-`mkfs /dev/sda`}"]]
         );
     }
 

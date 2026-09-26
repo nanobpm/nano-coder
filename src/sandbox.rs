@@ -140,6 +140,11 @@ impl SandboxConfig {
                 (Some(rest), Some(home)) => home.join(rest),
                 _ => cwd.join(extra),
             };
+            // A configured writable path is an explicit grant, so create it when it does
+            // not exist yet; otherwise `canonicalize()` fails and the grant is dropped.
+            if !path.exists() {
+                let _ = std::fs::create_dir_all(&path);
+            }
             add(path);
         }
         roots
@@ -458,5 +463,21 @@ mod tests {
         let (ok, text) = run(&config, workspace.path(), &format!("echo hi > {}/f.txt", extra.path().display()));
         assert!(ok, "{text}");
         assert!(extra.path().join("f.txt").exists());
+    }
+
+    #[test]
+    fn nonexistent_writable_paths_are_created_and_granted() {
+        let workspace = outside_dir();
+        let parent = outside_dir();
+        // A configured path that does not exist yet must still be granted, not dropped.
+        let target = parent.path().join("state/app");
+        assert!(!target.exists());
+        let config = SandboxConfig {
+            mode: SandboxMode::ReadOnly,
+            writable: vec![target.display().to_string()],
+            ..Default::default()
+        };
+        assert!(config.writable_roots(workspace.path()).iter().any(|r| r.ends_with("state/app")));
+        assert!(config.allows_write(&target.join("f.txt"), workspace.path()));
     }
 }

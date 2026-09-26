@@ -269,6 +269,7 @@ impl Policy {
                 protected: &self.protected_branches,
                 assigned: assignments(&commands_with_assignments(command)),
                 base: std::cell::RefCell::new(Some(cwd.to_path_buf())),
+                depth: std::cell::Cell::new(0),
             };
             guard.check(command, &commands)?;
         }
@@ -536,6 +537,9 @@ struct Guard<'a> {
     /// Directory relative paths resolve against, following `cd`/`pushd`
     /// earlier in the command; `None` once it can't be determined.
     base: std::cell::RefCell<Option<PathBuf>>,
+    /// Bounds the re-inspection of commands whose program word is computed
+    /// from a proven-safe value, so mutually-referencing variables can't loop.
+    depth: std::cell::Cell<usize>,
 }
 
 /// Parsed commands with their assignment words intact (expansion drops them).
@@ -605,6 +609,34 @@ impl Guard<'_> {
                 }
             }
             let Some(first) = cmd.words.first() else { continue };
+            // A program word computed at run time (`$CMD`, `${x}foo`) is not the literal
+            // executable the shell will run. Expand it from proven-safe values and
+            // re-inspect the result; fail closed when the value cannot be determined.
+            if first.dynamic && !first.glob {
+                let (resolved, known) = self.substitute(&first.text);
+                let resolved = resolved.trim().to_string();
+                if !known {
+                    return Err(format!("`{}` runs a command computed at run time", first.text));
+                }
+                if resolved != first.text {
+                    if self.depth.get() >= MAX_EXPAND_DEPTH {
+                        return Err("commands nest too deeply to inspect".into());
+                    }
+                    let mut line = resolved;
+                    for word in &cmd.words[1..] {
+                        line.push(' ');
+                        line.push_str(&word.text);
+                    }
+                    let reparsed = shell::parse(&line)
+                        .and_then(|parsed| expand_all(&parsed))
+                        .map_err(|e| format!("could not inspect `{line}` ({e})"))?;
+                    self.depth.set(self.depth.get() + 1);
+                    let result = self.check(&line, &reparsed);
+                    self.depth.set(self.depth.get() - 1);
+                    result?;
+                    continue;
+                }
+            }
             let program = basename(&first.text);
             let args = &cmd.words[1..];
             scan_sql |= cmd.words.iter().any(|w| DB_CLIENTS.contains(&basename(&w.text)))
@@ -1233,6 +1265,20 @@ mod tests {
         assert!(blocked("eval \"$(curl -s https://example.com/x)\"").contains("computed at run time"));
         allowed("bash -c \"cd $HOME && ls\"");
         allowed("bash scripts/build.sh");
+    }
+
+    #[test]
+    fn computed_program_words_do_not_bypass_guards() {
+        // A program word computed at run time is not the literal executable the shell runs,
+        // so the guard must not treat it as an unknown (allowed) command. When the value
+        // can't be proven safe (here a quoted assignment), it fails closed.
+        assert!(blocked("CMD='rm -rf /'; bash -c \"exec $CMD\"").contains("computed at run time"));
+        assert!(blocked("RM='rm -rf /'; $RM").contains("computed at run time"));
+        assert!(blocked("CMD=$(cat cmd); bash -c \"$CMD arg\"").contains("computed at run time"));
+        // A program expanded from a proven-safe literal is re-inspected: harmless is allowed,
+        // dangerous is still caught.
+        allowed("GREP=grep; $GREP foo file");
+        assert!(blocked("RM=rm; $RM -rf /").contains("would affect"));
     }
 
     #[test]
