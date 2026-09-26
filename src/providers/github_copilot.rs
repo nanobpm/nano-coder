@@ -23,7 +23,9 @@ use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, Stre
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
-const DEFAULT_API_BASE: &str = "https://api.individual.githubcopilot.com";
+/// Public Copilot API endpoint, used as the fallback when the session token
+/// carries no proxy endpoint.
+pub const DEFAULT_API_BASE: &str = "https://api.individual.githubcopilot.com";
 const MODELS_API_VERSION: &str = "2025-05-01";
 /// Refresh the session token this long before it expires.
 const REFRESH_MARGIN_SECS: i64 = 300;
