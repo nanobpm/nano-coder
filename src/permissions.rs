@@ -261,7 +261,7 @@ impl Policy {
         if self.builtin {
             for cmd in &commands {
                 for redirect in cmd.redirects.iter().filter(|r| is_write_redirect(&r.op)) {
-                    device_write(&redirect.target.text)?;
+                    device_write(&redirect.target.text, cwd)?;
                 }
             }
         }
@@ -311,14 +311,33 @@ fn is_write_redirect(op: &str) -> bool {
     matches!(op, ">" | ">>" | ">|" | "&>" | "&>>" | "<>")
 }
 
+/// Resolve a redirection/`dd` target lexically against `cwd`, collapsing `.`/`..`
+/// and following the final symlink where possible, so a device reached through a
+/// relative path (`/tmp/../dev/sda`) or a symlink is judged by its real location.
+fn resolve_target(target: &str, cwd: &Path) -> PathBuf {
+    let expanded = expand_tilde(target);
+    let joined = if expanded.is_absolute() { expanded } else { cwd.join(expanded) };
+    let norm = normalize(&joined);
+    // `canonicalize` follows every symlink (including the final component); fall
+    // back to `real` (which at least resolved the `..` lexically) when the target
+    // does not exist yet.
+    norm.canonicalize().unwrap_or_else(|_| real(&norm))
+}
+
 /// Refuse a redirection that writes directly to a raw device (`> /dev/sda`).
-fn device_write(target: &str) -> Result<(), String> {
-    let dev = target.starts_with("/dev/")
-        && !SAFE_DEVICES.contains(&target)
-        && !target.starts_with("/dev/fd/")
-        && !target.starts_with("/dev/tty")
-        && !target.starts_with("/dev/shm/")
-        && !target.starts_with("/dev/pts/");
+/// `target` is resolved against `cwd` first so a path that only *reaches* a
+/// device (`/tmp/../dev/sda`, or a symlink into `/dev`) cannot slip past the
+/// literal `/dev/` prefix test.
+fn device_write(target: &str, cwd: &Path) -> Result<(), String> {
+    let resolved = resolve_target(target, cwd);
+    let path = resolved.to_string_lossy();
+    let path = path.as_ref();
+    let dev = path.starts_with("/dev/")
+        && !SAFE_DEVICES.contains(&path)
+        && !path.starts_with("/dev/fd/")
+        && !path.starts_with("/dev/tty")
+        && !path.starts_with("/dev/shm/")
+        && !path.starts_with("/dev/pts/");
     if dev {
         return Err(format!("it writes directly to the device {target}"));
     }
@@ -411,9 +430,19 @@ fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value:
         }
         // `--opt=value` carries its value in the same word; only the space-separated
         // `--opt value` form consumes the next word.
-        let long_with_value = text.starts_with("--") && !text.contains('=') && long_with_value.contains(&text);
-        let short_with_value = text.len() == 2 && !text.starts_with("--") && with_value.contains(&text[1..]);
-        i += if long_with_value || short_with_value { 2 } else { 1 };
+        let consume_next = if text.starts_with("--") {
+            !text.contains('=') && long_with_value.contains(&text)
+        } else {
+            // Short options may be bundled (`sudo -iu root`): a value-taking option
+            // consumes the following word only when it is the *last* letter of the
+            // bundle; otherwise the rest of the same word is its value. Fail toward
+            // consuming the next word so a wrapped command can't hide behind it.
+            let opts = &text[1..];
+            opts.chars()
+                .position(|c| with_value.contains(c))
+                .is_some_and(|pos| pos + 1 == opts.chars().count())
+        };
+        i += if consume_next { 2 } else { 1 };
     }
     i
 }
@@ -645,6 +674,12 @@ const SYSTEM_DIRS: &[&str] = &[
     "/System", "/boot", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/dev", "/var/lib", "/private/var/lib", "/private/var/db",
 ];
 
+/// The `var` roots themselves are catastrophic to delete wholesale (`rm -rf
+/// /private/var`), but their descendants are not blanket-blocked: workspaces and
+/// temp dirs commonly live under `/var/folders` or `/var/lib/...`, so only an
+/// exact match (or a parent of the working directory) is treated as a system dir.
+const VAR_ROOTS: &[&str] = &["/var", "/private/var"];
+
 impl Guard<'_> {
     fn check(&self, raw: &str, commands: &[Simple]) -> Result<(), String> {
         if FORK_BOMB.is_match(raw) {
@@ -751,7 +786,16 @@ impl Guard<'_> {
             }
             "mv" => {
                 let (_, targets) = split_flags(args);
-                if let Some((dest, sources)) = targets.split_last() {
+                // GNU `mv -t DIR` / `--target-directory=DIR` moves every operand
+                // *into* DIR, so the destination is DIR (a flag), not the last
+                // operand. Guard DIR explicitly or the move into `/etc` is missed.
+                if let Some(dir) = mv_target_dir(args) {
+                    for source in &targets {
+                        self.protect(source, true, "mv")?;
+                    }
+                    let dest = Word { text: dir, ..Word::default() };
+                    self.protect(&dest, false, "mv")?;
+                } else if let Some((dest, sources)) = targets.split_last() {
                     for source in sources {
                         self.protect(source, true, "mv")?;
                     }
@@ -776,8 +820,24 @@ impl Guard<'_> {
             }
             "find" if has("-delete") => {
                 let narrowed = any_word(&["-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename"]);
-                let starts: Vec<&Word> =
-                    args.iter().take_while(|a| !a.text.starts_with('-') && !matches!(a.text.as_str(), "(" | "!")).collect();
+                // `find`'s leading global options (`-H`/`-L`/`-P`, `-D debugopts`,
+                // `-Olevel`) precede the start paths; skip them first so
+                // `find -P / -name x -delete` doesn't see the option as ending an
+                // (empty) start-path list and fall back to the implicit `.`.
+                let mut s = 0;
+                while let Some(a) = args.get(s) {
+                    match a.text.as_str() {
+                        "-H" | "-L" | "-P" => s += 1,
+                        "-D" => s += 2,
+                        t if t.starts_with("-O") => s += 1,
+                        _ => break,
+                    }
+                }
+                let s = s.min(args.len());
+                let starts: Vec<&Word> = args[s..]
+                    .iter()
+                    .take_while(|a| !a.text.starts_with('-') && !matches!(a.text.as_str(), "(" | "!"))
+                    .collect();
                 // With no explicit start path, `find` searches the current directory,
                 // so `find -delete` wipes the working tree; treat it as an implicit `.`.
                 let implicit = Word { text: ".".into(), ..Word::default() };
@@ -871,7 +931,7 @@ impl Guard<'_> {
     }
 
     fn device_write(&self, target: &str) -> Result<(), String> {
-        device_write(target)
+        device_write(target, self.cwd)
     }
 
     /// Refuse to delete, move or recursively re-permission a path whose loss
@@ -931,6 +991,9 @@ impl Guard<'_> {
         if !in_workspace && SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
             return Some("a system directory".into());
         }
+        if !in_workspace && VAR_ROOTS.contains(&p.to_string_lossy().as_ref()) {
+            return Some("a system directory".into());
+        }
         // Any component being `.git` (not just the last) means the operation
         // reaches into repository metadata: `rm -rf .git/objects` is as harmful
         // as removing `.git` itself.
@@ -959,6 +1022,9 @@ impl Guard<'_> {
             return Some("a top-level system directory");
         }
         if SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
+            return Some("a system directory");
+        }
+        if VAR_ROOTS.contains(&p.to_string_lossy().as_ref()) {
             return Some("a system directory");
         }
         None
@@ -995,7 +1061,11 @@ impl Guard<'_> {
                 let part = component.as_os_str().to_string_lossy();
                 if part.contains(['*', '?', '[']) {
                     let all = part.chars().all(|c| matches!(c, '*' | '?' | '.'));
-                    let parent = real(&normalize(&base.join(&prefix)));
+                    // Follow a symlink in the wildcard's parent too (`rm -rf link/*`
+                    // where `link` -> `/home`): resolve it fully rather than leaving
+                    // the final component unresolved as `real` would.
+                    let joined_parent = normalize(&base.join(&prefix));
+                    let parent = joined_parent.canonicalize().unwrap_or_else(|_| real(&joined_parent));
                     return Ok(Some(if all { (parent, true) } else { (path, false) }));
                 }
                 prefix.push(component.as_os_str());
@@ -1150,6 +1220,29 @@ fn current_branch(dir: &Path) -> Option<String> {
         .ok()?;
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !name.is_empty()).then_some(name)
+}
+
+/// The destination directory of a `mv`/`cp` given via `-t DIR`, `-tDIR`, or
+/// `--target-directory[=]DIR`, if present. Everything else is then a source.
+fn mv_target_dir(args: &[Word]) -> Option<String> {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let t = arg.text.as_str();
+        if t == "--" {
+            break;
+        }
+        if let Some(v) = t.strip_prefix("--target-directory=") {
+            return Some(v.to_string());
+        }
+        if t == "--target-directory" || t == "-t" {
+            return args.get(i + 1).map(|w| w.text.clone());
+        }
+        if t.len() > 2 && t.starts_with("-t") && !t.starts_with("--") {
+            return Some(t[2..].to_string());
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split arguments into flags and operands (everything after `--` is an operand).
@@ -1485,6 +1578,56 @@ mod tests {
         // #6 Quoting an option does not stop the shell interpreting it as one.
         assert!(blocked("rm \"-rf\" /").contains("filesystem root"));
         assert!(blocked("chmod \"-R\" 777 /").contains("filesystem root"));
+    }
+
+    #[test]
+    fn round6_guard_hardening() {
+        // #1 A device reached through `..` or an unnormalized path must still be
+        // caught even though it does not literally start with `/dev/`.
+        assert!(blocked("dd of=/tmp/../dev/sda").contains("device"));
+        assert!(blocked("echo x > /tmp/../dev/sda").contains("device"));
+        allowed("echo x > /tmp/../dev/null");
+
+        // #2 Bundled short options (`sudo -iu root`) consume their argument, so the
+        // wrapped destructive command is still inspected.
+        assert!(blocked("sudo -iu root sh -c 'rm -rf /'").contains("filesystem root"));
+        assert!(blocked("sudo -u root rm -rf /").contains("filesystem root"));
+
+        // #3 The `var` roots are catastrophic to delete wholesale.
+        assert!(blocked("rm -rf /private/var").contains("system directory"));
+        assert!(blocked("rm -rf /var").contains("system directory"));
+
+        // #4 `mv -t DIR` / `--target-directory=DIR` moves into DIR, so DIR is the
+        // destination that must be guarded.
+        assert!(blocked("mv --target-directory=/etc harmless").contains("system directory"));
+        assert!(blocked("mv -t /etc harmless").contains("system directory"));
+        allowed("mv -t build harmless");
+
+        // #5 A leading `find` option must not be mistaken for the end of the start
+        // paths, hiding an unrestricted root traversal.
+        assert!(blocked("find -P / -name passwd -delete").contains("filesystem root"));
+        assert!(blocked("find -L / -name x -delete").contains("filesystem root"));
+        allowed("find -P . -name '*.log' -delete");
+    }
+
+    #[test]
+    fn wildcard_parent_follows_symlink_out_of_workspace() {
+        // #6 `rm -rf link/*` expands through `link`; if it points outside the
+        // workspace (here $HOME) the deletion must be blocked, while a wildcard
+        // over a real in-workspace directory is fine.
+        use std::os::unix::fs::symlink;
+        let home = dirs::home_dir().expect("home dir");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nano-perm-glob-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let link = dir.join("link");
+        symlink(&home, &link).unwrap();
+        let p = Policy::default();
+        let blocked = p.check_in("bash", &json!({ "command": "rm -rf link/*" }), &dir).is_err();
+        let allowed = p.check_in("bash", &json!({ "command": "rm -rf real/*" }), &dir).is_ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(blocked, "rm -rf link/* should follow the symlink into $HOME");
+        assert!(allowed, "rm -rf real/* inside the workspace should be allowed");
     }
 
     #[test]

@@ -245,7 +245,7 @@ nothing inspects that. The boundary is the OS sandbox, plus credentials: don't g
 production database URLs or broadly scoped tokens.
 
 **Sandbox** (`--sandbox workspace`, off by default) runs each shell command under Seatbelt
-(`sandbox-exec`) on macOS or Landlock on Linux (5.13+). Commands can read everywhere, but
+(`sandbox-exec`) on macOS or Landlock on Linux (6.2+). Commands can read everywhere, but
 write only to:
 
 - `workspace`: the working directory, its git directories (including a worktree's shared
