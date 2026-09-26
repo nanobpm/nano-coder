@@ -548,6 +548,15 @@ impl Agent {
         }
         self.calibration = None;
         self.compact_floor = 0;
+        {
+            // A fresh session starts with clean cumulative counters so the
+            // status line and `/context` reflect only this session. Shared
+            // with startup, where these are already zero.
+            let mut stats = self.stats.lock().unwrap();
+            stats.session_input_tokens = 0;
+            stats.session_output_tokens = 0;
+            stats.compactions = 0;
+        }
         self.refresh_stats();
         Ok(id)
     }

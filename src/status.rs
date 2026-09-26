@@ -85,6 +85,20 @@ impl StatusLine {
         self.draw();
     }
 
+    /// Clear the screen and scrollback for a fresh session, then re-establish
+    /// the scroll region and redraw. A naive clear would fight the DECSTBM
+    /// region, so it is reset and re-confined here.
+    pub fn clear(&self) {
+        {
+            let size = self.size.lock().unwrap();
+            let Some((rows, _cols)) = *size else { return };
+            // Drop the region, home the cursor, wipe the screen + scrollback,
+            // then re-confine scrolling to every row but the pinned bottom one.
+            write_raw(&format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{}r", rows.max(2) - 1));
+        }
+        self.draw();
+    }
+
     /// Clear the status line and give the whole screen back.
     pub fn teardown(&self) {
         let mut size = self.size.lock().unwrap();

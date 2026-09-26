@@ -496,6 +496,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        "/restart" => {
+            // Start a brand-new session in place: new ID, context reset to
+            // just the system prompt, empty plan, counters zeroed. The
+            // previous session log stays on disk and is still resumable.
+            let id = agent.new_session()?;
+            terminal.renderer.clear_screen();
+            println!("Session: {id} (resume with --resume {id})");
+            Ok(true)
+        }
         "/verbosity" => {
             let current = ui::verbosity();
             println!("Verbosity: {current} ({})", current.describe());
