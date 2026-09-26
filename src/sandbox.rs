@@ -319,6 +319,13 @@ mod platform {
         if abi < 1 {
             return Err("sandbox unavailable: this kernel does not support Landlock (Linux 5.13+ with Landlock enabled)".into());
         }
+        // Without `REFER` (Landlock ABI 2, Linux 5.19+) cross-directory rename/link
+        // operations are not confined, so a workspace-sandboxed command could move a
+        // file out of the workspace and escape the write boundary. Fail closed rather
+        // than silently leave that hole open.
+        if abi < 2 {
+            return Err("sandbox unavailable: enforcing the write boundary needs Landlock ABI 2 (Linux 5.19+); on older kernels cross-directory renames cannot be confined".into());
+        }
         let mut fs = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR | MAKE_DIR | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_BLOCK | MAKE_SYM;
         if abi >= 2 {
             fs |= REFER;
