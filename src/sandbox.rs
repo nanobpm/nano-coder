@@ -113,7 +113,13 @@ impl SandboxConfig {
         let mut roots = Vec::new();
         let home = dirs::home_dir();
         let mut add = |path: PathBuf| {
+            // Never grant the filesystem root as a writable subtree: it would
+            // disable the workspace boundary entirely. This can happen when an
+            // env-controlled root (e.g. `TMPDIR=/`, or a temp path that resolves
+            // to `/`) is canonicalized here, so reject `/` centrally and fail
+            // closed rather than trusting each caller to pre-filter it.
             if let Ok(real) = path.canonicalize()
+                && real != Path::new("/")
                 && !roots.contains(&real)
             {
                 roots.push(real);
