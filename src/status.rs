@@ -64,8 +64,12 @@ fn scroll_region_bottom(rows: u16) -> u16 {
 /// leaving the conversation above and the scrollback untouched. Runs
 /// unconditionally for both grow and shrink; it addresses no absolute row, so
 /// it is safe whether the terminal grew or shrank.
+///
+/// DECSTBM homes the cursor, so the cursor must be restored after resetting
+/// the region and before erasing — otherwise `ESC[J` erases from row 1 and
+/// wipes the whole visible conversation.
 fn resize_sequence(rows: u16) -> String {
-    format!("\x1b7\x1b[r\x1b[J\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
+    format!("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
 }
 
 impl StatusLine {
@@ -362,7 +366,9 @@ mod tests {
         let seq = resize_sequence(40);
         assert!(seq.starts_with("\x1b7"), "cursor not saved first: {seq:?}");
         assert!(seq.contains("\x1b[r"), "region not reset to full screen: {seq:?}");
-        assert!(seq.contains("\x1b[J"), "screen below cursor not erased: {seq:?}");
+        // DECSTBM homes the cursor: it must be restored before erasing, or the
+        // erase starts at row 1 and wipes the conversation.
+        assert!(seq.contains("\x1b[r\x1b8\x1b[J"), "erase not from the restored cursor: {seq:?}");
         assert!(seq.ends_with("\x1b[1;39r\x1b8"), "region not re-pinned / cursor not restored: {seq:?}");
     }
 
