@@ -384,10 +384,6 @@ impl LLMClient for GithubCopilotClient {
         }
     }
 
-    fn streams(&self) -> bool {
-        self.transport.provider().stream
-    }
-
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         // Bound the whole probe: `models_json` first does a token exchange whose
         // request carries the transport's normal (long) timeout, so a stalled
