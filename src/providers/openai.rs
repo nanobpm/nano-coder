@@ -3,8 +3,9 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HttpTransport, ResolvedProvider};
+use super::{HttpTransport, ResolvedProvider, StreamAction};
 use crate::llm::{
     ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter, TokenUsage, ToolCall,
     report_whole,
@@ -325,7 +326,24 @@ pub(crate) async fn stream_chat(
     let body = transport.stream_body(body, json!({ "stream": true, "stream_options": { "include_usage": true } }));
     let replay = transport.provider().replay_reasoning;
     let mut accumulator = StreamAccumulator::new(replay);
-    let whole = transport.post_stream_to(url, &body, auth, &mut |data| accumulator.push(data, sink)).await?;
+    let whole = transport
+        .post_stream_to(url, &body, auth, &mut |action| match action {
+            StreamAction::Data(data) => {
+                let visible = AtomicBool::new(false);
+                accumulator.push(data, &|event| {
+                    if event.has_content() {
+                        visible.store(true, Ordering::Relaxed);
+                    }
+                    sink(event);
+                })?;
+                Ok(visible.load(Ordering::Relaxed))
+            }
+            StreamAction::Reset => {
+                accumulator = StreamAccumulator::new(replay);
+                Ok(false)
+            }
+        })
+        .await?;
     if let Some(value) = whole {
         let response = parse_response(&value, replay)?;
         report_whole(sink, &response);
@@ -698,6 +716,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn retries_mid_stream_disconnect_before_any_output() {
+        // First attempt: valid SSE headers, but the body is cut off before any
+        // complete event arrives — `x-truncate` advertises more bytes than are
+        // sent and then the connection closes, simulating a transient timeout or
+        // reset mid-stream (the user-reported "reading response stream ...
+        // operation timed out"). Nothing was emitted, so the whole request is
+        // retried; the second attempt streams cleanly.
+        let truncated = r#"data: {"choices":[{"delta":{"content":"par"#.to_string();
+        let events = [
+            json!({"choices":[{"delta":{"role":"assistant","content":"hello"}}]}),
+            json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
+        ];
+        let mut good: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        good.push_str("data: [DONE]\n\n");
+        let (url, captured) = test_server::serve(vec![
+            (200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
+            (200, "content-type: text/event-stream\r\n", good),
+        ])
+        .await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hi")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = client
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .await
+            .unwrap();
+        assert_eq!(response.content, "hello world");
+        // Output is delivered exactly once — no duplication from the retry.
+        assert_eq!(*seen.lock().unwrap(), vec!["hello", " world"]);
+        assert_eq!(captured.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_mid_stream_disconnect_after_partial_output() {
+        // The first attempt delivers one *complete* SSE event — so a payload has
+        // already been handed to the caller — and then the connection is cut off
+        // mid-stream (`x-truncate` advertises more bytes than are sent) before a
+        // terminating `[DONE]`. Retrying here would re-request and duplicate the
+        // already-emitted output, so the error must surface instead and no second
+        // request may be made. This guards the `emitted == true` branch.
+        let mut truncated = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"role":"assistant","content":"hello"}}]})
+        );
+        // A second event begins but is severed before it is complete.
+        truncated.push_str(r#"data: {"choices":[{"delta":{"content":" wor"#);
+        let (url, captured) = test_server::serve(vec![(
+            200,
+            "content-type: text/event-stream\r\nx-truncate: 1\r\n",
+            truncated,
+        )])
+        .await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hi")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let result = client
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .await;
+        // The mid-stream failure surfaces rather than being silently retried.
+        assert!(result.is_err(), "expected the truncated stream to error, got {result:?}");
+        // The already-delivered payload is seen exactly once — never duplicated.
+        assert_eq!(*seen.lock().unwrap(), vec!["hello"]);
+        // Crucially, no retry was attempted after output began.
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_after_metadata_only_event_and_resets_accumulator() {
+        // The first attempt delivers one *complete* SSE event that carries only
+        // metadata (a tool-call delta) — nothing visible ever reaches the
+        // caller's sink — and is then severed mid-stream. Because no visible
+        // output was emitted, the request must still be retried (the fix for
+        // treating every `on_data` call as "emitted"). The retry must also reset
+        // the attempt-local accumulator, otherwise the tool-call name/arguments
+        // buffered on the first attempt would be duplicated onto the second.
+        let call = json!({"choices":[{"delta":{"role":"assistant","tool_calls":[
+            {"index":0,"id":"c1","type":"function","function":{"name":"get_time","arguments":"{}"}}
+        ]}}]});
+        let mut truncated = format!("data: {call}\n\n");
+        // A second event begins but is cut off before it completes.
+        truncated.push_str(r#"data: {"choices":[{"delta":{"content":" wor"#);
+        let events = [call.clone(), json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})];
+        let mut good: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        good.push_str("data: [DONE]\n\n");
+        let (url, captured) = test_server::serve(vec![
+            (200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
+            (200, "content-type: text/event-stream\r\n", good),
+        ])
+        .await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hi")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = client
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .await
+            .unwrap();
+        // A metadata-only event must not suppress the retry.
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        // No visible text was ever emitted to the caller.
+        assert!(seen.lock().unwrap().is_empty(), "no visible output expected, got {:?}", seen.lock().unwrap());
+        // The accumulator was reset before the retry: the tool call is not
+        // duplicated ("get_timeget_time"/"{}{}") across the two attempts.
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "get_time");
+        assert_eq!(response.tool_calls[0].arguments, json!({}));
     }
 
     #[tokio::test]

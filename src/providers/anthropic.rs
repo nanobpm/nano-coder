@@ -3,8 +3,9 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HttpTransport, ResolvedProvider};
+use super::{HttpTransport, ResolvedProvider, StreamAction};
 use crate::llm::{ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole};
 
 const API_VERSION: &str = "2023-06-01";
@@ -308,7 +309,22 @@ impl LLMClient for AnthropicClient {
                         None => builder,
                     }
                 },
-                &mut |data| accumulator.push(data, sink),
+                &mut |action| match action {
+                    StreamAction::Data(data) => {
+                        let visible = AtomicBool::new(false);
+                        accumulator.push(data, &|event| {
+                            if event.has_content() {
+                                visible.store(true, Ordering::Relaxed);
+                            }
+                            sink(event);
+                        })?;
+                        Ok(visible.load(Ordering::Relaxed))
+                    }
+                    StreamAction::Reset => {
+                        accumulator = StreamAccumulator::default();
+                        Ok(false)
+                    }
+                },
             )
             .await?;
         if let Some(value) = whole {
@@ -467,5 +483,58 @@ mod tests {
         };
         let encoded = encode_messages(&[Message::user("hello"), assistant]);
         assert_eq!(encoded[1]["content"], json!([{"type": "text", "text": "hi"}]));
+    }
+
+    #[tokio::test]
+    async fn retries_after_empty_delta_and_resets_accumulator() {
+        // The first attempt delivers a *complete* SSE event whose `text_delta`
+        // is empty — the sink is invoked but nothing visible reaches the caller
+        // — and is then severed mid-stream. An empty delta must not flip the
+        // "visible output emitted" flag, so the transient failure is still
+        // retried (regression for empty deltas suppressing retries). The retry
+        // must also reset the attempt-local accumulator so the text buffered on
+        // the first attempt is not duplicated onto the second.
+        let start = json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
+        let empty = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}});
+        let mut truncated: String = [&start, &empty]
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect();
+        // A second event begins but is cut off before it completes.
+        truncated.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"wor");
+        let good_events = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ];
+        let good: String = good_events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect();
+        let (url, captured) = test_server::serve(vec![
+            (200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
+            (200, "content-type: text/event-stream\r\n", good),
+        ])
+        .await;
+        let messages = [Message::user("hi")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event
+                && !t.is_empty()
+            {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = client(&url)
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) }, &sink)
+            .await
+            .unwrap();
+        // An empty delta must not suppress the retry.
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        // The accumulator was reset before the retry: text is not duplicated.
+        assert_eq!(response.content, "world");
+        assert_eq!(*seen.lock().unwrap(), vec!["world"]);
     }
 }

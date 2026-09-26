@@ -369,6 +369,18 @@ pub(crate) struct HttpTransport {
     provider: ResolvedProvider,
 }
 
+/// A step in consuming a server-sent event stream, handed to the `on_data`
+/// callback of [`HttpTransport::post_stream_to`].
+pub(crate) enum StreamAction<'a> {
+    /// A decoded `data:` payload to process. The callback returns `true` once
+    /// it has delivered visible output (text/thinking) to the caller.
+    Data(&'a str),
+    /// The stream is about to be restarted after a transient failure; discard
+    /// any attempt-local accumulator state so buffered deltas are not
+    /// duplicated on the retry.
+    Reset,
+}
+
 impl HttpTransport {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -521,16 +533,25 @@ impl HttpTransport {
         }
     }
 
-    /// POST `body` expecting server-sent events; each `data:` payload is passed
-    /// to `on_data`. Failures before the stream starts are retried like
-    /// `post_json_to`; a failure mid-stream is returned. If the server answers
-    /// with plain JSON instead, that value is returned.
+    /// POST `body` expecting server-sent events; each `data:` payload is handed
+    /// to `on_data` as [`StreamAction::Data`], which returns `true` once it has
+    /// delivered *visible* output to the caller's sink (text/thinking) rather
+    /// than merely consuming metadata-only events (role, usage, tool-call
+    /// deltas). Failures before the stream starts are retried like
+    /// `post_json_to`. A mid-stream failure (e.g. a transient connection reset
+    /// or timeout) is retried the same way *as long as no visible output has
+    /// reached the caller yet* — restarting after visible output would
+    /// duplicate it, so once any is delivered the error is returned. Before
+    /// each retry `on_data` is invoked with [`StreamAction::Reset`] so it can
+    /// discard attempt-local accumulator state and avoid duplicating buffered
+    /// deltas on the restarted stream. If the server answers with plain JSON
+    /// instead, that value is returned.
     pub async fn post_stream_to(
         &self,
         url: &str,
         body: &Value,
         auth: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
-        on_data: &mut (dyn FnMut(&str) -> Result<()> + Send),
+        on_data: &mut (dyn FnMut(StreamAction<'_>) -> Result<bool> + Send),
     ) -> Result<Option<Value>> {
         let policy = &self.provider.retry;
         let mut attempt = 0;
@@ -554,46 +575,61 @@ impl HttpTransport {
                         .is_some_and(|v| v.contains("event-stream"));
                     if (200..300).contains(&status) && is_sse {
                         let mut parser = SseParser::default();
-                        loop {
-                            let chunk = response
-                                .chunk()
-                                .await
-                                .map_err(|e| self.wrap(anyhow!(e).context("reading response stream")))?;
-                            let Some(chunk) = chunk else { break };
-                            for data in parser.push(&chunk) {
-                                if data.trim() == "[DONE]" {
+                        let mut emitted = false;
+                        let stream_err = loop {
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    for data in parser.push(&chunk) {
+                                        if data.trim() == "[DONE]" {
+                                            return Ok(None);
+                                        }
+                                        if on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))? {
+                                            emitted = true;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(data) = parser.finish()
+                                        && data.trim() != "[DONE]"
+                                    {
+                                        on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))?;
+                                    }
                                     return Ok(None);
                                 }
-                                on_data(&data).map_err(|e| self.wrap(e))?;
+                                // Connection reset/timeout mid-stream: transient.
+                                Err(e) => break anyhow!(e).context("reading response stream"),
                             }
+                        };
+                        // Retry only if we haven't handed any *visible* output
+                        // to the caller yet; otherwise a restart would duplicate
+                        // it. Metadata-only events (role/usage/tool-call deltas)
+                        // do not count as visible output.
+                        if emitted || attempt >= policy.max_retries {
+                            return Err(self.wrap(stream_err));
                         }
-                        if let Some(data) = parser.finish()
-                            && data.trim() != "[DONE]"
-                        {
-                            on_data(&data).map_err(|e| self.wrap(e))?;
-                        }
-                        return Ok(None);
-                    }
-                    match response.text().await {
-                        Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
-                        Ok(text) if (200..300).contains(&status) => {
-                            return match serde_json::from_str::<Value>(&text) {
-                                Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
-                                    Err(self.wrap(ApiError::from_body(status, &text).into()))
+                        (stream_err, retry_after)
+                    } else {
+                        match response.text().await {
+                            Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
+                            Ok(text) if (200..300).contains(&status) => {
+                                return match serde_json::from_str::<Value>(&text) {
+                                    Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
+                                        Err(self.wrap(ApiError::from_body(status, &text).into()))
+                                    }
+                                    Ok(value) => Ok(Some(value)),
+                                    Err(e) => Err(self.wrap(anyhow!(
+                                        "invalid response ({e}): {}",
+                                        text.chars().take(500).collect::<String>()
+                                    ))),
+                                };
+                            }
+                            Ok(text) => {
+                                let api = ApiError::from_body(status, &text);
+                                if !retry::retryable(&api, &self.provider.retryable_statuses) {
+                                    return Err(self.wrap(api.into()));
                                 }
-                                Ok(value) => Ok(Some(value)),
-                                Err(e) => Err(self.wrap(anyhow!(
-                                    "invalid response ({e}): {}",
-                                    text.chars().take(500).collect::<String>()
-                                ))),
-                            };
-                        }
-                        Ok(text) => {
-                            let api = ApiError::from_body(status, &text);
-                            if !retry::retryable(&api, &self.provider.retryable_statuses) {
-                                return Err(self.wrap(api.into()));
+                                (api.into(), retry_after)
                             }
-                            (api.into(), retry_after)
                         }
                     }
                 }
@@ -603,6 +639,10 @@ impl HttpTransport {
             if attempt >= policy.max_retries {
                 return Err(self.wrap(err));
             }
+            // Discard attempt-local accumulator state before retrying so the
+            // restarted stream is re-read from scratch without duplicating any
+            // deltas buffered during the failed attempt.
+            on_data(StreamAction::Reset).map_err(|e| self.wrap(e))?;
             let delay = retry::retry_delay(
                 policy,
                 attempt,
