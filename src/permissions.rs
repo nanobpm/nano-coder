@@ -229,12 +229,22 @@ impl Policy {
                         return Err(format!("rule `{}` denies {tool} on {}", rule.source, absolute.display()));
                     }
                 }
-                if tool != "read_file" && self.sandbox.active() && !self.sandbox.allows_write(&absolute, cwd) {
-                    return Err(format!(
-                        "{} is outside the {} sandbox's writable directories",
-                        absolute.display(),
-                        self.sandbox.mode.as_str()
-                    ));
+                if tool != "read_file" && self.sandbox.active() {
+                    // Check the symlink-resolved target as well as the lexical path:
+                    // `write_file`/`write_atomically` follow symlinks, so
+                    // `link/../etc/hosts` (with `link -> /`) collapses lexically to a
+                    // workspace-relative path while actually writing to `/etc/hosts`.
+                    // Guarding only the lexical `absolute` would let that escape the
+                    // sandbox, so reject when *either* view lands outside it.
+                    if let Some(outside) =
+                        [&absolute, &resolved].into_iter().find(|p| !self.sandbox.allows_write(p, cwd))
+                    {
+                        return Err(format!(
+                            "{} is outside the {} sandbox's writable directories",
+                            outside.display(),
+                            self.sandbox.mode.as_str()
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -651,7 +661,16 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
         match basename(text) {
             "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "fi" | "done" | "esac"
             | "[[" | "coproc" | "nohup" | "builtin" | "unbuffer" | "busybox" => i += 1,
-            "for" | "select" => return Ok(()),
+            // A `for`/`select` loop binds a variable to values we cannot resolve
+            // statically. Its body is parsed as independent simple commands, so
+            // `for x in /; do rm -rf "$x"; done` would inspect `rm -rf "$x"` with
+            // `$x` unset — treated as empty and silently allowed. Fail closed:
+            // refuse to model the loop rather than under-approximate its variable.
+            "for" | "select" => {
+                return Err(format!(
+                    "cannot analyze `{text}` loop variables safely; rewrite the loop as explicit commands"
+                ));
+            }
             "function" => i += 2,
             "time" => i = skip_options(words, i + 1, "", &[]),
             "command" => {
@@ -2213,6 +2232,35 @@ mod tests {
         assert!(run("find . -name '*.tmp' -delete").is_ok());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn round12_guard_hardening() {
+        // #2 `for`/`select` loops bind a variable we cannot resolve statically, so
+        // the guard fails closed instead of inspecting the body with it unset
+        // (which would treat `$x` as empty and let `rm -rf "$x"` through).
+        assert!(blocked("for x in /; do rm -rf \"$x\"; done").contains("loop"));
+        assert!(blocked("select x in a b; do rm -rf \"$x\"; done").contains("loop"));
+
+        // #4 ANSI-C `$'...'` escapes are decoded, so an `rm -rf /` hidden behind
+        // `\xNN` / octal is unmasked and still caught rather than read as the
+        // literal text `x72m` (dynamic=false) that hides the real command.
+        assert!(blocked("bash -c $'\\x72m -rf /'").contains("filesystem root"));
+        assert!(blocked("bash -c $'\\162m -rf /'").contains("filesystem root"));
+        allowed("bash -c $'\\x68\\x69'"); // decodes to the harmless `hi`
+
+        // #1 A symlinked path that lexically normalizes inside the workspace but
+        // physically resolves outside it must not escape the write sandbox.
+        use std::os::unix::fs::symlink;
+        let base = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        symlink("/", cwd.join("root-link")).unwrap();
+        let sandbox = SandboxConfig { mode: crate::sandbox::SandboxMode::Workspace, ..Default::default() };
+        let p = Policy::new(&PermissionsConfig::default(), &sandbox);
+        let err = p.check_in("write_file", &json!({"path": "root-link/../etc/hosts"}), &cwd).unwrap_err();
+        assert!(err.contains("outside the workspace sandbox"), "{err}");
     }
 
     #[test]

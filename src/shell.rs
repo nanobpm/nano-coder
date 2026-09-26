@@ -93,6 +93,102 @@ impl Parser {
         self.chars.get(self.pos + offset).copied()
     }
 
+    /// Decode one ANSI-C (`$'...'`) backslash escape, `self.pos` positioned just
+    /// past the backslash. Bash interprets these escapes, so `\x72` means `r`:
+    /// leaving it as the literal text `x72` would make the guard inspect the
+    /// wrong command (`bash -c $'\x72m -rf /'` would look like the harmless
+    /// `x72m`, hiding the real `rm`). Decode every well-defined escape so the
+    /// true bytes are inspected, and fail closed on anything unrecognized by
+    /// marking the word dynamic (untrusted) instead of trusting it as a literal.
+    fn ansi_c_escape(&mut self, word: &mut Word) -> Result<(), String> {
+        let next = self.peek().ok_or("unterminated $'...' string")?;
+        self.pos += 1;
+        let push_code = |word: &mut Word, val: u32| match char::from_u32(val) {
+            Some(c) => word.text.push(c),
+            None => word.dynamic = true,
+        };
+        match next {
+            'a' => word.text.push('\u{07}'),
+            'b' => word.text.push('\u{08}'),
+            'e' | 'E' => word.text.push('\u{1b}'),
+            'f' => word.text.push('\u{0c}'),
+            'n' => word.text.push('\n'),
+            'r' => word.text.push('\r'),
+            't' => word.text.push('\t'),
+            'v' => word.text.push('\u{0b}'),
+            '\\' => word.text.push('\\'),
+            '\'' => word.text.push('\''),
+            '"' => word.text.push('"'),
+            '?' => word.text.push('?'),
+            'x' => {
+                // `\xHH` — one or two hex digits.
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 2 {
+                    match self.peek().and_then(|c| c.to_digit(16)) {
+                        Some(d) => {
+                            val = val * 16 + d;
+                            self.pos += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 { word.text.push('x') } else { push_code(word, val) }
+            }
+            '0'..='7' => {
+                // `\NNN` — up to three octal digits (the first already consumed).
+                let mut val = next.to_digit(8).unwrap_or(0);
+                let mut n = 1;
+                while n < 3 {
+                    match self.peek().and_then(|c| c.to_digit(8)) {
+                        Some(d) => {
+                            val = val * 8 + d;
+                            self.pos += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                push_code(word, val)
+            }
+            'u' | 'U' => {
+                // `\uHHHH` / `\UHHHHHHHH` — up to 4 / 8 hex digits.
+                let width = if next == 'u' { 4 } else { 8 };
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < width {
+                    match self.peek().and_then(|c| c.to_digit(16)) {
+                        Some(d) => {
+                            val = val * 16 + d;
+                            self.pos += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 { word.text.push(next) } else { push_code(word, val) }
+            }
+            'c' => {
+                // `\cX` — control character.
+                match self.peek() {
+                    Some(c) => {
+                        self.pos += 1;
+                        word.text.push(((c.to_ascii_uppercase() as u8) ^ 0x40) as char);
+                    }
+                    None => word.dynamic = true,
+                }
+            }
+            other => {
+                // Unrecognized escape: distrust the token so an unmodelled
+                // encoding cannot masquerade as a benign literal.
+                word.text.push(other);
+                word.dynamic = true;
+            }
+        }
+        Ok(())
+    }
+
     fn eat(&mut self, c: char) -> bool {
         if self.peek() == Some(c) {
             self.pos += 1;
@@ -503,15 +599,8 @@ impl Parser {
                                 break;
                             }
                             Some('\\') => {
-                                let next = self.peek_at(1).ok_or("unterminated $'...' string")?;
-                                word.text.push(match next {
-                                    'n' => '\n',
-                                    't' => '\t',
-                                    'r' => '\r',
-                                    '0' => '\0',
-                                    other => other,
-                                });
-                                self.pos += 2;
+                                self.pos += 1;
+                                self.ansi_c_escape(&mut word)?;
                             }
                             Some(c) => {
                                 word.text.push(c);
