@@ -394,8 +394,7 @@ fn device_write(target: &str, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn basename(text: &str) -> &str {
-    text.rsplit('/').next().unwrap_or(text)
+fn basename(text: &str) -> &str {    text.rsplit('/').next().unwrap_or(text)
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -424,6 +423,77 @@ fn normalize(path: &Path) -> PathBuf {
 // ---- Command normalization -------------------------------------------------
 
 const MAX_EXPAND_DEPTH: usize = 8;
+
+/// True when a `find` narrowing predicate (`-name`/`-path`/`-regex`/...) could
+/// match a `.git` path, so a narrowed `-delete` could still recurse into and
+/// remove repository metadata.
+fn find_predicate_reaches_git(args: &[Word]) -> bool {
+    // Representative paths a matching predicate would let `-delete` reach.
+    const GIT_PATHS: &[&str] = &[".git", "./.git", "a/.git", "a/.git/HEAD", "a/b/.git"];
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let hit = match arg.text.as_str() {
+            "-name" | "-iname" => args.get(i + 1).is_some_and(|v| glob_reaches(&v.text, &[".git"])),
+            "-path" | "-ipath" | "-wholename" | "-iwholename" => {
+                args.get(i + 1).is_some_and(|v| glob_reaches(&v.text, GIT_PATHS))
+            }
+            "-regex" | "-iregex" => args.get(i + 1).is_some_and(|v| regex_reaches(&v.text, GIT_PATHS)),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a shell glob `pattern` matches any of `targets`. An unparseable
+/// pattern is treated as matching (fail closed).
+fn glob_reaches(pattern: &str, targets: &[&str]) -> bool {
+    let mut re = String::from("^");
+    for c in pattern.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    re.push('$');
+    Regex::new(&re).map(|re| targets.iter().any(|t| re.is_match(t))).unwrap_or(true)
+}
+
+/// Whether a regex `pattern` matches any of `targets`. An unparseable pattern is
+/// treated as matching (fail closed).
+fn regex_reaches(pattern: &str, targets: &[&str]) -> bool {
+    Regex::new(pattern).map(|re| targets.iter().any(|t| re.is_match(t))).unwrap_or(true)
+}
+
+/// Whether a `.git` directory exists at or below `root`, i.e. a recursive
+/// `find`/`-delete` starting there could reach repository metadata. Walks only
+/// directories (symlinks are not followed, matching `find`'s default); a very
+/// large tree exhausts the budget and is treated conservatively as containing
+/// one.
+fn contains_git_dir(root: &Path) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    let mut budget = 20_000usize;
+    while let Some(dir) = stack.pop() {
+        if budget == 0 {
+            return true;
+        }
+        budget -= 1;
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if entry.file_name() == ".git" {
+                    return true;
+                }
+                stack.push(entry.path());
+            }
+        }
+    }
+    false
+}
 
 fn expand_all(parsed: &[Simple]) -> Result<Vec<Simple>, String> {
     let mut out = Vec::new();
@@ -455,6 +525,26 @@ fn script_text(words: &[Word]) -> Result<String, String> {
     Ok(text)
 }
 
+/// The inline script an interpreter runs via `-c`/`-e`/`--eval` (attached or
+/// space-separated), or `None` when it runs a file/REPL instead.
+fn interpreter_inline_script(args: &[Word]) -> Option<Word> {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let t = arg.text.as_str();
+        if matches!(t, "-c" | "-e" | "-E" | "-r" | "--eval" | "eval") {
+            return args.get(i + 1).cloned();
+        }
+        if (t.starts_with("-c") || t.starts_with("-e") || t.starts_with("-E") || t.starts_with("-r")) && t.len() > 2 {
+            return Some(Word { text: t[2..].to_string(), dynamic: arg.dynamic, ..Word::default() });
+        }
+        if let Some(rest) = t.strip_prefix("--eval=") {
+            return Some(Word { text: rest.to_string(), dynamic: arg.dynamic, ..Word::default() });
+        }
+        i += 1;
+    }
+    None
+}
+
 static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=").unwrap());
 
 /// Skip options (words starting with `-`); `with_value` lists short options
@@ -473,6 +563,35 @@ const XARGS_LONG_WITH_VALUE: &[&str] =
 /// `timeout`; otherwise their value is mistaken for the duration or the wrapped
 /// program (`timeout --kill-after 1 5 rm -rf /`).
 const TIMEOUT_LONG_WITH_VALUE: &[&str] = &["--kill-after", "--signal"];
+
+/// Long options (in `--opt value` form) that consume the following word for
+/// `docker`/`podman` `exec`/`run`; otherwise their value is mistaken for the
+/// container/image and the nested command is not reached.
+const DOCKER_LONG_WITH_VALUE: &[&str] = &[
+    "--env", "--user", "--workdir", "--volume", "--publish", "--name", "--network", "--net", "--hostname",
+    "--entrypoint", "--env-file", "--label", "--label-file", "--mount", "--add-host", "--device", "--dns", "--expose",
+    "--link", "--log-driver", "--restart", "--memory", "--cpus", "--platform", "--detach-keys", "--volumes-from",
+    "--tmpfs", "--ulimit", "--sysctl", "--cap-add", "--cap-drop", "--security-opt", "--pid", "--ipc", "--uts",
+    "--group-add", "--health-cmd", "--stop-signal", "--stop-timeout", "--pull", "--attach", "--cidfile",
+];
+
+/// Index of the command `docker`/`podman exec CONTAINER CMD...` or
+/// `docker run IMAGE CMD...` runs, or `None` when this is not an `exec`/`run`
+/// invocation (or carries no nested command). `from` points just past the
+/// `docker`/`podman` word.
+fn container_command_start(words: &[Word], mut from: usize) -> Option<usize> {
+    if words.get(from).is_some_and(|w| w.text == "container") {
+        from += 1;
+    }
+    match words.get(from).map(|w| w.text.as_str()) {
+        Some("exec") | Some("run") => from += 1,
+        _ => return None,
+    }
+    // Skip the flags, then the CONTAINER/IMAGE operand; what remains is the
+    // command that actually runs inside the container.
+    let start = skip_options(words, from, "eupvwmhl", DOCKER_LONG_WITH_VALUE) + 1;
+    (start < words.len()).then_some(start)
+}
 
 fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value: &[&str]) -> usize {
     while let Some(word) = words.get(i) {
@@ -601,6 +720,21 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 return parse_inner(&script_text(rest)?, depth, out);
             }
             "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "fish" => return expand_shell(simple, i, depth, out),
+            "docker" | "podman" => {
+                // `docker exec c sh -c '...'` / `docker run img sh -c '...'` run a
+                // nested command (and often a nested shell); unwrap to it so its
+                // shell scripts, DB clients and destructive words are inspected
+                // rather than hidden inside the container invocation.
+                push(out, i);
+                if depth >= MAX_EXPAND_DEPTH {
+                    return Ok(());
+                }
+                if let Some(start) = container_command_start(words, i + 1) {
+                    let inner = Simple { words: words[start..].to_vec(), ..Default::default() };
+                    return expand(&inner, depth + 1, out);
+                }
+                return Ok(());
+            }
             "find" => {
                 push(out, i);
                 let mut j = i + 1;
@@ -712,9 +846,80 @@ struct Guard<'a> {
     depth: std::cell::Cell<usize>,
 }
 
-/// Parsed commands with their assignment words intact (expansion drops them).
+/// Parsed commands with their assignment words intact (expansion drops them),
+/// including commands nested inside inspectable scripts (`bash -c`, `eval`,
+/// here-docs fed to a shell). A variable assigned inside such a script
+/// (`bash -c 'D=/; rm -rf "$D"'`) is in scope for the later commands that
+/// script runs, so the guard must see it too; expansion strips assignments, so
+/// this parallel pass collects them.
 fn commands_with_assignments(command: &str) -> Vec<Simple> {
-    shell::parse(command).unwrap_or_default()
+    let mut out = Vec::new();
+    for simple in shell::parse(command).unwrap_or_default() {
+        collect_with_assignments(&simple, 0, &mut out);
+    }
+    out
+}
+
+fn collect_with_assignments(simple: &Simple, depth: usize, out: &mut Vec<Simple>) {
+    out.push(simple.clone());
+    if depth >= MAX_EXPAND_DEPTH {
+        return;
+    }
+    for script in nested_scripts(simple) {
+        if let Ok(inner) = shell::parse_nested(&script, depth) {
+            for command in &inner {
+                collect_with_assignments(command, depth + 1, out);
+            }
+        }
+    }
+}
+
+/// Script texts nested inside `simple` that the shell runs (`bash -c SCRIPT`,
+/// `eval SCRIPT`, a here-doc fed to a shell). Used only to collect the
+/// assignments they make; over-collecting a script that never runs is harmless
+/// (it only makes the guard resolve more variables), so this stays deliberately
+/// permissive and never fails.
+fn nested_scripts(simple: &Simple) -> Vec<String> {
+    let words = &simple.words;
+    let mut scripts: Vec<String> = simple.heredocs.iter().map(|h| h.body.clone()).collect();
+    let mut i = 0;
+    while let Some(word) = words.get(i) {
+        match basename(&word.text) {
+            "eval" => {
+                if let Ok(text) = script_text(words.get(i + 1..).unwrap_or_default()) {
+                    scripts.push(text);
+                }
+                break;
+            }
+            "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "fish" => {
+                let mut j = i + 1;
+                while let Some(w) = words.get(j) {
+                    let t = w.text.as_str();
+                    if !(t.starts_with('-') || t.starts_with('+')) || t == "--" || t == "-" {
+                        break;
+                    }
+                    if let Some(pos) = t[1..].find('c') {
+                        let attached = &t[1 + pos + 1..];
+                        let script = if attached.is_empty() {
+                            words.get(j + 1).cloned()
+                        } else {
+                            Some(Word { text: attached.to_string(), dynamic: w.dynamic, ..Word::default() })
+                        };
+                        if let Some(script) = script
+                            && let Ok(text) = script_text(std::slice::from_ref(&script))
+                        {
+                            scripts.push(text);
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    scripts
 }
 
 fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
@@ -819,6 +1024,15 @@ impl Guard<'_> {
             }
             let program = basename(&first.text);
             let args = &cmd.words[1..];
+            // A dynamic interpreter script (`python3 -c "$CMD"`, `ruby -e "$(...)"`)
+            // cannot be inspected: the destructive-SQL scan below sees only the
+            // literal `$CMD`/`$(...)`, not the code it runs. Fail closed on such a
+            // computed inline script, exactly as `bash -c "$CMD"` does.
+            if INTERPRETERS.iter().any(|p| program.starts_with(p))
+                && let Some(script) = interpreter_inline_script(args)
+            {
+                script_text(std::slice::from_ref(&script))?;
+            }
             let interp_eval = INTERPRETERS.iter().any(|i| program.starts_with(i))
                 && args.iter().any(|a| {
                     let t = a.text.as_str();
@@ -852,15 +1066,13 @@ impl Guard<'_> {
             Some(word) => self.resolve_dir(word),
         };
         // A `cd` to a path that is not an existing directory fails, leaving the
-        // shell in the previous directory. Recording an unverifiable target that
-        // lies *outside* the workspace would let `cd /elsewhere/missing; rm -rf *`
-        // be judged against the benign target while the shell, still in the
-        // workspace, empties the working tree. Fail closed (undeterminable) in that
-        // case. A target inside the workspace is safe either way, so keep it.
+        // shell in the previous directory. Recording that unverifiable target
+        // would judge later relative commands against a directory the shell never
+        // entered — `cd missing; rm -rf *` would be checked against `.../missing`
+        // (in-workspace, allowed) while the shell empties the real working tree.
+        // Fail closed (undeterminable) so those relative commands are blocked.
         *self.base.borrow_mut() = match next {
-            Some(path) if !path.is_dir() => {
-                (self.cwd.as_path() != Path::new("/") && path.starts_with(&self.cwd)).then_some(path)
-            }
+            Some(path) if !path.is_dir() => None,
             other => other,
         };
     }
@@ -1005,6 +1217,23 @@ impl Guard<'_> {
                             return Err(format!("`find -delete` under {what} ({}) can remove protected files", path.display()));
                         }
                     }
+                    // Recursion from an in-workspace start still reaches a nested
+                    // `.git` directory, which is protected unconditionally, so
+                    // `find . -name '*' -delete` would wipe repository metadata.
+                    // Reject when the narrowing predicate could match a `.git` path
+                    // and such a directory actually exists under a start path.
+                    if find_predicate_reaches_git(args) {
+                        for start in &starts {
+                            if let Ok(Some((path, _))) = self.resolve(start)
+                                && contains_git_dir(&path)
+                            {
+                                return Err(format!(
+                                    "`find -delete` under {} can recurse into a git repository's .git directory",
+                                    path.display()
+                                ));
+                            }
+                        }
+                    }
                 } else {
                     for start in &starts {
                         self.protect(start, true, "find -delete")?;
@@ -1101,7 +1330,20 @@ impl Guard<'_> {
         if !known {
             return Err("it redirects to a target computed at run time".into());
         }
-        device_write(&target, &self.cwd)
+        // A relative target is opened in the shell's *current* directory, which a
+        // preceding `cd`/`pushd` may have moved (`cd /tmp && echo x > link` opens
+        // `/tmp/link`, not `<cwd>/link`). Resolve it against the tracked base and
+        // fail closed when that directory is unknown; an absolute target ignores
+        // the base, so any value works there.
+        let base = if expand_tilde(&target).is_absolute() {
+            self.cwd.clone()
+        } else {
+            match self.base.borrow().clone() {
+                Some(base) => base,
+                None => return Err("it redirects relative to a directory nano-coder can't determine; use an absolute path".into()),
+            }
+        };
+        device_write(&target, &base)
     }
 
     /// Refuse to delete, move or recursively re-permission a path whose loss
@@ -1542,12 +1784,16 @@ mod tests {
             "pushd .. && rm -rf project",
             "DIR=/; rm -rf \"$DIR\"",
             "export DIR=..; rm -rf $DIR/*",
+            // A `cd` to a directory that does not exist (here the workspace is the
+            // fake `/work/project`, so neither target exists) fails closed: the
+            // shell would stay put, so a following relative destructive command
+            // must not be judged against the target it never reached.
+            "cd build && rm -rf *",
+            "cd sub/dir && rm -rf ../out",
         ] {
             blocked(command);
         }
         for command in [
-            "cd build && rm -rf *",
-            "cd sub/dir && rm -rf ../out",
             "DIR=build; rm -rf \"$DIR\"/*",
             "OUT=$(mktemp -d); rm -rf \"$OUT\"/*",
             "cd \"$UNSET_NANO_VAR\" && rm -rf /tmp/scratch",
@@ -1855,11 +2101,13 @@ mod tests {
         assert!(blocked("timeout --signal TERM 5 rm -rf /").contains("filesystem root"));
         assert!(blocked("timeout --kill-after=1 5 rm -rf /").contains("filesystem root"));
 
-        // #5 An unverifiable `cd` outside the workspace must not let a relative
-        // destructive path escape the working-directory guard; an in-workspace `cd`
-        // is still fine.
+        // #5 An unverifiable `cd` must not let a relative destructive path escape
+        // the working-directory guard. A `cd` whose target is not an existing
+        // directory fails closed (the shell would stay put) whether the target is
+        // inside or outside the workspace; a real existing subdirectory is still
+        // followed (covered against the real filesystem in `round11_guard_hardening`).
         assert!(check(&Policy::default(), "cd /home/nano-does-not-exist/deep; rm -rf *").is_err());
-        allowed("cd build && rm -rf *");
+        assert!(check(&Policy::default(), "cd build; rm -rf *").is_err());
 
         // #8 Narrowed `find -delete` also guards home top-level folders and `.git`.
         let home = dirs::home_dir().expect("home dir");
@@ -1909,6 +2157,62 @@ mod tests {
         assert!(blocked("echo x > \"$(printf /dev/sda)\"").contains("computed at run time"));
         assert!(blocked("echo x > `printf /dev/sda`").contains("computed at run time"));
         assert!(blocked("echo x > $NANO_UNSET_TARGET").contains("computed at run time"));
+    }
+
+    #[test]
+    fn round11_guard_hardening() {
+        // #1 A shell nested under a container wrapper (`docker exec c sh -c '...'`)
+        // is unwrapped so its DB client and destructive SQL are inspected.
+        assert!(blocked("docker exec db sh -c 'psql -c \"DROP DATABASE app\"'").contains("destructive database"));
+        assert!(blocked("docker exec db psql -U app -c 'drop database app'").contains("destructive database"));
+        assert!(blocked("docker run --rm -it img sh -c 'psql -c \"DROP TABLE t\"'").contains("destructive database"));
+        allowed("docker exec db ls -la");
+        allowed("docker run --rm alpine echo hi");
+
+        // #2 A variable assigned inside a nested `bash -c`/`eval` script is in scope
+        // for the commands that script runs, so the guard must resolve it too.
+        assert!(blocked("bash -c 'D=/; rm -rf \"$D\"'").contains("filesystem root"));
+        assert!(blocked("sh -c 'D=/; rm -rf $D'").contains("filesystem root"));
+        assert!(blocked("eval 'DIR=/; rm -rf \"$DIR\"'").contains("filesystem root"));
+
+        // #3 A dynamic interpreter script (`python3 -c "$CMD"`) cannot be inspected,
+        // so it fails closed instead of scanning the literal `$CMD` for SQL.
+        assert!(blocked("python3 -c \"$CMD\"").contains("computed at run time"));
+        assert!(blocked("ruby -e \"$(cat script.rb)\"").contains("computed at run time"));
+        assert!(blocked("node -e\"$CODE\"").contains("computed at run time"));
+        allowed("python3 -c 'print(1 + 1)'");
+
+        // The remaining checks resolve paths against the real filesystem.
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("nano-perm-round11-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(base.join("build")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let p = Policy::default();
+        let run = |c: &str| p.check_in("bash", &json!({ "command": c }), &base);
+
+        // #4 A `cd` into a real existing subdirectory is followed (an in-workspace
+        // relative delete there is allowed); a `cd` to a directory that does not
+        // exist fails closed, since the shell would stay in the working directory.
+        assert!(run("cd build && rm -rf *").is_ok());
+        assert!(run("cd missing-dir; rm -rf *").is_err());
+
+        // #6 A relative redirect target is resolved against the directory a preceding
+        // `cd` moved into, so a symlink to a device there is still caught; an unknown
+        // current directory fails closed.
+        symlink("/dev/sda", base.join("build/disk")).unwrap();
+        assert!(run("cd build && echo x > disk").unwrap_err().contains("device"));
+        assert!(run("cd missing-dir; echo x > out").unwrap_err().contains("can't determine"));
+
+        // #5 A narrowed `find -delete` whose predicate can match a `.git` path is
+        // rejected when a `.git` directory is actually reachable under a start path,
+        // but ordinary narrowed cleanups that cannot match `.git` still pass.
+        std::fs::create_dir_all(base.join(".git/objects")).unwrap();
+        assert!(run("find . -name '*' -delete").unwrap_err().contains(".git"));
+        assert!(run("find . -path '*/.git/*' -delete").unwrap_err().contains(".git"));
+        assert!(run("find . -name '*.tmp' -delete").is_ok());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
