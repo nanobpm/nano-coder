@@ -203,6 +203,12 @@ impl SandboxConfig {
             }
         }
         for extra in &self.writable {
+            // A `~/`-prefixed or absolute extra is a deliberate operator choice to
+            // grant a specific out-of-workspace path. A *relative* extra, however, is
+            // meant to name a subdirectory of the workspace, so a symlink in its path
+            // (e.g. `writable = ["build"]` with `build` -> `/`) that escapes `cwd` must
+            // not silently widen the grant to the whole filesystem.
+            let relative = extra.strip_prefix("~/").is_none() && !Path::new(extra).is_absolute();
             let path = match (extra.strip_prefix("~/"), &home) {
                 (Some(rest), Some(home)) => home.join(rest),
                 _ => cwd.join(extra),
@@ -212,7 +218,19 @@ impl SandboxConfig {
             if !path.exists() {
                 let _ = std::fs::create_dir_all(&path);
             }
-            add(path);
+            if relative {
+                // Only grant a relative extra when its real path stays inside the
+                // workspace and is not the filesystem root itself; fail closed otherwise.
+                let cwd_real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+                if let Ok(real) = path.canonicalize()
+                    && real != Path::new("/")
+                    && real.starts_with(&cwd_real)
+                {
+                    add(real);
+                }
+            } else {
+                add(path);
+            }
         }
         roots
     }
