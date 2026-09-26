@@ -89,7 +89,7 @@ impl EditView {
         let reserved = if self.status.is_some() { 2 } else { 1 };
         let max_rows = (rows as usize).saturating_sub(reserved).min(16);
         let lines = if self.menu_hidden { Vec::new() } else { crate::commands::menu(&self.line, cols as usize, max_rows) };
-        let (seq, used) = menu_sequence(self.menu_rows, &lines);
+        let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
@@ -149,11 +149,13 @@ impl EditView {
     /// sized to the new terminal. Call after the status line re-establishes the
     /// scroll region for the new size.
     pub fn resize(&mut self) {
-        if self.menu_rows > 0 {
-            let (seq, _) = menu_sequence(self.menu_rows, &[]);
+        // With a status line, its resize erased everything below the cursor
+        // (the menu included) and re-anchored the prompt, so only redraw.
+        if self.menu_rows > 0 && self.status.is_none() {
+            let (seq, _) = menu_sequence(self.menu_rows, &[], false);
             write(&seq);
-            self.menu_rows = 0;
         }
+        self.menu_rows = 0;
         self.draw_menu();
     }
 
@@ -189,7 +191,7 @@ impl EditView {
 
     fn take(&mut self) -> String {
         if self.menu_visible() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[]);
+            let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some());
             write(&seq);
             self.menu_rows = 0;
         }
@@ -209,8 +211,10 @@ impl EditView {
 /// the number of rows in use afterwards. The cursor ends where it started.
 /// Rows are reserved with IND (ESC D), which scrolls at the bottom of the
 /// scroll region and keeps the column; the status line below the region is
-/// never touched.
-fn menu_sequence(old_rows: usize, lines: &[String]) -> (String, usize) {
+/// never touched. With `anchor` (a status line is pinned), rows the menu gives
+/// up are closed by scrolling the conversation back down, so the prompt stays
+/// directly above the status line.
+fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, usize) {
     if old_rows == 0 && lines.is_empty() {
         return (String::new(), 0);
     }
@@ -228,6 +232,11 @@ fn menu_sequence(old_rows: usize, lines: &[String]) -> (String, usize) {
         }
     }
     seq.push_str("\x1b8");
+    if anchor && lines.len() < old_rows {
+        // The released rows scrolled away, so only the drawn lines remain.
+        seq.push_str(&crate::status::anchor_sequence((old_rows - lines.len()) as u16));
+        return (seq, lines.len());
+    }
     (seq, if lines.is_empty() { 0 } else { rows })
 }
 
@@ -266,6 +275,14 @@ const ESCAPE_SEQUENCE_WAIT_MS: i32 = 30;
 
 static ORIGINAL: OnceLock<libc::termios> = OnceLock::new();
 
+/// Whether a line reader is in key mode (no echo) and so will read — and
+/// forward — a cursor position report the terminal sends back.
+static KEY_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn key_mode_active() -> bool {
+    KEY_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn get_termios() -> Option<libc::termios> {
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     (unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) } == 0).then_some(termios)
@@ -291,12 +308,15 @@ impl KeyMode {
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
-        (unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0).then_some(Self)
+        let entered = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0;
+        KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
+        entered.then_some(Self)
     }
 }
 
 impl Drop for KeyMode {
     fn drop(&mut self) {
+        KEY_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
         restore_terminal();
     }
 }
@@ -376,12 +396,19 @@ impl LineReader {
                     let menu = view.menu_visible();
                     drop(view);
                     match self.byte_within(ESCAPE_SEQUENCE_WAIT_MS) {
-                        // Skip escape sequences (arrow keys and the like).
-                        Some(b'[' | b'O') => {
+                        // Skip escape sequences (arrow keys and the like),
+                        // forwarding a cursor position report to the status
+                        // line when it is waiting for one.
+                        Some(intro @ (b'[' | b'O')) => {
+                            let mut seq = vec![0x1b, intro];
                             while let Some(b) = self.next_byte() {
+                                seq.push(b);
                                 if (0x40..=0x7e).contains(&b) {
                                     break;
                                 }
+                            }
+                            if let Some(row) = crate::status::cursor_report_row(&seq) {
+                                crate::status::cursor_reported(row);
                             }
                         }
                         None if menu => shared.lock().unwrap().hide_menu(),
@@ -433,15 +460,31 @@ mod tests {
     #[test]
     fn menu_rows_are_reserved_drawn_and_cleared() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let (seq, rows) = menu_sequence(0, &lines);
+        let (seq, rows) = menu_sequence(0, &lines, false);
         assert_eq!(rows, 2);
         assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
         // Narrowing reuses the rows and blanks the extra one.
-        let (seq, rows) = menu_sequence(2, &lines[..1]);
+        let (seq, rows) = menu_sequence(2, &lines[..1], false);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
-        let (seq, rows) = menu_sequence(2, &[]);
+        let (seq, rows) = menu_sequence(2, &[], false);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
-        assert_eq!(menu_sequence(0, &[]), (String::new(), 0));
+        assert_eq!(menu_sequence(0, &[], false), (String::new(), 0));
+    }
+
+    #[test]
+    fn anchored_menu_scrolls_released_rows_back_down() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        // Opening is the same as unanchored: rows are reserved with IND.
+        assert_eq!(menu_sequence(0, &lines, true), menu_sequence(0, &lines, false));
+        // Narrowing blanks the extra row, then scrolls the conversation down
+        // one row into it so the prompt stays above the status line.
+        let (seq, rows) = menu_sequence(2, &lines[..1], true);
+        assert_eq!(rows, 1);
+        assert!(seq.ends_with(&format!("\x1b8{}", crate::status::anchor_sequence(1))), "{seq:?}");
+        // Closing scrolls down by every row the menu used.
+        let (seq, rows) = menu_sequence(2, &[], true);
+        assert_eq!(rows, 0);
+        assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
     }
 
     #[test]
