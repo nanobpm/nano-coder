@@ -3,8 +3,9 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HttpTransport, ResolvedProvider};
+use super::{HttpTransport, ResolvedProvider, StreamAction};
 use crate::llm::{ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole};
 
 const API_VERSION: &str = "2023-06-01";
@@ -308,7 +309,20 @@ impl LLMClient for AnthropicClient {
                         None => builder,
                     }
                 },
-                &mut |data| accumulator.push(data, sink),
+                &mut |action| match action {
+                    StreamAction::Data(data) => {
+                        let visible = AtomicBool::new(false);
+                        accumulator.push(data, &|event| {
+                            visible.store(true, Ordering::Relaxed);
+                            sink(event);
+                        })?;
+                        Ok(visible.load(Ordering::Relaxed))
+                    }
+                    StreamAction::Reset => {
+                        accumulator = StreamAccumulator::default();
+                        Ok(false)
+                    }
+                },
             )
             .await?;
         if let Some(value) = whole {
