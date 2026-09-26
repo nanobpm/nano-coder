@@ -107,6 +107,7 @@ impl LLMClient for MockLLMClient {
                         id: format!("call_{call_id}"),
                         name: name.to_string(),
                         arguments,
+                        item_id: None,
                     }],
                     usage: Self::usage(20),
                     stop_reason: Some("tool_calls".into()),

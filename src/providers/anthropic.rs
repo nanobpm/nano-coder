@@ -24,7 +24,13 @@ impl AnthropicClient {
     }
 
     pub fn build_body(&self, request: &ChatRequest<'_>) -> Value {
-        let provider = self.transport.provider();
+        build_body(&self.transport, request)
+    }
+}
+
+/// Messages API request body for `request`, with provider overrides applied.
+pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+        let provider = transport.provider();
         let system: Vec<&str> = request
             .messages
             .iter()
@@ -56,8 +62,7 @@ impl AnthropicClient {
             // Anthropic's range is 0..=1.
             body["temperature"] = json!(temperature.clamp(0.0, 1.0));
         }
-        self.transport.finish_body(body)
-    }
+        transport.finish_body(body)
 }
 
 /// Encode messages as content blocks, merging consecutive same-role turns
@@ -136,6 +141,7 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
                 id: block.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
                 name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                item_id: None,
             }),
             _ => {}
         }
@@ -168,7 +174,7 @@ enum Block {
 
 /// Accumulates a streamed Messages response.
 #[derive(Default)]
-struct StreamAccumulator {
+pub(crate) struct StreamAccumulator {
     blocks: Vec<(u64, Block)>,
     prompt_tokens: i64,
     usage: Option<TokenUsage>,
@@ -180,7 +186,7 @@ impl StreamAccumulator {
         self.blocks.iter_mut().find(|(i, _)| *i == index).map(|(_, b)| b)
     }
 
-    fn push(&mut self, data: &str, sink: StreamSink<'_>) -> Result<()> {
+    pub(crate) fn push(&mut self, data: &str, sink: StreamSink<'_>) -> Result<()> {
         let event: Value = serde_json::from_str(data).map_err(|e| anyhow!("invalid stream event ({e}): {data}"))?;
         let str_of = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
         let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -240,7 +246,7 @@ impl StreamAccumulator {
         Ok(())
     }
 
-    fn finish(self) -> LLMResponse {
+    pub(crate) fn finish(self) -> LLMResponse {
         let mut response = LLMResponse { usage: self.usage, stop_reason: self.stop_reason, ..Default::default() };
         for (_, block) in self.blocks {
             match block {
@@ -261,11 +267,49 @@ impl StreamAccumulator {
                         Value::Object(map) => Value::Object(map),
                         _ => json!({}),
                     },
+                    item_id: None,
                 }),
             }
         }
         response
     }
+}
+
+/// Stream a Messages request to `url`, accumulating a full response.
+/// `auth` adds provider-specific authentication and version headers.
+pub(crate) async fn stream(
+    transport: &HttpTransport,
+    url: &str,
+    body: Value,
+    auth: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    sink: StreamSink<'_>,
+) -> Result<LLMResponse> {
+    let body = transport.stream_body(body, json!({ "stream": true }));
+    let mut accumulator = StreamAccumulator::default();
+    let whole = transport
+        .post_stream_to(url, &body, auth, &mut |action| match action {
+            StreamAction::Data(data) => {
+                let visible = AtomicBool::new(false);
+                accumulator.push(data, &|event| {
+                    if event.has_content() {
+                        visible.store(true, Ordering::Relaxed);
+                    }
+                    sink(event);
+                })?;
+                Ok(visible.load(Ordering::Relaxed))
+            }
+            StreamAction::Reset => {
+                accumulator = StreamAccumulator::default();
+                Ok(false)
+            }
+        })
+        .await?;
+    if let Some(value) = whole {
+        let response = parse_response(&value)?;
+        report_whole(sink, &response);
+        return Ok(response);
+    }
+    Ok(accumulator.finish())
 }
 
 #[async_trait]
@@ -293,46 +337,16 @@ impl LLMClient for AnthropicClient {
             report_whole(sink, &response);
             return Ok(response);
         }
-        let body = self.transport.stream_body(self.build_body(request), json!({ "stream": true }));
         let api_key = provider.api_key.clone();
         let url = format!("{}/messages", provider.base_url);
-        let mut accumulator = StreamAccumulator::default();
-        let whole = self
-            .transport
-            .post_stream_to(
-                &url,
-                &body,
-                |builder| {
-                    let builder = builder.header("anthropic-version", API_VERSION);
-                    match &api_key {
-                        Some(key) => builder.header("x-api-key", key),
-                        None => builder,
-                    }
-                },
-                &mut |action| match action {
-                    StreamAction::Data(data) => {
-                        let visible = AtomicBool::new(false);
-                        accumulator.push(data, &|event| {
-                            if event.has_content() {
-                                visible.store(true, Ordering::Relaxed);
-                            }
-                            sink(event);
-                        })?;
-                        Ok(visible.load(Ordering::Relaxed))
-                    }
-                    StreamAction::Reset => {
-                        accumulator = StreamAccumulator::default();
-                        Ok(false)
-                    }
-                },
-            )
-            .await?;
-        if let Some(value) = whole {
-            let response = parse_response(&value)?;
-            report_whole(sink, &response);
-            return Ok(response);
-        }
-        Ok(accumulator.finish())
+        stream(&self.transport, &url, self.build_body(request), |builder| {
+            let builder = builder.header("anthropic-version", API_VERSION);
+            match &api_key {
+                Some(key) => builder.header("x-api-key", key),
+                None => builder,
+            }
+        }, sink)
+        .await
     }
 
     fn model_name(&self) -> &str {
@@ -373,8 +387,8 @@ mod tests {
             Message::assistant_with_tools(
                 "checking",
                 vec![
-                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}) },
-                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad") },
+                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None },
+                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad"), item_id: None },
                 ],
             ),
             Message::tool_result("t1", "get_time", "noon"),

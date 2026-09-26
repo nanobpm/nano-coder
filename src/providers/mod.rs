@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod github_copilot;
 pub mod mock;
 pub mod openai;
+pub mod openai_responses;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
@@ -284,6 +285,12 @@ pub fn resolve(
         None => Default::default(),
     };
     let defaults = RetryPolicy::default();
+    // Copilot reasoning models (Responses-routed GPT‑5+/Grok/…) require their
+    // reasoning items replayed across tool calls, so replay defaults on for
+    // them; a user config value still overrides this.
+    let replay_reasoning = config.replay_reasoning.unwrap_or_else(|| {
+        kind == ProviderKind::GithubCopilot && github_copilot::is_reasoning_model(&model)
+    });
     Ok(ResolvedProvider {
         name: name.to_string(),
         kind,
@@ -295,7 +302,7 @@ pub fn resolve(
         drop_params: config.drop_params.clone().unwrap_or_default(),
         max_tokens_param: config.max_tokens_param.clone().unwrap_or_else(|| "max_tokens".into()),
         stream: config.stream.unwrap_or(true),
-        replay_reasoning: config.replay_reasoning.unwrap_or(false),
+        replay_reasoning,
         timeout: Duration::from_secs(config.timeout_secs.unwrap_or(600)),
         retry: RetryPolicy {
             max_retries: config.max_retries.unwrap_or(defaults.max_retries),
@@ -832,6 +839,23 @@ mod tests {
             parse_model_spec("meta-llama/llama-4", &providers, "together"),
             ("together", Some("meta-llama/llama-4"))
         );
+    }
+
+    #[test]
+    fn copilot_reasoning_models_default_to_reasoning_replay() {
+        let user = HashMap::new();
+        // A reasoning model (Responses-routed GPT‑5+) turns replay on by default.
+        assert!(resolve("github-copilot/gpt-6-astra", &user, "mock").unwrap().replay_reasoning);
+        // A non-reasoning Copilot model leaves replay off.
+        assert!(!resolve("github-copilot/gpt-4.1", &user, "mock").unwrap().replay_reasoning);
+        assert!(!resolve("github-copilot/o4-mini", &user, "mock").unwrap().replay_reasoning);
+        // An explicit config value still overrides the reasoning-model default.
+        let mut off = HashMap::new();
+        off.insert(
+            "github-copilot".to_string(),
+            ProviderConfig { replay_reasoning: Some(false), ..Default::default() },
+        );
+        assert!(!resolve("github-copilot/gpt-6-astra", &off, "mock").unwrap().replay_reasoning);
     }
 
     #[test]

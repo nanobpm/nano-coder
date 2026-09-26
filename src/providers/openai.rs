@@ -160,6 +160,7 @@ pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
                             .unwrap_or_default()
                             .to_string(),
                         arguments: ToolCall::decode_arguments(&raw),
+                        item_id: None,
                     }
                 })
                 .collect()
@@ -288,6 +289,7 @@ impl StreamAccumulator {
                 id: if id.is_empty() { format!("call_{index}") } else { id },
                 name,
                 arguments: ToolCall::decode_arguments(&raw),
+                item_id: None,
             })
             .collect();
         LLMResponse {
@@ -574,7 +576,7 @@ mod tests {
             Message::user("what time is it?"),
             Message::assistant_with_tools(
                 "",
-                vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: json!({}) }],
+                vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: json!({}), item_id: None }],
             ),
             Message::tool_result("c1", "get_time", "noon"),
         ]
@@ -887,7 +889,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.thinking, "Let me check.more");
         assert_eq!(response.content, "Checking");
-        assert_eq!(response.tool_calls, vec![ToolCall { id: "call_a".into(), name: "bash".into(), arguments: json!({"command": "ls"}) }]);
+        assert_eq!(response.tool_calls, vec![ToolCall { id: "call_a".into(), name: "bash".into(), arguments: json!({"command": "ls"}), item_id: None }]);
         assert_eq!(response.usage.unwrap().total_tokens, 17);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
         assert_eq!(*seen.lock().unwrap(), vec!["R:Let me ", "R:check.", "R:more", "T:Checking"]);

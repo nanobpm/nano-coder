@@ -3,10 +3,12 @@
 //! Uses a Copilot subscription by authenticating the way the VS Code Copilot
 //! Chat extension does: a GitHub device-flow login with VS Code's OAuth client
 //! ID, an exchange of that OAuth token for a short-lived Copilot session token,
-//! and OpenAI-compatible Chat Completions calls carrying VS Code's editor
-//! headers. This is not a GitHub-sanctioned integration: it may conflict with
-//! GitHub's terms or your organisation's Copilot policy, and it can break when
-//! GitHub changes what it checks. It is only used when explicitly selected.
+//! and model calls carrying VS Code's editor headers. Each model is routed to
+//! the upstream API Copilot serves it through (Chat Completions, OpenAI
+//! Responses, or Anthropic Messages — see [`copilot_api_for_model`]). This is
+//! not a GitHub-sanctioned integration: it may conflict with GitHub's terms or
+//! your organisation's Copilot policy, and it can break when GitHub changes what
+//! it checks. It is only used when explicitly selected.
 
 use std::path::PathBuf;
 
@@ -17,8 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::openai;
+use super::openai_responses;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
+use super::anthropic;
 use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
@@ -41,6 +45,90 @@ const EDITOR_HEADERS: [(&str, &str); 4] = [
     ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
     ("Copilot-Integration-Id", "vscode-chat"),
 ];
+
+/// Anthropic Messages API version, sent as `anthropic-version` when a model
+/// routes to Copilot's `/v1/messages` endpoint.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// The Copilot upstream API a given model must be called through. Copilot
+/// proxies several model families, and newer models are only reachable via a
+/// specific endpoint: calling the wrong one fails with an
+/// `unsupported_api_for_model` HTTP 400 rather than falling back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotApi {
+    /// OpenAI Chat Completions (`/chat/completions`) — the legacy default.
+    Completions,
+    /// OpenAI Responses (`/responses`) — required by `gpt-*`, `grok-*`, and
+    /// other models Copilot only serves through the Responses endpoint.
+    Responses,
+    /// Anthropic Messages (`/v1/messages`) — used by Claude 4.x/5.x models.
+    Messages,
+}
+
+impl CopilotApi {
+    /// The endpoint path this API is reached at, relative to the API base.
+    fn path(self) -> &'static str {
+        match self {
+            CopilotApi::Completions => "/chat/completions",
+            CopilotApi::Responses => "/responses",
+            CopilotApi::Messages => "/v1/messages",
+        }
+    }
+}
+
+/// Route a Copilot model id to the upstream API it must be called through, using
+/// the same model-family rules as Pi's Copilot catalog
+/// (`/^claude-(haiku|sonnet|opus|fable)-[45]([.\-]|$)/` for Messages; `gpt-`,
+/// `grok-`, `oswe`, `mai-` prefixes for Responses).
+fn copilot_api_for_model(model_id: &str) -> CopilotApi {
+    // Claude 4.x/5.x are served through the Anthropic Messages endpoint. Older
+    // Claude (3.x) and everything else keep the legacy Chat Completions path.
+    const CLAUDE_FAMILIES: [&str; 4] = ["claude-haiku-", "claude-sonnet-", "claude-opus-", "claude-fable-"];
+    let is_claude_4_or_5 = CLAUDE_FAMILIES.iter().any(|family| {
+        model_id.strip_prefix(family).is_some_and(|rest| {
+            let mut chars = rest.chars();
+            // The major version must be 4 or 5, and be a whole token — followed
+            // by a separator (`.`/`-`) or the end, so `claude-sonnet-42` (a
+            // hypothetical future line) is not misread as v4.
+            matches!(chars.next(), Some('4' | '5')) && matches!(chars.next(), None | Some('.' | '-'))
+        })
+    });
+    if is_claude_4_or_5 {
+        return CopilotApi::Messages;
+    }
+    // GPT, Grok, OSWE and MAI-Code are only served via the Responses endpoint.
+    if ["gpt-", "grok-", "oswe", "mai-"].iter().any(|prefix| model_id.starts_with(prefix)) {
+        return CopilotApi::Responses;
+    }
+    CopilotApi::Completions
+}
+
+/// Whether a Copilot model reasons, and so (1) needs its reasoning items
+/// replayed across tool calls and (2) rejects a non-default `temperature`.
+///
+/// Reasoning models are the Responses-routed families — OpenAI GPT‑5 and newer,
+/// Grok, OSWE and MAI‑Code — with `gpt-4.x` (and earlier `gpt-*`) the one
+/// non-reasoning exception, since those still accept a custom `temperature`.
+/// Non-Responses models (older Claude, the o‑series, Gemini, …) are not treated
+/// as reasoning models here: the Responses path is the only one this catalog
+/// routes reasoning models through.
+pub(crate) fn is_reasoning_model(model_id: &str) -> bool {
+    if copilot_api_for_model(model_id) != CopilotApi::Responses {
+        return false;
+    }
+    if let Some(rest) = model_id.strip_prefix("gpt-") {
+        // gpt-5, gpt-5.6, gpt-6-astra … reason; gpt-4.1 and earlier do not.
+        return leading_major_version(rest).is_some_and(|major| major >= 5);
+    }
+    true
+}
+
+/// The leading integer of a version tail such as `"5.6"`, `"6-astra"` or `"4.1"`
+/// (`5`, `6`, `4`). `None` when the tail does not start with a digit.
+fn leading_major_version(tail: &str) -> Option<u32> {
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
 
 /// GitHub host (`github.com`, or a GHE.com domain via `GITHUB_COPILOT_DOMAIN`).
 pub fn domain() -> String {
@@ -324,7 +412,13 @@ impl GithubCopilotClient {
 #[async_trait]
 impl LLMClient for GithubCopilotClient {
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
-        let body = openai::build_body(&self.transport, request);
+        let provider = self.transport.provider();
+        let api = copilot_api_for_model(&provider.model);
+        let body = match api {
+            CopilotApi::Completions => openai::build_body(&self.transport, request),
+            CopilotApi::Responses => openai_responses::build_body(&self.transport, request),
+            CopilotApi::Messages => anthropic::build_body(&self.transport, request),
+        };
         // Copilot bills a premium request per user-initiated turn; tool
         // follow-ups are marked agent-initiated, as VS Code does.
         let initiator = match request.messages.last().map(|m| &m.role) {
@@ -335,18 +429,33 @@ impl LLMClient for GithubCopilotClient {
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;
-            let url = format!("{}/chat/completions", self.api_base(&session));
+            let url = format!("{}{}", self.api_base(&session), api.path());
             let result = self
                 .transport
                 .post_json_to(&url, &body, |builder| {
-                    with_editor_headers(builder, &overrides)
+                    let builder = with_editor_headers(builder, &overrides)
                         .bearer_auth(&session.token)
                         .header("X-Initiator", initiator)
-                        .header("Openai-Intent", "conversation-edits")
+                        .header("Openai-Intent", "conversation-edits");
+                    match api {
+                        CopilotApi::Messages => builder.header("anthropic-version", ANTHROPIC_VERSION),
+                        _ => builder,
+                    }
                 })
                 .await;
             match result {
-                Ok(value) => return openai::parse_response(&value, self.transport.provider().replay_reasoning),
+                Ok(value) => {
+                    return match api {
+                        CopilotApi::Completions => {
+                            openai::parse_response(&value, self.transport.provider().replay_reasoning)
+                        }
+                        CopilotApi::Responses => openai_responses::parse_response(
+                            &value,
+                            self.transport.provider().replay_reasoning,
+                        ),
+                        CopilotApi::Messages => anthropic::parse_response(&value),
+                    };
+                }
                 // The session token was revoked or expired early: re-exchange once.
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
                 Err(e) => return Err(e),
@@ -360,7 +469,13 @@ impl LLMClient for GithubCopilotClient {
             report_whole(sink, &response);
             return Ok(response);
         }
-        let body = openai::build_body(&self.transport, request);
+        let provider = self.transport.provider();
+        let api = copilot_api_for_model(&provider.model);
+        let body = match api {
+            CopilotApi::Completions => openai::build_body(&self.transport, request),
+            CopilotApi::Responses => openai_responses::build_body(&self.transport, request),
+            CopilotApi::Messages => anthropic::build_body(&self.transport, request),
+        };
         let initiator = match request.messages.last().map(|m| &m.role) {
             Some(Role::User) => "user",
             _ => "agent",
@@ -369,14 +484,22 @@ impl LLMClient for GithubCopilotClient {
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;
-            let url = format!("{}/chat/completions", self.api_base(&session));
-            let result = openai::stream_chat(&self.transport, &url, body.clone(), |builder| {
-                with_editor_headers(builder, &overrides)
+            let url = format!("{}{}", self.api_base(&session), api.path());
+            let auth = |builder: reqwest::RequestBuilder| {
+                let builder = with_editor_headers(builder, &overrides)
                     .bearer_auth(&session.token)
                     .header("X-Initiator", initiator)
-                    .header("Openai-Intent", "conversation-edits")
-            }, sink)
-            .await;
+                    .header("Openai-Intent", "conversation-edits");
+                match api {
+                    CopilotApi::Messages => builder.header("anthropic-version", ANTHROPIC_VERSION),
+                    _ => builder,
+                }
+            };
+            let result = match api {
+                CopilotApi::Completions => openai::stream_chat(&self.transport, &url, body.clone(), auth, sink).await,
+                CopilotApi::Responses => openai_responses::stream(&self.transport, &url, body.clone(), auth, sink).await,
+                CopilotApi::Messages => anthropic::stream(&self.transport, &url, body.clone(), auth, sink).await,
+            };
             match result {
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
                 other => return other,
@@ -432,12 +555,16 @@ impl LLMClient for GithubCopilotClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Message, ToolCall};
+    use crate::llm::{Message, StreamEvent, ToolCall};
     use crate::providers::{ProviderConfig, ProviderKind, resolve, test_server};
     use serde_json::json;
     use std::collections::HashMap;
 
     fn client(base: &str) -> GithubCopilotClient {
+        client_model(base, "gpt-4.1")
+    }
+
+    fn client_model(base: &str, model: &str) -> GithubCopilotClient {
         let mut user = HashMap::new();
         user.insert(
             "github-copilot".to_string(),
@@ -447,7 +574,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let provider = resolve("github-copilot/gpt-4.1", &user, "mock").unwrap();
+        let provider = resolve(&format!("github-copilot/{model}"), &user, "mock").unwrap();
         let endpoints = Endpoints {
             device_code: format!("{base}/login/device/code"),
             access_token: format!("{base}/login/oauth/access_token"),
@@ -465,7 +592,197 @@ mod tests {
         .to_string()
     }
 
-    const CHAT_OK: &str = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+    // `gpt-4.1` routes to the Responses endpoint, so its non-streamed reply is an
+    // `output` list, not Chat Completions `choices`.
+    const CHAT_OK: &str = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"status":"completed"}"#;
+
+    #[test]
+    fn catalogs_model_endpoints() {
+        use CopilotApi::*;
+        // Claude 4.x/5.x → Anthropic Messages.
+        assert_eq!(copilot_api_for_model("claude-sonnet-4"), Messages);
+        assert_eq!(copilot_api_for_model("claude-sonnet-4.5"), Messages);
+        assert_eq!(copilot_api_for_model("claude-opus-5"), Messages);
+        assert_eq!(copilot_api_for_model("claude-haiku-4.5"), Messages);
+        assert_eq!(copilot_api_for_model("claude-fable-5"), Messages);
+        // Older Claude and unrelated `claude-*` ids stay on Chat Completions.
+        assert_eq!(copilot_api_for_model("claude-3.5-sonnet"), Completions);
+        assert_eq!(copilot_api_for_model("claude-sonnet-42"), Completions);
+        // GPT, Grok, OSWE, MAI-Code → Responses.
+        assert_eq!(copilot_api_for_model("gpt-4.1"), Responses);
+        assert_eq!(copilot_api_for_model("gpt-6-astra"), Responses);
+        assert_eq!(copilot_api_for_model("grok-code-fast-1"), Responses);
+        assert_eq!(copilot_api_for_model("oswe-preview"), Responses);
+        assert_eq!(copilot_api_for_model("mai-code-1"), Responses);
+        // Everything else keeps the legacy Chat Completions default.
+        assert_eq!(copilot_api_for_model("o4-mini"), Completions);
+        assert_eq!(copilot_api_for_model("gemini-2.5-pro"), Completions);
+    }
+
+    #[test]
+    fn classifies_reasoning_models() {
+        // GPT‑5 and newer, Grok, OSWE and MAI‑Code reason.
+        assert!(is_reasoning_model("gpt-6-astra"));
+        assert!(is_reasoning_model("gpt-5.6-sol"));
+        assert!(is_reasoning_model("gpt-5"));
+        assert!(is_reasoning_model("grok-code-fast-1"));
+        assert!(is_reasoning_model("oswe-preview"));
+        assert!(is_reasoning_model("mai-code-1"));
+        // gpt-4.x (and earlier gpt-*) accept a custom temperature — not reasoning.
+        assert!(!is_reasoning_model("gpt-4.1"));
+        assert!(!is_reasoning_model("gpt-4o-mini"));
+        // Models that never route through Responses are not treated as reasoning.
+        assert!(!is_reasoning_model("o4-mini"));
+        assert!(!is_reasoning_model("claude-sonnet-4.5"));
+        assert!(!is_reasoning_model("gemini-2.5-pro"));
+    }
+
+    #[tokio::test]
+    async fn routes_completions_model_to_chat_completions() {
+        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "o4-mini");
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        assert_eq!(client.chat(&request).await.unwrap().content, "hi");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/chat/completions");
+        assert_eq!(api_log[0].body["model"], "o4-mini");
+        assert!(api_log[0].body.get("messages").is_some());
+    }
+
+    #[tokio::test]
+    async fn routes_gpt_model_to_responses_endpoint() {
+        let ok = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"pong"}]}],"usage":{"input_tokens":3,"output_tokens":1},"status":"completed"}"#;
+        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "gpt-6-astra");
+        let messages = vec![Message::user("ping")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        assert_eq!(client.chat(&request).await.unwrap().content, "pong");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/responses");
+        assert_eq!(api_log[0].body["model"], "gpt-6-astra");
+        // Responses format: a flat `input` list, not `messages`.
+        assert!(api_log[0].body.get("input").is_some());
+        assert!(api_log[0].body.get("messages").is_none());
+        let headers = api_log[0].headers.to_lowercase();
+        assert!(headers.contains("copilot-integration-id: vscode-chat"));
+    }
+
+    #[tokio::test]
+    async fn routes_claude_model_to_messages_endpoint() {
+        let ok = json!({
+            "content": [{ "type": "text", "text": "bonjour" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 4, "output_tokens": 2 }
+        })
+        .to_string();
+        let (api, api_log) = test_server::serve(vec![(200, "", ok)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "claude-sonnet-4.5");
+        let messages = vec![Message::system("be brief"), Message::user("hi")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        assert_eq!(client.chat(&request).await.unwrap().content, "bonjour");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/v1/messages");
+        assert_eq!(api_log[0].body["model"], "claude-sonnet-4.5");
+        // Messages format: content-block `messages` plus a hoisted `system`.
+        assert_eq!(api_log[0].body["system"], "be brief");
+        let headers = api_log[0].headers.to_lowercase();
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert!(headers.contains("copilot-integration-id: vscode-chat"));
+    }
+
+    #[tokio::test]
+    async fn stream_routes_completions_model_to_chat_completions() {
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "choices": [{ "delta": { "role": "assistant", "content": "hi" } }] })
+        );
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "o4-mini");
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "hi");
+        assert_eq!(*seen.lock().unwrap(), "hi");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/chat/completions");
+        assert!(api_log[0].body.get("messages").is_some());
+        assert_eq!(api_log[0].body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_routes_gpt_model_to_responses_endpoint() {
+        let events = [
+            json!({ "type": "response.output_text.delta", "delta": "po" }),
+            json!({ "type": "response.output_text.delta", "delta": "ng" }),
+            json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 3, "output_tokens": 1 } } }),
+        ];
+        let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "gpt-6-astra");
+        let messages = vec![Message::user("ping")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "pong");
+        assert_eq!(*seen.lock().unwrap(), "pong");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/responses");
+        // Responses format: a flat `input` list, not `messages`.
+        assert!(api_log[0].body.get("input").is_some());
+        assert!(api_log[0].body.get("messages").is_none());
+        assert_eq!(api_log[0].body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_routes_claude_model_to_messages_endpoint() {
+        let events = [
+            json!({ "type": "message_start", "message": { "usage": { "input_tokens": 4, "output_tokens": 1 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "bonjour" } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 2 } }),
+            json!({ "type": "message_stop" }),
+        ];
+        let sse: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "claude-sonnet-4.5");
+        let messages = vec![Message::system("be brief"), Message::user("hi")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "bonjour");
+        assert_eq!(*seen.lock().unwrap(), "bonjour");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/v1/messages");
+        // Messages format: a hoisted `system` field.
+        assert_eq!(api_log[0].body["system"], "be brief");
+        let headers = api_log[0].headers.to_lowercase();
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert_eq!(api_log[0].body["stream"], true);
+    }
 
     #[test]
     fn derives_api_base_from_proxy_endpoint() {
@@ -492,7 +809,7 @@ mod tests {
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
-            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}) }]),
+            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}), item_id: None }]),
             Message::tool_result("c", "t", "ok"),
         ];
         let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };
@@ -504,7 +821,7 @@ mod tests {
         assert!(auth_log[0].headers.contains("vscode/"));
         let api_log = api_log.lock().unwrap();
         let first = api_log[0].headers.to_lowercase();
-        assert_eq!(api_log[0].path, "/chat/completions");
+        assert_eq!(api_log[0].path, "/responses");
         assert!(first.contains("authorization: bearer sess-1"));
         assert!(first.contains("copilot-integration-id: vscode-chat"));
         assert!(first.contains("x-initiator: user"));

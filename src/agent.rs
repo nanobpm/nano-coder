@@ -1359,7 +1359,7 @@ mod tests {
 
     fn tool_call(id: &str) -> LLMResponse {
         LLMResponse {
-            tool_calls: vec![ToolCall { id: id.into(), name: "echo".into(), arguments: json!({"text": "pong"}) }],
+            tool_calls: vec![ToolCall { id: id.into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None }],
             ..Default::default()
         }
     }
@@ -1408,7 +1408,7 @@ mod tests {
         log.append(&Record::Message(Message::user("run it"))).unwrap();
         log.append(&Record::Message(Message::assistant_with_tools(
             "",
-            vec![ToolCall { id: "c9".into(), name: "echo".into(), arguments: json!({}) }],
+            vec![ToolCall { id: "c9".into(), name: "echo".into(), arguments: json!({}), item_id: None }],
         )))
         .unwrap();
         drop(log);
@@ -1517,7 +1517,7 @@ mod tests {
     async fn auto_compaction_mid_turn_keeps_the_turn_going() {
         let dir = tempfile::tempdir().unwrap();
         let big = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "big".into(), arguments: json!({}) }],
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "big".into(), arguments: json!({}), item_id: None }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
@@ -1704,11 +1704,11 @@ mod tests {
         std::fs::write(repo.join("pkg/AGENTS.md"), "Never edit generated files.").unwrap();
         let file = repo.join("pkg/lib.rs");
         let read = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r1".into(), name: "read_file".into(), arguments: json!({"path": file}) }],
+            tool_calls: vec![ToolCall { id: "r1".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None }],
             ..Default::default()
         };
         let again = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r2".into(), name: "read_file".into(), arguments: json!({"path": file}) }],
+            tool_calls: vec![ToolCall { id: "r2".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![read, again, text("done")], dir.path());
@@ -1731,7 +1731,7 @@ mod tests {
     }
 
     fn call(id: &str, name: &str, arguments: Value) -> LLMResponse {
-        LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments }], ..Default::default() }
+        LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments, item_id: None }], ..Default::default() }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1817,7 +1817,7 @@ mod tests {
     }
 
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}) }
+        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}), item_id: None }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1826,7 +1826,7 @@ mod tests {
         let batch = LLMResponse {
             tool_calls: vec![
                 report("o1", "completed", "Opened PR #5"),
-                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}) },
+                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None },
             ],
             ..Default::default()
         };
@@ -1942,7 +1942,7 @@ mod tests {
     async fn failed_tool_reports_failed_status_and_replay_covers_history() {
         let dir = tempfile::tempdir().unwrap();
         let broken = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "broken".into(), arguments: json!({}) }],
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "broken".into(), arguments: json!({}), item_id: None }],
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![broken, text("sorry")], dir.path());
@@ -2119,8 +2119,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = LLMResponse {
             tool_calls: vec![
-                ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "sleep 30"}) },
-                ToolCall { id: "e1".into(), name: "echo".into(), arguments: json!({"text": "never"}) },
+                ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "sleep 30"}), item_id: None },
+                ToolCall { id: "e1".into(), name: "echo".into(), arguments: json!({"text": "never"}), item_id: None },
             ],
             ..Default::default()
         };

@@ -613,9 +613,9 @@ mod tests {
 
     #[test]
     fn summarizes_tool_calls() {
-        let call = ToolCall { id: "1".into(), name: "bash".into(), arguments: json!({"command": "ls\n  -la"}) };
+        let call = ToolCall { id: "1".into(), name: "bash".into(), arguments: json!({"command": "ls\n  -la"}), item_id: None };
         assert!(tool_summary(&call, 40).contains("ls -la"));
-        let call = ToolCall { id: "1".into(), name: "get_time".into(), arguments: json!({}) };
+        let call = ToolCall { id: "1".into(), name: "get_time".into(), arguments: json!({}), item_id: None };
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");
