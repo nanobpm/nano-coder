@@ -50,6 +50,12 @@ impl RateMeter {
     /// rate (tokens/sec) when enough time has passed to refresh the display,
     /// otherwise `None` (first token, zero elapsed, or throttled).
     fn record(&mut self, bytes: usize, now: Instant) -> Option<f64> {
+        // Ignore zero-byte deltas: some producers emit empty text/thinking
+        // deltas, and starting the clock on one would depress the later rate
+        // even though no output has arrived yet.
+        if bytes == 0 {
+            return None;
+        }
         let start = *self.first_token_at.get_or_insert(now);
         self.bytes += bytes;
         let elapsed = now.duration_since(start).as_secs_f64();
@@ -62,6 +68,21 @@ impl RateMeter {
         }
         self.last_emit = Some(now);
         Some(self.bytes.div_ceil(4) as f64 / elapsed)
+    }
+
+    /// Compute a final rate at turn end, ignoring the throttle, so streams that
+    /// arrive as a single delta (elapsed zero at `record` time, hence never
+    /// published) still report a rate. Uses the exact completion-token count
+    /// when known, otherwise the streamed-byte estimate. Returns `None` when no
+    /// output was streamed or no measurable time elapsed.
+    fn finish(&self, tokens: Option<u64>, now: Instant) -> Option<f64> {
+        let start = self.first_token_at?;
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let tokens = tokens.map_or_else(|| self.bytes.div_ceil(4) as f64, |t| t as f64);
+        Some(tokens / elapsed)
     }
 }
 
@@ -948,7 +969,20 @@ impl Agent {
                 };
                 match result {
                     None => break None,
-                    Some(Ok(response)) => break Some(response),
+                    Some(Ok(response)) => {
+                        // A stream that arrives as a single delta has zero
+                        // elapsed at `record` time and never publishes a rate;
+                        // sample the meter once here (using exact usage when
+                        // available) so one-shot streams still report one.
+                        let tokens = response.usage.as_ref().and_then(|u| u64::try_from(u.completion_tokens).ok());
+                        if let Some(rate) = rate_meter.lock().unwrap().finish(tokens, Instant::now()) {
+                            stats.lock().unwrap().tokens_per_sec = Some(rate);
+                            if let Some(sink) = event_sink {
+                                sink(session_id, &AgentEvent::Context);
+                            }
+                        }
+                        break Some(response);
+                    }
                     Some(Err(e)) => {
                         let message = format!("{e:#}");
                         if overflow_retried || !context::is_context_overflow(&message) {
@@ -1360,6 +1394,40 @@ mod tests {
         assert!(meter.record(100, t0 + Duration::from_millis(300)).is_some());
         assert!(meter.record(100, t0 + Duration::from_millis(350)).is_none());
         assert!(meter.record(100, t0 + Duration::from_millis(600)).is_some());
+    }
+
+    #[test]
+    fn rate_meter_ignores_empty_deltas() {
+        // Empty deltas must not start the clock; otherwise the idle gap before
+        // real output arrives would depress the reported rate.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(0, t0), None);
+        // A real 4-byte (~1 token) delta one second later starts the clock now,
+        // so the first published rate reflects only actual output.
+        assert_eq!(meter.record(4, t0 + Duration::from_secs(1)), None);
+        let rate = meter
+            .record(4, t0 + Duration::from_millis(1_500))
+            .expect("rate after real output");
+        // 8 bytes ≈ 2 tokens over 0.5s ≈ 4 tok/s (not diluted by the empty delta).
+        assert!((rate - 4.0).abs() < 0.01, "got {rate}");
+    }
+
+    #[test]
+    fn rate_meter_finish_publishes_one_shot_stream() {
+        // A whole completion in a single delta: `record` sees zero elapsed and
+        // never publishes, but `finish` samples the meter at turn end.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(400, t0), None);
+        // Exact usage wins over the byte estimate: 200 tokens over 2s = 100 tok/s.
+        let rate = meter.finish(Some(200), t0 + Duration::from_secs(2)).expect("final rate");
+        assert!((rate - 100.0).abs() < 0.01, "got {rate}");
+        // With no usage, it falls back to the byte estimate (~100 tokens / 2s).
+        let est = meter.finish(None, t0 + Duration::from_secs(2)).expect("estimated rate");
+        assert!((est - 50.0).abs() < 0.01, "got {est}");
+        // No output streamed → no rate.
+        assert_eq!(RateMeter::default().finish(Some(10), t0), None);
     }
 
     /// Replays scripted responses and records the requests it saw.
