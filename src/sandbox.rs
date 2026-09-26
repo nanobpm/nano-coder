@@ -680,6 +680,32 @@ mod tests {
     }
 
     #[test]
+    fn os_sandbox_contains_static_guard_bypasses() {
+        // Defect-CLASS invariant (see SECURITY.md): the static command-safety
+        // guard in `permissions.rs` is a best-effort ADVISORY layer over a
+        // Turing-complete shell and has documented, undecidable bypass classes
+        // (encoded payloads, `docker cp`, incomplete option grammars, ...). The
+        // OS sandbox is the real containment boundary, so a write the static
+        // guard cannot see through must STILL be unable to escape the workspace.
+        let workspace = outside_dir();
+        let other = outside_dir();
+        let config = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
+
+        // An ANSI-C-encoded redirect to an absolute path outside the workspace:
+        // exactly the kind of encoded payload the static guard does not decode.
+        let target = other.path().join("escape.txt");
+        let encoded = target.to_string_lossy().replace('/', r"\x2f");
+        let script = format!("printf pwned > $'{encoded}' 2>/dev/null; echo done");
+        let (_, text) = run(&config, workspace.path(), &script);
+
+        assert!(text.contains("done"), "{text}");
+        assert!(!target.exists(), "OS sandbox let an encoded write escape the workspace: {text}");
+        // The write-root boundary is a pure predicate too, independent of any
+        // parse of the command text.
+        assert!(!config.allows_write(&target, workspace.path()));
+    }
+
+    #[test]
     fn root_cwd_is_not_a_writable_root() {
         // An ACP session whose `cwd` is `/` must not grant the whole host
         // filesystem as a writable subtree; only the temp roots remain.
