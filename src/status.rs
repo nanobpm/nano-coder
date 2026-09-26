@@ -101,20 +101,32 @@ impl StatusLine {
         // and re-pin the scroll region first, so the stale bar left at the old
         // bottom row is cleared even when the SIGWINCH resize() later no-ops.
         let Some((rows, cols)) = terminal_size() else { return };
-        let mut size = self.size.lock().unwrap();
+        // Compute the resize cleanup under the `size` lock, then release that
+        // lock before taking any other. draw() must never hold two of the
+        // struct's mutexes at once: set_input() takes `input` and then calls
+        // draw(), so if draw() held `size` while locking `input` the two paths
+        // could deadlock on a lock-order inversion. Scoping each lock to a
+        // single acquire removes that ordering entirely.
+        //
         // When the size changed, prepend the resize cleanup so the whole draw —
         // region reset, erase-below and the fresh bar — is emitted as one
         // atomic write. Splitting it into separate writes lets output from
         // another thread interleave between them and tear the escape sequences.
-        let prefix = match *size {
-            None => return, // torn down
-            Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
-                *size = Some((rows, cols));
-                resize_sequence(rows)
+        let prefix = {
+            let mut size = self.size.lock().unwrap();
+            match *size {
+                None => return, // torn down
+                Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
+                    *size = Some((rows, cols));
+                    resize_sequence(rows)
+                }
+                Some(_) => String::new(),
             }
-            Some(_) => String::new(),
         };
-        let line = match self.input.lock().unwrap().as_deref() {
+        // Snapshot the steer text and drop the `input` lock before touching
+        // `stats`, so at most one of these locks is ever held at a time.
+        let input = self.input.lock().unwrap().clone();
+        let line = match input.as_deref() {
             Some(text) => render_input(text, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };

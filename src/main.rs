@@ -746,13 +746,21 @@ async fn main() -> Result<()> {
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() {
-                    if separate {
-                        println!();
-                    }
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
-                    io::stdout().write_all(prompt.as_bytes()).unwrap();
-                    io::stdout().flush().unwrap();
+                    // Emit the optional separator, the prompt and the flush as
+                    // one unit under the terminal lock. Without it a concurrent
+                    // status redraw from the resize task can acquire TERM_LOCK
+                    // and slip its save/erase/re-pin sequence between these
+                    // writes, scattering the prompt across the screen.
+                    status::with_term_lock(|| {
+                        if separate {
+                            println!();
+                        }
+                        let mut out = io::stdout();
+                        out.write_all(prompt.as_bytes()).unwrap();
+                        out.flush().unwrap();
+                    });
                     view.prompt_redrawn();
                 }
             };
