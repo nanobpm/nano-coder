@@ -215,8 +215,14 @@ impl Policy {
             "read_file" | "write_file" | "edit_file" => {
                 let Some(path) = args.get("path").and_then(Value::as_str) else { return Ok(()) };
                 let absolute = normalize(&cwd.join(expand_tilde(path)));
+                // `read_file`/`write_atomically` dereference symlinks, so a link like
+                // `safe -> ~/.ssh/id_ed25519` would let `Read(~/.ssh/**)` miss the real
+                // target. Match rules against the symlink-resolved path too (the deepest
+                // existing ancestor for a not-yet-created file), keeping the lexical check
+                // for paths that do not exist.
+                let resolved = resolve_symlinks(&absolute);
                 for rule in self.deny.iter().filter(|r| r.applies_to(tool)) {
-                    if path_rule_matches(rule, &absolute, cwd) {
+                    if path_rule_matches(rule, &absolute, cwd) || path_rule_matches(rule, &resolved, cwd) {
                         return Err(format!("rule `{}` denies {tool} on {}", rule.source, absolute.display()));
                     }
                 }
@@ -310,7 +316,29 @@ fn command_text(cmd: &Simple) -> String {
 
 /// A redirection operator that writes to its target.
 fn is_write_redirect(op: &str) -> bool {
-    matches!(op, ">" | ">>" | ">|" | "&>" | "&>>" | "<>")
+    // `>&` is Bash's combined stdout/stderr output redirection (`echo hi >& /dev/sda`);
+    // `2>&1` is harmless because its target resolves to the fd word `1`, not a path.
+    matches!(op, ">" | ">>" | ">|" | "&>" | "&>>" | "<>" | ">&")
+}
+
+/// Resolve `path` through symlinks by canonicalizing its deepest existing
+/// ancestor and re-appending the not-yet-existing tail, so a file-tool target
+/// reached through a symlink is judged by the file it really reads or writes.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(real) => return rest.iter().rev().fold(real, |p: PathBuf, part| p.join(part)),
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return path.to_path_buf(),
+            },
+        }
+    }
 }
 
 /// Resolve a redirection/`dd` target lexically against `cwd`, collapsing `.`/`..`
@@ -337,7 +365,6 @@ fn device_write(target: &str, cwd: &Path) -> Result<(), String> {
     let dev = path.starts_with("/dev/")
         && !SAFE_DEVICES.contains(&path)
         && !path.starts_with("/dev/fd/")
-        && !path.starts_with("/dev/tty")
         && !path.starts_with("/dev/shm/")
         && !path.starts_with("/dev/pts/");
     if dev {
@@ -421,6 +448,11 @@ const SUDO_LONG_WITH_VALUE: &[&str] =
 const XARGS_LONG_WITH_VALUE: &[&str] =
     &["--max-args", "--max-chars", "--max-lines", "--max-procs", "--delimiter", "--arg-file", "--process-slot-var"];
 
+/// Long options (in `--opt value` form) that consume the following word for
+/// `timeout`; otherwise their value is mistaken for the duration or the wrapped
+/// program (`timeout --kill-after 1 5 rm -rf /`).
+const TIMEOUT_LONG_WITH_VALUE: &[&str] = &["--kill-after", "--signal"];
+
 fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value: &[&str]) -> usize {
     while let Some(word) = words.get(i) {
         let text = word.text.as_str();
@@ -496,7 +528,7 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 }
             }
             "timeout" => {
-                i = skip_options(words, i + 1, "sk", &[]);
+                i = skip_options(words, i + 1, "sk", TIMEOUT_LONG_WITH_VALUE);
                 i += 1; // duration
             }
             "env" => {
@@ -747,7 +779,18 @@ impl Guard<'_> {
             Some(word) if word.text == "-" => None,
             Some(word) => self.resolve_dir(word),
         };
-        *self.base.borrow_mut() = next;
+        // A `cd` to a path that is not an existing directory fails, leaving the
+        // shell in the previous directory. Recording an unverifiable target that
+        // lies *outside* the workspace would let `cd /elsewhere/missing; rm -rf *`
+        // be judged against the benign target while the shell, still in the
+        // workspace, empties the working tree. Fail closed (undeterminable) in that
+        // case. A target inside the workspace is safe either way, so keep it.
+        *self.base.borrow_mut() = match next {
+            Some(path) if !path.is_dir() => {
+                (self.cwd != Path::new("/") && path.starts_with(self.cwd)).then_some(path)
+            }
+            other => other,
+        };
     }
 
     fn resolve_dir(&self, word: &Word) -> Option<PathBuf> {
@@ -796,15 +839,17 @@ impl Guard<'_> {
                         self.protect(source, true, "mv")?;
                     }
                     let dest = Word { text: dir, ..Word::default() };
-                    self.protect(&dest, false, "mv")?;
+                    self.protect(&self.follow_symlink(&dest), false, "mv")?;
                 } else if let Some((dest, sources)) = targets.split_last() {
                     for source in sources {
                         self.protect(source, true, "mv")?;
                     }
                     // The destination can overwrite an existing protected path
                     // (`mv x /etc/passwd`); guard it, but not writes into the
-                    // working directory itself (`mv a .`).
-                    self.protect(dest, false, "mv")?;
+                    // working directory itself (`mv a .`). A destination that is a
+                    // symlink to a directory is followed (`mv passwd link` with
+                    // `link -> /etc` writes `/etc/passwd`), so resolve it first.
+                    self.protect(&self.follow_symlink(dest), false, "mv")?;
                 }
             }
             "chmod" | "chown" | "chgrp" => {
@@ -825,11 +870,20 @@ impl Guard<'_> {
                 // `find`'s leading global options (`-H`/`-L`/`-P`, `-D debugopts`,
                 // `-Olevel`) precede the start paths; skip them first so
                 // `find -P / -name x -delete` doesn't see the option as ending an
-                // (empty) start-path list and fall back to the implicit `.`.
+                // (empty) start-path list and fall back to the implicit `.`. `-H`/`-L`
+                // also make `find` follow command-line symlinks, so track that mode.
+                let mut follow = false;
                 let mut s = 0;
                 while let Some(a) = args.get(s) {
                     match a.text.as_str() {
-                        "-H" | "-L" | "-P" => s += 1,
+                        "-H" | "-L" => {
+                            follow = true;
+                            s += 1;
+                        }
+                        "-P" => {
+                            follow = false;
+                            s += 1;
+                        }
                         "-D" => s += 2,
                         t if t.starts_with("-O") => s += 1,
                         _ => break,
@@ -844,12 +898,18 @@ impl Guard<'_> {
                 // so `find -delete` wipes the working tree; treat it as an implicit `.`.
                 let implicit = Word { text: ".".into(), ..Word::default() };
                 let starts: Vec<&Word> = if starts.is_empty() { vec![&implicit] } else { starts };
+                // Under `-H`/`-L`, a start path that is a symlink is traversed as its
+                // target (`find -L link -name passwd -delete` with `link -> /etc`), so
+                // resolve it before the destructive-root checks.
+                let starts: Vec<Word> =
+                    starts.iter().map(|&w| if follow { self.follow_symlink(w) } else { w.clone() }).collect();
                 if narrowed {
                     // A narrowed `-delete` still recurses from its start paths, so a
-                    // catastrophic root (`find / -name passwd -delete`, `find ~ ...`)
-                    // can wipe protected files. Keep guarding those roots, but allow
-                    // ordinary `find . -name '*.tmp' -delete` inside the workspace.
-                    for &start in &starts {
+                    // catastrophic root (`find / -name passwd -delete`, `find ~ ...`,
+                    // `find ~/Documents ...`, `find .git ...`) can wipe protected files.
+                    // Keep guarding those roots, but allow ordinary
+                    // `find . -name '*.tmp' -delete` inside the workspace.
+                    for start in &starts {
                         if let Ok(Some((path, _))) = self.resolve(start)
                             && let Some(what) = self.catastrophic_root(&path)
                         {
@@ -857,7 +917,7 @@ impl Guard<'_> {
                         }
                     }
                 } else {
-                    for &start in &starts {
+                    for start in &starts {
                         self.protect(start, true, "find -delete")?;
                     }
                 }
@@ -870,8 +930,12 @@ impl Guard<'_> {
                 }
             }
             "shred" | "blkdiscard" => {
-                for arg in args.iter().filter(|a| a.text.starts_with("/dev/")) {
-                    self.device_write(&arg.text)?;
+                // Guard every operand through `device_write` (which resolves `..` and
+                // symlinks) rather than filtering by a literal `/dev/` prefix, so
+                // `shred /tmp/../dev/sda` or a symlink into `/dev` is still caught.
+                let (_, targets) = split_flags(args);
+                for target in &targets {
+                    self.device_write(&target.text)?;
                 }
             }
             p if p.starts_with("mkfs") || p.starts_with("newfs") => {
@@ -1016,18 +1080,28 @@ impl Guard<'_> {
     /// workspace subtree (used for narrowed `find -delete`, where the working
     /// directory and its descendants are legitimate targets).
     fn catastrophic_root(&self, p: &Path) -> Option<&'static str> {
-        // The workspace subtree is exempt — unless the workspace itself is `/`,
-        // where treating every path as in-workspace would disable the guard.
+        // Repository metadata is always protected, even inside the workspace, so a
+        // narrowed `find .git -name '*' -delete` cannot wipe it.
+        if p.components().any(|c| c.as_os_str() == ".git") {
+            return Some("a git repository's .git directory");
+        }
+        // The workspace subtree is otherwise exempt — unless the workspace itself
+        // is `/`, where treating every path as in-workspace would disable the guard.
         if self.cwd != Path::new("/") && p.starts_with(self.cwd) {
             return None;
         }
         if p == Path::new("/") {
             return Some("the filesystem root");
         }
-        if let Some(home) = self.home.as_deref()
-            && home.starts_with(p)
-        {
-            return Some("your home directory");
+        if let Some(home) = self.home.as_deref() {
+            if home.starts_with(p) {
+                return Some("your home directory");
+            }
+            // A top-level folder of home (`find ~/Documents -name '*.tmp' -delete`)
+            // is protected the same way `danger` protects it.
+            if p.parent() == Some(home) {
+                return Some("a top-level folder of your home directory");
+            }
         }
         if p.components().count() <= 1 {
             return Some("a top-level system directory");
@@ -1039,6 +1113,21 @@ impl Guard<'_> {
             return Some("a system directory");
         }
         None
+    }
+
+    /// Follow a command-line symlink operand to its real path when the tool
+    /// dereferences it (`find -L`/`-H` start paths, a `mv`/`cp` destination that
+    /// is a symlink to a directory). Returns a word carrying the canonical target
+    /// so the destructive/protected-path checks judge the real location; leaves
+    /// the word untouched when it is not an existing symlink.
+    fn follow_symlink(&self, word: &Word) -> Word {
+        if let Ok(Some((path, false))) = self.resolve(word)
+            && path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(canon) = path.canonicalize()
+        {
+            return Word { text: canon.to_string_lossy().into_owned(), ..Word::default() };
+        }
+        word.clone()
     }
 
     /// Resolve a path word lexically: known variables and `~` are substituted,
@@ -1637,6 +1726,93 @@ mod tests {
         assert!(p.check_in("bash", &json!({ "command": "rm -rf /etc" }), root).is_err());
         assert!(p.check_in("bash", &json!({ "command": "chmod -R 777 /" }), root).is_err());
         assert!(p.check_in("bash", &json!({ "command": "find / -name x -delete" }), root).is_err());
+    }
+
+    #[test]
+    fn round8_guard_hardening() {
+        // #2 `>&` is combined output redirection, so it must run the device guard.
+        assert!(blocked("echo hi >& /dev/sda").contains("device"));
+        {
+            let p = policy(&["Bash(echo *)"], &[]);
+            assert!(check(&p, "echo hi >& /dev/sda").is_err());
+        }
+        allowed("echo hi >& out.log");
+        allowed("echo hi 2>&1"); // the fd word `1`, not a path
+
+        // #3 The `/dev/tty` exception is exact: real tty device nodes are blocked.
+        assert!(blocked("echo data > /dev/ttyS0").contains("device"));
+        assert!(blocked("echo data > /dev/ttyUSB0").contains("device"));
+        allowed("echo data > /dev/tty");
+
+        // #4 `timeout` value-taking long options must be skipped so the nested
+        // command is still inspected.
+        assert!(blocked("timeout --kill-after 1 5 rm -rf /").contains("filesystem root"));
+        assert!(blocked("timeout --signal TERM 5 rm -rf /").contains("filesystem root"));
+        assert!(blocked("timeout --kill-after=1 5 rm -rf /").contains("filesystem root"));
+
+        // #5 An unverifiable `cd` outside the workspace must not let a relative
+        // destructive path escape the working-directory guard; an in-workspace `cd`
+        // is still fine.
+        assert!(check(&Policy::default(), "cd /home/nano-does-not-exist/deep; rm -rf *").is_err());
+        allowed("cd build && rm -rf *");
+
+        // #8 Narrowed `find -delete` also guards home top-level folders and `.git`.
+        let home = dirs::home_dir().expect("home dir");
+        let p = Policy::default();
+        let docs = home.join("Documents");
+        let cmd = format!("find {} -name '*.tmp' -delete", docs.display());
+        assert!(p.check_in("bash", &json!({ "command": cmd }), Path::new("/work/project")).is_err());
+        // `.git` is protected even inside the workspace subtree.
+        assert!(check(&Policy::default(), "find .git -name '*' -delete").is_err());
+    }
+
+    #[test]
+    fn find_follow_and_mv_symlink_dest_are_resolved() {
+        // #6/#7 `find -L link ... -delete` and `mv x link` (with `link -> /etc`)
+        // dereference the symlink, so the guard must judge the real target.
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nano-perm-follow-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("etc");
+        symlink("/etc", &link).unwrap();
+        let p = Policy::default();
+        let find_blocked = p.check_in("bash", &json!({ "command": "find -L etc -name passwd -delete" }), &dir).is_err();
+        let mv_blocked = p.check_in("bash", &json!({ "command": "mv passwd etc" }), &dir).is_err();
+        let find_default_ok =
+            p.check_in("bash", &json!({ "command": "find etc -name passwd -delete" }), &dir).is_ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(find_blocked, "find -L should follow the symlink into /etc");
+        assert!(mv_blocked, "mv into a symlink-to-/etc should be blocked");
+        assert!(find_default_ok, "find without -L only removes the link itself");
+    }
+
+    #[test]
+    fn shred_normalizes_device_paths() {
+        // #9 `shred`/`blkdiscard` operands go through the resolving device guard,
+        // not a literal `/dev/` prefix test.
+        assert!(blocked("shred /tmp/../dev/sda").contains("device"));
+        assert!(blocked("shred -n 3 -u /dev/sda").contains("device"));
+        allowed("shred -n 3 -u scratch.txt");
+    }
+
+    #[test]
+    fn path_rules_follow_symlink_targets() {
+        // #1 File tools dereference symlinks, so a link to a protected file must be
+        // caught by the rule even though its lexical path does not match.
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nano-perm-link-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret.env");
+        std::fs::write(&secret, "TOKEN=1").unwrap();
+        let link = dir.join("innocent.txt");
+        symlink(&secret, &link).unwrap();
+        let rule = format!("Read({}/*.env)", dir.display());
+        let p = policy(&[], &[&rule]);
+        let via_link = p.check_in("read_file", &json!({ "path": "innocent.txt" }), &dir).is_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(via_link, "reading through a symlink to a *.env file must be denied");
     }
 
     #[test]
