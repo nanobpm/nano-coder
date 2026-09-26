@@ -256,8 +256,13 @@ impl Policy {
         let allow: Vec<&Rule> = self.allow.iter().filter(|r| r.subject == Subject::Command).collect();
         if !allow.is_empty()
             && commands.iter().all(|cmd| {
+                // A redirection-only command (no words but with redirects, e.g.
+                // `> /dev/sda`) is not an empty no-op: it must match an allow rule
+                // so the builtin guard still runs on it. Only a truly empty command
+                // (no words and no redirects) is treated as automatically approved.
                 let text = command_text(cmd);
-                cmd.words.is_empty() || allow.iter().any(|r| r.matches(&text))
+                (cmd.words.is_empty() && cmd.redirects.is_empty())
+                    || allow.iter().any(|r| r.matches(&text))
             })
         {
             return Ok(());
@@ -1297,6 +1302,15 @@ mod tests {
         check(&p, "rm -rf /").unwrap_err();
         let p = policy(&["Bash(*)"], &[]);
         check(&p, "rm -rf /").unwrap();
+    }
+
+    #[test]
+    fn allow_list_still_guards_redirection_only_commands() {
+        // A redirection-only command (empty words) must not be auto-approved by an
+        // unrelated allow rule; the builtin device-write guard must still run.
+        let p = policy(&["Bash(echo *)"], &[]);
+        assert!(check(&p, "> /dev/sda").is_err());
+        assert!(check(&p, "echo hi > /dev/null").is_ok());
     }
 
     #[test]
