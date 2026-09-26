@@ -29,12 +29,23 @@ pub struct Redirect {
     pub target: Word,
 }
 
+/// A here-document body fed to a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heredoc {
+    /// The raw body text between the operator line and the delimiter.
+    pub body: String,
+    /// The parent shell expands the body (so command substitutions and
+    /// parameter expansions in it run) unless the delimiter was quoted
+    /// (`<<'EOF'` / `<<"EOF"` / `<<\EOF`).
+    pub expand: bool,
+}
+
 /// A simple command: words, redirections and here-document bodies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Simple {
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
-    pub heredocs: Vec<String>,
+    pub heredocs: Vec<Heredoc>,
 }
 
 const MAX_DEPTH: usize = 16;
@@ -58,6 +69,7 @@ struct PendingHeredoc {
     command: usize,
     delimiter: String,
     strip_tabs: bool,
+    expand: bool,
 }
 
 struct Parser {
@@ -120,7 +132,7 @@ impl Parser {
                     for heredoc in pending.drain(..) {
                         let body = self.heredoc_body(&heredoc.delimiter, heredoc.strip_tabs);
                         if let Some(command) = self.out.get_mut(heredoc.command) {
-                            command.heredocs.push(body);
+                            command.heredocs.push(Heredoc { body, expand: heredoc.expand });
                         }
                     }
                 }
@@ -250,7 +262,13 @@ impl Parser {
         let target = self.word()?;
         if op == "<<" || op == "<<-" {
             // The body belongs to the current command, which gets its index when flushed.
-            pending.push(PendingHeredoc { command: usize::MAX, delimiter: target.text.clone(), strip_tabs: op == "<<-" });
+            // A quoted delimiter (`<<'EOF'`) disables expansion of the body.
+            pending.push(PendingHeredoc {
+                command: usize::MAX,
+                delimiter: target.text.clone(),
+                strip_tabs: op == "<<-",
+                expand: !target.quoted,
+            });
         }
         current.redirects.push(Redirect { op, target });
         Ok(())
@@ -601,10 +619,10 @@ mod tests {
         assert_eq!(parsed[0].redirects[0].op, ">");
         assert_eq!(parsed[0].redirects[0].target.text, "/dev/sda");
         assert_eq!(parsed[0].redirects[1].op, ">&");
-        assert_eq!(parsed[0].heredocs, vec!["DROP DATABASE x;\n"]);
+        assert_eq!(parsed[0].heredocs, vec![Heredoc { body: "DROP DATABASE x;\n".into(), expand: true }]);
         assert_eq!(parsed[1].words[0].text, "echo");
         let parsed = parse("psql <<-'SQL' && echo ok\n\tDROP TABLE t;\n\tSQL\n").unwrap();
-        assert_eq!(parsed[0].heredocs, vec!["\tDROP TABLE t;\n"]);
+        assert_eq!(parsed[0].heredocs, vec![Heredoc { body: "\tDROP TABLE t;\n".into(), expand: false }]);
         assert_eq!(parsed[1].words[0].text, "echo");
     }
 
