@@ -1853,6 +1853,20 @@ mod tests {
     }
 
     #[test]
+    fn static_guard_is_advisory_and_fails_closed_on_uninspectable_input() {
+        // Defect-CLASS invariant (see SECURITY.md): the static guard is a
+        // best-effort ADVISORY layer, not the security boundary. It is NOT
+        // expected to be complete over a Turing-complete shell — the OS sandbox
+        // contains the documented static-bypass classes it cannot see through.
+        // What it MUST do is fail CLOSED on the one bounded case it can
+        // recognise as uninspectable: a command body computed at run time that
+        // it cannot parse at all.
+        assert!(blocked("bash -c \"$CMD\"").contains("computed at run time"));
+        assert!(blocked("CMD=$(cat x); bash -c \"$CMD arg\"").contains("computed at run time"));
+        assert!(blocked("sh -c \"$(cat payload)\"").contains("computed at run time"));
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",
