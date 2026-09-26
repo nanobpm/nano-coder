@@ -7,7 +7,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
-use crate::context::{Activity, ContextStats, SharedStats, format_tokens};
+use crate::context::{Activity, ContextStats, SharedStats, format_rate, format_tokens};
 
 pub struct StatusLine {
     stats: SharedStats,
@@ -177,6 +177,13 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     if let Some((text, color)) = activity {
         segments.push(Segment { text: format!(" {text} "), color: Some(color), priority: 7 });
     }
+    // Live output rate while the model is generating; lowest priority so it is
+    // shed first on narrow terminals, and hidden unless a rate is available.
+    if matches!(stats.activity, Activity::Thinking)
+        && let Some(rate) = stats.tokens_per_sec
+    {
+        segments.push(Segment { text: format!(" {} ", format_rate(rate)), color: Some("\x1b[38;5;108m"), priority: 0 });
+    }
 
     let width = |segments: &[Segment]| -> usize {
         segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + segments.len().saturating_sub(1)
@@ -232,6 +239,7 @@ mod tests {
             activity: Activity::Tool("bash".into()),
             plan: Some((2, 5)),
             cwd: "/tmp/project".into(),
+            tokens_per_sec: None,
         }
     }
 
@@ -257,5 +265,30 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn shows_output_rate_only_while_generating() {
+        let generating = ContextStats { activity: Activity::Thinking, tokens_per_sec: Some(2.0), ..stats() };
+        assert!(visible(&render(&generating, 160)).contains("2.0 tok/s"), "rate should show while thinking");
+
+        let fast = ContextStats { activity: Activity::Thinking, tokens_per_sec: Some(12.4), ..stats() };
+        assert!(visible(&render(&fast, 160)).contains("12 tok/s"), "fast rate rounds to integer");
+
+        // A rate is only shown while thinking, never during a tool call or idle.
+        let tooling = ContextStats { tokens_per_sec: Some(2.0), ..stats() };
+        assert!(!visible(&render(&tooling, 160)).contains("tok/s"), "rate hidden outside generation");
+        let idle = ContextStats { activity: Activity::Idle, tokens_per_sec: None, ..stats() };
+        assert!(!visible(&render(&idle, 160)).contains("tok/s"), "rate hidden when idle");
+    }
+
+    #[test]
+    fn drops_output_rate_first_on_narrow_widths() {
+        let generating = ContextStats { activity: Activity::Thinking, tokens_per_sec: Some(2.0), ..stats() };
+        // Wide enough to shed the rate but keep the model name.
+        let line = visible(&render(&generating, 50));
+        assert_eq!(line.chars().count(), 50);
+        assert!(line.contains("work/llama-b"), "{line:?}");
+        assert!(!line.contains("tok/s"), "rate should be dropped first: {line:?}");
     }
 }

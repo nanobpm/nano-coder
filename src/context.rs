@@ -60,6 +60,9 @@ pub struct ContextStats {
     pub plan: Option<(usize, usize)>,
     /// Working directory shown on the status line.
     pub cwd: String,
+    /// Live output rate while generating (completion tokens per second),
+    /// `None` when idle or before the first streamed token.
+    pub tokens_per_sec: Option<f64>,
 }
 
 impl ContextStats {
@@ -83,6 +86,15 @@ pub fn format_tokens(tokens: usize) -> String {
 /// Rough token count for text (about four characters per token).
 pub fn text_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
+}
+
+/// `12 tok/s`-style output-rate label.
+pub fn format_rate(tokens_per_sec: f64) -> String {
+    if tokens_per_sec >= 10.0 {
+        format!("{tokens_per_sec:.0} tok/s")
+    } else {
+        format!("{tokens_per_sec:.1} tok/s")
+    }
 }
 
 pub fn message_tokens(message: &Message) -> usize {

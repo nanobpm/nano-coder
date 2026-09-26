@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -25,6 +26,44 @@ const INTERRUPTED_TOOL_RESULT: &str =
     "Error: the harness stopped before this tool call completed; its outcome is unknown.";
 const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this tool call ran.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
+
+/// Accumulates streamed output to estimate a live output rate (completion
+/// tokens per second), throttled so the status line does not redraw on every
+/// delta. Tokens are estimated from streamed bytes (~4 bytes/token) and
+/// reconciled against exact usage at turn end.
+#[derive(Default)]
+struct RateMeter {
+    /// When the first streamed byte arrived; the rate divides by elapsed since
+    /// this instant, so it is `None` (no rate) until then.
+    first_token_at: Option<Instant>,
+    /// Total output bytes streamed so far this turn.
+    bytes: usize,
+    /// When the rate was last published, for throttling.
+    last_emit: Option<Instant>,
+}
+
+impl RateMeter {
+    /// Minimum spacing between rate updates (~4 Hz) to avoid flicker/overhead.
+    const THROTTLE: Duration = Duration::from_millis(250);
+
+    /// Record `bytes` of streamed output produced at `now`. Returns the current
+    /// rate (tokens/sec) when enough time has passed to refresh the display,
+    /// otherwise `None` (first token, zero elapsed, or throttled).
+    fn record(&mut self, bytes: usize, now: Instant) -> Option<f64> {
+        let start = *self.first_token_at.get_or_insert(now);
+        self.bytes += bytes;
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let due = self.last_emit.is_none_or(|t| now.duration_since(t) >= Self::THROTTLE);
+        if !due {
+            return None;
+        }
+        self.last_emit = Some(now);
+        Some(self.bytes.div_ceil(4) as f64 / elapsed)
+    }
+}
 
 /// A steering message sent while a turn is running. `tag` identifies the
 /// request that carried it (e.g. the ACP request ID) so it can be answered.
@@ -430,6 +469,10 @@ impl Agent {
         let changed = {
             let mut stats = self.stats.lock().unwrap();
             let changed = stats.activity != activity;
+            if !matches!(activity, Activity::Thinking) {
+                // Generation has stopped; drop the live output rate.
+                stats.tokens_per_sec = None;
+            }
             stats.activity = activity;
             changed
         };
@@ -872,12 +915,26 @@ impl Agent {
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
+                let stats = self.stats.clone();
+                let rate_meter = Arc::new(Mutex::new(RateMeter::default()));
                 let on_stream = |event: StreamEvent<'_>| {
-                    if let Some(sink) = event_sink {
-                        match event {
-                            StreamEvent::Text(text) => sink(session_id, &AgentEvent::TextDelta { text }),
-                            StreamEvent::Thinking(text) => sink(session_id, &AgentEvent::ThinkingDelta { text }),
+                    let Some(sink) = event_sink else { return };
+                    let text = match event {
+                        StreamEvent::Text(text) => {
+                            sink(session_id, &AgentEvent::TextDelta { text });
+                            text
                         }
+                        StreamEvent::Thinking(text) => {
+                            sink(session_id, &AgentEvent::ThinkingDelta { text });
+                            text
+                        }
+                    };
+                    // Update the live output rate, throttled so the status line
+                    // does not redraw on every delta.
+                    let rate = rate_meter.lock().unwrap().record(text.len(), Instant::now());
+                    if let Some(rate) = rate {
+                        stats.lock().unwrap().tokens_per_sec = Some(rate);
+                        sink(session_id, &AgentEvent::Context);
                     }
                 };
                 let call = if self.streaming && event_sink.is_some() {
@@ -1272,6 +1329,38 @@ mod tests {
     use crate::tools::ToolDefinition;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rate_meter_tracks_scripted_stream() {
+        // A slow ~2 tok/s stream: 8 bytes (≈2 tokens) per second.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        // First delta starts the clock; zero elapsed yields no rate yet.
+        assert_eq!(meter.record(8, t0), None);
+        // One second later, 16 bytes total ≈ 4 tokens over 1s → ~4 tok/s...
+        let one = meter.record(8, t0 + Duration::from_secs(1)).expect("rate after first second");
+        assert!((one - 4.0).abs() < 0.01, "got {one}");
+        // ...settling toward ~2 tok/s as the stream continues at 8 bytes/sec.
+        let mut last = one;
+        for sec in 2..=8 {
+            if let Some(rate) = meter.record(8, t0 + Duration::from_secs(sec)) {
+                last = rate;
+            }
+        }
+        // 72 bytes ≈ 18 tokens over 8s ≈ 2.25 tok/s.
+        assert!((last - 2.25).abs() < 0.1, "settled rate {last}");
+    }
+
+    #[test]
+    fn rate_meter_throttles_updates() {
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(100, t0), None); // first token, no rate
+        // Emits once ~250ms in, then suppresses closely-spaced deltas.
+        assert!(meter.record(100, t0 + Duration::from_millis(300)).is_some());
+        assert!(meter.record(100, t0 + Duration::from_millis(350)).is_none());
+        assert!(meter.record(100, t0 + Duration::from_millis(600)).is_some());
+    }
 
     /// Replays scripted responses and records the requests it saw.
     struct Scripted {
