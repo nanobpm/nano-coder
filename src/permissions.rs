@@ -603,6 +603,81 @@ fn container_command_start(words: &[Word], mut from: usize) -> Option<usize> {
     (start < words.len()).then_some(start)
 }
 
+/// True when a `-v`/`--volume`/`--mount` spec bind-mounts a *host* filesystem
+/// path (rather than a named volume), letting the container write host files
+/// outside the sandbox. `--mount type=bind,...` is always a host bind; the
+/// `-v SRC:DST` form binds the host when `SRC` is a filesystem path (absolute,
+/// relative or `~`) rather than a named volume. A single `-v /data` (no `:`) is
+/// an anonymous container-only volume, so it is not a host bind.
+fn mount_binds_host(spec: &str) -> bool {
+    if spec.contains("type=bind") {
+        return true;
+    }
+    if spec.contains("source=") || spec.contains("src=") {
+        return spec.split(',').any(|kv| {
+            kv.strip_prefix("source=")
+                .or_else(|| kv.strip_prefix("src="))
+                .is_some_and(|s| s.starts_with('/') || s.starts_with('.') || s.starts_with('~'))
+        });
+    }
+    match spec.split_once(':') {
+        Some((src, _)) => src.starts_with('/') || src.starts_with('.') || src.starts_with('~'),
+        None => false,
+    }
+}
+
+/// Returns `Some(reason)` when a `docker`/`podman run|exec` invocation carries an
+/// option that lets the container act outside this process's sandbox: a host
+/// bind mount, `--privileged`, a host namespace (`--pid=host`, ...), raw
+/// `--device` access, an added capability, a relaxed `--security-opt`, or the
+/// container socket (caught as a host bind of `/var/run/docker.sock`). The
+/// container runtime performs those operations as a separate, unsandboxed
+/// process, so unwrapping to the inner command is not enough — the caller must
+/// fail closed. `from` points just past the `docker`/`podman` word.
+fn container_escape(words: &[Word], mut from: usize) -> Option<String> {
+    if words.get(from).is_some_and(|w| w.text == "container") {
+        from += 1;
+    }
+    match words.get(from).map(|w| w.text.as_str()) {
+        Some("exec") | Some("run") => from += 1,
+        _ => return None,
+    }
+    let mut i = from;
+    while let Some(word) = words.get(i) {
+        let text = word.text.as_str();
+        if text == "--" || !text.starts_with('-') || text == "-" {
+            break; // reached the container/image operand
+        }
+        let (name, inline) = match text.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (text, None),
+        };
+        let value = inline.clone().or_else(|| words.get(i + 1).map(|w| w.text.clone()));
+        match name {
+            "--privileged" => return Some("--privileged".into()),
+            "--device" | "--cap-add" | "--security-opt" => return Some(name.to_string()),
+            "-v" | "--volume" | "--mount" if value.as_deref().is_some_and(mount_binds_host) => {
+                return Some(format!("host bind mount `{}`", value.unwrap_or_default()));
+            }
+            "--pid" | "--ipc" | "--uts" | "--userns" | "--cgroupns" | "--network" | "--net"
+                if value.as_deref().is_some_and(|v| v == "host" || v.ends_with(":host") || v.ends_with("=host")) =>
+            {
+                return Some(format!("{name} host namespace"));
+            }
+            _ => {}
+        }
+        let consumes_value = inline.is_none()
+            && if let Some(long) = name.strip_prefix("--") {
+                DOCKER_LONG_WITH_VALUE.contains(&format!("--{long}").as_str())
+            } else {
+                let opts = &name[1..];
+                opts.chars().position(|c| "eupvwmhl".contains(c)).is_some_and(|pos| pos + 1 == opts.chars().count())
+            };
+        i += if consumes_value { 2 } else { 1 };
+    }
+    None
+}
+
 fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value: &[&str]) -> usize {
     while let Some(word) = words.get(i) {
         let text = word.text.as_str();
@@ -745,6 +820,19 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 // shell scripts, DB clients and destructive words are inspected
                 // rather than hidden inside the container invocation.
                 push(out, i);
+                // ...but the container runtime is a separate, unsandboxed process:
+                // host bind mounts, `--privileged`, host namespaces, `--device`,
+                // added capabilities and the container socket let it write outside
+                // Landlock/Seatbelt even when the inner command looks benign
+                // (`docker run --privileged -v /:/host alpine rm -rf /host/etc`
+                // unwraps to `rm -rf /host/etc`). Fail closed on such escapes.
+                if let Some(reason) = container_escape(words, i + 1) {
+                    return Err(format!(
+                        "container invocation escapes the sandbox via {reason}: the container runtime performs \
+                         this write as a separate, unsandboxed process — remove host bind mounts, \
+                         privileged/host-namespace, device and capability options"
+                    ));
+                }
                 if depth >= MAX_EXPAND_DEPTH {
                     return Ok(());
                 }
@@ -818,13 +906,30 @@ fn expand_shell(simple: &Simple, at: usize, depth: usize, out: &mut Vec<Simple>)
         j += if text.ends_with('o') || text.ends_with('O') { 2 } else { 1 };
     }
     if j >= words.len() {
-        // Script on stdin: inspect here-documents and here-strings. A here-document
-        // fed to a shell is executed as a script regardless of delimiter quoting.
+        // No `-c` script and no script-file operand: the shell runs whatever it
+        // reads from standard input. Inspect the sources we *can* read — here-docs
+        // and here-strings — and fail closed on any stdin we cannot: a pipe
+        // (`printf 'rm -rf /\n' | bash`) leaves this simple command with no
+        // redirect at all, and a `bash < script.sh` file redirect points stdin at
+        // a file we cannot read. Either way the script would execute unseen once
+        // the OS sandbox is off, so treat it as uninspectable rather than assume
+        // it is empty/interactive.
+        let mut inspected_stdin = false;
         for body in &simple.heredocs {
             parse_inner(&body.body, depth, out)?;
+            inspected_stdin = true;
         }
         for redirect in simple.redirects.iter().filter(|r| r.op == "<<<") {
             parse_inner(&script_text(std::slice::from_ref(&redirect.target))?, depth, out)?;
+            inspected_stdin = true;
+        }
+        let redirects_stdin_from_file = simple.redirects.iter().any(|r| matches!(r.op.as_str(), "<" | "0<"));
+        if redirects_stdin_from_file || !inspected_stdin {
+            return Err(format!(
+                "`{}` reads its script from standard input (a pipe or file redirect) that cannot be inspected; \
+                 pass the script via `-c` or a here-document so it can be checked",
+                words[at].text
+            ));
         }
     }
     Ok(())
@@ -2261,6 +2366,35 @@ mod tests {
         let p = Policy::new(&PermissionsConfig::default(), &sandbox);
         let err = p.check_in("write_file", &json!({"path": "root-link/../etc/hosts"}), &cwd).unwrap_err();
         assert!(err.contains("outside the workspace sandbox"), "{err}");
+    }
+
+    #[test]
+    fn round13_guard_hardening() {
+        // #1 A container invocation is a separate, unsandboxed process: host bind
+        // mounts, `--privileged`, host namespaces, `--device`, `--cap-add` and
+        // `--security-opt` let it write past Landlock/Seatbelt even though the
+        // unwrapped inner command looks benign. Fail closed on those escapes.
+        assert!(blocked("docker run --privileged -v /:/host alpine rm -rf /host/etc").contains("container"));
+        assert!(blocked("docker run --rm -v /:/host alpine cat /host/etc/hosts").contains("container"));
+        assert!(blocked("docker run --network=host alpine sh -c 'echo hi'").contains("container"));
+        assert!(blocked("podman run --pid host alpine true").contains("container"));
+        assert!(blocked("docker run --device /dev/sda alpine true").contains("container"));
+        assert!(blocked("docker run --cap-add SYS_ADMIN alpine true").contains("container"));
+        assert!(blocked("docker run --mount type=bind,source=/,target=/host alpine true").contains("container"));
+        // Benign container runs (no host escape) still unwrap to the inner command.
+        allowed("docker run --rm alpine echo hi");
+        allowed("docker run -v myvol:/data alpine echo hi");
+
+        // #2 A shell that reads its script from an uninspectable stdin — a pipe or
+        // a `< file` redirect — must fail closed instead of running unseen input.
+        assert!(blocked("printf 'rm -rf /\\n' | bash").contains("standard input"));
+        assert!(blocked("echo whatever | sh").contains("standard input"));
+        assert!(blocked("bash < script.sh").contains("standard input"));
+        // Here-documents and here-strings remain inspectable, so they still parse.
+        allowed("bash <<EOF\necho hi\nEOF");
+        allowed("bash <<< 'echo hi'");
+        // A here-string still hiding a destructive command is caught, not passed.
+        assert!(blocked("bash <<< 'rm -rf /'").contains("filesystem root"));
     }
 
     #[test]

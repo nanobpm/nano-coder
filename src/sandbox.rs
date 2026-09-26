@@ -428,6 +428,16 @@ mod platform {
         }
         // SAFETY: the kernel returned a new file descriptor that we now own.
         let ruleset = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        // Device-node creation (`MAKE_CHAR`/`MAKE_BLOCK`) is *handled* by the
+        // ruleset above but granted on *no* root, so `mknod` fails closed
+        // everywhere inside the sandbox. Below ABI 5 `IOCTL_DEV` does not exist, so
+        // a char/block node created with `mknod ./sda` in a writable workspace dir
+        // could be driven with `dd of=./sda` to reach the underlying raw device —
+        // escaping the write boundary, since the lexical device guard only
+        // recognizes `/dev/...`. Keeping these rights handled-but-ungranted denies
+        // device-node creation without leaving the operation entirely unmediated
+        // (which is what dropping them from `fs` would do).
+        let granted = fs & !(MAKE_CHAR | MAKE_BLOCK);
         for root in roots {
             let Ok(path) = CString::new(root.as_os_str().as_bytes()) else { continue };
             // SAFETY: path is a valid C string.
@@ -437,7 +447,7 @@ mod platform {
             }
             // SAFETY: open returned a new descriptor that we now own.
             let parent = unsafe { OwnedFd::from_raw_fd(raw) };
-            let access = if root.is_dir() { fs } else { fs & (WRITE_FILE | TRUNCATE | IOCTL_DEV) };
+            let access = if root.is_dir() { granted } else { granted & (WRITE_FILE | TRUNCATE | IOCTL_DEV) };
             let rule = PathBeneathAttr { allowed_access: access, parent_fd: parent.as_raw_fd() };
             // SAFETY: rule outlives the call; both descriptors are open.
             let status = unsafe {
