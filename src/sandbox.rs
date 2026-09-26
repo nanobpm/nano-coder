@@ -157,6 +157,7 @@ impl SandboxConfig {
             if self.tool_caches
                 && let Some(home) = &home
             {
+                let home_real = home.canonicalize().ok();
                 for cache in TOOL_CACHES {
                     // A tool cache is an explicit grant when `tool_caches` is set, but
                     // in a clean home the directory may not exist yet; create it so
@@ -166,7 +167,18 @@ impl SandboxConfig {
                     if !path.exists() {
                         let _ = std::fs::create_dir_all(&path);
                     }
-                    add(path);
+                    // A cache parent that is a symlink escaping home (e.g. `~/.cache`
+                    // -> `/`) would canonicalize to a root outside home and grant far
+                    // more than the intended cache subtree — in the worst case the
+                    // entire filesystem. Only grant the cache when its real path stays
+                    // under the real home directory and is not the filesystem root
+                    // itself; fail closed otherwise.
+                    if let Ok(real) = path.canonicalize()
+                        && real != Path::new("/")
+                        && home_real.as_ref().is_some_and(|h| real.starts_with(h))
+                    {
+                        add(real);
+                    }
                 }
             }
         }
