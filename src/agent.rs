@@ -13,6 +13,7 @@ use crate::instructions::ProjectInstructions;
 use crate::skills::{self, Skills};
 use crate::goal::{self, Outcome};
 use crate::output;
+use crate::permissions::Policy;
 use crate::plan::{self, Plan};
 use crate::reminders::{self, Reminders};
 use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
@@ -242,6 +243,8 @@ pub struct Agent {
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
+    /// Checked before every tool call (see `permissions.rs`).
+    policy: Policy,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -250,7 +253,9 @@ const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
+        let policy = Policy::new(&config.permissions, &config.sandbox);
         Self {
+            policy,
             client,
             tools: ToolRegistry::new(),
             hooks: HookRegistry::new(),
@@ -281,6 +286,10 @@ impl Agent {
 
     /// Build an agent whose client is resolved from `config.model`.
     pub fn from_config(config: Config) -> Result<Self> {
+        let policy = Policy::new(&config.permissions, &config.sandbox);
+        if !policy.errors.is_empty() {
+            anyhow::bail!("invalid [permissions] rules: {}", policy.errors.join("; "));
+        }
         let client = Self::client_for(&config, &config.model)?;
         Ok(Self::new(client, config))
     }
@@ -965,7 +974,11 @@ impl Agent {
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
-                let result = if is_plan_tool {
+                let result = if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
+                    // The policy is consulted before dispatching to any handler, so deny
+                    // rules and the pre-tool check also cover plan, skill and outcome tools.
+                    Err(anyhow::anyhow!(reason))
+                } else if is_plan_tool {
                     self.run_plan_tool(tool_call)
                 } else if is_skill_tool {
                     self.skills.load(&tool_call.arguments).map(Value::String)

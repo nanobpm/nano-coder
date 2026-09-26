@@ -55,6 +55,10 @@ pub struct Config {
     pub reminders: bool,
     /// Agent skills (`SKILL.md` folders and `ai.lock` entries).
     pub skills: crate::skills::SkillsConfig,
+    /// Allow/deny rules and built-in guards checked before each tool call.
+    pub permissions: crate::permissions::PermissionsConfig,
+    /// OS sandbox for shell commands (off by default).
+    pub sandbox: crate::sandbox::SandboxConfig,
 }
 
 impl Default for Config {
@@ -83,6 +87,8 @@ impl Default for Config {
             outcome_tool: true,
             reminders: true,
             skills: crate::skills::SkillsConfig::default(),
+            permissions: crate::permissions::PermissionsConfig::default(),
+            sandbox: crate::sandbox::SandboxConfig::default(),
         }
     }
 }

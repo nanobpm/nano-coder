@@ -25,6 +25,7 @@ cargo install nano-coder             # or build from source
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
 - **Project instructions**: `AGENTS.md` (or `CLAUDE.md`, `.github/copilot-instructions.md`) from the repository is added to the system prompt
+- **Safety**: built-in guards block destructive commands (`rm -rf /`, `DROP DATABASE`, force-pushing `main`, ...), user allow/deny rules, and an optional OS sandbox (Seatbelt on macOS, Landlock on Linux)
 - **Skills**: `SKILL.md` folders from the repository, `~/.agents/skills`, and an spm `ai.lock`, loaded on demand with `load_skill`
 
 ## Two Execution Modes
@@ -127,6 +128,9 @@ src/
 │   └── mock.rs      # Offline scripted client
 ├── bash.rs      # bash tool: timeout, file capture, bounded output
 ├── files.rs     # read_file / write_file / edit_file tools
+├── shell.rs     # Bash parser used by the permission checks
+├── permissions.rs # Allow/deny rules and built-in guards against destructive commands
+├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
@@ -184,8 +188,76 @@ with the whole result saved under the temp directory (`nano-coder-<pid>/tool-<id
 and its path in the marker. `read_file` pages instead.
 
 Relative paths resolve against the working directory (ACP `session/new` `cwd`). Writes are
-atomic (temp file + rename). There is no permission prompt: run workers in a disposable
-workspace.
+atomic (temp file + rename). There is no permission prompt; every call is checked against
+the [permission rules and sandbox](#permissions-and-sandbox) instead.
+
+## Permissions and Sandbox
+
+nano-coder never stops to ask for approval (it runs headless in agent fleets). Every tool call
+is checked before it runs instead, and a blocked call returns an error telling the model to
+stop and ask the user rather than work around the block.
+
+**Order of checks:** `deny` rules, then `allow` rules, then the built-in guards. Deny always
+wins. An allow rule approves a shell command only when *every* command in it matches, so
+`Bash(git *)` does not approve `git status && rm -rf /`.
+
+**Rules** name a tool and an optional pattern:
+
+| Rule | Matches |
+|---|---|
+| `Bash(rm -rf *)` | a shell command; `*` matches anything, including spaces and `/` |
+| `Bash(git push:*)` | `git push` alone or with any arguments |
+| `Read(~/.ssh/**)` | `read_file` paths; `**` crosses directories, `*` does not |
+| `Edit(**/.env)` / `Write(...)` | `write_file` and `edit_file` paths (relative to the working directory, or absolute) |
+| `write_file`, `bash`, any tool name | every call to that tool |
+
+**Shell commands are parsed, not pattern-matched as text.** The command line is split on `;`,
+`&&`, `||`, `|`, `&`, newlines and parentheses; quotes are removed; `$(...)`, backticks and
+`<(...)` are parsed as further commands. The guards and rules then see through assignments
+(`FOO=1 cmd`), wrappers (`sudo`, `env`, `timeout`, `nice`, `xargs`, `nohup`, `command`, ...),
+`bash -c '...'`, `eval`, `ssh host cmd`, `find -exec`, and here-documents fed to a shell. A command
+that cannot be parsed, or a script computed at run time (`bash -c "$CMD"`,
+`eval "$(curl ...)"`), is blocked.
+
+**Built-in guards** (`builtin_rules = true`) block:
+
+- recursive `rm` (and `mv`, `find -delete`, `chmod -R`/`chown -R`) on `/`, your home directory
+  or its top-level folders, the working directory or its parents, top-level and system
+  directories, and `.git`. `rm -rf *` counts as the working directory. An unset variable counts
+  as empty, so `rm -rf "$DIR/"*` is blocked unless written `"${DIR:?}/"*`. Paths follow a `cd` and
+  variable assignments earlier in the same command (`cd .. && rm -rf project` is blocked)
+- `mkfs`, `fdisk`, `wipefs`, destructive `diskutil`, `dd of=/dev/...` and redirects to
+  devices, fork bombs, `shutdown`/`reboot`
+- destructive SQL (`DROP DATABASE|SCHEMA|TABLE`, `TRUNCATE`, `DELETE FROM` without `WHERE`,
+  `ALTER TABLE ... DROP`, `FLUSHALL`, `dropDatabase()`) in a command that uses a database client
+  (`psql`, `mysql`, `sqlite3`, `mongosh`, `redis-cli`, also via `docker exec`) or inline
+  interpreter code (`python -c`), plus `dropdb`, `rails db:drop`, `prisma migrate reset`,
+  `manage.py flush`
+- `terraform destroy`, `pulumi destroy`, `kubectl delete namespace|--all`, `aws s3 rb`
+- `git push --force` (or `+refspec`, `--all`, wildcard refspecs) to, or deleting, a protected
+  branch, and `git push --mirror`
+
+Add an allow rule for anything legitimate they block, e.g.
+`allow = ["Bash(sqlite3 test.db *)"]`, or set `builtin_rules = false`.
+
+**These checks catch mistakes, not adversaries.** A model can write a script and run it, and
+nothing inspects that. The boundary is the OS sandbox, plus credentials: don't give the agent
+production database URLs or broadly scoped tokens.
+
+**Sandbox** (`--sandbox workspace`, off by default) runs each shell command under Seatbelt
+(`sandbox-exec`) on macOS or Landlock on Linux (6.2+). Commands can read everywhere, but
+write only to:
+
+- `workspace`: the working directory, its git directories (including a worktree's shared
+  one), temp directories, package-manager caches (`~/.cargo/registry`, `~/.npm`, `~/.cache`,
+  `~/Library/Caches`, `~/.gradle`, `~/go/pkg/mod`, ...) and `writable` paths
+- `read-only`: temp directories and `writable` paths
+
+`write_file` and `edit_file` are held to the same directories. `network = false` blocks
+outbound connections (macOS: except to localhost; Linux: all TCP, which needs Linux 6.7+).
+If the sandbox is enabled but cannot be applied, commands fail instead of running
+unsandboxed. When a sandboxed command fails with a permission error, the result tells the
+model where it may write.
 
 ## Commands
 
@@ -234,7 +306,8 @@ cargo run -- --resume sess-20260923T012518-7e7923f8
 ```
 
 Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
-`--config PATH`, `--verbosity LEVEL` (`-v`).
+`--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
+`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules).
 
 ## Configuration
 
@@ -268,6 +341,18 @@ user_dirs = ["~/.agents/skills"]
 ai_lock = true                          # load skills pinned in ai.lock
 fetch = true                            # fetch ai.lock commits missing from the spm store
 allowed_hosts = ["github.com"]          # hosts ai.lock entries may be fetched from ("*" = any)
+
+[permissions]                           # see Permissions and Sandbox
+builtin_rules = true                    # block destructive commands unless allowed
+allow = []                              # e.g. ["Bash(sqlite3 test.db *)"]
+deny = []                               # e.g. ["Bash(git push:*)", "Edit(**/.env)"]
+protected_branches = ["main", "master", "trunk", "develop"]
+
+[sandbox]
+mode = "off"                            # off | workspace | read-only (or --sandbox)
+writable = []                           # extra writable paths, e.g. ["~/.local/state/myapp"]
+network = true                          # false blocks outbound connections
+tool_caches = true                      # workspace mode: allow ~/.cargo/registry, ~/.npm, ~/.cache, ...
 ```
 
 The default model is `gpt-4o-mini` on the `mock` provider, so the harness still works offline.
@@ -632,4 +717,6 @@ Retry classification, output bounding, bash result formatting and the session-lo
 are adapted from [unreal-agent](https://github.com/unreallabsai/unreal-agent)
 (MIT, Copyright (c) 2026 Unreal Labs). System reminders and the outcome tool follow ideas in
 [grok-build](https://github.com/xai-org/grok-build)'s `<system-reminder>` notes and
-`update_goal` tool.
+`update_goal` tool. The permission model (deny wins, allow rules must cover every command in
+a chain, wrappers stripped before matching) and the Seatbelt/Landlock sandbox profiles follow
+grok-build's and Codex's designs.
