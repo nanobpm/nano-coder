@@ -441,11 +441,14 @@ List a provider's models with `--list-models <provider>` (OpenAI-compatible endp
 
 The `github-copilot` provider uses a GitHub Copilot subscription by authenticating **as the
 VS Code Copilot Chat extension**: a device-flow login with VS Code's OAuth client ID, an
-exchange for a short-lived Copilot session token, and Chat Completions calls with VS Code's
-editor headers. This is the approach several open-source agents (e.g. pi) take, but it is
-**not a GitHub-sanctioned integration**. It may breach GitHub's terms or your organisation's
-Copilot policy, it can break without notice, and misuse could get an account flagged. It is
-never used unless you select it.
+exchange for a short-lived Copilot session token, and model calls with VS Code's editor
+headers. Each model is routed to the upstream API Copilot serves it through — Chat
+Completions by default, the OpenAI Responses endpoint for `gpt-*`/`grok-*`/`oswe*`/`mai-*`
+models (e.g. `gpt-6-astra`, which Copilot serves *only* via Responses), and the Anthropic
+Messages endpoint for Claude 4.x/5.x. This is the approach several open-source agents
+(e.g. pi) take, but it is **not a GitHub-sanctioned integration**. It may breach GitHub's
+terms or your organisation's Copilot policy, it can break without notice, and misuse could
+get an account flagged. It is never used unless you select it.
 
 ```bash
 nano-coder --login github-copilot          # interactive; saves the OAuth token (0600)
@@ -456,8 +459,7 @@ nano-coder --model github-copilot/gpt-4.1
 Headless workers can't do the device flow; set `GITHUB_COPILOT_OAUTH_TOKEN` to a token from a
 previous login instead (credentials live in `<data dir>/nano-coder/github-copilot.json`).
 Tool follow-ups are sent with `X-Initiator: agent`, so a turn is billed like one VS Code
-request. `GITHUB_COPILOT_DOMAIN` selects a GHE.com host. Models that Copilot serves only
-through its Responses API are not supported.
+request. `GITHUB_COPILOT_DOMAIN` selects a GHE.com host.
 
 The sanctioned route is the [Copilot SDK](https://github.com/github/copilot-sdk), which
 drives the Copilot CLI's own agent loop rather than exposing the model.

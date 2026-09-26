@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod github_copilot;
 pub mod mock;
 pub mod openai;
+pub mod openai_responses;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
