@@ -523,8 +523,11 @@ impl HttpTransport {
 
     /// POST `body` expecting server-sent events; each `data:` payload is passed
     /// to `on_data`. Failures before the stream starts are retried like
-    /// `post_json_to`; a failure mid-stream is returned. If the server answers
-    /// with plain JSON instead, that value is returned.
+    /// `post_json_to`. A mid-stream failure (e.g. a transient connection reset
+    /// or timeout) is retried the same way *as long as nothing has been emitted
+    /// to `on_data` yet* — restarting after partial output would duplicate it,
+    /// so once any payload has been delivered the error is returned. If the
+    /// server answers with plain JSON instead, that value is returned.
     pub async fn post_stream_to(
         &self,
         url: &str,
@@ -554,46 +557,58 @@ impl HttpTransport {
                         .is_some_and(|v| v.contains("event-stream"));
                     if (200..300).contains(&status) && is_sse {
                         let mut parser = SseParser::default();
-                        loop {
-                            let chunk = response
-                                .chunk()
-                                .await
-                                .map_err(|e| self.wrap(anyhow!(e).context("reading response stream")))?;
-                            let Some(chunk) = chunk else { break };
-                            for data in parser.push(&chunk) {
-                                if data.trim() == "[DONE]" {
+                        let mut emitted = false;
+                        let stream_err = loop {
+                            match response.chunk().await {
+                                Ok(Some(chunk)) => {
+                                    for data in parser.push(&chunk) {
+                                        if data.trim() == "[DONE]" {
+                                            return Ok(None);
+                                        }
+                                        on_data(&data).map_err(|e| self.wrap(e))?;
+                                        emitted = true;
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(data) = parser.finish()
+                                        && data.trim() != "[DONE]"
+                                    {
+                                        on_data(&data).map_err(|e| self.wrap(e))?;
+                                    }
                                     return Ok(None);
                                 }
-                                on_data(&data).map_err(|e| self.wrap(e))?;
+                                // Connection reset/timeout mid-stream: transient.
+                                Err(e) => break anyhow!(e).context("reading response stream"),
                             }
+                        };
+                        // Retry only if we haven't handed any payload to the
+                        // caller yet; otherwise a restart would duplicate output.
+                        if emitted || attempt >= policy.max_retries {
+                            return Err(self.wrap(stream_err));
                         }
-                        if let Some(data) = parser.finish()
-                            && data.trim() != "[DONE]"
-                        {
-                            on_data(&data).map_err(|e| self.wrap(e))?;
-                        }
-                        return Ok(None);
-                    }
-                    match response.text().await {
-                        Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
-                        Ok(text) if (200..300).contains(&status) => {
-                            return match serde_json::from_str::<Value>(&text) {
-                                Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
-                                    Err(self.wrap(ApiError::from_body(status, &text).into()))
+                        (stream_err, retry_after)
+                    } else {
+                        match response.text().await {
+                            Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
+                            Ok(text) if (200..300).contains(&status) => {
+                                return match serde_json::from_str::<Value>(&text) {
+                                    Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
+                                        Err(self.wrap(ApiError::from_body(status, &text).into()))
+                                    }
+                                    Ok(value) => Ok(Some(value)),
+                                    Err(e) => Err(self.wrap(anyhow!(
+                                        "invalid response ({e}): {}",
+                                        text.chars().take(500).collect::<String>()
+                                    ))),
+                                };
+                            }
+                            Ok(text) => {
+                                let api = ApiError::from_body(status, &text);
+                                if !retry::retryable(&api, &self.provider.retryable_statuses) {
+                                    return Err(self.wrap(api.into()));
                                 }
-                                Ok(value) => Ok(Some(value)),
-                                Err(e) => Err(self.wrap(anyhow!(
-                                    "invalid response ({e}): {}",
-                                    text.chars().take(500).collect::<String>()
-                                ))),
-                            };
-                        }
-                        Ok(text) => {
-                            let api = ApiError::from_body(status, &text);
-                            if !retry::retryable(&api, &self.provider.retryable_statuses) {
-                                return Err(self.wrap(api.into()));
+                                (api.into(), retry_after)
                             }
-                            (api.into(), retry_after)
                         }
                     }
                 }
