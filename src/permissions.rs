@@ -214,13 +214,16 @@ impl Policy {
             },
             "read_file" | "write_file" | "edit_file" => {
                 let Some(path) = args.get("path").and_then(Value::as_str) else { return Ok(()) };
-                let absolute = normalize(&cwd.join(expand_tilde(path)));
+                let joined = cwd.join(expand_tilde(path));
+                let absolute = normalize(&joined);
                 // `read_file`/`write_atomically` dereference symlinks, so a link like
                 // `safe -> ~/.ssh/id_ed25519` would let `Read(~/.ssh/**)` miss the real
                 // target. Match rules against the symlink-resolved path too (the deepest
                 // existing ancestor for a not-yet-created file), keeping the lexical check
-                // for paths that do not exist.
-                let resolved = resolve_symlinks(&absolute);
+                // for paths that do not exist. Resolve from the *raw* joined path (with
+                // `..` intact) so `link/../etc/hosts` (where `link -> /`) cannot be
+                // collapsed to a workspace-relative path before its symlink is followed.
+                let resolved = resolve_symlinks(&joined);
                 for rule in self.deny.iter().filter(|r| r.applies_to(tool)) {
                     if path_rule_matches(rule, &absolute, cwd) || path_rule_matches(rule, &resolved, cwd) {
                         return Err(format!("rule `{}` denies {tool} on {}", rule.source, absolute.display()));
@@ -266,13 +269,16 @@ impl Policy {
         // never bypass it. (Only when built-in guards are enabled at all.) The
         // guard substitutes known command-local variables, so `D=/dev/sda; > "$D"`
         // is caught here too.
-        let guard = self.builtin.then(|| Guard {
-            cwd,
-            home: dirs::home_dir(),
-            protected: &self.protected_branches,
-            assigned: assignments(&commands_with_assignments(command)),
-            base: std::cell::RefCell::new(Some(cwd.to_path_buf())),
-            depth: std::cell::Cell::new(0),
+        let guard = self.builtin.then(|| {
+            let cwd = resolve_symlinks(cwd);
+            Guard {
+                base: std::cell::RefCell::new(Some(cwd.clone())),
+                cwd,
+                home: dirs::home_dir(),
+                protected: &self.protected_branches,
+                assigned: assignments(&commands_with_assignments(command)),
+                depth: std::cell::Cell::new(0),
+            }
         });
         if let Some(guard) = &guard {
             for cmd in &commands {
@@ -329,15 +335,30 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     loop {
         match existing.canonicalize() {
-            Ok(real) => return rest.iter().rev().fold(real, |p: PathBuf, part| p.join(part)),
+            // `canonicalize` resolves every symlink *and* `..` in the existing
+            // prefix atomically (so a `..` that crosses a symlink is handled
+            // correctly); `normalize` then collapses any `..` left in the
+            // not-yet-existing tail, where no symlink can hide.
+            Ok(real) => return normalize(&rest.iter().rev().fold(real, |p: PathBuf, part| p.join(part))),
             Err(_) => match (existing.parent(), existing.file_name()) {
                 (Some(parent), Some(name)) => {
                     rest.push(name.to_os_string());
                     existing = parent;
                 }
-                _ => return path.to_path_buf(),
+                _ => return normalize(path),
             },
         }
+    }
+}
+
+/// Resolve `..` and intermediate symlinks in `path` against the real filesystem
+/// while leaving the final component unresolved, so a destructive operation is
+/// judged by the link itself (not its target) yet a symlinked or `..`-laden
+/// *ancestor* cannot disguise the real location (`link/../etc` with `link -> /`).
+fn resolve_parent(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => normalize(&resolve_symlinks(parent).join(name)),
+        _ => resolve_symlinks(path),
     }
 }
 
@@ -347,11 +368,11 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
 fn resolve_target(target: &str, cwd: &Path) -> PathBuf {
     let expanded = expand_tilde(target);
     let joined = if expanded.is_absolute() { expanded } else { cwd.join(expanded) };
-    let norm = normalize(&joined);
-    // `canonicalize` follows every symlink (including the final component); fall
-    // back to `real` (which at least resolved the `..` lexically) when the target
-    // does not exist yet.
-    norm.canonicalize().unwrap_or_else(|_| real(&norm))
+    // Resolve symlinks (including the final component, which a device write
+    // follows) and `..` against the real filesystem *before* collapsing them
+    // lexically, so `/tmp/../dev/sda` — or a symlink whose `..` crosses into
+    // `/dev` — is judged by its real location instead of a lexically-collapsed one.
+    resolve_symlinks(&joined)
 }
 
 /// Refuse a redirection that writes directly to a raw device (`> /dev/sda`).
@@ -487,6 +508,10 @@ fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value:
 /// the commands that actually run.
 fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
     let words = &simple.words;
+    // Command substitutions in an *unquoted* here-document body are run by the
+    // parent shell before the target utility ever sees the body, so inspect them
+    // for every command — not only shell wrappers (`cat <<EOF\n$(rm -rf /)\nEOF`).
+    inspect_heredocs(simple, depth, out)?;
     let mut i = 0;
     let push = |out: &mut Vec<Simple>, from: usize| {
         out.push(Simple { words: words[from.min(words.len())..].to_vec(), ..simple.clone() });
@@ -497,7 +522,10 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
             return Ok(());
         };
         let text = word.text.as_str();
-        if !word.quoted && ASSIGNMENT.is_match(text) {
+        // A leading assignment prefixes the command (`DIR="/" rm -rf "$DIR"`); strip
+        // it so the real program is inspected. `Word::quoted` is set when only the
+        // value was quoted, so it must not disqualify the token as an assignment.
+        if ASSIGNMENT.is_match(text) {
             i += 1;
             continue;
         }
@@ -602,7 +630,7 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
 /// `bash [options] [-c SCRIPT | FILE | <<HEREDOC]`
 fn expand_shell(simple: &Simple, at: usize, depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
     let words = &simple.words;
-    let mut has_c = false;
+    out.push(Simple { words: words[at..].to_vec(), ..simple.clone() });
     let mut j = at + 1;
     while let Some(word) = words.get(j) {
         let text = word.text.as_str();
@@ -617,18 +645,30 @@ fn expand_shell(simple: &Simple, at: usize, depth: usize, out: &mut Vec<Simple>)
             j += if matches!(text, "--rcfile" | "--init-file") { 2 } else { 1 };
             continue;
         }
-        has_c |= text.contains('c');
+        // A short-option word carrying `-c` runs the rest of the command line as a
+        // script. Valid shell attaches that script to the option word itself
+        // (`bash -c'rm -rf /'` → word `-crm -rf /`) as well as the space-separated
+        // `bash -c 'script'` form. `script_text` fails closed when the script is
+        // computed at run time (`bash -c"$CMD"`), which we cannot inspect.
+        if let Some(pos) = text[1..].find('c') {
+            let attached = &text[1 + pos + 1..];
+            if attached.is_empty() {
+                if let Some(script) = words.get(j + 1) {
+                    parse_inner(&script_text(std::slice::from_ref(script))?, depth, out)?;
+                }
+            } else {
+                let script = Word { text: attached.to_string(), dynamic: word.dynamic, ..Word::default() };
+                parse_inner(&script_text(std::slice::from_ref(&script))?, depth, out)?;
+            }
+            return Ok(());
+        }
         j += if text.ends_with('o') || text.ends_with('O') { 2 } else { 1 };
     }
-    out.push(Simple { words: words[at..].to_vec(), ..simple.clone() });
-    if has_c {
-        if let Some(script) = words.get(j) {
-            parse_inner(&script_text(std::slice::from_ref(script))?, depth, out)?;
-        }
-    } else if j >= words.len() {
-        // Script on stdin: inspect here-documents and here-strings.
+    if j >= words.len() {
+        // Script on stdin: inspect here-documents and here-strings. A here-document
+        // fed to a shell is executed as a script regardless of delimiter quoting.
         for body in &simple.heredocs {
-            parse_inner(body, depth, out)?;
+            parse_inner(&body.body, depth, out)?;
         }
         for redirect in simple.redirects.iter().filter(|r| r.op == "<<<") {
             parse_inner(&script_text(std::slice::from_ref(&redirect.target))?, depth, out)?;
@@ -637,10 +677,28 @@ fn expand_shell(simple: &Simple, at: usize, depth: usize, out: &mut Vec<Simple>)
     Ok(())
 }
 
+/// Inspect a command's here-document bodies for command substitutions the parent
+/// shell runs before the command starts. Only *expanding* (unquoted-delimiter)
+/// bodies are considered, and only when they carry a `$(...)`/backtick, so inert
+/// data heredocs are untouched; an unparseable substitution fails closed.
+fn inspect_heredocs(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
+    for heredoc in &simple.heredocs {
+        if heredoc.expand && (heredoc.body.contains("$(") || heredoc.body.contains('`')) {
+            parse_inner(&heredoc.body, depth, out)?;
+        }
+    }
+    Ok(())
+}
+
 // ---- Built-in guards ---------------------------------------------------------
 
 struct Guard<'a> {
-    cwd: &'a Path,
+    /// The working directory, resolved through symlinks and `..` so it compares
+    /// consistently with the (also symlink-resolved) destructive-target paths —
+    /// e.g. a workspace at `/var/lib/jenkins/...` and a target under it both share
+    /// the `/private/var/...` prefix on macOS, keeping the in-workspace exception
+    /// honest.
+    cwd: PathBuf,
     home: Option<PathBuf>,
     protected: &'a [String],
     /// Variables assigned in the command line itself: `Some(value)` when
@@ -667,7 +725,11 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
             words.next();
         }
         for word in words {
-            if word.quoted || !ASSIGNMENT.is_match(&word.text) {
+            // `Word::quoted` is set when *any* part of the token was quoted, so a
+            // legitimate assignment whose value is quoted (`DIR="/"`) still parses
+            // as one — don't skip it. `literal` below marks dynamic/glob values
+            // unknown, so only proven constants become known.
+            if !ASSIGNMENT.is_match(&word.text) {
                 if word.text.starts_with('-') {
                     continue;
                 }
@@ -757,9 +819,19 @@ impl Guard<'_> {
             }
             let program = basename(&first.text);
             let args = &cmd.words[1..];
-            scan_sql |= cmd.words.iter().any(|w| DB_CLIENTS.contains(&basename(&w.text)))
-                || (INTERPRETERS.iter().any(|i| program.starts_with(i))
-                    && args.iter().any(|a| matches!(a.text.as_str(), "-c" | "-e" | "-E" | "-r" | "--eval" | "eval")));
+            let interp_eval = INTERPRETERS.iter().any(|i| program.starts_with(i))
+                && args.iter().any(|a| {
+                    let t = a.text.as_str();
+                    // Both the space-separated (`python3 -c 'SQL'`) and the attached
+                    // (`python3 -c"...DROP TABLE t"`, `ruby -e'...'`) forms carry an
+                    // inline script; detect the option whether or not the script is
+                    // glued to it (and regardless of whether it is computed).
+                    matches!(t, "-c" | "-e" | "-E" | "-r" | "--eval" | "eval")
+                        || ((t.starts_with("-c") || t.starts_with("-e") || t.starts_with("-E") || t.starts_with("-r"))
+                            && t.len() > 2)
+                        || t.starts_with("--eval=")
+                });
+            scan_sql |= cmd.words.iter().any(|w| DB_CLIENTS.contains(&basename(&w.text))) || interp_eval;
             match program {
                 "cd" | "pushd" => self.change_dir(args),
                 "popd" => *self.base.borrow_mut() = None,
@@ -787,7 +859,7 @@ impl Guard<'_> {
         // case. A target inside the workspace is safe either way, so keep it.
         *self.base.borrow_mut() = match next {
             Some(path) if !path.is_dir() => {
-                (self.cwd != Path::new("/") && path.starts_with(self.cwd)).then_some(path)
+                (self.cwd.as_path() != Path::new("/") && path.starts_with(&self.cwd)).then_some(path)
             }
             other => other,
         };
@@ -800,7 +872,12 @@ impl Guard<'_> {
         }
         let text = self.expand_home(text)?;
         let base = self.base.borrow().clone()?;
-        Some(normalize(&base.join(text)))
+        // `cd` dereferences symlinks in its target, so record the *physical*
+        // directory (`cd link` with `link -> /etc` really moves to `/etc`).
+        // Resolving symlinks and `..` here stops a later relative destructive
+        // command (`find . -delete`, `chmod -R 777 .`) from being judged against
+        // the lexical in-workspace path while the shell actually sits elsewhere.
+        Some(resolve_symlinks(&base.join(text)))
     }
 
     fn expand_home(&self, text: String) -> Option<String> {
@@ -903,6 +980,18 @@ impl Guard<'_> {
                 // resolve it before the destructive-root checks.
                 let starts: Vec<Word> =
                     starts.iter().map(|&w| if follow { self.follow_symlink(w) } else { w.clone() }).collect();
+                // An unquoted start operand that expands to nothing (an unset/empty
+                // variable, `find $UNSET -delete`) is removed by the shell before
+                // `find` runs; drop those. If that leaves no start paths, `find`
+                // falls back to the implicit `.` and deletes the working tree, so
+                // guard it exactly like `find -delete`.
+                let mut starts: Vec<Word> = starts
+                    .into_iter()
+                    .filter(|w| !matches!(self.resolve(w), Ok(None)))
+                    .collect();
+                if starts.is_empty() {
+                    starts.push(implicit.clone());
+                }
                 if narrowed {
                     // A narrowed `-delete` still recurses from its start paths, so a
                     // catastrophic root (`find / -name passwd -delete`, `find ~ ...`,
@@ -999,9 +1088,20 @@ impl Guard<'_> {
     fn device_write(&self, target: &str) -> Result<(), String> {
         // Substitute known command-local variables first, so a target reached
         // through a proven assignment (`D=/dev/sda; echo x > "$D"`, `dd of=$D`)
-        // is judged by the real device path rather than the literal `$D`.
-        let target = if target.contains('$') { self.substitute(target).0 } else { target.to_string() };
-        device_write(&target, self.cwd)
+        // is judged by the real device path rather than the literal `$D`. When the
+        // target is computed at run time (`echo x > "$(printf /dev/sda)"`, a
+        // backtick substitution, or an unset/dynamic variable) its real path is
+        // unknowable, so fail closed rather than checking the empty placeholder the
+        // substitution leaves behind.
+        if target.contains('`') {
+            return Err("it redirects to a target computed at run time".into());
+        }
+        let (target, known) =
+            if target.contains('$') { self.substitute(target) } else { (target.to_string(), true) };
+        if !known {
+            return Err("it redirects to a target computed at run time".into());
+        }
+        device_write(&target, &self.cwd)
     }
 
     /// Refuse to delete, move or recursively re-permission a path whose loss
@@ -1038,7 +1138,7 @@ impl Guard<'_> {
         if p == Path::new("/") {
             return Some("the filesystem root".into());
         }
-        if protect_cwd && p == self.cwd {
+        if protect_cwd && p == self.cwd.as_path() {
             return Some("the working directory".into());
         }
         if protect_cwd && self.cwd.starts_with(p) {
@@ -1056,8 +1156,8 @@ impl Guard<'_> {
         // somewhere like /var/lib/jenkins. But when the workspace itself is `/`
         // (which `apply_cwd` permits), *everything* is "inside" it, so the
         // exception must not apply or `rm -rf /etc` would look in-workspace.
-        let root_workspace = self.cwd == Path::new("/");
-        let in_workspace = !root_workspace && p.starts_with(self.cwd) && p != self.cwd;
+        let root_workspace = self.cwd.as_path() == Path::new("/");
+        let in_workspace = !root_workspace && p.starts_with(&self.cwd) && p != self.cwd.as_path();
         if !in_workspace && p.components().count() <= 2 {
             return Some("a top-level system directory".into());
         }
@@ -1087,7 +1187,7 @@ impl Guard<'_> {
         }
         // The workspace subtree is otherwise exempt — unless the workspace itself
         // is `/`, where treating every path as in-workspace would disable the guard.
-        if self.cwd != Path::new("/") && p.starts_with(self.cwd) {
+        if self.cwd.as_path() != Path::new("/") && p.starts_with(&self.cwd) {
             return None;
         }
         if p == Path::new("/") {
@@ -1145,14 +1245,18 @@ impl Guard<'_> {
             None if text.starts_with('/') => PathBuf::from("/"),
             None => return Err(()),
         };
-        let joined = normalize(&base.join(&text));
-        // A trailing slash makes the shell follow a symlink in the final component
-        // (`rm -rf link/` deletes through `link`), so resolve it fully rather than
-        // leaving the last component unresolved as `real` normally does.
+        let raw = base.join(&text);
+        // Resolve `..` and intermediate symlinks against the real filesystem
+        // *before* collapsing them. Collapsing `..` lexically first (as
+        // `normalize` did) would turn `link/../etc` — where `link -> /` makes the
+        // shell operate on `/etc` — into a harmless workspace-relative path,
+        // letting the destructive-path guard miss it.
         let path = if text.ends_with('/') {
-            joined.canonicalize().unwrap_or_else(|_| real(&joined))
+            // A trailing slash makes the shell follow a symlink in the final
+            // component (`rm -rf link/` deletes through `link`), so resolve it fully.
+            resolve_symlinks(&raw)
         } else {
-            real(&joined)
+            resolve_parent(&raw)
         };
         // Treat the first wildcard component as "everything in its parent".
         if word.glob {
@@ -1162,10 +1266,9 @@ impl Guard<'_> {
                 if part.contains(['*', '?', '[']) {
                     let all = part.chars().all(|c| matches!(c, '*' | '?' | '.'));
                     // Follow a symlink in the wildcard's parent too (`rm -rf link/*`
-                    // where `link` -> `/home`): resolve it fully rather than leaving
-                    // the final component unresolved as `real` would.
-                    let joined_parent = normalize(&base.join(&prefix));
-                    let parent = joined_parent.canonicalize().unwrap_or_else(|_| real(&joined_parent));
+                    // where `link` -> `/home`): resolve it fully, from the raw path so
+                    // an ancestor `..`/symlink is resolved before being collapsed.
+                    let parent = resolve_symlinks(&base.join(&prefix));
                     return Ok(Some(if all { (parent, true) } else { (path, false) }));
                 }
                 prefix.push(component.as_os_str());
@@ -1220,7 +1323,7 @@ impl Guard<'_> {
     }
 
     fn git(&self, args: &[Word]) -> Result<(), String> {
-        let mut dir = self.base.borrow().clone().unwrap_or_else(|| self.cwd.to_path_buf());
+        let mut dir = self.base.borrow().clone().unwrap_or_else(|| self.cwd.clone());
         let mut i = 0;
         while let Some(arg) = args.get(i) {
             match arg.text.as_str() {
@@ -1298,16 +1401,6 @@ impl Guard<'_> {
             }
         }
         Ok(())
-    }
-}
-
-/// Resolve symlinks in the parent (so `/tmp/x` compares equal to the working
-/// directory `/private/tmp/x`), but not in the last component: deleting a
-/// symlink deletes the link.
-fn real(path: &Path) -> PathBuf {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => parent.canonicalize().map(|p| p.join(name)).unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
     }
 }
 
@@ -1588,10 +1681,12 @@ mod tests {
     #[test]
     fn computed_program_words_do_not_bypass_guards() {
         // A program word computed at run time is not the literal executable the shell runs,
-        // so the guard must not treat it as an unknown (allowed) command. When the value
-        // can't be proven safe (here a quoted assignment), it fails closed.
-        assert!(blocked("CMD='rm -rf /'; bash -c \"exec $CMD\"").contains("computed at run time"));
-        assert!(blocked("RM='rm -rf /'; $RM").contains("computed at run time"));
+        // so the guard must not treat it as an unknown (allowed) command. A quoted literal
+        // assignment (`CMD='rm -rf /'`) is a *proven* value, so it is resolved and the
+        // dangerous command it expands to is caught.
+        assert!(blocked("CMD='rm -rf /'; bash -c \"exec $CMD\"").contains("would affect"));
+        assert!(blocked("RM='rm -rf /'; $RM").contains("would affect"));
+        // A value computed at run time cannot be proven safe, so it fails closed.
         assert!(blocked("CMD=$(cat cmd); bash -c \"$CMD arg\"").contains("computed at run time"));
         // A program expanded from a proven-safe literal is re-inspected: harmless is allowed,
         // dangerous is still caught.
@@ -1691,10 +1786,12 @@ mod tests {
     #[test]
     fn round6_guard_hardening() {
         // #1 A device reached through `..` or an unnormalized path must still be
-        // caught even though it does not literally start with `/dev/`.
-        assert!(blocked("dd of=/tmp/../dev/sda").contains("device"));
-        assert!(blocked("echo x > /tmp/../dev/sda").contains("device"));
-        allowed("echo x > /tmp/../dev/null");
+        // caught even though it does not literally start with `/dev/`. `/usr` is a
+        // real directory on both Linux and macOS, so `/usr/../dev` resolves to the
+        // real `/dev` on either host (unlike `/tmp`, a symlink to `/private/tmp`).
+        assert!(blocked("dd of=/usr/../dev/sda").contains("device"));
+        assert!(blocked("echo x > /usr/../dev/sda").contains("device"));
+        allowed("echo x > /usr/../dev/null");
 
         // #2 Bundled short options (`sudo -iu root`) consume their argument, so the
         // wrapped destructive command is still inspected.
@@ -1724,7 +1821,7 @@ mod tests {
         // be caught: the guard substitutes `$D` before judging the target.
         assert!(blocked("D=/dev/sda; echo x > \"$D\"").contains("device"));
         assert!(blocked("D=/dev/sda; dd if=/dev/zero of=$D").contains("device"));
-        assert!(blocked("D=/tmp/../dev/sda; echo x > $D").contains("device"));
+        assert!(blocked("D=/usr/../dev/sda; echo x > $D").contains("device"));
         allowed("D=/dev/null; echo x > \"$D\"");
 
         // #2 When the workspace itself is `/`, the in-workspace exception must not
@@ -1775,6 +1872,85 @@ mod tests {
     }
 
     #[test]
+    fn round10_guard_hardening() {
+        // #2 A command substitution in an *unquoted* here-document body is run by
+        // the parent shell before the utility starts, so it must be inspected for
+        // every command, not just shell wrappers. A quoted delimiter is inert data.
+        assert!(blocked("cat <<EOF\n$(rm -rf /)\nEOF").contains("filesystem root"));
+        assert!(blocked("python3 <<EOF\n`rm -rf /`\nEOF").contains("filesystem root"));
+        allowed("cat <<'EOF'\n$(rm -rf /)\nEOF");
+
+        // #3 A `-c` script attached to the option word (no space) must still be
+        // inspected; a script computed at run time fails closed.
+        assert!(blocked("bash -c'rm -rf /'").contains("filesystem root"));
+        assert!(blocked("sh -c\"rm -rf /\"").contains("filesystem root"));
+        assert!(blocked("bash -c\"$CMD\"").contains("computed at run time"));
+
+        // #4 `Word::quoted` (set when only the value is quoted) must not stop an
+        // assignment from being parsed, so `DIR="/"` still resolves `$DIR`.
+        assert!(blocked("DIR=\"/\"; rm -rf \"$DIR\"").contains("filesystem root"));
+        assert!(blocked("DIR='/'; rm -rf \"$DIR\"").contains("filesystem root"));
+        assert!(blocked("DIR=\"/\" rm -rf \"$DIR\"").contains("filesystem root"));
+
+        // #5 Interpreter command strings attached to their short option carry the
+        // script (`python3 -c"..."`, `ruby -e'...'`), so `scan_sql` must see them.
+        assert!(blocked("python3 -c\"import sqlite3; sqlite3.connect('a.db').execute('DROP TABLE t')\"")
+            .contains("destructive database"));
+        assert!(blocked("ruby -e'system(\"psql -c \\\"DROP TABLE t\\\"\")'").contains("destructive database"));
+
+        // #7 An unquoted start operand that expands to nothing (`find $UNSET -delete`)
+        // is removed before `find` runs, leaving the implicit `.` that wipes the
+        // working tree; it must be guarded exactly like a bare `find -delete`.
+        assert!(blocked("find $NANO_UNSET_VAR -delete").contains("working directory"));
+        assert!(blocked("find -delete").contains("working directory"));
+
+        // #8 A redirect target computed at run time cannot be judged, so it fails
+        // closed rather than checking the empty placeholder the substitution leaves.
+        assert!(blocked("echo x > \"$(printf /dev/sda)\"").contains("computed at run time"));
+        assert!(blocked("echo x > `printf /dev/sda`").contains("computed at run time"));
+        assert!(blocked("echo x > $NANO_UNSET_TARGET").contains("computed at run time"));
+    }
+
+    #[test]
+    fn resolve_collapses_parent_after_symlink() {
+        // #1 A `..` that follows a symlink must be resolved through the link's real
+        // target before it is collapsed, or a path can escape its rules. Here
+        // `link -> base/sub/a`, so `link/../secret` is `base/sub/secret`, not
+        // `base/secret`; a rule on `base/sub/*` must catch it.
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("nano-perm-collapse-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(base.join("sub/a")).unwrap();
+        std::fs::write(base.join("sub/secret"), "x").unwrap();
+        let base = base.canonicalize().unwrap();
+        symlink(base.join("sub/a"), base.join("link")).unwrap();
+        let rule = format!("Read({}/sub/*)", base.display());
+        let p = policy(&[], &[&rule]);
+        let denied = p.check_in("read_file", &json!({ "path": "link/../secret" }), &base).is_err();
+        std::fs::remove_dir_all(&base).ok();
+        assert!(denied, "`link/../secret` must resolve through the symlink to base/sub/secret");
+    }
+
+    #[test]
+    fn cd_into_symlink_tracks_physical_base() {
+        // #6 `cd link` (with `link -> /etc`) physically moves into the target, so a
+        // later relative destructive path operates in `/etc`, not `cwd/link`.
+        use std::os::unix::fs::symlink;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nano-perm-cd-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        symlink("/etc", dir.join("etc")).unwrap();
+        let p = Policy::default();
+        let chmod_blocked = p.check_in("bash", &json!({ "command": "cd etc && chmod -R 777 ." }), &dir).is_err();
+        let find_blocked =
+            p.check_in("bash", &json!({ "command": "cd etc && find . -name passwd -delete" }), &dir).is_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(chmod_blocked, "chmod -R after cd into a /etc symlink must be blocked");
+        assert!(find_blocked, "find -delete after cd into a /etc symlink must be blocked");
+    }
+
+    #[test]
     fn find_follow_and_mv_symlink_dest_are_resolved() {
         // #6/#7 `find -L link ... -delete` and `mv x link` (with `link -> /etc`)
         // dereference the symlink, so the guard must judge the real target.
@@ -1798,8 +1974,9 @@ mod tests {
     #[test]
     fn shred_normalizes_device_paths() {
         // #9 `shred`/`blkdiscard` operands go through the resolving device guard,
-        // not a literal `/dev/` prefix test.
-        assert!(blocked("shred /tmp/../dev/sda").contains("device"));
+        // not a literal `/dev/` prefix test. `/usr` is real on both Linux and macOS
+        // (unlike `/tmp`), so `/usr/../dev` resolves to the real `/dev` on either.
+        assert!(blocked("shred /usr/../dev/sda").contains("device"));
         assert!(blocked("shred -n 3 -u /dev/sda").contains("device"));
         allowed("shred -n 3 -u scratch.txt");
     }
@@ -1812,6 +1989,10 @@ mod tests {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("nano-perm-link-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Canonicalize the workspace root so the rule glob is built from the same
+        // physical prefix the file tool resolves the symlink target to (on macOS
+        // `std::env::temp_dir()` is under `/var/folders`, a symlink to `/private/...`).
+        let dir = dir.canonicalize().unwrap();
         let secret = dir.join("secret.env");
         std::fs::write(&secret, "TOKEN=1").unwrap();
         let link = dir.join("innocent.txt");
