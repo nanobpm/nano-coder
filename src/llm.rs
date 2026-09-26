@@ -120,11 +120,20 @@ pub struct TokenUsage {
 
 /// Tool call requested by LLM. `arguments` is the decoded JSON object; if the
 /// model produced invalid JSON it is kept verbatim as a `Value::String`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Call id (`call_*`) used to pair a tool result with its call; stable
+    /// across providers and the id carried in `function_call_output`.
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Provider output-item id (OpenAI Responses `fc_*`) when the call came from
+    /// the Responses API. Reasoning models pair the preserved reasoning item
+    /// with its function call by this id, so it must be replayed on the
+    /// `function_call` item of the next request. `None` for providers that have
+    /// no separate item id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
 }
 
 impl ToolCall {

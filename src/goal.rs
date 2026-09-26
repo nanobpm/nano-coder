@@ -141,6 +141,7 @@ mod tests {
             id: id.into(),
             name: TOOL_NAME.into(),
             arguments: json!({"status": status, "summary": id}),
+            item_id: None,
         };
         let messages = vec![
             Message::user("go"),
