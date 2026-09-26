@@ -534,18 +534,25 @@ impl Agent {
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
         self.load_project_instructions();
-        self.conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) }];
+        let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
+        // Stage the new log before mutating any live state so a disk/permission
+        // failure leaves the current session (conversation, id, log) intact
+        // instead of detaching the agent from it.
+        let session = if self.config.persist_sessions {
+            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
+            log.append(&Record::Message(system.clone()))?;
+            Some(log)
+        } else {
+            None
+        };
+        self.conversation = vec![system];
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
         self.plan = Plan::default();
-        self.session = None;
+        self.reminders = Reminders::default();
+        self.session = session;
         self.session_id = Some(id.clone());
-        if self.config.persist_sessions {
-            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
-            log.append(&Record::Message(self.conversation[0].clone()))?;
-            self.session = Some(log);
-        }
         self.calibration = None;
         self.compact_floor = 0;
         {

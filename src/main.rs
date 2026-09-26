@@ -502,7 +502,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // previous session log stays on disk and is still resumable.
             let id = agent.new_session()?;
             terminal.renderer.clear_screen();
-            println!("Session: {id} (resume with --resume {id})");
+            if agent.session_path().is_some() {
+                println!("Session: {id} (resume with --resume {id})");
+            } else {
+                println!("Session: {id}");
+            }
             Ok(true)
         }
         "/verbosity" => {
