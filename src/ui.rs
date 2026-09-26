@@ -186,6 +186,22 @@ impl Renderer {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }
 
+    /// Wipe the screen and scrollback for a fresh session, re-pinning the
+    /// status line's scroll region, and reset the renderer's line state.
+    pub fn clear_screen(&self) {
+        match &self.status {
+            Some(status) => status.clear(),
+            None if self.tty => {
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J");
+                let _ = stdout.flush();
+            }
+            None => {}
+        }
+        let mut state = self.state.lock().unwrap();
+        *state = State { at_line_start: true, ..Default::default() };
+    }
+
     fn out(&self, state: &mut State, text: &str) {
         if text.is_empty() {
             return;

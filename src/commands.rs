@@ -20,6 +20,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/model", args: "[provider/model]", description: "Show or switch the model" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
+    Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },
     Command { name: "/exit", args: "", description: "Exit the agent" },
     Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
 ];

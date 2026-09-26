@@ -20,7 +20,7 @@ cargo install nano-coder             # or build from source
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/exit`
+- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -287,6 +287,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/model [provider/model]` - Show or switch the model (conversation is kept)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
+- `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent
 
 ## Building and Running

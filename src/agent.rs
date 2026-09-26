@@ -533,21 +533,45 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
-        self.load_project_instructions();
-        self.conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) }];
+        // Discover instructions/skills into temporaries so a staging failure
+        // below leaves self.instructions/self.skills (and the live system
+        // prompt they render) untouched, rather than pairing the old
+        // conversation with newly discovered instructions.
+        let (instructions, skills) = self.discover_project_instructions();
+        let system =
+            Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt_from(&instructions, &skills)) };
+        // Stage the new log before mutating any live state so a disk/permission
+        // failure leaves the current session (conversation, id, log,
+        // instructions, skills) intact instead of detaching the agent from it.
+        let session = if self.config.persist_sessions {
+            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
+            log.append(&Record::Message(system.clone()))?;
+            Some(log)
+        } else {
+            None
+        };
+        // Staging succeeded — now commit all live state.
+        self.instructions = instructions;
+        self.skills = skills;
+        self.conversation = vec![system];
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
         self.plan = Plan::default();
-        self.session = None;
+        self.reminders = Reminders::default();
+        self.session = session;
         self.session_id = Some(id.clone());
-        if self.config.persist_sessions {
-            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
-            log.append(&Record::Message(self.conversation[0].clone()))?;
-            self.session = Some(log);
-        }
         self.calibration = None;
         self.compact_floor = 0;
+        {
+            // A fresh session starts with clean cumulative counters so the
+            // status line and `/context` reflect only this session. Shared
+            // with startup, where these are already zero.
+            let mut stats = self.stats.lock().unwrap();
+            stats.session_input_tokens = 0;
+            stats.session_output_tokens = 0;
+            stats.compactions = 0;
+        }
         self.refresh_stats();
         Ok(id)
     }
@@ -648,23 +672,39 @@ impl Agent {
     /// The configured system prompt plus any project instructions and the
     /// skill index.
     pub fn system_prompt(&self) -> String {
-        let extra = self.instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        format!("{}{extra}{}", self.config.system_prompt, self.skills.render_index())
+        self.system_prompt_from(&self.instructions, &self.skills)
     }
 
-    /// Discover instruction files and skills for the current working directory.
-    fn load_project_instructions(&mut self) {
+    /// Render the system prompt from a given instruction/skill set, so a new
+    /// session can build its prompt from freshly discovered temporaries before
+    /// committing them to `self`.
+    fn system_prompt_from(&self, instructions: &Option<ProjectInstructions>, skills: &Skills) -> String {
+        let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
+        format!("{}{extra}{}", self.config.system_prompt, skills.render_index())
+    }
+
+    /// Discover instruction files and skills for the current working directory,
+    /// returning them without mutating `self`.
+    fn discover_project_instructions(&self) -> (Option<ProjectInstructions>, Skills) {
         let enabled = self.config.project_instructions && std::env::var_os("AGENTIC_NO_PROJECT_INSTRUCTIONS").is_none();
         let cwd = std::env::current_dir().ok();
-        self.instructions = enabled
+        let instructions = enabled
             .then(|| cwd.clone())
             .flatten()
             .map(|cwd| ProjectInstructions::discover(&cwd, &self.config.project_instruction_files));
         let skills_enabled = self.config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
-        self.skills = match cwd.filter(|_| skills_enabled) {
+        let skills = match cwd.filter(|_| skills_enabled) {
             Some(cwd) => Skills::discover(&cwd, &self.config.skills),
             None => Skills::default(),
         };
+        (instructions, skills)
+    }
+
+    /// Discover instruction files and skills, committing them to `self`.
+    fn load_project_instructions(&mut self) {
+        let (instructions, skills) = self.discover_project_instructions();
+        self.instructions = instructions;
+        self.skills = skills;
     }
 
     pub fn skills(&self) -> &Skills {
@@ -1450,6 +1490,27 @@ mod tests {
         drop(agent);
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert_eq!(restored.conversation, conversation);
+    }
+
+    #[test]
+    fn new_session_resets_cumulative_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        {
+            // Seed the cumulative counters shared with `/context` and the
+            // status line, as if a prior session had accrued usage.
+            let stats = agent.context_stats();
+            let mut stats = stats.lock().unwrap();
+            stats.session_input_tokens = 1_234;
+            stats.session_output_tokens = 567;
+            stats.compactions = 3;
+        }
+        agent.new_session().unwrap();
+        let stats = agent.context_stats();
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.session_input_tokens, 0);
+        assert_eq!(stats.session_output_tokens, 0);
+        assert_eq!(stats.compactions, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
