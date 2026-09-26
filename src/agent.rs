@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -25,6 +26,142 @@ const INTERRUPTED_TOOL_RESULT: &str =
     "Error: the harness stopped before this tool call completed; its outcome is unknown.";
 const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this tool call ran.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
+
+/// Accumulates streamed output to estimate a live output rate (completion
+/// tokens per second), throttled so the status line does not redraw on every
+/// delta. Tokens are estimated from streamed bytes (~4 bytes/token) and
+/// reconciled against exact usage at turn end.
+struct RateMeter {
+    /// When this generation's LLM call began, captured before the request is
+    /// sent. Used as the `finish` denominator ONLY for a whole-response burst —
+    /// which hands the entire body over in a single delta at completion,
+    /// leaving no delta span to divide by — so a one-shot response still
+    /// reports the issue's `usage / elapsed` average over the real call
+    /// duration instead of a near-zero span.
+    generation_start: Instant,
+    /// When the first non-empty output delta arrived. The live per-delta rate
+    /// and the periodic refresh both divide by elapsed since this instant (not
+    /// `generation_start`) so idle time-to-first-token — and any empty thinking
+    /// deltas before it — does not depress the displayed rate, and so a paused
+    /// stream decays smoothly and continuously with the live rate. `None` until
+    /// the first real output byte.
+    first_token_at: Option<Instant>,
+    /// When the most recent non-empty delta arrived. Compared with
+    /// `first_token_at` only to tell a genuine multi-delta stream (deltas that
+    /// spanned at least `MULTI_DELTA_SPAN` → divide by the first-token elapsed)
+    /// from a burst — a single delta, or the back-to-back thinking+text
+    /// callbacks of a one-shot `report_whole` (no real span → fall back to
+    /// `generation_start`). It selects the denominator; it never suppresses the
+    /// rate.
+    last_token_at: Option<Instant>,
+    /// Total output bytes streamed so far this turn.
+    bytes: usize,
+    /// When the rate was last published, for throttling.
+    last_emit: Option<Instant>,
+}
+
+impl Default for RateMeter {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
+}
+
+impl RateMeter {
+    /// Minimum spacing between rate updates (~4 Hz) to avoid flicker/overhead.
+    const THROTTLE: Duration = Duration::from_millis(250);
+
+    /// Minimum span between the first and most recent delta for output to count
+    /// as a genuine incremental stream (`finish` then divides by the first-token
+    /// elapsed). Below it — including the two back-to-back callbacks
+    /// `report_whole` emits for a one-shot response's thinking and text — there
+    /// is effectively no delta span, so `finish` falls back to the whole-call
+    /// `generation_start` denominator instead of dividing by microseconds. This
+    /// only selects the denominator; it never suppresses the rate.
+    const MULTI_DELTA_SPAN: Duration = Duration::from_millis(250);
+
+    /// Create a meter whose generation clock starts at `generation_start` —
+    /// the moment the LLM call is issued, so `finish` can report throughput
+    /// over the whole call even when output arrives as a single burst.
+    fn new(generation_start: Instant) -> Self {
+        Self { generation_start, first_token_at: None, last_token_at: None, bytes: 0, last_emit: None }
+    }
+
+    /// Record `bytes` of streamed output produced at `now`. Returns the current
+    /// live rate (tokens/sec) once the deltas have spanned `MULTI_DELTA_SPAN`
+    /// and the throttle allows a refresh, otherwise `None` (first token, a
+    /// sub-span burst such as `report_whole`'s back-to-back thinking+text
+    /// callbacks, or throttled). The live rate divides by elapsed since the
+    /// FIRST token so pre-output idle does not dilute it, and the span gate
+    /// keeps a one-shot burst from momentarily publishing a microsecond-based
+    /// near-infinite value; `finish` handles the one-shot average.
+    fn record(&mut self, bytes: usize, now: Instant) -> Option<f64> {
+        // Ignore zero-byte deltas: some producers emit empty text/thinking
+        // deltas, and starting the clock on one would depress the later rate
+        // even though no output has arrived yet.
+        if bytes == 0 {
+            return None;
+        }
+        let start = *self.first_token_at.get_or_insert(now);
+        self.last_token_at = Some(now);
+        self.bytes += bytes;
+        let elapsed = now.duration_since(start).as_secs_f64();
+        // Stay silent until the deltas have spanned a meaningful interval, so a
+        // burst delivered in back-to-back callbacks does not publish a rate
+        // computed over mere microseconds.
+        if now.duration_since(start) < Self::MULTI_DELTA_SPAN {
+            return None;
+        }
+        let due = self.last_emit.is_none_or(|t| now.duration_since(t) >= Self::THROTTLE);
+        if !due {
+            return None;
+        }
+        self.last_emit = Some(now);
+        Some(self.bytes.div_ceil(4) as f64 / elapsed)
+    }
+
+    /// Re-sample the live rate for the periodic status-bar refresh, ignoring
+    /// the throttle. Divides the streamed-byte estimate by elapsed since the
+    /// FIRST token — the same denominator as the live `record` rate — so a
+    /// pause or hung endpoint decays the displayed value smoothly and
+    /// continuously as elapsed grows, rather than jumping. Returns `None`
+    /// before the first output delta or if no measurable time has elapsed.
+    fn sample(&self, now: Instant) -> Option<f64> {
+        let start = self.first_token_at?;
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        Some(self.bytes.div_ceil(4) as f64 / elapsed)
+    }
+
+    /// Compute the final rate at turn end using the exact completion-token
+    /// count when known, otherwise the streamed-byte estimate. A genuine
+    /// multi-delta stream (its deltas spanned time) divides by elapsed since
+    /// the first token, continuous with the live rate; a single-delta burst
+    /// (`report_whole`, or a `stream = true` provider that returns one
+    /// plain-JSON body) has no delta span, so it falls back to elapsed since
+    /// `generation_start` — the whole-call `usage / elapsed` average — instead
+    /// of dividing by the microseconds it took to hand the body over. Returns
+    /// `None` when no output delta was streamed (nothing to measure) or no
+    /// measurable time elapsed.
+    fn finish(&self, tokens: Option<u64>, now: Instant) -> Option<f64> {
+        let first = self.first_token_at?;
+        // A stream whose deltas spanned a meaningful interval divides by the
+        // first-token elapsed; a burst — a single delta, or the back-to-back
+        // thinking+text callbacks of a one-shot `report_whole` — has no real
+        // span and falls back to the whole-call duration.
+        let start = match self.last_token_at {
+            Some(last) if last.duration_since(first) >= Self::MULTI_DELTA_SPAN => first,
+            _ => self.generation_start,
+        };
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let tokens = tokens.map_or_else(|| self.bytes.div_ceil(4) as f64, |t| t as f64);
+        Some(tokens / elapsed)
+    }
+}
 
 /// A steering message sent while a turn is running. `tag` identifies the
 /// request that carried it (e.g. the ACP request ID) so it can be answered.
@@ -430,6 +567,10 @@ impl Agent {
         let changed = {
             let mut stats = self.stats.lock().unwrap();
             let changed = stats.activity != activity;
+            if !matches!(activity, Activity::Thinking) {
+                // Generation has stopped; drop the live output rate.
+                stats.tokens_per_sec = None;
+            }
             stats.activity = activity;
             changed
         };
@@ -912,26 +1053,104 @@ impl Agent {
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
+                let stats = self.stats.clone();
+                let rate_meter = Arc::new(Mutex::new(RateMeter::new(Instant::now())));
+                // A fresh generation has no measured rate yet. Clear any rate
+                // carried over from the previous response and redraw, so the
+                // status bar never shows a stale tokens/sec until the new
+                // meter's first throttled sample. `set_activity(Thinking)` does
+                // not clear it (it clears only on non-Thinking transitions), so
+                // when a queued steer keeps activity at `Thinking` across
+                // requests the old rate would otherwise linger.
+                let had_rate = stats.lock().unwrap().tokens_per_sec.take().is_some();
+                if had_rate && let Some(sink) = event_sink {
+                    sink(session_id, &AgentEvent::Context);
+                }
+                // A live tokens/sec meter is only meaningful when the UI is in
+                // streaming mode with a sink to draw to. Whether the provider
+                // actually streams is judged by the `RateMeter` from delivered
+                // output: a `report_whole` provider hands the whole body over in
+                // one delta at completion, so no live per-delta rate is
+                // published (zero elapsed since the first token), and `finish`
+                // instead reports the call's `usage / elapsed` average.
+                let meter_live = self.streaming && event_sink.is_some();
                 let on_stream = |event: StreamEvent<'_>| {
-                    if let Some(sink) = event_sink {
-                        match event {
-                            StreamEvent::Text(text) => sink(session_id, &AgentEvent::TextDelta { text }),
-                            StreamEvent::Thinking(text) => sink(session_id, &AgentEvent::ThinkingDelta { text }),
+                    let Some(sink) = event_sink else { return };
+                    let text = match event {
+                        StreamEvent::Text(text) => {
+                            sink(session_id, &AgentEvent::TextDelta { text });
+                            text
                         }
+                        StreamEvent::Thinking(text) => {
+                            sink(session_id, &AgentEvent::ThinkingDelta { text });
+                            text
+                        }
+                    };
+                    // Update the live output rate, throttled so the status line
+                    // does not redraw on every delta.
+                    if !meter_live {
+                        return;
+                    }
+                    let rate = rate_meter.lock().unwrap().record(text.len(), Instant::now());
+                    if let Some(rate) = rate {
+                        stats.lock().unwrap().tokens_per_sec = Some(rate);
+                        sink(session_id, &AgentEvent::Context);
                     }
                 };
-                let call = if self.streaming && event_sink.is_some() {
+                let streaming = self.streaming && event_sink.is_some();
+                let mut call = if streaming {
                     self.client.chat_stream(&request, &on_stream)
                 } else {
                     self.client.chat(&request)
                 };
-                let result = tokio::select! {
-                    response = call => Some(response),
-                    () = control.cancelled() => None,
+                // While streaming, refresh the displayed rate on a timer even
+                // when no new deltas arrive. The rate is cumulative
+                // (estimated_tokens / elapsed), so a pause or a hung endpoint
+                // must keep lowering the shown value as elapsed grows instead
+                // of leaving the last sample frozen on the status bar — that is
+                // what distinguishes a slow stream from a stalled one.
+                let mut refresh = tokio::time::interval(Duration::from_secs(1));
+                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                refresh.tick().await; // discard the immediate first tick
+                let result = loop {
+                    tokio::select! {
+                        response = &mut call => break Some(response),
+                        () = control.cancelled() => break None,
+                        _ = refresh.tick(), if meter_live => {
+                            let rate = rate_meter.lock().unwrap().sample(Instant::now());
+                            if let Some(rate) = rate {
+                                stats.lock().unwrap().tokens_per_sec = Some(rate);
+                                if let Some(sink) = event_sink {
+                                    sink(session_id, &AgentEvent::Context);
+                                }
+                            }
+                        }
+                    }
                 };
+                // `call` still borrows `request` (and thus `self`); drop it now
+                // so the overflow branch below can take `&mut self` to compact.
+                drop(call);
                 match result {
                     None => break None,
-                    Some(Ok(response)) => break Some(response),
+                    Some(Ok(response)) => {
+                        // Sample the meter once at completion using the exact
+                        // completion-token count when the provider reports it.
+                        // `finish` divides by the whole-call elapsed, so a
+                        // one-shot/bursty response that never published a live
+                        // per-delta rate still reports a `usage / elapsed`
+                        // average.
+                        let tokens = response.usage.as_ref().and_then(|u| u64::try_from(u.completion_tokens).ok());
+                        if let Some(rate) = meter_live
+                            .then(|| rate_meter.lock().unwrap().finish(tokens, Instant::now()))
+                            .flatten()
+                        {
+                            stats.lock().unwrap().tokens_per_sec = Some(rate);
+                            if let Some(sink) = event_sink {
+                                sink(session_id, &AgentEvent::Context);
+                            }
+                        }
+                        break Some(response);
+                    }
                     Some(Err(e)) => {
                         let message = format!("{e:#}");
                         if overflow_retried || !context::is_context_overflow(&message) {
@@ -1313,6 +1532,130 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn rate_meter_tracks_scripted_stream() {
+        // A slow ~2 tok/s stream: 8 bytes (≈2 tokens) per second.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        // First delta starts the clock; zero elapsed yields no rate yet.
+        assert_eq!(meter.record(8, t0), None);
+        // One second later, 16 bytes total ≈ 4 tokens over 1s → ~4 tok/s...
+        let one = meter.record(8, t0 + Duration::from_secs(1)).expect("rate after first second");
+        assert!((one - 4.0).abs() < 0.01, "got {one}");
+        // ...settling toward ~2 tok/s as the stream continues at 8 bytes/sec.
+        let mut last = one;
+        for sec in 2..=8 {
+            if let Some(rate) = meter.record(8, t0 + Duration::from_secs(sec)) {
+                last = rate;
+            }
+        }
+        // 72 bytes ≈ 18 tokens over 8s ≈ 2.25 tok/s.
+        assert!((last - 2.25).abs() < 0.1, "settled rate {last}");
+    }
+
+    #[test]
+    fn rate_meter_throttles_updates() {
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(100, t0), None); // first token, no rate
+        // Emits once ~250ms in, then suppresses closely-spaced deltas.
+        assert!(meter.record(100, t0 + Duration::from_millis(300)).is_some());
+        assert!(meter.record(100, t0 + Duration::from_millis(350)).is_none());
+        assert!(meter.record(100, t0 + Duration::from_millis(600)).is_some());
+    }
+
+    #[test]
+    fn rate_meter_ignores_empty_deltas() {
+        // Empty deltas must not start the clock; otherwise the idle gap before
+        // real output arrives would depress the reported rate.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(0, t0), None);
+        // A real 4-byte (~1 token) delta one second later starts the clock now,
+        // so the first published rate reflects only actual output.
+        assert_eq!(meter.record(4, t0 + Duration::from_secs(1)), None);
+        let rate = meter
+            .record(4, t0 + Duration::from_millis(1_500))
+            .expect("rate after real output");
+        // 8 bytes ≈ 2 tokens over 0.5s ≈ 4 tok/s (not diluted by the empty delta).
+        assert!((rate - 4.0).abs() < 0.01, "got {rate}");
+    }
+
+    #[test]
+    fn rate_meter_finish_falls_back_to_usage_over_elapsed_for_one_shot() {
+        // A whole completion handed over in a single delta (a `report_whole`
+        // fallback, or any provider that returns one plain-JSON body): `record`
+        // sees zero elapsed since the first token and never publishes a live
+        // rate, but `finish` divides by the whole-call elapsed (from generation
+        // start), so a one-shot response still reports the issue's `usage /
+        // elapsed` average instead of a near-infinite delta-span division.
+        let t0 = Instant::now();
+        let mut meter = RateMeter::new(t0);
+        assert_eq!(meter.record(400, t0), None); // single burst delta, no live rate
+        // Exact usage wins over the byte estimate: 200 tokens over 2s = 100 tok/s.
+        let rate = meter.finish(Some(200), t0 + Duration::from_secs(2)).expect("one-shot rate");
+        assert!((rate - 100.0).abs() < 0.01, "got {rate}");
+        // Without usage, fall back to the byte estimate (400 bytes ≈ 100 tokens / 2s).
+        let est = meter.finish(None, t0 + Duration::from_secs(2)).expect("estimated rate");
+        assert!((est - 50.0).abs() < 0.01, "got {est}");
+        // No output delta ever streamed (e.g. a tool-call-only turn) → no rate,
+        // even though exact usage is known: there is nothing that was generated
+        // as visible output to meter.
+        assert_eq!(RateMeter::new(t0).finish(Some(10), t0 + Duration::from_secs(1)), None);
+
+        // `report_whole` emits a one-shot response's thinking and text as two
+        // back-to-back callbacks microseconds apart. That sub-MULTI_DELTA_SPAN
+        // pair must NOT be mistaken for a genuine stream: it still divides by
+        // the whole-call duration, not the microseconds between callbacks.
+        let mut two_callbacks = RateMeter::new(t0);
+        assert_eq!(two_callbacks.record(200, t0), None); // thinking callback
+        assert_eq!(two_callbacks.record(200, t0 + Duration::from_millis(1)), None); // text callback, ~0 span
+        // 200 tokens over the 2s call, not 400 bytes / 1ms.
+        let burst = two_callbacks.finish(Some(200), t0 + Duration::from_secs(2)).expect("burst rate");
+        assert!((burst - 100.0).abs() < 0.01, "got {burst}");
+    }
+
+    #[test]
+    fn rate_meter_finish_uses_first_token_denominator_for_multi_delta_stream() {
+        // A genuine stream whose deltas span time reconciles at completion
+        // against the first-token elapsed — continuous with the live rate and
+        // the periodic refresh — not the whole-call duration, so a long
+        // time-to-first-token does not deflate the final number.
+        let t0 = Instant::now();
+        // Generation starts 2s before the first token (slow TTFT), then two
+        // deltas arrive 1s apart.
+        let mut meter = RateMeter::new(t0);
+        let first = t0 + Duration::from_secs(2);
+        assert_eq!(meter.record(400, first), None); // first token, no live rate yet
+        assert!(meter.record(400, first + Duration::from_secs(1)).is_some());
+        // 200 exact tokens over the 3s SINCE THE FIRST TOKEN (not 5s since the
+        // call began) = ~66.7 tok/s; the TTFT is excluded.
+        let rate = meter.finish(Some(200), first + Duration::from_secs(3)).expect("stream rate");
+        assert!((rate - 200.0 / 3.0).abs() < 0.01, "got {rate}");
+    }
+
+    #[test]
+    fn rate_meter_sample_decays_during_pause() {
+        // The periodic status-bar refresh re-samples the meter with `sample`
+        // (byte estimate, first-token denominator) while no new deltas arrive.
+        // Because the rate is cumulative (estimated_tokens / elapsed since the
+        // first token), each later sample must report a strictly lower value,
+        // so a pause or hang visibly lowers the displayed rate — continuously
+        // with the live rate — instead of leaving a stale sample frozen.
+        let t0 = Instant::now();
+        let mut meter = RateMeter::new(t0);
+        assert_eq!(meter.record(400, t0), None); // one delta records 400 bytes ≈ 100 tokens
+        let at_1s = meter.sample(t0 + Duration::from_secs(1)).expect("rate at 1s");
+        let at_2s = meter.sample(t0 + Duration::from_secs(2)).expect("rate at 2s");
+        let at_5s = meter.sample(t0 + Duration::from_secs(5)).expect("rate at 5s");
+        assert!(at_2s < at_1s, "pause must lower the rate: {at_2s} !< {at_1s}");
+        assert!(at_5s < at_2s, "a longer pause lowers it further: {at_5s} !< {at_2s}");
+        // 100 estimated tokens over 5s = 20 tok/s.
+        assert!((at_5s - 20.0).abs() < 0.01, "got {at_5s}");
+        // Before the first output delta there is nothing to sample.
+        assert_eq!(RateMeter::new(t0).sample(t0 + Duration::from_secs(1)), None);
+    }
+
     /// Replays scripted responses and records the requests it saw.
     struct Scripted {
         responses: Mutex<Vec<LLMResponse>>,
@@ -1692,6 +2035,40 @@ mod tests {
         let update = crate::acp::update_for(&AgentEvent::Thinking { text: "r" }).unwrap();
         assert_eq!(update["sessionUpdate"], "agent_thought_chunk");
         assert!(crate::acp::update_for(&AgentEvent::TextDelta { text: "r" }).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_shot_provider_publishes_usage_over_elapsed_rate() {
+        // A provider whose `chat_stream` falls back to `report_whole` (default
+        // trait impl) hands the whole response to the sink in one delta at
+        // completion, so no live per-delta rate is published. The meter still
+        // reports the turn's average at completion — exact `usage / elapsed`,
+        // divided by the whole-call duration from generation start rather than
+        // the near-zero delta span — which is the issue's one-shot fallback.
+        // (The live rate is cleared when the turn goes idle, so it is observed
+        // here as it is published, via the event sink during the turn.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut response = text("the whole answer at once");
+        response.usage = Some(crate::llm::TokenUsage { prompt_tokens: 3, completion_tokens: 6, ..Default::default() });
+        let (mut agent, _) = agent(vec![response], dir.path());
+        agent.set_streaming(true);
+        let stats = agent.context_stats();
+        let observed = Arc::new(Mutex::new(None::<f64>));
+        let (obs, st) = (observed.clone(), stats.clone());
+        agent.set_event_sink(Box::new(move |_, event| {
+            if matches!(event, AgentEvent::Context)
+                && let Some(rate) = st.lock().unwrap().tokens_per_sec
+            {
+                *obs.lock().unwrap() = Some(rate);
+            }
+        }));
+        agent.new_session().unwrap();
+        agent.send_message("hi").await.unwrap();
+        let observed = *observed.lock().unwrap();
+        assert!(
+            observed.is_some_and(|r| r > 0.0),
+            "a one-shot completion reports a usage/elapsed average, got {observed:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2085,6 +2462,40 @@ mod tests {
         let n = conversation.len();
         assert_eq!(conversation[n - 3].content, "first draft");
         assert_eq!(conversation[n - 2].content, "make it shorter");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_generation_clears_stale_output_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        // A shared slot lets the on_call hook reach the agent's live stats.
+        let stats_slot: Arc<Mutex<Option<SharedStats>>> = Arc::new(Mutex::new(None));
+        let observed: Arc<Mutex<Vec<Option<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let slot = stats_slot.clone();
+        let seen_rates = observed.clone();
+        let (mut agent, _) = interfering(
+            vec![text("first draft"), text("revised")],
+            dir.path(),
+            move |call, control| {
+                let stats = slot.lock().unwrap().clone().unwrap();
+                if call == 1 {
+                    // Simulate a rate left over from this response, then queue a
+                    // steer so the turn continues into a second generation
+                    // without transitioning through `Activity::Idle`.
+                    stats.lock().unwrap().tokens_per_sec = Some(123.0);
+                    control.steer("make it shorter", None);
+                } else {
+                    // The second generation must start with a cleared rate,
+                    // even though the activity never left `Thinking`.
+                    seen_rates.lock().unwrap().push(stats.lock().unwrap().tokens_per_sec);
+                }
+            },
+            None,
+        );
+        *stats_slot.lock().unwrap() = Some(agent.context_stats());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "write").await.unwrap();
+        assert_eq!(outcome.response, "revised");
+        assert_eq!(observed.lock().unwrap().as_slice(), [None], "stale rate cleared at generation start");
     }
 
     #[tokio::test(flavor = "multi_thread")]
