@@ -528,7 +528,7 @@ impl LLMClient for GithubCopilotClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Message, ToolCall};
+    use crate::llm::{Message, StreamEvent, ToolCall};
     use crate::providers::{ProviderConfig, ProviderKind, resolve, test_server};
     use serde_json::json;
     use std::collections::HashMap;
@@ -648,6 +648,95 @@ mod tests {
         let headers = api_log[0].headers.to_lowercase();
         assert!(headers.contains("anthropic-version: 2023-06-01"));
         assert!(headers.contains("copilot-integration-id: vscode-chat"));
+    }
+
+    #[tokio::test]
+    async fn stream_routes_completions_model_to_chat_completions() {
+        let sse = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({ "choices": [{ "delta": { "role": "assistant", "content": "hi" } }] })
+        );
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "o4-mini");
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "hi");
+        assert_eq!(*seen.lock().unwrap(), "hi");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/chat/completions");
+        assert!(api_log[0].body.get("messages").is_some());
+        assert_eq!(api_log[0].body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_routes_gpt_model_to_responses_endpoint() {
+        let events = [
+            json!({ "type": "response.output_text.delta", "delta": "po" }),
+            json!({ "type": "response.output_text.delta", "delta": "ng" }),
+            json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 3, "output_tokens": 1 } } }),
+        ];
+        let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "gpt-6-astra");
+        let messages = vec![Message::user("ping")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "pong");
+        assert_eq!(*seen.lock().unwrap(), "pong");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/responses");
+        // Responses format: a flat `input` list, not `messages`.
+        assert!(api_log[0].body.get("input").is_some());
+        assert!(api_log[0].body.get("messages").is_none());
+        assert_eq!(api_log[0].body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn stream_routes_claude_model_to_messages_endpoint() {
+        let events = [
+            json!({ "type": "message_start", "message": { "usage": { "input_tokens": 4, "output_tokens": 1 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "bonjour" } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 2 } }),
+            json!({ "type": "message_stop" }),
+        ];
+        let sse: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+        let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "claude-sonnet-4.5");
+        let messages = vec![Message::system("be brief"), Message::user("hi")];
+        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) };
+        let seen = std::sync::Mutex::new(String::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push_str(t);
+            }
+        };
+        let response = client.chat_stream(&request, &sink).await.unwrap();
+        assert_eq!(response.content, "bonjour");
+        assert_eq!(*seen.lock().unwrap(), "bonjour");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/v1/messages");
+        // Messages format: a hoisted `system` field.
+        assert_eq!(api_log[0].body["system"], "be brief");
+        let headers = api_log[0].headers.to_lowercase();
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert_eq!(api_log[0].body["stream"], true);
     }
 
     #[test]
