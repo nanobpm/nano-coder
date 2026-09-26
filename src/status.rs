@@ -101,20 +101,29 @@ impl StatusLine {
         // and re-pin the scroll region first, so the stale bar left at the old
         // bottom row is cleared even when the SIGWINCH resize() later no-ops.
         let Some((rows, cols)) = terminal_size() else { return };
-        let mut size = self.size.lock().unwrap();
+        // Never hold two of this struct's locks at once. Snapshot the steer
+        // text under `input`, release it, then take `size` on its own: draw()
+        // acquiring `size` -> `input` while set_input() held `input` across a
+        // draw() would be a lock-order inversion that could deadlock the UI
+        // during a concurrent resize. Taking each lock in isolation removes any
+        // ordering between them, so no caller can invert it.
+        let input = self.input.lock().unwrap().clone();
         // When the size changed, prepend the resize cleanup so the whole draw —
         // region reset, erase-below and the fresh bar — is emitted as one
         // atomic write. Splitting it into separate writes lets output from
         // another thread interleave between them and tear the escape sequences.
-        let prefix = match *size {
-            None => return, // torn down
-            Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
-                *size = Some((rows, cols));
-                resize_sequence(rows)
+        let prefix = {
+            let mut size = self.size.lock().unwrap();
+            match *size {
+                None => return, // torn down
+                Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
+                    *size = Some((rows, cols));
+                    resize_sequence(rows)
+                }
+                Some(_) => String::new(),
             }
-            Some(_) => String::new(),
         };
-        let line = match self.input.lock().unwrap().as_deref() {
+        let line = match input.as_deref() {
             Some(text) => render_input(text, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };

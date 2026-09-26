@@ -746,13 +746,21 @@ async fn main() -> Result<()> {
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() {
-                    if separate {
-                        println!();
-                    }
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
-                    io::stdout().write_all(prompt.as_bytes()).unwrap();
-                    io::stdout().flush().unwrap();
+                    // Emit the (optional) separator and prompt as one unit under
+                    // the terminal lock so a concurrent status redraw from the
+                    // resize task cannot land between them and scatter the
+                    // prompt. Held across the whole write, matching the renderer
+                    // and line editor.
+                    crate::status::with_term_lock(|| {
+                        let mut out = io::stdout().lock();
+                        if separate {
+                            let _ = out.write_all(b"\n");
+                        }
+                        let _ = out.write_all(prompt.as_bytes());
+                        let _ = out.flush();
+                    });
                     view.prompt_redrawn();
                 }
             };
