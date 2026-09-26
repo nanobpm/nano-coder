@@ -263,7 +263,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to steer, Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
-    // Blank line separates user input from LLM output.
+    // Blank line after LLM output.
     println!();
     renderer.begin_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
@@ -514,14 +514,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
             if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("\n{}", ui::stamp_block(&outcome.response));
+                println!("{}", ui::stamp_block(&outcome.response));
             } else if outcome.stop_reason == agent::StopReason::Cancelled {
                 println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
             } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
                 let last = outcome.response.lines().last().unwrap_or_default();
                 println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
             }
-            println!();
             Ok(true)
         }
     }
@@ -694,12 +693,16 @@ async fn main() -> Result<()> {
         let mut terminal = Terminal::start(config_path, view, renderer);
         let mut running = true;
         let mut exit_armed = false;
+        let mut separate = false;
         while running {
             if let Some(status) = &status {
                 status.draw();
             }
-            let prompt = |terminal: &Terminal| {
+            let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() {
+                    if separate {
+                        println!();
+                    }
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
                     io::stdout().write_all(prompt.as_bytes()).unwrap();
@@ -707,13 +710,14 @@ async fn main() -> Result<()> {
                     view.prompt_redrawn();
                 }
             };
-            prompt(&terminal);
+            prompt(&terminal, separate);
+            separate = false;
 
             let input = loop {
                 match terminal.next().await {
                     TermInput::ToggleThinking => {
                         if terminal.renderer.toggle_thinking() {
-                            prompt(&terminal);
+                            prompt(&terminal, false);
                         }
                     }
                     other => break other,
@@ -743,6 +747,7 @@ async fn main() -> Result<()> {
                     eprintln!("Error: {:#}", e);
                 }
             }
+            separate = true;
         }
 
         println!("\nGoodbye!");
