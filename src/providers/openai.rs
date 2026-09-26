@@ -654,6 +654,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_but_steady_stream_survives_beyond_idle_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        // Idle timeout of 1s, but the stream lasts ~2.5s total, dripping an event
+        // every 500ms. A *total* request timeout would kill this healthy stream;
+        // an idle (read) timeout must not, because no single gap exceeds 1s.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            for piece in ["hel", "lo", " wor", "ld"] {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let event = json!({ "choices": [{ "delta": { "content": piece } }] });
+                socket.write_all(format!("data: {event}\n\n").as_bytes()).await.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            socket.write_all(b"data: [DONE]\n\n").await.unwrap();
+            socket.shutdown().await.ok();
+        });
+        let mut user = HashMap::new();
+        user.insert(
+            "slow".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("http://{addr}")),
+                api_key: Some("sk-test".into()),
+                timeout_secs: Some(1),
+                ..Default::default()
+            },
+        );
+        let client = OpenAiClient::new(resolve("slow/some-model", &user, "mock").unwrap()).unwrap();
+        let messages = [Message::user("hi")];
+        let sink = |_e: StreamEvent<'_>| {};
+        let response = client
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .await
+            .unwrap();
+        assert_eq!(response.content, "hello world");
+    }
+
+    #[tokio::test]
     async fn does_not_retry_auth_errors() {
         let (url, captured) = test_server::serve(vec![(
             401,
