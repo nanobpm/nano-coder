@@ -118,7 +118,15 @@ impl SandboxConfig {
                 && let Some(home) = &home
             {
                 for cache in TOOL_CACHES {
-                    add(home.join(cache));
+                    // A tool cache is an explicit grant when `tool_caches` is set, but
+                    // in a clean home the directory may not exist yet; create it so
+                    // `canonicalize()` succeeds and the package manager can populate it,
+                    // rather than silently dropping the grant.
+                    let path = home.join(cache);
+                    if !path.exists() {
+                        let _ = std::fs::create_dir_all(&path);
+                    }
+                    add(path);
                 }
             }
         }
