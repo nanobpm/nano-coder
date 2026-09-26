@@ -192,7 +192,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
       # Trusted publishing needs npm >= 11.5.1.
       - run: npm install -g npm@11.5.1
       - uses: actions/download-artifact@v4
@@ -200,6 +199,9 @@ jobs:
           pattern: bin-*
           merge-multiple: true
           path: bins
+      # semantic-release bumped Cargo.toml on a new tag/commit we haven't checked out (and
+      # on a dry run there is no tag at all), so set the version here before packing.
+      - run: node scripts/set-version.mjs ${{ needs.release.outputs.version }}
       - run: node scripts/npm-packages.mjs --version ${{ needs.release.outputs.version }} --binaries bins --out npm-dist
       - name: Publish (platform packages first, then the main package)
         shell: bash
