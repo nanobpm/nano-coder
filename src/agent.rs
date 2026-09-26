@@ -969,15 +969,39 @@ impl Agent {
                         sink(session_id, &AgentEvent::Context);
                     }
                 };
-                let call = if self.streaming && event_sink.is_some() {
+                let streaming = self.streaming && event_sink.is_some();
+                let mut call = if streaming {
                     self.client.chat_stream(&request, &on_stream)
                 } else {
                     self.client.chat(&request)
                 };
-                let result = tokio::select! {
-                    response = call => Some(response),
-                    () = control.cancelled() => None,
+                // While streaming, refresh the displayed rate on a timer even
+                // when no new deltas arrive. The rate is cumulative
+                // (estimated_tokens / elapsed), so a pause or a hung endpoint
+                // must keep lowering the shown value as elapsed grows instead
+                // of leaving the last sample frozen on the status bar — that is
+                // what distinguishes a slow stream from a stalled one.
+                let mut refresh = tokio::time::interval(Duration::from_secs(1));
+                refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                refresh.tick().await; // discard the immediate first tick
+                let result = loop {
+                    tokio::select! {
+                        response = &mut call => break Some(response),
+                        () = control.cancelled() => break None,
+                        _ = refresh.tick(), if streaming => {
+                            let rate = rate_meter.lock().unwrap().finish(None, Instant::now());
+                            if let Some(rate) = rate {
+                                stats.lock().unwrap().tokens_per_sec = Some(rate);
+                                if let Some(sink) = event_sink {
+                                    sink(session_id, &AgentEvent::Context);
+                                }
+                            }
+                        }
+                    }
                 };
+                // `call` still borrows `request` (and thus `self`); drop it now
+                // so the overflow branch below can take `&mut self` to compact.
+                drop(call);
                 match result {
                     None => break None,
                     Some(Ok(response)) => {
@@ -1439,6 +1463,25 @@ mod tests {
         assert!((est - 50.0).abs() < 0.01, "got {est}");
         // No output streamed → no rate.
         assert_eq!(RateMeter::default().finish(Some(10), t0), None);
+    }
+
+    #[test]
+    fn rate_meter_sample_decays_during_pause() {
+        // The periodic status-bar refresh re-samples the meter with `finish`
+        // (no exact token count) while no new deltas arrive. Because the rate
+        // is cumulative (estimated_tokens / elapsed), each later sample must
+        // report a strictly lower value, so a pause or hang visibly lowers the
+        // displayed rate instead of leaving a stale sample frozen.
+        let mut meter = RateMeter::default();
+        let t0 = Instant::now();
+        assert_eq!(meter.record(400, t0), None); // one delta starts the clock
+        let at_1s = meter.finish(None, t0 + Duration::from_secs(1)).expect("rate at 1s");
+        let at_2s = meter.finish(None, t0 + Duration::from_secs(2)).expect("rate at 2s");
+        let at_5s = meter.finish(None, t0 + Duration::from_secs(5)).expect("rate at 5s");
+        assert!(at_2s < at_1s, "pause must lower the rate: {at_2s} !< {at_1s}");
+        assert!(at_5s < at_2s, "a longer pause lowers it further: {at_5s} !< {at_2s}");
+        // 100 estimated tokens over 5s ≈ 20 tok/s.
+        assert!((at_5s - 20.0).abs() < 0.01, "got {at_5s}");
     }
 
     /// Replays scripted responses and records the requests it saw.
