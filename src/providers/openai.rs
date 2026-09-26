@@ -331,7 +331,9 @@ pub(crate) async fn stream_chat(
             StreamAction::Data(data) => {
                 let visible = AtomicBool::new(false);
                 accumulator.push(data, &|event| {
-                    visible.store(true, Ordering::Relaxed);
+                    if event.has_content() {
+                        visible.store(true, Ordering::Relaxed);
+                    }
                     sink(event);
                 })?;
                 Ok(visible.load(Ordering::Relaxed))

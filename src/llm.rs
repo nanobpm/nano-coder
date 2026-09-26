@@ -159,6 +159,17 @@ pub enum StreamEvent<'a> {
     Thinking(&'a str),
 }
 
+impl StreamEvent<'_> {
+    /// Whether this event carries visible content for the caller. Empty deltas
+    /// (e.g. an empty `text_delta`) reach the sink but deliver nothing, so they
+    /// must not count as visible output when deciding whether a retry is safe.
+    pub fn has_content(&self) -> bool {
+        match self {
+            StreamEvent::Text(text) | StreamEvent::Thinking(text) => !text.is_empty(),
+        }
+    }
+}
+
 /// Receives stream events as they arrive.
 pub type StreamSink<'a> = &'a (dyn Fn(StreamEvent<'_>) + Send + Sync);
 
