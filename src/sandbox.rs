@@ -621,7 +621,12 @@ mod tests {
         let ws = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
         let ws_roots = ws.writable_roots(workspace.path());
         if Path::new("/dev/fd").exists() {
-            assert!(ws_roots.iter().any(|r| r == Path::new("/dev/fd")), "workspace mode dropped /dev/fd: {ws_roots:?}");
+            // `writable_roots` returns *canonical* paths, so on Linux — where
+            // `/dev/fd` is a symlink to `/proc/self/fd` — the granted root is the
+            // resolved `/proc/<pid>/fd`, while on macOS `/dev/fd` is a real dir.
+            // Compare against the same canonical form rather than the literal link.
+            let fd_real = Path::new("/dev/fd").canonicalize().unwrap();
+            assert!(ws_roots.iter().any(|r| r == &fd_real), "workspace mode dropped /dev/fd: {ws_roots:?}");
         }
         // …but never the host-shared `/dev/shm` / `/dev/pts` trees, in any mode.
         assert!(!ws_roots.iter().any(|r| r == Path::new("/dev/shm")), "workspace mode granted shared /dev/shm: {ws_roots:?}");

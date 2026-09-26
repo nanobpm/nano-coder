@@ -382,7 +382,35 @@ fn resolve_target(target: &str, cwd: &Path) -> PathBuf {
     // follows) and `..` against the real filesystem *before* collapsing them
     // lexically, so `/tmp/../dev/sda` — or a symlink whose `..` crosses into
     // `/dev` — is judged by its real location instead of a lexically-collapsed one.
-    resolve_symlinks(&joined)
+    let resolved = resolve_symlinks(&joined);
+    // `canonicalize` (used inside `resolve_symlinks`) can only follow a symlink
+    // whose *target already exists*, so a link to a device node absent on this
+    // host (`disk -> /dev/sda` on a machine with no `/dev/sda`) is left pointing
+    // at the link itself. A redirect still writes *through* it, so read the link
+    // explicitly and judge the write by its (possibly dangling) target.
+    follow_dangling_symlink(&resolved)
+}
+
+/// Follow a chain of symlinks that [`resolve_symlinks`] left unresolved because
+/// their ultimate target does not exist on this host, so a redirect through a
+/// dangling `disk -> /dev/sda` link is still judged by `/dev/sda`. A resolvable
+/// link is already followed by `resolve_symlinks`, so `read_link` fails and this
+/// returns immediately; the bound guards against symlink loops.
+fn follow_dangling_symlink(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&current) else { return current };
+        let next = if target.is_absolute() {
+            target
+        } else {
+            match current.parent() {
+                Some(parent) => parent.join(target),
+                None => target,
+            }
+        };
+        current = resolve_symlinks(&next);
+    }
+    current
 }
 
 /// Refuse a redirection that writes directly to a raw device (`> /dev/sda`).
