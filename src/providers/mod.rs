@@ -71,6 +71,9 @@ pub struct ProviderConfig {
     pub context_window: Option<usize>,
     /// Stream responses (server-sent events) in the interactive CLI. Default true.
     pub stream: Option<bool>,
+    /// Idle timeout in seconds: the maximum silence between received bytes
+    /// before a request fails. Resets on each chunk, so it never cuts off a
+    /// slow but steady stream — it only catches a stalled connection. Default 600.
     pub timeout_secs: Option<u64>,
     pub max_retries: Option<u32>,
     pub retry_initial_backoff_ms: Option<u64>,
@@ -226,6 +229,8 @@ pub struct ResolvedProvider {
     pub drop_params: Vec<String>,
     pub max_tokens_param: String,
     pub stream: bool,
+    /// Idle timeout: max silence between received bytes before a request fails
+    /// (resets on each chunk, so slow steady streams are never cut off).
     pub timeout: Duration,
     pub retry: RetryPolicy,
     pub retryable_statuses: Vec<u16>,
@@ -367,7 +372,12 @@ pub(crate) struct HttpTransport {
 impl HttpTransport {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(provider.timeout)
+            // An *idle* timeout: it resets on every received byte, so a slow but
+            // steady stream (e.g. a local model emitting a few tokens/second) is
+            // never cut off mid-response — only a genuinely stalled connection
+            // (no data for `provider.timeout`) trips it. A total request deadline
+            // would kill long, healthy streams by wall-clock alone.
+            .read_timeout(provider.timeout)
             .connect_timeout(Duration::from_secs(30))
             .build()
             .context("build HTTP client")?;

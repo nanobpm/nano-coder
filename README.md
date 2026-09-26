@@ -326,7 +326,7 @@ kind = "anthropic"
 base_url = "https://llm-gateway.example.com/anthropic/v1"
 api_key_env = "WORK_GATEWAY_KEY"        # or api_key = "..." (prefer the env var)
 # api_key_command = "op read op://vault/gateway/key"   # used when the env var is unset
-timeout_secs = 300
+timeout_secs = 300                      # idle timeout: max silence between streamed bytes (default 600)
 max_retries = 3
 ```
 
