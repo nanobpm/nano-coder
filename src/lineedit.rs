@@ -243,9 +243,11 @@ fn rows_above_cursor(chars: usize, cols: usize) -> usize {
 
 fn write(text: &str) {
     use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(text.as_bytes());
-    let _ = out.flush();
+    crate::status::with_term_lock(|| {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    });
 }
 
 /// What a key press produced.

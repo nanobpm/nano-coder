@@ -192,9 +192,11 @@ impl Renderer {
         match &self.status {
             Some(status) => status.clear(),
             None if self.tty => {
-                let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J");
-                let _ = stdout.flush();
+                crate::status::with_term_lock(|| {
+                    let mut stdout = io::stdout().lock();
+                    let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J");
+                    let _ = stdout.flush();
+                });
             }
             None => {}
         }
@@ -206,18 +208,20 @@ impl Renderer {
         if text.is_empty() {
             return;
         }
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(text.as_bytes());
-        let _ = stdout.flush();
-        let visible = strip_ansi(text);
-        if let Some(last) = visible.chars().last() {
-            state.at_line_start = last == '\n';
-        }
-        if state.at_line_start && !state.deferred.is_empty() && state.thinking.is_none() {
-            let notes: String = state.deferred.drain(..).map(|n| format!("{DIM}{n}{RESET}\n")).collect();
-            let _ = stdout.write_all(notes.as_bytes());
+        crate::status::with_term_lock(|| {
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
-        }
+            let visible = strip_ansi(text);
+            if let Some(last) = visible.chars().last() {
+                state.at_line_start = last == '\n';
+            }
+            if state.at_line_start && !state.deferred.is_empty() && state.thinking.is_none() {
+                let notes: String = state.deferred.drain(..).map(|n| format!("{DIM}{n}{RESET}\n")).collect();
+                let _ = stdout.write_all(notes.as_bytes());
+                let _ = stdout.flush();
+            }
+        });
     }
 
     fn newline(&self, state: &mut State) {
