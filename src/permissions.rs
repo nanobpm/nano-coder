@@ -253,6 +253,18 @@ impl Policy {
                 return Err(format!("rule `{}` denies `{text}`", rule.source));
             }
         }
+        // A broad allow rule (`Bash(echo *)`) matches on the command words only,
+        // dropping redirections, so it would otherwise auto-approve a catastrophic
+        // device write like `echo hi > /dev/sda`. Run the device-write guard on
+        // every write redirect before the allow short-circuit so an allow match can
+        // never bypass it. (Only when built-in guards are enabled at all.)
+        if self.builtin {
+            for cmd in &commands {
+                for redirect in cmd.redirects.iter().filter(|r| is_write_redirect(&r.op)) {
+                    device_write(&redirect.target.text)?;
+                }
+            }
+        }
         let allow: Vec<&Rule> = self.allow.iter().filter(|r| r.subject == Subject::Command).collect();
         if !allow.is_empty()
             && commands.iter().all(|cmd| {
@@ -292,6 +304,25 @@ fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {
 
 fn command_text(cmd: &Simple) -> String {
     cmd.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+}
+
+/// A redirection operator that writes to its target.
+fn is_write_redirect(op: &str) -> bool {
+    matches!(op, ">" | ">>" | ">|" | "&>" | "&>>" | "<>")
+}
+
+/// Refuse a redirection that writes directly to a raw device (`> /dev/sda`).
+fn device_write(target: &str) -> Result<(), String> {
+    let dev = target.starts_with("/dev/")
+        && !SAFE_DEVICES.contains(&target)
+        && !target.starts_with("/dev/fd/")
+        && !target.starts_with("/dev/tty")
+        && !target.starts_with("/dev/shm/")
+        && !target.starts_with("/dev/pts/");
+    if dev {
+        return Err(format!("it writes directly to the device {target}"));
+    }
+    Ok(())
 }
 
 fn basename(text: &str) -> &str {
@@ -622,7 +653,7 @@ impl Guard<'_> {
         let mut scan_sql = false;
         for cmd in commands {
             for redirect in &cmd.redirects {
-                if matches!(redirect.op.as_str(), ">" | ">>" | ">|" | "&>" | "&>>" | "<>") {
+                if is_write_redirect(&redirect.op) {
                     self.device_write(&redirect.target.text)?;
                 }
             }
@@ -734,7 +765,11 @@ impl Guard<'_> {
                 let (flags, targets) = split_flags(args);
                 let recursive = flags.iter().any(|f| *f == "--recursive" || (!f.starts_with("--") && f.contains('R')));
                 if recursive {
-                    for target in targets.iter().skip(1) {
+                    // The first operand is the mode/owner unless it came from
+                    // `--reference=FILE`, in which case there is no mode operand and
+                    // every operand is a target (`chmod -R --reference=X /`).
+                    let skip = usize::from(!flags.iter().any(|f| f.starts_with("--reference")));
+                    for target in targets.iter().skip(skip) {
                         self.protect(target, false, program)?;
                     }
                 }
@@ -743,6 +778,10 @@ impl Guard<'_> {
                 let narrowed = any_word(&["-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename"]);
                 let starts: Vec<&Word> =
                     args.iter().take_while(|a| !a.text.starts_with('-') && !matches!(a.text.as_str(), "(" | "!")).collect();
+                // With no explicit start path, `find` searches the current directory,
+                // so `find -delete` wipes the working tree; treat it as an implicit `.`.
+                let implicit = Word { text: ".".into(), ..Word::default() };
+                let starts: Vec<&Word> = if starts.is_empty() { vec![&implicit] } else { starts };
                 if narrowed {
                     // A narrowed `-delete` still recurses from its start paths, so a
                     // catastrophic root (`find / -name passwd -delete`, `find ~ ...`)
@@ -832,16 +871,7 @@ impl Guard<'_> {
     }
 
     fn device_write(&self, target: &str) -> Result<(), String> {
-        let dev = target.starts_with("/dev/")
-            && !SAFE_DEVICES.contains(&target)
-            && !target.starts_with("/dev/fd/")
-            && !target.starts_with("/dev/tty")
-            && !target.starts_with("/dev/shm/")
-            && !target.starts_with("/dev/pts/");
-        if dev {
-            return Err(format!("it writes directly to the device {target}"));
-        }
-        Ok(())
+        device_write(target)
     }
 
     /// Refuse to delete, move or recursively re-permission a path whose loss
@@ -949,7 +979,15 @@ impl Guard<'_> {
             None if text.starts_with('/') => PathBuf::from("/"),
             None => return Err(()),
         };
-        let path = real(&normalize(&base.join(&text)));
+        let joined = normalize(&base.join(&text));
+        // A trailing slash makes the shell follow a symlink in the final component
+        // (`rm -rf link/` deletes through `link`), so resolve it fully rather than
+        // leaving the last component unresolved as `real` normally does.
+        let path = if text.ends_with('/') {
+            joined.canonicalize().unwrap_or_else(|_| real(&joined))
+        } else {
+            real(&joined)
+        };
         // Treat the first wildcard component as "everything in its parent".
         if word.glob {
             let mut prefix = PathBuf::new();
@@ -1122,7 +1160,7 @@ fn split_flags(args: &[Word]) -> (Vec<&str>, Vec<&Word>) {
     for arg in args {
         if !only_operands && arg.text == "--" {
             only_operands = true;
-        } else if !only_operands && arg.text.starts_with('-') && arg.text.len() > 1 && !arg.quoted {
+        } else if !only_operands && arg.text.starts_with('-') && arg.text.len() > 1 {
             flags.push(arg.text.as_str());
         } else {
             operands.push(arg);
@@ -1423,6 +1461,50 @@ mod tests {
         blocked("find /etc -name '*.conf' -delete");
         allowed("find . -name '*.log' -delete");
         allowed("find ./build -path '*/tmp/*' -delete");
+    }
+
+    #[test]
+    fn round5_guard_hardening() {
+        // #1 A broad allow rule matches on words only; the device-write guard must
+        // still run on a redirect it does not cover.
+        let p = policy(&["Bash(echo *)"], &[]);
+        assert!(check(&p, "echo hi > /dev/sda").is_err());
+        assert!(check(&p, "echo hi > /dev/null").is_ok());
+
+        // #3 `chmod -R --reference=FILE` has no mode operand, so every operand is a
+        // target and the root must not be skipped over.
+        assert!(blocked("chmod -R --reference=/etc/passwd /").contains("filesystem root"));
+        allowed("chmod -R 755 build");
+
+        // #4 `find -delete` with no start path implicitly searches the working
+        // directory, so it must be guarded like `find . -delete`.
+        blocked("find -delete");
+        blocked("find -type f -delete");
+        allowed("find -name '*.log' -delete");
+
+        // #6 Quoting an option does not stop the shell interpreting it as one.
+        assert!(blocked("rm \"-rf\" /").contains("filesystem root"));
+        assert!(blocked("chmod \"-R\" 777 /").contains("filesystem root"));
+    }
+
+    #[test]
+    fn trailing_slash_follows_symlink_out_of_workspace() {
+        // #5 A trailing slash makes the shell follow a symlink in the final
+        // component, so `rm -rf link/` reaches the link's target (here $HOME) and
+        // must be blocked, while `rm -rf link` only removes the link itself.
+        use std::os::unix::fs::symlink;
+        let home = dirs::home_dir().expect("home dir");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("nano-perm-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link");
+        symlink(&home, &link).unwrap();
+        let p = Policy::default();
+        let blocked = p.check_in("bash", &json!({ "command": "rm -rf link/" }), &dir).is_err();
+        let allowed = p.check_in("bash", &json!({ "command": "rm -rf link" }), &dir).is_ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(blocked, "rm -rf link/ should follow the symlink into $HOME");
+        assert!(allowed, "rm -rf link should only delete the link");
     }
 
     #[test]
