@@ -158,14 +158,35 @@ fn status_line(stats: &DemoStats) -> Line<'static> {
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
+    // Everything after raw mode is enabled runs through `run`, whose result we
+    // capture so we can *always* restore the terminal — on success, on an early
+    // `?` error, and (via ratatui's panic-safe backend teardown aside) on the
+    // ordinary error paths — before propagating any failure to the caller.
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::with_options(
+    let terminal = Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(1),
         },
-    )?;
+    );
 
+    let result = terminal.and_then(|mut terminal| {
+        let loop_result = run(&mut terminal);
+        // Restore the viewport regardless of how the loop exited.
+        let clear_result = terminal.clear();
+        loop_result.and(clear_result)
+    });
+
+    // Always leave raw mode, even if construction or the loop failed.
+    let restore_result = disable_raw_mode();
+
+    result?;
+    restore_result?;
+    println!();
+    Ok(())
+}
+
+fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut stats = DemoStats {
         provider: "macbook".to_string(),
         model: "qwen3.8-neo-coder".to_string(),
@@ -243,8 +264,5 @@ fn main() -> io::Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    terminal.clear()?;
-    println!();
     Ok(())
 }
