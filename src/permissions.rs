@@ -695,7 +695,7 @@ const INTERPRETERS: &[&str] = &["python", "python3", "node", "ruby", "perl", "ph
 
 static DESTRUCTIVE_SQL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(drop\s+(database|schema|table|user|role|owned\s+by)\b|truncate\s+(table\s+)?[\w"`\[]|delete\s+from\s+[\w."`\[\]]+\s*($|;|'|"|\))|alter\s+table\s+\S+\s+drop\s|dropDatabase\s*\(|flushall\b|flushdb\b)"#,
+        r#"(?i)\b(drop\s+(database|schema|table|user|role|owned\s+by)\b|truncate\s+(table\s+)?[\w"`\[]|delete\s+from\s+[\w."`\[\]]+\s*($|;|'|"|\))|delete\s+from\s+[\w."`\[\]]+[^;]*\b(where|or)\s+(not\s+)?(true\b|\d+\s*=\s*\d+|'[^']*'\s*=\s*'[^']*'|"[^"]*"\s*=\s*"[^"]*")|alter\s+table\s+\S+\s+drop\s|dropDatabase\s*\(|flushall\b|flushdb\b)"#,
     )
     .unwrap()
 });
@@ -1532,12 +1532,20 @@ mod tests {
             "npx prisma migrate reset --force",
             "terraform destroy -auto-approve",
             "kubectl delete namespace prod",
+            // Tautological DELETE predicates delete the whole table but carry a
+            // WHERE clause, so they must not slip past as "targeted".
+            "psql -c 'DELETE FROM users WHERE true'",
+            "psql -c 'DELETE FROM users WHERE 1=1'",
+            "mysql -e 'DELETE FROM users WHERE 1 = 1'",
+            "psql -c \"DELETE FROM users WHERE id = 5 OR 1=1\"",
+            "sqlite3 a.db \"DELETE FROM t WHERE 'x'='x'\"",
         ] {
             let reason = blocked(command);
             assert!(!reason.is_empty(), "{command}");
         }
         allowed("psql -c 'SELECT * FROM users'");
         allowed("psql -c \"DELETE FROM users WHERE id = 3\"");
+        allowed("psql -c \"DELETE FROM users WHERE name = 'bob'\"");
         allowed("grep -rn 'DROP TABLE' migrations/");
         allowed("kubectl delete pod web-1");
         allowed("terraform plan");
