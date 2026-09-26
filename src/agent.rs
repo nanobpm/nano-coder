@@ -949,6 +949,14 @@ impl Agent {
                 if had_rate && let Some(sink) = event_sink {
                     sink(session_id, &AgentEvent::Context);
                 }
+                // A live tokens/sec meter is only meaningful when the provider
+                // delivers output incrementally. When `chat_stream` falls back
+                // to `report_whole` (provider `stream = false`), the entire
+                // response is handed to `on_stream` in one delta at completion,
+                // so timing it would divide the whole output by mere callback
+                // overhead and publish a meaningless huge rate. Gate every meter
+                // update on the provider actually streaming.
+                let meter_live = self.streaming && event_sink.is_some() && self.client.streams();
                 let on_stream = |event: StreamEvent<'_>| {
                     let Some(sink) = event_sink else { return };
                     let text = match event {
@@ -963,6 +971,9 @@ impl Agent {
                     };
                     // Update the live output rate, throttled so the status line
                     // does not redraw on every delta.
+                    if !meter_live {
+                        return;
+                    }
                     let rate = rate_meter.lock().unwrap().record(text.len(), Instant::now());
                     if let Some(rate) = rate {
                         stats.lock().unwrap().tokens_per_sec = Some(rate);
@@ -988,7 +999,7 @@ impl Agent {
                     tokio::select! {
                         response = &mut call => break Some(response),
                         () = control.cancelled() => break None,
-                        _ = refresh.tick(), if streaming => {
+                        _ = refresh.tick(), if meter_live => {
                             let rate = rate_meter.lock().unwrap().finish(None, Instant::now());
                             if let Some(rate) = rate {
                                 stats.lock().unwrap().tokens_per_sec = Some(rate);
@@ -1010,7 +1021,10 @@ impl Agent {
                         // sample the meter once here (using exact usage when
                         // available) so one-shot streams still report one.
                         let tokens = response.usage.as_ref().and_then(|u| u64::try_from(u.completion_tokens).ok());
-                        if let Some(rate) = rate_meter.lock().unwrap().finish(tokens, Instant::now()) {
+                        if let Some(rate) = meter_live
+                            .then(|| rate_meter.lock().unwrap().finish(tokens, Instant::now()))
+                            .flatten()
+                        {
                             stats.lock().unwrap().tokens_per_sec = Some(rate);
                             if let Some(sink) = event_sink {
                                 sink(session_id, &AgentEvent::Context);
@@ -1842,6 +1856,33 @@ mod tests {
         let update = crate::acp::update_for(&AgentEvent::Thinking { text: "r" }).unwrap();
         assert_eq!(update["sessionUpdate"], "agent_thought_chunk");
         assert!(crate::acp::update_for(&AgentEvent::TextDelta { text: "r" }).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_streaming_provider_publishes_no_output_rate() {
+        // A provider whose `chat_stream` falls back to `report_whole` (default
+        // trait impl, `streams()` == false) hands the whole response to the sink
+        // in one delta at completion. Timing that would divide the entire output
+        // by mere callback overhead and publish a meaningless huge rate, so the
+        // meter must stay silent even with the streaming UI enabled.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("the whole answer at once")], dir.path());
+        assert!(!agent.client.streams(), "test client uses the non-streaming default");
+        agent.set_streaming(true);
+        let deltas = Arc::new(Mutex::new(0usize));
+        let seen = deltas.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if matches!(event, AgentEvent::TextDelta { .. }) {
+                *seen.lock().unwrap() += 1;
+            }
+        }));
+        agent.new_session().unwrap();
+        agent.send_message("hi").await.unwrap();
+        assert!(*deltas.lock().unwrap() >= 1, "the whole response is still reported to the sink");
+        assert_eq!(
+            agent.context_stats().lock().unwrap().tokens_per_sec, None,
+            "no rate is published for a non-streaming provider"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

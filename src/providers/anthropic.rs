@@ -335,6 +335,10 @@ impl LLMClient for AnthropicClient {
         Ok(accumulator.finish())
     }
 
+    fn streams(&self) -> bool {
+        self.transport.provider().stream
+    }
+
     fn model_name(&self) -> &str {
         &self.transport.provider().model
     }
