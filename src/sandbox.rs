@@ -117,7 +117,12 @@ impl SandboxConfig {
             }
         };
         if self.mode == SandboxMode::Workspace {
-            add(cwd.to_path_buf());
+            // A `cwd` of `/` would grant the entire host filesystem as a writable
+            // subtree; refuse to treat the filesystem root as a workspace write root
+            // and fail closed (the temp roots below remain available).
+            if cwd != Path::new("/") {
+                add(cwd.to_path_buf());
+            }
             let cwd_real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
             for dir in git_dirs(cwd) {
                 // `git rev-parse` output is influenced by a `.git` *file* in the
@@ -277,7 +282,10 @@ mod platform {
             allowed.push_str(&format!(" ({kind} {})", quote(root)));
         }
         let mut profile = format!(
-            "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*{allowed} (regex #\"^/dev/tty\"))\n"
+            // Writable roots are listed literally in `{allowed}` (which already
+            // includes the `/dev/tty` device node); do not add a broad `^/dev/tty`
+            // regex, which would also grant serial/USB nodes like `/dev/ttyS0`.
+            "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*{allowed})\n"
         );
         if !config.network {
             profile.push_str("(deny network-outbound (remote ip))\n(allow network-outbound (remote ip \"localhost:*\"))\n");
@@ -553,5 +561,15 @@ mod tests {
         let roots = config.writable_roots(workspace.path());
         let fake_real = fake_git.canonicalize().unwrap_or(fake_git);
         assert!(!roots.iter().any(|r| r.starts_with(&fake_real)), "external git dir was granted: {roots:?}");
+    }
+
+    #[test]
+    fn root_cwd_is_not_a_writable_root() {
+        // An ACP session whose `cwd` is `/` must not grant the whole host
+        // filesystem as a writable subtree; only the temp roots remain.
+        let config = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
+        let roots = config.writable_roots(Path::new("/"));
+        assert!(!roots.iter().any(|r| r == Path::new("/")), "root cwd was granted as a writable root: {roots:?}");
+        assert!(!config.allows_write(Path::new("/etc/hosts"), Path::new("/")));
     }
 }
