@@ -194,15 +194,6 @@ pub trait LLMClient: Send + Sync {
         report_whole(sink, &response);
         Ok(response)
     }
-    /// Whether `chat_stream` delivers output incrementally as the provider
-    /// generates it, rather than reporting the whole response at the end. Only
-    /// then is a live tokens/sec rate meaningful; a `report_whole` fallback
-    /// hands the entire response to the sink at once, so timing it yields a
-    /// meaningless value. Defaults to `false` to match the non-streaming
-    /// default `chat_stream` above.
-    fn streams(&self) -> bool {
-        false
-    }
     /// Model IDs offered by the endpoint, where it can list them.
     async fn list_models(&self) -> Result<Vec<String>> {
         anyhow::bail!("provider {:?} cannot list models", self.provider_name())
