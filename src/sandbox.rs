@@ -124,18 +124,30 @@ impl SandboxConfig {
                 add(cwd.to_path_buf());
             }
             let cwd_real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-            for dir in git_dirs(cwd) {
+            let dirs = git_dirs(cwd);
+            // A linked worktree's `--git-dir` (`<common>/worktrees/<name>`) and
+            // `--git-common-dir` (the *main* checkout's git dir) live under the main
+            // repository, which is normally a *sibling* of this worktree — so neither
+            // `within` nor `ancestor_repo` holds and a naive check drops them, which
+            // then makes a workspace sandbox reject the `git commit` that must update
+            // the worktree's metadata and shared refs. Accept them when git ties the
+            // worktree back to `cwd`: the per-worktree git dir carries a `gitdir`
+            // back-pointer resolving into `cwd`.
+            let is_worktree_of_cwd =
+                dirs.iter().filter_map(|d| d.canonicalize().ok()).any(|real| worktree_backpointer_within(&real, &cwd_real));
+            for dir in dirs {
                 // `git rev-parse` output is influenced by a `.git` *file* in the
-                // workspace: a worktree pointer can name a git directory belonging
-                // to an unrelated repository outside `cwd`. Only grant a git dir
-                // whose real path is inside the workspace, or whose repository root
+                // workspace: a poisoned worktree pointer can name a git directory
+                // belonging to an unrelated repository outside `cwd`. Only grant a git
+                // dir whose real path is inside the workspace, whose repository root
                 // (its parent) contains the workspace (a normal repo entered from a
-                // subdirectory). A poisoned pointer to an external repo satisfies
-                // neither and is dropped rather than handed write access.
+                // subdirectory), or that git has tied back to this worktree above. A
+                // poisoned pointer to an external repo satisfies none of these and is
+                // dropped rather than handed write access.
                 let Ok(real) = dir.canonicalize() else { continue };
                 let within = real.starts_with(&cwd_real);
                 let ancestor_repo = real.parent().is_some_and(|repo| cwd_real.starts_with(repo));
-                if within || ancestor_repo {
+                if within || ancestor_repo || is_worktree_of_cwd {
                     add(dir);
                 }
             }
@@ -249,6 +261,22 @@ fn git_dirs(cwd: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
     String::from_utf8_lossy(&output.stdout).lines().map(|l| cwd.join(l.trim())).collect()
+}
+
+/// Whether `git_dir` is the per-worktree git directory of the worktree rooted at
+/// `cwd_real`. A linked worktree's `<common>/worktrees/<name>` directory holds a
+/// `gitdir` file naming that worktree's own `.git` link; its parent is the
+/// worktree root. Confirming the back-pointer resolves to `cwd` proves the git dir
+/// genuinely belongs to this worktree, rather than being a poisoned `.git` pointer
+/// aimed at an unrelated repository.
+fn worktree_backpointer_within(git_dir: &Path, cwd_real: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(git_dir.join("gitdir")) else {
+        return false;
+    };
+    Path::new(content.trim())
+        .parent()
+        .and_then(|root| root.canonicalize().ok())
+        .is_some_and(|root| root == cwd_real)
 }
 
 /// A command prepared to run inside the sandbox. Keep it alive until spawned.
@@ -561,6 +589,41 @@ mod tests {
         let roots = config.writable_roots(workspace.path());
         let fake_real = fake_git.canonicalize().unwrap_or(fake_git);
         assert!(!roots.iter().any(|r| r.starts_with(&fake_real)), "external git dir was granted: {roots:?}");
+    }
+
+    #[test]
+    fn linked_worktree_git_dirs_are_granted() {
+        // A linked worktree lives beside its main checkout; `git commit` there must
+        // reach the shared common dir under the main repo. Those git dirs are
+        // neither inside the worktree nor an ancestor of it, so they are granted only
+        // because git ties them back to this worktree via the `gitdir` back-pointer.
+        let base = outside_dir();
+        let main = base.path().join("main");
+        let wt = base.path().join("wt");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], dir: &Path| {
+            let ok = Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"], &main);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        git(&["add", "-A"], &main);
+        git(&["commit", "-qm", "seed"], &main);
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()], &main);
+
+        let config = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
+        let roots = config.writable_roots(&wt);
+        let common = main.join(".git").canonicalize().unwrap();
+        assert!(
+            roots.iter().any(|r| r.starts_with(&common)),
+            "linked worktree's shared git common dir was not granted: {roots:?}"
+        );
     }
 
     #[test]
