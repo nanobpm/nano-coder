@@ -266,7 +266,7 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     }
     labels.push("Cancel".into());
     let choice = Select::new().with_prompt("Provider to add or edit").items(&labels).default(0).interact()?;
-    let name = match choice {
+    let (name, is_new) = match choice {
         0 => {
             let name: String = Input::new()
                 .with_prompt("Name (used as the model prefix, e.g. work in work/llama3)")
@@ -279,9 +279,9 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
                     }
                 })
                 .interact_text()?;
-            name.trim().to_string()
+            (name.trim().to_string(), true)
         }
-        i if i < labels.len() - 1 => labels[i].trim_start_matches("✓ ").to_string(),
+        i if i < labels.len() - 1 => (labels[i].strip_prefix("✓ ").unwrap_or(&labels[i]).to_string(), false),
         _ => return Ok(None),
     };
     let current = all.get(&name).cloned().unwrap_or_default();
@@ -294,6 +294,12 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     let mut base_url = Input::<String>::new().with_prompt("Base URL (e.g. http://merlin.local:8000/v1)").allow_empty(kind == ProviderKind::GithubCopilot);
     if let Some(url) = &current.base_url {
         base_url = base_url.default(url.clone());
+    } else if kind == ProviderKind::GithubCopilot
+        && is_new
+        && !all.contains_key(&name)
+        && providers::github_copilot::domain() == "github.com"
+    {
+        base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
     }
     let base_url = base_url.interact_text()?.trim().trim_end_matches('/').to_string();
 
