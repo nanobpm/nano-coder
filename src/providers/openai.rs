@@ -654,6 +654,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_mid_stream_disconnect_before_any_output() {
+        // First attempt: valid SSE headers, but the body is cut off before any
+        // complete event arrives — `x-truncate` advertises more bytes than are
+        // sent and then the connection closes, simulating a transient timeout or
+        // reset mid-stream (the user-reported "reading response stream ...
+        // operation timed out"). Nothing was emitted, so the whole request is
+        // retried; the second attempt streams cleanly.
+        let truncated = r#"data: {"choices":[{"delta":{"content":"par"#.to_string();
+        let events = [
+            json!({"choices":[{"delta":{"role":"assistant","content":"hello"}}]}),
+            json!({"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}),
+        ];
+        let mut good: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        good.push_str("data: [DONE]\n\n");
+        let (url, captured) = test_server::serve(vec![
+            (200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
+            (200, "content-type: text/event-stream\r\n", good),
+        ])
+        .await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hi")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = client
+            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .await
+            .unwrap();
+        assert_eq!(response.content, "hello world");
+        // Output is delivered exactly once — no duplication from the retry.
+        assert_eq!(*seen.lock().unwrap(), vec!["hello", " world"]);
+        assert_eq!(captured.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn does_not_retry_auth_errors() {
         let (url, captured) = test_server::serve(vec![(
             401,
