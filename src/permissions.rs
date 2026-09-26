@@ -257,11 +257,21 @@ impl Policy {
         // dropping redirections, so it would otherwise auto-approve a catastrophic
         // device write like `echo hi > /dev/sda`. Run the device-write guard on
         // every write redirect before the allow short-circuit so an allow match can
-        // never bypass it. (Only when built-in guards are enabled at all.)
-        if self.builtin {
+        // never bypass it. (Only when built-in guards are enabled at all.) The
+        // guard substitutes known command-local variables, so `D=/dev/sda; > "$D"`
+        // is caught here too.
+        let guard = self.builtin.then(|| Guard {
+            cwd,
+            home: dirs::home_dir(),
+            protected: &self.protected_branches,
+            assigned: assignments(&commands_with_assignments(command)),
+            base: std::cell::RefCell::new(Some(cwd.to_path_buf())),
+            depth: std::cell::Cell::new(0),
+        });
+        if let Some(guard) = &guard {
             for cmd in &commands {
                 for redirect in cmd.redirects.iter().filter(|r| is_write_redirect(&r.op)) {
-                    device_write(&redirect.target.text, cwd)?;
+                    guard.device_write(&redirect.target.text)?;
                 }
             }
         }
@@ -279,15 +289,7 @@ impl Policy {
         {
             return Ok(());
         }
-        if self.builtin {
-            let guard = Guard {
-                cwd,
-                home: dirs::home_dir(),
-                protected: &self.protected_branches,
-                assigned: assignments(&commands_with_assignments(command)),
-                base: std::cell::RefCell::new(Some(cwd.to_path_buf())),
-                depth: std::cell::Cell::new(0),
-            };
+        if let Some(guard) = &guard {
             guard.check(command, &commands)?;
         }
         Ok(())
@@ -931,7 +933,11 @@ impl Guard<'_> {
     }
 
     fn device_write(&self, target: &str) -> Result<(), String> {
-        device_write(target, self.cwd)
+        // Substitute known command-local variables first, so a target reached
+        // through a proven assignment (`D=/dev/sda; echo x > "$D"`, `dd of=$D`)
+        // is judged by the real device path rather than the literal `$D`.
+        let target = if target.contains('$') { self.substitute(target).0 } else { target.to_string() };
+        device_write(&target, self.cwd)
     }
 
     /// Refuse to delete, move or recursively re-permission a path whose loss
@@ -983,8 +989,11 @@ impl Guard<'_> {
             }
         }
         // Inside the workspace is fine even when the workspace lives
-        // somewhere like /var/lib/jenkins.
-        let in_workspace = p.starts_with(self.cwd) && p != self.cwd;
+        // somewhere like /var/lib/jenkins. But when the workspace itself is `/`
+        // (which `apply_cwd` permits), *everything* is "inside" it, so the
+        // exception must not apply or `rm -rf /etc` would look in-workspace.
+        let root_workspace = self.cwd == Path::new("/");
+        let in_workspace = !root_workspace && p.starts_with(self.cwd) && p != self.cwd;
         if !in_workspace && p.components().count() <= 2 {
             return Some("a top-level system directory".into());
         }
@@ -1007,7 +1016,9 @@ impl Guard<'_> {
     /// workspace subtree (used for narrowed `find -delete`, where the working
     /// directory and its descendants are legitimate targets).
     fn catastrophic_root(&self, p: &Path) -> Option<&'static str> {
-        if p.starts_with(self.cwd) {
+        // The workspace subtree is exempt — unless the workspace itself is `/`,
+        // where treating every path as in-workspace would disable the guard.
+        if self.cwd != Path::new("/") && p.starts_with(self.cwd) {
             return None;
         }
         if p == Path::new("/") {
@@ -1608,6 +1619,24 @@ mod tests {
         assert!(blocked("find -P / -name passwd -delete").contains("filesystem root"));
         assert!(blocked("find -L / -name x -delete").contains("filesystem root"));
         allowed("find -P . -name '*.log' -delete");
+    }
+
+    #[test]
+    fn round7_guard_hardening() {
+        // #1 A device write reached through a proven command-local assignment must
+        // be caught: the guard substitutes `$D` before judging the target.
+        assert!(blocked("D=/dev/sda; echo x > \"$D\"").contains("device"));
+        assert!(blocked("D=/dev/sda; dd if=/dev/zero of=$D").contains("device"));
+        assert!(blocked("D=/tmp/../dev/sda; echo x > $D").contains("device"));
+        allowed("D=/dev/null; echo x > \"$D\"");
+
+        // #2 When the workspace itself is `/`, the in-workspace exception must not
+        // disable the system-directory guard.
+        let p = Policy::default();
+        let root = Path::new("/");
+        assert!(p.check_in("bash", &json!({ "command": "rm -rf /etc" }), root).is_err());
+        assert!(p.check_in("bash", &json!({ "command": "chmod -R 777 /" }), root).is_err());
+        assert!(p.check_in("bash", &json!({ "command": "find / -name x -delete" }), root).is_err());
     }
 
     #[test]

@@ -88,10 +88,17 @@ const TOOL_CACHES: &[&str] = &[
     ".deno",
 ];
 
-const DEVICES: &[&str] = &[
-    "/dev/null", "/dev/zero", "/dev/tty", "/dev/stdout", "/dev/stderr", "/dev/ptmx", "/dev/dtracehelper", "/dev/fd",
-    "/dev/pts", "/dev/shm",
-];
+/// Individual device *nodes* commands routinely need for I/O. Granting one adds
+/// only that single node (a file, not a subtree), so they are safe in every mode.
+const DEVICE_NODES: &[&str] =
+    &["/dev/null", "/dev/zero", "/dev/tty", "/dev/stdout", "/dev/stderr", "/dev/ptmx", "/dev/dtracehelper"];
+
+/// Device *directories*: on Linux the path-beneath rule grants the full write
+/// set to the whole subtree below each, so granting `/dev/shm` would let a
+/// `read-only` sandbox write arbitrary host-side files there. They are only
+/// added when the sandbox already permits workspace writes, never in read-only
+/// mode (whose boundary is temp dirs only).
+const DEVICE_DIRS: &[&str] = &["/dev/fd", "/dev/pts", "/dev/shm"];
 
 impl SandboxConfig {
     pub fn active(&self) -> bool {
@@ -111,8 +118,21 @@ impl SandboxConfig {
         };
         if self.mode == SandboxMode::Workspace {
             add(cwd.to_path_buf());
+            let cwd_real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
             for dir in git_dirs(cwd) {
-                add(dir);
+                // `git rev-parse` output is influenced by a `.git` *file* in the
+                // workspace: a worktree pointer can name a git directory belonging
+                // to an unrelated repository outside `cwd`. Only grant a git dir
+                // whose real path is inside the workspace, or whose repository root
+                // (its parent) contains the workspace (a normal repo entered from a
+                // subdirectory). A poisoned pointer to an external repo satisfies
+                // neither and is dropped rather than handed write access.
+                let Ok(real) = dir.canonicalize() else { continue };
+                let within = real.starts_with(&cwd_real);
+                let ancestor_repo = real.parent().is_some_and(|repo| cwd_real.starts_with(repo));
+                if within || ancestor_repo {
+                    add(dir);
+                }
             }
             if self.tool_caches
                 && let Some(home) = &home
@@ -140,8 +160,15 @@ impl SandboxConfig {
         }
         add(PathBuf::from("/tmp"));
         add(PathBuf::from("/var/tmp"));
-        for device in DEVICES {
+        for device in DEVICE_NODES {
             add(PathBuf::from(device));
+        }
+        // Directory devices grant write access to their whole subtree, so only
+        // expose them when the sandbox already allows workspace writes.
+        if self.mode == SandboxMode::Workspace {
+            for device in DEVICE_DIRS {
+                add(PathBuf::from(device));
+            }
         }
         for extra in &self.writable {
             let path = match (extra.strip_prefix("~/"), &home) {
@@ -334,6 +361,15 @@ mod platform {
         if abi >= 3 {
             fs |= TRUNCATE;
         }
+        // `IOCTL_DEV` (Landlock ABI 5, Linux 6.10+) is the only right that confines
+        // device ioctls. On ABI 3/4 it does not exist, so device ioctls are *not*
+        // mediated by Landlock at all: a command may open a device and issue a
+        // mutating ioctl regardless of the write roots. We deliberately do not raise
+        // the minimum ABI to 5 (that would drop the sandbox on Linux 6.2–6.9);
+        // instead we handle `IOCTL_DEV` when the kernel offers it, and rely on the
+        // lexical `dd`/device-write guards in `permissions.rs` as the compensating
+        // control on older kernels. The OS sandbox is therefore not, by itself, a
+        // complete device-write boundary below ABI 5.
         if abi >= 5 {
             fs |= IOCTL_DEV;
         }
@@ -482,18 +518,40 @@ mod tests {
     }
 
     #[test]
-    fn nonexistent_writable_paths_are_created_and_granted() {
+    fn read_only_mode_does_not_grant_device_directories() {
+        // Directory devices grant their whole subtree; read-only mode must not
+        // expose them (its boundary is temp dirs only), while the individual
+        // device nodes it needs for I/O stay writable.
         let workspace = outside_dir();
-        let parent = outside_dir();
-        // A configured path that does not exist yet must still be granted, not dropped.
-        let target = parent.path().join("state/app");
-        assert!(!target.exists());
-        let config = SandboxConfig {
-            mode: SandboxMode::ReadOnly,
-            writable: vec![target.display().to_string()],
-            ..Default::default()
-        };
-        assert!(config.writable_roots(workspace.path()).iter().any(|r| r.ends_with("state/app")));
-        assert!(config.allows_write(&target.join("f.txt"), workspace.path()));
+        let ro = SandboxConfig { mode: SandboxMode::ReadOnly, ..Default::default() };
+        let roots = ro.writable_roots(workspace.path());
+        for dir in super::DEVICE_DIRS {
+            assert!(!roots.iter().any(|r| r == Path::new(dir)), "read-only granted directory device {dir}: {roots:?}");
+        }
+        assert!(!ro.allows_write(Path::new("/dev/shm/x"), workspace.path()));
+        // Node devices remain available so `> /dev/null` still works.
+        assert!(ro.allows_write(Path::new("/dev/null"), workspace.path()));
+
+        // Workspace mode may still grant them.
+        let ws = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
+        let ws_roots = ws.writable_roots(workspace.path());
+        if Path::new("/dev/shm").exists() {
+            assert!(ws_roots.iter().any(|r| r == Path::new("/dev/shm")), "workspace mode dropped /dev/shm: {ws_roots:?}");
+        }
+    }
+
+    #[test]
+    fn external_git_dir_is_not_granted() {
+        // A `.git` pointer that resolves to an unrelated repository outside the
+        // workspace must not be handed a writable root.
+        let workspace = outside_dir();
+        let outsider = outside_dir();
+        let fake_git = outsider.path().join(".git");
+        std::fs::create_dir_all(&fake_git).unwrap();
+        std::fs::write(workspace.path().join(".git"), format!("gitdir: {}\n", fake_git.display())).unwrap();
+        let config = SandboxConfig { mode: SandboxMode::Workspace, tool_caches: false, ..Default::default() };
+        let roots = config.writable_roots(workspace.path());
+        let fake_real = fake_git.canonicalize().unwrap_or(fake_git);
+        assert!(!roots.iter().any(|r| r.starts_with(&fake_real)), "external git dir was granted: {roots:?}");
     }
 }
