@@ -29,6 +29,26 @@ fn write_raw(bytes: &str) {
     let _ = out.flush();
 }
 
+/// The last scrollable row: the terminal's bottom row is reserved for the
+/// status line, so the region is `1..=bottom-1`. Clamped to at least 1.
+fn scroll_region_bottom(rows: u16) -> u16 {
+    rows.max(2) - 1
+}
+
+/// Bytes that clean up after a resize from `old_rows` to `rows`: drop the
+/// scroll region, erase the old *and* new bottom rows that could still hold a
+/// stale status line, then re-pin the region. This runs unconditionally for
+/// both grow and shrink. The old row is clamped to the new height because a row
+/// that scrolled off the top is no longer reachable by cursor addressing.
+fn resize_sequence(old_rows: u16, rows: u16) -> String {
+    let bottom = rows.max(2);
+    let old_bottom = old_rows.min(rows);
+    format!(
+        "\x1b7\x1b[r\x1b[{old_bottom};1H\x1b[2K\x1b[{bottom};1H\x1b[2K\x1b[1;{}r\x1b8",
+        scroll_region_bottom(rows)
+    )
+}
+
 impl StatusLine {
     /// Reserve the bottom row, when stdin and stdout are a terminal and
     /// `AGENTIC_NO_STATUS` is unset.
@@ -50,8 +70,23 @@ impl StatusLine {
     }
 
     pub fn draw(&self) {
-        let size = self.size.lock().unwrap();
-        let Some((rows, cols)) = *size else { return };
+        // Target the real current terminal, never a stale cached size. A draw()
+        // triggered by a Context event, the renderer or lineedit before the
+        // SIGWINCH handler has run must not write the status line to a
+        // mid-screen row — that is what scatters copies across the screen on
+        // resize. When the size has changed, erase the old and new bottom rows
+        // and re-pin the scroll region first, so the stale bar left at the old
+        // bottom row is cleared even when the SIGWINCH resize() later no-ops.
+        let Some((rows, cols)) = terminal_size() else { return };
+        let mut size = self.size.lock().unwrap();
+        match *size {
+            None => return, // torn down
+            Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
+                write_raw(&resize_sequence(old_rows, rows));
+                *size = Some((rows, cols));
+            }
+            Some(_) => {}
+        }
         let line = match self.input.lock().unwrap().as_deref() {
             Some(text) => render_input(text, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
@@ -74,12 +109,7 @@ impl StatusLine {
             if (old_rows, old_cols) == (rows, cols) {
                 return;
             }
-            let mut seq = String::from("\x1b7");
-            if old_rows <= rows {
-                seq.push_str(&format!("\x1b[{old_rows};1H\x1b[2K"));
-            }
-            seq.push_str(&format!("\x1b[1;{}r\x1b8", rows.max(2) - 1));
-            write_raw(&seq);
+            write_raw(&resize_sequence(old_rows, rows));
             *size = Some((rows, cols));
         }
         self.draw();
@@ -257,5 +287,33 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn resize_sequence_erases_old_and_new_bottom_rows_on_grow() {
+        // Grow 24 -> 40: reset the region, erase both the old (24) and new (40)
+        // bottom rows so no stale bar survives, then re-pin for the new size.
+        let seq = resize_sequence(24, 40);
+        assert!(seq.contains("\x1b[r"), "region not reset to full screen: {seq:?}");
+        assert!(seq.contains("\x1b[24;1H\x1b[2K"), "old bottom row not erased: {seq:?}");
+        assert!(seq.contains("\x1b[40;1H\x1b[2K"), "new bottom row not erased: {seq:?}");
+        assert!(seq.ends_with("\x1b[1;39r\x1b8"), "region not re-pinned: {seq:?}");
+    }
+
+    #[test]
+    fn resize_sequence_clamps_old_row_when_shrinking() {
+        // Shrink 40 -> 24: the old bottom row (40) is off-screen and no longer
+        // addressable, so clamp to the new height rather than moving there.
+        let seq = resize_sequence(40, 24);
+        assert!(!seq.contains("40;1H"), "addressed an off-screen row: {seq:?}");
+        assert!(seq.contains("\x1b[24;1H\x1b[2K"), "bottom row not erased: {seq:?}");
+        assert!(seq.ends_with("\x1b[1;23r\x1b8"), "region not re-pinned: {seq:?}");
+    }
+
+    #[test]
+    fn scroll_region_never_underflows_on_tiny_terminals() {
+        assert_eq!(scroll_region_bottom(1), 1);
+        assert_eq!(scroll_region_bottom(2), 1);
+        assert_eq!(scroll_region_bottom(24), 23);
     }
 }
