@@ -359,7 +359,17 @@ static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-
 
 /// Skip options (words starting with `-`); `with_value` lists short options
 /// that take the next word as their value.
-fn skip_options(words: &[Word], mut i: usize, with_value: &str) -> usize {
+/// Long options (in `--opt value` form) that consume the following word for
+/// `sudo`/`doas`; otherwise their value is mistaken for the wrapped program.
+const SUDO_LONG_WITH_VALUE: &[&str] =
+    &["--user", "--group", "--chdir", "--role", "--type", "--prompt", "--host", "--close-from", "--command-timeout"];
+
+/// Long options (in `--opt value` form) that consume the following word for
+/// `xargs`; otherwise their value is mistaken for the wrapped program.
+const XARGS_LONG_WITH_VALUE: &[&str] =
+    &["--max-args", "--max-chars", "--max-lines", "--max-procs", "--delimiter", "--arg-file", "--process-slot-var"];
+
+fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value: &[&str]) -> usize {
     while let Some(word) = words.get(i) {
         let text = word.text.as_str();
         if text == "--" {
@@ -368,8 +378,11 @@ fn skip_options(words: &[Word], mut i: usize, with_value: &str) -> usize {
         if !text.starts_with('-') || text == "-" {
             break;
         }
+        // `--opt=value` carries its value in the same word; only the space-separated
+        // `--opt value` form consumes the next word.
+        let long_with_value = text.starts_with("--") && !text.contains('=') && long_with_value.contains(&text);
         let short_with_value = text.len() == 2 && !text.starts_with("--") && with_value.contains(&text[1..]);
-        i += if short_with_value { 2 } else { 1 };
+        i += if long_with_value || short_with_value { 2 } else { 1 };
     }
     i
 }
@@ -399,29 +412,29 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
             | "[[" | "coproc" | "nohup" | "builtin" | "unbuffer" | "busybox" => i += 1,
             "for" | "select" => return Ok(()),
             "function" => i += 2,
-            "time" => i = skip_options(words, i + 1, ""),
+            "time" => i = skip_options(words, i + 1, "", &[]),
             "command" => {
                 if words.get(i + 1).is_some_and(|w| w.text == "-v" || w.text == "-V") {
                     return Ok(());
                 }
-                i = skip_options(words, i + 1, "");
+                i = skip_options(words, i + 1, "", &[]);
             }
-            "exec" => i = skip_options(words, i + 1, "a"),
-            "sudo" | "doas" => i = skip_options(words, i + 1, "ugCDhprtUTR"),
-            "nice" => i = skip_options(words, i + 1, "n"),
-            "ionice" => i = skip_options(words, i + 1, "cnpt"),
-            "stdbuf" => i = skip_options(words, i + 1, "ioe"),
-            "setsid" => i = skip_options(words, i + 1, ""),
-            "caffeinate" => i = skip_options(words, i + 1, "tw"),
-            "xargs" => i = skip_options(words, i + 1, "InPLdEsa"),
+            "exec" => i = skip_options(words, i + 1, "a", &[]),
+            "sudo" | "doas" => i = skip_options(words, i + 1, "ugCDhprtUTR", SUDO_LONG_WITH_VALUE),
+            "nice" => i = skip_options(words, i + 1, "n", &[]),
+            "ionice" => i = skip_options(words, i + 1, "cnpt", &[]),
+            "stdbuf" => i = skip_options(words, i + 1, "ioe", &[]),
+            "setsid" => i = skip_options(words, i + 1, "", &[]),
+            "caffeinate" => i = skip_options(words, i + 1, "tw", &[]),
+            "xargs" => i = skip_options(words, i + 1, "InPLdEsa", XARGS_LONG_WITH_VALUE),
             "chrt" => {
-                i = skip_options(words, i + 1, "");
+                i = skip_options(words, i + 1, "", &[]);
                 if words.get(i).is_some_and(|w| w.text.chars().all(|c| c.is_ascii_digit())) {
                     i += 1;
                 }
             }
             "timeout" => {
-                i = skip_options(words, i + 1, "sk");
+                i = skip_options(words, i + 1, "sk", &[]);
                 i += 1; // duration
             }
             "env" => {
@@ -445,7 +458,7 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 i = j;
             }
             "watch" => {
-                let j = skip_options(words, i + 1, "nq");
+                let j = skip_options(words, i + 1, "nq", &[]);
                 let rest = words.get(j..).unwrap_or_default();
                 if rest.is_empty() {
                     return Ok(());
@@ -457,7 +470,7 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 return parse_inner(&script_text(rest)?, depth, out);
             }
             "ssh" => {
-                let j = skip_options(words, i + 1, "bcDEeFIiJLlmOoPpQRSWw") + 1; // host
+                let j = skip_options(words, i + 1, "bcDEeFIiJLlmOoPpQRSWw", &[]) + 1; // host
                 push(out, i);
                 let rest = words.get(j..).unwrap_or_default();
                 if rest.is_empty() {
@@ -707,10 +720,14 @@ impl Guard<'_> {
             }
             "mv" => {
                 let (_, targets) = split_flags(args);
-                if let Some((_, sources)) = targets.split_last() {
+                if let Some((dest, sources)) = targets.split_last() {
                     for source in sources {
                         self.protect(source, true, "mv")?;
                     }
+                    // The destination can overwrite an existing protected path
+                    // (`mv x /etc/passwd`); guard it, but not writes into the
+                    // working directory itself (`mv a .`).
+                    self.protect(dest, false, "mv")?;
                 }
             }
             "chmod" | "chown" | "chgrp" => {
@@ -724,8 +741,22 @@ impl Guard<'_> {
             }
             "find" if has("-delete") => {
                 let narrowed = any_word(&["-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename"]);
-                if !narrowed {
-                    for start in args.iter().take_while(|a| !a.text.starts_with('-') && !matches!(a.text.as_str(), "(" | "!")) {
+                let starts: Vec<&Word> =
+                    args.iter().take_while(|a| !a.text.starts_with('-') && !matches!(a.text.as_str(), "(" | "!")).collect();
+                if narrowed {
+                    // A narrowed `-delete` still recurses from its start paths, so a
+                    // catastrophic root (`find / -name passwd -delete`, `find ~ ...`)
+                    // can wipe protected files. Keep guarding those roots, but allow
+                    // ordinary `find . -name '*.tmp' -delete` inside the workspace.
+                    for &start in &starts {
+                        if let Ok(Some((path, _))) = self.resolve(start)
+                            && let Some(what) = self.catastrophic_root(&path)
+                        {
+                            return Err(format!("`find -delete` under {what} ({}) can remove protected files", path.display()));
+                        }
+                    }
+                } else {
+                    for &start in &starts {
                         self.protect(start, true, "find -delete")?;
                     }
                 }
@@ -770,7 +801,15 @@ impl Guard<'_> {
                 return Err("it destroys infrastructure".into());
             }
             "pulumi" if has("destroy") => return Err("it destroys infrastructure".into()),
-            "kubectl" | "oc" if has("delete") && any_word(&["namespace", "ns", "--all", "--all-namespaces", "-A"]) => {
+            "kubectl" | "oc"
+                if has("delete")
+                    && (any_word(&["namespace", "namespaces", "ns", "--all", "--all-namespaces", "-A"])
+                        // Resource-qualified forms: `kubectl delete ns/prod`, `namespace/prod`.
+                        || args.iter().any(|a| {
+                            let t = a.text.as_str();
+                            t.starts_with("ns/") || t.starts_with("namespace/") || t.starts_with("namespaces/")
+                        })) =>
+            {
                 return Err("it deletes Kubernetes namespaces or every resource of a kind".into());
             }
             "aws" if (has("s3") && (has("rb") || has("rm") && has("--recursive"))) => {
@@ -819,41 +858,8 @@ impl Guard<'_> {
             }
         };
         let (path, glob) = path;
-        let danger = |p: &Path| -> Option<String> {
-            let home = self.home.as_deref();
-            if p == Path::new("/") {
-                return Some("the filesystem root".into());
-            }
-            if protect_cwd && p == self.cwd {
-                return Some("the working directory".into());
-            }
-            if protect_cwd && self.cwd.starts_with(p) {
-                return Some("a parent of the working directory".into());
-            }
-            if let Some(home) = home {
-                if home.starts_with(p) {
-                    return Some("your home directory".into());
-                }
-                if p.parent() == Some(home) {
-                    return Some(format!("a top-level folder of your home directory (~/{})", p.file_name()?.to_string_lossy()));
-                }
-            }
-            // Inside the workspace is fine even when the workspace lives
-            // somewhere like /var/lib/jenkins.
-            let in_workspace = p.starts_with(self.cwd) && p != self.cwd;
-            if !in_workspace && p.components().count() <= 2 {
-                return Some("a top-level system directory".into());
-            }
-            if !in_workspace && SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
-                return Some("a system directory".into());
-            }
-            if p.file_name().is_some_and(|n| n == ".git") {
-                return Some("a git repository's .git directory".into());
-            }
-            None
-        };
         // `rm -rf dir/*` empties dir: as bad as deleting it when dir is protected.
-        match danger(&path) {
+        match self.danger(&path, protect_cwd) {
             Some(what) => Err(format!(
                 "`{action} {}` would affect {what} ({}{})",
                 word.text,
@@ -862,6 +868,70 @@ impl Guard<'_> {
             )),
             None => Ok(()),
         }
+    }
+
+    /// Describe why deleting/moving/re-permissioning `p` would be catastrophic,
+    /// or `None` when it is safe. `protect_cwd` also guards the working
+    /// directory and its parents.
+    fn danger(&self, p: &Path, protect_cwd: bool) -> Option<String> {
+        let home = self.home.as_deref();
+        if p == Path::new("/") {
+            return Some("the filesystem root".into());
+        }
+        if protect_cwd && p == self.cwd {
+            return Some("the working directory".into());
+        }
+        if protect_cwd && self.cwd.starts_with(p) {
+            return Some("a parent of the working directory".into());
+        }
+        if let Some(home) = home {
+            if home.starts_with(p) {
+                return Some("your home directory".into());
+            }
+            if p.parent() == Some(home) {
+                return Some(format!("a top-level folder of your home directory (~/{})", p.file_name()?.to_string_lossy()));
+            }
+        }
+        // Inside the workspace is fine even when the workspace lives
+        // somewhere like /var/lib/jenkins.
+        let in_workspace = p.starts_with(self.cwd) && p != self.cwd;
+        if !in_workspace && p.components().count() <= 2 {
+            return Some("a top-level system directory".into());
+        }
+        if !in_workspace && SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
+            return Some("a system directory".into());
+        }
+        // Any component being `.git` (not just the last) means the operation
+        // reaches into repository metadata: `rm -rf .git/objects` is as harmful
+        // as removing `.git` itself.
+        if p.components().any(|c| c.as_os_str() == ".git") {
+            return Some("a git repository's .git directory".into());
+        }
+        None
+    }
+
+    /// Like [`Guard::danger`] but only for catastrophic *roots* outside the
+    /// workspace subtree (used for narrowed `find -delete`, where the working
+    /// directory and its descendants are legitimate targets).
+    fn catastrophic_root(&self, p: &Path) -> Option<&'static str> {
+        if p.starts_with(self.cwd) {
+            return None;
+        }
+        if p == Path::new("/") {
+            return Some("the filesystem root");
+        }
+        if let Some(home) = self.home.as_deref()
+            && home.starts_with(p)
+        {
+            return Some("your home directory");
+        }
+        if p.components().count() <= 1 {
+            return Some("a top-level system directory");
+        }
+        if SYSTEM_DIRS.iter().any(|d| p.starts_with(d)) {
+            return Some("a system directory");
+        }
+        None
     }
 
     /// Resolve a path word lexically: known variables and `~` are substituted,
@@ -926,7 +996,11 @@ impl Guard<'_> {
             }
             let modifier = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             match (value, modifier) {
-                (Some(v), m) if !m.trim_start_matches(':').starts_with('+') => v,
+                // `${X:+word}` / `${X+word}`: expands to `word` when X is set,
+                // otherwise to nothing. `DIR=/; rm -rf "${DIR:+/}"` really runs
+                // `rm -rf /`, so substitute the operand when the value is present.
+                (Some(_), m) if m.trim_start_matches(':').starts_with('+') => m.trim_start_matches(':')[1..].to_string(),
+                (Some(v), _) => v,
                 // `${X:?}` aborts when X is unset: the path is not empty.
                 (None, m) if m.trim_start_matches(':').starts_with('?') => format!("__{name}__"),
                 (None, m) if m.trim_start_matches(':').starts_with(['-', '=']) => m.trim_start_matches(':')[1..].to_string(),
@@ -1311,6 +1385,44 @@ mod tests {
         let p = policy(&["Bash(echo *)"], &[]);
         assert!(check(&p, "> /dev/sda").is_err());
         assert!(check(&p, "echo hi > /dev/null").is_ok());
+    }
+
+    #[test]
+    fn guards_wrapper_long_options_and_qualified_targets() {
+        // Long wrapper options that take a value must not be mistaken for the
+        // wrapped program, or the destructive command escapes inspection.
+        assert!(blocked("sudo --user root rm -rf /").contains("filesystem root"));
+        assert!(blocked("xargs --max-args 1 rm -rf /").contains("filesystem root"));
+        // `--opt=value` form keeps working, and legitimate wrapped commands pass.
+        allowed("sudo --user=root ls /tmp");
+        allowed("xargs --max-args=1 echo hi");
+
+        // `${VAR:+word}` expands to `word` when the variable is set.
+        assert!(blocked("DIR=/; rm -rf \"${DIR:+/}\"").contains("filesystem root"));
+        allowed("FOO=1; rm -rf \"${FOO:+build}\"");
+        allowed("rm -rf \"${UNSET_NANO_VAR:+/}\"");
+
+        // Any `.git` component (not just a trailing one) is protected.
+        assert!(blocked("rm -rf .git/objects").contains(".git"));
+        assert!(blocked("rm -rf src/../.git/refs").contains(".git"));
+
+        // Resource-qualified Kubernetes namespace deletes are caught.
+        blocked("kubectl delete ns/prod");
+        blocked("kubectl delete namespace/prod");
+        blocked("oc delete namespaces/prod");
+
+        // `mv` destinations that overwrite protected files are caught, while
+        // ordinary moves within the workspace still pass.
+        assert!(blocked("mv -f harmless /etc/passwd").contains("system"));
+        allowed("mv a.txt sub/b.txt");
+        allowed("mv build/app.tar dist/");
+
+        // Narrowed `find -delete` still protects catastrophic roots, but not
+        // ordinary in-workspace cleanups.
+        blocked("find / -name passwd -delete");
+        blocked("find /etc -name '*.conf' -delete");
+        allowed("find . -name '*.log' -delete");
+        allowed("find ./build -path '*/tmp/*' -delete");
     }
 
     #[test]
