@@ -177,7 +177,13 @@ impl EditView {
             crate::commands::complete_line(&context.config, &recents, &self.line)
         };
         match completed {
-            Some(done) => self.replace_line(&done),
+            Some(done) => {
+                // The completion rewrites the whole command line, so move the
+                // cursor to the end before applying it; replacing at a mid-line
+                // cursor would corrupt the command.
+                self.cursor = self.line.chars().count();
+                self.replace_line(&done);
+            }
             // Restore the documented space fallback for a slash line past its
             // command name (e.g. `/compact focus`, `/model value extra`) that
             // has no completion, while keeping Tab a no-op for a bare ambiguous
