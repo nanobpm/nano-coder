@@ -26,6 +26,7 @@ impl MockLLMClient {
             prompt_tokens: 50,
             completion_tokens,
             total_tokens: 50 + completion_tokens,
+            aic: None,
         })
     }
 

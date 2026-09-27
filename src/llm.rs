@@ -116,6 +116,17 @@ pub struct TokenUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// AI Credits the request cost, when the provider reports them (GitHub
+    /// Copilot's `copilot_usage.total_nano_aiu`, converted to credits).
+    pub aic: Option<f64>,
+}
+
+/// Read GitHub Copilot's `copilot_usage.total_nano_aiu` from a response body
+/// or terminal stream event, converted to AI Credits (1 credit = 1e9 nano).
+/// `None` when the field is absent (non-Copilot providers, older responses).
+pub fn copilot_aic(value: &Value) -> Option<f64> {
+    let nano = value.pointer("/copilot_usage/total_nano_aiu").and_then(Value::as_f64)?;
+    Some(nano / 1e9)
 }
 
 /// Tool call requested by LLM. `arguments` is the decoded JSON object; if the
@@ -298,5 +309,18 @@ mod tests {
         assert_eq!(content, "Answer <b></b> done");
         assert_eq!(ThinkSplitter::split_all("<think>x</think>\n\nhi"), ("hi".into(), "x".into()));
         assert_eq!(ThinkSplitter::split_all("plain"), ("plain".into(), String::new()));
+    }
+
+    #[test]
+    fn reads_copilot_aic_from_nano() {
+        let value = serde_json::json!({
+            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18},
+            "copilot_usage": {"total_nano_aiu": 11_600_000}
+        });
+        assert_eq!(copilot_aic(&value), Some(0.0116));
+        // Absent on non-Copilot responses.
+        assert_eq!(copilot_aic(&serde_json::json!({"usage": {}})), None);
+        // A zero cost is still reported (0x-multiplier models are free).
+        assert_eq!(copilot_aic(&serde_json::json!({"copilot_usage": {"total_nano_aiu": 0}})), Some(0.0));
     }
 }

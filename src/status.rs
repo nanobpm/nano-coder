@@ -372,6 +372,10 @@ fn render(stats: &ContextStats, cols: usize) -> String {
             priority: 2,
         });
     }
+    // AI Credits used (GitHub Copilot), when the provider reports them.
+    if let Some(aic) = stats.session_aic {
+        segments.push(Segment { text: format!(" {aic:.1} AIC "), color: Some("\x1b[38;5;222m"), priority: 2 });
+    }
     let compact = match threshold {
         Some(t) => format!(" auto-compact {t:.0}%"),
         None => " auto-compact off".to_string(),
@@ -444,6 +448,7 @@ mod tests {
             messages: 42,
             session_input_tokens: 310_000,
             session_output_tokens: 12_400,
+            session_aic: None,
             compactions: 1,
             auto_compact: Some(0.8),
             activity: Activity::Tool("bash".into()),
@@ -469,6 +474,16 @@ mod tests {
         assert!(line.contains("work/llama-b"), "{line:?}");
         assert!(line.contains("ctx 96.5k/128k"), "{line:?}");
         assert!(!line.contains("auto-compact"), "{line:?}");
+    }
+
+    #[test]
+    fn shows_aic_only_when_reported() {
+        // No credits by default.
+        assert!(!visible(&render(&stats(), 140)).contains("AIC"));
+        // Credits appear once the provider reports them.
+        let with_aic = ContextStats { session_aic: Some(0.0541), ..stats() };
+        let line = visible(&render(&with_aic, 140));
+        assert!(line.contains("0.1 AIC"), "{line:?}");
     }
 
     #[test]

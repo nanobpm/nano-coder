@@ -149,7 +149,11 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
     Ok(LLMResponse {
         content,
         tool_calls,
-        usage: value.get("usage").map(|usage| parse_usage(usage, 0)),
+        usage: value.get("usage").map(|usage| {
+            let mut usage = parse_usage(usage, 0);
+            usage.aic = crate::llm::copilot_aic(value);
+            usage
+        }),
         stop_reason: value.get("stop_reason").and_then(Value::as_str).map(str::to_string),
         thinking,
         thinking_blocks,
@@ -161,7 +165,7 @@ fn parse_usage(usage: &Value, prompt: i64) -> TokenUsage {
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
     let prompt = prompt + field("input_tokens") + field("cache_read_input_tokens") + field("cache_creation_input_tokens");
     let completion = field("output_tokens");
-    TokenUsage { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
+    TokenUsage { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion, aic: None }
 }
 
 /// Content block being streamed.
@@ -234,6 +238,7 @@ impl StreamAccumulator {
                     // `message_delta` usage repeats input tokens on some versions.
                     total.prompt_tokens = total.prompt_tokens.max(self.prompt_tokens);
                     total.total_tokens = total.prompt_tokens + total.completion_tokens;
+                    total.aic = crate::llm::copilot_aic(&event);
                     self.usage = Some(total);
                 }
             }
@@ -445,6 +450,31 @@ mod tests {
         assert!(headers.contains("anthropic-version: 2023-06-01"));
     }
 
+    #[test]
+    fn parses_copilot_aic_from_response_and_stream() {
+        // Non-streaming: `copilot_usage` is a sibling of `usage`.
+        let response = parse_response(&json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 8, "output_tokens": 10},
+            "copilot_usage": {"total_nano_aiu": 11_600_000}
+        }))
+        .unwrap();
+        assert_eq!(response.usage.unwrap().aic, Some(0.0116));
+
+        // Streaming: it rides the terminal `message_delta` event.
+        let events = [
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 8, "output_tokens": 1}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 10}, "copilot_usage": {"total_nano_aiu": 11_600_000}}),
+        ];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        assert_eq!(accumulator.finish().usage.unwrap().aic, Some(0.0116));
+    }
+
     #[tokio::test]
     async fn streams_thinking_text_and_tool_use_and_replays_thinking() {
         let events = [
@@ -477,7 +507,7 @@ mod tests {
         assert_eq!(response.content, "Running");
         assert_eq!(response.thinking, "Plan.");
         assert_eq!(response.tool_calls[0].arguments, json!({"command": "ls"}));
-        assert_eq!(response.usage, Some(TokenUsage { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29 }));
+        assert_eq!(response.usage, Some(TokenUsage { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29, aic: None }));
         assert_eq!(captured.lock().unwrap()[0].body["stream"], true);
 
         let assistant = Message {
