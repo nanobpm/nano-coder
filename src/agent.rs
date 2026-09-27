@@ -1242,11 +1242,15 @@ impl Agent {
                 }
             }
 
-            let tools = self.tool_definitions();
-
             let mut overflow_retried = false;
             let response = loop {
                 self.set_activity(Activity::Thinking);
+                // Rebuilt every retry iteration, not just once before the loop:
+                // an overflow retry compacts (in smart mode) below, which unlocks
+                // the history tools, so recomputing here lets the retried request
+                // actually offer `history_search`/`history_read` for the folded
+                // history instead of reusing the pre-compaction tool set.
+                let tools = self.tool_definitions();
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
@@ -2331,6 +2335,70 @@ mod tests {
         let error = agent.send_message("ping").await.unwrap_err();
         assert!(format!("{error:#}").contains("prompt is too long"));
         assert_eq!(agent.context_stats().lock().unwrap().activity, Activity::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overflow_smart_compaction_rebuilds_tools_before_retry() {
+        // Records the tool names offered in each request, replaying scripted
+        // results (some overflowing).
+        struct ToolSpy {
+            results: Mutex<Vec<std::result::Result<LLMResponse, String>>>,
+            tools_seen: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+        #[async_trait]
+        impl LLMClient for ToolSpy {
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.tools_seen.lock().unwrap().push(request.tools.iter().map(|t| t.name.clone()).collect());
+                self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
+            }
+            fn model_name(&self) -> &str {
+                "toolspy"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools_seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let overflow = "HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens.".to_string();
+        let client = ToolSpy {
+            // 0: initial call -> tool call; 1: next request overflows (still
+            // pre-compaction tools); 2: the summary request (no tools); 3: the
+            // retry after the smart compaction (must now offer history tools).
+            results: Mutex::new(vec![Ok(tool_call("c1")), Err(overflow), Ok(text("SUMMARY: pinged")), Ok(text("done"))]),
+            tools_seen: tools_seen.clone(),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            compaction_mode: CompactionMode::Smart,
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(|args| Ok(json!(args["text"].as_str().unwrap_or("").to_string()))),
+        );
+        agent.new_session().unwrap();
+        assert_eq!(agent.send_message("ping").await.unwrap(), "done");
+
+        let seen = tools_seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        // The overflowing attempt (before compaction) does not yet offer the
+        // history tools...
+        assert!(
+            !seen[1].iter().any(|n| history::is_history_tool(n)),
+            "history tools before smart compaction: {:?}",
+            seen[1]
+        );
+        // ...but the retry issued after the overflow-triggered smart compaction
+        // must, so the model can retrieve the folded history it was just told
+        // about. Without rebuilding `tools` per iteration this reused seen[1].
+        assert!(
+            seen[3].contains(&history::SEARCH_TOOL.to_string()) && seen[3].contains(&history::READ_TOOL.to_string()),
+            "retry after smart compaction must offer history tools: {:?}",
+            seen[3]
+        );
     }
 
     #[tokio::test]
