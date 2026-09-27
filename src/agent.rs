@@ -203,6 +203,7 @@ struct ControlInner {
     absorbed: Mutex<Vec<Steer>>,
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
+    mode: Mutex<crate::mode::AgentMode>,
 }
 
 /// Steering and cancellation for the running turn. Cheap to clone and safe to
@@ -220,6 +221,7 @@ impl Default for TurnControl {
                 absorbed: Mutex::new(Vec::new()),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
+                mode: Mutex::new(crate::mode::AgentMode::default()),
             }),
         }
     }
@@ -252,6 +254,22 @@ impl TurnControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// The current operating mode (normal/plan/auto).
+    pub fn mode(&self) -> crate::mode::AgentMode {
+        *self.inner.mode.lock().unwrap()
+    }
+
+    pub fn set_mode(&self, mode: crate::mode::AgentMode) {
+        *self.inner.mode.lock().unwrap() = mode;
+    }
+
+    /// Advance to the next mode in the Shift+Tab cycle; returns it.
+    pub fn cycle_mode(&self) -> crate::mode::AgentMode {
+        let mut mode = self.inner.mode.lock().unwrap();
+        *mode = mode.next();
+        *mode
     }
 
     /// Flag for synchronous tools (e.g. bash) to poll.
@@ -382,6 +400,9 @@ pub struct Agent {
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
     policy: Policy,
+    /// Rendezvous for the `question` tool: the handler blocks here until the
+    /// turn loop answers.
+    questions: crate::question::QuestionBroker,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -418,6 +439,7 @@ impl Agent {
             plan: Plan::default(),
             reminders: Reminders::default(),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
+            questions: crate::question::QuestionBroker::new(),
         }
     }
 
@@ -559,6 +581,7 @@ impl Agent {
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
+            stats.mode = self.control.mode();
         }
         self.emit(AgentEvent::Context);
     }
@@ -596,6 +619,38 @@ impl Agent {
     /// Handle for steering or cancelling the running turn from another task.
     pub fn control(&self) -> TurnControl {
         self.control.clone()
+    }
+
+    /// The question broker, for the turn loop to answer a pending `question`.
+    pub fn questions(&self) -> crate::question::QuestionBroker {
+        self.questions.clone()
+    }
+
+    /// The current operating mode (normal/plan/auto).
+    pub fn mode(&self) -> crate::mode::AgentMode {
+        self.control.mode()
+    }
+
+    /// Switch mode; refreshes the status line and (for plan mode) the tool
+    /// gating takes effect at the next model call. Takes `&self` so it can be
+    /// called while a turn future holds a `&mut` borrow.
+    pub fn set_mode(&self, mode: crate::mode::AgentMode) {
+        self.control.set_mode(mode);
+        self.refresh_stats();
+    }
+
+    /// Patch the stored system message for the current mode: plan mode appends
+    /// a read-only note (and leaving plan mode removes it). Advisory only —
+    /// the tool gating is the real guarantee. Needs `&mut`, so callers apply it
+    /// between turns.
+    fn apply_mode_to_system_prompt(&mut self) {
+        let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
+        // Strip any existing note, then add it back only in plan mode.
+        let base = first.content.replace(crate::mode::PLAN_PROMPT_NOTE, "");
+        first.content = match self.control.mode() {
+            crate::mode::AgentMode::Plan => format!("{base}{}", crate::mode::PLAN_PROMPT_NOTE),
+            _ => base,
+        };
     }
 
     /// Add queued steering messages to the conversation.
@@ -907,6 +962,11 @@ impl Agent {
         if !self.skills.is_empty() {
             tools.push(skills::definition());
         }
+        // Plan mode is read-only: only analysis/planning/reporting tools are
+        // offered (the dispatch backstops this for calls already in flight).
+        if self.control.mode() == crate::mode::AgentMode::Plan {
+            tools.retain(|t| crate::mode::plan_allows(&t.name));
+        }
         tools
     }
 
@@ -945,6 +1005,7 @@ impl Agent {
             }
         self.control.start_turn();
         self.reminders.start_turn();
+        self.apply_mode_to_system_prompt();
         let resuming = self
             .pending_input
             .clone()
@@ -1019,7 +1080,31 @@ impl Agent {
         let mut cancelled = false;
         let mut reported: Option<Outcome> = None;
 
-        for iteration in 1..=max_iterations {
+        // The cap is mode-dependent and can be extended when the user says
+        // "keep going". Auto mode disables it; normal mode asks (interactive
+        // only); ACP/headless keeps the hard stop.
+        let mut budget = match self.control.mode() {
+            crate::mode::AgentMode::Auto => usize::MAX,
+            _ => max_iterations,
+        };
+        let mut iteration = 0usize;
+        loop {
+            iteration += 1;
+            if iteration > budget {
+                // Cap reached. Only normal mode in an interactive session asks
+                // to continue; anything else (auto, ACP/headless) stops.
+                let can_prompt = self.control.mode() == crate::mode::AgentMode::Normal && self.questions.is_interactive();
+                if can_prompt {
+                    match self.questions.cap().wait().await {
+                        crate::question::CapDecision::Continue => {
+                            budget = budget.saturating_add(max_iterations);
+                            continue;
+                        }
+                        crate::question::CapDecision::Stop => break,
+                    }
+                }
+                break;
+            }
             if self.control.is_cancelled() {
                 cancelled = true;
                 break;
@@ -1201,7 +1286,7 @@ impl Agent {
                 self.emit_assistant_text(&response.content);
                 // A steer that arrived while the answer was being written gets
                 // a reply in this turn rather than being left for the next.
-                if iteration < max_iterations && self.control.has_steers() && !self.control.is_cancelled() {
+                if iteration < budget && self.control.has_steers() && !self.control.is_cancelled() {
                     last_content = response.content.clone();
                     continue;
                 }
@@ -1233,7 +1318,11 @@ impl Agent {
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
-                let result = if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
+                let result = if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
+                    // Backstop for a mutating call already in flight when plan
+                    // mode was switched on mid-turn.
+                    Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
+                } else if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
                     // The policy is consulted before dispatching to any handler, so deny
                     // rules and the pre-tool check also cover plan, skill and outcome tools.
                     Err(anyhow::anyhow!(reason))
@@ -1318,7 +1407,7 @@ impl Agent {
             StopReason::EndTurn => final_response.unwrap_or_default(),
             StopReason::Cancelled => CANCELLED_RESPONSE.to_string(),
             StopReason::MaxTurnRequests => {
-                format!("{last_content}\n[stopped after {max_iterations} LLM calls without a final answer]")
+                format!("{last_content}\n[stopped after {iteration} LLM calls without a final answer]")
                     .trim_start()
                     .to_string()
             }
@@ -2571,5 +2660,63 @@ mod tests {
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "done");
         assert_eq!(agent.control().take_pending().len(), 1, "late steer left for the caller to requeue");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mode_gates_mutating_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // The model tries to call `bash` (mutating), then answers with text.
+        let calls = LLMResponse {
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "rm -rf /"}), item_id: None }],
+            ..Default::default()
+        };
+        let (mut agent, _) = agent(vec![calls, text("cannot do that in plan mode")], dir.path());
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "delete everything").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        let conversation = agent.conversation();
+        let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("a tool result was recorded");
+        assert!(tool_result.is_error, "gated call is an error");
+        assert!(tool_result.content.contains("disabled in plan mode"), "{}", tool_result.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mode_keeps_read_only_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![tool_call("e1"), text("done")], dir.path());
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "echo something").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        let conversation = agent.conversation();
+        let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("echo ran");
+        assert!(!tool_result.is_error, "echo is read-only and allowed in plan mode");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_mode_disables_the_turn_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // More tool calls than the cap; auto mode should run them all.
+        let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
+        agent.config.max_iterations = 2;
+        agent.set_mode(crate::mode::AgentMode::Auto);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn, "auto mode runs past the cap");
+        assert_eq!(outcome.response, "done");
+        assert_eq!(seen.lock().unwrap().len(), 4, "all four model calls ran");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn normal_mode_cap_stops_headless() {
+        let dir = tempfile::tempdir().unwrap();
+        // Non-interactive (no one answers the cap prompt): the cap stops the turn.
+        let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3")], dir.path());
+        agent.config.max_iterations = 2;
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
+        assert_eq!(seen.lock().unwrap().len(), 2, "stopped at the cap");
     }
 }

@@ -19,6 +19,8 @@ pub const TOOL_NAME: &str = "report_outcome";
 pub enum Status {
     Completed,
     Blocked,
+    /// The agent has a question or needs a decision from the user to proceed.
+    NeedsInput,
 }
 
 impl Status {
@@ -26,6 +28,7 @@ impl Status {
         match text.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
             "completed" | "complete" | "done" | "success" | "succeeded" => Some(Status::Completed),
             "blocked" | "stuck" | "failed" | "failure" | "needs_help" => Some(Status::Blocked),
+            "needs_input" | "question" | "ask" | "clarify" | "needs_decision" => Some(Status::NeedsInput),
             _ => None,
         }
     }
@@ -34,6 +37,7 @@ impl Status {
         match self {
             Status::Completed => "completed",
             Status::Blocked => "blocked",
+            Status::NeedsInput => "needs_input",
         }
     }
 }
@@ -57,10 +61,10 @@ impl Outcome {
             other => other,
         };
         let Some(status) = args.get("status").and_then(Value::as_str) else {
-            bail!("report_outcome needs `status`: \"completed\" or \"blocked\"");
+            bail!("report_outcome needs `status`: \"completed\", \"blocked\" or \"needs_input\"");
         };
         let Some(status) = Status::parse(status) else {
-            bail!("report_outcome `status` must be \"completed\" or \"blocked\", got {status:?}");
+            bail!("report_outcome `status` must be \"completed\", \"blocked\" or \"needs_input\", got {status:?}");
         };
         let summary = args.get("summary").and_then(Value::as_str).unwrap_or_default().trim();
         if summary.is_empty() {
@@ -74,6 +78,7 @@ impl Outcome {
         match self.status {
             Status::Completed => self.summary.clone(),
             Status::Blocked => format!("Blocked: {}", self.summary),
+            Status::NeedsInput => format!("Question: {}", self.summary),
         }
     }
 
@@ -102,15 +107,16 @@ pub fn definition() -> ToolDefinition {
          answer. Use status \"completed\" only when the whole task is done and checked (for example, tests pass); \
          summarize what changed and include any PR URLs, branches, or commits. Use status \"blocked\" only when \
          you cannot make progress: after three or more different failed attempts at the same problem, or when \
-         you need a decision, access, or information that only a person can give. Say what is needed. Do not \
-         call this for partial progress or to answer a simple question.",
+         you need access or information that only a person can give. Use status \"needs_input\" when you have a \
+         question or need a decision from the user to proceed; put the question in the summary. Do not \
+         call this for partial progress.",
         json!({
             "type": "object",
             "properties": {
-                "status": { "type": "string", "enum": ["completed", "blocked"] },
+                "status": { "type": "string", "enum": ["completed", "blocked", "needs_input"] },
                 "summary": {
                     "type": "string",
-                    "description": "Completed: what was done, with PR URLs or commits. Blocked: what was tried and what is needed to continue."
+                    "description": "Completed: what was done, with PR URLs or commits. Blocked: what was tried and what is needed to continue. NeedsInput: the question or decision you need from the user."
                 }
             },
             "required": ["status", "summary"]
