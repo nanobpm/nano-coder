@@ -365,7 +365,12 @@ impl Renderer {
                         // An unparseable/unknown/missing status is NOT a success;
                         // use a neutral marker so an invalid `report_outcome`
                         // (e.g. `{"status":"oops"}`) is not shown as a green ✔.
-                        let raw = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        // `status` is model-controlled; strip control/escape
+                        // characters so an invalid value cannot smuggle ANSI/OSC
+                        // sequences into the terminal via this fallback.
+                        let raw = crate::sanitize_terminal_text(
+                            call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                        );
                         if raw.is_empty() {
                             format!("{DIM}• unknown{RESET}")
                         } else {
