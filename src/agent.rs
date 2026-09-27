@@ -1118,6 +1118,12 @@ impl Agent {
             }
             self.absorb_steers()?;
 
+            // Refresh the mode note on the system prompt before rebuilding the
+            // tools, so a mid-turn Shift+Tab keeps the prompt and the available
+            // tool set in sync: leaving plan mode drops the read-only note (and
+            // exposes mutating tools) while entering it re-adds the note.
+            self.apply_mode_to_system_prompt();
+
             // Rebuild the tool set each call so a mid-turn mode switch (e.g.
             // Shift+Tab out of plan mode) takes effect at the next model call.
             // The dispatch-time gate still backstops a switch into plan mode.
