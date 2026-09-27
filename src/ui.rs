@@ -132,6 +132,7 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[38;5;114m";
 const RED: &str = "\x1b[38;5;203m";
+const YELLOW: &str = "\x1b[38;5;179m";
 const RESET: &str = "\x1b[0m";
 const REDRAW_EVERY: Duration = Duration::from_millis(50);
 const PREVIEW_LINES: usize = 10;
@@ -354,7 +355,11 @@ impl Renderer {
                 self.newline(&mut state);
                 state.streamed_thinking = false;
                 let status = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-                let mark = if status == "blocked" { format!("{RED}■ blocked{RESET}") } else { format!("{GREEN}✔ {status}{RESET}") };
+                let mark = match status {
+                    "blocked" => format!("{RED}■ blocked{RESET}"),
+                    "needs_input" => format!("{YELLOW}? needs input{RESET}"),
+                    _ => format!("{GREEN}✔ {status}{RESET}"),
+                };
                 self.out(&mut state, &format!("{}{mark}\n", stamp()));
             }
             AgentEvent::ToolResult { call, ok: true, .. } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
