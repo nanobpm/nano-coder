@@ -658,7 +658,7 @@ summary becomes the final answer (`Blocked: ...` / `Question: ...`), and the out
 in ACP `_meta.outcome` and recorded in the session log's `turn_end` record. If the harness
 stops after the call but before the turn ends, resuming the input finishes it with the
 recorded outcome without calling the model again. In the terminal the call shows as
-`✔ completed` or `■ blocked` followed by the summary. Set `outcome_tool = false` to leave the
+`✔ completed`, `■ blocked`, or `? needs input` followed by the summary. Set `outcome_tool = false` to leave the
 tool out.
 
 `needs_input` is the structural "waiting on the user" signal: an orchestrator (or auto mode)

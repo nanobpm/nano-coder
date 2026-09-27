@@ -355,9 +355,9 @@ impl Renderer {
                 self.newline(&mut state);
                 state.streamed_thinking = false;
                 let status = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-                let mark = match status {
-                    "blocked" => format!("{RED}■ blocked{RESET}"),
-                    "needs_input" => format!("{YELLOW}? needs input{RESET}"),
+                let mark = match crate::goal::Status::parse(status) {
+                    Some(crate::goal::Status::Blocked) => format!("{RED}■ blocked{RESET}"),
+                    Some(crate::goal::Status::NeedsInput) => format!("{YELLOW}? needs input{RESET}"),
                     _ => format!("{GREEN}✔ {status}{RESET}"),
                 };
                 self.out(&mut state, &format!("{}{mark}\n", stamp()));
