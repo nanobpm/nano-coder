@@ -530,11 +530,63 @@ mod platform {
 mod tests {
     use super::*;
 
-    fn run(config: &SandboxConfig, cwd: &Path, script: &str) -> (bool, String) {
+    /// Run `script` under the sandbox, returning `Some((success, output))`, or
+    /// `None` when the OS sandbox cannot be applied here at all — macOS Seatbelt
+    /// refuses to apply a profile from a process that is already sandboxed
+    /// (`sandbox_apply: Operation not permitted`), which is the case when the
+    /// test suite itself runs inside a sandboxed agent harness. The containment
+    /// assertions are meaningless then.
+    ///
+    /// Stable Rust's libtest has no runtime "ignored" state, so a bare early
+    /// return on that condition would masquerade as a genuine green pass while
+    /// none of the containment assertions ran — the very false-green this suite
+    /// exists to remove. So an unavailable sandbox **fails the run by default**
+    /// (see [`sandbox_unavailable`]); it degrades to a skip only when the caller
+    /// has explicitly opted in via `NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS`, and even
+    /// then the skip is announced with a greppable `SKIP` notice — never counted
+    /// as a silent success.
+    fn run(config: &SandboxConfig, cwd: &Path, script: &str) -> Option<(bool, String)> {
         let mut sandboxed = command(config, "bash", script, cwd).expect("sandbox available");
         let output = sandboxed.command.current_dir(cwd).output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        (output.status.success(), text)
+        if text.contains("sandbox_apply: Operation not permitted") {
+            return sandbox_unavailable("OS sandbox cannot be applied inside an already-sandboxed process");
+        }
+        Some((output.status.success(), text))
+    }
+
+    /// Handle an environment where the OS sandbox cannot be applied at all.
+    ///
+    /// A containment test whose sandbox never applied has exercised none of its
+    /// assertions, so counting it as `ok` is a false-green. This therefore
+    /// **fails the run by default** (`panic!`), which libtest records as a real
+    /// test failure rather than a pass — the honest signal stable libtest's lack
+    /// of a runtime "ignored" state otherwise denies us. The one deliberate
+    /// exception is running the suite inside an already-sandboxed agent harness,
+    /// where a nested sandbox is impossible: setting the
+    /// `NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS` environment variable (to any value)
+    /// opts into skipping instead, and even then the skip is announced with an
+    /// explicit, greppable `SKIP <test>: …` notice (see [`skip_notice`]) so the
+    /// un-run assertions are never hidden.
+    fn sandbox_unavailable(reason: &str) -> Option<(bool, String)> {
+        if std::env::var_os("NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS").is_some() {
+            skip_notice(reason);
+            return None;
+        }
+        panic!(
+            "{reason}; containment assertions could not run and are not counted as a pass. \
+             Set NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS=1 to skip these tests when the OS sandbox \
+             genuinely cannot be applied (e.g. inside an already-sandboxed agent harness)."
+        );
+    }
+
+    /// Emit a standardized, greppable skip notice for an environment-unavailable
+    /// containment test. libtest names each test's thread after the test path,
+    /// so `SKIP <test>: <reason>` pins the notice to the exact test that did not
+    /// assert — the explicit skip signal libtest's default harness cannot give.
+    fn skip_notice(reason: &str) {
+        let test = std::thread::current().name().unwrap_or("<unknown>").to_string();
+        println!("SKIP {test}: {reason}; containment assertions not exercised");
     }
 
     /// A directory outside the temp dirs (which the sandbox always allows).
@@ -567,7 +619,7 @@ mod tests {
             v = victim.display(),
             o = other.path().display()
         );
-        let (_, text) = run(&config, workspace.path(), &script);
+        let Some((_, text)) = run(&config, workspace.path(), &script) else { return };
         assert!(text.contains("wrote-inside"), "{text}");
         assert!(workspace.path().join("inside.txt").exists());
         assert!(victim.exists(), "sandboxed rm deleted a file outside the workspace: {text}");
@@ -582,7 +634,7 @@ mod tests {
     fn read_only_mode_blocks_workspace_writes() {
         let workspace = outside_dir();
         let config = SandboxConfig { mode: SandboxMode::ReadOnly, ..Default::default() };
-        let (_, text) = run(&config, workspace.path(), "echo hi > inside.txt; ls >/dev/null && echo listed");
+        let Some((_, text)) = run(&config, workspace.path(), "echo hi > inside.txt; ls >/dev/null && echo listed") else { return };
         assert!(text.contains("listed"), "{text}");
         assert!(!workspace.path().join("inside.txt").exists(), "{text}");
         assert!(!config.allows_write(Path::new("inside.txt"), workspace.path()));
@@ -597,7 +649,7 @@ mod tests {
             writable: vec![extra.path().display().to_string()],
             ..Default::default()
         };
-        let (ok, text) = run(&config, workspace.path(), &format!("echo hi > {}/f.txt", extra.path().display()));
+        let Some((ok, text)) = run(&config, workspace.path(), &format!("echo hi > \"{}/f.txt\"", extra.path().display())) else { return };
         assert!(ok, "{text}");
         assert!(extra.path().join("f.txt").exists());
     }
@@ -701,7 +753,7 @@ mod tests {
         let target = other.path().join("escape.txt");
         let encoded = target.to_string_lossy().replace('/', r"\x2f");
         let script = format!("printf pwned > $'{encoded}' 2>/dev/null; echo done");
-        let (_, text) = run(&config, workspace.path(), &script);
+        let Some((_, text)) = run(&config, workspace.path(), &script) else { return };
 
         assert!(text.contains("done"), "{text}");
         assert!(!target.exists(), "OS sandbox let an encoded write escape the workspace: {text}");
