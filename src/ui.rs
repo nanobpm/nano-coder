@@ -362,8 +362,15 @@ impl Renderer {
                     Some(crate::goal::Status::NeedsInput) => format!("{YELLOW}? needs input{RESET}"),
                     Some(crate::goal::Status::Completed) => format!("{GREEN}✔ completed{RESET}"),
                     None => {
+                        // An unparseable/unknown/missing status is NOT a success;
+                        // use a neutral marker so an invalid `report_outcome`
+                        // (e.g. `{"status":"oops"}`) is not shown as a green ✔.
                         let raw = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-                        format!("{GREEN}✔ {raw}{RESET}")
+                        if raw.is_empty() {
+                            format!("{DIM}• unknown{RESET}")
+                        } else {
+                            format!("{DIM}• {raw}{RESET}")
+                        }
                     }
                 };
                 self.out(&mut state, &format!("{}{mark}\n", stamp()));

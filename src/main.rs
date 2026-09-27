@@ -469,7 +469,7 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// clipboard/title writes) through the interactive picker. Dropping C0/C1
 /// control characters — including ESC (0x1B), which begins every such sequence —
 /// neutralises them while leaving ordinary printable text intact.
-fn sanitize_terminal_text(s: &str) -> String {
+pub(crate) fn sanitize_terminal_text(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
