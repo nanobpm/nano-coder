@@ -288,7 +288,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/restart` - Start a fresh session (clean context) without exiting
-- `/exit` - Exit the agent
+- `/exit` - Exit the agent (prints the session's `--resume` command first)
 
 ## Building and Running
 
