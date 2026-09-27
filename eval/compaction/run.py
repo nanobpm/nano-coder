@@ -382,6 +382,11 @@ def main():
     p.add_argument("--out", default=str(HERE / "results"))
     p.add_argument("--keep", action="store_true", help="keep each run's working directory")
     args = p.parse_args()
+    # Runs start in their own working directory, so resolve paths now.
+    if os.sep in args.bin:
+        args.bin = str(Path(args.bin).resolve())
+    elif shutil.which(args.bin):
+        args.bin = shutil.which(args.bin)
 
     if args.self_test:
         import fake_llm
