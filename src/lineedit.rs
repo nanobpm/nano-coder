@@ -349,13 +349,17 @@ impl LineReader {
     /// while `suspend` is set it releases stdin (polling in short slices) so a
     /// foreground picker can read it instead. Returns `None` on EOF/error.
     fn first_byte(&mut self) -> Option<u8> {
-        if let Some(byte) = self.pending.pop_front() {
-            return Some(byte);
-        }
         loop {
+            // Honour suspension before draining any buffered bytes: while a
+            // foreground picker owns the terminal, queued/pasted bytes in
+            // `pending` must stay put (not be consumed as prompt/steering
+            // input) so they cannot race dialoguer.
             if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(SUSPEND_POLL_MS as u64));
                 continue;
+            }
+            if let Some(byte) = self.pending.pop_front() {
+                return Some(byte);
             }
             let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
             let ready = unsafe { libc::poll(&mut fd, 1, SUSPEND_POLL_MS) };
