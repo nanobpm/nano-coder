@@ -16,8 +16,10 @@ pub struct StatusLine {
     stats: SharedStats,
     /// Terminal rows and columns the scroll region was set for.
     size: Mutex<Option<(u16, u16)>>,
-    /// Text being typed during a turn (a steer), shown instead of the stats.
-    input: Mutex<Option<String>>,
+    /// Text being typed during a turn (a steer), with the cursor's character
+    /// index, shown instead of the stats. Stored raw and rendered at draw time
+    /// so the steer prefix, cursor and padding are applied exactly once.
+    input: Mutex<Option<(String, usize)>>,
 }
 
 pub fn terminal_size() -> Option<(u16, u16)> {
@@ -225,16 +227,18 @@ impl StatusLine {
             }
             Some(_) => String::new(),
         };
-        let line = match self.input.lock().unwrap().as_deref() {
-            Some(text) => render_input(text, cols as usize),
+        let line = match &*self.input.lock().unwrap() {
+            Some((text, cursor)) => render_input_with_cursor(text, *cursor, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
         write_raw(&format!("{prefix}\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
     }
 
-    /// Show `text` as a line being typed (None: back to the stats).
-    pub fn set_input(&self, text: Option<&str>) {
-        *self.input.lock().unwrap() = text.map(str::to_string);
+    /// Show `text` as a line being typed, with the cursor `cursor` characters
+    /// in (None: back to the stats). The text is stored raw and rendered at
+    /// draw time.
+    pub fn set_input(&self, text: Option<(&str, usize)>) {
+        *self.input.lock().unwrap() = text.map(|(t, c)| (t.to_string(), c));
         self.draw();
     }
 
@@ -313,10 +317,6 @@ struct Segment {
     color: Option<&'static str>,
     /// Lower priority segments are dropped first when the line is too wide.
     priority: u8,
-}
-
-fn render_input(text: &str, cols: usize) -> String {
-    render_input_with_cursor(text, text.chars().count(), cols)
 }
 
 /// The steer line with the cursor marked at `cursor` characters in, and

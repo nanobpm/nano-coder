@@ -43,6 +43,11 @@ pub struct EditView {
     /// Rows the last prompt redraw occupies, menu included; the next redraw
     /// clears this many rows below the prompt's first row before reprinting.
     drawn_rows: usize,
+    /// Rows the cursor sits below the prompt's first row after the last
+    /// redraw. The next redraw climbs back up this many rows to reach the
+    /// prompt row before reprinting, so a wrapped/newline row is never
+    /// mistaken for the prompt row.
+    drawn_cursor_row: usize,
 }
 
 /// What the argument type-ahead needs from the agent loop.
@@ -67,6 +72,7 @@ impl EditView {
             prompt_width: 2,
             context,
             drawn_rows: 0,
+            drawn_cursor_row: 0,
         }))
     }
 
@@ -108,11 +114,10 @@ impl EditView {
         self.line_changed();
     }
 
-    /// The text with the cursor marked, for the status line.
+    /// The text with the cursor marked, for the status line. The status line
+    /// stores it raw and renders (prefix, cursor, padding) once at draw time.
     fn show_on_status(&self, status: &StatusLine) {
-        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80);
-        let rendered = crate::status::render_input_with_cursor(&self.line, self.cursor, cols);
-        status.set_input(Some(&rendered));
+        status.set_input(Some((&self.line, self.cursor)));
     }
 
     fn line_changed(&mut self) {
@@ -298,9 +303,19 @@ impl EditView {
         let content = self.content_rows(cols);
         let (cursor_row, cursor_col) = self.cursor_position(cols);
         let clear_below = self.drawn_rows.saturating_sub(content).saturating_sub(cursor_row);
+        // The cursor was left `drawn_cursor_row` rows below the prompt's first
+        // row (a wrapped or newline row); climb back to the prompt row before
+        // reprinting, or the prompt lands on a content row and overwrites the
+        // tail of the input.
+        let up = self.drawn_cursor_row;
         self.drawn_rows = content + self.menu_rows;
+        self.drawn_cursor_row = cursor_row;
         let stamp = crate::ui::stamp();
-        let mut seq = format!("\x1b7\r{stamp}> {}\x1b[J", self.line);
+        let mut seq = String::new();
+        if up > 0 {
+            seq.push_str(&format!("\x1b[{up}A"));
+        }
+        seq.push_str(&format!("\x1b7\r{stamp}> {}\x1b[J", self.line));
         if clear_below > 0 {
             seq.push_str(&format!("\x1b[{clear_below}B\x1b[J"));
         }
@@ -324,7 +339,7 @@ impl EditView {
             return;
         }
         let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80);
-        let up = rows_above_cursor(self.prompt_width + self.line.chars().count(), cols);
+        let up = self.cursor_position(cols).0;
         let up = if up > 0 { format!("\x1b[{up}A") } else { String::new() };
         write(&format!("\x1b7{up}\r{stamp}\x1b8"));
     }
@@ -333,7 +348,11 @@ impl EditView {
     /// menu rows scrolled away, so draw it afresh.
     pub fn prompt_redrawn(&mut self) {
         self.menu_rows = 0;
-        self.drawn_rows = self.content_rows(crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80));
+        let content = self.content_rows(crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80));
+        self.drawn_rows = content;
+        // The prompt and whole line were just printed, so the cursor rests at
+        // the end of the input, on its last row.
+        self.drawn_cursor_row = content.saturating_sub(1);
         self.draw_menu();
     }
 
@@ -350,6 +369,10 @@ impl EditView {
         }
         self.menu_rows = 0;
         self.draw_menu();
+        // The status resize re-anchored the prompt and the non-status branch
+        // above restored the cursor to the prompt row, so it now sits on the
+        // prompt's first row.
+        self.drawn_cursor_row = 0;
         // Reflow moved the input's rows; reprint it with the cursor back
         // where it belongs.
         self.redraw();
@@ -486,7 +509,11 @@ impl EditView {
         let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
         let cols = (cols as usize).max(1);
         let content = self.content_rows(cols);
-        let top = (rows as usize).saturating_sub(content + self.menu_rows) + 1;
+        // A status line reserves the bottom row, so the prompt is anchored one
+        // row higher; without that offset a click on the status row counts as
+        // input and a click on the real prompt row is rejected.
+        let reserved = if self.status.is_some() { 1 } else { 0 };
+        let top = (rows as usize).saturating_sub(content + self.menu_rows + reserved) + 1;
         let (row, col) = (y as usize, (x as usize).saturating_sub(1));
         if row < top || row >= top + content {
             return;
@@ -506,6 +533,7 @@ impl EditView {
         let line = std::mem::take(&mut self.line);
         self.cursor = 0;
         self.drawn_rows = 0;
+        self.drawn_cursor_row = 0;
         match self.on_status() {
             Some(status) => status.set_input(None),
             None => {
@@ -552,16 +580,6 @@ fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, us
     (seq, if lines.is_empty() { 0 } else { rows })
 }
 
-/// How many rows above the cursor the prompt starts, when `chars`
-/// characters have been printed from column 0 of a `cols`-wide terminal.
-/// A row filled exactly leaves the cursor on it (pending wrap).
-fn rows_above_cursor(chars: usize, cols: usize) -> usize {
-    if chars == 0 || cols == 0 {
-        return 0;
-    }
-    if chars.is_multiple_of(cols) { chars / cols - 1 } else { chars / cols }
-}
-
 fn write(text: &str) {
     use std::io::Write;
     crate::status::with_term_lock(|| {
@@ -593,6 +611,11 @@ static ORIGINAL: OnceLock<libc::termios> = OnceLock::new();
 /// forward — a cursor position report the terminal sends back.
 static KEY_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether key mode's terminal setup was ever applied. Cleanup control bytes
+/// are only emitted when it was, so piped/non-TTY sessions (which never enter
+/// key mode) keep clean, machine-readable stdout on exit.
+static KEY_MODE_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn key_mode_active() -> bool {
     KEY_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -607,7 +630,11 @@ pub fn restore_terminal() {
     if let Some(original) = ORIGINAL.get() {
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original) };
     }
-    write("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
+    // Only undo the key-mode escapes if they were ever sent; a piped/non-TTY
+    // session never entered key mode, so writing them would corrupt stdout.
+    if KEY_MODE_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+        write("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
+    }
 }
 
 /// Key-by-key input while alive: no echo, no line buffering, and control
@@ -628,6 +655,7 @@ impl KeyMode {
         let entered = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0;
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         if entered {
+            KEY_MODE_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
             write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>4;1m\x1b[>1u");
         }
         entered.then_some(Self)
@@ -997,6 +1025,7 @@ mod tests {
             prompt_width: 2,
             context: Arc::new(Mutex::new(EditContext::default())),
             drawn_rows: 0,
+            drawn_cursor_row: 0,
         };
         view.mode = EditMode::Turn;
         view
@@ -1039,14 +1068,6 @@ mod tests {
         let (seq, rows) = menu_sequence(2, &[], true);
         assert_eq!(rows, 0);
         assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
-    }
-
-    #[test]
-    fn finds_the_prompt_row_of_a_wrapped_line() {
-        assert_eq!(rows_above_cursor(11, 80), 0);
-        assert_eq!(rows_above_cursor(80, 80), 0, "pending wrap stays on the row");
-        assert_eq!(rows_above_cursor(81, 80), 1);
-        assert_eq!(rows_above_cursor(200, 80), 2);
     }
 
     #[test]
