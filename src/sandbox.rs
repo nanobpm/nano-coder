@@ -535,24 +535,49 @@ mod tests {
     /// refuses to apply a profile from a process that is already sandboxed
     /// (`sandbox_apply: Operation not permitted`), which is the case when the
     /// test suite itself runs inside a sandboxed agent harness. The containment
-    /// assertions are meaningless then, so callers skip rather than fail and
-    /// pollute the signal.
+    /// assertions are meaningless then.
     ///
-    /// Stable Rust's libtest has no runtime "ignored" state, so such a test
-    /// cannot report as `ignored`; a bare early return would then masquerade as
-    /// a genuine green pass. To keep the signal honest, `None` is accompanied by
-    /// an explicit, greppable `SKIP <test>: …` notice (see [`skip_notice`]) that
-    /// names the skipped test, so anyone scanning the output can tell the
-    /// containment assertions were never exercised.
+    /// Stable Rust's libtest has no runtime "ignored" state, so a bare early
+    /// return on that condition would masquerade as a genuine green pass while
+    /// none of the containment assertions ran — the very false-green this suite
+    /// exists to remove. So an unavailable sandbox **fails the run by default**
+    /// (see [`sandbox_unavailable`]); it degrades to a skip only when the caller
+    /// has explicitly opted in via `NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS`, and even
+    /// then the skip is announced with a greppable `SKIP` notice — never counted
+    /// as a silent success.
     fn run(config: &SandboxConfig, cwd: &Path, script: &str) -> Option<(bool, String)> {
         let mut sandboxed = command(config, "bash", script, cwd).expect("sandbox available");
         let output = sandboxed.command.current_dir(cwd).output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         if text.contains("sandbox_apply: Operation not permitted") {
-            skip_notice("OS sandbox cannot be applied inside an already-sandboxed process");
-            return None;
+            return sandbox_unavailable("OS sandbox cannot be applied inside an already-sandboxed process");
         }
         Some((output.status.success(), text))
+    }
+
+    /// Handle an environment where the OS sandbox cannot be applied at all.
+    ///
+    /// A containment test whose sandbox never applied has exercised none of its
+    /// assertions, so counting it as `ok` is a false-green. This therefore
+    /// **fails the run by default** (`panic!`), which libtest records as a real
+    /// test failure rather than a pass — the honest signal stable libtest's lack
+    /// of a runtime "ignored" state otherwise denies us. The one deliberate
+    /// exception is running the suite inside an already-sandboxed agent harness,
+    /// where a nested sandbox is impossible: setting the
+    /// `NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS` environment variable (to any value)
+    /// opts into skipping instead, and even then the skip is announced with an
+    /// explicit, greppable `SKIP <test>: …` notice (see [`skip_notice`]) so the
+    /// un-run assertions are never hidden.
+    fn sandbox_unavailable(reason: &str) -> Option<(bool, String)> {
+        if std::env::var_os("NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS").is_some() {
+            skip_notice(reason);
+            return None;
+        }
+        panic!(
+            "{reason}; containment assertions could not run and are not counted as a pass. \
+             Set NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS=1 to skip these tests when the OS sandbox \
+             genuinely cannot be applied (e.g. inside an already-sandboxed agent harness)."
+        );
     }
 
     /// Emit a standardized, greppable skip notice for an environment-unavailable
