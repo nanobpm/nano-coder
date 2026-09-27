@@ -260,7 +260,7 @@ impl EditView {
     fn prompt_start(&self, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let w = self.prompt_width;
-        if w > 0 && w % cols == 0 {
+        if w > 0 && w.is_multiple_of(cols) {
             (w / cols - 1, cols)
         } else {
             (w / cols, w % cols)
