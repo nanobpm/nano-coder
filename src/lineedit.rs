@@ -173,24 +173,38 @@ impl EditView {
         if cols == 0 {
             return 1;
         }
-        let mut rows = 1;
-        let mut col = self.prompt_width % cols;
+        let (mut row, mut col) = self.prompt_start(cols);
         for c in self.line.chars() {
             if c == '\n' {
-                rows += 1;
+                row += 1;
                 col = 0;
             } else {
                 // Pending wrap, matching `cursor_position`: a row filled
                 // exactly leaves the cursor on it, and only the *next*
                 // character starts a new row.
                 if col == cols {
-                    rows += 1;
+                    row += 1;
                     col = 0;
                 }
                 col += 1;
             }
         }
-        rows
+        row + 1
+    }
+
+    /// The prompt's end position `(row, col)` from its first row, shared by
+    /// every wrap helper so they agree. A prompt that exactly fills one or more
+    /// rows is a pending wrap: the cursor rests at column `cols` on the last
+    /// filled row and the first input character wraps to the next row. On a
+    /// terminal wide enough for the prompt this is simply `(0, prompt_width)`.
+    fn prompt_start(&self, cols: usize) -> (usize, usize) {
+        let cols = cols.max(1);
+        let w = self.prompt_width;
+        if w > 0 && w % cols == 0 {
+            (w / cols - 1, cols)
+        } else {
+            (w / cols, w % cols)
+        }
     }
 
     /// The cursor's row and column, counted from the prompt's row. The column
@@ -202,8 +216,7 @@ impl EditView {
     /// character wraps to the next row.
     fn cursor_position(&self, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
-        let mut row = 0;
-        let mut col = self.prompt_width % cols;
+        let (mut row, mut col) = self.prompt_start(cols);
         for c in self.line.chars().take(self.cursor) {
             if c == '\n' {
                 row += 1;
@@ -223,9 +236,16 @@ impl EditView {
     /// row, clamped into the input. Used to place the cursor on a mouse click.
     fn char_at_position(&self, cols: usize, row: usize, col: usize) -> usize {
         let cols = cols.max(1);
-        let mut r = 0;
-        let mut c = self.prompt_width % cols;
+        let (mut r, mut c) = self.prompt_start(cols);
         for (idx, ch) in self.line.chars().enumerate() {
+            // Apply the pending wrap before locating this glyph, as
+            // `cursor_position` does: the first glyph after a filled row
+            // renders at (row + 1, column 0), not at the pending (row, cols)
+            // slot, so a click on it must match there.
+            if ch != '\n' && c == cols {
+                r += 1;
+                c = 0;
+            }
             if r == row && c == col {
                 return idx;
             }
@@ -233,11 +253,6 @@ impl EditView {
                 r += 1;
                 c = 0;
             } else {
-                // Pending wrap, matching `content_rows`/`cursor_position`.
-                if c == cols {
-                    r += 1;
-                    c = 0;
-                }
                 c += 1;
             }
         }
@@ -634,6 +649,9 @@ enum Esc {
     Delete,
     /// Ctrl- or Cmd-Enter: insert a newline instead of sending.
     Newline,
+    /// An unmodified Enter reported as an escape sequence (kitty keyboard
+    /// protocol `CSI 13 u`): submit the line, like a bare CR would.
+    Submit,
     Mouse { x: u16, y: u16 },
     /// Something else (function keys, releases, motion, unknown sequences).
     Ignored,
@@ -739,6 +757,7 @@ impl LineReader {
                                     Esc::WordRight => shared.lock().unwrap().move_word_right(),
                                     Esc::Delete => shared.lock().unwrap().delete(),
                                     Esc::Newline => shared.lock().unwrap().insert("\n"),
+                                    Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
                                     Esc::Mouse { x, y } => shared.lock().unwrap().mouse_press(x, y),
                                     Esc::Ignored => {}
                                 }
@@ -852,6 +871,9 @@ fn parse_escape(seq: &[u8]) -> Esc {
             let mut parts = params.split(';');
             match (parts.next().and_then(|k| k.parse::<u16>().ok()), parts.next().and_then(|m| m.parse::<u16>().ok())) {
                 (Some(13), Some(m)) if m & 0b100 != 0 || m & 0b1000 != 0 => Esc::Newline,
+                // Unmodified Enter (modifier absent or the bare `1`): legacy
+                // mode would deliver a CR, so submit rather than ignore it.
+                (Some(13), None | Some(1)) => Esc::Submit,
                 _ => Esc::Ignored,
             }
         }
@@ -1062,6 +1084,12 @@ mod tests {
         let mut v = view("ab\ncd");
         v.prompt_width = 2;
         assert_eq!(v.char_at_position(80, 1, 0), 3);
+        // The first glyph after a soft wrap: with cols=4 and a width-2 prompt,
+        // "abcdef" renders 'c' at row 1, column 0 (a click there must land on
+        // it, not fall through to the end of the buffer).
+        let mut v = view("abcdef");
+        v.prompt_width = 2;
+        assert_eq!(v.char_at_position(4, 1, 0), 2);
     }
 
     #[test]
@@ -1106,6 +1134,9 @@ mod tests {
         // kitty keyboard protocol: CSI 13 ; modifier u
         assert!(matches!(parse_escape(b"\x1b[13;5u"), Esc::Newline), "kitty Ctrl-Enter");
         assert!(matches!(parse_escape(b"\x1b[13;9u"), Esc::Newline), "kitty Cmd-Enter");
+        // Unmodified kitty Enter submits rather than being ignored.
+        assert!(matches!(parse_escape(b"\x1b[13u"), Esc::Submit), "kitty Enter (no modifier) submits");
+        assert!(matches!(parse_escape(b"\x1b[13;1u"), Esc::Submit), "kitty Enter (modifier 1) submits");
     }
 
     #[test]
