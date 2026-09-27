@@ -9,7 +9,7 @@ homepage = "https://github.com/nanobpm/nano-coder"
 readme = "README.md"
 keywords = ["ai", "agent", "coding-agent", "acp", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["tla/", "target/", "npm/", "scripts/", ".github/", "TLA-plan.md", "RELEASING.md"]
+exclude = ["tla/", "eval/", "target/", "npm/", "scripts/", ".github/", "TLA-plan.md", "RELEASING.md"]
 
 [[bin]]
 name = "nano-coder"

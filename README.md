@@ -589,7 +589,8 @@ To judge whether it helps, the log records each compaction's `mode`, `model` and
 `turn_end`). `/context` shows the mode and this session's history-tool use.
 `scripts/compaction-report.py [SESSION_DIR]` tabulates compacted sessions by model and mode:
 compactions, turns after the first compaction, turns that used the history tools, and
-reported outcomes. See [#29](https://github.com/nanobpm/nano-coder/issues/29) for the design.
+reported outcomes. `eval/compaction/` has a harness that compares the two modes across
+providers and models on synthetic or forked real sessions (see its README). See [#29](https://github.com/nanobpm/nano-coder/issues/29) for the design.
 
 ## Project Instructions
 
