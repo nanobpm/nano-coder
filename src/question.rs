@@ -110,7 +110,16 @@ impl QuestionBroker {
         // the broker is alive, but a dropped sender means "shut down": treat as
         // dismissed.
         let answer = answer_rx.blocking_recv().unwrap_or(QuestionAnswer::Dismissed);
-        *self.pending.lock().unwrap() = None;
+        // Clear the slot only if it still points at *our* request. A later
+        // question registered after we were resolved must not be erased by our
+        // own teardown, or its handler would block forever with nothing to
+        // render.
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.as_ref().is_some_and(|p| Arc::ptr_eq(p, &request)) {
+                *pending = None;
+            }
+        }
         answer
     }
 
