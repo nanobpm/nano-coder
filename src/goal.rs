@@ -24,7 +24,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
             "completed" | "complete" | "done" | "success" | "succeeded" => Some(Status::Completed),
             "blocked" | "stuck" | "failed" | "failure" | "needs_help" => Some(Status::Blocked),
