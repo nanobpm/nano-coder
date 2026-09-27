@@ -364,7 +364,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         continue;
                     }
                     let gate = terminal.suspend_input();
-                    let decision = prompt_cap_reached(&renderer).await;
+                    let decision = prompt_cap_reached(&renderer, terminal.picker_lock()).await;
                     gate.store(false, std::sync::atomic::Ordering::SeqCst);
                     cap.decide(decision);
                 }
@@ -470,11 +470,6 @@ async fn prompt_question(
     use question::QuestionAnswer;
     let auto = control.mode() == mode::AgentMode::Auto;
 
-    // Serialise picker workers: wait for any previous (possibly orphaned)
-    // dialoguer worker to release stdin before starting our own, so only one
-    // ever reads keystrokes.
-    let guard = picker_lock.lock_owned().await;
-
     // The whole prompt run: ask each question, collecting one string each.
     // Dismissal (Esc) at any question dismisses the lot.
     let ask = |questions: &[question::Question]| -> Result<QuestionAnswer> {
@@ -489,6 +484,10 @@ async fn prompt_question(
     };
 
     if !auto {
+        // Normal mode: the user is present, so it is fine to block until any
+        // previous (possibly orphaned) worker releases stdin, so only one ever
+        // reads keystrokes.
+        let guard = picker_lock.lock_owned().await;
         let questions = questions.to_vec();
         let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
         drop(guard);
@@ -497,6 +496,27 @@ async fn prompt_question(
 
     // Auto mode: give the user a chance to answer, then answer ourselves.
     renderer.note(&format!("[auto: answering for you in {AUTO_AWAY_SECS}s — the user is away]"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(AUTO_AWAY_SECS);
+
+    // Acquire stdin, but never past the away deadline. If a prior orphaned
+    // worker still holds the picker lock while the user is away, blocking here
+    // would keep this question from ever resolving (finding: later questions
+    // wait on the lock before their own timeout can start). Bound the wait so
+    // it still answers `Away`, and serialise so only one worker reads stdin.
+    let guard = match tokio::time::timeout_at(deadline, picker_lock.clone().lock_owned()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            renderer.note("[auto: no answer — making the best decision]");
+            // Do not start a competing reader. Keep the caller's input gate
+            // suspended until the picker frees (the prior orphan exits), so
+            // stdin is never read by two workers at once.
+            let orphan = tokio::spawn(async move {
+                let _ = picker_lock.lock_owned().await;
+            });
+            return (QuestionAnswer::Away, Some(orphan));
+        }
+    };
+
     let questions = questions.to_vec();
     let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
     tokio::select! {
@@ -504,7 +524,7 @@ async fn prompt_question(
             drop(guard);
             (joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None)
         }
-        () = tokio::time::sleep(std::time::Duration::from_secs(AUTO_AWAY_SECS)) => {
+        () = tokio::time::sleep_until(deadline) => {
             renderer.note("[auto: no answer — making the best decision]");
             // Keep the worker alive (it is still blocked on stdin) and hold the
             // picker lock until it exits, so any later question serialises
@@ -521,10 +541,17 @@ async fn prompt_question(
 
 /// Ask whether to keep going when the turn cap is reached. Defaults to stop,
 /// so an unattended prompt does not run away. Runs on the turn loop.
-async fn prompt_cap_reached(renderer: &std::sync::Arc<ui::Renderer>) -> question::CapDecision {
+async fn prompt_cap_reached(
+    renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+) -> question::CapDecision {
     use question::CapDecision;
+    // Serialise with the question picker: this is another dialoguer reader, so
+    // never run it while an orphaned auto-away worker still holds stdin. Block
+    // until that worker releases the lock so only one ever reads keystrokes.
+    let guard = picker_lock.lock_owned().await;
     let renderer = renderer.clone();
-    tokio::task::spawn_blocking(move || {
+    let decision = tokio::task::spawn_blocking(move || {
         let keep_going = dialoguer::Confirm::new()
             .with_prompt("Reached the turn cap without a final answer. Keep going?")
             .default(false)
@@ -540,7 +567,9 @@ async fn prompt_cap_reached(renderer: &std::sync::Arc<ui::Renderer>) -> question
         }
     })
     .await
-    .unwrap_or(CapDecision::Stop)
+    .unwrap_or(CapDecision::Stop);
+    drop(guard);
+    decision
 }
 
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
