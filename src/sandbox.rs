@@ -530,22 +530,38 @@ mod platform {
 mod tests {
     use super::*;
 
-    /// Run `script` under the sandbox, returning `(success, output)`. Returns
-    /// `None` when the OS sandbox cannot be applied here at all — macOS
-    /// Seatbelt refuses to apply a profile from a process that is already
-    /// sandboxed (`sandbox_apply: Operation not permitted`), which is the case
-    /// when the test suite itself runs inside a sandboxed agent harness. The
-    /// containment assertions are meaningless then, so callers skip rather than
-    /// fail and pollute the signal.
+    /// Run `script` under the sandbox, returning `Some((success, output))`, or
+    /// `None` when the OS sandbox cannot be applied here at all — macOS Seatbelt
+    /// refuses to apply a profile from a process that is already sandboxed
+    /// (`sandbox_apply: Operation not permitted`), which is the case when the
+    /// test suite itself runs inside a sandboxed agent harness. The containment
+    /// assertions are meaningless then, so callers skip rather than fail and
+    /// pollute the signal.
+    ///
+    /// Stable Rust's libtest has no runtime "ignored" state, so such a test
+    /// cannot report as `ignored`; a bare early return would then masquerade as
+    /// a genuine green pass. To keep the signal honest, `None` is accompanied by
+    /// an explicit, greppable `SKIP <test>: …` notice (see [`skip_notice`]) that
+    /// names the skipped test, so anyone scanning the output can tell the
+    /// containment assertions were never exercised.
     fn run(config: &SandboxConfig, cwd: &Path, script: &str) -> Option<(bool, String)> {
         let mut sandboxed = command(config, "bash", script, cwd).expect("sandbox available");
         let output = sandboxed.command.current_dir(cwd).output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         if text.contains("sandbox_apply: Operation not permitted") {
-            eprintln!("skipping: OS sandbox cannot be applied inside an already-sandboxed process");
+            skip_notice("OS sandbox cannot be applied inside an already-sandboxed process");
             return None;
         }
         Some((output.status.success(), text))
+    }
+
+    /// Emit a standardized, greppable skip notice for an environment-unavailable
+    /// containment test. libtest names each test's thread after the test path,
+    /// so `SKIP <test>: <reason>` pins the notice to the exact test that did not
+    /// assert — the explicit skip signal libtest's default harness cannot give.
+    fn skip_notice(reason: &str) {
+        let test = std::thread::current().name().unwrap_or("<unknown>").to_string();
+        println!("SKIP {test}: {reason}; containment assertions not exercised");
     }
 
     /// A directory outside the temp dirs (which the sandbox always allows).
@@ -608,7 +624,7 @@ mod tests {
             writable: vec![extra.path().display().to_string()],
             ..Default::default()
         };
-        let Some((ok, text)) = run(&config, workspace.path(), &format!("echo hi > {}/f.txt", extra.path().display())) else { return };
+        let Some((ok, text)) = run(&config, workspace.path(), &format!("echo hi > \"{}/f.txt\"", extra.path().display())) else { return };
         assert!(ok, "{text}");
         assert!(extra.path().join("f.txt").exists());
     }
