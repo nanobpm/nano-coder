@@ -352,18 +352,11 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // Yield stdin to the picker so the line reader does not
                         // race it for the answer keystrokes.
                         let gate = terminal.suspend_input();
-                        let (answer, orphan) = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock()).await;
-                        match orphan {
-                            None => gate.store(false, std::sync::atomic::Ordering::SeqCst),
-                            // An auto-answer worker timed out but is still parked
-                            // on stdin; resume the reader only once it exits.
-                            Some(handle) => {
-                                tokio::spawn(async move {
-                                    let _ = handle.await;
-                                    gate.store(false, std::sync::atomic::Ordering::SeqCst);
-                                });
-                            }
-                        }
+                        // `prompt_question` owns the gate: it clears it while
+                        // holding the picker lock — immediately, or once a
+                        // timed-out auto-answer worker frees stdin — so the
+                        // reader never resumes while a dialoguer is still active.
+                        let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
                     }
                 }
@@ -475,8 +468,10 @@ async fn prompt_question(
     control: &agent::TurnControl,
     renderer: &std::sync::Arc<ui::Renderer>,
     picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-) -> (question::QuestionAnswer, Option<tokio::task::JoinHandle<()>>) {
+    gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> question::QuestionAnswer {
     use question::QuestionAnswer;
+    use std::sync::atomic::Ordering::SeqCst;
     let auto = control.mode() == mode::AgentMode::Auto;
 
     // The whole prompt run: ask each question, collecting one string each.
@@ -499,8 +494,12 @@ async fn prompt_question(
         let guard = picker_lock.lock_owned().await;
         let questions = questions.to_vec();
         let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
+        // Clear the gate while still holding the picker guard, so the input
+        // reader cannot resume before the next picker (which must take this
+        // same lock) has re-suspended it.
+        gate.store(false, SeqCst);
         drop(guard);
-        return (asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None);
+        return asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed);
     }
 
     // Auto mode: give the user a chance to answer, then answer ourselves.
@@ -517,12 +516,16 @@ async fn prompt_question(
         Err(_) => {
             renderer.note("[auto: no answer — making the best decision]");
             // Do not start a competing reader. Keep the caller's input gate
-            // suspended until the picker frees (the prior orphan exits), so
-            // stdin is never read by two workers at once.
-            let orphan = tokio::spawn(async move {
-                let _ = picker_lock.lock_owned().await;
+            // suspended until the picker frees (the prior orphan exits), then
+            // clear the gate while still holding the guard, so a later picker
+            // cannot acquire the lock and re-suspend between our lock release
+            // and the gate release (which would let the reader race stdin).
+            tokio::spawn(async move {
+                let guard = picker_lock.lock_owned().await;
+                gate.store(false, SeqCst);
+                drop(guard);
             });
-            return (QuestionAnswer::Away, Some(orphan));
+            return QuestionAnswer::Away;
         }
     };
 
@@ -530,20 +533,23 @@ async fn prompt_question(
     let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
     tokio::select! {
         joined = &mut worker => {
+            // Clear the gate while still holding the guard, then release it.
+            gate.store(false, SeqCst);
             drop(guard);
-            (joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None)
+            joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed)
         }
         () = tokio::time::sleep_until(deadline) => {
             renderer.note("[auto: no answer — making the best decision]");
             // Keep the worker alive (it is still blocked on stdin) and hold the
-            // picker lock until it exits, so any later question serialises
-            // behind it instead of spawning a second stdin reader. Hand the
-            // task back so the caller resumes input only once it has exited.
-            let orphan = tokio::spawn(async move {
+            // picker lock until it exits. Clear the gate while still holding the
+            // guard so the reader resumes only once this worker exits, with no
+            // window for a later picker to slip in between lock and gate release.
+            tokio::spawn(async move {
                 let _ = worker.await;
+                gate.store(false, SeqCst);
                 drop(guard);
             });
-            (QuestionAnswer::Away, Some(orphan))
+            QuestionAnswer::Away
         }
     }
 }
