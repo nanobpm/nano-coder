@@ -588,6 +588,7 @@ async fn run_compaction(
     terminal: &mut Terminal,
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
+    let stats = agent.context_stats();
     let compaction = agent.compact(instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
@@ -614,6 +615,12 @@ async fn run_compaction(
                 }
                 TermInput::CycleMode => {
                     let mode = control.cycle_mode();
+                    // Mirror the prompt/turn `CycleMode` path: refresh the
+                    // shared stats and emit a context event so the status line
+                    // reflects the new mode immediately, not just after a later
+                    // refresh while `/compact` is still running.
+                    stats.lock().unwrap().mode = mode;
+                    terminal.renderer.event(&agent::AgentEvent::Context);
                     eprintln!("[mode: {mode} — {}]", mode.describe());
                 }
                 other => terminal.queued.push_back(other),

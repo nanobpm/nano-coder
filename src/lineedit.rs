@@ -406,6 +406,17 @@ impl LineReader {
     /// The next byte if one arrives within `ms` milliseconds.
     fn byte_within(&mut self, ms: i32) -> Option<u8> {
         if self.pending.is_empty() {
+            // Honour suspension in the escape-sequence path too: a real
+            // sequence (arrow key, Shift+Tab) arrives atomically, so its
+            // continuation is already buffered in `pending` and read below.
+            // But if nothing is buffered and a foreground picker has taken the
+            // terminal, the next bytes belong to the picker — do not poll or
+            // read stdin for them. Report "no continuation" so the ESC we
+            // already consumed resolves as a bare Escape and the picker keeps
+            // its own keystrokes (including its `ESC [ Z`).
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut fd, 1, ms) } <= 0 {
                 return None;
