@@ -329,6 +329,48 @@ impl Drop for KeyMode {
 pub struct LineReader {
     pending: std::collections::VecDeque<u8>,
     utf8: Vec<u8>,
+    /// While set, the reader yields stdin instead of consuming it, so a
+    /// foreground picker (a `question`/turn-cap prompt) can own the terminal
+    /// without racing this reader for keystrokes.
+    suspend: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long the reader polls stdin (and re-checks `suspend`) per slice, so a
+/// suspend request is observed within this many milliseconds.
+const SUSPEND_POLL_MS: i32 = 15;
+
+impl LineReader {
+    /// A reader that yields stdin whenever `suspend` is set.
+    pub fn with_suspend(suspend: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { suspend, ..Self::default() }
+    }
+
+    /// The byte that begins the next key press. Blocks until one arrives, but
+    /// while `suspend` is set it releases stdin (polling in short slices) so a
+    /// foreground picker can read it instead. Returns `None` on EOF/error.
+    fn first_byte(&mut self) -> Option<u8> {
+        if let Some(byte) = self.pending.pop_front() {
+            return Some(byte);
+        }
+        loop {
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(SUSPEND_POLL_MS as u64));
+                continue;
+            }
+            let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut fd, 1, SUSPEND_POLL_MS) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            if ready == 0 {
+                continue; // timeout: re-check suspend, then poll again
+            }
+            return self.next_byte();
+        }
+    }
 }
 
 impl LineReader {
@@ -367,7 +409,7 @@ impl LineReader {
         view.lock().unwrap().menu_enabled = true;
         let shared = view;
         loop {
-            let Some(byte) = self.next_byte() else { return Key::Eof };
+            let Some(byte) = self.first_byte() else { return Key::Eof };
             let mut view = view.lock().unwrap();
             match byte {
                 b'\r' | b'\n' => {

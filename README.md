@@ -526,8 +526,9 @@ shows when the message was sent. Turn this off with `timestamps = false`.
 In an interactive terminal the bottom row shows the provider/model, context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
-count, and what the agent is doing. It uses a terminal scroll region, follows resizes, and is
-off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
+save space), and what the agent is doing. It uses a terminal scroll region, follows resizes,
+and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.
 
