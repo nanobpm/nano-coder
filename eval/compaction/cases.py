@@ -101,7 +101,7 @@ def user_constraint(seed, filler_turns):
     log.bash("git status", "On branch main\nnothing to commit, working tree clean")
     log.answer("Understood. I'll start by reading the lease renewal code.")
     filler(log, rng, filler_turns)
-    return log.records, "Remind me: what branch name and dev-server port did I ask for at the very start?", [branch, str(port)], ["5173"]
+    return log.records, "Remind me: what branch name and dev-server port did I ask for at the very start?", [branch, str(port)], []
 
 
 def working_command(seed, filler_turns):

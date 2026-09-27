@@ -40,11 +40,15 @@ REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 import cases as synthetic  # noqa: E402
 
+# Denied unless --tools all: synthetic logs describe a project that doesn't
+# exist, so without history tools the agent would explore the real disk.
+WORK_TOOLS = ("bash", "read_file", "write_file", "edit_file")
 OVERRIDDEN = ("session_dir", "compaction_mode", "auto_compact", "persist_sessions", "project_instructions", "model")
 
 
 def default_config():
-    for base in (Path.home() / ".config/nano-coder", Path.home() / ".config/rusty-harness"):
+    # nano-coder, then the pre-rename agentic-harness (as the binary does).
+    for base in (Path.home() / ".config/nano-coder", Path.home() / ".config/agentic-harness"):
         if (base / "config.toml").is_file():
             return base / "config.toml"
     return None
@@ -123,6 +127,7 @@ def load_cases(args):
                     "question": spec["question"],
                     "expect": spec.get("expect", []),
                     "forbid": spec.get("forbid", []),
+                    "cwd": spec.get("cwd"),
                 }
             out.append(case)
     return out
@@ -219,13 +224,18 @@ def run_one(args, case, model, mode, repeat, work_root):
     run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
+    if case.get("cwd") and args.tools == "all":
+        cwd = Path(case["cwd"]).expanduser()
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
     config.write_text(config_text(args.config, session_dir, mode))
-    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "session": str(session_dir / f"{session_id}.jsonl")}
+    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools, "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
-    acp = Acp([args.bin, "--acp", "--config", str(config), "--model", model], cwd, run_dir / "stderr.txt", args.timeout)
+    argv = [args.bin, "--acp", "--config", str(config), "--model", model]
+    if args.tools == "history":
+        argv += [a for tool in WORK_TOOLS for a in ("--deny", tool)]
+    acp = Acp(argv, cwd, run_dir / "stderr.txt", args.timeout)
     try:
         acp.call("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         acp.call("session/load", {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []})
@@ -242,24 +252,32 @@ def run_one(args, case, model, mode, repeat, work_root):
     records = read_log(result["session"])
     replace_at = next((i for i in range(len(records) - 1, -1, -1)
                        if records[i]["type"] == "replace" and "mode" in records[i]["data"]), None)
-    summary, after = "", []
+    summary, kept, after = "", "", []
     if replace_at is not None:
         after = records[replace_at + 1:]
-        summary = next((m["content"] for m in records[replace_at]["data"]["messages"]
-                        if m["role"] == "user" and m["content"].startswith("[")), "")
+        remaining = records[replace_at]["data"]["messages"]
+        summary = next((m["content"] for m in remaining if m["role"] == "user" and m["content"].startswith("[")), "")
+        # Everything left in context: summary plus the recent messages compaction keeps.
+        kept = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or []) for m in remaining)
     tool_calls = [c["name"] for r in after if r["type"] == "message" for c in r["data"].get("tool_calls", [])]
     turn_end = next((r["data"] for r in reversed(after) if r["type"] == "turn_end"), None)
     answer = turn_end["response"] if turn_end else ""
+    if "error" not in result:
+        if not turn_end:
+            result["error"] = "no answer recorded (provider error?); see " + str(run_dir / "stderr.txt")
+        elif result.get("fallback") and "failed" in str(result["fallback"]):
+            result["error"] = "compaction failed: " + str(result["fallback"])[:300]
     result.update({
         "answer": answer,
         "passed": bool(turn_end) and matches_all(case["expect"], answer) and not matches_any(case["forbid"], answer),
+        "kept": matches_all(case["expect"], kept),
         "summary_kept": matches_all(case["expect"], summary),
         "summary_chars": len(summary),
         "history_calls": sum(1 for n in tool_calls if n.startswith("history_")),
         "tool_calls": tool_calls,
     })
-    if not args.keep:
-        shutil.rmtree(run_dir / "cwd", ignore_errors=True)
+    if not args.keep and cwd == run_dir / "cwd":
+        shutil.rmtree(cwd, ignore_errors=True)
     return result
 
 
@@ -272,20 +290,21 @@ def report(results, out=sys.stdout):
     for r in results:
         groups[(r["model"], r["mode"])].append(r)
     width = max([len(m) for m, _ in groups] + [5])
-    header = (f"{'model':<{width}}  {'mode':<8} {'runs':>4} {'errors':>6} {'pass':>7} {'summ.kept':>9} "
+    header = (f"{'model':<{width}}  {'mode':<8} {'runs':>4} {'errors':>6} {'pass':>7} {'kept':>9} "
               f"{'pass|lost':>9} {'lost':>4} {'used hist':>9} {'hist/run':>8} {'secs':>6}")
     print(header, file=out)
     print("-" * len(header), file=out)
     for (model, mode), rs in sorted(groups.items()):
         ok = [r for r in rs if "error" not in r]
-        lost = [r for r in ok if not r["summary_kept"]]
+        lost = [r for r in ok if not r.get("kept", r["summary_kept"])]
         print(f"{model:<{width}}  {mode:<8} {len(rs):>4} {len(rs) - len(ok):>6} "
               f"{pct(sum(r['passed'] for r in ok), len(ok)):>7} {pct(sum(r['summary_kept'] for r in ok), len(ok)):>9} "
               f"{pct(sum(r['passed'] for r in lost), len(lost)):>9} {len(lost):>4} "
               f"{pct(sum(r['history_calls'] > 0 for r in ok), len(ok)):>9} "
               f"{(sum(r['history_calls'] for r in ok) / len(ok) if ok else 0):>8.2f} "
               f"{(sum(r['seconds'] for r in rs) / len(rs)):>6.1f}", file=out)
-    print("\npass|lost = pass rate among runs whose summary lost the detail (where retrieval can matter).", file=out)
+    print("\nkept = the detail survived compaction (in the summary or the recent messages kept verbatim).\n"
+          "pass|lost = pass rate among runs where it did not (where retrieval can matter).", file=out)
     by_case = defaultdict(lambda: defaultdict(list))
     for r in results:
         by_case[r["case"].split("/")[0]][(r["model"], r["mode"])].append(r)
@@ -311,11 +330,11 @@ def self_test_verdict(results):
         base = r["case"].split("/")[0]
         if "error" in r:
             problems.append(f"{r['case']} {r['mode']}: {r['error']}")
-        elif r["summary_kept"]:
-            problems.append(f"{r['case']} {r['mode']}: the lossy summary kept the detail?")
         elif base == "recent-control":
-            if not r["passed"]:
-                problems.append(f"{r['case']} {r['mode']}: control failed")
+            if not (r["passed"] and r["kept"]):
+                problems.append(f"{r['case']} {r['mode']}: control failed (passed={r['passed']} kept={r['kept']})")
+        elif r["kept"]:
+            problems.append(f"{r['case']} {r['mode']}: the detail survived a lossy summary?")
         elif r["mode"] == "standard" and (r["passed"] or r["history_calls"]):
             problems.append(f"{r['case']} standard: passed={r['passed']} history_calls={r['history_calls']}")
         elif r["mode"] == "smart" and not (r["passed"] and r["history_calls"]):
@@ -353,7 +372,10 @@ def main():
     p.add_argument("--seeds", type=int, default=2, help="variants per synthetic case")
     p.add_argument("--filler-turns", type=int, default=15, help="unrelated turns after the detail in synthetic cases")
     p.add_argument("--repeats", type=int, default=1)
-    p.add_argument("--jobs", type=int, default=4)
+    p.add_argument("--jobs", type=int, default=4, help="parallel runs (use 1 for a local model that serves one request at a time)")
+    p.add_argument("--tools", choices=("history", "all"), default="history",
+                   help="history: deny bash and file tools, so answers come from context or history (default); "
+                        "all: normal tools, for forks of real sessions run in their project")
     p.add_argument("--timeout", type=int, default=600, help="seconds per run")
     p.add_argument("--config", default=default_config(), help="base config with providers (default: your config.toml)")
     p.add_argument("--bin", default=default_binary())
@@ -395,7 +417,7 @@ def main():
                 sink.flush()
             status = "ERROR " + r["error"] if "error" in r else ("pass" if r["passed"] else "FAIL")
             print(f"[{done}/{len(jobs)}] {r['case']} {r['model']} {r['mode']}: {status} "
-                  f"(summary kept: {r.get('summary_kept')}, history calls: {r.get('history_calls')})", file=sys.stderr)
+                  f"(kept: {r.get('kept')}, history calls: {r.get('history_calls')})", file=sys.stderr)
     print()
     report(results)
     print(f"\nresults: {results_path}\nsession logs: {work_root}")

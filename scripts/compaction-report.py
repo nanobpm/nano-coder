@@ -21,7 +21,9 @@ from pathlib import Path
 
 def default_dirs():
     home = Path.home()
-    return [home / "Library/Application Support/nano-coder/sessions", home / ".local/share/nano-coder/sessions"]
+    return [home / base / app / "sessions"
+            for base in ("Library/Application Support", ".local/share")
+            for app in ("nano-coder", "agentic-harness")]
 
 
 def session_files(args):
