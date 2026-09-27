@@ -284,7 +284,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
-- `/model [provider/model]` - Show or switch the model (conversation is kept)
+- `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/restart` - Start a fresh session (clean context) without exiting
