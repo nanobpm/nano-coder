@@ -466,8 +466,27 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        "/model" => {
+        "/model" if terminal.outstanding => {
+            // Typed during a turn: a stdin read is still pending, so an
+            // interactive picker would race it for keystrokes.
             println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
+            println!("(read-only: run /model again at the prompt to switch)");
+            Ok(true)
+        }
+        "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            // The picker reads keystrokes from stdin and draws on stderr, so it
+            // needs both to be terminals; piped input/output just gets the
+            // current model.
+            println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
+            Ok(true)
+        }
+        "/model" => {
+            if let Some(spec) = settings::pick_model_interactive(agent).await? {
+                agent.set_model(&spec).await?;
+                println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+            } else {
+                println!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name());
+            }
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {

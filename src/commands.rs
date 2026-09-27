@@ -17,7 +17,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/plan", args: "", description: "Show the agent's task plan with notes" },
     Command { name: "/tools", args: "", description: "List available tools" },
     Command { name: "/skills", args: "", description: "List skills the agent can load" },
-    Command { name: "/model", args: "[provider/model]", description: "Show or switch the model" },
+    Command { name: "/model", args: "[provider/model]", description: "Show the model and pick a new one (or switch directly)" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
     Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },

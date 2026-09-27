@@ -75,17 +75,19 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
         let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
         match selection {
             0 => {
-                if let Some(spec) = pick_model(agent, None).await? {
+                if let Some(spec) = pick_model_interactive(agent).await? {
                     switch_model(agent, &spec, &mut changes).await;
                 }
             }
             1 => {
                 if let Some(name) = edit_provider(agent)? {
                     changes.providers.insert(name.clone());
-                    if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()?
-                        && let Some(spec) = pick_model(agent, Some(&name)).await?
-                    {
-                        switch_model(agent, &spec, &mut changes).await;
+                    if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
+                        let (user, default_provider) = agent.config().effective_providers();
+                        let all = providers::effective_providers(&user);
+                        if let Step::Done(spec) = pick_model_from_provider(&name, &all, &user, &default_provider).await? {
+                            switch_model(agent, &spec, &mut changes).await;
+                        }
                     }
                 }
             }
@@ -184,33 +186,94 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
     Ok(())
 }
 
-/// Choose a provider (unless given), then a model from its live model list,
-/// falling back to typing a model ID. Returns a `provider/model` spec.
-async fn pick_model(agent: &Agent, provider: Option<&str>) -> Result<Option<String>> {
+/// Interactive `/model`: show the current model, then pick a provider and one
+/// of its models. Esc at the model list goes back to the provider list; Esc
+/// there leaves the model unchanged. Returns the chosen `provider/model` spec.
+pub async fn pick_model_interactive(agent: &Agent) -> Result<Option<String>> {
+    println!(
+        "Current model: {} (provider {})",
+        agent.model_name(),
+        agent.provider_name()
+    );
     let (user, default_provider) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
-    let name = match provider {
-        Some(name) => name.to_string(),
-        None => {
-            let names: Vec<&String> = all.keys().collect();
-            let labels: Vec<String> = all
-                .iter()
-                .map(|(name, p)| format!("{name:<14} {}", key_status(p)))
-                .chain(["Cancel".to_string()])
-                .collect();
-            let current = agent.provider_name();
-            let default = names.iter().position(|n| n.as_str() == current).unwrap_or(0);
-            let choice = Select::new().with_prompt("Provider").items(&labels).default(default).interact()?;
-            match names.get(choice) {
-                Some(name) => name.to_string(),
+    let mut provider = None;
+    loop {
+        let name = match provider.take() {
+            Some(name) => name,
+            None => match pick_provider(agent, &all)? {
+                Some(name) => name,
                 None => return Ok(None),
-            }
+            },
+        };
+        match pick_model_from_provider(&name, &all, &user, &default_provider).await? {
+            Step::Done(spec) => return Ok(Some(spec)),
+            Step::Back => continue,
         }
-    };
-    let default_model = all.get(&name).and_then(|p| p.default_model.clone()).unwrap_or_default();
+    }
+}
+
+/// Where a picker step goes next: a choice was made, or Esc steps back.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Done(String),
+    Back,
+}
+
+/// What a selection in the model list means: `choice` is the highlighted row
+/// (`None` when Esc was pressed) among `models` plus the trailing "Other
+/// (type a model ID)" and "Back to providers" rows.
+fn model_choice(choice: Option<usize>, models: &[String]) -> Step {
+    match choice {
+        None => Step::Back,
+        Some(i) if i < models.len() => Step::Done(models[i].clone()),
+        Some(i) if i == models.len() => Step::Done(String::new()), // "Other": the caller prompts for an ID
+        Some(_) => Step::Back,                                     // "Back to providers"
+    }
+}
+
+/// The `provider/model` spec for a chosen or typed model ID; empty means the
+/// user wants to go back to the provider list.
+fn model_spec(provider: &str, model: &str) -> Step {
+    let model = model.trim();
+    if model.is_empty() { Step::Back } else { Step::Done(format!("{provider}/{model}")) }
+}
+
+/// Scrollable list of the configured providers, with the current provider
+/// pre-selected. Esc (or the Cancel row) returns `None`.
+fn pick_provider(agent: &Agent, all: &std::collections::BTreeMap<String, ProviderConfig>) -> Result<Option<String>> {
+    let names: Vec<&String> = all.keys().collect();
+    let labels: Vec<String> = all
+        .iter()
+        .map(|(name, p)| format!("{name:<14} {}", key_status(p)))
+        .chain(["Cancel".to_string()])
+        .collect();
+    let current = agent.provider_name();
+    let default = names.iter().position(|n| n.as_str() == current).unwrap_or(0);
+    let choice = Select::new()
+        .with_prompt("Provider (↑/↓ to scroll, Enter to select, Esc to keep the current model)")
+        .items(&labels)
+        .default(default)
+        .interact_opt()?;
+    match choice.and_then(|i| names.get(i)) {
+        Some(name) => Ok(Some(name.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// Scrollable list of the provider's live models, falling back to typing a
+/// model ID when the list cannot be fetched. Esc (or the Back row) returns
+/// `Step::Back` so the caller shows the provider list again.
+async fn pick_model_from_provider(
+    name: &str,
+    all: &std::collections::BTreeMap<String, ProviderConfig>,
+    user: &std::collections::HashMap<String, ProviderConfig>,
+    default_provider: &str,
+) -> Result<Step> {
+    let default_model = all.get(name).and_then(|p| p.default_model.clone()).unwrap_or_default();
 
     println!("Fetching models from {name}...");
-    let models = match providers::build_lister(&name, &user, &default_provider) {
+    let models = match providers::build_lister(name, user, default_provider) {
         Ok(client) => match tokio::time::timeout(LIST_MODELS_TIMEOUT, client.list_models()).await {
             Ok(Ok(models)) => models,
             Ok(Err(e)) => {
@@ -229,27 +292,34 @@ async fn pick_model(agent: &Agent, provider: Option<&str>) -> Result<Option<Stri
     };
 
     let model = if models.is_empty() {
-        let mut input = Input::<String>::new().with_prompt("Model ID").allow_empty(true);
-        if !default_model.is_empty() {
-            input = input.default(default_model);
-        }
-        input.interact_text()?
+        // No default: pressing Enter on blank input must go back to the
+        // provider list, which a dialoguer default would swallow by returning
+        // the default model instead of an empty string.
+        Input::<String>::new()
+            .with_prompt("Model ID (empty to go back to the provider list)")
+            .allow_empty(true)
+            .interact_text()?
     } else {
         let mut labels = models.clone();
         labels.push("Other (type a model ID)".into());
-        labels.push("Cancel".into());
+        labels.push("Back to providers".into());
         let default = models.iter().position(|m| *m == default_model).unwrap_or(0);
-        let choice = Select::new().with_prompt("Model").items(&labels).default(default).max_length(15).interact()?;
-        if choice == models.len() {
-            Input::<String>::new().with_prompt("Model ID").interact_text()?
-        } else if choice > models.len() {
-            return Ok(None);
-        } else {
-            models[choice].clone()
+        let choice = Select::new()
+            .with_prompt(format!("Model from {name} (Esc to go back)"))
+            .items(&labels)
+            .default(default)
+            .max_length(15)
+            .interact_opt()?;
+        match model_choice(choice, &models) {
+            Step::Back => return Ok(Step::Back),
+            Step::Done(picked) if picked.is_empty() => Input::<String>::new()
+                .with_prompt("Model ID (empty to go back to the provider list)")
+                .allow_empty(true)
+                .interact_text()?,
+            Step::Done(picked) => picked,
         }
     };
-    let model = model.trim();
-    Ok(Some(if model.is_empty() { name } else { format!("{name}/{model}") }))
+    Ok(model_spec(name, &model))
 }
 
 /// Add a provider or edit an existing one. Returns its name.
@@ -464,6 +534,24 @@ fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_choice_maps_rows_to_steps() {
+        let models = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(model_choice(None, &models), Step::Back, "Esc steps back");
+        assert_eq!(model_choice(Some(0), &models), Step::Done("alpha".into()));
+        assert_eq!(model_choice(Some(1), &models), Step::Done("beta".into()));
+        assert_eq!(model_choice(Some(2), &models), Step::Done(String::new()), "Other prompts for an ID");
+        assert_eq!(model_choice(Some(3), &models), Step::Back, "Back to providers");
+    }
+
+    #[test]
+    fn model_spec_builds_provider_slash_model_or_goes_back() {
+        assert_eq!(model_spec("work", "llama3"), Step::Done("work/llama3".into()));
+        assert_eq!(model_spec("work", "  qwen3  "), Step::Done("work/qwen3".into()), "IDs are trimmed");
+        assert_eq!(model_spec("work", ""), Step::Back, "empty ID goes back");
+        assert_eq!(model_spec("work", "   "), Step::Back, "blank ID goes back");
+    }
 
     #[test]
     fn save_updates_only_changed_keys_and_keeps_comments() {
