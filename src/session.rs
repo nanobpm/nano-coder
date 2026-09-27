@@ -46,6 +46,9 @@ pub enum Record {
         /// Reported with `report_outcome` during the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::goal::Outcome>,
+        /// `history_search` / `history_read` calls made during the turn.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        history_calls: u32,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The conversation was replaced wholesale (compaction, system-prompt reset).
@@ -55,6 +58,15 @@ pub enum Record {
         /// mid-turn): the index of its user message in `messages`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_position: Option<usize>,
+        /// Compaction only: first and last log line folded into the summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summarized: Option<(u64, u64)>,
+        /// Compaction only: `standard` or `smart`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::config::CompactionMode>,
+        /// Compaction only: the `provider/model` in use, for comparing modes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
@@ -87,9 +99,20 @@ pub struct Restored {
     pub plan: Option<crate::plan::Plan>,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 pub struct SessionLog {
     path: PathBuf,
     file: File,
+    /// Committed records in the file (the last line number written).
+    lines: u64,
+}
+
+/// Directory for complete copies of truncated tool output of session `id`.
+pub fn spill_dir_for(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.spill"))
 }
 
 pub fn default_dir() -> PathBuf {
@@ -142,7 +165,7 @@ impl SessionLog {
             created_at: now(),
         })?)?;
         file.sync_data()?;
-        Ok(Self { path, file })
+        Ok(Self { path, file, lines: 1 })
     }
 
     pub fn open(dir: &Path, id: &str) -> Result<(Self, Restored)> {
@@ -163,21 +186,24 @@ impl SessionLog {
             // Drop a torn trailing record so later appends stay line-aligned.
             file.set_len(committed as u64)?;
         }
-        Ok((Self { path, file }, restored))
+        let lines = bytes[..committed].split(|&b| b == b'\n').filter(|l| !l.is_empty()).count() as u64;
+        Ok((Self { path, file, lines }, restored))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn append(&mut self, record: &Record) -> Result<()> {
+    /// Append a record; returns its 1-based line number in the log.
+    pub fn append(&mut self, record: &Record) -> Result<u64> {
         self.file
             .write_all(&encode(record)?)
             .with_context(|| format!("append to session log {}", self.path.display()))?;
         if matches!(record, Record::TurnEnd { .. } | Record::Replace { .. }) {
             self.file.sync_data()?;
         }
-        Ok(())
+        self.lines += 1;
+        Ok(self.lines)
     }
 }
 
@@ -202,7 +228,10 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             Record::Input { id, text, .. } => {
                 restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
             }
-            Record::Message(message) => restored.conversation.push(message),
+            Record::Message(mut message) => {
+                message.log_line.get_or_insert(index as u64 + 1);
+                restored.conversation.push(message);
+            }
             Record::TurnEnd { input_id, response, outcome, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
                     restored.pending_input = None;
@@ -247,7 +276,7 @@ mod tests {
     }
 
     fn turn_end(id: &str) -> Record {
-        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, recorded_at: now() }
+        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, history_calls: 0, recorded_at: now() }
     }
 
     #[test]
@@ -278,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s2").unwrap();
         log.append(&Record::Message(Message::user("a"))).unwrap();
-        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, recorded_at: now() })
+        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, summarized: None, mode: None, model: None, recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
@@ -292,7 +321,7 @@ mod tests {
         log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
         log.append(&Record::Message(Message::user("go"))).unwrap();
         let messages = vec![Message::system("sys"), Message::user("summary"), Message::user("go")];
-        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), recorded_at: now() })
+        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), summarized: None, mode: None, model: None, recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();

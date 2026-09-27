@@ -16,6 +16,7 @@ mod config;
 mod context;
 mod files;
 mod goal;
+mod history;
 mod hooks;
 mod instructions;
 mod plan;
@@ -76,6 +77,7 @@ fn register_builtin_tools(agent: &mut Agent) {
         default_timeout: std::time::Duration::from_secs(agent.config().bash_timeout_secs.max(1)),
         cancel: Some(agent.control().cancel_flag()),
         sandbox: agent.config().sandbox.clone(),
+        shared_output_dir: Some(agent.spill_dir_handle()),
         ..Default::default()
     };
     agent.tools().register(bash::definition(), Box::new(move |args| {
@@ -648,12 +650,13 @@ async fn prompt_cap_reached(
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
 async fn run_compaction(
     agent: &mut Agent,
+    mode: Option<config::CompactionMode>,
     instructions: Option<&str>,
     terminal: &mut Terminal,
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
     let stats = agent.context_stats();
-    let compaction = agent.compact(instructions);
+    let compaction = agent.compact(mode, instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
     loop {
@@ -701,9 +704,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
-            let instructions = cmd["/compact".len()..].trim().to_string();
+            let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
+            let focus = focus.map(str::to_string);
             println!("Compacting...");
-            match run_compaction(agent, Some(instructions.as_str()).filter(|i| !i.is_empty()), terminal).await? {
+            match run_compaction(agent, mode, focus.as_deref(), terminal).await? {
                 Some(report) => println!("Conversation {report}"),
                 None => println!("Nothing to compact"),
             }
@@ -748,6 +752,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                     stats.compactions
                 ),
                 None => println!("Auto-compact: off"),
+            }
+            println!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str());
+            if stats.history_searches + stats.history_reads > 0 {
+                println!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads);
             }
             println!("(context window {})", agent.context_window_with_source().1);
             Ok(true)

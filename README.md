@@ -102,8 +102,8 @@ instead of guessing from the stop reason: `blocked` means the model needs help (
 escalation). Redelivering the input returns the same outcome. See [Outcomes](#outcomes).
 
 **Slash commands work via ACP too:**
-- `/compact [focus]` - summarizes the conversation; the result has `compacted`, `before`,
-  `after`, `tokensBefore`, `tokensAfter`, `summarized` and `fallback`
+- `/compact [--smart|--standard] [focus]` - summarizes the conversation; the result has
+  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode` and `fallback`
 - `/settings` - returns current settings as JSON
 - `/tools` - lists registered tools
 - `/plan` - returns `plan` (JSON) and `text` (the rendered plan)
@@ -271,8 +271,10 @@ list. Tab completes the command, or the part all matches share. Esc hides the li
 list is built from the same table as `/help` (`src/commands.rs`).
 
 - `/help` - Show available commands
-- `/compact [focus]` - Summarize older messages with the current model, keeping the latest
-  message. Optional text tells the summary what to focus on. Esc Esc or Ctrl-C cancels
+- `/compact [--smart|--standard] [focus]` - Summarize older messages with the current model,
+  keeping the latest message. `--smart` / `--standard` override `compaction_mode` for this
+  compaction (see [Smart compaction](#smart-compaction-experimental)). Optional text tells the
+  summary what to focus on. Esc Esc or Ctrl-C cancels
 - `/verbosity [quiet|normal|verbose|debug]` - Show or set how much is printed (see below)
 - `/context` - Show context usage, window, session token totals, AI Credits (GitHub Copilot), auto-compaction state and the loaded instruction files
 - `/settings` - Interactive settings menu:
@@ -282,7 +284,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
   - **Turn cap** (`max_iterations`): LLM calls per input; normal mode asks before stopping
-  - **Context**: auto-compaction on/off, threshold, context-window override
+  - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
     (`--config` or `~/.config/nano-coder/config.toml`), keeping comments and
@@ -336,6 +338,7 @@ persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
+compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
@@ -558,6 +561,36 @@ another 10% of the window, so a context that can't shrink isn't summarized on ev
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.
 
+### Smart compaction (experimental)
+
+A summary is lossy: whatever it leaves out is gone for the agent, even though the session
+log still has every original message. Smart compaction keeps the whole history reachable.
+It is off by default (`compaction_mode = "standard"`); try it on one compaction with
+`/compact --smart`, or set `compaction_mode = "smart"` to use it for auto-compaction too.
+It needs a session log, and falls back to a standard summary when `persist_sessions` is off.
+
+- **Message IDs.** A message's ID is the line of the session log where it was first
+  recorded, shown as `#N`. IDs are stable across compactions and `--resume`.
+- **Citing summary.** The summarizer sees each message labelled `[#N]` and is asked to cite
+  `(#N)` for details whose exact text may matter (errors, commands, outputs, the user's
+  wording) instead of copying them. The summary ends with the range it covers and a note
+  that the originals can be retrieved. Tool results clipped at compaction point at their ID.
+- **History tools.** Once a smart summary is in the context, the agent gets two tools
+  over the current session's log (and only that one):
+  - `history_search(pattern, role?, before?, after?, limit?)` - case-insensitive regex (or
+    plain text) search, newest first, one `#N role name (time): snippet` line per match.
+    Earlier history lookups are not searched.
+  - `history_read(id, max_output_length?)` - one message in full, bounded like other tool
+    output (the whole is spilled to a file when it is longer).
+  Before a smart compaction the tools are not offered, so they cost nothing.
+
+To judge whether it helps, the log records each compaction's `mode`, `model` and the
+`summarized` line range (on the `replace` record), and each turn's `history_calls` (on
+`turn_end`). `/context` shows the mode and this session's history-tool use.
+`scripts/compaction-report.py [SESSION_DIR]` tabulates compacted sessions by model and mode:
+compactions, turns after the first compaction, turns that used the history tools, and
+reported outcomes. See [#29](https://github.com/nanobpm/nano-coder/issues/29) for the design.
+
 ## Project Instructions
 
 When a session starts, the harness looks for instruction files in every directory from the
@@ -675,6 +708,8 @@ Resume a session with `--resume <id>` or ACP `session/load`.
 Record times and each message's `timestamp` are RFC 3339 with the local UTC offset
 (for example `2026-09-24T13:02:12.44+12:00`). Older logs with UTC times still load.
 
+- Truncated tool output is kept whole in `<session_dir>/<id>.spill/`, so the paths in the
+  log stay valid after the process exits (temporary directory when sessions are not persisted).
 - An unsupported format version is an explicit error on resume.
 - Only records ending in a newline count as committed. A half-written last line from a
   crash is discarded and truncated before the next write.

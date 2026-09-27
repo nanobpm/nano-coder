@@ -277,8 +277,9 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
 
             // Handle /compact [instructions] via ACP
             if command == "/compact" || command.starts_with("/compact ") {
-                let instructions = command.strip_prefix("/compact").map(str::trim).filter(|i| !i.is_empty());
-                return Some(match agent.compact(instructions).await {
+                let args = command.strip_prefix("/compact").unwrap_or_default();
+                let (mode, instructions) = crate::commands::parse_compact_args(args);
+                return Some(match agent.compact(mode, instructions).await {
                     Err(e) => error(id, -32603, format!("{e:#}")),
                     Ok(None) => result(id, json!({ "stopReason": "end_turn", "compacted": false })),
                     Ok(Some(report)) => result(
@@ -291,6 +292,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             "tokensBefore": report.tokens_before,
                             "tokensAfter": report.tokens_after,
                             "summarized": report.summarized,
+                            "mode": report.mode.as_str(),
                             "fallback": report.fallback,
                         }),
                     ),

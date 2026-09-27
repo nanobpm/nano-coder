@@ -66,9 +66,10 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             format!("Turn cap         {} LLM calls per input (normal mode asks before stopping)", config.max_iterations),
             "System prompt".to_string(),
             format!(
-                "Context          {} window, auto-compact {}",
+                "Context          {} window, auto-compact {}, {} compaction",
                 crate::context::format_tokens(agent.context_window()),
-                if config.auto_compact { format!("at {:.0}%", config.auto_compact_threshold * 100.0) } else { "off".into() }
+                if config.auto_compact { format!("at {:.0}%", config.auto_compact_threshold * 100.0) } else { "off".into() },
+                config.compaction_mode.as_str()
             ),
             format!("Verbosity        {} ({})", config.verbosity, config.verbosity.describe()),
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
@@ -184,6 +185,12 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
     } else {
         config.auto_compact_threshold
     };
+    let modes = ["standard: summary only", "smart (experimental): summary cites the session log; history tools recover originals"];
+    let current = usize::from(config.compaction_mode == crate::config::CompactionMode::Smart);
+    let mode = match Select::new().with_prompt("Compaction mode").items(&modes).default(current).interact()? {
+        1 => crate::config::CompactionMode::Smart,
+        _ => crate::config::CompactionMode::Standard,
+    };
     let window: usize = Input::new()
         .with_prompt("Context window in tokens (0 = from provider/model)")
         .default(config.context_window.unwrap_or(0))
@@ -191,6 +198,7 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
     let config = agent.config_mut();
     config.auto_compact = auto;
     config.auto_compact_threshold = threshold;
+    config.compaction_mode = mode;
     config.context_window = (window > 0).then_some(window);
     agent.refresh_stats();
     Ok(())
@@ -501,6 +509,7 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     if changes.compaction {
         doc["auto_compact"] = toml_edit::value(config.auto_compact);
         doc["auto_compact_threshold"] = toml_edit::value(config.auto_compact_threshold);
+        doc["compaction_mode"] = toml_edit::value(config.compaction_mode.as_str());
         match config.context_window {
             Some(window) => doc["context_window"] = toml_edit::value(window as i64),
             None => {

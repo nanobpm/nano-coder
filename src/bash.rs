@@ -32,6 +32,8 @@ pub struct BashConfig {
     pub cancel: Option<Arc<AtomicBool>>,
     /// OS sandbox for the command (see `sandbox.rs`).
     pub sandbox: SandboxConfig,
+    /// When set, overrides `output_dir` (the agent's per-session spill dir).
+    pub shared_output_dir: Option<Arc<std::sync::RwLock<PathBuf>>>,
 }
 
 impl Default for BashConfig {
@@ -43,6 +45,7 @@ impl Default for BashConfig {
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             cancel: None,
             sandbox: SandboxConfig::default(),
+            shared_output_dir: None,
         }
     }
 }
@@ -117,11 +120,15 @@ pub fn run(config: &BashConfig, args: &Value) -> String {
 }
 
 fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String> {
-    fs::create_dir_all(&config.output_dir)
-        .map_err(|e| format!("create output directory {}: {e}", config.output_dir.display()))?;
+    let output_dir = match &config.shared_output_dir {
+        Some(shared) => shared.read().unwrap().clone(),
+        None => config.output_dir.clone(),
+    };
+    fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("create output directory {}: {e}", output_dir.display()))?;
     let call = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
-    let out_path = config.output_dir.join(format!("bash-{call}.stdout"));
-    let err_path = config.output_dir.join(format!("bash-{call}.stderr"));
+    let out_path = output_dir.join(format!("bash-{call}.stdout"));
+    let err_path = output_dir.join(format!("bash-{call}.stderr"));
     let create = |path: &Path| File::create(path).map_err(|e| format!("create {}: {e}", path.display()));
 
     let cwd = match &config.working_dir {

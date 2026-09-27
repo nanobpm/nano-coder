@@ -460,6 +460,8 @@ mod tests {
             session_output_tokens: 12_400,
             session_aic: None,
             compactions: 1,
+            history_searches: 0,
+            history_reads: 0,
             auto_compact: Some(0.8),
             activity: Activity::Tool("bash".into()),
             plan: Some((2, 5)),

@@ -49,6 +49,11 @@ pub struct Message {
     /// offset. Kept in the session log; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<chrono::DateTime<chrono::FixedOffset>>,
+    /// Line of the session log where this message was first recorded (its
+    /// stable `#N` ID for the history tools). Not sent to providers; written
+    /// to the log only inside `replace` records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_line: Option<u64>,
 }
 
 impl Message {
@@ -62,6 +67,7 @@ impl Message {
             tool_call_id: None,
             name: None,
             timestamp: None,
+            log_line: None,
         }
     }
 

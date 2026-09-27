@@ -10,7 +10,7 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command { name: "/help", args: "", description: "Show this help" },
-    Command { name: "/compact", args: "[focus]", description: "Summarize older messages to free context (optional focus)" },
+    Command { name: "/compact", args: "[--smart|--standard] [focus]", description: "Summarize older messages to free context (optional mode and focus)" },
     Command { name: "/context", args: "", description: "Show context-window use and token totals" },
     Command { name: "/settings", args: "", description: "View/edit settings" },
     Command { name: "/verbosity", args: "[quiet|normal|verbose|debug]", description: "Show or set output detail" },
@@ -25,6 +25,19 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/exit", args: "", description: "Exit the agent" },
     Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
 ];
+
+/// Split `/compact` arguments into a one-off mode override and the focus.
+pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>, Option<&str>) {
+    let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let mode = match first {
+        "--smart" => Some(crate::config::CompactionMode::Smart),
+        "--standard" => Some(crate::config::CompactionMode::Standard),
+        _ => None,
+    };
+    let focus = if mode.is_some() { rest.trim() } else { args };
+    (mode, Some(focus).filter(|f| !f.is_empty()))
+}
 
 /// Commands whose name starts with `prefix`.
 pub fn matching(prefix: &str) -> Vec<&'static Command> {
@@ -127,7 +140,7 @@ mod tests {
         assert_eq!(menu("/", 200, 50).len(), COMMANDS.len());
         let rows: Vec<String> = menu("/co", 200, 50).iter().map(|r| plain(r)).collect();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].trim_start().starts_with("/compact [focus]") && rows[1].trim_start().starts_with("/context"));
+        assert!(rows[0].trim_start().starts_with("/compact [--smart|--standard] [focus]") && rows[1].trim_start().starts_with("/context"));
         assert!(plain(&menu("/zz", 200, 50)[0]).contains("no matching command"));
         assert!(menu("/model gpt", 200, 50).is_empty(), "arguments hide the menu");
         assert!(menu("hello /", 200, 50).is_empty());
@@ -150,6 +163,15 @@ mod tests {
         assert_eq!(complete("/c").as_deref(), Some("/co"));
         assert_eq!(complete("/co"), None, "already the common prefix");
         assert_eq!(complete("/x"), None);
+    }
+
+    #[test]
+    fn compact_args_take_an_optional_mode_then_focus() {
+        use crate::config::CompactionMode::*;
+        assert_eq!(parse_compact_args(""), (None, None));
+        assert_eq!(parse_compact_args(" the auth bug "), (None, Some("the auth bug")));
+        assert_eq!(parse_compact_args("--smart"), (Some(Smart), None));
+        assert_eq!(parse_compact_args("--standard  keep paths"), (Some(Standard), Some("keep paths")));
     }
 
     #[test]

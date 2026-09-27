@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-use crate::config::Config;
+use crate::config::{CompactionMode, Config};
+use crate::history;
 use crate::context::{self, Activity, SharedStats};
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
@@ -324,13 +325,16 @@ pub struct CompactReport {
     pub summarized: usize,
     /// Why summarizing failed, when messages were dropped instead.
     pub fallback: Option<String>,
+    /// The mode the compaction ran in.
+    pub mode: CompactionMode,
 }
 
 impl std::fmt::Display for CompactReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "compacted {} messages: ~{} -> ~{} tokens ({} -> {} messages)",
+            "{}compacted {} messages: ~{} -> ~{} tokens ({} -> {} messages)",
+            if self.mode == CompactionMode::Smart { "smart-" } else { "" },
             self.summarized,
             context::format_tokens(self.tokens_before),
             context::format_tokens(self.tokens_after),
@@ -403,6 +407,11 @@ pub struct Agent {
     /// Rendezvous for the `question` tool: the handler blocks here until the
     /// turn loop answers.
     questions: crate::question::QuestionBroker,
+    /// Where truncated tool output is kept whole (per session when persisted);
+    /// shared with the bash tool.
+    spill_dir: Arc<RwLock<std::path::PathBuf>>,
+    /// History-tool calls in the current turn.
+    turn_history_calls: u32,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -440,6 +449,8 @@ impl Agent {
             reminders: Reminders::default(),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
+            spill_dir: Arc::new(RwLock::new(output::spill_dir())),
+            turn_history_calls: 0,
         }
     }
 
@@ -729,6 +740,34 @@ impl Agent {
         self.session.as_ref().map(SessionLog::path)
     }
 
+    /// Directory for complete copies of truncated tool output, shared so the
+    /// bash tool follows session changes.
+    pub fn spill_dir_handle(&self) -> Arc<RwLock<std::path::PathBuf>> {
+        self.spill_dir.clone()
+    }
+
+    fn spill_dir(&self) -> std::path::PathBuf {
+        self.spill_dir.read().unwrap().clone()
+    }
+
+    /// Persisted sessions keep spilled output beside their log, so the paths
+    /// in the log stay valid after the process exits.
+    fn set_spill_dir(&self, id: &str) {
+        let dir = if self.session.is_some() {
+            session::spill_dir_for(&self.config.session_dir(), id)
+        } else {
+            output::spill_dir()
+        };
+        *self.spill_dir.write().unwrap() = dir;
+    }
+
+    /// Whether the history tools are offered: a smart summary is in context
+    /// and there is a session log to read.
+    fn history_tools_enabled(&self) -> bool {
+        self.session.is_some()
+            && self.conversation.iter().any(|m| m.role == Role::User && m.content.starts_with(context::SMART_SUMMARY_PREFIX))
+    }
+
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
@@ -760,6 +799,7 @@ impl Agent {
         self.reminders = Reminders::default();
         self.session = session;
         self.session_id = Some(id.clone());
+        self.set_spill_dir(&id);
         self.calibration = None;
         self.compact_floor = 0;
         {
@@ -771,6 +811,8 @@ impl Agent {
             stats.session_output_tokens = 0;
             stats.session_aic = None;
             stats.compactions = 0;
+            stats.history_searches = 0;
+            stats.history_reads = 0;
         }
         // Each session starts in the default mode; a plan/auto selection does
         // not leak across `/restart` or a later session load.
@@ -796,6 +838,7 @@ impl Agent {
         self.plan = restored.plan.unwrap_or_default();
         self.session = Some(log);
         self.session_id = Some(id.to_string());
+        self.set_spill_dir(id);
         self.calibration = None;
         self.compact_floor = 0;
         self.repair_dangling_tool_calls()?;
@@ -835,19 +878,26 @@ impl Agent {
     fn push(&mut self, mut message: Message) -> Result<()> {
         message.timestamp.get_or_insert_with(session::now);
         if let Some(log) = &mut self.session {
-            log.append(&Record::Message(message.clone()))?;
+            let line = log.append(&Record::Message(message.clone()))?;
+            message.log_line.get_or_insert(line);
         }
         self.conversation.push(message);
         Ok(())
     }
 
     fn replace_conversation(&mut self, messages: Vec<Message>) -> Result<()> {
-        self.replace_keeping_pending(messages, None)
+        self.replace_keeping_pending(messages, None, None)
     }
 
     /// Replace the conversation; `pending_position` keeps the in-flight input
     /// alive with its user message at that index.
-    fn replace_keeping_pending(&mut self, mut messages: Vec<Message>, pending_position: Option<usize>) -> Result<()> {
+    /// `compaction` records the folded log-line range and mode.
+    fn replace_keeping_pending(
+        &mut self,
+        mut messages: Vec<Message>,
+        pending_position: Option<usize>,
+        compaction: Option<(Option<(u64, u64)>, CompactionMode)>,
+    ) -> Result<()> {
         let now = session::now();
         for message in &mut messages {
             message.timestamp.get_or_insert(now);
@@ -856,6 +906,9 @@ impl Agent {
             log.append(&Record::Replace {
                 messages: messages.clone(),
                 pending_position,
+                summarized: compaction.and_then(|(range, _)| range),
+                mode: compaction.map(|(_, mode)| mode),
+                model: compaction.map(|_| self.config.model.clone()),
                 recorded_at: now,
             })?;
         }
@@ -972,6 +1025,9 @@ impl Agent {
         if !self.skills.is_empty() {
             tools.push(skills::definition());
         }
+        if self.history_tools_enabled() {
+            tools.extend(history::definitions());
+        }
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
         if self.control.mode() == crate::mode::AgentMode::Plan {
@@ -1016,6 +1072,7 @@ impl Agent {
         self.control.start_turn();
         self.reminders.start_turn();
         self.apply_mode_to_system_prompt();
+        self.turn_history_calls = 0;
         let resuming = self
             .pending_input
             .clone()
@@ -1149,7 +1206,7 @@ impl Agent {
             self.hooks.trigger(&ctx);
 
             if self.over_threshold() {
-                self.compact_logged(CompactTrigger::Threshold, None).await?;
+                self.compact_logged(CompactTrigger::Threshold, self.config.compaction_mode, None).await?;
                 if self.control.is_cancelled() {
                     cancelled = true;
                     break;
@@ -1279,7 +1336,7 @@ impl Agent {
                             context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000),
                         );
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
-                        let compacted = self.compact_logged(CompactTrigger::Overflow, None).await?;
+                        let compacted = self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
                         if compacted.is_none() || self.control.is_cancelled() {
                             if self.control.is_cancelled() {
                                 break None;
@@ -1347,6 +1404,7 @@ impl Agent {
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
+                let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
                 let result = if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
@@ -1359,6 +1417,8 @@ impl Agent {
                     self.run_plan_tool(tool_call)
                 } else if is_skill_tool {
                     self.skills.load(&tool_call.arguments).map(Value::String)
+                } else if is_history_tool {
+                    self.run_history_tool(tool_call).map(Value::String)
                 } else if is_outcome_tool {
                     Outcome::from_args(&tool_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
@@ -1394,9 +1454,9 @@ impl Agent {
                     result_text.push_str(&nested);
                 }
                 // bash, read_file and load_skill bound their own output (and bash keeps the whole).
-                if !matches!(tool_call.name.as_str(), "bash" | "read_file") && !is_skill_tool {
+                if !matches!(tool_call.name.as_str(), "bash" | "read_file" | history::READ_TOOL) && !is_skill_tool {
                     let name = format!("tool-{}-{}.txt", sanitize(&tool_call.id), sanitize(&tool_call.name));
-                    result_text = output::bound_and_spill(&result_text, self.tool_output_limit, &output::spill_dir(), &name);
+                    result_text = output::bound_and_spill(&result_text, self.tool_output_limit, &self.spill_dir(), &name);
                 }
                 if self.config.reminders && !is_plan_tool && !is_outcome_tool {
                     for note in self.reminders.after_tool_call(&self.plan) {
@@ -1460,6 +1520,7 @@ impl Agent {
                 input_id: input_id.clone(),
                 response: response.clone(),
                 outcome: outcome.clone(),
+                history_calls: self.turn_history_calls,
                 recorded_at: session::now(),
             })?;
         }
@@ -1474,10 +1535,12 @@ impl Agent {
 
     /// Summarize older messages into one, keeping recent messages (and the
     /// in-flight turn's user message) verbatim. `instructions` steer what the
-    /// summary focuses on. Returns `None` when there is nothing to compact.
-    pub async fn compact(&mut self, instructions: Option<&str>) -> Result<Option<CompactReport>> {
+    /// summary focuses on; `mode` overrides `compaction_mode` for this call.
+    /// Returns `None` when there is nothing to compact.
+    pub async fn compact(&mut self, mode: Option<CompactionMode>, instructions: Option<&str>) -> Result<Option<CompactReport>> {
         self.control.start_turn();
-        let report = self.compact_logged(CompactTrigger::Manual, instructions).await;
+        let mode = mode.unwrap_or(self.config.compaction_mode);
+        let report = self.compact_logged(CompactTrigger::Manual, mode, instructions).await;
         self.set_activity(Activity::Idle);
         report
     }
@@ -1492,9 +1555,14 @@ impl Agent {
         tokens as f64 > window as f64 * threshold && tokens > self.compact_floor + window / 10
     }
 
-    async fn compact_logged(&mut self, trigger: CompactTrigger, instructions: Option<&str>) -> Result<Option<CompactReport>> {
+    async fn compact_logged(
+        &mut self,
+        trigger: CompactTrigger,
+        mode: CompactionMode,
+        instructions: Option<&str>,
+    ) -> Result<Option<CompactReport>> {
         self.set_activity(Activity::Compacting);
-        let report = self.compact_with(trigger, instructions).await?;
+        let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
             if trigger != CompactTrigger::Manual {
@@ -1507,7 +1575,16 @@ impl Agent {
         Ok(report)
     }
 
-    async fn compact_with(&mut self, trigger: CompactTrigger, instructions: Option<&str>) -> Result<Option<CompactReport>> {
+    async fn compact_with(
+        &mut self,
+        trigger: CompactTrigger,
+        mode: CompactionMode,
+        instructions: Option<&str>,
+    ) -> Result<Option<CompactReport>> {
+        // Smart compaction points into the session log; without one it
+        // falls back to a plain summary.
+        let mode = if self.session.is_some() { mode } else { CompactionMode::Standard };
+        let smart = mode == CompactionMode::Smart;
         let window = self.context_window();
         let body_start = usize::from(self.conversation.first().is_some_and(|m| m.role == Role::System));
         let len = self.conversation.len();
@@ -1546,12 +1623,19 @@ impl Agent {
         }
 
         let summary_input_chars = window.saturating_sub(context::SUMMARY_MAX_TOKENS as usize + 2_000).max(2_000) * 3;
-        let transcript = context::render_transcript(summarized, summary_input_chars);
+        let transcript = context::render_transcript(summarized, summary_input_chars, smart);
+        let lines: Vec<u64> = summarized.iter().filter_map(|m| m.log_line).collect();
+        let range = lines.iter().min().zip(lines.iter().max()).map(|(a, b)| (*a, *b));
         let mut request_text = format!("Conversation to summarize:\n\n{transcript}");
         if let Some(focus) = instructions.map(str::trim).filter(|f| !f.is_empty()) {
             request_text.push_str(&format!("\n\nWhen summarizing, focus on: {focus}"));
         }
-        let summary_messages = [Message::system(context::SUMMARY_SYSTEM_PROMPT), Message::user(&request_text)];
+        let system_prompt = if smart {
+            format!("{}{}", context::SUMMARY_SYSTEM_PROMPT, context::SMART_SUMMARY_INSTRUCTIONS)
+        } else {
+            context::SUMMARY_SYSTEM_PROMPT.to_string()
+        };
+        let summary_messages = [Message::system(&system_prompt), Message::user(&request_text)];
         let request = ChatRequest {
             messages: &summary_messages,
             tools: &[],
@@ -1566,10 +1650,15 @@ impl Agent {
         let (summary, fallback) = match result {
             Ok(response) if !response.content.trim().is_empty() => {
                 self.record_usage(&response, false);
-                (format!("{}\n{}", context::SUMMARY_PREFIX, response.content.trim()), None)
+                let summary = if smart {
+                    format!("{}\n{}\n\n{}", context::SMART_SUMMARY_PREFIX, response.content.trim(), context::smart_summary_note(range))
+                } else {
+                    format!("{}\n{}", context::SUMMARY_PREFIX, response.content.trim())
+                };
+                (summary, None)
             }
-            Ok(_) => (self.dropped_note(summarized.len()), Some("empty summary".to_string())),
-            Err(e) => (self.dropped_note(summarized.len()), Some(format!("{e:#}"))),
+            Ok(_) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some("empty summary".to_string())),
+            Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
 
         let mut messages: Vec<Message> = self.conversation[..body_start].to_vec();
@@ -1592,12 +1681,17 @@ impl Agent {
         if trigger != CompactTrigger::Manual {
             // A single huge tool result can still overflow on its own.
             for message in messages.iter_mut().skip(body_start + 1).filter(|m| m.role == Role::Tool) {
-                context::clip_message(message, (window / 8).max(1_000));
+                if context::clip_message(message, (window / 8).max(1_000))
+                    && smart
+                    && let Some(line) = message.log_line
+                {
+                    message.content.push_str(&format!("\n[clipped at compaction; history_read #{line} has it whole]"));
+                }
             }
         }
 
         let summarized = split - body_start;
-        self.replace_keeping_pending(messages, pending_position)?;
+        self.replace_keeping_pending(messages, pending_position, Some((range, mode)))?;
         if let Some(instructions) = &mut self.instructions {
             instructions.forget_nested();
         }
@@ -1608,6 +1702,7 @@ impl Agent {
             tokens_after: self.estimate_context_tokens().0,
             summarized,
             fallback,
+            mode,
         }))
     }
 
@@ -1624,8 +1719,29 @@ impl Agent {
         self.tool_output_limit = limit;
     }
 
-    fn dropped_note(&self, count: usize) -> String {
-        format!("[{count} earlier messages were removed to fit the context window; no summary is available]")
+    /// Stand-in for a failed summary. Given the dropped log range (smart
+    /// mode), it is a smart summary too, so the history tools stay offered.
+    fn dropped_note(&self, count: usize, range: Option<(u64, u64)>) -> String {
+        let note = format!("[{count} earlier messages were removed to fit the context window; no summary is available]");
+        match range {
+            Some(range) => format!("{}\n{note}\n\n{}", context::SMART_SUMMARY_PREFIX, context::smart_summary_note(Some(range))),
+            None => note,
+        }
+    }
+
+    fn run_history_tool(&mut self, call: &ToolCall) -> Result<String> {
+        let path = self.session_path().ok_or_else(|| anyhow::anyhow!("no session log"))?.to_path_buf();
+        self.turn_history_calls += 1;
+        let read = call.name == history::READ_TOOL;
+        {
+            let mut stats = self.stats.lock().unwrap();
+            if read { stats.history_reads += 1 } else { stats.history_searches += 1 }
+        }
+        if read {
+            history::read(&path, &call.arguments, &self.spill_dir())
+        } else {
+            history::search(&path, &call.arguments)
+        }
     }
 
     /// Get conversation length
@@ -1801,7 +1917,7 @@ mod tests {
 
     /// `message` without its timestamp, for comparing with a constructed one.
     fn unstamped(message: &Message) -> Message {
-        Message { timestamp: None, ..message.clone() }
+        Message { timestamp: None, log_line: None, ..message.clone() }
     }
 
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
@@ -1934,7 +2050,7 @@ mod tests {
         let (mut agent, seen) = agent(vec![tool_call("c1"), text("done"), text("SUMMARY: pinged once")], dir.path());
         let id = agent.new_session().unwrap();
         agent.send_message("ping").await.unwrap();
-        let report = agent.compact(Some("the ping")).await.unwrap().expect("compacted");
+        let report = agent.compact(None, Some("the ping")).await.unwrap().expect("compacted");
         assert_eq!((report.messages_before, report.messages_after, report.summarized), (5, 3, 3));
         assert_eq!(report.fallback, None);
 
@@ -1954,6 +2070,83 @@ mod tests {
         drop(agent);
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert_eq!(restored.conversation, conversation);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smart_compaction_cites_log_lines_and_offers_history_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(
+            vec![
+                tool_call("c1"),
+                text("done"),
+                text("SUMMARY: pinged once, got pong (#6)"),
+                call("h1", history::SEARCH_TOOL, json!({"pattern": "PONG"})),
+                call("h2", history::READ_TOOL, json!({"id": "#6"})),
+                text("it said pong"),
+            ],
+            dir.path(),
+        );
+        let id = agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let names = |agent: &Agent| agent.tool_definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert!(!names(&agent).iter().any(|n| history::is_history_tool(n)), "no history tools before a smart summary");
+
+        let report = agent.compact(Some(CompactionMode::Smart), None).await.unwrap().expect("compacted");
+        assert_eq!(report.mode, CompactionMode::Smart);
+        assert!(report.to_string().starts_with("smart-compacted 3 messages"), "{report}");
+        let request = seen.lock().unwrap()[2].clone();
+        assert!(request[0].content.ends_with(context::SMART_SUMMARY_INSTRUCTIONS));
+        assert!(request[1].content.contains("[#4] USER:\nping"), "{}", request[1].content);
+        assert!(request[1].content.contains("[#6] TOOL result (echo):\npong"), "{}", request[1].content);
+        let summary = agent.conversation()[1].content.clone();
+        assert!(summary.starts_with(context::SMART_SUMMARY_PREFIX) && summary.contains("messages #4–#6"), "{summary}");
+        assert!(names(&agent).contains(&history::SEARCH_TOOL.to_string()));
+
+        assert_eq!(agent.send_message("what did the tool say?").await.unwrap(), "it said pong");
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        let results: Vec<&Message> = last.iter().filter(|m| m.role == Role::Tool).collect();
+        assert!(results[0].content.starts_with("#6 tool echo") && results[0].content.contains(": pong"), "{}", results[0].content);
+        assert!(results[1].content.starts_with("#6 tool echo") && results[1].content.ends_with("\npong"), "{}", results[1].content);
+        {
+            let stats = agent.context_stats();
+            let stats = stats.lock().unwrap();
+            assert_eq!((stats.history_searches, stats.history_reads), (1, 1));
+        }
+
+        drop(agent);
+        let log = std::fs::read_to_string(dir.path().join(format!("{id}.jsonl"))).unwrap();
+        let records: Vec<Record> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert!(records.iter().any(|r| matches!(r, Record::Replace { summarized: Some((4, 6)), mode: Some(CompactionMode::Smart), .. })));
+        assert!(matches!(records.last(), Some(Record::TurnEnd { history_calls: 2, .. })));
+        // Kept messages keep their IDs across resume.
+        let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
+        assert_eq!(restored.conversation[2].log_line, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smart_mode_needs_a_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![tool_call("c1"), text("done"), text("SUMMARY")], dir.path());
+        agent.config_mut().persist_sessions = false;
+        agent.config_mut().compaction_mode = CompactionMode::Smart;
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.mode, CompactionMode::Standard);
+        assert!(agent.conversation()[1].content.starts_with(context::SUMMARY_PREFIX));
+        assert!(!agent.tool_definitions().iter().any(|d| history::is_history_tool(&d.name)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persisted_sessions_spill_beside_their_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![call("big1", "echo", json!({"text": "y".repeat(50)})), text("ok")], dir.path());
+        agent.set_tool_output_limit(10);
+        let id = agent.new_session().unwrap();
+        agent.send_message("go").await.unwrap();
+        let path = session::spill_dir_for(dir.path(), &id).join("tool-big1-echo.txt");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "y".repeat(50));
+        assert_eq!(*agent.spill_dir_handle().read().unwrap(), session::spill_dir_for(dir.path(), &id));
     }
 
     #[test]
@@ -2303,7 +2496,7 @@ mod tests {
         assert_eq!(plans[1]["_meta"]["plan"]["items"][0]["notes"][0], "it is in parser.rs:40");
         assert_eq!(Plan::from_value(&plans[1]["_meta"]["plan"]).unwrap(), agent.plan().clone());
 
-        agent.compact(None).await.unwrap().expect("compacted");
+        agent.compact(None, None).await.unwrap().expect("compacted");
         let summary = agent.conversation()[1].content.clone();
         assert!(summary.contains("SUMMARY: looked for the bug") && summary.contains("Goal: Fix the bug"), "{summary}");
         assert!(summary.contains("- it is in parser.rs:40") && summary.contains("Next: 2. Fix it"), "{summary}");
