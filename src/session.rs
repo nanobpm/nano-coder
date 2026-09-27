@@ -97,6 +97,9 @@ pub struct Restored {
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
+    /// Whether the last replacement was a smart compaction, so the resumed
+    /// session should offer the history tools without re-sniffing message text.
+    pub history_available: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -225,18 +228,22 @@ fn same_content(a: &Message, b: &Message) -> bool {
 /// smart compaction would emit them without `[#N]` citations even though the
 /// original records are still present. Match each un-IDed retained message to
 /// the first not-yet-claimed original with identical content, preserving order
-/// so duplicate messages map to distinct originals. The system message is
-/// skipped: it is never `[#N]`-cited and carries no `log_line` in a live session,
-/// so backfilling it would make a reloaded session disagree with the in-memory
-/// one. Messages with no matching original (e.g. a freshly generated summary)
-/// are left un-IDed.
-fn backfill_log_lines(messages: &mut [Message], originals: &[Message]) {
+/// so duplicate messages map to distinct originals. `summarized` (the folded
+/// line range, when the log recorded one) bounds the search to originals past
+/// the summary, so a duplicate whose earlier occurrence was folded into the
+/// summary is not mis-mapped to that folded copy; pre-range legacy logs fall
+/// back to the first content match. The system message is skipped: it is never
+/// `[#N]`-cited and carries no `log_line` in a live session, so backfilling it
+/// would make a reloaded session disagree with the in-memory one. Messages with
+/// no matching original (e.g. a freshly generated summary) are left un-IDed.
+fn backfill_log_lines(messages: &mut [Message], originals: &[Message], summarized: Option<(u64, u64)>) {
+    let floor = summarized.map_or(0, |(_, end)| end);
     let mut claimed = vec![false; originals.len()];
     for message in messages.iter_mut().filter(|m| m.log_line.is_none() && m.role != Role::System) {
         if let Some((index, original)) = originals
             .iter()
             .enumerate()
-            .find(|(i, o)| !claimed[*i] && o.log_line.is_some() && same_content(o, message))
+            .find(|(i, o)| !claimed[*i] && o.log_line.is_some_and(|line| line > floor) && same_content(o, message))
         {
             message.log_line = original.log_line;
             claimed[index] = true;
@@ -283,13 +290,16 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 };
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { mut messages, pending_position, .. } => {
-                backfill_log_lines(&mut messages, &originals);
+            Record::Replace { mut messages, pending_position, summarized, mode, .. } => {
+                backfill_log_lines(&mut messages, &originals, summarized);
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
                     (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
                     _ => None,
                 };
+                // A smart compaction offers the history tools; restore that
+                // state from the mode rather than sniffing the summary text.
+                restored.history_available = matches!(mode, Some(crate::config::CompactionMode::Smart));
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
         }
@@ -400,6 +410,53 @@ mod tests {
         expected[2].log_line = Some(3);
         assert_eq!(restored.conversation, expected);
         assert_eq!(restored.pending_input, Some(PendingInput { id: "in-1".into(), text: "go".into(), position: 2 }));
+    }
+
+    #[test]
+    fn backfill_uses_the_summarized_range_to_disambiguate_duplicates() {
+        // Two identical "same" messages; a smart compaction folds the first
+        // (records #2..=#4) into the summary and keeps only the later one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s6").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2 (folded)
+        log.append(&Record::Message(Message::user("same"))).unwrap(); // #3 (folded)
+        log.append(&Record::Message(Message::assistant("x"))).unwrap(); // #4 (folded)
+        log.append(&Record::Message(Message::user("same"))).unwrap(); // #5 (retained)
+        // The retained "same" carries no log_line, as a legacy write would.
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary"), Message::user("same")],
+            pending_position: None,
+            summarized: Some((2, 4)),
+            mode: Some(crate::config::CompactionMode::Smart),
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s6").unwrap();
+        // The range bounds the match past #4, so the retained "same" maps to the
+        // second occurrence (#5), not the folded first one (#3).
+        assert_eq!(restored.conversation[1].log_line, Some(5));
+        assert!(restored.history_available, "a smart replace offers the history tools");
+    }
+
+    #[test]
+    fn standard_replace_does_not_offer_history_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s7").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary")],
+            pending_position: None,
+            summarized: Some((2, 2)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        assert!(!restored.history_available, "a standard replace drops the history tools");
     }
 
     #[test]

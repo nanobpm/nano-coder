@@ -412,6 +412,11 @@ pub struct Agent {
     spill_dir: Arc<RwLock<std::path::PathBuf>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
+    /// Whether a real smart-compaction summary is in context, gating the
+    /// history tools. Tracked explicitly (set by compaction, restored from the
+    /// replace record's mode) rather than sniffed from message text, so a user
+    /// message that merely begins with the summary prefix cannot unlock them.
+    history_available: bool,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -451,6 +456,7 @@ impl Agent {
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
+            history_available: false,
         }
     }
 
@@ -761,11 +767,13 @@ impl Agent {
         *self.spill_dir.write().unwrap() = dir;
     }
 
-    /// Whether the history tools are offered: a smart summary is in context
-    /// and there is a session log to read.
+    /// Whether the history tools are offered: a real smart summary is in
+    /// context (tracked in `history_available`) and there is a session log to
+    /// read. Detecting the summary from message text would let a user message
+    /// beginning with the prefix unlock the tools, so state is tracked
+    /// explicitly instead.
     fn history_tools_enabled(&self) -> bool {
-        self.session.is_some()
-            && self.conversation.iter().any(|m| m.role == Role::User && m.content.starts_with(context::SMART_SUMMARY_PREFIX))
+        self.session.is_some() && self.history_available
     }
 
     /// Start a fresh conversation, persisted under a new session ID if enabled.
@@ -802,6 +810,7 @@ impl Agent {
         self.set_spill_dir(&id);
         self.calibration = None;
         self.compact_floor = 0;
+        self.history_available = false;
         {
             // A fresh session starts with clean cumulative counters so the
             // status line and `/context` reflect only this session. Shared
@@ -841,6 +850,9 @@ impl Agent {
         self.set_spill_dir(id);
         self.calibration = None;
         self.compact_floor = 0;
+        // Whether the history tools are offered is durable state: restore it
+        // from the log (the last replace's mode) rather than the message text.
+        self.history_available = restored.history_available;
         {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
@@ -911,13 +923,20 @@ impl Agent {
         for message in &mut messages {
             message.timestamp.get_or_insert(now);
         }
+        // The history tools follow the compaction: a smart summary offers them,
+        // any other replacement (standard compaction or a plain rebuild) drops
+        // them. Track it explicitly so message text cannot spoof the state.
+        self.history_available = matches!(compaction, Some((_, CompactionMode::Smart)));
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
                 pending_position,
                 summarized: compaction.and_then(|(range, _)| range),
                 mode: compaction.map(|(_, mode)| mode),
-                model: compaction.map(|_| self.config.model.clone()),
+                // Record the resolved provider/model, not the raw user spec
+                // (which can be a bare model name under a default provider), so
+                // mode comparisons keep the provider dimension.
+                model: compaction.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
                 recorded_at: now,
             })?;
         }
@@ -1204,7 +1223,8 @@ impl Agent {
             // Rebuild the tool set each call so a mid-turn mode switch (e.g.
             // Shift+Tab out of plan mode) takes effect at the next model call.
             // The dispatch-time gate still backstops a switch into plan mode.
-            let tools = self.tool_definitions();
+            // Built after the threshold compaction below so a smart summary
+            // created there adds the history tools to this same request.
 
             // Trigger before_llm_send hook
             let ctx = HookContext::new(HookEvent::BeforeLLMSend)
@@ -1221,6 +1241,8 @@ impl Agent {
                     break;
                 }
             }
+
+            let tools = self.tool_definitions();
 
             let mut overflow_retried = false;
             let response = loop {
@@ -2130,6 +2152,21 @@ mod tests {
         // Kept messages keep their IDs across resume.
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert_eq!(restored.conversation[2].log_line, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spoofed_summary_prefix_does_not_unlock_history_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.new_session().unwrap();
+        // A user message that merely begins with the summary prefix must not be
+        // mistaken for a real smart summary: the history tools stay gated until
+        // an actual smart compaction sets the state.
+        agent.push(Message::user(&format!("{}\nnot a real summary", context::SMART_SUMMARY_PREFIX))).unwrap();
+        assert!(
+            !agent.tool_definitions().iter().any(|d| history::is_history_tool(&d.name)),
+            "history tools must not be unlocked by message text alone"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -126,10 +126,35 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     };
     fs::create_dir_all(&output_dir)
         .map_err(|e| format!("create output directory {}: {e}", output_dir.display()))?;
-    let call = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
-    let out_path = output_dir.join(format!("bash-{call}.stdout"));
-    let err_path = output_dir.join(format!("bash-{call}.stderr"));
-    let create = |path: &Path| File::create(path).map_err(|e| format!("create {}: {e}", path.display()));
+    // Reserve a per-call output basename without overwriting spills from an
+    // earlier run of a resumed session. Their paths are still referenced by
+    // logged tool results, so reusing bash-1 again after a restart (when the
+    // in-process CALL_COUNTER restarts at zero) would corrupt those "complete
+    // output" files. Probe increasing indices with create_new, skipping any
+    // that already exist, so a resumed session continues past the highest
+    // existing spill instead of clobbering a live name.
+    let (out_file, err_file, out_path, err_path) = loop {
+        let call = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+        let out_path = output_dir.join(format!("bash-{call}.stdout"));
+        let err_path = output_dir.join(format!("bash-{call}.stderr"));
+        let out_file = match File::create_new(&out_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create {}: {e}", out_path.display())),
+        };
+        match File::create_new(&err_path) {
+            Ok(err_file) => break (out_file, err_file, out_path, err_path),
+            // The stdout name was free but the stderr one was not (e.g. a
+            // half-written pair left by a crash): drop the file we just made
+            // and advance rather than leaking it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                drop(out_file);
+                let _ = fs::remove_file(&out_path);
+                continue;
+            }
+            Err(e) => return Err(format!("create {}: {e}", err_path.display())),
+        }
+    };
 
     let cwd = match &config.working_dir {
         Some(dir) => dir.clone(),
@@ -148,8 +173,8 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     command
         .current_dir(&cwd)
         .stdin(Stdio::null())
-        .stdout(create(&out_path)?)
-        .stderr(create(&err_path)?)
+        .stdout(out_file)
+        .stderr(err_file)
         // Own process group so a timeout kills the whole pipeline.
         .process_group(0);
     let mut child = command.spawn().map_err(|e| format!("spawn {}: {e}", config.shell))?;

@@ -80,6 +80,10 @@ const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "load_skill",
     "report_outcome",
     "question",
+    // Read-only history retrieval: safe to run while planning, so a smart
+    // summary's folded detail stays reachable in plan mode.
+    "history_search",
+    "history_read",
 ];
 
 /// Whether `tool` may run in plan mode.
