@@ -746,13 +746,19 @@ async fn main() -> Result<()> {
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() {
-                    if separate {
-                        println!();
-                    }
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
-                    io::stdout().write_all(prompt.as_bytes()).unwrap();
-                    io::stdout().flush().unwrap();
+                    // Serialise the prompt write under the terminal lock so it
+                    // cannot move the cursor mid-way through the SIGWINCH
+                    // anchor's query-to-scroll critical section (status::anchor).
+                    crate::status::with_term_lock(|| {
+                        let mut out = io::stdout().lock();
+                        if separate {
+                            let _ = out.write_all(b"\n");
+                        }
+                        let _ = out.write_all(prompt.as_bytes());
+                        let _ = out.flush();
+                    });
                     view.prompt_redrawn();
                 }
             };
