@@ -180,11 +180,14 @@ impl EditView {
                 rows += 1;
                 col = 0;
             } else {
-                col += 1;
+                // Pending wrap, matching `cursor_position`: a row filled
+                // exactly leaves the cursor on it, and only the *next*
+                // character starts a new row.
                 if col == cols {
                     rows += 1;
                     col = 0;
                 }
+                col += 1;
             }
         }
         rows
@@ -230,11 +233,12 @@ impl EditView {
                 r += 1;
                 c = 0;
             } else {
-                c += 1;
+                // Pending wrap, matching `content_rows`/`cursor_position`.
                 if c == cols {
                     r += 1;
                     c = 0;
                 }
+                c += 1;
             }
         }
         self.line.chars().count()
@@ -1040,7 +1044,7 @@ mod tests {
         let mut view = view("");
         view.prompt_width = 2;
         view.insert("abcdef");
-        assert_eq!(view.content_rows(4), 3); // "> ab", "cd", "ef"
+        assert_eq!(view.content_rows(4), 2); // "> ab", "cdef": pending wrap after "f"
         assert_eq!(view.cursor_position(4), (1, 4), "the last char fills the row: pending wrap");
         view.move_to(2);
         assert_eq!(view.cursor_position(4), (0, 4), "pending wrap stays on the row");
