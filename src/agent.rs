@@ -417,6 +417,11 @@ pub struct Agent {
     /// replace record's mode) rather than sniffed from message text, so a user
     /// message that merely begins with the summary prefix cannot unlock them.
     history_available: bool,
+    /// A failed tool call (e.g. bash, read_file) after a smart compaction gets a one-time
+    /// pointer to the history tools (models tend to look on disk for what
+    /// was only in the conversation). Cleared once shown or once the agent
+    /// uses a history tool.
+    history_hint_pending: bool,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -457,6 +462,7 @@ impl Agent {
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
             history_available: false,
+            history_hint_pending: false,
         }
     }
 
@@ -811,6 +817,7 @@ impl Agent {
         self.calibration = None;
         self.compact_floor = 0;
         self.history_available = false;
+        self.history_hint_pending = false;
         {
             // A fresh session starts with clean cumulative counters so the
             // status line and `/context` reflect only this session. Shared
@@ -853,6 +860,7 @@ impl Agent {
         // Whether the history tools are offered is durable state: restore it
         // from the log (the last replace's mode) rather than the message text.
         self.history_available = restored.history_available;
+        self.history_hint_pending = restored.history_available;
         {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
@@ -927,6 +935,7 @@ impl Agent {
         // any other replacement (standard compaction or a plain rebuild) drops
         // them. Track it explicitly so message text cannot spoof the state.
         self.history_available = matches!(compaction, Some((_, CompactionMode::Smart)));
+        self.history_hint_pending = self.history_available;
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
@@ -1494,6 +1503,16 @@ impl Agent {
                         result_text.push_str("\n\n");
                         result_text.push_str(&reminders::wrap(&note));
                     }
+                }
+                if history::is_history_tool(&tool_call.name) {
+                    self.history_hint_pending = false;
+                } else if history::looks_failed(&tool_call.name, ok, &result_text)
+                    && self.history_hint_pending
+                    && self.history_tools_enabled()
+                {
+                    self.history_hint_pending = false;
+                    result_text.push_str("\n\n");
+                    result_text.push_str(history::FAILED_TOOL_HINT);
                 }
                 let message = if ok {
                     Message::tool_result(&tool_call.id, &tool_call.name, &result_text)
@@ -2152,6 +2171,58 @@ mod tests {
         // Kept messages keep their IDs across resume.
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert_eq!(restored.conversation[2].log_line, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_tool_after_smart_compaction_points_to_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(
+            vec![
+                tool_call("c1"),
+                text("done"),
+                text("SUMMARY: pinged"),
+                call("b1", "broken", json!({})),
+                call("b2", "broken", json!({})),
+                text("gave up"),
+                call("b3", "broken", json!({})),
+                text("again"),
+            ],
+            dir.path(),
+        );
+        agent.tools().register(
+            ToolDefinition::new("broken", "fails", json!({"type": "object"})),
+            Box::new(|_| Err(anyhow::anyhow!("boom"))),
+        );
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        agent.compact(Some(CompactionMode::Smart), None).await.unwrap().expect("compacted");
+        agent.send_message("what was the error?").await.unwrap();
+        let tool_results = |seen: &Seen| -> Vec<String> {
+            let last = seen.lock().unwrap().last().unwrap().clone();
+            last.iter().filter(|m| m.role == Role::Tool && m.name.as_deref() == Some("broken")).map(|m| m.content.clone()).collect()
+        };
+        let results = tool_results(&seen);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains(history::FAILED_TOOL_HINT), "first failure gets the hint: {}", results[0]);
+        assert!(!results[1].contains(history::FAILED_TOOL_HINT), "only once: {}", results[1]);
+        agent.send_message("try once more").await.unwrap();
+        let results = tool_results(&seen);
+        assert_eq!(results.len(), 3);
+        assert!(!results[2].contains(history::FAILED_TOOL_HINT), "not again in a later turn: {}", results[2]);
+
+        // Standard compaction never hints (no history tools).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) =
+            self::agent(vec![tool_call("c1"), text("done"), text("SUMMARY"), call("b1", "broken", json!({})), text("x")], dir.path());
+        agent.tools().register(
+            ToolDefinition::new("broken", "fails", json!({"type": "object"})),
+            Box::new(|_| Err(anyhow::anyhow!("boom"))),
+        );
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        agent.compact(Some(CompactionMode::Standard), None).await.unwrap().expect("compacted");
+        agent.send_message("what was the error?").await.unwrap();
+        assert!(!tool_results(&seen).iter().any(|r| r.contains(history::FAILED_TOOL_HINT)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
