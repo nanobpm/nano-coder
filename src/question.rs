@@ -376,4 +376,38 @@ mod tests {
         assert!(!answered.contains('\x1b'), "escape leaked: {answered:?}");
         assert!(!answered.contains('\x07'), "control leaked: {answered:?}");
     }
+
+    #[tokio::test]
+    async fn sequential_questions_each_wake_the_watcher() {
+        // Regression for the "repeated questions do not trigger the watch
+        // channel" report: tokio's `watch::Sender::send` bumps the version and
+        // wakes every `changed()` even when the value is unchanged (`true` ->
+        // `true`), so a second sequential question still notifies the turn loop.
+        let broker = QuestionBroker::new();
+        let mut rx = broker.subscribe();
+
+        for expected in ["first", "second"] {
+            let worker = broker.clone();
+            let label = expected.to_string();
+            let handle = std::thread::spawn(move || {
+                worker.ask_blocking(vec![Question {
+                    question: label,
+                    header: String::new(),
+                    options: vec![],
+                    custom: true,
+                }])
+            });
+            // The watcher wakes even though the value stays `true` across calls.
+            rx.changed().await.unwrap();
+            let request = loop {
+                if let Some(request) = broker.pending() {
+                    break request;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            };
+            assert_eq!(request.questions[0].question, expected);
+            broker.resolve(QuestionAnswer::Answers(vec!["ok".into()]));
+            assert_eq!(handle.join().unwrap(), QuestionAnswer::Answers(vec!["ok".into()]));
+        }
+    }
 }
