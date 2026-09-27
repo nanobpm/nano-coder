@@ -216,6 +216,11 @@ pub fn parse(args: &Value) -> Result<Vec<Question>> {
         if question.question.trim().is_empty() {
             bail!("each question needs non-empty `question` text");
         }
+        if !question.custom && question.options.is_empty() {
+            // Without options and without a custom answer there is nothing to
+            // present; the picker would build a selection with no choices.
+            bail!("a question with `custom: false` needs at least one option");
+        }
         questions.push(question);
     }
     Ok(questions)
@@ -300,6 +305,16 @@ mod tests {
 
         assert!(parse(&json!({ "questions": [] })).is_err(), "empty array rejected");
         assert!(parse(&json!({ "questions": [ { "question": "  " } ] })).is_err(), "blank text rejected");
+
+        // `custom: false` with no options has nothing to present.
+        assert!(
+            parse(&json!({ "questions": [ { "question": "Pick", "custom": false } ] })).is_err(),
+            "non-custom question without options rejected"
+        );
+        assert!(
+            parse(&json!({ "questions": [ { "question": "Pick", "custom": false, "options": [ {"label": "A"} ] } ] })).is_ok(),
+            "non-custom question with an option accepted"
+        );
     }
 
     #[test]

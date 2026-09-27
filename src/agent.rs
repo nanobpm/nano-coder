@@ -1087,14 +1087,16 @@ impl Agent {
 
         // The cap is mode-dependent and can be extended when the user says
         // "keep going". Auto mode disables it; normal mode asks (interactive
-        // only); ACP/headless keeps the hard stop.
-        let mut budget = match self.control.mode() {
-            crate::mode::AgentMode::Auto => usize::MAX,
-            _ => max_iterations,
-        };
+        // only); ACP/headless keeps the hard stop. Re-evaluated from the live
+        // mode each iteration so a mid-turn Shift+Tab changes cap behavior too.
+        let mut granted_extra = 0usize;
         let mut iteration = 0usize;
         loop {
             iteration += 1;
+            let budget = match self.control.mode() {
+                crate::mode::AgentMode::Auto => usize::MAX,
+                _ => max_iterations.saturating_add(granted_extra),
+            };
             if iteration > budget {
                 // Cap reached. Only normal mode in an interactive session asks
                 // to continue; anything else (auto, ACP/headless) stops.
@@ -1102,7 +1104,7 @@ impl Agent {
                 if can_prompt {
                     match self.questions.cap().wait().await {
                         crate::question::CapDecision::Continue => {
-                            budget = budget.saturating_add(max_iterations);
+                            granted_extra = granted_extra.saturating_add(max_iterations);
                             continue;
                         }
                         crate::question::CapDecision::Stop => break,

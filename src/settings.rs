@@ -488,7 +488,9 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         doc["max_tokens"] = toml_edit::value(i64::from(config.max_tokens));
     }
     if changes.max_iterations {
-        doc["max_iterations"] = toml_edit::value(config.max_iterations as i64);
+        // A `usize` above `i64::MAX` would wrap to a negative TOML integer that
+        // cannot be read back as `usize`; clamp instead of casting.
+        doc["max_iterations"] = toml_edit::value(i64::try_from(config.max_iterations).unwrap_or(i64::MAX));
     }
     if changes.system_prompt {
         doc["system_prompt"] = toml_edit::value(config.system_prompt.as_str());
