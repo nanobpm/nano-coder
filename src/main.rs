@@ -191,10 +191,36 @@ struct Terminal {
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic generation bumped on every `suspend_input()`. It lets a
+    /// picker's cleanup resume the reader only if no *newer* prompt has since
+    /// suspended it: a stale auto-away worker must not clear a later prompt's
+    /// suspension (which would resume stdin under an active dialoguer).
+    suspend_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Serialises dialoguer picker workers so at most one ever owns stdin. An
     /// auto-away worker that outlived its timeout keeps this held until it
     /// exits, so a later question cannot spawn a second stdin reader.
     picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// An owned token for one input suspension. Cleanup calls [`InputGate::release`],
+/// which resumes the background line reader *only* if this is still the most
+/// recent suspension — so a stale worker finishing late cannot clear a newer
+/// prompt's gate and resume stdin while that prompt's dialoguer is active.
+#[derive(Clone)]
+struct InputGate {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    token: u64,
+}
+
+impl InputGate {
+    /// Resume the reader iff no later `suspend_input()` has superseded this one.
+    fn release(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.generation.load(SeqCst) == self.token {
+            self.flag.store(false, SeqCst);
+        }
+    }
 }
 
 impl Terminal {
@@ -261,16 +287,21 @@ impl Terminal {
             view,
             renderer,
             suspend,
+            suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
-    /// it; returns the flag so the caller can resume it once the picker (or an
-    /// orphaned auto-answer worker) is truly done.
-    fn suspend_input(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.suspend.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.suspend.clone()
+    /// it; returns a generation-stamped [`InputGate`] the caller (or an orphaned
+    /// auto-answer worker) releases once the picker is truly done. The stamp
+    /// ensures a stale worker cannot resume the reader out from under a newer
+    /// prompt that has since re-suspended input.
+    fn suspend_input(&self) -> InputGate {
+        use std::sync::atomic::Ordering::SeqCst;
+        let token = self.suspend_gen.fetch_add(1, SeqCst) + 1;
+        self.suspend.store(true, SeqCst);
+        InputGate { flag: self.suspend.clone(), generation: self.suspend_gen.clone(), token }
     }
 
     /// A clone of the picker serialisation lock (see the field docs).
@@ -366,8 +397,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         continue;
                     }
                     let gate = terminal.suspend_input();
-                    let decision = prompt_cap_reached(&renderer, terminal.picker_lock()).await;
-                    gate.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
                 }
                 input = terminal.recv() => match input {
@@ -432,12 +462,30 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
 const AUTO_AWAY_SECS: u64 = 15;
 
 /// Render one question and return its answer string, `None` when dismissed.
+/// Strip terminal control characters from model-controlled text before it is
+/// handed to dialoguer for rendering. `q.question`, option labels and
+/// descriptions all originate from the model, so a prompt-injected model could
+/// otherwise smuggle ANSI/OSC escape sequences (cursor moves, screen clears,
+/// clipboard/title writes) through the interactive picker. Dropping C0/C1
+/// control characters — including ESC (0x1B), which begins every such sequence —
+/// neutralises them while leaving ordinary printable text intact.
+fn sanitize_terminal_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
     use dialoguer::{Input, Select};
     let mut labels: Vec<String> = q
         .options
         .iter()
-        .map(|o| if o.description.is_empty() { o.label.clone() } else { format!("{} — {}", o.label, o.description) })
+        .map(|o| {
+            let label = sanitize_terminal_text(&o.label);
+            if o.description.is_empty() {
+                label
+            } else {
+                format!("{} — {}", label, sanitize_terminal_text(&o.description))
+            }
+        })
         .collect();
     let custom_index = if q.custom {
         labels.push("Type your own answer".into());
@@ -445,7 +493,11 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     } else {
         None
     };
-    let choice = Select::new().with_prompt(&q.question).items(&labels).default(0).interact_opt()?;
+    let choice = Select::new()
+        .with_prompt(sanitize_terminal_text(&q.question))
+        .items(&labels)
+        .default(0)
+        .interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -468,10 +520,9 @@ async fn prompt_question(
     control: &agent::TurnControl,
     renderer: &std::sync::Arc<ui::Renderer>,
     picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-    gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gate: InputGate,
 ) -> question::QuestionAnswer {
     use question::QuestionAnswer;
-    use std::sync::atomic::Ordering::SeqCst;
     let auto = control.mode() == mode::AgentMode::Auto;
 
     // The whole prompt run: ask each question, collecting one string each.
@@ -494,10 +545,11 @@ async fn prompt_question(
         let guard = picker_lock.lock_owned().await;
         let questions = questions.to_vec();
         let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
-        // Clear the gate while still holding the picker guard, so the input
+        // Release the gate while still holding the picker guard, so the input
         // reader cannot resume before the next picker (which must take this
-        // same lock) has re-suspended it.
-        gate.store(false, SeqCst);
+        // same lock) has re-suspended it. `release()` is generation-aware, so
+        // it is a no-op if a newer prompt has already re-suspended input.
+        gate.release();
         drop(guard);
         return asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed);
     }
@@ -517,12 +569,12 @@ async fn prompt_question(
             renderer.note("[auto: no answer — making the best decision]");
             // Do not start a competing reader. Keep the caller's input gate
             // suspended until the picker frees (the prior orphan exits), then
-            // clear the gate while still holding the guard, so a later picker
+            // release the gate while still holding the guard, so a later picker
             // cannot acquire the lock and re-suspend between our lock release
             // and the gate release (which would let the reader race stdin).
             tokio::spawn(async move {
                 let guard = picker_lock.lock_owned().await;
-                gate.store(false, SeqCst);
+                gate.release();
                 drop(guard);
             });
             return QuestionAnswer::Away;
@@ -533,20 +585,21 @@ async fn prompt_question(
     let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
     tokio::select! {
         joined = &mut worker => {
-            // Clear the gate while still holding the guard, then release it.
-            gate.store(false, SeqCst);
+            // Release the gate while still holding the guard, then drop it.
+            gate.release();
             drop(guard);
             joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed)
         }
         () = tokio::time::sleep_until(deadline) => {
             renderer.note("[auto: no answer — making the best decision]");
             // Keep the worker alive (it is still blocked on stdin) and hold the
-            // picker lock until it exits. Clear the gate while still holding the
-            // guard so the reader resumes only once this worker exits, with no
-            // window for a later picker to slip in between lock and gate release.
+            // picker lock until it exits. Release the gate while still holding
+            // the guard so the reader resumes only once this worker exits, with
+            // no window for a later picker to slip in between lock and gate
+            // release.
             tokio::spawn(async move {
                 let _ = worker.await;
-                gate.store(false, SeqCst);
+                gate.release();
                 drop(guard);
             });
             QuestionAnswer::Away
@@ -559,6 +612,7 @@ async fn prompt_question(
 async fn prompt_cap_reached(
     renderer: &std::sync::Arc<ui::Renderer>,
     picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    gate: InputGate,
 ) -> question::CapDecision {
     use question::CapDecision;
     // Serialise with the question picker: this is another dialoguer reader, so
@@ -583,6 +637,10 @@ async fn prompt_cap_reached(
     })
     .await
     .unwrap_or(CapDecision::Stop);
+    // Release the gate while still holding the guard, so the input reader cannot
+    // resume before the next picker re-suspends it (generation-aware: a no-op if
+    // a newer prompt already re-suspended input).
+    gate.release();
     drop(guard);
     decision
 }
@@ -1141,5 +1199,13 @@ mod tests {
         // Too slow: the second press re-arms instead of cancelling.
         assert!(!escape.press(t + Duration::from_millis(1600)));
         assert!(escape.press(t + Duration::from_millis(1700)));
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_control_and_escape_sequences() {
+        // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
+        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
+        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
+        assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
     }
 }
