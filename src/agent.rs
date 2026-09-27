@@ -841,6 +841,15 @@ impl Agent {
         self.set_spill_dir(id);
         self.calibration = None;
         self.compact_floor = 0;
+        {
+            // History-tool usage is per-session live state: a resumed session
+            // starts fresh so `/context` and the status line report only calls
+            // made after the load, not ones left over from a prior session in
+            // this same agent. Mirrors `new_session`.
+            let mut stats = self.stats.lock().unwrap();
+            stats.history_searches = 0;
+            stats.history_reads = 0;
+        }
         self.repair_dangling_tool_calls()?;
         // A loaded session starts in the default mode, not whatever mode the
         // previous session left selected.

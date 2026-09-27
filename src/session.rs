@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::Message;
+use crate::llm::{Message, Role};
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -207,8 +207,48 @@ impl SessionLog {
     }
 }
 
+/// Compare two messages by their durable content, ignoring the transient
+/// `timestamp`/`log_line` fields that differ between a direct record and the
+/// copy retained inside a later `replace` record.
+fn same_content(a: &Message, b: &Message) -> bool {
+    a.role == b.role
+        && a.content == b.content
+        && a.tool_calls == b.tool_calls
+        && a.tool_call_id == b.tool_call_id
+        && a.name == b.name
+        && a.is_error == b.is_error
+}
+
+/// Backfill stable `[#N]` IDs onto a `replace` record's retained messages from
+/// the original message records they were folded from. Logs written before the
+/// stable-ID feature stored `replace` messages without `log_line`, so a later
+/// smart compaction would emit them without `[#N]` citations even though the
+/// original records are still present. Match each un-IDed retained message to
+/// the first not-yet-claimed original with identical content, preserving order
+/// so duplicate messages map to distinct originals. The system message is
+/// skipped: it is never `[#N]`-cited and carries no `log_line` in a live session,
+/// so backfilling it would make a reloaded session disagree with the in-memory
+/// one. Messages with no matching original (e.g. a freshly generated summary)
+/// are left un-IDed.
+fn backfill_log_lines(messages: &mut [Message], originals: &[Message]) {
+    let mut claimed = vec![false; originals.len()];
+    for message in messages.iter_mut().filter(|m| m.log_line.is_none() && m.role != Role::System) {
+        if let Some((index, original)) = originals
+            .iter()
+            .enumerate()
+            .find(|(i, o)| !claimed[*i] && o.log_line.is_some() && same_content(o, message))
+        {
+            message.log_line = original.log_line;
+            claimed[index] = true;
+        }
+    }
+}
+
 fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     let mut restored = Restored::default();
+    // Every direct message record seen so far, with its assigned `log_line`, so
+    // a later `replace` from a legacy log can recover the IDs of retained messages.
+    let mut originals: Vec<Message> = Vec::new();
     for (index, line) in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
         let record: Record =
             serde_json::from_slice(line).with_context(|| format!("decode record {}", index + 1))?;
@@ -230,6 +270,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             Record::Message(mut message) => {
                 message.log_line.get_or_insert(index as u64 + 1);
+                originals.push(message.clone());
                 restored.conversation.push(message);
             }
             Record::TurnEnd { input_id, response, outcome, .. } => {
@@ -242,7 +283,8 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 };
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { messages, pending_position, .. } => {
+            Record::Replace { mut messages, pending_position, .. } => {
+                backfill_log_lines(&mut messages, &originals);
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
                     (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
@@ -315,6 +357,34 @@ mod tests {
     }
 
     #[test]
+    fn replace_backfills_log_lines_for_legacy_retained_messages() {
+        // A pre-feature log stores `replace` messages without `log_line`. Decoding
+        // must recover each retained message's ID from its original record so
+        // smart compaction can still cite it as `[#N]`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s5").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
+        log.append(&Record::Message(Message::user("first"))).unwrap(); // #3
+        log.append(&Record::Message(Message::assistant("reply"))).unwrap(); // #4
+        // Retained messages carry no `log_line`, as a legacy compaction would write.
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("first"), Message::assistant("reply"), Message::assistant("summary")],
+            pending_position: None,
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s5").unwrap();
+        let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
+        // System is skipped (never cited); "first" -> #3, "reply" -> #4 (record
+        // #1 is the session header); the freshly generated "summary" stays un-IDed.
+        assert_eq!(lines, vec![None, Some(3), Some(4), None]);
+    }
+
+    #[test]
     fn replace_can_keep_the_pending_input() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s3").unwrap();
@@ -325,7 +395,10 @@ mod tests {
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();
-        assert_eq!(restored.conversation, messages);
+        // The retained "go" folds in original record #3, so its ID is backfilled.
+        let mut expected = messages.clone();
+        expected[2].log_line = Some(3);
+        assert_eq!(restored.conversation, expected);
         assert_eq!(restored.pending_input, Some(PendingInput { id: "in-1".into(), text: "go".into(), position: 2 }));
     }
 
