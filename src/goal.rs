@@ -40,6 +40,20 @@ impl Status {
             Status::NeedsInput => "needs_input",
         }
     }
+
+    /// Extract the outcome status from `report_outcome` arguments, tolerating
+    /// arguments sent as a JSON string (as [`Outcome::from_args`] does).
+    pub fn from_args(args: &Value) -> Option<Self> {
+        let parsed;
+        let args = match args {
+            Value::String(text) => {
+                parsed = serde_json::from_str::<Value>(text).ok()?;
+                &parsed
+            }
+            other => other,
+        };
+        args.get("status").and_then(Value::as_str).and_then(Status::parse)
+    }
 }
 
 /// A reported outcome.
