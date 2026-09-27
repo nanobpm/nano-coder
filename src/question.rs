@@ -251,7 +251,11 @@ pub fn result_text(questions: &[Question], answer: &QuestionAnswer) -> String {
                 .enumerate()
                 .map(|(i, q)| {
                     let answer = answers.get(i).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "Unanswered".into());
-                    format!("\"{}\"=\"{answer}\"", q.question)
+                    format!(
+                        "\"{}\"=\"{}\"",
+                        crate::sanitize_terminal_text(&q.question),
+                        crate::sanitize_terminal_text(&answer)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -357,5 +361,19 @@ mod tests {
         assert!(result_text(&questions, &QuestionAnswer::Dismissed).contains("dismissed"));
         let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["opt".into()]));
         assert!(answered.contains("\"Q\"=\"opt\""), "{answered}");
+    }
+
+    #[test]
+    fn result_text_strips_control_sequences_from_model_and_user_text() {
+        let questions = vec![Question {
+            question: "pick\x1b[2Jone".into(),
+            header: String::new(),
+            options: vec![],
+            custom: true,
+        }];
+        let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["ans\x07wer".into()]));
+        assert!(answered.contains("\"pick[2Jone\"=\"answer\""), "{answered}");
+        assert!(!answered.contains('\x1b'), "escape leaked: {answered:?}");
+        assert!(!answered.contains('\x07'), "control leaked: {answered:?}");
     }
 }
