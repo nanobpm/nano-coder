@@ -97,7 +97,7 @@ echoes it in `_meta.plan`, and the model is told about it with the first prompt 
 advertises this as `agentCapabilities._meta.planSeed`. See [Task Plans](#task-plans).
 
 **Outcomes.** When the model calls `report_outcome`, the `session/prompt` result carries
-`_meta.outcome`: `{"status": "completed" | "blocked", "summary": "..."}`. A client can use it
+`_meta.outcome`: `{"status": "completed" | "blocked" | "needs_input", "summary": "..."}`. A client can use it
 instead of guessing from the stop reason: `blocked` means the model needs help (an
 escalation). Redelivering the input returns the same outcome. See [Outcomes](#outcomes).
 
@@ -139,7 +139,9 @@ src/
 ├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, steering on the status line)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
-├── goal.rs      # report_outcome tool (completed / blocked)
+├── goal.rs      # report_outcome tool (completed / blocked / needs_input)
+├── mode.rs      # Agent mode (normal / plan / auto) and the plan-mode tool gate
+├── question.rs  # question tool and the mid-turn question / turn-cap rendezvous
 ├── commands.rs  # Slash-command table for /help and the as-you-type menu
 ├── skills.rs    # SKILL.md discovery, ai.lock sources and the load_skill tool
 ├── reminders.rs # <system-reminder> notes appended to tool results
@@ -178,8 +180,11 @@ The harness exposes 6 lifecycle hook events:
 - `edit_file` - Replace exact text (`path`, `old_string`, `new_string`, optional `replace_all`).
   Fails unless `old_string` matches exactly once (or `replace_all` is set).
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
-- `report_outcome` - Report the task `completed` or `blocked`, with a `summary`; ends the turn
-  (see [Outcomes](#outcomes)).
+- `report_outcome` - Report the task `completed`, `blocked` or `needs_input`, with a `summary`; ends
+  the turn (see [Outcomes](#outcomes)).
+- `question` - Ask the user a structured question and wait for the answer, without ending the turn.
+  Interactive sessions only; in auto mode an unanswered question is resolved after 15s with the
+  away message. Headless (ACP) sessions get an error instead.
 - `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
   when skills were found (see [Skills](#skills)).
 
@@ -276,6 +281,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
+  - **Turn cap** (`max_iterations`): LLM calls per input; normal mode asks before stopping
   - **Context**: auto-compaction on/off, threshold, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
@@ -285,6 +291,10 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
 - `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept)
+- `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
+  - **normal** - full tools; reaching the turn cap asks whether to keep going
+  - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
+  - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/restart` - Start a fresh session (clean context) without exiting
@@ -516,10 +526,10 @@ shows when the message was sent. Turn this off with `timestamps = false`.
 In an interactive terminal the bottom row shows the provider/model, context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
-count, and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a
-terminal scroll region, follows resizes, and is
-off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
+save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a terminal
+scroll region, follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.
 
@@ -641,15 +651,20 @@ Plan and outcome calls don't count. Set `reminders = false` to turn them off.
 ## Outcomes
 
 `report_outcome` is the model's explicit end-of-task signal: `status` is `completed` (the
-whole task is done and checked; the summary lists PRs or commits) or `blocked` (after three
+whole task is done and checked; the summary lists PRs or commits), `blocked` (after three
 or more different failed attempts, or when only a person can unblock it; the summary says
-what is needed). The call ends the turn. Other calls in the same response still run, then the
-summary becomes the final answer (`Blocked: ...` for blocked), and the outcome is returned
+what is needed), or `needs_input` (the model has a question or needs a decision; the summary
+is the question). The call ends the turn. Other calls in the same response still run, then the
+summary becomes the final answer (`Blocked: ...` / `Question: ...`), and the outcome is returned
 in ACP `_meta.outcome` and recorded in the session log's `turn_end` record. If the harness
 stops after the call but before the turn ends, resuming the input finishes it with the
 recorded outcome without calling the model again. In the terminal the call shows as
-`✔ completed` or `■ blocked` followed by the summary. Set `outcome_tool = false` to leave the
+`✔ completed`, `■ blocked`, or `? needs input` followed by the summary. Set `outcome_tool = false` to leave the
 tool out.
+
+`needs_input` is the structural "waiting on the user" signal: an orchestrator (or auto mode)
+can tell it apart from a clean `completed` without guessing from the text. For a richer,
+multi-choice question that does not end the turn, the model uses the `question` tool instead.
 
 ## Sessions
 

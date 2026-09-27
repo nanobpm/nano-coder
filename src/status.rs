@@ -361,6 +361,16 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     if let Some((done, total)) = stats.plan {
         segments.push(Segment { text: format!(" plan {done}/{total} "), color: None, priority: 4 });
     }
+    // The mode is only worth a segment when it is not the default; normal is
+    // the expected state and the space is better spent on context stats.
+    let mode_segment = match stats.mode {
+        crate::mode::AgentMode::Normal => None,
+        crate::mode::AgentMode::Plan => Some((" plan ", "\x1b[1;38;5;221m")),
+        crate::mode::AgentMode::Auto => Some((" auto ", "\x1b[1;38;5;114m")),
+    };
+    if let Some((text, color)) = mode_segment {
+        segments.push(Segment { text: text.to_string(), color: Some(color), priority: 10 });
+    }
     if stats.session_input_tokens + stats.session_output_tokens > 0 {
         segments.push(Segment {
             text: format!(
@@ -455,6 +465,7 @@ mod tests {
             plan: Some((2, 5)),
             cwd: "/tmp/project".into(),
             tokens_per_sec: None,
+            mode: crate::mode::AgentMode::Normal,
         }
     }
 

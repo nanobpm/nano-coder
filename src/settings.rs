@@ -21,6 +21,7 @@ struct Changes {
     model: bool,
     temperature: bool,
     max_tokens: bool,
+    max_iterations: bool,
     system_prompt: bool,
     compaction: bool,
     verbosity: bool,
@@ -29,7 +30,7 @@ struct Changes {
 
 impl Changes {
     fn any(&self) -> bool {
-        self.model || self.temperature || self.max_tokens || self.system_prompt || self.compaction || self.verbosity || !self.providers.is_empty()
+        self.model || self.temperature || self.max_tokens || self.max_iterations || self.system_prompt || self.compaction || self.verbosity || !self.providers.is_empty()
     }
 }
 
@@ -62,6 +63,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             "Add or edit a provider".to_string(),
             format!("Temperature      {}", config.temperature),
             format!("Max tokens       {}", config.max_tokens),
+            format!("Turn cap         {} LLM calls per input (normal mode asks before stopping)", config.max_iterations),
             "System prompt".to_string(),
             format!(
                 "Context          {} window, auto-compact {}",
@@ -105,6 +107,14 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 changes.max_tokens = true;
             }
             4 => {
+                let value: usize = Input::new()
+                    .with_prompt("Turn cap (LLM calls per input; normal mode asks before stopping, auto ignores it)")
+                    .default(agent.config().max_iterations)
+                    .interact_text()?;
+                agent.config_mut().max_iterations = value.max(1);
+                changes.max_iterations = true;
+            }
+            5 => {
                 let value: String = Input::new()
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
@@ -112,11 +122,11 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 agent.set_system_prompt(&value)?;
                 changes.system_prompt = true;
             }
-            5 => {
+            6 => {
                 edit_context(agent)?;
                 changes.compaction = true;
             }
-            6 => {
+            7 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
@@ -125,7 +135,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 crate::ui::set_verbosity(levels[choice]);
                 changes.verbosity = true;
             }
-            7 => save_and_report(agent.config(), &mut changes, config_path),
+            8 => save_and_report(agent.config(), &mut changes, config_path),
             _ => {
                 if changes.any()
                     && Confirm::new()
@@ -476,6 +486,11 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     }
     if changes.max_tokens {
         doc["max_tokens"] = toml_edit::value(i64::from(config.max_tokens));
+    }
+    if changes.max_iterations {
+        // A `usize` above `i64::MAX` would wrap to a negative TOML integer that
+        // cannot be read back as `usize`; clamp instead of casting.
+        doc["max_iterations"] = toml_edit::value(i64::try_from(config.max_iterations).unwrap_or(i64::MAX));
     }
     if changes.system_prompt {
         doc["system_prompt"] = toml_edit::value(config.system_prompt.as_str());

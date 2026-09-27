@@ -21,9 +21,11 @@ mod instructions;
 mod plan;
 mod lineedit;
 mod llm;
+mod mode;
 mod output;
 mod permissions;
 mod providers;
+mod question;
 mod reminders;
 mod sandbox;
 mod settings;
@@ -78,6 +80,18 @@ fn register_builtin_tools(agent: &mut Agent) {
     };
     agent.tools().register(bash::definition(), Box::new(move |args| {
         Ok(json!(bash::run(&bash_config, &args)))
+    }));
+
+    // question tool: blocks until the turn loop answers (see question.rs).
+    // Headless (ACP) sessions have no one to answer, so it errors instead.
+    let broker = agent.questions();
+    agent.tools().register(question::definition(), Box::new(move |args| {
+        if !broker.is_interactive() {
+            anyhow::bail!("question tool needs an interactive terminal; end your turn with the question, or report_outcome(needs_input) with the question in the summary, instead");
+        }
+        let questions = question::parse(&args)?;
+        let answer = broker.ask_blocking(questions.clone());
+        Ok(json!(question::result_text(&questions, &answer)))
     }));
 }
 
@@ -135,6 +149,8 @@ enum TermInput {
     ToggleThinking,
     /// A lone Esc press.
     Escape,
+    /// Shift+Tab: cycle the agent mode (normal/plan/auto).
+    CycleMode,
 }
 
 /// Esc twice within this window cancels the running turn.
@@ -172,6 +188,39 @@ struct Terminal {
     /// The line being typed (terminal stdin only).
     view: lineedit::SharedView,
     renderer: std::sync::Arc<ui::Renderer>,
+    /// Set to make the stdin reader yield the terminal to a foreground picker
+    /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
+    suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic generation bumped on every `suspend_input()`. It lets a
+    /// picker's cleanup resume the reader only if no *newer* prompt has since
+    /// suspended it: a stale auto-away worker must not clear a later prompt's
+    /// suspension (which would resume stdin under an active dialoguer).
+    suspend_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Serialises dialoguer picker workers so at most one ever owns stdin. An
+    /// auto-away worker that outlived its timeout keeps this held until it
+    /// exits, so a later question cannot spawn a second stdin reader.
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// An owned token for one input suspension. Cleanup calls [`InputGate::release`],
+/// which resumes the background line reader *only* if this is still the most
+/// recent suspension — so a stale worker finishing late cannot clear a newer
+/// prompt's gate and resume stdin while that prompt's dialoguer is active.
+#[derive(Clone)]
+struct InputGate {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    token: u64,
+}
+
+impl InputGate {
+    /// Resume the reader iff no later `suspend_input()` has superseded this one.
+    fn release(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.generation.load(SeqCst) == self.token {
+            self.flag.store(false, SeqCst);
+        }
+    }
 }
 
 impl Terminal {
@@ -181,9 +230,11 @@ impl Terminal {
         let lines = tx.clone();
         let key_mode = io::stdin().is_terminal() && io::stdout().is_terminal();
         let reader_view = view.clone();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_suspend = suspend.clone();
         std::thread::spawn(move || {
             if key_mode {
-                let mut reader = lineedit::LineReader::default();
+                let mut reader = lineedit::LineReader::with_suspend(reader_suspend);
                 let send = |key: lineedit::Key| {
                     let _ = lines.send(match key {
                         lineedit::Key::Line(line) => TermInput::Line(line),
@@ -191,6 +242,7 @@ impl Terminal {
                         lineedit::Key::Interrupt => TermInput::Interrupt,
                         lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
                         lineedit::Key::Escape => TermInput::Escape,
+                        lineedit::Key::CycleMode => TermInput::CycleMode,
                     });
                 };
                 for () in want_rx {
@@ -234,7 +286,27 @@ impl Terminal {
             config_path,
             view,
             renderer,
+            suspend,
+            suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Make the stdin reader yield the terminal so a foreground picker can own
+    /// it; returns a generation-stamped [`InputGate`] the caller (or an orphaned
+    /// auto-answer worker) releases once the picker is truly done. The stamp
+    /// ensures a stale worker cannot resume the reader out from under a newer
+    /// prompt that has since re-suspended input.
+    fn suspend_input(&self) -> InputGate {
+        use std::sync::atomic::Ordering::SeqCst;
+        let token = self.suspend_gen.fetch_add(1, SeqCst) + 1;
+        self.suspend.store(true, SeqCst);
+        InputGate { flag: self.suspend.clone(), generation: self.suspend_gen.clone(), token }
+    }
+
+    /// A clone of the picker serialisation lock (see the field docs).
+    fn picker_lock(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.picker_lock.clone()
     }
 
     fn request_line(&mut self) {
@@ -253,7 +325,16 @@ impl Terminal {
 
     async fn recv(&mut self) -> TermInput {
         let input = self.events.recv().await.unwrap_or(TermInput::Eof);
-        if !matches!(input, TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape) {
+        // These are mid-line events delivered from *inside* an active
+        // `read_line` (via its `send` callback): the reader keeps running and
+        // still owns the outstanding read, so they must not clear `outstanding`
+        // or the next `request_line` would queue a second concurrent reader
+        // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
+        // is emitted the same way and belongs in this set.
+        if !matches!(
+            input,
+            TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode
+        ) {
             self.outstanding = false;
         }
         input
@@ -263,6 +344,7 @@ impl Terminal {
 /// Run a turn; typed lines steer it, and Ctrl-C or Esc Esc cancels it.
 async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Terminal) -> Result<agent::TurnOutcome> {
     let control = agent.control();
+    let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to steer, Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
@@ -273,8 +355,13 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
     let mut escape = DoubleEscape::default();
     let outcome = async {
+        // Grab the broker before the turn future borrows `agent` mutably.
+        let questions = agent.questions();
         let turn = agent.run_turn(None, text);
         tokio::pin!(turn);
+        let mut question_rx = questions.subscribe();
+        let cap = questions.cap();
+        let mut cap_rx = cap.subscribe();
         loop {
             if !terminal.queued.iter().any(|i| matches!(i, TermInput::Eof)) {
                 terminal.request_line();
@@ -284,6 +371,35 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                 // must happen before a buffered cancel or steer is routed to it.
                 biased;
                 outcome = &mut turn => break outcome,
+                // A `question` tool call is waiting for an answer. The handler
+                // is parked on the blocking pool; answer it here, where we own
+                // the terminal.
+                notified = question_rx.changed() => {
+                    if notified.is_err() {
+                        // Broker dropped (agent gone): nothing more to answer.
+                        continue;
+                    }
+                    if let Some(request) = questions.pending() {
+                        // Yield stdin to the picker so the line reader does not
+                        // race it for the answer keystrokes.
+                        let gate = terminal.suspend_input();
+                        // `prompt_question` owns the gate: it clears it while
+                        // holding the picker lock — immediately, or once a
+                        // timed-out auto-answer worker frees stdin — so the
+                        // reader never resumes while a dialoguer is still active.
+                        let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
+                        questions.resolve(answer);
+                    }
+                }
+                // The turn hit the cap in normal mode: ask whether to continue.
+                notified = cap_rx.changed() => {
+                    if notified.is_err() {
+                        continue;
+                    }
+                    let gate = terminal.suspend_input();
+                    let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
+                    cap.decide(decision);
+                }
                 input = terminal.recv() => match input {
                     TermInput::Interrupt => {
                         control.cancel();
@@ -300,6 +416,17 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     }
                     TermInput::ToggleThinking => {
                         renderer.toggle_thinking();
+                    }
+                    TermInput::CycleMode => {
+                        // `control` is a shared handle, so this works while the
+                        // turn future holds a `&mut` borrow of the agent.
+                        let mode = control.cycle_mode();
+                        // `Agent::set_mode` (used between turns) also refreshes
+                        // the shared stats; do the equivalent here so the status
+                        // line reflects the new mode immediately, mid-turn.
+                        stats.lock().unwrap().mode = mode;
+                        renderer.event(&agent::AgentEvent::Context);
+                        renderer.note(&format!("[mode: {mode} — {}]", mode.describe()));
                     }
                     TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() && !line.trim().starts_with('/') => {
                         control.steer(line.trim(), None);
@@ -331,6 +458,193 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     Ok(outcome)
 }
 
+/// How long auto mode waits for the user before answering a question itself.
+const AUTO_AWAY_SECS: u64 = 15;
+
+/// Render one question and return its answer string, `None` when dismissed.
+/// Strip terminal control characters from model-controlled text before it is
+/// handed to dialoguer for rendering. `q.question`, option labels and
+/// descriptions all originate from the model, so a prompt-injected model could
+/// otherwise smuggle ANSI/OSC escape sequences (cursor moves, screen clears,
+/// clipboard/title writes) through the interactive picker. Dropping C0/C1
+/// control characters — including ESC (0x1B), which begins every such sequence —
+/// neutralises them while leaving ordinary printable text intact.
+pub(crate) fn sanitize_terminal_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn ask_one(q: &question::Question) -> Result<Option<String>> {
+    use dialoguer::{Input, Select};
+    let mut labels: Vec<String> = q
+        .options
+        .iter()
+        .map(|o| {
+            let label = sanitize_terminal_text(&o.label);
+            if o.description.is_empty() {
+                label
+            } else {
+                format!("{} — {}", label, sanitize_terminal_text(&o.description))
+            }
+        })
+        .collect();
+    let custom_index = if q.custom {
+        labels.push("Type your own answer".into());
+        Some(labels.len() - 1)
+    } else {
+        None
+    };
+    let choice = Select::new()
+        .with_prompt(sanitize_terminal_text(&q.question))
+        .items(&labels)
+        .default(0)
+        .interact_opt()?;
+    match choice {
+        None => Ok(None),
+        Some(i) if Some(i) == custom_index => {
+            let text: String = Input::new().with_prompt("Answer").interact_text()?;
+            Ok(Some(text))
+        }
+        Some(i) => Ok(Some(q.options[i].label.clone())),
+    }
+}
+
+/// Render a pending `question` and return the answer, plus an optional handle
+/// to a still-running auto-answer worker. In auto mode the user gets
+/// `AUTO_AWAY_SECS` to respond before the question is answered with the away
+/// message; a `spawn_blocking` dialoguer worker cannot be aborted, so when the
+/// timeout fires the worker is handed back (still parked on stdin) for the
+/// caller to await before it resumes the line reader — the two must never read
+/// keystrokes at once. Runs on the turn loop, which owns the terminal.
+async fn prompt_question(
+    questions: &[question::Question],
+    control: &agent::TurnControl,
+    renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    gate: InputGate,
+) -> question::QuestionAnswer {
+    use question::QuestionAnswer;
+    let auto = control.mode() == mode::AgentMode::Auto;
+
+    // The whole prompt run: ask each question, collecting one string each.
+    // Dismissal (Esc) at any question dismisses the lot.
+    let ask = |questions: &[question::Question]| -> Result<QuestionAnswer> {
+        let mut answers = Vec::new();
+        for q in questions {
+            match ask_one(q)? {
+                Some(answer) => answers.push(answer),
+                None => return Ok(QuestionAnswer::Dismissed),
+            }
+        }
+        Ok(QuestionAnswer::Answers(answers))
+    };
+
+    if !auto {
+        // Normal mode: the user is present, so it is fine to block until any
+        // previous (possibly orphaned) worker releases stdin, so only one ever
+        // reads keystrokes.
+        let guard = picker_lock.lock_owned().await;
+        let questions = questions.to_vec();
+        let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
+        // Release the gate while still holding the picker guard, so the input
+        // reader cannot resume before the next picker (which must take this
+        // same lock) has re-suspended it. `release()` is generation-aware, so
+        // it is a no-op if a newer prompt has already re-suspended input.
+        gate.release();
+        drop(guard);
+        return asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed);
+    }
+
+    // Auto mode: give the user a chance to answer, then answer ourselves.
+    renderer.note(&format!("[auto: answering for you in {AUTO_AWAY_SECS}s — the user is away]"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(AUTO_AWAY_SECS);
+
+    // Acquire stdin, but never past the away deadline. If a prior orphaned
+    // worker still holds the picker lock while the user is away, blocking here
+    // would keep this question from ever resolving (finding: later questions
+    // wait on the lock before their own timeout can start). Bound the wait so
+    // it still answers `Away`, and serialise so only one worker reads stdin.
+    let guard = match tokio::time::timeout_at(deadline, picker_lock.clone().lock_owned()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            renderer.note("[auto: no answer — making the best decision]");
+            // Do not start a competing reader. Keep the caller's input gate
+            // suspended until the picker frees (the prior orphan exits), then
+            // release the gate while still holding the guard, so a later picker
+            // cannot acquire the lock and re-suspend between our lock release
+            // and the gate release (which would let the reader race stdin).
+            tokio::spawn(async move {
+                let guard = picker_lock.lock_owned().await;
+                gate.release();
+                drop(guard);
+            });
+            return QuestionAnswer::Away;
+        }
+    };
+
+    let questions = questions.to_vec();
+    let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
+    tokio::select! {
+        joined = &mut worker => {
+            // Release the gate while still holding the guard, then drop it.
+            gate.release();
+            drop(guard);
+            joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            renderer.note("[auto: no answer — making the best decision]");
+            // Keep the worker alive (it is still blocked on stdin) and hold the
+            // picker lock until it exits. Release the gate while still holding
+            // the guard so the reader resumes only once this worker exits, with
+            // no window for a later picker to slip in between lock and gate
+            // release.
+            tokio::spawn(async move {
+                let _ = worker.await;
+                gate.release();
+                drop(guard);
+            });
+            QuestionAnswer::Away
+        }
+    }
+}
+
+/// Ask whether to keep going when the turn cap is reached. Defaults to stop,
+/// so an unattended prompt does not run away. Runs on the turn loop.
+async fn prompt_cap_reached(
+    renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    gate: InputGate,
+) -> question::CapDecision {
+    use question::CapDecision;
+    // Serialise with the question picker: this is another dialoguer reader, so
+    // never run it while an orphaned auto-away worker still holds stdin. Block
+    // until that worker releases the lock so only one ever reads keystrokes.
+    let guard = picker_lock.lock_owned().await;
+    let renderer = renderer.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        let keep_going = dialoguer::Confirm::new()
+            .with_prompt("Reached the turn cap without a final answer. Keep going?")
+            .default(false)
+            .interact_opt()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if keep_going {
+            renderer.note("[continuing past the turn cap]");
+            CapDecision::Continue
+        } else {
+            CapDecision::Stop
+        }
+    })
+    .await
+    .unwrap_or(CapDecision::Stop);
+    // Release the gate while still holding the guard, so the input reader cannot
+    // resume before the next picker re-suspends it (generation-aware: a no-op if
+    // a newer prompt already re-suspended input).
+    gate.release();
+    drop(guard);
+    decision
+}
+
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
 async fn run_compaction(
     agent: &mut Agent,
@@ -338,6 +652,7 @@ async fn run_compaction(
     terminal: &mut Terminal,
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
+    let stats = agent.context_stats();
     let compaction = agent.compact(instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
@@ -361,6 +676,16 @@ async fn run_compaction(
                 }
                 TermInput::ToggleThinking => {
                     terminal.renderer.toggle_thinking();
+                }
+                TermInput::CycleMode => {
+                    let mode = control.cycle_mode();
+                    // Mirror the prompt/turn `CycleMode` path: refresh the
+                    // shared stats and emit a context event so the status line
+                    // reflects the new mode immediately, not just after a later
+                    // refresh while `/compact` is still running.
+                    stats.lock().unwrap().mode = mode;
+                    terminal.renderer.event(&agent::AgentEvent::Context);
+                    eprintln!("[mode: {mode} — {}]", mode.describe());
                 }
                 other => terminal.queued.push_back(other),
             },
@@ -539,6 +864,25 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        "/mode" => {
+            let current = agent.mode();
+            println!("Mode: {current} ({})", current.describe());
+            for mode in mode::AgentMode::ALL {
+                println!("  {:<8} {}", mode.to_string(), mode.describe());
+            }
+            println!("(Shift+Tab cycles; /mode NAME sets it directly)");
+            Ok(true)
+        }
+        _ if cmd.starts_with("/mode ") => {
+            match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
+                Ok(m) => {
+                    agent.set_mode(m);
+                    println!("Mode set to {m} ({})", m.describe());
+                }
+                Err(e) => println!("{e}"),
+            }
+            Ok(true)
+        }
         _ if cmd.starts_with("/verbosity ") => {
             match cmd["/verbosity ".len()..].parse::<ui::Verbosity>() {
                 Ok(level) => {
@@ -700,6 +1044,12 @@ async fn main() -> Result<()> {
         eprintln!("ACP harness ready (provider: {}, model: {})", agent.provider_name(), agent.model_name());
         acp::run_acp(&mut agent).await?;
     } else {
+        // The interactive CLI answers `question` tool calls, but only when a
+        // real terminal is attached: with piped stdin/stdout the picker cannot
+        // be driven, so `question` must take the documented headless path
+        // instead of blocking in dialoguer while `Terminal` also reads stdin.
+        let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+        agent.questions().set_interactive(interactive);
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
@@ -794,6 +1144,12 @@ async fn main() -> Result<()> {
                             prompt(&terminal, false);
                         }
                     }
+                    TermInput::CycleMode => {
+                        let mode = agent.control().cycle_mode();
+                        agent.set_mode(mode);
+                        println!("\nMode: {mode} ({})", mode.describe());
+                        prompt(&terminal, false);
+                    }
                     other => break other,
                 }
             };
@@ -805,7 +1161,7 @@ async fn main() -> Result<()> {
                     println!("\n(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape => continue,
+                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
                 TermInput::Line(line) => line.trim().to_string(),
             };
             exit_armed = false;
@@ -858,5 +1214,13 @@ mod tests {
         // Too slow: the second press re-arms instead of cancelling.
         assert!(!escape.press(t + Duration::from_millis(1600)));
         assert!(escape.press(t + Duration::from_millis(1700)));
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_control_and_escape_sequences() {
+        // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
+        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
+        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
+        assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
     }
 }

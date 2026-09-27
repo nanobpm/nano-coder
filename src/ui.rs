@@ -132,6 +132,7 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[38;5;114m";
 const RED: &str = "\x1b[38;5;203m";
+const YELLOW: &str = "\x1b[38;5;179m";
 const RESET: &str = "\x1b[0m";
 const REDRAW_EVERY: Duration = Duration::from_millis(50);
 const PREVIEW_LINES: usize = 10;
@@ -353,8 +354,30 @@ impl Renderer {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
                 state.streamed_thinking = false;
-                let status = call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
-                let mark = if status == "blocked" { format!("{RED}■ blocked{RESET}") } else { format!("{GREEN}✔ {status}{RESET}") };
+                // Derive the status from the parsed outcome so string-encoded
+                // arguments (a JSON string, which `Outcome::from_args` accepts)
+                // and aliases render the correct marker, not a false success.
+                let mark = match crate::goal::Status::from_args(&call.arguments) {
+                    Some(crate::goal::Status::Blocked) => format!("{RED}■ blocked{RESET}"),
+                    Some(crate::goal::Status::NeedsInput) => format!("{YELLOW}? needs input{RESET}"),
+                    Some(crate::goal::Status::Completed) => format!("{GREEN}✔ completed{RESET}"),
+                    None => {
+                        // An unparseable/unknown/missing status is NOT a success;
+                        // use a neutral marker so an invalid `report_outcome`
+                        // (e.g. `{"status":"oops"}`) is not shown as a green ✔.
+                        // `status` is model-controlled; strip control/escape
+                        // characters so an invalid value cannot smuggle ANSI/OSC
+                        // sequences into the terminal via this fallback.
+                        let raw = crate::sanitize_terminal_text(
+                            call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                        );
+                        if raw.is_empty() {
+                            format!("{DIM}• unknown{RESET}")
+                        } else {
+                            format!("{DIM}• {raw}{RESET}")
+                        }
+                    }
+                };
                 self.out(&mut state, &format!("{}{mark}\n", stamp()));
             }
             AgentEvent::ToolResult { call, ok: true, .. } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}

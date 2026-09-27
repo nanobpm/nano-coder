@@ -267,6 +267,8 @@ pub enum Key {
     ToggleThinking,
     /// A lone Esc press (not part of an escape sequence).
     Escape,
+    /// Shift+Tab: cycle the agent mode (normal/plan/auto).
+    CycleMode,
 }
 
 /// How long to wait after Esc for the rest of an escape sequence. Terminals
@@ -327,6 +329,60 @@ impl Drop for KeyMode {
 pub struct LineReader {
     pending: std::collections::VecDeque<u8>,
     utf8: Vec<u8>,
+    /// While set, the reader yields stdin instead of consuming it, so a
+    /// foreground picker (a `question`/turn-cap prompt) can own the terminal
+    /// without racing this reader for keystrokes.
+    suspend: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long the reader polls stdin (and re-checks `suspend`) per slice, so a
+/// suspend request is observed within this many milliseconds.
+const SUSPEND_POLL_MS: i32 = 15;
+
+impl LineReader {
+    /// A reader that yields stdin whenever `suspend` is set.
+    pub fn with_suspend(suspend: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { suspend, ..Self::default() }
+    }
+
+    /// The byte that begins the next key press. Blocks until one arrives, but
+    /// while `suspend` is set it releases stdin (polling in short slices) so a
+    /// foreground picker can read it instead. Returns `None` on EOF/error.
+    fn first_byte(&mut self) -> Option<u8> {
+        loop {
+            // Honour suspension before draining any buffered bytes: while a
+            // foreground picker owns the terminal, queued/pasted bytes in
+            // `pending` must stay put (not be consumed as prompt/steering
+            // input) so they cannot race dialoguer.
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(SUSPEND_POLL_MS as u64));
+                continue;
+            }
+            if let Some(byte) = self.pending.pop_front() {
+                return Some(byte);
+            }
+            let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut fd, 1, SUSPEND_POLL_MS) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            if ready == 0 {
+                continue; // timeout: re-check suspend, then poll again
+            }
+            // Re-check suspend after poll: a foreground picker may have set it
+            // while we were parked in `poll`. If so, do not read — `next_byte`
+            // would pull up to 1024 bytes off stdin (including the picker's
+            // first keystrokes). Loop back so those bytes stay unread until the
+            // picker has consumed them and suspension clears.
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            return self.next_byte();
+        }
+    }
 }
 
 impl LineReader {
@@ -350,6 +406,17 @@ impl LineReader {
     /// The next byte if one arrives within `ms` milliseconds.
     fn byte_within(&mut self, ms: i32) -> Option<u8> {
         if self.pending.is_empty() {
+            // Honour suspension in the escape-sequence path too: a real
+            // sequence (arrow key, Shift+Tab) arrives atomically, so its
+            // continuation is already buffered in `pending` and read below.
+            // But if nothing is buffered and a foreground picker has taken the
+            // terminal, the next bytes belong to the picker — do not poll or
+            // read stdin for them. Report "no continuation" so the ESC we
+            // already consumed resolves as a bare Escape and the picker keeps
+            // its own keystrokes (including its `ESC [ Z`).
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut fd, 1, ms) } <= 0 {
                 return None;
@@ -365,7 +432,7 @@ impl LineReader {
         view.lock().unwrap().menu_enabled = true;
         let shared = view;
         loop {
-            let Some(byte) = self.next_byte() else { return Key::Eof };
+            let Some(byte) = self.first_byte() else { return Key::Eof };
             let mut view = view.lock().unwrap();
             match byte {
                 b'\r' | b'\n' => {
@@ -407,7 +474,12 @@ impl LineReader {
                                     break;
                                 }
                             }
-                            if let Some(row) = crate::status::cursor_report_row(&seq) {
+                            // Shift+Tab is ESC [ Z (backtab); everything else is
+                            // skipped, with a cursor position report forwarded to
+                            // the status line when it is waiting for one.
+                            if seq == [0x1b, b'[', b'Z'] {
+                                send(Key::CycleMode);
+                            } else if let Some(row) = crate::status::cursor_report_row(&seq) {
                                 crate::status::cursor_reported(row);
                             }
                         }

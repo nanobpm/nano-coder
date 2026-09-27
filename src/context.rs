@@ -66,6 +66,8 @@ pub struct ContextStats {
     /// Live output rate while generating (completion tokens per second),
     /// `None` when idle or before the first streamed token.
     pub tokens_per_sec: Option<f64>,
+    /// The operating mode (normal/plan/auto), shown on the status line.
+    pub mode: crate::mode::AgentMode,
 }
 
 impl ContextStats {
