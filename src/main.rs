@@ -294,7 +294,16 @@ impl Terminal {
 
     async fn recv(&mut self) -> TermInput {
         let input = self.events.recv().await.unwrap_or(TermInput::Eof);
-        if !matches!(input, TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape) {
+        // These are mid-line events delivered from *inside* an active
+        // `read_line` (via its `send` callback): the reader keeps running and
+        // still owns the outstanding read, so they must not clear `outstanding`
+        // or the next `request_line` would queue a second concurrent reader
+        // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
+        // is emitted the same way and belongs in this set.
+        if !matches!(
+            input,
+            TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode
+        ) {
             self.outstanding = false;
         }
         input
