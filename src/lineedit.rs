@@ -100,7 +100,11 @@ impl EditView {
     /// The text with the cursor marked, for the status line. The status line
     /// stores it raw and renders (prefix, cursor, padding) once at draw time.
     fn show_on_status(&self, status: &StatusLine) {
-        status.set_input(Some((&self.line, self.cursor)));
+        if self.line.is_empty() {
+            status.set_input(None);
+        } else {
+            status.set_input(Some((&self.line, self.cursor)));
+        }
     }
 
     fn line_changed(&mut self) {
@@ -196,7 +200,7 @@ impl EditView {
     fn cursor_position(&self, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let mut row = 0;
-        let mut col = self.prompt_width;
+        let mut col = self.prompt_width % cols;
         for c in self.line.chars().take(self.cursor) {
             if c == '\n' {
                 row += 1;
@@ -743,6 +747,10 @@ impl LineReader {
                             self.pending.push_front(0x1b);
                             send(Key::Escape);
                         }
+                        // Alt-b / Alt-f: readline word jumps arrive as ESC b /
+                        // ESC f, which never enter the CSI parser above.
+                        Some(b'b') => shared.lock().unwrap().move_word_left(),
+                        Some(b'f') => shared.lock().unwrap().move_word_right(),
                         // Alt+key: ignored.
                         Some(_) => {}
                     }
@@ -871,6 +879,11 @@ fn read_paste(reader: &mut LineReader) -> String {
                 }
                 out.push('\n');
             }
+            '\n' => out.push('\n'),
+            // Drop other control bytes (ESC, etc.) so pasted ANSI escapes
+            // cannot execute terminal control sequences when the buffer is
+            // later interpolated into prompt/status output.
+            c if c.is_control() => {}
             _ => out.push(c),
         }
     }
