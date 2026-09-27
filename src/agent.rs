@@ -768,6 +768,9 @@ impl Agent {
             stats.session_output_tokens = 0;
             stats.compactions = 0;
         }
+        // Each session starts in the default mode; a plan/auto selection does
+        // not leak across `/restart` or a later session load.
+        self.control.set_mode(crate::mode::AgentMode::default());
         self.refresh_stats();
         Ok(id)
     }
@@ -792,6 +795,9 @@ impl Agent {
         self.calibration = None;
         self.compact_floor = 0;
         self.repair_dangling_tool_calls()?;
+        // A loaded session starts in the default mode, not whatever mode the
+        // previous session left selected.
+        self.control.set_mode(crate::mode::AgentMode::default());
         self.refresh_stats();
         Ok(())
     }
@@ -1073,7 +1079,6 @@ impl Agent {
             .with_data("message_count", json!(self.conversation.len()));
         self.hooks.trigger(&ctx);
 
-        let tools = self.tool_definitions();
         let max_iterations = self.config.max_iterations.max(1);
         let mut final_response = None;
         let mut last_content = String::new();
@@ -1110,6 +1115,11 @@ impl Agent {
                 break;
             }
             self.absorb_steers()?;
+
+            // Rebuild the tool set each call so a mid-turn mode switch (e.g.
+            // Shift+Tab out of plan mode) takes effect at the next model call.
+            // The dispatch-time gate still backstops a switch into plan mode.
+            let tools = self.tool_definitions();
 
             // Trigger before_llm_send hook
             let ctx = HookContext::new(HookEvent::BeforeLLMSend)
@@ -1407,7 +1417,10 @@ impl Agent {
             StopReason::EndTurn => final_response.unwrap_or_default(),
             StopReason::Cancelled => CANCELLED_RESPONSE.to_string(),
             StopReason::MaxTurnRequests => {
-                format!("{last_content}\n[stopped after {iteration} LLM calls without a final answer]")
+                // `iteration` was incremented past the cap before the loop
+                // broke, so the number of completed calls is one fewer.
+                let completed = iteration.saturating_sub(1);
+                format!("{last_content}\n[stopped after {completed} LLM calls without a final answer]")
                     .trim_start()
                     .to_string()
             }
@@ -2671,8 +2684,8 @@ mod tests {
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![calls, text("cannot do that in plan mode")], dir.path());
-        agent.set_mode(crate::mode::AgentMode::Plan);
         agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
         let outcome = agent.run_turn(None, "delete everything").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         let conversation = agent.conversation();
@@ -2685,8 +2698,8 @@ mod tests {
     async fn plan_mode_keeps_read_only_tools() {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![tool_call("e1"), text("done")], dir.path());
-        agent.set_mode(crate::mode::AgentMode::Plan);
         agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
         let outcome = agent.run_turn(None, "echo something").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         let conversation = agent.conversation();
@@ -2695,13 +2708,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn new_session_and_load_reset_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("hi")], dir.path());
+        let id = agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        assert_eq!(agent.mode(), crate::mode::AgentMode::Plan);
+        // A fresh session starts back in the default mode.
+        agent.new_session().unwrap();
+        assert_eq!(agent.mode(), crate::mode::AgentMode::Normal, "new_session resets the mode");
+        // So does loading an existing one.
+        agent.set_mode(crate::mode::AgentMode::Auto);
+        agent.load_session(&id).unwrap();
+        assert_eq!(agent.mode(), crate::mode::AgentMode::Normal, "load_session resets the mode");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn auto_mode_disables_the_turn_cap() {
         let dir = tempfile::tempdir().unwrap();
         // More tool calls than the cap; auto mode should run them all.
         let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
         agent.config.max_iterations = 2;
-        agent.set_mode(crate::mode::AgentMode::Auto);
         agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Auto);
         let outcome = agent.run_turn(None, "go").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn, "auto mode runs past the cap");
         assert_eq!(outcome.response, "done");

@@ -188,6 +188,9 @@ struct Terminal {
     /// The line being typed (terminal stdin only).
     view: lineedit::SharedView,
     renderer: std::sync::Arc<ui::Renderer>,
+    /// Set to make the stdin reader yield the terminal to a foreground picker
+    /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
+    suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Terminal {
@@ -197,9 +200,11 @@ impl Terminal {
         let lines = tx.clone();
         let key_mode = io::stdin().is_terminal() && io::stdout().is_terminal();
         let reader_view = view.clone();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_suspend = suspend.clone();
         std::thread::spawn(move || {
             if key_mode {
-                let mut reader = lineedit::LineReader::default();
+                let mut reader = lineedit::LineReader::with_suspend(reader_suspend);
                 let send = |key: lineedit::Key| {
                     let _ = lines.send(match key {
                         lineedit::Key::Line(line) => TermInput::Line(line),
@@ -251,7 +256,16 @@ impl Terminal {
             config_path,
             view,
             renderer,
+            suspend,
         }
+    }
+
+    /// Make the stdin reader yield the terminal so a foreground picker can own
+    /// it; returns the flag so the caller can resume it once the picker (or an
+    /// orphaned auto-answer worker) is truly done.
+    fn suspend_input(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.suspend.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.suspend.clone()
     }
 
     fn request_line(&mut self) {
@@ -280,6 +294,7 @@ impl Terminal {
 /// Run a turn; typed lines steer it, and Ctrl-C or Esc Esc cancels it.
 async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Terminal) -> Result<agent::TurnOutcome> {
     let control = agent.control();
+    let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to steer, Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
@@ -315,7 +330,21 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         continue;
                     }
                     if let Some(request) = questions.pending() {
-                        let answer = prompt_question(request.questions(), &control, &renderer).await;
+                        // Yield stdin to the picker so the line reader does not
+                        // race it for the answer keystrokes.
+                        let gate = terminal.suspend_input();
+                        let (answer, orphan) = prompt_question(request.questions(), &control, &renderer).await;
+                        match orphan {
+                            None => gate.store(false, std::sync::atomic::Ordering::SeqCst),
+                            // An auto-answer worker timed out but is still parked
+                            // on stdin; resume the reader only once it exits.
+                            Some(handle) => {
+                                tokio::spawn(async move {
+                                    let _ = handle.await;
+                                    gate.store(false, std::sync::atomic::Ordering::SeqCst);
+                                });
+                            }
+                        }
                         questions.resolve(answer);
                     }
                 }
@@ -324,7 +353,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     if notified.is_err() {
                         continue;
                     }
+                    let gate = terminal.suspend_input();
                     let decision = prompt_cap_reached(&renderer).await;
+                    gate.store(false, std::sync::atomic::Ordering::SeqCst);
                     cap.decide(decision);
                 }
                 input = terminal.recv() => match input {
@@ -348,6 +379,11 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // `control` is a shared handle, so this works while the
                         // turn future holds a `&mut` borrow of the agent.
                         let mode = control.cycle_mode();
+                        // `Agent::set_mode` (used between turns) also refreshes
+                        // the shared stats; do the equivalent here so the status
+                        // line reflects the new mode immediately, mid-turn.
+                        stats.lock().unwrap().mode = mode;
+                        renderer.event(&agent::AgentEvent::Context);
                         renderer.note(&format!("[mode: {mode} — {}]", mode.describe()));
                     }
                     TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() && !line.trim().starts_with('/') => {
@@ -408,14 +444,18 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     }
 }
 
-/// Render a pending `question` and return the answer. In auto mode the user
-/// gets `AUTO_AWAY_SECS` to respond before the question is answered with the
-/// away message. Runs on the turn loop, which owns the terminal.
+/// Render a pending `question` and return the answer, plus an optional handle
+/// to a still-running auto-answer worker. In auto mode the user gets
+/// `AUTO_AWAY_SECS` to respond before the question is answered with the away
+/// message; a `spawn_blocking` dialoguer worker cannot be aborted, so when the
+/// timeout fires the worker is handed back (still parked on stdin) for the
+/// caller to await before it resumes the line reader — the two must never read
+/// keystrokes at once. Runs on the turn loop, which owns the terminal.
 async fn prompt_question(
     questions: &[question::Question],
     control: &agent::TurnControl,
     renderer: &std::sync::Arc<ui::Renderer>,
-) -> question::QuestionAnswer {
+) -> (question::QuestionAnswer, Option<tokio::task::JoinHandle<()>>) {
     use question::QuestionAnswer;
     let auto = control.mode() == mode::AgentMode::Auto;
 
@@ -435,18 +475,23 @@ async fn prompt_question(
     if !auto {
         let questions = questions.to_vec();
         let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
-        return asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed);
+        return (asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None);
     }
 
     // Auto mode: give the user a chance to answer, then answer ourselves.
     renderer.note(&format!("[auto: answering for you in {AUTO_AWAY_SECS}s — the user is away]"));
     let questions = questions.to_vec();
-    match tokio::time::timeout(std::time::Duration::from_secs(AUTO_AWAY_SECS), tokio::task::spawn_blocking(move || ask(&questions))).await {
-        Ok(Ok(Ok(answer))) => answer,
-        Ok(_) => QuestionAnswer::Dismissed,
-        Err(_) => {
+    let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
+    tokio::select! {
+        joined = &mut worker => {
+            (joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None)
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(AUTO_AWAY_SECS)) => {
             renderer.note("[auto: no answer — making the best decision]");
-            QuestionAnswer::Away
+            // Keep the worker alive (it is still blocked on stdin) and hand it
+            // back so the caller resumes input only once it has exited.
+            let orphan = tokio::spawn(async move { let _ = worker.await; });
+            (QuestionAnswer::Away, Some(orphan))
         }
     }
 }
@@ -863,8 +908,12 @@ async fn main() -> Result<()> {
         eprintln!("ACP harness ready (provider: {}, model: {})", agent.provider_name(), agent.model_name());
         acp::run_acp(&mut agent).await?;
     } else {
-        // The interactive CLI answers `question` tool calls.
-        agent.questions().set_interactive(true);
+        // The interactive CLI answers `question` tool calls, but only when a
+        // real terminal is attached: with piped stdin/stdout the picker cannot
+        // be driven, so `question` must take the documented headless path
+        // instead of blocking in dialoguer while `Terminal` also reads stdin.
+        let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+        agent.questions().set_interactive(interactive);
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
