@@ -737,6 +737,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 println!("Plan:         {done}/{total} done (/plan to show it)");
             }
             println!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens);
+            if let Some(aic) = stats.session_aic {
+                println!("AI Credits:   {aic:.2} used this session");
+            }
             match stats.auto_compact {
                 Some(t) => println!(
                     "Auto-compact: at {:.0}% (~{} tokens); compacted {} time(s)",
@@ -798,10 +801,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             println!("(read-only: run /model again at the prompt to switch)");
             Ok(true)
         }
-        "/model" if !(io::stdin().is_terminal() && io::stdout().is_terminal()) => {
-            // The picker reads stdin and needs a real terminal; piped
-            // stdin/stdout just gets the current model. (stderr may still be a
-            // TTY, so it is the wrong thing to check here.)
+        "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            // The picker reads keystrokes from stdin and draws on stderr, so it
+            // needs both to be terminals; piped input/output just gets the
+            // current model.
             println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
             Ok(true)
         }
@@ -1178,6 +1181,18 @@ async fn main() -> Result<()> {
         }
 
         println!("\nGoodbye!");
+        // Repeat the resume instruction on exit so it is still on screen (and
+        // in scrollback) after a long session has pushed the start-up banner
+        // away. `/restart` may have swapped the session mid-run, so re-read
+        // the current ID rather than remembering the start-up one. Gate on
+        // `session_path()` (not `session_id()`): when persistence is disabled
+        // `/restart` still assigns a session ID even though nothing is written
+        // to disk, so printing a `--resume` command there would be unusable.
+        if agent.session_path().is_some()
+            && let Some(id) = agent.session_id()
+        {
+            println!("Session: {id} (resume with --resume {id})");
+        }
     }
 
     Ok(())

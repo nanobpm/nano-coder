@@ -186,6 +186,7 @@ fn parse_usage(value: &Value) -> Option<TokenUsage> {
             prompt_tokens: field("prompt_tokens"),
             completion_tokens: field("completion_tokens"),
             total_tokens: field("total_tokens"),
+            aic: crate::llm::copilot_aic(value),
         }
     })
 }
@@ -630,6 +631,24 @@ mod tests {
         assert_eq!(response.tool_calls[1].arguments, Value::String("{oops".into()));
         assert_eq!(response.usage.unwrap().total_tokens, 7);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn parses_copilot_aic_from_response() {
+        let response = parse_response(&json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18},
+            "copilot_usage": {"total_nano_aiu": 11_600_000}
+        }), false)
+        .unwrap();
+        assert_eq!(response.usage.unwrap().aic, Some(0.0116));
+        // Non-Copilot responses carry no credits.
+        let plain = parse_response(&json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18}
+        }), false)
+        .unwrap();
+        assert_eq!(plain.usage.unwrap().aic, None);
     }
 
     #[tokio::test]

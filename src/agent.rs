@@ -608,6 +608,9 @@ impl Agent {
             let mut stats = self.stats.lock().unwrap();
             stats.session_input_tokens += usage.prompt_tokens.max(0) as u64;
             stats.session_output_tokens += usage.completion_tokens.max(0) as u64;
+            if let Some(aic) = usage.aic {
+                *stats.session_aic.get_or_insert(0.0) += aic;
+            }
         }
         if counts_as_context && usage.prompt_tokens > 0 {
             // Anchored at the assistant message about to be pushed.
@@ -766,6 +769,7 @@ impl Agent {
             let mut stats = self.stats.lock().unwrap();
             stats.session_input_tokens = 0;
             stats.session_output_tokens = 0;
+            stats.session_aic = None;
             stats.compactions = 0;
         }
         // Each session starts in the default mode; a plan/auto selection does
@@ -1963,6 +1967,7 @@ mod tests {
             let mut stats = stats.lock().unwrap();
             stats.session_input_tokens = 1_234;
             stats.session_output_tokens = 567;
+            stats.session_aic = Some(1.5);
             stats.compactions = 3;
         }
         agent.new_session().unwrap();
@@ -1970,7 +1975,25 @@ mod tests {
         let stats = stats.lock().unwrap();
         assert_eq!(stats.session_input_tokens, 0);
         assert_eq!(stats.session_output_tokens, 0);
+        assert_eq!(stats.session_aic, None);
         assert_eq!(stats.compactions, 0);
+    }
+
+    #[test]
+    fn record_usage_accumulates_aic_when_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let response = |aic: Option<f64>| LLMResponse {
+            usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic }),
+            ..Default::default()
+        };
+        // A provider that reports credits accumulates them.
+        agent.record_usage(&response(Some(0.0116)), false);
+        agent.record_usage(&response(Some(0.0425)), false);
+        assert_eq!(agent.context_stats().lock().unwrap().session_aic, Some(0.0541));
+        // A response without credits leaves the total untouched.
+        agent.record_usage(&response(None), false);
+        assert_eq!(agent.context_stats().lock().unwrap().session_aic, Some(0.0541));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2106,7 +2129,7 @@ mod tests {
         assert!(!calibrated && raw > 0);
         let response = LLMResponse {
             content: "hi".into(),
-            usage: Some(crate::llm::TokenUsage { prompt_tokens: 1_000, completion_tokens: 50, total_tokens: 1_050 }),
+            usage: Some(crate::llm::TokenUsage { prompt_tokens: 1_000, completion_tokens: 50, total_tokens: 1_050, aic: None }),
             ..Default::default()
         };
         agent.record_usage(&response, true);
