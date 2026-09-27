@@ -191,6 +191,10 @@ struct Terminal {
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Serialises dialoguer picker workers so at most one ever owns stdin. An
+    /// auto-away worker that outlived its timeout keeps this held until it
+    /// exits, so a later question cannot spawn a second stdin reader.
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Terminal {
@@ -257,6 +261,7 @@ impl Terminal {
             view,
             renderer,
             suspend,
+            picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -266,6 +271,11 @@ impl Terminal {
     fn suspend_input(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.suspend.store(true, std::sync::atomic::Ordering::SeqCst);
         self.suspend.clone()
+    }
+
+    /// A clone of the picker serialisation lock (see the field docs).
+    fn picker_lock(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.picker_lock.clone()
     }
 
     fn request_line(&mut self) {
@@ -333,7 +343,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // Yield stdin to the picker so the line reader does not
                         // race it for the answer keystrokes.
                         let gate = terminal.suspend_input();
-                        let (answer, orphan) = prompt_question(request.questions(), &control, &renderer).await;
+                        let (answer, orphan) = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock()).await;
                         match orphan {
                             None => gate.store(false, std::sync::atomic::Ordering::SeqCst),
                             // An auto-answer worker timed out but is still parked
@@ -455,9 +465,15 @@ async fn prompt_question(
     questions: &[question::Question],
     control: &agent::TurnControl,
     renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> (question::QuestionAnswer, Option<tokio::task::JoinHandle<()>>) {
     use question::QuestionAnswer;
     let auto = control.mode() == mode::AgentMode::Auto;
+
+    // Serialise picker workers: wait for any previous (possibly orphaned)
+    // dialoguer worker to release stdin before starting our own, so only one
+    // ever reads keystrokes.
+    let guard = picker_lock.lock_owned().await;
 
     // The whole prompt run: ask each question, collecting one string each.
     // Dismissal (Esc) at any question dismisses the lot.
@@ -475,6 +491,7 @@ async fn prompt_question(
     if !auto {
         let questions = questions.to_vec();
         let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
+        drop(guard);
         return (asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None);
     }
 
@@ -484,13 +501,19 @@ async fn prompt_question(
     let mut worker = tokio::task::spawn_blocking(move || ask(&questions));
     tokio::select! {
         joined = &mut worker => {
+            drop(guard);
             (joined.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed), None)
         }
         () = tokio::time::sleep(std::time::Duration::from_secs(AUTO_AWAY_SECS)) => {
             renderer.note("[auto: no answer — making the best decision]");
-            // Keep the worker alive (it is still blocked on stdin) and hand it
-            // back so the caller resumes input only once it has exited.
-            let orphan = tokio::spawn(async move { let _ = worker.await; });
+            // Keep the worker alive (it is still blocked on stdin) and hold the
+            // picker lock until it exits, so any later question serialises
+            // behind it instead of spawning a second stdin reader. Hand the
+            // task back so the caller resumes input only once it has exited.
+            let orphan = tokio::spawn(async move {
+                let _ = worker.await;
+                drop(guard);
+            });
             (QuestionAnswer::Away, Some(orphan))
         }
     }
@@ -666,9 +689,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             println!("(read-only: run /model again at the prompt to switch)");
             Ok(true)
         }
-        "/model" if !io::stderr().is_terminal() => {
-            // The picker needs a terminal; piped stdin/stdout just gets the
-            // current model.
+        "/model" if !(io::stdin().is_terminal() && io::stdout().is_terminal()) => {
+            // The picker reads stdin and needs a real terminal; piped
+            // stdin/stdout just gets the current model. (stderr may still be a
+            // TTY, so it is the wrong thing to check here.)
             println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
             Ok(true)
         }
