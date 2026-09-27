@@ -797,10 +797,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
+            let before = agent.config().model.clone();
             settings::run(agent, &terminal.config_path).await?;
-            // Providers or the model may have changed: refresh what the line
-            // editor's argument suggestions read.
-            terminal.sync_context(agent);
+            // Providers or the model may have changed. A model switched through
+            // the settings dialog must land in the recents MRU just like one
+            // switched with `/model`; a provider-only edit just refreshes the
+            // config the line editor's argument suggestions read.
+            if agent.config().model != before {
+                terminal.model_switched(agent);
+            } else {
+                terminal.sync_context(agent);
+            }
             Ok(true)
         }
         "/tools" => {

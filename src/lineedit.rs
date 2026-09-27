@@ -142,11 +142,36 @@ impl EditView {
             let recents = context.recents.lock().unwrap().models().to_vec();
             crate::commands::complete_line(&context.config, &recents, &self.line)
         };
-        if let Some(done) = completed {
-            let rest = done[self.line.len()..].to_string();
-            if !rest.is_empty() {
-                self.insert(&rest);
+        match completed {
+            Some(done) => self.replace_line(&done),
+            // Restore the documented space fallback for a slash line past its
+            // command name (e.g. `/compact focus`, `/model value extra`) that
+            // has no completion, while keeping Tab a no-op for a bare ambiguous
+            // command (`/s`) and for the known first-argument menus (`/model`,
+            // `/mode`, `/verbosity`).
+            None if self.line.contains(char::is_whitespace)
+                && !crate::commands::has_argument_menu(&self.line) =>
+            {
+                self.insert(" ");
             }
+            None => {}
+        }
+    }
+
+    /// Replace the whole input with `line`. `complete_line` canonicalizes the
+    /// separator, so `done` need not start with the raw text typed (e.g.
+    /// `/model  ol` with extra spacing); comparing by characters keeps the
+    /// shared leading run — rewriting only what changed — and never slices on a
+    /// byte boundary, so irregular spacing can no longer panic.
+    fn replace_line(&mut self, line: &str) {
+        let shared = self.line.chars().zip(line.chars()).take_while(|(a, b)| a == b).count();
+        let extra = self.line.chars().count().saturating_sub(shared);
+        if extra > 0 {
+            self.erase(extra);
+        }
+        let tail: String = line.chars().skip(shared).collect();
+        if !tail.is_empty() {
+            self.insert(&tail);
         }
     }
 
@@ -615,6 +640,9 @@ mod tests {
         view.line = "/s".into();
         view.tab();
         assert_eq!(view.line, "/s", "ambiguous: unchanged");
+        view.line = "/compact focus".into();
+        view.tab();
+        assert_eq!(view.line, "/compact focus ", "past the command name: space fallback");
         view.line = "fix it".into();
         view.tab();
         assert_eq!(view.line, "fix it ");
@@ -641,5 +669,8 @@ mod tests {
         view.line = "/model zz".into();
         view.tab();
         assert_eq!(view.line, "/model zz", "no match: unchanged");
+        view.line = "/model  ol".into();
+        view.tab();
+        assert_eq!(view.line, "/model ollama", "irregular spacing canonicalizes without panicking");
     }
 }
