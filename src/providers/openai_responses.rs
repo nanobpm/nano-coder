@@ -189,7 +189,10 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
     Ok(LLMResponse {
         content,
         tool_calls,
-        usage: parse_usage(value.get("usage")),
+        usage: parse_usage(value.get("usage")).map(|mut usage| {
+            usage.aic = crate::llm::copilot_aic(value);
+            usage
+        }),
         stop_reason: value
             .get("status")
             .and_then(Value::as_str)
@@ -212,6 +215,7 @@ fn parse_usage(usage: Option<&Value>) -> Option<TokenUsage> {
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
+        aic: None,
     })
 }
 
@@ -311,6 +315,9 @@ impl StreamAccumulator {
             Some("response.completed" | "response.incomplete") => {
                 if let Some(response) = event.get("response") {
                     if let Some(usage) = parse_usage(response.get("usage")) {
+                        // Copilot's `copilot_usage` is a sibling of `response`.
+                        let mut usage = usage;
+                        usage.aic = crate::llm::copilot_aic(&event);
                         self.usage = Some(usage);
                     }
                     if let Some(status) = response.get("status").and_then(Value::as_str) {
@@ -526,6 +533,32 @@ mod tests {
         assert_eq!(response.tool_calls[0].name, "bash");
         assert_eq!(response.tool_calls[0].arguments["cmd"], "ls");
         assert_eq!(response.usage.unwrap().total_tokens, 7);
+    }
+
+    #[test]
+    fn parses_copilot_aic_from_response_and_stream() {
+        // Non-streaming: `copilot_usage` is a sibling of `usage`.
+        let value = json!({
+            "status": "completed",
+            "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "hi" }] }],
+            "usage": { "input_tokens": 7, "output_tokens": 13 },
+            "copilot_usage": { "total_nano_aiu": 42_500_000 }
+        });
+        assert_eq!(parse_response(&value, false).unwrap().usage.unwrap().aic, Some(0.0425));
+
+        // Streaming: it rides the terminal `response.completed` event, as a
+        // sibling of `response`.
+        let events = [json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"input_tokens": 7, "output_tokens": 13}},
+            "copilot_usage": {"total_nano_aiu": 42_500_000}
+        })];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        assert_eq!(accumulator.finish().usage.unwrap().aic, Some(0.0425));
     }
 
     #[test]

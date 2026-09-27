@@ -269,7 +269,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/compact [focus]` - Summarize older messages with the current model, keeping the latest
   message. Optional text tells the summary what to focus on. Esc Esc or Ctrl-C cancels
 - `/verbosity [quiet|normal|verbose|debug]` - Show or set how much is printed (see below)
-- `/context` - Show context usage, window, session token totals, auto-compaction state and the loaded instruction files
+- `/context` - Show context usage, window, session token totals, AI Credits (GitHub Copilot), auto-compaction state and the loaded instruction files
 - `/settings` - Interactive settings menu:
   - **Model**: pick a provider, then a model from its live model list (or type an ID)
   - **Add or edit a provider**: name, API kind (OpenAI-compatible, Anthropic, Copilot),
@@ -516,7 +516,9 @@ shows when the message was sent. Turn this off with `timestamps = false`.
 In an interactive terminal the bottom row shows the provider/model, context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
-count, and what the agent is doing. It uses a terminal scroll region, follows resizes, and is
+count, and what the agent is doing. With a GitHub Copilot model it also shows the session's
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a
+terminal scroll region, follows resizes, and is
 off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.

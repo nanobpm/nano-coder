@@ -412,6 +412,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 println!("Plan:         {done}/{total} done (/plan to show it)");
             }
             println!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens);
+            if let Some(aic) = stats.session_aic {
+                println!("AI Credits:   {aic:.2} used this session");
+            }
             match stats.auto_compact {
                 Some(t) => println!(
                     "Auto-compact: at {:.0}% (~{} tokens); compacted {} time(s)",
