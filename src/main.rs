@@ -87,7 +87,7 @@ fn register_builtin_tools(agent: &mut Agent) {
     let broker = agent.questions();
     agent.tools().register(question::definition(), Box::new(move |args| {
         if !broker.is_interactive() {
-            anyhow::bail!("question tool needs an interactive terminal; end your turn with the question, or report_outcome(blocked), instead");
+            anyhow::bail!("question tool needs an interactive terminal; end your turn with the question, or report_outcome(needs_input) with the question in the summary, instead");
         }
         let questions = question::parse(&args)?;
         let answer = broker.ask_blocking(questions.clone());
