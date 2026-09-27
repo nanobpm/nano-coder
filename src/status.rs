@@ -97,9 +97,12 @@ impl StatusLine {
         // triggered by a Context event, the renderer or lineedit before the
         // SIGWINCH handler has run must not write the status line to a
         // mid-screen row — that is what scatters copies across the screen on
-        // resize. When the size has changed, erase the old and new bottom rows
-        // and re-pin the scroll region first, so the stale bar left at the old
-        // bottom row is cleared even when the SIGWINCH resize() later no-ops.
+        // resize. When the size has changed, prepend the resize cleanup
+        // (`resize_sequence`): reset the scroll region and erase from the
+        // conversation cursor downward, then re-pin the region for the new
+        // height. That cursor-relative erase-below wipes any bar the resize
+        // stranded on a mid-screen row even when the SIGWINCH resize() later
+        // no-ops, without addressing any absolute row.
         let Some((rows, cols)) = terminal_size() else { return };
         let mut size = self.size.lock().unwrap();
         // When the size changed, prepend the resize cleanup so the whole draw —
