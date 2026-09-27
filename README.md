@@ -268,7 +268,9 @@ model where it may write.
 
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
-list is built from the same table as `/help` (`src/commands.rs`).
+list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
+argument set (`/model`, `/mode`, `/verbosity`) get the same treatment for their first
+argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
 - `/compact [--smart|--standard] [focus]` - Summarize older messages with the current model,
@@ -292,7 +294,7 @@ list is built from the same table as `/help` (`src/commands.rs`).
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
-- `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept)
+- `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching the turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
