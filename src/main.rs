@@ -6,6 +6,7 @@ use serde_json::json;
 use std::env;
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 mod agent;
@@ -20,6 +21,7 @@ mod hooks;
 mod instructions;
 mod plan;
 mod lineedit;
+mod recents;
 mod llm;
 mod mode;
 mod output;
@@ -187,6 +189,10 @@ struct Terminal {
     config_path: std::path::PathBuf,
     /// The line being typed (terminal stdin only).
     view: lineedit::SharedView,
+    /// Recently used models, hoisted in the `/model` type-ahead and saved
+    /// here on each successful switch.
+    recents: recents::SharedRecents,
+    recents_path: std::path::PathBuf,
     renderer: std::sync::Arc<ui::Renderer>,
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
@@ -224,7 +230,13 @@ impl InputGate {
 }
 
 impl Terminal {
-    fn start(config_path: std::path::PathBuf, view: lineedit::SharedView, renderer: std::sync::Arc<ui::Renderer>) -> Self {
+    fn start(
+        config_path: std::path::PathBuf,
+        view: lineedit::SharedView,
+        renderer: std::sync::Arc<ui::Renderer>,
+        recents: recents::SharedRecents,
+        recents_path: std::path::PathBuf,
+    ) -> Self {
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
         let lines = tx.clone();
@@ -285,11 +297,33 @@ impl Terminal {
             steerable: io::stdin().is_terminal(),
             config_path,
             view,
+            recents,
+            recents_path,
             renderer,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// After a successful model switch: hoist the spec in the `/model`
+    /// type-ahead (persisted), and refresh the config the line editor's
+    /// argument suggestions read.
+    fn model_switched(&mut self, agent: &Agent) {
+        let spec = agent.config().model.clone();
+        {
+            let mut recents = self.recents.lock().unwrap();
+            recents.record(&spec);
+            recents::save(&self.recents_path, &recents);
+        }
+        self.sync_context(agent);
+    }
+
+    /// Refresh the config the line editor's argument suggestions read, after
+    /// anything that may have changed it (`/settings`, a provider edit).
+    fn sync_context(&mut self, agent: &Agent) {
+        let context = self.view.lock().unwrap().context_handle();
+        context.lock().unwrap().config = agent.config().clone();
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
@@ -763,7 +797,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
+            let before = agent.config().model.clone();
             settings::run(agent, &terminal.config_path).await?;
+            // Providers or the model may have changed. A model switched through
+            // the settings dialog must land in the recents MRU just like one
+            // switched with `/model`; a provider-only edit just refreshes the
+            // config the line editor's argument suggestions read.
+            if agent.config().model != before {
+                terminal.model_switched(agent);
+            } else {
+                terminal.sync_context(agent);
+            }
             Ok(true)
         }
         "/tools" => {
@@ -811,6 +855,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         "/model" => {
             if let Some(spec) = settings::pick_model_interactive(agent).await? {
                 agent.set_model(&spec).await?;
+                terminal.model_switched(agent);
                 println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             } else {
                 println!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name());
@@ -819,6 +864,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         _ if cmd.starts_with("/model ") => {
             agent.set_model(cmd["/model ".len()..].trim()).await?;
+            terminal.model_switched(agent);
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             Ok(true)
         }
@@ -1093,7 +1139,12 @@ async fn main() -> Result<()> {
         agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
         agent.set_streaming(true);
         agent.refresh_stats();
-        let view = lineedit::EditView::shared(status.clone());
+        let recents_path = recents::default_path();
+        let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
+        let view = {
+            let context = Arc::new(Mutex::new(lineedit::EditContext { config: agent.config().clone(), recents: recents.clone() }));
+            lineedit::EditView::shared(status.clone(), context)
+        };
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         {
@@ -1108,7 +1159,7 @@ async fn main() -> Result<()> {
                 }
             });
         }
-        let mut terminal = Terminal::start(config_path, view, renderer);
+        let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
         let mut running = true;
         let mut exit_armed = false;
         let mut separate = false;

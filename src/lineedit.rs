@@ -29,12 +29,22 @@ pub struct EditView {
     /// Visible width of the prompt before the line (it starts with a
     /// timestamp when timestamps are on).
     prompt_width: usize,
+    /// Live configuration, for `/model` argument suggestions. Shared with the
+    /// agent loop so a model/provider change is seen on the next keystroke.
+    context: Arc<Mutex<EditContext>>,
+}
+
+/// What the argument type-ahead needs from the agent loop.
+#[derive(Default)]
+pub struct EditContext {
+    pub config: crate::config::Config,
+    pub recents: crate::recents::SharedRecents,
 }
 
 pub type SharedView = Arc<Mutex<EditView>>;
 
 impl EditView {
-    pub fn shared(status: Option<Arc<StatusLine>>) -> SharedView {
+    pub fn shared(status: Option<Arc<StatusLine>>, context: Arc<Mutex<EditContext>>) -> SharedView {
         Arc::new(Mutex::new(Self {
             line: String::new(),
             mode: EditMode::Prompt,
@@ -43,6 +53,7 @@ impl EditView {
             menu_hidden: false,
             menu_enabled: false,
             prompt_width: 2,
+            context,
         }))
     }
 
@@ -54,6 +65,12 @@ impl EditView {
                 _ => status.set_input(None),
             }
         }
+    }
+
+    /// The shared suggestion context, so the agent loop can refresh the
+    /// config after a model/provider change.
+    pub fn context_handle(&self) -> Arc<Mutex<EditContext>> {
+        self.context.clone()
     }
 
     fn on_status(&self) -> Option<&StatusLine> {
@@ -88,7 +105,18 @@ impl EditView {
         // is present (none under AGENTIC_NO_STATUS or a short terminal).
         let reserved = if self.status.is_some() { 2 } else { 1 };
         let max_rows = (rows as usize).saturating_sub(reserved).min(16);
-        let lines = if self.menu_hidden { Vec::new() } else { crate::commands::menu(&self.line, cols as usize, max_rows) };
+        let lines = if self.menu_hidden {
+            Vec::new()
+        } else if crate::commands::has_argument_menu(&self.line) {
+            // Past the command name: argument type-ahead for the commands
+            // with a known argument set (`/model`, `/mode`, `/verbosity`).
+            let context = self.context.lock().unwrap();
+            let recents = context.recents.lock().unwrap().models().to_vec();
+            let found = crate::commands::suggestions(&context.config, &recents, &self.line);
+            crate::commands::suggestion_menu(&found, &self.line, cols as usize, max_rows)
+        } else {
+            crate::commands::menu(&self.line, cols as usize, max_rows)
+        };
         let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
         self.menu_rows = used;
         if !seq.is_empty() {
@@ -102,18 +130,48 @@ impl EditView {
         self.draw_menu();
     }
 
-    /// Tab: complete a `/command`; elsewhere a space.
+    /// Tab: complete a `/command` or its first argument (`/model`, `/mode`,
+    /// `/verbosity` have a known argument set); elsewhere a space.
     fn tab(&mut self) {
-        let is_command = self.line.starts_with('/') && !self.line.contains(char::is_whitespace);
-        match is_command.then(|| crate::commands::complete(&self.line)).flatten() {
-            Some(done) => {
-                let rest = done[self.line.len()..].to_string();
-                if !rest.is_empty() {
-                    self.insert(&rest);
-                }
+        if !self.line.starts_with('/') {
+            self.insert(" ");
+            return;
+        }
+        let completed = {
+            let context = self.context.lock().unwrap();
+            let recents = context.recents.lock().unwrap().models().to_vec();
+            crate::commands::complete_line(&context.config, &recents, &self.line)
+        };
+        match completed {
+            Some(done) => self.replace_line(&done),
+            // Restore the documented space fallback for a slash line past its
+            // command name (e.g. `/compact focus`, `/model value extra`) that
+            // has no completion, while keeping Tab a no-op for a bare ambiguous
+            // command (`/s`) and for the known first-argument menus (`/model`,
+            // `/mode`, `/verbosity`).
+            None if self.line.contains(char::is_whitespace)
+                && !crate::commands::has_argument_menu(&self.line) =>
+            {
+                self.insert(" ");
             }
-            None if is_command => {}
-            None => self.insert(" "),
+            None => {}
+        }
+    }
+
+    /// Replace the whole input with `line`. `complete_line` canonicalizes the
+    /// separator, so `done` need not start with the raw text typed (e.g.
+    /// `/model  ol` with extra spacing); comparing by characters keeps the
+    /// shared leading run — rewriting only what changed — and never slices on a
+    /// byte boundary, so irregular spacing can no longer panic.
+    fn replace_line(&mut self, line: &str) {
+        let shared = self.line.chars().zip(line.chars()).take_while(|(a, b)| a == b).count();
+        let extra = self.line.chars().count().saturating_sub(shared);
+        if extra > 0 {
+            self.erase(extra);
+        }
+        let tail: String = line.chars().skip(shared).collect();
+        if !tail.is_empty() {
+            self.insert(&tail);
         }
     }
 
@@ -517,9 +575,13 @@ impl LineReader {
 mod tests {
     use super::*;
 
+    fn test_view() -> SharedView {
+        EditView::shared(None, Arc::new(Mutex::new(EditContext::default())))
+    }
+
     #[test]
     fn erase_word_handles_multibyte_spaces() {
-        let view = EditView::shared(None);
+        let view = test_view();
         let mut view = view.lock().unwrap();
         view.mode = EditMode::Turn; // no status line: echoes, but must not panic
         view.line = "run a\u{a0}bé  ".into();
@@ -569,7 +631,7 @@ mod tests {
 
     #[test]
     fn tab_completes_commands_and_is_a_space_elsewhere() {
-        let view = EditView::shared(None);
+        let view = test_view();
         let mut view = view.lock().unwrap();
         view.mode = EditMode::Turn; // not drawn: no terminal in tests
         view.line = "/comp".into();
@@ -578,8 +640,37 @@ mod tests {
         view.line = "/s".into();
         view.tab();
         assert_eq!(view.line, "/s", "ambiguous: unchanged");
+        view.line = "/compact focus".into();
+        view.tab();
+        assert_eq!(view.line, "/compact focus ", "past the command name: space fallback");
         view.line = "fix it".into();
         view.tab();
         assert_eq!(view.line, "fix it ");
+    }
+
+    #[test]
+    fn tab_completes_model_arguments_from_context() {
+        let context = Arc::new(Mutex::new(EditContext {
+            config: toml::from_str(r#"model = "openai/gpt-4o""#).unwrap(),
+            recents: crate::recents::SharedRecents::default(),
+        }));
+        context.lock().unwrap().recents.lock().unwrap().record("ollama/qwen3:8b");
+        let view = EditView::shared(None, context);
+        let mut view = view.lock().unwrap();
+        view.mode = EditMode::Turn;
+        view.line = "/model ol".into();
+        view.tab();
+        assert_eq!(view.line, "/model ollama", "common prefix first");
+        view.tab();
+        assert_eq!(view.line, "/model ollama/qwen3:8b", "then descend to the recent spec");
+        view.line = "/mode a".into();
+        view.tab();
+        assert_eq!(view.line, "/mode auto");
+        view.line = "/model zz".into();
+        view.tab();
+        assert_eq!(view.line, "/model zz", "no match: unchanged");
+        view.line = "/model  ol".into();
+        view.tab();
+        assert_eq!(view.line, "/model ollama", "irregular spacing canonicalizes without panicking");
     }
 }
