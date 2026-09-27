@@ -210,9 +210,12 @@ impl SessionLog {
     }
 }
 
-/// Compare two messages by their durable content, ignoring the transient
+/// Compare two messages by their durable content, ignoring only the transient
 /// `timestamp`/`log_line` fields that differ between a direct record and the
-/// copy retained inside a later `replace` record.
+/// copy retained inside a later `replace` record. Durable provider content
+/// (including `thinking_blocks`) is compared, so two assistant messages with
+/// identical visible text/tool calls but different reasoning blocks are not
+/// treated as the same message.
 fn same_content(a: &Message, b: &Message) -> bool {
     a.role == b.role
         && a.content == b.content
@@ -220,6 +223,7 @@ fn same_content(a: &Message, b: &Message) -> bool {
         && a.tool_call_id == b.tool_call_id
         && a.name == b.name
         && a.is_error == b.is_error
+        && a.thinking_blocks == b.thinking_blocks
 }
 
 /// Backfill stable `[#N]` IDs onto a `replace` record's retained messages from
@@ -457,6 +461,34 @@ mod tests {
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
         assert!(!restored.history_available, "a standard replace drops the history tools");
+    }
+
+    #[test]
+    fn backfill_distinguishes_messages_by_thinking_blocks() {
+        // Two assistant messages share visible text but carry different reasoning
+        // blocks. Backfill must not treat them as identical: the retained copy
+        // must recover the ID of the original with matching thinking blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
+        let think_a = Message { thinking_blocks: vec![serde_json::json!({"thinking": "a"})], ..Message::assistant("reply") };
+        let think_b = Message { thinking_blocks: vec![serde_json::json!({"thinking": "b"})], ..Message::assistant("reply") };
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
+        log.append(&Record::Message(think_a.clone())).unwrap(); // #3
+        log.append(&Record::Message(think_b.clone())).unwrap(); // #4
+        // A legacy replace retains only the second reasoning variant, un-IDed.
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary"), Message { log_line: None, ..think_b.clone() }],
+            pending_position: None,
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
+        // Maps to #4 (matching thinking blocks), not #3.
+        assert_eq!(restored.conversation[1].log_line, Some(4));
     }
 
     #[test]
