@@ -825,9 +825,14 @@ async fn main() -> Result<()> {
         // Repeat the resume instruction on exit so it is still on screen (and
         // in scrollback) after a long session has pushed the start-up banner
         // away. `/restart` may have swapped the session mid-run, so re-read
-        // the current ID rather than remembering the start-up one.
-        if let Some(id) = agent.session_id() {
-            println!("Session: {id} (resume with --resume {id})");
+        // the current ID rather than remembering the start-up one. Gate on
+        // `session_path()` (not `session_id()`): when persistence is disabled
+        // `/restart` still assigns a session ID even though nothing is written
+        // to disk, so printing a `--resume` command there would be unusable.
+        if agent.session_path().is_some() {
+            if let Some(id) = agent.session_id() {
+                println!("Session: {id} (resume with --resume {id})");
+            }
         }
     }
 
