@@ -829,10 +829,10 @@ async fn main() -> Result<()> {
         // `session_path()` (not `session_id()`): when persistence is disabled
         // `/restart` still assigns a session ID even though nothing is written
         // to disk, so printing a `--resume` command there would be unusable.
-        if agent.session_path().is_some() {
-            if let Some(id) = agent.session_id() {
-                println!("Session: {id} (resume with --resume {id})");
-            }
+        if agent.session_path().is_some()
+            && let Some(id) = agent.session_id()
+        {
+            println!("Session: {id} (resume with --resume {id})");
         }
     }
 
