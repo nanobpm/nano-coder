@@ -61,7 +61,7 @@ def default_binary():
     return shutil.which("nano-coder") or "nano-coder"
 
 
-def config_text(base, session_dir, mode):
+def config_text(base, session_dir, mode, extra_body=None, providers=()):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
@@ -81,7 +81,25 @@ def config_text(base, session_dir, mode):
         "persist_sessions = true",
         "project_instructions = false",
     ]
-    return "\n".join(head + lines) + "\n"
+    tail = []
+    if extra_body:
+        # Inline-table form of the JSON; appended per provider under test.
+        def toml_value(v):
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, dict):
+                return "{ " + ", ".join(f"{json.dumps(k)} = {toml_value(x)}" for k, x in v.items()) + " }"
+            if isinstance(v, list):
+                return "[" + ", ".join(toml_value(x) for x in v) + "]"
+            return json.dumps(v)
+        text = "\n".join(lines)
+        for provider in providers:
+            if f"[providers.{provider}.extra_body]" in text or re.search(rf"(?ms)^\[providers\.{re.escape(provider)}\].*?^extra_body", text):
+                print(f"warning: providers.{provider} already sets extra_body; --extra-body ignored for it", file=sys.stderr)
+                continue
+            tail.append(f"[providers.{provider}.extra_body]")
+            tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in extra_body.items()]
+    return "\n".join(head + lines + tail) + "\n"
 
 
 def fork_records(path, line):
@@ -130,6 +148,43 @@ def load_cases(args):
                     "cwd": spec.get("cwd"),
                 }
             out.append(case)
+    return out
+
+
+def reuse_cases(results_files):
+    """Compacted logs from earlier runs, cut right after the compaction, so a
+    new model only answers the question (no summary to write: the costly part
+    on a slow model). Keeps smart runs whose detail was lost and that did not
+    error; the summary was written by the earlier run's model."""
+    out = []
+    for file in results_files:
+        for line in open(file):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("mode") != "smart" or "error" in r or r.get("kept", r.get("summary_kept")):
+                continue
+            records = read_log(r["session"])
+            at = max((i for i, x in enumerate(records) if x["type"] == "replace" and "mode" in x["data"]), default=None)
+            if at is None:
+                continue
+            if "question" in r:
+                question, expect, forbid = r["question"], r["expect"], r.get("forbid", [])
+            else:
+                # Older results: rebuild the synthetic case from name and seed.
+                name, seed = r["case"].split("/s")
+                case = synthetic.build(name, int(seed), 15)
+                question, expect, forbid = case["question"], case["expect"], case["forbid"]
+                text = json.dumps(records[:at])
+                if not matches_all(expect, text):
+                    print(f"warning: skipping {r['case']}: rebuilt answer not in its log", file=sys.stderr)
+                    continue
+            out.append({
+                "name": f"{r['case']}@{r['model'].split('/')[-1]}",
+                "records": records[:at + 1],
+                "question": question, "expect": expect, "forbid": forbid,
+                "precompacted": True,
+            })
     return out
 
 
@@ -229,8 +284,9 @@ def run_one(args, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, mode))
-    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools, "session": str(session_dir / f"{session_id}.jsonl")}
+    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [model.split("/")[0]]))
+    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
+              "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
     argv = [args.bin, "--acp", "--config", str(config), "--model", model]
     if args.tools == "history":
@@ -239,10 +295,14 @@ def run_one(args, case, model, mode, repeat, work_root):
     try:
         acp.call("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         acp.call("session/load", {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []})
-        compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
-        result["compacted"] = bool(compacted and compacted.get("compacted"))
-        result["fallback"] = compacted.get("fallback") if compacted else None
-        acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": case["question"]}]})
+        if case.get("precompacted"):
+            result["compacted"], result["fallback"] = True, None
+        else:
+            compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
+            result["compacted"] = bool(compacted and compacted.get("compacted"))
+            result["fallback"] = compacted.get("fallback") if compacted else None
+        question = case["question"] + (" Answer in one line." if args.terse else "")
+        acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": question}]})
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
     finally:
@@ -369,6 +429,14 @@ def main():
     p.add_argument("--synthetic", default=",".join(synthetic.CASES),
                    help="comma-separated built-in cases ('' for none): " + ", ".join(synthetic.CASES))
     p.add_argument("--cases", action="append", help="JSON case file (repeatable)")
+    p.add_argument("--reuse-compaction", action="append", metavar="RESULTS",
+                   help="answer only: reuse compacted logs from earlier smart runs where the detail was lost "
+                        "(skips writing a summary; for slow models). Implies --modes smart and no synthetic cases")
+    p.add_argument("--extra-body", type=json.loads, metavar="JSON",
+                   help='merged into requests of the providers under test, e.g. \'{"chat_template_kwargs": {"enable_thinking": false}}\'')
+    p.add_argument("--shuffle", action="store_true", help="run jobs in a random (seeded) order, for a time-boxed sample")
+    p.add_argument("--max-minutes", type=float, help="start no new runs after this long; unstarted runs are skipped")
+    p.add_argument("--terse", action="store_true", help='append "Answer in one line." to questions')
     p.add_argument("--seeds", type=int, default=2, help="variants per synthetic case")
     p.add_argument("--filler-turns", type=int, default=15, help="unrelated turns after the detail in synthetic cases")
     p.add_argument("--repeats", type=int, default=1)
@@ -396,7 +464,9 @@ def main():
         args.config, args.models = str(base), "fake/oracle"
     if not args.models:
         p.error("--models is required (or use --self-test)")
-    cases = load_cases(args)
+    if args.reuse_compaction:
+        args.modes, args.synthetic = "smart", ""
+    cases = load_cases(args) + (reuse_cases(args.reuse_compaction) if args.reuse_compaction else [])
     if not cases:
         sys.exit("no cases")
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -410,12 +480,24 @@ def main():
     print(f"{len(jobs)} runs ({len(cases)} cases x {len(models)} models x {len(modes)} modes x {args.repeats}); "
           f"logs in {work_root}; results in {results_path}", file=sys.stderr)
 
+    if args.shuffle:
+        import random
+        random.Random(0).shuffle(jobs)
+    deadline = time.monotonic() + args.max_minutes * 60 if args.max_minutes else None
+
+    def run_job(*job):
+        if deadline and time.monotonic() > deadline:
+            return None
+        return run_one(args, *job, work_root)
+
     results = []
     lock = threading.Lock()
     with open(results_path, "w") as sink, concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        futures = [pool.submit(run_one, args, *job, work_root) for job in jobs]
+        futures = [pool.submit(run_job, *job) for job in jobs]
         for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
             r = future.result()
+            if r is None:
+                continue
             with lock:
                 results.append(r)
                 sink.write(json.dumps(r) + "\n")
