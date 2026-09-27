@@ -292,13 +292,13 @@ async fn pick_model_from_provider(
     };
 
     let model = if models.is_empty() {
-        let mut input = Input::<String>::new()
+        // No default: pressing Enter on blank input must go back to the
+        // provider list, which a dialoguer default would swallow by returning
+        // the default model instead of an empty string.
+        Input::<String>::new()
             .with_prompt("Model ID (empty to go back to the provider list)")
-            .allow_empty(true);
-        if !default_model.is_empty() {
-            input = input.default(default_model);
-        }
-        input.interact_text()?
+            .allow_empty(true)
+            .interact_text()?
     } else {
         let mut labels = models.clone();
         labels.push("Other (type a model ID)".into());
