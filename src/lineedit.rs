@@ -143,6 +143,10 @@ impl EditView {
             Some(done) => {
                 let rest = done[self.line.len()..].to_string();
                 if !rest.is_empty() {
+                    // The completion extends the whole command, so append its
+                    // suffix at the end regardless of where the cursor sits;
+                    // inserting at a mid-line cursor would corrupt the command.
+                    self.cursor = self.line.chars().count();
                     self.insert(&rest);
                 }
             }
