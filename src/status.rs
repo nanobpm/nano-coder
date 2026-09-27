@@ -81,7 +81,11 @@ fn query_cursor_direct() -> Option<(u16, u16)> {
         return None;
     }
     let mut raw = original;
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    // Disable ISIG too: with ECHO/ICANON off, a Ctrl-C mid-query would
+    // otherwise deliver SIGINT and terminate the process before termios is
+    // restored below, stranding the terminal in non-echo/non-canonical mode.
+    // Treat the interrupt byte as ordinary input for the brief query instead.
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
     raw.c_cc[libc::VMIN] = 0;
     raw.c_cc[libc::VTIME] = 0;
     if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
