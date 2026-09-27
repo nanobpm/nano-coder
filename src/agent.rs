@@ -1105,6 +1105,13 @@ impl Agent {
                     match self.questions.cap().wait().await {
                         crate::question::CapDecision::Continue => {
                             granted_extra = granted_extra.saturating_add(max_iterations);
+                            // This probe iteration hit the cap without running a
+                            // model call, so rewind it: the next loop pass
+                            // re-increments to the same number and actually
+                            // spends it on a call. Without this the extended run
+                            // skips one iteration (cap 2 -> calls 1, 2, 4) and
+                            // the final `completed = iteration - 1` overcounts.
+                            iteration = iteration.saturating_sub(1);
                             continue;
                         }
                         crate::question::CapDecision::Stop => break,

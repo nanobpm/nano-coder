@@ -372,6 +372,14 @@ impl LineReader {
             if ready == 0 {
                 continue; // timeout: re-check suspend, then poll again
             }
+            // Re-check suspend after poll: a foreground picker may have set it
+            // while we were parked in `poll`. If so, do not read — `next_byte`
+            // would pull up to 1024 bytes off stdin (including the picker's
+            // first keystrokes). Loop back so those bytes stay unread until the
+            // picker has consumed them and suspension clears.
+            if self.suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
             return self.next_byte();
         }
     }
