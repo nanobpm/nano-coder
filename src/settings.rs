@@ -302,9 +302,9 @@ async fn pick_model_from_provider(
     };
 
     let model = if models.is_empty() {
-        // No default here: the prompt documents that an empty answer goes back
-        // to the provider list, and dialoguer's `default(...)` would turn an
-        // empty Enter into the default model, stealing that back path.
+        // No default: pressing Enter on blank input must go back to the
+        // provider list, which a dialoguer default would swallow by returning
+        // the default model instead of an empty string.
         Input::<String>::new()
             .with_prompt("Model ID (empty to go back to the provider list)")
             .allow_empty(true)

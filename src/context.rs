@@ -52,6 +52,9 @@ pub struct ContextStats {
     pub messages: usize,
     pub session_input_tokens: u64,
     pub session_output_tokens: u64,
+    /// AI Credits used this session, when the provider reports them (GitHub
+    /// Copilot). `None` for providers that do not meter in credits.
+    pub session_aic: Option<f64>,
     pub compactions: u32,
     /// Auto-compaction threshold as a fraction of the window (None = off).
     pub auto_compact: Option<f64>,
