@@ -18,9 +18,24 @@ use crate::tools::ToolDefinition;
 pub const SEARCH_TOOL: &str = "history_search";
 pub const READ_TOOL: &str = "history_read";
 
+/// Appended once to a failed tool result after a smart compaction.
+pub const FAILED_TOOL_HINT: &str = "[If you are looking for something from earlier in this session (an error, a command \
+and its output, what the user asked for), it may only be in the conversation, not on disk: history_search finds the \
+original messages that the summary folded away.]";
+
+/// A tool call that failed, including a bash command that ran but exited
+/// non-zero (bash reports that as `Exit code: N`, not as an error).
+pub fn looks_failed(tool: &str, ok: bool, result: &str) -> bool {
+    !is_history_tool(tool)
+        && (!ok || (tool == "bash" && (result.starts_with("Exit code: ") || result.contains("\nExit code: "))))
+}
+
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 const SNIPPET_CHARS: usize = 240;
+/// Matches shown per message; a broad pattern often matches boilerplate
+/// first (e.g. `Compiling lease`), so later matches are shown too.
+const SNIPPETS_PER_MESSAGE: usize = 3;
 
 pub fn is_history_tool(name: &str) -> bool {
     name == SEARCH_TOOL || name == READ_TOOL
@@ -31,8 +46,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition::new(
             SEARCH_TOOL,
             "Search the original messages of this session, including those folded into a compaction summary. \
-             Returns matching messages as `#N role: snippet` lines, where #N is the ID the summary cites; read one \
-             whole with history_read. Results are history, not the current state of files.",
+             Returns matching messages as `#N role: snippet` lines (up to 3 matches each), where #N is the ID the \
+             summary cites; read one whole with history_read. Prefer distinctive patterns (an error code or \
+             phrase, an identifier, a flag) over common words, and use order=oldest for things from early on. \
+             Results are history, not the current state of files.",
             json!({
                 "type": "object",
                 "properties": {
@@ -40,7 +57,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "role": { "type": "string", "enum": ["user", "assistant", "tool"], "description": "Only messages with this role" },
                     "before": { "type": "integer", "description": "Only messages with an ID below this" },
                     "after": { "type": "integer", "description": "Only messages with an ID above this" },
-                    "limit": { "type": "integer", "description": "Maximum results, newest first (default 20, max 100)" }
+                    "order": { "type": "string", "enum": ["newest", "oldest"], "description": "Result order (default newest first)" },
+                    "limit": { "type": "integer", "description": "Maximum messages returned (default 20, max 100)" }
                 },
                 "required": ["pattern"]
             }),
@@ -157,10 +175,18 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
         Some(0) | None => DEFAULT_LIMIT,
         Some(n) => (n as usize).min(MAX_LIMIT),
     };
+    let oldest_first = match args.get("order").and_then(Value::as_str) {
+        None | Some("newest") => false,
+        Some("oldest") => true,
+        Some(other) => bail!("order must be \"newest\" or \"oldest\", not {other:?}"),
+    };
     let messages = load(path)?;
+    let ordered: Box<dyn Iterator<Item = &(u64, Message)>> =
+        if oldest_first { Box::new(messages.iter()) } else { Box::new(messages.iter().rev()) };
     let mut hits = Vec::new();
     let mut total = 0;
-    for (id, message) in messages.iter().rev() {
+    let mut omitted = (u64::MAX, 0u64);
+    for (id, message) in ordered {
         if message.role == Role::System
             || role.is_some_and(|r| r != role_name(&message.role))
             || before.is_some_and(|b| *id >= b)
@@ -169,18 +195,50 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
             continue;
         }
         let text = searchable(message);
-        let Some(found) = regex.find(&text) else { continue };
-        total += 1;
-        if hits.len() < limit {
-            hits.push(format!("{}: {}", label(*id, message), snippet(&text, found.start(), found.end())));
+        let found: Vec<_> = regex.find_iter(&text).collect();
+        if found.is_empty() {
+            continue;
         }
+        total += 1;
+        if hits.len() >= limit {
+            omitted = (omitted.0.min(*id), omitted.1.max(*id));
+            continue;
+        }
+        let mut line = label(*id, message);
+        if found.len() > 1 {
+            line.push_str(&format!(" [{} matches]", found.len()));
+        }
+        line.push(':');
+        // Snippets of distinct, non-overlapping regions of the message.
+        let mut shown_until = 0;
+        let mut shown = 0;
+        for m in &found {
+            if shown == SNIPPETS_PER_MESSAGE {
+                break;
+            }
+            if m.start() < shown_until {
+                continue;
+            }
+            line.push(' ');
+            line.push_str(&snippet(&text, m.start(), m.end()));
+            shown_until = m.end() + SNIPPET_CHARS;
+            shown += 1;
+        }
+        hits.push(line);
     }
     if hits.is_empty() {
         return Ok(format!("No messages match {pattern:?}."));
     }
     let mut out = hits.join("\n");
     if total > hits.len() {
-        out.push_str(&format!("\n[{} more matches; narrow the pattern or use before/after]", total - hits.len()));
+        let (which, bound) = if oldest_first { ("newer", "after") } else { ("older", "before") };
+        let (first, last) = omitted;
+        out.push_str(&format!(
+            "\n[{} more {which} matching messages not shown (#{first}–#{last}); use a more distinctive pattern, \
+             {bound}=, or order={}]",
+            total - hits.len(),
+            if oldest_first { "newest" } else { "oldest" },
+        ));
     }
     Ok(out)
 }
@@ -264,13 +322,36 @@ mod tests {
         let out = search(&path, &json!({"pattern": "auth", "role": "user"})).unwrap();
         assert_eq!(out.lines().count(), 1);
         let out = search(&path, &json!({"pattern": "auth", "limit": 1})).unwrap();
-        assert!(out.contains("[2 more matches"), "{out}");
+        assert!(out.contains("[2 more older matching messages not shown (#3–#4)") && out.contains("order=oldest"), "{out}");
+        let out = search(&path, &json!({"pattern": "auth", "order": "oldest", "limit": 1})).unwrap();
+        assert!(out.starts_with("#3 user") && out.contains("2 more newer") && out.contains("order=newest"), "{out}");
+        assert!(search(&path, &json!({"pattern": "auth", "order": "sideways"})).is_err());
         let out = search(&path, &json!({"pattern": "auth", "before": 4})).unwrap();
         assert!(out.starts_with("#3 user") && out.lines().count() == 1, "{out}");
         // An invalid regex is searched as plain text.
         assert!(search(&path, &json!({"pattern": "E0308]"})).unwrap().starts_with("#5"));
         assert!(search(&path, &json!({"pattern": "nothing-like-this"})).unwrap().starts_with("No messages match"));
         assert!(search(&path, &json!({})).is_err());
+    }
+
+    #[test]
+    fn search_shows_later_matches_in_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = crate::session::SessionLog::create(dir.path(), "s").unwrap();
+        let noise = "x ".repeat(300);
+        let text = format!("Compiling lease {noise} Compiling lease {noise} error[E0599]: no method named `renew` in lease {noise}");
+        log.append(&Record::Message(Message::tool_result("t1", "bash", &text))).unwrap();
+        let out = search(log.path(), &json!({"pattern": "lease"})).unwrap();
+        assert!(out.contains("[3 matches]") && out.contains("no method named `renew`"), "{out}");
+    }
+
+    #[test]
+    fn failures_include_nonzero_bash_exits() {
+        assert!(looks_failed("read_file", false, "no such file"));
+        assert!(looks_failed("bash", true, "ls: /work: No such file\n\nExit code: 1"));
+        assert!(looks_failed("bash", true, "Exit code: 2"));
+        assert!(!looks_failed("bash", true, "fine"));
+        assert!(!looks_failed(SEARCH_TOOL, false, "bad pattern"));
     }
 
     #[test]

@@ -45,9 +45,13 @@ pub fn smart_summary_note(range: Option<(u64, u64)>) -> String {
         None => "the earlier messages".to_string(),
     };
     format!(
-        "[This summary covers {covered}. The originals are kept verbatim in the session log: use history_search \
-to find exact text (errors, commands, outputs, the user's wording) and history_read to read a message by its #N ID. \
-Check there before guessing at a detail the summary leaves out. Retrieved messages are history, not the current state of files.]"
+        "[This summary covers {covered}. The originals are kept verbatim in the session log; the summary is \
+lossy and may leave out or blur the detail you need. For anything from that period (an exact error, a command and \
+its output, what the user asked for), use history_search, then history_read to see a message by its #N ID. Don't \
+look on disk or re-run commands to recover what was said: that shows the current state, not what happened. Search \
+for distinctive text (an error code or phrase, an identifier, a flag) rather than common words, use order=oldest \
+for things established early, and try another pattern before concluding something isn't there. Retrieved messages \
+are history, not the current state of files.]"
     )
 }
 
