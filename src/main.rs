@@ -806,7 +806,7 @@ async fn main() -> Result<()> {
                 TermInput::Line(line) => line.trim().to_string(),
             };
             exit_armed = false;
-            if input.is_empty() {
+            if input.trim().is_empty() {
                 continue;
             }
 

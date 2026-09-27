@@ -2,6 +2,12 @@
 //! the kernel's line mode) lets Ctrl-O and Ctrl-C act immediately, and lets
 //! text typed during a turn show on the status line instead of mixing with
 //! streamed output.
+//!
+//! The input is a (possibly multi-line) buffer with a cursor: arrow keys,
+//! Home/End and Alt/Option word jumps move it, Ctrl-Enter (or Cmd-Enter,
+//! via modifyOtherKeys/kitty-style key reporting) inserts a newline, and a
+//! bracketed paste keeps its line breaks instead of sending line by line.
+//! With mouse tracking on, clicking inside the input moves the cursor there.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -18,6 +24,8 @@ pub enum EditMode {
 
 pub struct EditView {
     line: String,
+    /// Cursor position as a character index into `line` (0..=chars).
+    cursor: usize,
     mode: EditMode,
     status: Option<Arc<StatusLine>>,
     /// Rows below the prompt used by the command menu.
@@ -29,6 +37,9 @@ pub struct EditView {
     /// Visible width of the prompt before the line (it starts with a
     /// timestamp when timestamps are on).
     prompt_width: usize,
+    /// Rows the last prompt redraw occupies, menu included; the next redraw
+    /// clears this many rows below the prompt's first row before reprinting.
+    drawn_rows: usize,
 }
 
 pub type SharedView = Arc<Mutex<EditView>>;
@@ -37,12 +48,14 @@ impl EditView {
     pub fn shared(status: Option<Arc<StatusLine>>) -> SharedView {
         Arc::new(Mutex::new(Self {
             line: String::new(),
+            cursor: 0,
             mode: EditMode::Prompt,
             status,
             menu_rows: 0,
             menu_hidden: false,
             menu_enabled: false,
             prompt_width: 2,
+            drawn_rows: 0,
         }))
     }
 
@@ -50,7 +63,7 @@ impl EditView {
         self.mode = mode;
         if let Some(status) = &self.status {
             match mode {
-                EditMode::Turn if !self.line.is_empty() => status.set_input(Some(&self.line)),
+                EditMode::Turn if !self.line.is_empty() => self.show_on_status(status),
                 _ => status.set_input(None),
             }
         }
@@ -60,13 +73,29 @@ impl EditView {
         (self.mode == EditMode::Turn).then_some(self.status.as_deref()).flatten()
     }
 
+    /// Byte offset of `idx` characters into the line.
+    fn byte_of(&self, idx: usize) -> usize {
+        self.line.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(self.line.len())
+    }
+
+    /// Insert `text` at the cursor. Newlines are kept: the input is
+    /// multi-line, and only Enter (not part of a paste) sends it.
     fn insert(&mut self, text: &str) {
-        self.line.push_str(text);
+        let at = self.byte_of(self.cursor);
+        self.line.insert_str(at, text);
+        self.cursor += text.chars().count();
         match self.on_status() {
-            Some(status) => status.set_input(Some(&self.line)),
-            None => write(text),
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
         }
         self.line_changed();
+    }
+
+    /// The text with the cursor marked, for the status line.
+    fn show_on_status(&self, status: &StatusLine) {
+        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80);
+        let rendered = crate::status::render_input_with_cursor(&self.line, self.cursor, cols);
+        status.set_input(Some(&rendered));
     }
 
     fn line_changed(&mut self) {
@@ -117,11 +146,116 @@ impl EditView {
         }
     }
 
-    /// The prompt (`HH:MM:SS > ` or `> `) followed by the line so far.
+    /// The prompt (`HH:MM:SS > `) followed by the line so far.
     pub fn prompt(&mut self) -> String {
         let stamp = crate::ui::stamp();
         self.prompt_width = crate::ui::visible_width(&stamp) + 2;
         format!("{stamp}> {}", self.line)
+    }
+
+    /// Terminal rows the content occupies from the prompt's row, given a
+    /// `cols`-wide terminal. Newlines start a new row; a row filled exactly
+    /// leaves the cursor on it (pending wrap).
+    fn content_rows(&self, cols: usize) -> usize {
+        if cols == 0 {
+            return 1;
+        }
+        let mut rows = 1;
+        let mut col = self.prompt_width % cols;
+        for c in self.line.chars() {
+            if c == '\n' {
+                rows += 1;
+                col = 0;
+            } else {
+                col += 1;
+                if col == cols {
+                    rows += 1;
+                    col = 0;
+                }
+            }
+        }
+        rows
+    }
+
+    /// The cursor's row and column, counted from the prompt's row. The column
+    /// is where the *next* character would go, which is how terminals report
+    /// the cursor (a row filled exactly is a pending wrap: column `cols`).
+    /// The cursor's row and column, counted from the prompt's row. The column
+    /// is where the *next* character would go: a row filled exactly leaves the
+    /// cursor on it at column `cols` (a pending wrap), and printing one more
+    /// character wraps to the next row.
+    fn cursor_position(&self, cols: usize) -> (usize, usize) {
+        let cols = cols.max(1);
+        let mut row = 0;
+        let mut col = self.prompt_width;
+        for c in self.line.chars().take(self.cursor) {
+            if c == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                if col == cols {
+                    row += 1;
+                    col = 0;
+                }
+                col += 1;
+            }
+        }
+        (row, col)
+    }
+
+    /// The character index whose glyph is at (`row`, `col`) from the prompt's
+    /// row, clamped into the input. Used to place the cursor on a mouse click.
+    fn char_at_position(&self, cols: usize, row: usize, col: usize) -> usize {
+        let cols = cols.max(1);
+        let mut r = 0;
+        let mut c = self.prompt_width % cols;
+        for (idx, ch) in self.line.chars().enumerate() {
+            if r == row && c == col {
+                return idx;
+            }
+            if ch == '\n' {
+                r += 1;
+                c = 0;
+            } else {
+                c += 1;
+                if c == cols {
+                    r += 1;
+                    c = 0;
+                }
+            }
+        }
+        self.line.chars().count()
+    }
+
+    /// Reprint the prompt and the whole input with the cursor where
+    /// `self.cursor` is, clearing whatever an earlier redraw (or the menu)
+    /// left below. Only meaningful at the prompt; on the status line the
+    /// caller updates it instead.
+    fn redraw(&mut self) {
+        if !self.menu_enabled || self.mode != EditMode::Prompt {
+            return;
+        }
+        let (_rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
+        let cols = (cols as usize).max(1);
+        let content = self.content_rows(cols);
+        let (cursor_row, cursor_col) = self.cursor_position(cols);
+        let clear_below = self.drawn_rows.saturating_sub(content).saturating_sub(cursor_row);
+        self.drawn_rows = content + self.menu_rows;
+        let stamp = crate::ui::stamp();
+        let mut seq = format!("\x1b7\r{stamp}> {}\x1b[J", self.line);
+        if clear_below > 0 {
+            seq.push_str(&format!("\x1b[{clear_below}B\x1b[J"));
+        }
+        seq.push_str("\x1b8");
+        if cursor_row > 0 {
+            seq.push_str(&format!("\x1b[{cursor_row}B"));
+        }
+        if cursor_col > 0 {
+            seq.push_str(&format!("\r\x1b[{cursor_col}C"));
+        } else {
+            seq.push('\r');
+        }
+        write(&seq);
     }
 
     /// On Enter: rewrite the prompt's timestamp with the time the line was
@@ -141,6 +275,7 @@ impl EditView {
     /// menu rows scrolled away, so draw it afresh.
     pub fn prompt_redrawn(&mut self) {
         self.menu_rows = 0;
+        self.drawn_rows = self.content_rows(crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80));
         self.draw_menu();
     }
 
@@ -157,36 +292,149 @@ impl EditView {
         }
         self.menu_rows = 0;
         self.draw_menu();
+        // Reflow moved the input's rows; reprint it with the cursor back
+        // where it belongs.
+        self.redraw();
     }
 
-    /// Remove the last `n` characters.
-    fn erase(&mut self, n: usize) {
-        let mut erased = String::new();
-        for _ in 0..n {
-            match self.line.pop() {
-                Some(c) => erased.push(c),
-                None => break,
-            }
+    /// Remove the character before the cursor (Backspace).
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
         }
+        self.cursor -= 1;
+        let at = self.byte_of(self.cursor);
+        self.line.remove(at);
         match self.on_status() {
-            Some(status) => status.set_input((!self.line.is_empty()).then_some(self.line.as_str())),
-            None => write(&"\x08 \x08".repeat(erased.chars().count())),
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
         }
-        if !erased.is_empty() {
-            self.line_changed();
-        }
+        self.line_changed();
     }
 
+    /// Remove the character under the cursor (Delete).
+    fn delete(&mut self) {
+        if self.cursor >= self.line.chars().count() {
+            return;
+        }
+        let at = self.byte_of(self.cursor);
+        self.line.remove(at);
+        match self.on_status() {
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
+        }
+        self.line_changed();
+    }
+
+    /// Remove the word before the cursor, plus any whitespace separating it
+    /// from the cursor.
     fn erase_word(&mut self) {
-        let trimmed = self.line.trim_end();
+        let before: String = self.line.chars().take(self.cursor).collect();
+        let trimmed = before.trim_end();
         let word_start = trimmed
             .char_indices()
             .rev()
             .find(|(_, c)| c.is_whitespace())
             .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
-        let n = self.line[word_start..].chars().count();
-        self.erase(n);
+        let start = before[..word_start].chars().count();
+        let from = self.byte_of(start);
+        let to = self.byte_of(self.cursor);
+        self.line.replace_range(from..to, "");
+        self.cursor = start;
+        match self.on_status() {
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
+        }
+        self.line_changed();
+    }
+
+    /// Clear the whole input (Ctrl-U).
+    fn clear_line(&mut self) {
+        if self.line.is_empty() {
+            return;
+        }
+        self.line.clear();
+        self.cursor = 0;
+        match self.on_status() {
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
+        }
+        self.line_changed();
+    }
+
+    /// Move the cursor, updating the status line or the terminal cursor.
+    fn move_to(&mut self, idx: usize) {
+        let idx = idx.min(self.line.chars().count());
+        if idx == self.cursor {
+            return;
+        }
+        self.cursor = idx;
+        match self.on_status() {
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.move_to(self.cursor.saturating_sub(1));
+    }
+
+    fn move_right(&mut self) {
+        self.move_to(self.cursor + 1);
+    }
+
+    fn move_home(&mut self) {
+        self.move_to(0);
+    }
+
+    fn move_end(&mut self) {
+        self.move_to(self.line.chars().count());
+    }
+
+    /// Word boundaries follow readline: a word ends at whitespace.
+    fn move_word_left(&mut self) {
+        let before: Vec<char> = self.line.chars().take(self.cursor).collect();
+        let mut i = before.len();
+        while i > 0 && before[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !before[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.move_to(i);
+    }
+
+    fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.line.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.move_to(i);
+    }
+
+    /// A mouse press at column `x`, row `y` (1-based screen coordinates):
+    /// place the cursor on the glyph there when the press is inside the
+    /// input's rows. Presses on the menu below or above the prompt are
+    /// ignored.
+    fn mouse_press(&mut self, x: u16, y: u16) {
+        if self.mode != EditMode::Prompt {
+            return;
+        }
+        let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
+        let cols = (cols as usize).max(1);
+        let content = self.content_rows(cols);
+        let top = (rows as usize).saturating_sub(content + self.menu_rows) + 1;
+        let (row, col) = (y as usize, (x as usize).saturating_sub(1));
+        if row < top || row >= top + content {
+            return;
+        }
+        let idx = self.char_at_position(cols, row - top, col);
+        self.move_to(idx);
     }
 
     fn take(&mut self) -> String {
@@ -198,9 +446,15 @@ impl EditView {
         self.menu_hidden = false;
         self.restamp_prompt();
         let line = std::mem::take(&mut self.line);
+        self.cursor = 0;
+        self.drawn_rows = 0;
         match self.on_status() {
             Some(status) => status.set_input(None),
-            None => write("\r\n"),
+            None => {
+                // The input may occupy several rows; the cursor can be on any
+                // of them, so clear from here down before the newline.
+                write("\x1b[J\r\n");
+            }
         }
         line
     }
@@ -293,11 +547,14 @@ pub fn restore_terminal() {
     if let Some(original) = ORIGINAL.get() {
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original) };
     }
+    write("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
 }
 
 /// Key-by-key input while alive: no echo, no line buffering, and control
 /// keys (Ctrl-C, Ctrl-O, which macOS would use to discard output) delivered
-/// as bytes. Output processing is left on.
+/// as bytes. Output processing is left on. While active, the terminal is
+/// asked for bracketed paste, SGR mouse presses and modifyOtherKeys/kitty
+/// key reporting (so Ctrl/Cmd-Enter is distinguishable from Enter).
 struct KeyMode;
 
 impl KeyMode {
@@ -310,6 +567,9 @@ impl KeyMode {
         raw.c_cc[libc::VTIME] = 0;
         let entered = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0;
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
+        if entered {
+            write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>4;1m\x1b[>1u");
+        }
         entered.then_some(Self)
     }
 }
@@ -319,6 +579,24 @@ impl Drop for KeyMode {
         KEY_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
         restore_terminal();
     }
+}
+
+/// What an escape sequence (arrow key, function key, modified key, mouse
+/// press) means for the editor.
+#[derive(Debug)]
+enum Esc {
+    Left,
+    Right,
+    Home,
+    End,
+    WordLeft,
+    WordRight,
+    Delete,
+    /// Ctrl- or Cmd-Enter: insert a newline instead of sending.
+    Newline,
+    Mouse { x: u16, y: u16 },
+    /// Something else (function keys, releases, motion, unknown sequences).
+    Ignored,
 }
 
 /// Reads keys, carrying bytes that arrived past the end of a line (pastes)
@@ -375,30 +653,25 @@ impl LineReader {
                     }
                     return Key::Line(view.take() + "\n");
                 }
+                0x01 => view.move_home(),
                 0x03 => {
-                    let n = view.line.chars().count();
-                    view.erase(n);
+                    view.clear_line();
                     drop(view);
                     send(Key::Interrupt);
                 }
                 0x04 if view.line.is_empty() => return Key::Eof,
+                0x05 => view.move_end(),
                 0x0f => {
                     drop(view);
                     send(Key::ToggleThinking);
                 }
-                0x7f | 0x08 => view.erase(1),
-                0x15 => {
-                    let n = view.line.chars().count();
-                    view.erase(n);
-                }
+                0x7f | 0x08 => view.backspace(),
+                0x15 => view.clear_line(),
                 0x17 => view.erase_word(),
                 0x1b => {
                     let menu = view.menu_visible();
                     drop(view);
                     match self.byte_within(ESCAPE_SEQUENCE_WAIT_MS) {
-                        // Skip escape sequences (arrow keys and the like),
-                        // forwarding a cursor position report to the status
-                        // line when it is waiting for one.
                         Some(intro @ (b'[' | b'O')) => {
                             let mut seq = vec![0x1b, intro];
                             while let Some(b) = self.next_byte() {
@@ -409,6 +682,26 @@ impl LineReader {
                             }
                             if let Some(row) = crate::status::cursor_report_row(&seq) {
                                 crate::status::cursor_reported(row);
+                            } else if seq == b"\x1b[200~" {
+                                // Bracketed paste: keep line breaks instead
+                                // of sending line by line.
+                                let text = read_paste(self);
+                                if !text.is_empty() {
+                                    shared.lock().unwrap().insert(&text);
+                                }
+                            } else {
+                                match parse_escape(&seq) {
+                                    Esc::Left => shared.lock().unwrap().move_left(),
+                                    Esc::Right => shared.lock().unwrap().move_right(),
+                                    Esc::Home => shared.lock().unwrap().move_home(),
+                                    Esc::End => shared.lock().unwrap().move_end(),
+                                    Esc::WordLeft => shared.lock().unwrap().move_word_left(),
+                                    Esc::WordRight => shared.lock().unwrap().move_word_right(),
+                                    Esc::Delete => shared.lock().unwrap().delete(),
+                                    Esc::Newline => shared.lock().unwrap().insert("\n"),
+                                    Esc::Mouse { x, y } => shared.lock().unwrap().mouse_press(x, y),
+                                    Esc::Ignored => {}
+                                }
                             }
                         }
                         None if menu => shared.lock().unwrap().hide_menu(),
@@ -441,16 +734,142 @@ impl LineReader {
     }
 }
 
+/// Interpret a complete escape sequence. `ESC [ ...` sequences are CSI;
+/// `ESC O x` are SS3 (application cursor keys).
+fn parse_escape(seq: &[u8]) -> Esc {
+    match seq {
+        // SS3 application cursor keys and Home/End.
+        [0x1b, b'O', b'D'] => return Esc::Left,
+        [0x1b, b'O', b'C'] => return Esc::Right,
+        [0x1b, b'O', b'H'] => return Esc::Home,
+        [0x1b, b'O', b'F'] => return Esc::End,
+        // Alt-b / Alt-f (readline word jumps), sent as ESC b / ESC f.
+        [0x1b, b'b'] => return Esc::WordLeft,
+        [0x1b, b'f'] => return Esc::WordRight,
+        _ => {}
+    }
+    let [0x1b, b'[', body @ .., final_byte] = seq else {
+        return Esc::Ignored;
+    };
+    let body = std::str::from_utf8(body).unwrap_or("");
+    // SGR mouse: < button ; column ; row, M for press and m for release.
+    if let Some(sgr) = body.strip_prefix('<') {
+        let parts: Vec<&str> = sgr.split(';').collect();
+        if parts.len() == 3 && *final_byte == b'M' {
+            let button: u16 = parts[0].parse().unwrap_or(64);
+            let (x, y) = (parts[1].parse().unwrap_or(0), parts[2].parse().unwrap_or(0));
+            // Button 0-2 is a press; 64+ is a wheel, 32+ is motion.
+            if button < 3 {
+                return Esc::Mouse { x, y };
+            }
+        }
+        return Esc::Ignored;
+    }
+    // Bracketed paste markers are handled by the caller before this.
+    match (*final_byte, body) {
+        (b'D', "") => Esc::Left,
+        (b'C', "") => Esc::Right,
+        (b'H', "") => Esc::Home,
+        (b'F', "") => Esc::End,
+        (b'Z', "") => Esc::Ignored, // Shift-Tab
+        (b'~', "3") => Esc::Delete,
+        (b'~', "1" | "7") => Esc::Home,
+        (b'~', "4" | "8") => Esc::End,
+        // CSI 1 ; modifier {C,D,H,F} and CSI modifier {C,D,H,F}:
+        // xterm modifier encoding is 1 + (shift=1, alt=2, ctrl=4).
+        (dir @ (b'C' | b'D' | b'H' | b'F'), params) => {
+            let encoded: u16 = params.rsplit(';').next().and_then(|m| m.parse().ok()).unwrap_or(1);
+            let bits = encoded.saturating_sub(1);
+            // Shift alone selects text in a GUI editor; here it is a plain
+            // move. Alt (bit 1) or Ctrl (bit 2) jump by word.
+            let word = bits & 0b110 != 0;
+            match (dir, word) {
+                (b'C', true) => Esc::WordRight,
+                (b'D', true) => Esc::WordLeft,
+                (b'C', false) => Esc::Right,
+                (b'D', false) => Esc::Left,
+                (b'H', _) => Esc::Home,
+                (b'F', _) => Esc::End,
+                _ => Esc::Ignored,
+            }
+        }
+        // modifyOtherKeys / kitty: CSI 27 ; modifier ; 13 ~ is Enter with a
+        // modifier. Ctrl (5) and Cmd/Super (9) insert a newline.
+        (b'~', params) if params.starts_with("27;") => {
+            let mut parts = params.split(';');
+            let (_, modifier, key) = (parts.next(), parts.next(), parts.next());
+            match (modifier.and_then(|m| m.parse::<u16>().ok()), key) {
+                (Some(5 | 9), Some("13")) => Esc::Newline,
+                _ => Esc::Ignored,
+            }
+        }
+        // kitty keyboard protocol: CSI 13 ; modifier u.
+        (b'u', params) => {
+            let mut parts = params.split(';');
+            match (parts.next().and_then(|k| k.parse::<u16>().ok()), parts.next().and_then(|m| m.parse::<u16>().ok())) {
+                (Some(13), Some(m)) if m & 0b100 != 0 || m & 0b1000 != 0 => Esc::Newline,
+                _ => Esc::Ignored,
+            }
+        }
+        _ => Esc::Ignored,
+    }
+}
+
+/// Read a bracketed paste (`ESC [ 200 ~` already consumed) up to
+/// `ESC [ 201 ~` and return its text with line endings normalized to `\n`.
+fn read_paste(reader: &mut LineReader) -> String {
+    const END: &[u8] = b"\x1b[201~";
+    let mut bytes = Vec::new();
+    while let Some(byte) = reader.next_byte() {
+        bytes.push(byte);
+        if bytes.ends_with(END) {
+            bytes.truncate(bytes.len() - END.len());
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // CRLF and lone CR both become \n inside the input.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A standalone view holding `line`, with no status line and drawing
+    /// disabled (no terminal in tests).
+    fn view(line: &str) -> EditView {
+        let mut view = EditView {
+            line: line.into(),
+            cursor: line.chars().count(),
+            mode: EditMode::Turn,
+            status: None,
+            menu_rows: 0,
+            menu_hidden: false,
+            menu_enabled: false,
+            prompt_width: 2,
+            drawn_rows: 0,
+        };
+        view.mode = EditMode::Turn;
+        view
+    }
+
     #[test]
     fn erase_word_handles_multibyte_spaces() {
-        let view = EditView::shared(None);
-        let mut view = view.lock().unwrap();
-        view.mode = EditMode::Turn; // no status line: echoes, but must not panic
-        view.line = "run a\u{a0}bé  ".into();
+        let mut view = view("run a\u{a0}bé  ");
         view.erase_word();
         assert_eq!(view.line, "run a\u{a0}");
         view.erase_word();
@@ -497,17 +916,180 @@ mod tests {
 
     #[test]
     fn tab_completes_commands_and_is_a_space_elsewhere() {
-        let view = EditView::shared(None);
-        let mut view = view.lock().unwrap();
-        view.mode = EditMode::Turn; // not drawn: no terminal in tests
-        view.line = "/comp".into();
-        view.tab();
-        assert_eq!(view.line, "/compact ");
-        view.line = "/s".into();
-        view.tab();
-        assert_eq!(view.line, "/s", "ambiguous: unchanged");
-        view.line = "fix it".into();
-        view.tab();
-        assert_eq!(view.line, "fix it ");
+        let mut v = view("/comp");
+        v.tab();
+        assert_eq!(v.line, "/compact ");
+        let mut v = view("/s");
+        v.tab();
+        assert_eq!(v.line, "/s", "ambiguous: unchanged");
+        let mut v = view("fix it");
+        v.tab();
+        assert_eq!(v.line, "fix it ");
+    }
+
+    #[test]
+    fn inserts_and_deletes_at_the_cursor() {
+        let mut view = view("helo");
+        view.move_left();
+        view.move_left();
+        view.insert("l");
+        assert_eq!(view.line, "hello");
+        assert_eq!(view.cursor, 3);
+        view.backspace();
+        assert_eq!(view.line, "helo");
+        assert_eq!(view.cursor, 2);
+        view.delete();
+        assert_eq!(view.line, "heo");
+        view.move_home();
+        view.insert(">> ");
+        assert_eq!(view.line, ">> heo");
+        view.move_end();
+        view.insert("!");
+        assert_eq!(view.line, ">> heo!");
+    }
+
+    #[test]
+    fn movement_clamps_at_the_ends() {
+        let mut view = view("ab");
+        view.move_left();
+        view.move_left();
+        view.move_left();
+        assert_eq!(view.cursor, 0);
+        view.move_right();
+        view.move_right();
+        view.move_right();
+        assert_eq!(view.cursor, 2);
+    }
+
+    #[test]
+    fn word_jumps_skip_whitespace() {
+        let mut view = view("foo bar  baz");
+        view.move_word_left();
+        assert_eq!(view.cursor, 9);
+        view.move_word_left();
+        assert_eq!(view.cursor, 4);
+        view.move_word_left();
+        assert_eq!(view.cursor, 0);
+        view.move_word_right();
+        assert_eq!(view.cursor, 4);
+        view.move_word_right();
+        assert_eq!(view.cursor, 9);
+    }
+
+    #[test]
+    fn erase_word_from_the_middle_keeps_the_tail() {
+        let mut view = view("foo bar baz");
+        view.move_to(8); // after "foo bar "
+        view.erase_word();
+        assert_eq!(view.line, "foo baz");
+        assert_eq!(view.cursor, 4);
+    }
+
+    #[test]
+    fn newlines_make_multiple_rows() {
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("one\ntwo\nthree");
+        assert_eq!(view.content_rows(80), 3);
+        view.move_to(4); // on "two"
+        assert_eq!(view.cursor_position(80), (1, 0));
+        view.move_to(0);
+        assert_eq!(view.cursor_position(80), (0, 2));
+    }
+
+    #[test]
+    fn wraps_long_lines_onto_more_rows() {
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("abcdef");
+        assert_eq!(view.content_rows(4), 3); // "> ab", "cd", "ef"
+        assert_eq!(view.cursor_position(4), (1, 4), "the last char fills the row: pending wrap");
+        view.move_to(2);
+        assert_eq!(view.cursor_position(4), (0, 4), "pending wrap stays on the row");
+    }
+
+    #[test]
+    fn maps_a_clicked_position_to_a_character() {
+        let mut v = view("hello world");
+        v.prompt_width = 2;
+        // Row 0, column 5 (0-based) is the 4th character.
+        assert_eq!(v.char_at_position(80, 0, 5), 3);
+        // Past the end clamps to the end of the input.
+        assert_eq!(v.char_at_position(80, 0, 60), 11);
+        // A newline: row 1 column 0 is the character after it.
+        let mut v = view("ab\ncd");
+        v.prompt_width = 2;
+        assert_eq!(v.char_at_position(80, 1, 0), 3);
+    }
+
+    #[test]
+    fn parses_cursor_and_function_keys() {
+        assert!(matches!(parse_escape(b"\x1b[D"), Esc::Left));
+        assert!(matches!(parse_escape(b"\x1b[C"), Esc::Right));
+        assert!(matches!(parse_escape(b"\x1b[H"), Esc::Home));
+        assert!(matches!(parse_escape(b"\x1b[F"), Esc::End));
+        assert!(matches!(parse_escape(b"\x1bOD"), Esc::Left));
+        assert!(matches!(parse_escape(b"\x1bOC"), Esc::Right));
+        assert!(matches!(parse_escape(b"\x1bOH"), Esc::Home));
+        assert!(matches!(parse_escape(b"\x1bOF"), Esc::End));
+        assert!(matches!(parse_escape(b"\x1b[3~"), Esc::Delete));
+        assert!(matches!(parse_escape(b"\x1b[1~"), Esc::Home));
+        assert!(matches!(parse_escape(b"\x1b[4~"), Esc::End));
+        // Up/down are not editing keys.
+        assert!(matches!(parse_escape(b"\x1b[A"), Esc::Ignored));
+        assert!(matches!(parse_escape(b"\x1b[B"), Esc::Ignored));
+    }
+
+    #[test]
+    fn parses_modified_cursor_keys() {
+        // Ctrl-Left / Ctrl-Right and Alt-Left / Alt-Right are word jumps.
+        assert!(matches!(parse_escape(b"\x1b[1;5D"), Esc::WordLeft));
+        assert!(matches!(parse_escape(b"\x1b[1;5C"), Esc::WordRight));
+        assert!(matches!(parse_escape(b"\x1b[1;3D"), Esc::WordLeft));
+        assert!(matches!(parse_escape(b"\x1b[1;3C"), Esc::WordRight));
+        // Alt-b / Alt-f.
+        assert!(matches!(parse_escape(b"\x1bb"), Esc::WordLeft));
+        assert!(matches!(parse_escape(b"\x1bf"), Esc::WordRight));
+        // Shift+arrows and Ctrl+Shift+arrows are not word jumps.
+        assert!(matches!(parse_escape(b"\x1b[1;2D"), Esc::Left));
+        assert!(matches!(parse_escape(b"\x1b[1;6D"), Esc::WordLeft));
+    }
+
+    #[test]
+    fn parses_ctrl_and_cmd_enter_as_a_newline() {
+        // modifyOtherKeys: ESC [ 27 ; modifier ; 13 ~
+        assert!(matches!(parse_escape(b"\x1b[27;5;13~"), Esc::Newline), "Ctrl-Enter");
+        assert!(matches!(parse_escape(b"\x1b[27;9;13~"), Esc::Newline), "Cmd-Enter");
+        assert!(matches!(parse_escape(b"\x1b[27;2;13~"), Esc::Ignored), "Shift-Enter is left alone");
+        // kitty keyboard protocol: CSI 13 ; modifier u
+        assert!(matches!(parse_escape(b"\x1b[13;5u"), Esc::Newline), "kitty Ctrl-Enter");
+        assert!(matches!(parse_escape(b"\x1b[13;9u"), Esc::Newline), "kitty Cmd-Enter");
+    }
+
+    #[test]
+    fn parses_sgr_mouse_presses() {
+        match parse_escape(b"\x1b[<0;10;5M") {
+            Esc::Mouse { x, y } => assert_eq!((x, y), (10, 5)),
+            other => panic!("expected a mouse press, got {other:?}"),
+        }
+        // Releases and wheel events are ignored.
+        assert!(matches!(parse_escape(b"\x1b[<0;10;5m"), Esc::Ignored));
+        assert!(matches!(parse_escape(b"\x1b[<64;10;5M"), Esc::Ignored));
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings() {
+        // CRLF, lone CR and LF all become \n.
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"one\r\ntwo\rthree\nfour\x1b[201~".iter());
+        assert_eq!(read_paste(&mut reader), "one\ntwo\nthree\nfour");
+    }
+
+    #[test]
+    fn take_returns_the_multiline_input() {
+        let mut view = view("one\ntwo");
+        assert_eq!(view.take(), "one\ntwo");
+        assert!(view.line.is_empty());
+        assert_eq!(view.cursor, 0);
     }
 }
