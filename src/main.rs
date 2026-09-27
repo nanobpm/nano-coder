@@ -473,8 +473,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             println!("(read-only: run /model again at the prompt to switch)");
             Ok(true)
         }
-        "/model" if !io::stderr().is_terminal() => {
-            // The picker needs a terminal; piped stdin/stdout just gets the
+        "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            // The picker reads keystrokes from stdin and draws on stderr, so it
+            // needs both to be terminals; piped input/output just gets the
             // current model.
             println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
             Ok(true)
