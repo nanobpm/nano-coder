@@ -2,10 +2,13 @@
 //! use, session tokens and what the agent is doing.
 //!
 //! The rows above it are made a scroll region (DECSTBM), so ordinary output
-//! scrolls without disturbing the status line.
+//! scrolls without disturbing the status line. The conversation is kept
+//! bottom-anchored (directly above the status line, blank rows at the top) so
+//! that shrinking the window drops blank rows rather than conversation.
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::context::{Activity, ContextStats, SharedStats, format_rate, format_tokens};
 
@@ -24,11 +27,120 @@ pub fn terminal_size() -> Option<(u16, u16)> {
 }
 
 fn write_raw(bytes: &str) {
-    with_term_lock(|| {
-        let mut out = io::stdout().lock();
-        let _ = out.write_all(bytes.as_bytes());
-        let _ = out.flush();
-    });
+    with_term_lock(|| emit(bytes));
+}
+
+/// Write without taking the terminal lock; the caller must hold it.
+fn emit(bytes: &str) {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(bytes.as_bytes());
+    let _ = out.flush();
+}
+
+/// A cursor position report (`ESC [ row ; col R`) the line reader forwarded,
+/// and whether one is being waited for. Reports arriving while nothing waits
+/// are ignored: a modified F3 key sends the same shape.
+static CURSOR_REPORT: (Mutex<(bool, Option<u16>)>, Condvar) = (Mutex::new((false, None)), Condvar::new());
+
+/// How long to wait for the terminal to answer a cursor position query.
+const CURSOR_REPORT_WAIT: Duration = Duration::from_millis(150);
+
+/// Called by the line reader when it parses a cursor position report.
+/// Returns whether the report was expected (and so consumed).
+pub fn cursor_reported(row: u16) -> bool {
+    let (lock, signal) = &CURSOR_REPORT;
+    let mut report = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !report.0 {
+        return false;
+    }
+    report.1 = Some(row);
+    signal.notify_all();
+    true
+}
+
+/// Parse a cursor position report `ESC [ row ; col R` into `(row, col)`.
+fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
+    let start = bytes.windows(2).rposition(|w| w == b"\x1b[")? + 2;
+    let body = std::str::from_utf8(&bytes[start..]).ok()?.strip_suffix('R')?;
+    let (row, col) = body.split_once(';')?;
+    Some((row.parse().ok()?, col.parse().ok()?))
+}
+
+/// The row of a complete cursor position report, for the line reader.
+pub fn cursor_report_row(seq: &[u8]) -> Option<u16> {
+    parse_cursor_report(seq).map(|(row, _)| row)
+}
+
+/// Ask the terminal where the cursor is, reading the answer straight from
+/// stdin. Only for use before the line reader starts (it would otherwise
+/// race for the reply): echo and line buffering are turned off meanwhile so
+/// the reply is never printed.
+fn query_cursor_direct() -> Option<(u16, u16)> {
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+        return None;
+    }
+    let mut raw = original;
+    // Disable ISIG too: with ECHO/ICANON off, a Ctrl-C mid-query would
+    // otherwise deliver SIGINT and terminate the process before termios is
+    // restored below, stranding the terminal in non-echo/non-canonical mode.
+    // Treat the interrupt byte as ordinary input for the brief query instead.
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    raw.c_cc[libc::VMIN] = 0;
+    raw.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+    emit("\x1b[6n");
+    let deadline = std::time::Instant::now() + CURSOR_REPORT_WAIT * 2;
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"R") {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut fd, 1, left.as_millis() as i32) } <= 0 {
+            break;
+        }
+        let mut byte = 0u8;
+        if unsafe { libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) } != 1 {
+            break;
+        }
+        reply.push(byte);
+    }
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
+    parse_cursor_report(&reply)
+}
+
+/// Bytes that scroll the scroll region's content down `gap` rows and move
+/// the cursor down with it, so the conversation sits directly above the
+/// status line. Blank lines are inserted at the top of the region (IL at row
+/// 1, equivalent to SD but more widely emulated) and the region's bottom
+/// `gap` rows — blank, below the cursor — drop off.
+pub fn anchor_sequence(gap: u16) -> String {
+    if gap == 0 {
+        return String::new();
+    }
+    format!("\x1b7\x1b[1;1H\x1b[{gap}L\x1b8\x1b[{gap}B")
+}
+
+/// Bytes that pin the status row and bottom-anchor the conversation, given
+/// where the cursor is (`None`: unknown). With the conversation directly
+/// above the status line there are no blank rows between them, so when the
+/// window shrinks the terminal drops blank rows from the top instead of
+/// pushing the conversation up out of view: terminals only trim blank rows
+/// at the very bottom, and the status line's row is never blank.
+fn install_sequence(rows: u16, cursor: Option<(u16, u16)>) -> String {
+    let bottom = scroll_region_bottom(rows);
+    match cursor {
+        Some((row, col)) if row < bottom => {
+            format!("\x1b[1;{bottom}r\x1b[{row};{col}H{}", anchor_sequence(bottom - row))
+        }
+        // On (or below) the last region row, or unknown: make sure the cursor
+        // is above the bottom row, then confine scrolling.
+        _ => format!("\n\x1b[1A\x1b7\x1b[1;{bottom}r\x1b8"),
+    }
 }
 
 /// A process-wide lock serialising every write to the terminal. Escape
@@ -80,8 +192,7 @@ impl StatusLine {
             return None;
         }
         let (rows, cols) = terminal_size().filter(|(rows, _)| *rows >= 5)?;
-        // Make sure the cursor is above the bottom row, then confine scrolling.
-        write_raw(&format!("\n\x1b[1A\x1b7\x1b[1;{}r\x1b8", rows - 1));
+        write_raw(&install_sequence(rows, query_cursor_direct()));
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             write_raw("\x1b7\x1b[r\x1b8");
@@ -129,10 +240,42 @@ impl StatusLine {
 
     /// Re-establish the region after the terminal was resized. `draw()` already
     /// detects a size change and emits the region reset, erase-below and fresh
-    /// bar as one atomic write, so this simply delegates to it — keeping the
-    /// SIGWINCH path a single, un-interleavable terminal write.
+    /// bar as one atomic write. Then re-anchor the conversation: a terminal
+    /// that grew with too little scrollback to pull back pads blank rows at the
+    /// bottom, opening a gap between the conversation and the status line.
+    /// Call only from the SIGWINCH handler, never from the line reader thread
+    /// (which must be free to read the cursor position reply).
     pub fn resize(&self) {
         self.draw();
+        self.anchor();
+    }
+
+    /// Close any gap between the cursor and the status line by scrolling the
+    /// conversation down into it. Asks the terminal for the cursor row, which
+    /// only works while the line reader is in key mode (it forwards the reply;
+    /// outside key mode the reply would be echoed). The terminal lock is held
+    /// from the query to the scroll, so no output can move the cursor between
+    /// them. Gives up after a short wait if no reply is forwarded.
+    fn anchor(&self) {
+        if !crate::lineedit::key_mode_active() {
+            return;
+        }
+        let Some((rows, _)) = *self.size.lock().unwrap() else { return };
+        with_term_lock(|| {
+            let (lock, signal) = &CURSOR_REPORT;
+            let mut report = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *report = (true, None);
+            emit("\x1b[6n");
+            let (mut report, _) = signal
+                .wait_timeout_while(report, CURSOR_REPORT_WAIT, |r| r.1.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            let row = report.1.take();
+            report.0 = false;
+            drop(report);
+            if let Some(row) = row {
+                emit(&anchor_sequence(scroll_region_bottom(rows).saturating_sub(row)));
+            }
+        });
     }
 
     /// Clear the screen and scrollback for a fresh session, then re-establish
@@ -143,8 +286,11 @@ impl StatusLine {
             let size = self.size.lock().unwrap();
             let Some((rows, _cols)) = *size else { return };
             // Drop the region, home the cursor, wipe the screen + scrollback,
-            // then re-confine scrolling to every row but the pinned bottom one.
-            write_raw(&format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{}r", rows.max(2) - 1));
+            // re-confine scrolling to every row but the pinned bottom one, and
+            // start on the last region row so the new conversation is
+            // bottom-anchored like the first.
+            let bottom = scroll_region_bottom(rows);
+            write_raw(&format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{bottom}r\x1b[{bottom};1H"));
         }
         self.draw();
     }
@@ -381,6 +527,36 @@ mod tests {
             let seq = resize_sequence(rows);
             assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
         }
+    }
+
+    #[test]
+    fn parses_cursor_position_reports() {
+        assert_eq!(parse_cursor_report(b"\x1b[12;5R"), Some((12, 5)));
+        assert_eq!(parse_cursor_report(b"typed\x1b[3;1R"), Some((3, 1)), "takes the report after typeahead");
+        assert_eq!(parse_cursor_report(b"\x1b[12;5"), None, "incomplete");
+        assert_eq!(parse_cursor_report(b"\x1b[A"), None, "an arrow key is not a report");
+        assert_eq!(cursor_report_row(b"\x1b[7;40R"), Some(7));
+    }
+
+    #[test]
+    fn anchor_scrolls_the_region_down_and_follows_with_the_cursor() {
+        assert_eq!(anchor_sequence(0), "");
+        // Insert blank lines at the top of the region (pushing the
+        // conversation down), then move the restored cursor down with it.
+        assert_eq!(anchor_sequence(3), "\x1b7\x1b[1;1H\x1b[3L\x1b8\x1b[3B");
+    }
+
+    #[test]
+    fn install_bottom_anchors_the_conversation() {
+        // Cursor on row 8 of 24: pin rows 1..=23, put the cursor back and
+        // scroll the conversation down 15 rows so it sits on row 23.
+        assert_eq!(install_sequence(24, Some((8, 1))), format!("\x1b[1;23r\x1b[8;1H{}", anchor_sequence(15)));
+        // Already on the last region row, on the status row, or unknown: just
+        // keep the cursor off the bottom row and pin the region.
+        let plain = "\n\x1b[1A\x1b7\x1b[1;23r\x1b8";
+        assert_eq!(install_sequence(24, Some((23, 1))), plain);
+        assert_eq!(install_sequence(24, Some((24, 1))), plain);
+        assert_eq!(install_sequence(24, None), plain);
     }
 
     #[test]

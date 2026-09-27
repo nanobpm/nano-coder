@@ -517,7 +517,9 @@ In an interactive terminal the bottom row shows the provider/model, context usag
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count, and what the agent is doing. It uses a terminal scroll region, follows resizes, and is
-off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set.
+off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+directly above the status line (empty space collects at the top), so shrinking the window
+drops empty rows rather than pushing the conversation out of view.
 
 The context window comes from, in order: `context_window` in the config, `context_window`
 on the provider, the window the endpoint reports, a built-in table of known models, then
