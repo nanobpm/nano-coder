@@ -267,6 +267,8 @@ pub enum Key {
     ToggleThinking,
     /// A lone Esc press (not part of an escape sequence).
     Escape,
+    /// Shift+Tab: cycle the agent mode (normal/plan/auto).
+    CycleMode,
 }
 
 /// How long to wait after Esc for the rest of an escape sequence. Terminals
@@ -407,7 +409,12 @@ impl LineReader {
                                     break;
                                 }
                             }
-                            if let Some(row) = crate::status::cursor_report_row(&seq) {
+                            // Shift+Tab is ESC [ Z (backtab); everything else is
+                            // skipped, with a cursor position report forwarded to
+                            // the status line when it is waiting for one.
+                            if seq == [0x1b, b'[', b'Z'] {
+                                send(Key::CycleMode);
+                            } else if let Some(row) = crate::status::cursor_report_row(&seq) {
                                 crate::status::cursor_reported(row);
                             }
                         }

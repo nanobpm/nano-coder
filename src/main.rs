@@ -21,9 +21,11 @@ mod instructions;
 mod plan;
 mod lineedit;
 mod llm;
+mod mode;
 mod output;
 mod permissions;
 mod providers;
+mod question;
 mod reminders;
 mod sandbox;
 mod settings;
@@ -78,6 +80,18 @@ fn register_builtin_tools(agent: &mut Agent) {
     };
     agent.tools().register(bash::definition(), Box::new(move |args| {
         Ok(json!(bash::run(&bash_config, &args)))
+    }));
+
+    // question tool: blocks until the turn loop answers (see question.rs).
+    // Headless (ACP) sessions have no one to answer, so it errors instead.
+    let broker = agent.questions();
+    agent.tools().register(question::definition(), Box::new(move |args| {
+        if !broker.is_interactive() {
+            anyhow::bail!("question tool needs an interactive terminal; end your turn with the question, or report_outcome(blocked), instead");
+        }
+        let questions = question::parse(&args)?;
+        let answer = broker.ask_blocking(questions.clone());
+        Ok(json!(question::result_text(&questions, &answer)))
     }));
 }
 
@@ -135,6 +149,8 @@ enum TermInput {
     ToggleThinking,
     /// A lone Esc press.
     Escape,
+    /// Shift+Tab: cycle the agent mode (normal/plan/auto).
+    CycleMode,
 }
 
 /// Esc twice within this window cancels the running turn.
@@ -191,6 +207,7 @@ impl Terminal {
                         lineedit::Key::Interrupt => TermInput::Interrupt,
                         lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
                         lineedit::Key::Escape => TermInput::Escape,
+                        lineedit::Key::CycleMode => TermInput::CycleMode,
                     });
                 };
                 for () in want_rx {
@@ -273,8 +290,13 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
     let mut escape = DoubleEscape::default();
     let outcome = async {
+        // Grab the broker before the turn future borrows `agent` mutably.
+        let questions = agent.questions();
         let turn = agent.run_turn(None, text);
         tokio::pin!(turn);
+        let mut question_rx = questions.subscribe();
+        let cap = questions.cap();
+        let mut cap_rx = cap.subscribe();
         loop {
             if !terminal.queued.iter().any(|i| matches!(i, TermInput::Eof)) {
                 terminal.request_line();
@@ -284,6 +306,27 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                 // must happen before a buffered cancel or steer is routed to it.
                 biased;
                 outcome = &mut turn => break outcome,
+                // A `question` tool call is waiting for an answer. The handler
+                // is parked on the blocking pool; answer it here, where we own
+                // the terminal.
+                notified = question_rx.changed() => {
+                    if notified.is_err() {
+                        // Broker dropped (agent gone): nothing more to answer.
+                        continue;
+                    }
+                    if let Some(request) = questions.pending() {
+                        let answer = prompt_question(request.questions(), &control, &renderer).await;
+                        questions.resolve(answer);
+                    }
+                }
+                // The turn hit the cap in normal mode: ask whether to continue.
+                notified = cap_rx.changed() => {
+                    if notified.is_err() {
+                        continue;
+                    }
+                    let decision = prompt_cap_reached(&renderer).await;
+                    cap.decide(decision);
+                }
                 input = terminal.recv() => match input {
                     TermInput::Interrupt => {
                         control.cancel();
@@ -300,6 +343,12 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     }
                     TermInput::ToggleThinking => {
                         renderer.toggle_thinking();
+                    }
+                    TermInput::CycleMode => {
+                        // `control` is a shared handle, so this works while the
+                        // turn future holds a `&mut` borrow of the agent.
+                        let mode = control.cycle_mode();
+                        renderer.note(&format!("[mode: {mode} — {}]", mode.describe()));
                     }
                     TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() && !line.trim().starts_with('/') => {
                         control.steer(line.trim(), None);
@@ -329,6 +378,101 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         }
     }
     Ok(outcome)
+}
+
+/// How long auto mode waits for the user before answering a question itself.
+const AUTO_AWAY_SECS: u64 = 15;
+
+/// Render one question and return its answer string, `None` when dismissed.
+fn ask_one(q: &question::Question) -> Result<Option<String>> {
+    use dialoguer::{Input, Select};
+    let mut labels: Vec<String> = q
+        .options
+        .iter()
+        .map(|o| if o.description.is_empty() { o.label.clone() } else { format!("{} — {}", o.label, o.description) })
+        .collect();
+    let custom_index = if q.custom {
+        labels.push("Type your own answer".into());
+        Some(labels.len() - 1)
+    } else {
+        None
+    };
+    let choice = Select::new().with_prompt(&q.question).items(&labels).default(0).interact_opt()?;
+    match choice {
+        None => Ok(None),
+        Some(i) if Some(i) == custom_index => {
+            let text: String = Input::new().with_prompt("Answer").interact_text()?;
+            Ok(Some(text))
+        }
+        Some(i) => Ok(Some(q.options[i].label.clone())),
+    }
+}
+
+/// Render a pending `question` and return the answer. In auto mode the user
+/// gets `AUTO_AWAY_SECS` to respond before the question is answered with the
+/// away message. Runs on the turn loop, which owns the terminal.
+async fn prompt_question(
+    questions: &[question::Question],
+    control: &agent::TurnControl,
+    renderer: &std::sync::Arc<ui::Renderer>,
+) -> question::QuestionAnswer {
+    use question::QuestionAnswer;
+    let auto = control.mode() == mode::AgentMode::Auto;
+
+    // The whole prompt run: ask each question, collecting one string each.
+    // Dismissal (Esc) at any question dismisses the lot.
+    let ask = |questions: &[question::Question]| -> Result<QuestionAnswer> {
+        let mut answers = Vec::new();
+        for q in questions {
+            match ask_one(q)? {
+                Some(answer) => answers.push(answer),
+                None => return Ok(QuestionAnswer::Dismissed),
+            }
+        }
+        Ok(QuestionAnswer::Answers(answers))
+    };
+
+    if !auto {
+        let questions = questions.to_vec();
+        let asked = tokio::task::spawn_blocking(move || ask(&questions)).await;
+        return asked.ok().and_then(Result::ok).unwrap_or(QuestionAnswer::Dismissed);
+    }
+
+    // Auto mode: give the user a chance to answer, then answer ourselves.
+    renderer.note(&format!("[auto: answering for you in {AUTO_AWAY_SECS}s — the user is away]"));
+    let questions = questions.to_vec();
+    match tokio::time::timeout(std::time::Duration::from_secs(AUTO_AWAY_SECS), tokio::task::spawn_blocking(move || ask(&questions))).await {
+        Ok(Ok(Ok(answer))) => answer,
+        Ok(_) => QuestionAnswer::Dismissed,
+        Err(_) => {
+            renderer.note("[auto: no answer — making the best decision]");
+            QuestionAnswer::Away
+        }
+    }
+}
+
+/// Ask whether to keep going when the turn cap is reached. Defaults to stop,
+/// so an unattended prompt does not run away. Runs on the turn loop.
+async fn prompt_cap_reached(renderer: &std::sync::Arc<ui::Renderer>) -> question::CapDecision {
+    use question::CapDecision;
+    let renderer = renderer.clone();
+    tokio::task::spawn_blocking(move || {
+        let keep_going = dialoguer::Confirm::new()
+            .with_prompt("Reached the turn cap without a final answer. Keep going?")
+            .default(false)
+            .interact_opt()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if keep_going {
+            renderer.note("[continuing past the turn cap]");
+            CapDecision::Continue
+        } else {
+            CapDecision::Stop
+        }
+    })
+    .await
+    .unwrap_or(CapDecision::Stop)
 }
 
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
@@ -361,6 +505,10 @@ async fn run_compaction(
                 }
                 TermInput::ToggleThinking => {
                     terminal.renderer.toggle_thinking();
+                }
+                TermInput::CycleMode => {
+                    let mode = control.cycle_mode();
+                    eprintln!("[mode: {mode} — {}]", mode.describe());
                 }
                 other => terminal.queued.push_back(other),
             },
@@ -535,6 +683,25 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        "/mode" => {
+            let current = agent.mode();
+            println!("Mode: {current} ({})", current.describe());
+            for mode in mode::AgentMode::ALL {
+                println!("  {:<8} {}", mode.to_string(), mode.describe());
+            }
+            println!("(Shift+Tab cycles; /mode NAME sets it directly)");
+            Ok(true)
+        }
+        _ if cmd.starts_with("/mode ") => {
+            match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
+                Ok(m) => {
+                    agent.set_mode(m);
+                    println!("Mode set to {m} ({})", m.describe());
+                }
+                Err(e) => println!("{e}"),
+            }
+            Ok(true)
+        }
         _ if cmd.starts_with("/verbosity ") => {
             match cmd["/verbosity ".len()..].parse::<ui::Verbosity>() {
                 Ok(level) => {
@@ -696,6 +863,8 @@ async fn main() -> Result<()> {
         eprintln!("ACP harness ready (provider: {}, model: {})", agent.provider_name(), agent.model_name());
         acp::run_acp(&mut agent).await?;
     } else {
+        // The interactive CLI answers `question` tool calls.
+        agent.questions().set_interactive(true);
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
@@ -790,6 +959,12 @@ async fn main() -> Result<()> {
                             prompt(&terminal, false);
                         }
                     }
+                    TermInput::CycleMode => {
+                        let mode = agent.control().cycle_mode();
+                        agent.set_mode(mode);
+                        println!("\nMode: {mode} ({})", mode.describe());
+                        prompt(&terminal, false);
+                    }
                     other => break other,
                 }
             };
@@ -801,7 +976,7 @@ async fn main() -> Result<()> {
                     println!("\n(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape => continue,
+                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
                 TermInput::Line(line) => line.trim().to_string(),
             };
             exit_armed = false;

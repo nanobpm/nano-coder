@@ -18,6 +18,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/tools", args: "", description: "List available tools" },
     Command { name: "/skills", args: "", description: "List skills the agent can load" },
     Command { name: "/model", args: "[provider/model]", description: "Show the model and pick a new one (or switch directly)" },
+    Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
     Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },
@@ -66,7 +67,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("\n  {:width$}  {}", synopsis(c), c.description));
     }
     out.push_str("\nType / to list commands as you type; Tab completes, Esc hides the list.");
-    out.push_str("\nKeys: Enter during a turn steers it, Esc Esc or Ctrl-C cancels it, Ctrl-O expands/collapses thinking");
+    out.push_str("\nKeys: Enter during a turn steers it, Esc Esc or Ctrl-C cancels it, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
     out
 }
 
