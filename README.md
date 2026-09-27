@@ -513,7 +513,12 @@ error).
 
 **Input.** On a terminal, input is read key by key. While a turn runs, what you type shows
 on the status line; Enter sends it as a steer, Esc Esc or Ctrl-C cancels the turn. The prompt supports
-Backspace, Ctrl-U (clear), Ctrl-W (delete word) and Ctrl-D (exit on an empty line).
+editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
+Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and clicking with the mouse places the
+cursor. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
+input and Ctrl-W deletes the word before the cursor. Ctrl-Enter (or Cmd-Enter) inserts a
+newline without sending, and pasted text keeps its line breaks as a single multi-line input
+instead of sending line by line. Ctrl-D exits on an empty line.
 
 Streaming uses server-sent events. Set `stream = false` on a provider whose endpoint doesn't
 support it. ACP mode doesn't stream text, but sends each response's reasoning as an
