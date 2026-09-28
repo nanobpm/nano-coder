@@ -190,12 +190,22 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
             if isinstance(v, list):
                 return "[" + ", ".join(toml_value(x) for x in v) + "]"
             return json.dumps(v)
+        def toml_key(name):
+            # A TOML dotted-key segment: bare when it is a valid bare key,
+            # otherwise a quoted key so provider names with dots/spaces (e.g.
+            # `my.provider`) address one table instead of nesting.
+            if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                return name
+            return json.dumps(name)
         text = "\n".join(lines)
         for provider in providers:
-            if f"[providers.{provider}.extra_body]" in text or re.search(rf"(?ms)^\[providers\.{re.escape(provider)}\](?:(?!^\[).)*?^extra_body", text):
+            key = toml_key(provider)
+            # Match an existing extra_body under either the bare or quoted header.
+            prov_pat = rf"(?:{re.escape(provider)}|{re.escape(json.dumps(provider))})"
+            if re.search(rf"(?m)^\[providers\.{prov_pat}\.extra_body\]", text) or re.search(rf"(?ms)^\[providers\.{prov_pat}\](?:(?!^\[).)*?^extra_body", text):
                 print(f"warning: providers.{provider} already sets extra_body; --extra-body ignored for it", file=sys.stderr)
                 continue
-            tail.append(f"[providers.{provider}.extra_body]")
+            tail.append(f"[providers.{key}.extra_body]")
             tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in extra_body.items()]
     return "\n".join(head + lines + tail) + "\n"
 
