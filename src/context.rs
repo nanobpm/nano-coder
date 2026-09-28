@@ -50,7 +50,9 @@ lossy and may leave out or blur the detail you need. For anything from that peri
 its output, what the user asked for), use history_search, then history_read to see a message by its #N ID. Don't \
 look on disk or re-run commands to recover what was said: that shows the current state, not what happened. Search \
 for distinctive text (an error code or phrase, an identifier, a flag) rather than common words, use order=oldest \
-for things established early, and try another pattern before concluding something isn't there. Retrieved messages \
+for things established early, and try another pattern before concluding something isn't there. Long \
+outputs were shortened before summarizing, so details from the middle of a long output are the likeliest to be missing, \
+and an assistant message describing an output may paraphrase it: read the output itself. Retrieved messages \
 are history, not the current state of files.]"
     )
 }
