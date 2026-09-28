@@ -126,19 +126,30 @@ impl StatusLine {
         // and the cursor restored, so the terminal stays free to reflow the
         // conversation above it.
         let (rows, cols) = terminal_size()?;
-        {
+        // Capture the previously drawn height and update the cache atomically,
+        // then fold the stale-bar cleanup into this same sequence. When the
+        // terminal grew, the bar last drawn at `old_rows` lingers above the new
+        // bottom row and must be erased before repainting lower down. Doing the
+        // erase here — the single place the cached size changes — means whichever
+        // caller *first* observes the grown terminal does it, whether that is a
+        // normal write/event or the SIGWINCH `resize()` handler. That closes the
+        // race where a write's `draw_seq()` bumped the cache to the new height
+        // before `resize()` ran, leaving `resize()` to see equal heights, skip
+        // the cleanup, and strand a duplicate bar.
+        let old_rows = {
             let mut size = self.size.lock().unwrap();
-            if size.is_none() {
+            let Some((old_rows, _)) = *size else {
                 return None; // torn down
-            }
+            };
             *size = Some((rows, cols));
-        }
+            old_rows
+        };
         let input = self.input.lock().unwrap().clone();
         let line = match input {
             Some((text, cursor, queued)) => render_input(&text, cursor, queued, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
-        Some(draw_sequence(&line, rows))
+        Some(format!("{}{}", resize_erase_sequence(old_rows, rows), draw_sequence(&line, rows)))
     }
 
     pub fn draw(&self) {
@@ -157,24 +168,15 @@ impl StatusLine {
     }
 
     /// Redraw after the terminal was resized. With no scroll region, the
-    /// terminal itself reflows the conversation; erase any stale bar the resize
-    /// left behind, then paint the status line at the new bottom row.
+    /// terminal itself reflows the conversation; `draw` (via `draw_seq`) erases
+    /// any stale bar the resize left at the old bottom row before painting at
+    /// the new bottom. The cleanup lives in `draw_seq` — not here — so it also
+    /// fires when a write or event redraws first, after the terminal grew but
+    /// before this handler runs, rather than being lost to that race.
+    /// (Terminal-specific reflow of the old row makes the erase best-effort,
+    /// per the module note, but it removes the common duplicate-bar case
+    /// deterministically.)
     pub fn resize(&self) {
-        // The bar is absolutely positioned at the (old) bottom row. When the
-        // terminal grows, that row is still on screen — now above the new
-        // bottom — so the old bar lingers as a duplicate status line until
-        // later output happens to cover it. Erase it before repainting at the
-        // new bottom. On shrink the old row is below the new bottom and already
-        // gone, so there is nothing to erase. (Terminal-specific reflow of that
-        // row makes this best-effort, per the module note, but it removes the
-        // common duplicate-bar case deterministically.)
-        let previous = self.size.lock().unwrap().map(|(rows, _)| rows);
-        if let (Some(old_rows), Some((new_rows, _))) = (previous, terminal_size()) {
-            let erase = resize_erase_sequence(old_rows, new_rows);
-            if !erase.is_empty() {
-                write_raw(&erase);
-            }
-        }
         self.draw();
     }
 
@@ -538,6 +540,25 @@ mod tests {
         assert_eq!(resize_erase_sequence(24, 24), "");
         // No DECSTBM scroll region (which ends in a literal 'r') is set.
         assert!(!resize_erase_sequence(24, 30).contains('r'), "no scroll region may be set");
+    }
+
+    #[test]
+    fn draw_seq_folds_the_stale_bar_cleanup_before_the_repaint() {
+        // `draw_seq` composes the erase and the repaint into one sequence (the
+        // erase lives with the size-changing draw, not in `resize`, so whichever
+        // caller first observes the grown terminal clears the stale bar and the
+        // resize race cannot strand it). When the terminal grew from 24 to 30
+        // rows the old row (24) must be erased *before* the bar is painted at
+        // the new bottom (30).
+        let seq = format!("{}{}", resize_erase_sequence(24, 30), draw_sequence("STATUS", 30));
+        let erase_at = seq.find("\x1b[24;1H\x1b[2K").expect("old row erased");
+        let draw_at = seq.find("\x1b[30;1H").expect("bar painted at the new bottom");
+        assert!(erase_at < draw_at, "stale bar must be erased before the repaint: {seq:?}");
+        // Unchanged/shrunk height folds in no erase, only the repaint.
+        assert_eq!(
+            format!("{}{}", resize_erase_sequence(24, 24), draw_sequence("STATUS", 24)),
+            draw_sequence("STATUS", 24)
+        );
     }
 
     #[test]
