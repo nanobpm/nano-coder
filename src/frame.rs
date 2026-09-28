@@ -93,12 +93,8 @@ pub enum Role {
 /// of the item and the width, so a width change just re-renders every item.
 #[derive(Debug, Clone)]
 pub enum Item {
-    /// A user or assistant message (plain text, wrapped to width). `stamp` is
-    /// the pre-formatted timestamp prefix (e.g. `ui::stamp()`) captured when
-    /// the message was created; empty when timestamps are off. Storing it on
-    /// the item keeps rendering a pure function of item + width and preserves
-    /// the message's original time across re-renders (e.g. a width change).
-    Message { role: Role, stamp: String, text: String },
+    /// A user or assistant message (plain text, wrapped to width).
+    Message { role: Role, text: String },
     /// A finished reasoning block, shown collapsed as a one-line summary.
     Thinking { chars: usize, seconds: f64 },
     /// A tool invocation: the tool name and a one-line argument summary.
@@ -119,40 +115,63 @@ pub enum Item {
     Output(String),
 }
 
-/// Render one transcript item to lines at `width`.
+/// A transcript item paired with the timestamp prefix captured when it was
+/// created (empty when timestamps are off). Pairing the stamp with the item —
+/// rather than storing it per-variant — keeps every transcript item (messages,
+/// tool calls, results, plans, thinking, notes, and command output) stamped
+/// consistently, mirroring the legacy renderer's `ui::stamp_block`.
+#[derive(Debug, Clone)]
+pub struct StampedItem {
+    pub stamp: String,
+    pub item: Item,
+}
+
+/// Render one stamped transcript item: its content at the reduced width, with
+/// the timestamp on the first row and continuation rows indented under it
+/// (mirroring the legacy `ui::stamp_block`). Every assembled row is bounded to
+/// `width` so an extremely narrow frame can't overflow and wrap natively. With
+/// timestamps off the stamp is empty, so this collapses to plain `render_item`.
+pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let stamp_w = visible_width(&si.stamp);
+    let inner = width.saturating_sub(stamp_w).max(1);
+    let pad = " ".repeat(stamp_w);
+    render_item(&si.item, inner)
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let row = if i == 0 {
+                format!("{}{line}", si.stamp)
+            } else {
+                format!("{pad}{line}")
+            };
+            fit(&row, width)
+        })
+        .collect()
+}
+
+/// Render one transcript item's content to lines at `width` (without its
+/// timestamp; see [`render_stamped`]).
 pub fn render_item(item: &Item, width: usize) -> Vec<String> {
     let width = width.max(1);
     match item {
-        Item::Message { role, stamp, text } => {
+        Item::Message { role, text } => {
             let prefix = match role {
                 Role::User => "› ",
                 Role::Assistant => "",
             };
-            // Reserve the timestamp column for every line (continuation rows are
-            // indented under it, mirroring the legacy `ui::stamp_block`) and the
-            // `› ` marker column for the first line, so no row overflows `width`.
-            let stamp_w = visible_width(stamp);
-            let inner = width
-                .saturating_sub(stamp_w + prefix.chars().count())
-                .max(1);
+            // Reserve the `› ` marker column for the first line so no row
+            // overflows `width`; continuation rows start at column 0.
+            let inner = width.saturating_sub(prefix.chars().count()).max(1);
             let body = wrap_block(text, inner);
-            let pad = " ".repeat(stamp_w);
             body.into_iter()
                 .enumerate()
                 .map(|(i, line)| {
-                    // The stamp + marker prefix and the continuation indent are
-                    // fixed-width; bound every assembled row so an extremely
-                    // narrow frame can't overflow and wrap natively.
-                    let row = if i == 0 {
-                        if prefix.is_empty() {
-                            format!("{stamp}{line}")
-                        } else {
-                            format!("{stamp}{DIM}{prefix}{RESET}{line}")
-                        }
+                    if i == 0 && !prefix.is_empty() {
+                        format!("{DIM}{prefix}{RESET}{line}")
                     } else {
-                        format!("{pad}{line}")
-                    };
-                    fit(&row, width)
+                        line
+                    }
                 })
                 .collect()
         }
@@ -267,10 +286,10 @@ fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
 }
 
 /// Every transcript item's lines, in order, at `width`.
-pub fn transcript_lines(items: &[Item], width: usize) -> Vec<String> {
+pub fn transcript_lines(items: &[StampedItem], width: usize) -> Vec<String> {
     items
         .iter()
-        .flat_map(|item| render_item(item, width))
+        .flat_map(|item| render_stamped(item, width))
         .collect()
 }
 
@@ -314,7 +333,12 @@ pub fn editor_lines(prompt: &str, text: &str, cursor: usize, width: usize) -> Ve
     lines[0] = format!("{BOLD}{prompt}{RESET}{}", lines[0]);
     lines
         .into_iter()
-        .map(|line| line.replace(MARK, "\x1b[7m \x1b[27m"))
+        // The prompt (which may carry a timestamp) is prepended after wrapping,
+        // so bound every assembled row to `width`: when the terminal is narrower
+        // than the prompt, the row would otherwise native-wrap and push the
+        // status bar off the last line. `fit` counts the cursor sentinel as one
+        // cell, so this preserves it whenever it fits.
+        .map(|line| fit(&line, width).replace(MARK, "\x1b[7m \x1b[27m"))
         .collect()
 }
 
@@ -399,7 +423,7 @@ fn visible_width(text: &str) -> usize {
 /// Truncate a (possibly ANSI-coloured) string to `width` terminal cells,
 /// appending an ellipsis and a reset when it overflows.
 fn fit(text: &str, width: usize) -> String {
-    let expanded = expand_tabs(text);
+    let expanded = sanitize(text);
     let text = expanded.as_str();
     if visible_width(text) <= width {
         return text.to_string();
@@ -442,32 +466,44 @@ fn wrap_block(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-/// Expand tab characters to spaces (8-column tab stops) so layout width
-/// accounting stays exact. A literal `\t` has no `UnicodeWidthChar` width but
-/// the terminal advances it to the next tab stop, so leaving tabs in place lets
-/// tool output, model text, or pasted input emit rows wider than `width` and
-/// push the editor/status bar out of position. ANSI escape sequences are copied
-/// through without advancing the column.
-fn expand_tabs(line: &str) -> String {
+/// Prepare a logical line for width-accurate, layout-safe composition: expand
+/// tabs to 8-column stops and strip terminal controls that could escape the
+/// frame. A literal `\t` has no `UnicodeWidthChar` width but the terminal
+/// advances it to the next tab stop, so leaving tabs in place lets tool output,
+/// model text, or pasted input emit rows wider than `width`. More dangerously,
+/// content can carry cursor-movement / erase CSI sequences, OSC strings, or
+/// stray C0 controls (carriage returns, backspaces, …) that move the cursor or
+/// clear content *outside* the intended row. Only SGR styling — a CSI sequence
+/// ending in `m` — is preserved; every other escape and control character is
+/// dropped so it can't violate the frame layout. The editor cursor sentinel
+/// (`CURSOR_MARK`) is kept (it is swapped for a reverse-video block after
+/// layout).
+fn sanitize(line: &str) -> String {
     const TAB: usize = 8;
-    if !line.contains('\t') {
-        return line.to_string();
-    }
     let mut out = String::new();
     let mut col = 0usize;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            out.push(c);
+            // Collect a CSI sequence and keep it only when it is SGR styling;
+            // cursor-movement / erase CSI, OSC, and other escapes are dropped.
             if chars.peek() == Some(&'[') {
-                out.push(chars.next().unwrap());
+                let mut seq = String::from(c);
+                seq.push(chars.next().unwrap()); // '['
+                let mut final_byte = None;
                 while let Some(&n) = chars.peek() {
-                    out.push(chars.next().unwrap());
+                    seq.push(chars.next().unwrap());
                     if ('@'..='~').contains(&n) {
+                        final_byte = Some(n);
                         break;
                     }
                 }
+                if final_byte == Some('m') {
+                    out.push_str(&seq);
+                }
             }
+            // A bare ESC or non-CSI escape is dropped; any trailing bytes are
+            // handled as ordinary characters on the next iterations.
             continue;
         }
         if c == '\t' {
@@ -476,6 +512,16 @@ fn expand_tabs(line: &str) -> String {
                 out.push(' ');
             }
             col += spaces;
+            continue;
+        }
+        if c == CURSOR_MARK {
+            out.push(c);
+            col += 1;
+            continue;
+        }
+        // Other C0/DEL/C1 controls have no cell width but move the cursor or
+        // erase, so they'd break the frame's exact column accounting: drop them.
+        if c.is_control() {
             continue;
         }
         out.push(c);
@@ -488,7 +534,7 @@ fn expand_tabs(line: &str) -> String {
 /// sequences (they take no columns) and breaking on spaces where possible.
 fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
-    let line = expand_tabs(line);
+    let line = sanitize(line);
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut vis = 0usize;
@@ -816,9 +862,28 @@ mod tests {
             }
         }
         // Tabs advance to 8-column stops from the current column.
-        assert_eq!(expand_tabs("a\tb"), "a       b");
-        assert_eq!(expand_tabs("\tx"), "        x");
-        assert_eq!(expand_tabs("no tabs"), "no tabs");
+        assert_eq!(sanitize("a\tb"), "a       b");
+        assert_eq!(sanitize("\tx"), "        x");
+        assert_eq!(sanitize("no tabs"), "no tabs");
+    }
+
+    #[test]
+    fn unsafe_terminal_controls_are_stripped_from_layout() {
+        // SGR styling is preserved, but cursor-movement / erase CSI sequences,
+        // OSC strings, and stray C0 controls (carriage returns, backspaces) are
+        // dropped so content can't move the cursor or clear rows outside itself.
+        assert_eq!(sanitize("\x1b[31mred\x1b[0m"), "\x1b[31mred\x1b[0m");
+        assert_eq!(sanitize("a\x1b[2Jb"), "ab"); // erase screen dropped
+        assert_eq!(sanitize("a\x1b[Hb"), "ab"); // cursor home dropped
+        assert_eq!(sanitize("a\rb"), "ab"); // carriage return dropped
+        assert_eq!(sanitize("a\x08b"), "ab"); // backspace dropped
+        assert_eq!(sanitize("a\x07b"), "ab"); // BEL dropped
+        // A malicious control sequence can't survive into a laid-out row.
+        for line in wrap_ansi("evil\x1b[2K\x1b[1;1Hclear", 40) {
+            assert!(!line.contains('\x1b') || !line.contains('H'));
+            assert!(!line.contains('\x1b') || !line.contains('K'));
+            assert!(!line.contains('\r'));
+        }
     }
 
     #[test]
@@ -826,13 +891,15 @@ mod tests {
         // A stamped message renders the timestamp on the first line, keeps every
         // row within the width, and indents continuation rows under the stamp.
         let stamp = format!("{DIM}12:34:56{RESET} ");
-        let item = Item::Message {
-            role: Role::User,
+        let item = StampedItem {
             stamp: stamp.clone(),
-            text: "a fairly long user question that wraps onto several rows".into(),
+            item: Item::Message {
+                role: Role::User,
+                text: "a fairly long user question that wraps onto several rows".into(),
+            },
         };
         for width in 4..40 {
-            let lines = render_item(&item, width);
+            let lines = render_stamped(&item, width);
             for line in &lines {
                 assert!(
                     visible_width(line) <= width,
@@ -841,11 +908,14 @@ mod tests {
                 );
             }
         }
-        let lines = render_item(&item, 30);
+        let lines = render_stamped(&item, 30);
         assert!(strip(&lines[0]).starts_with("12:34:56 › "), "{:?}", lines[0]);
         // With timestamps off (empty stamp) the first row keeps the bare marker.
-        let bare = Item::Message { role: Role::User, stamp: String::new(), text: "hi".into() };
-        assert_eq!(strip(&render_item(&bare, 30)[0]), "› hi");
+        let bare = StampedItem {
+            stamp: String::new(),
+            item: Item::Message { role: Role::User, text: "hi".into() },
+        };
+        assert_eq!(strip(&render_stamped(&bare, 30)[0]), "› hi");
     }
 
     #[test]
@@ -922,21 +992,32 @@ mod tests {
     #[test]
     fn renders_items_within_the_width() {
         let items = vec![
-            Item::Message {
-                role: Role::Assistant,
+            StampedItem {
+                stamp: format!("{DIM}12:34:56{RESET} "),
+                item: Item::Message {
+                    role: Role::Assistant,
+                    text: "a fairly long assistant answer that should wrap".into(),
+                },
+            },
+            StampedItem {
+                stamp: format!("{DIM}12:34:56{RESET} "),
+                item: Item::ToolCall {
+                    name: "bash".into(),
+                    summary: "ls -la /some/very/long/path/that/overflows".into(),
+                },
+            },
+            StampedItem {
+                stamp: format!("{DIM}12:34:56{RESET} "),
+                item: Item::ToolResult {
+                    ok: true,
+                    output: "line1\nline2\nline3".into(),
+                    verbose: false,
+                },
+            },
+            StampedItem {
                 stamp: String::new(),
-                text: "a fairly long assistant answer that should wrap".into(),
+                item: Item::Note("a note that is also rather long and needs wrapping".into()),
             },
-            Item::ToolCall {
-                name: "bash".into(),
-                summary: "ls -la /some/very/long/path/that/overflows".into(),
-            },
-            Item::ToolResult {
-                ok: true,
-                output: "line1\nline2\nline3".into(),
-                verbose: false,
-            },
-            Item::Note("a note that is also rather long and needs wrapping".into()),
         ];
         for line in transcript_lines(&items, 20) {
             assert!(
@@ -1086,11 +1167,16 @@ mod emulator {
     fn sample_frame(width: usize) -> Vec<String> {
         let transcript = transcript_lines(
             &[
-                Item::Message { role: Role::User, stamp: String::new(), text: "please summarise the plan".into() },
-                Item::Message {
-                    role: Role::Assistant,
+                StampedItem {
                     stamp: String::new(),
-                    text: "here is a fairly long answer that is meant to wrap onto more than one row when the terminal is narrow".into(),
+                    item: Item::Message { role: Role::User, text: "please summarise the plan".into() },
+                },
+                StampedItem {
+                    stamp: String::new(),
+                    item: Item::Message {
+                        role: Role::Assistant,
+                        text: "here is a fairly long answer that is meant to wrap onto more than one row when the terminal is narrow".into(),
+                    },
                 },
             ],
             width,

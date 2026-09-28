@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::AgentEvent;
-use crate::frame::{self, FrameRenderer, Item, Role};
+use crate::frame::{self, FrameRenderer, Item, Role, StampedItem};
 use crate::llm::ToolCall;
 use crate::plan::{Plan, PlanItem, Status};
 use crate::status::{self, StatusLine};
@@ -128,6 +128,14 @@ pub fn stamp() -> String {
     if TIMESTAMPS.load(Ordering::Relaxed) { format!("{DIM}{}{RESET} ", chrono::Local::now().format("%H:%M:%S")) } else { String::new() }
 }
 
+/// Pair a frame transcript item with the current timestamp, so every item
+/// (message, tool call/result, plan, thinking, note, output) is stamped
+/// consistently — matching the legacy renderer, where `ui::stamp()` prefixes
+/// every interactive item when `timestamps` is on (the default).
+fn stamped(item: Item) -> StampedItem {
+    StampedItem { stamp: stamp(), item }
+}
+
 const THINK: &str = "\x1b[38;5;245m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
@@ -183,7 +191,7 @@ pub struct Renderer {
 struct FrameState {
     out: FrameRenderer<io::Stdout>,
     /// The transcript, oldest first. A width change re-renders every item.
-    items: Vec<Item>,
+    items: Vec<StampedItem>,
     /// The current input editor `(line, cursor)`.
     editor: (String, usize),
     /// Messages queued while a turn is in flight, shown as an indicator row
@@ -278,10 +286,10 @@ impl Renderer {
         if let Some((text, started)) = fs.think.take() {
             let text = text.trim();
             if !text.is_empty() {
-                fs.items.push(Item::Thinking {
+                fs.items.push(stamped(Item::Thinking {
                     chars: text.chars().count(),
                     seconds: started.elapsed().as_secs_f64(),
-                });
+                }));
             }
         }
     }
@@ -301,7 +309,7 @@ impl Renderer {
                     Some((_, started)) => {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
-                            fs.items.push(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() });
+                            fs.items.push(stamped(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() }));
                         }
                     }
                     // No pending reasoning. If deltas streamed this turn, a
@@ -311,7 +319,7 @@ impl Renderer {
                     None if !fs.think_streamed => {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
-                            fs.items.push(Item::Thinking { chars, seconds: 0.0 });
+                            fs.items.push(stamped(Item::Thinking { chars, seconds: 0.0 }));
                         }
                     }
                     None => {}
@@ -334,41 +342,39 @@ impl Renderer {
                 if let Some((think, started)) = fs.think.take() {
                     let think = think.trim();
                     if !think.is_empty() {
-                        fs.items.push(Item::Thinking {
+                        fs.items.push(stamped(Item::Thinking {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
-                        });
+                        }));
                     }
                 }
                 match fs.stream {
                     Some(i) => {
-                        if let Some(Item::Message { text: existing, .. }) = fs.items.get_mut(i) {
+                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) = fs.items.get_mut(i) {
                             existing.push_str(text);
                         }
                     }
                     None => {
-                        fs.items.push(Item::Message {
+                        fs.items.push(stamped(Item::Message {
                             role: Role::Assistant,
-                            stamp: stamp(),
                             text: (*text).to_string(),
-                        });
+                        }));
                         fs.stream = Some(fs.items.len() - 1);
                     }
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 if fs.stream.is_none() && !text.is_empty() {
-                    fs.items.push(Item::Message {
+                    fs.items.push(stamped(Item::Message {
                         role: Role::Assistant,
-                        stamp: stamp(),
                         text: (*text).to_string(),
-                    });
+                    }));
                 }
                 self.frame_finish_stream(fs);
             }
             AgentEvent::Plan { plan } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(Item::Plan((*plan).clone()));
+                fs.items.push(stamped(Item::Plan((*plan).clone())));
             }
             // Mirror the legacy renderer's user-facing filtering: plan_add /
             // plan_update are shown as the Plan checklist (the `Plan` event),
@@ -380,11 +386,11 @@ impl Renderer {
             AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
             AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
                 let _ = call;
-                fs.items.push(Item::ToolResult {
+                fs.items.push(stamped(Item::ToolResult {
                     ok: false,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
-                });
+                }));
             }
             AgentEvent::ToolCall { call }
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose =>
@@ -410,27 +416,27 @@ impl Renderer {
                         }
                     }
                 };
-                fs.items.push(Item::Note(mark));
+                fs.items.push(stamped(Item::Note(mark)));
             }
             AgentEvent::ToolResult { call, ok: true, .. }
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(Item::ToolCall {
+                fs.items.push(stamped(Item::ToolCall {
                     name: call.name.clone(),
                     summary: tool_summary_text(call),
-                });
+                }));
             }
             AgentEvent::ToolResult { ok, output, .. } => {
-                fs.items.push(Item::ToolResult {
+                fs.items.push(stamped(Item::ToolResult {
                     ok: *ok,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
-                });
+                }));
             }
             AgentEvent::Compacted => {
                 self.frame_finish_stream(fs);
-                fs.items.push(Item::Note("⟳ context compacted".to_string()));
+                fs.items.push(stamped(Item::Note("⟳ context compacted".to_string())));
             }
             // Steer/queued messages absorbed mid-turn arrive as `UserMessage`
             // events; render them in the transcript. Replaying a resumed
@@ -440,7 +446,7 @@ impl Renderer {
             // so there is no double entry.)
             AgentEvent::UserMessage { text } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(Item::Message { role: Role::User, stamp: stamp(), text: (*text).to_string() });
+                fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
             }
             AgentEvent::Context => {}
         }
@@ -451,7 +457,7 @@ impl Renderer {
     pub fn frame_user_message(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            fs.items.push(Item::Message { role: Role::User, stamp: stamp(), text: text.to_string() });
+            fs.items.push(stamped(Item::Message { role: Role::User, text: text.to_string() }));
             self.frame_render(&mut fs);
         }
     }
@@ -462,7 +468,7 @@ impl Renderer {
     pub fn print_block(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            fs.items.push(Item::Output(text.to_string()));
+            fs.items.push(stamped(Item::Output(text.to_string())));
             self.frame_render(&mut fs);
             return;
         }
@@ -571,7 +577,7 @@ impl Renderer {
     pub fn note(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            fs.items.push(Item::Note(text.to_string()));
+            fs.items.push(stamped(Item::Note(text.to_string())));
             self.frame_render(&mut fs);
             return;
         }
@@ -587,7 +593,7 @@ impl Renderer {
     pub fn urgent_note(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            fs.items.push(Item::Note(text.to_string()));
+            fs.items.push(stamped(Item::Note(text.to_string())));
             self.frame_render(&mut fs);
             return;
         }
@@ -982,7 +988,7 @@ mod tests {
         }
 
         #[cfg(test)]
-        fn frame_items(&self) -> Vec<Item> {
+        fn frame_items(&self) -> Vec<StampedItem> {
             self.frame.as_ref().unwrap().lock().unwrap().items.clone()
         }
     }
@@ -999,8 +1005,8 @@ mod tests {
         r.event(&AgentEvent::Thinking { text: "pondering the plan" });
         r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
         let items = r.frame_items();
-        let thinking = items.iter().filter(|i| matches!(i, Item::Thinking { .. })).count();
-        let messages = items.iter().filter(|i| matches!(i, Item::Message { role: Role::Assistant, .. })).count();
+        let thinking = items.iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
+        let messages = items.iter().filter(|i| matches!(i.item, Item::Message { role: Role::Assistant, .. })).count();
         assert_eq!(thinking, 1, "reasoning summary duplicated: {items:?}");
         assert_eq!(messages, 1, "streamed answer duplicated: {items:?}");
     }
@@ -1010,7 +1016,7 @@ mod tests {
         let r = Renderer::frame_for_test();
         // No ThinkingDelta: a whole `Thinking` block must still show once.
         r.event(&AgentEvent::Thinking { text: "quick thought" });
-        let thinking = r.frame_items().iter().filter(|i| matches!(i, Item::Thinking { .. })).count();
+        let thinking = r.frame_items().iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
         assert_eq!(thinking, 1);
     }
 
@@ -1020,7 +1026,7 @@ mod tests {
         // Replaying a resumed session (and mid-turn steer messages) surface as
         // `UserMessage` events; they must land in the transcript.
         r.event(&AgentEvent::UserMessage { text: "resumed prompt" });
-        let user = r.frame_items().iter().filter(|i| matches!(i, Item::Message { role: Role::User, text, .. } if text == "resumed prompt")).count();
+        let user = r.frame_items().iter().filter(|i| matches!(&i.item, Item::Message { role: Role::User, text, .. } if text == "resumed prompt")).count();
         assert_eq!(user, 1);
     }
 
