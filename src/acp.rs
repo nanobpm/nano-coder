@@ -4,6 +4,8 @@ use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -372,16 +374,26 @@ fn write_line(msg: &Value) {
 
 /// Run the ACP protocol loop. Stdin is read concurrently with turns so that
 /// `session/cancel` and steering prompts reach a running turn.
-pub async fn run_acp(agent: &mut Agent) -> Result<()> {
+///
+/// Returns `true` if at least one valid JSON-RPC request was received on
+/// stdin. Returns `false` when stdin reached EOF without a single parseable
+/// request (e.g. the client isn't speaking ACP), so the caller can exit
+/// non-zero instead of masking a misconfiguration as success.
+pub async fn run_acp(agent: &mut Agent) -> Result<bool> {
     agent.set_event_sink(Box::new(|session_id, event| {
         if let Some(update) = update_for(event) {
             send_notification("session/update", json!({ "sessionId": session_id, "update": update }));
         }
     }));
 
+    // Set once any line parses into a valid JSON-RPC message.
+    let saw_valid = Arc::new(AtomicBool::new(false));
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let reader_saw_valid = Arc::clone(&saw_valid);
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut first_line = true;
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim();
             if line.is_empty() {
@@ -389,12 +401,23 @@ pub async fn run_acp(agent: &mut Agent) -> Result<()> {
             }
             match serde_json::from_str::<Value>(line) {
                 Ok(msg) => {
+                    reader_saw_valid.store(true, Ordering::Relaxed);
                     if tx.send(msg).is_err() {
                         break;
                     }
                 }
-                Err(e) => eprintln!("ACP parse error: {e}"),
+                Err(e) => {
+                    // A non-JSON first line usually means the client isn't
+                    // speaking ACP at all; say so plainly instead of only
+                    // surfacing a serde byte position.
+                    if first_line {
+                        eprintln!("input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): {e}");
+                    } else {
+                        eprintln!("ACP parse error: {e}");
+                    }
+                }
             }
+            first_line = false;
         }
     });
 
@@ -415,7 +438,7 @@ pub async fn run_acp(agent: &mut Agent) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(saw_valid.load(Ordering::Relaxed))
 }
 
 /// Run one prompt turn while routing concurrent messages: cancels and steers
