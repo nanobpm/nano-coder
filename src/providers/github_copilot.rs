@@ -58,8 +58,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 enum CopilotApi {
     /// OpenAI Chat Completions (`/chat/completions`) — the legacy default.
     Completions,
-    /// OpenAI Responses (`/responses`) — required by `gpt-*`, `grok-*`, and
-    /// other models Copilot only serves through the Responses endpoint.
+    /// OpenAI Responses (`/responses`) — required by GPT-5+ (`gpt-5`, `gpt-6`,
+    /// …), `grok-*`, and other models Copilot only serves through the Responses
+    /// endpoint. GPT-4.x and earlier route to Chat Completions instead.
     Responses,
     /// Anthropic Messages (`/v1/messages`) — used by Claude 4.x/5.x models.
     Messages,
@@ -78,8 +79,9 @@ impl CopilotApi {
 
 /// Route a Copilot model id to the upstream API it must be called through, using
 /// the same model-family rules as Pi's Copilot catalog
-/// (`/^claude-(haiku|sonnet|opus|fable)-[45]([.\-]|$)/` for Messages; `gpt-`,
-/// `grok-`, `oswe`, `mai-` prefixes for Responses).
+/// (`/^claude-(haiku|sonnet|opus|fable)-[45]([.\-]|$)/` for Messages; GPT-5+,
+/// `grok-`, `oswe`, `mai-` for Responses; GPT-4.x and earlier for Chat
+/// Completions).
 fn copilot_api_for_model(model_id: &str) -> CopilotApi {
     // Claude 4.x/5.x are served through the Anthropic Messages endpoint. Older
     // Claude (3.x) and everything else keep the legacy Chat Completions path.
