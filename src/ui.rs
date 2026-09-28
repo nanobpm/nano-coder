@@ -137,6 +137,13 @@ const RESET: &str = "\x1b[0m";
 const REDRAW_EVERY: Duration = Duration::from_millis(50);
 const PREVIEW_LINES: usize = 10;
 
+/// Wrap a status-bar redraw emitted after streamed output so the cursor does
+/// not visibly dart to the bottom row: hide the cursor, draw (the bar sequence
+/// saves and restores the cursor itself), then show it again.
+fn repaint_over_output(bar: &str) -> String {
+    format!("\x1b[?25l{bar}\x1b[?25h")
+}
+
 /// A reasoning block that is streaming in.
 struct ThinkBlock {
     text: String,
@@ -163,6 +170,10 @@ struct State {
     stream_pad: usize,
     /// Notes held back until the streamed line they would interrupt ends.
     deferred: Vec<String>,
+    /// When the status bar was last repainted after a streamed write, so the
+    /// per-write bar redraw can be coalesced to at most once per
+    /// [`REDRAW_EVERY`] and a burst of fragments does not flicker.
+    last_status_repaint: Option<Instant>,
 }
 
 pub struct Renderer {
@@ -187,8 +198,8 @@ impl Renderer {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }
 
-    /// Wipe the screen and scrollback for a fresh session, re-pinning the
-    /// status line's scroll region, and reset the renderer's line state.
+    /// Wipe the screen and scrollback for a fresh session, and reset the
+    /// renderer's line state.
     pub fn clear_screen(&self) {
         match &self.status {
             Some(status) => status.clear(),
@@ -212,7 +223,6 @@ impl Renderer {
         crate::status::with_term_lock(|| {
             let mut stdout = io::stdout().lock();
             let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
             let visible = strip_ansi(text);
             if let Some(last) = visible.chars().last() {
                 state.at_line_start = last == '\n';
@@ -220,8 +230,24 @@ impl Renderer {
             if state.at_line_start && !state.deferred.is_empty() && state.thinking.is_none() {
                 let notes: String = state.deferred.drain(..).map(|n| format!("{DIM}{n}{RESET}\n")).collect();
                 let _ = stdout.write_all(notes.as_bytes());
-                let _ = stdout.flush();
             }
+            // Keep the bottom row reserved for the status bar. With no scroll
+            // region to pin it, streamed/tool output scrolls the conversation
+            // up until it reaches the bar's row and paints over it, leaving it
+            // missing until a later `Context` redraw. Repaint the bar in the
+            // same locked write so it is never clobbered mid-turn, coalesced to
+            // at most once per `REDRAW_EVERY` so a burst of fragments does not
+            // flicker. The bar sequence saves and restores the cursor itself;
+            // `repaint_over_output` additionally hides it across the jump so it
+            // never visibly darts to the bottom row.
+            if let Some(status) = &self.status
+                && state.last_status_repaint.is_none_or(|t| t.elapsed() >= REDRAW_EVERY)
+                && let Some(seq) = status.draw_seq()
+            {
+                let _ = stdout.write_all(repaint_over_output(&seq).as_bytes());
+                state.last_status_repaint = Some(Instant::now());
+            }
+            let _ = stdout.flush();
         });
     }
 
@@ -646,5 +672,20 @@ mod tests {
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");
+    }
+
+    #[test]
+    fn repaint_over_output_hides_and_restores_the_cursor() {
+        // The status bar is repainted after streamed output so scrolling never
+        // leaves it clobbered; the redraw is wrapped in hide/show-cursor (on
+        // top of the bar sequence's own save/restore) so the cursor does not
+        // flicker to the bottom row and back.
+        let bar = "\x1b7\x1b[24;1H\x1b[2KBAR\x1b8";
+        let seq = repaint_over_output(bar);
+        assert_eq!(seq, format!("\x1b[?25l{bar}\x1b[?25h"));
+        assert!(seq.starts_with("\x1b[?25l"), "hides the cursor first: {seq:?}");
+        assert!(seq.ends_with("\x1b[?25h"), "shows the cursor last: {seq:?}");
+        // Never sets a DECSTBM scroll region (which ends in a literal 'r').
+        assert!(!seq.contains('r'), "no scroll region command: {seq:?}");
     }
 }

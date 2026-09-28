@@ -1,20 +1,28 @@
-//! A status line pinned to the bottom row of the terminal: model, context
+//! A status line drawn on the bottom row of the terminal: model, context
 //! use, session tokens and what the agent is doing.
 //!
-//! The rows above it are made a scroll region (DECSTBM), so ordinary output
-//! scrolls without disturbing the status line. The conversation is kept
-//! bottom-anchored (directly above the status line, blank rows at the top) so
-//! that shrinking the window drops blank rows rather than conversation.
+//! The status line is drawn by absolute-positioning to the bottom row (save
+//! the cursor, jump to the last row, draw, restore), *without* confining the
+//! conversation to a DECSTBM scroll region. Holding a scroll region would pin
+//! the status line, but Ghostty and iTerm2 deliberately do not reflow text
+//! inside a scroll-margin region on resize — so the whole conversation would
+//! keep its old line breaks. Leaving the region unset lets those terminals
+//! reflow the message history when the window is resized; the status line is
+//! simply redrawn at the (new) bottom row whenever output lands there.
+//!
+//! Because no scroll region pins the bar, the bottom row is instead kept free
+//! for it by reserving a row before output lands there (see
+//! [`reserve_bottom_row`], and the line editor's `redraw`, which scrolls the
+//! prompt block up so a wrapping prompt never reaches the reserved row).
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use crate::context::{Activity, ContextStats, SharedStats, format_rate, format_tokens};
 
 pub struct StatusLine {
     stats: SharedStats,
-    /// Terminal rows and columns the scroll region was set for.
+    /// Terminal rows and columns the status line was last drawn for.
     size: Mutex<Option<(u16, u16)>>,
     /// Text being typed during a turn, with the cursor's character index and
     /// the queued-message count, shown instead of the stats. Stored raw and
@@ -40,120 +48,14 @@ fn emit(bytes: &str) {
     let _ = out.flush();
 }
 
-/// A cursor position report (`ESC [ row ; col R`) the line reader forwarded,
-/// and whether one is being waited for. Reports arriving while nothing waits
-/// are ignored: a modified F3 key sends the same shape.
-static CURSOR_REPORT: (Mutex<(bool, Option<u16>)>, Condvar) = (Mutex::new((false, None)), Condvar::new());
-
-/// How long to wait for the terminal to answer a cursor position query.
-const CURSOR_REPORT_WAIT: Duration = Duration::from_millis(150);
-
-/// Called by the line reader when it parses a cursor position report.
-/// Returns whether the report was expected (and so consumed).
-pub fn cursor_reported(row: u16) -> bool {
-    let (lock, signal) = &CURSOR_REPORT;
-    let mut report = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if !report.0 {
-        return false;
-    }
-    report.1 = Some(row);
-    signal.notify_all();
-    true
-}
-
-/// Parse a cursor position report `ESC [ row ; col R` into `(row, col)`.
-fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
-    let start = bytes.windows(2).rposition(|w| w == b"\x1b[")? + 2;
-    let body = std::str::from_utf8(&bytes[start..]).ok()?.strip_suffix('R')?;
-    let (row, col) = body.split_once(';')?;
-    Some((row.parse().ok()?, col.parse().ok()?))
-}
-
-/// The row of a complete cursor position report, for the line reader.
-pub fn cursor_report_row(seq: &[u8]) -> Option<u16> {
-    parse_cursor_report(seq).map(|(row, _)| row)
-}
-
-/// Ask the terminal where the cursor is, reading the answer straight from
-/// stdin. Only for use before the line reader starts (it would otherwise
-/// race for the reply): echo and line buffering are turned off meanwhile so
-/// the reply is never printed.
-fn query_cursor_direct() -> Option<(u16, u16)> {
-    let mut original: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-        return None;
-    }
-    let mut raw = original;
-    // Disable ISIG too: with ECHO/ICANON off, a Ctrl-C mid-query would
-    // otherwise deliver SIGINT and terminate the process before termios is
-    // restored below, stranding the terminal in non-echo/non-canonical mode.
-    // Treat the interrupt byte as ordinary input for the brief query instead.
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-    raw.c_cc[libc::VMIN] = 0;
-    raw.c_cc[libc::VTIME] = 0;
-    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-        return None;
-    }
-    emit("\x1b[6n");
-    let deadline = std::time::Instant::now() + CURSOR_REPORT_WAIT * 2;
-    let mut reply = Vec::new();
-    while !reply.ends_with(b"R") {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-        if unsafe { libc::poll(&mut fd, 1, left.as_millis() as i32) } <= 0 {
-            break;
-        }
-        let mut byte = 0u8;
-        if unsafe { libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) } != 1 {
-            break;
-        }
-        reply.push(byte);
-    }
-    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original) };
-    parse_cursor_report(&reply)
-}
-
-/// Bytes that scroll the scroll region's content down `gap` rows and move
-/// the cursor down with it, so the conversation sits directly above the
-/// status line. Blank lines are inserted at the top of the region (IL at row
-/// 1, equivalent to SD but more widely emulated) and the region's bottom
-/// `gap` rows — blank, below the cursor — drop off.
-pub fn anchor_sequence(gap: u16) -> String {
-    if gap == 0 {
-        return String::new();
-    }
-    format!("\x1b7\x1b[1;1H\x1b[{gap}L\x1b8\x1b[{gap}B")
-}
-
-/// Bytes that pin the status row and bottom-anchor the conversation, given
-/// where the cursor is (`None`: unknown). With the conversation directly
-/// above the status line there are no blank rows between them, so when the
-/// window shrinks the terminal drops blank rows from the top instead of
-/// pushing the conversation up out of view: terminals only trim blank rows
-/// at the very bottom, and the status line's row is never blank.
-fn install_sequence(rows: u16, cursor: Option<(u16, u16)>) -> String {
-    let bottom = scroll_region_bottom(rows);
-    match cursor {
-        Some((row, col)) if row < bottom => {
-            format!("\x1b[1;{bottom}r\x1b[{row};{col}H{}", anchor_sequence(bottom - row))
-        }
-        // On (or below) the last region row, or unknown: make sure the cursor
-        // is above the bottom row, then confine scrolling.
-        _ => format!("\n\x1b[1A\x1b7\x1b[1;{bottom}r\x1b8"),
-    }
-}
-
 /// A process-wide lock serialising every write to the terminal. Escape
 /// sequences are emitted from more than one thread — the renderer and line
 /// editor on the main task, the status line from the SIGWINCH handler — and a
-/// multi-write logical unit (the region reset before a redraw, a streamed
-/// fragment and its deferred notes) must not interleave with another thread's
-/// sequence, or the cursor-save/restore and cursor-addressing tear and scatter
-/// output across the screen. `std::io::Stdout`'s own lock only makes a single
-/// `write_all` atomic; this lock spans a whole unit.
+/// multi-write logical unit (a streamed fragment and its deferred notes, a
+/// status redraw) must not interleave with another thread's sequence, or the
+/// cursor-save/restore and cursor-addressing tear and scatter output across
+/// the screen. `std::io::Stdout`'s own lock only makes a single `write_all`
+/// atomic; this lock spans a whole unit.
 static TERM_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run `f` while holding the terminal write lock. Callers that emit escape
@@ -164,76 +66,96 @@ pub fn with_term_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The last scrollable row: the terminal's bottom row is reserved for the
-/// status line, so the region is `1..=bottom-1`. Clamped to at least 1.
-fn scroll_region_bottom(rows: u16) -> u16 {
-    rows.max(2) - 1
+/// Bytes that draw `line` on the bottom row of a `rows`-row terminal and put
+/// the cursor back where it was. No scroll region is set, so the terminal
+/// stays free to reflow the conversation on resize. The cursor is saved and
+/// restored around the jump, so output continues uninterrupted.
+fn draw_sequence(line: &str, rows: u16) -> String {
+    format!("\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8")
 }
 
-/// Bytes that clean up after a resize to `rows`: save the cursor (it sits at
-/// the conversation end), drop the scroll region, erase from the cursor to the
-/// end of the display, re-pin the region for the new height and restore the
-/// cursor. A terminal's resize reflows the whole grid and can relocate a
-/// previously-drawn status bar to a mid-screen row the app never addresses;
-/// erasing below the conversation cursor wipes any such stranded bar while
-/// leaving the conversation above and the scrollback untouched. Runs
-/// unconditionally for both grow and shrink; it addresses no absolute row, so
-/// it is safe whether the terminal grew or shrank.
+/// Bytes that erase a stale status bar left at `old_rows` after a resize, or
+/// empty when there is nothing stale to clear. When the terminal grew
+/// (`old_rows < new_rows`) the old, absolutely positioned bar sits above the
+/// new bottom row and must be cleared before the bar is repainted lower down;
+/// when it shrank (or is unchanged) the old row is below the new bottom (or is
+/// the same row `draw` will clear anyway) so nothing need be erased. No scroll
+/// region is set, so the terminal stays free to reflow the conversation.
+fn resize_erase_sequence(old_rows: u16, new_rows: u16) -> String {
+    if old_rows < new_rows { format!("\x1b7\x1b[{old_rows};1H\x1b[2K\x1b8") } else { String::new() }
+}
+
+/// Bytes that reserve the terminal's bottom row for the status line by keeping
+/// whatever is written next one row higher.
 ///
-/// DECSTBM homes the cursor, so the cursor must be restored after resetting
-/// the region and before erasing — otherwise `ESC[J` erases from row 1 and
-/// wipes the whole visible conversation.
-fn resize_sequence(rows: u16) -> String {
-    format!("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
+/// With no DECSTBM scroll region to pin the bar, output and the prompt would
+/// otherwise land on the same bottom row the status line owns and paint over
+/// it. `\n` opens a blank row at the bottom — it scrolls the conversation up
+/// only when the cursor is already on the last row, otherwise it just steps
+/// down into an existing blank row — `\x1b[1A` steps the cursor back above that
+/// row, and `\r\x1b[2K` clears the row the caller is about to write. Emitting
+/// this before the prompt lands the prompt one row up and leaves the bottom row
+/// free for the status line, without holding a scroll region (so the terminal
+/// stays free to reflow the conversation on resize).
+pub fn reserve_bottom_row() -> &'static str {
+    "\n\x1b[1A\r\x1b[2K"
 }
 
 impl StatusLine {
-    /// Reserve the bottom row, when stdin and stdout are a terminal and
-    /// `AGENTIC_NO_STATUS` is unset.
+    /// Draw the status line on the bottom row, when stdin and stdout are a
+    /// terminal and `AGENTIC_NO_STATUS` is unset.
     pub fn install(stats: SharedStats) -> Option<Arc<Self>> {
         if !io::stdout().is_terminal() || !io::stdin().is_terminal() || std::env::var_os("AGENTIC_NO_STATUS").is_some() {
             return None;
         }
         let (rows, cols) = terminal_size().filter(|(rows, _)| *rows >= 5)?;
-        write_raw(&install_sequence(rows, query_cursor_direct()));
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            write_raw("\x1b7\x1b[r\x1b8");
-            previous(info);
-        }));
         let status = Arc::new(Self { stats, size: Mutex::new(Some((rows, cols))), input: Mutex::new(None) });
         status.draw();
         Some(status)
     }
 
-    pub fn draw(&self) {
-        // Target the real current terminal, never a stale cached size. A draw()
-        // triggered by a Context event, the renderer or lineedit before the
-        // SIGWINCH handler has run must not write the status line to a
-        // mid-screen row — that is what scatters copies across the screen on
-        // resize. When the size has changed, erase the old and new bottom rows
-        // and re-pin the scroll region first, so the stale bar left at the old
-        // bottom row is cleared even when the SIGWINCH resize() later no-ops.
-        let Some((rows, cols)) = terminal_size() else { return };
-        let mut size = self.size.lock().unwrap();
-        // When the size changed, prepend the resize cleanup so the whole draw —
-        // region reset, erase-below and the fresh bar — is emitted as one
-        // atomic write. Splitting it into separate writes lets output from
-        // another thread interleave between them and tear the escape sequences.
-        let prefix = match *size {
-            None => return, // torn down
-            Some((old_rows, old_cols)) if (old_rows, old_cols) != (rows, cols) => {
-                *size = Some((rows, cols));
-                resize_sequence(rows)
-            }
-            Some(_) => String::new(),
+    /// The bytes that redraw the status line at the current bottom row, or
+    /// `None` when torn down. The caller emits them, so it can fold the redraw
+    /// into a larger write it already holds the terminal lock for (the line
+    /// editor appends this after a prompt redraw, whose clear-to-end-of-screen
+    /// would otherwise wipe the bar). Updates the cached size as a side effect.
+    pub(crate) fn draw_seq(&self) -> Option<String> {
+        // Target the real current terminal, never a stale cached size, so a
+        // draw after a resize lands on the new bottom row. There is no scroll
+        // region to re-pin: the status line is just painted at the bottom row
+        // and the cursor restored, so the terminal stays free to reflow the
+        // conversation above it.
+        let (rows, cols) = terminal_size()?;
+        // Capture the previously drawn height and update the cache atomically,
+        // then fold the stale-bar cleanup into this same sequence. When the
+        // terminal grew, the bar last drawn at `old_rows` lingers above the new
+        // bottom row and must be erased before repainting lower down. Doing the
+        // erase here — the single place the cached size changes — means whichever
+        // caller *first* observes the grown terminal does it, whether that is a
+        // normal write/event or the SIGWINCH `resize()` handler. That closes the
+        // race where a write's `draw_seq()` bumped the cache to the new height
+        // before `resize()` ran, leaving `resize()` to see equal heights, skip
+        // the cleanup, and strand a duplicate bar.
+        let old_rows = {
+            let mut size = self.size.lock().unwrap();
+            let Some((old_rows, _)) = *size else {
+                return None; // torn down
+            };
+            *size = Some((rows, cols));
+            old_rows
         };
         let input = self.input.lock().unwrap().clone();
         let line = match input {
             Some((text, cursor, queued)) => render_input(&text, cursor, queued, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
-        write_raw(&format!("{prefix}\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
+        Some(format!("{}{}", resize_erase_sequence(old_rows, rows), draw_sequence(&line, rows)))
+    }
+
+    pub fn draw(&self) {
+        if let Some(seq) = self.draw_seq() {
+            write_raw(&seq);
+        }
     }
 
     /// Show `text` as a line being typed, with the cursor `cursor` characters
@@ -245,60 +167,22 @@ impl StatusLine {
         self.draw();
     }
 
-    /// Re-establish the region after the terminal was resized. `draw()` already
-    /// detects a size change and emits the region reset, erase-below and fresh
-    /// bar as one atomic write. Then re-anchor the conversation: a terminal
-    /// that grew with too little scrollback to pull back pads blank rows at the
-    /// bottom, opening a gap between the conversation and the status line.
-    /// Call only from the SIGWINCH handler, never from the line reader thread
-    /// (which must be free to read the cursor position reply).
+    /// Redraw after the terminal was resized. With no scroll region, the
+    /// terminal itself reflows the conversation; `draw` (via `draw_seq`) erases
+    /// any stale bar the resize left at the old bottom row before painting at
+    /// the new bottom. The cleanup lives in `draw_seq` — not here — so it also
+    /// fires when a write or event redraws first, after the terminal grew but
+    /// before this handler runs, rather than being lost to that race.
+    /// (Terminal-specific reflow of the old row makes the erase best-effort,
+    /// per the module note, but it removes the common duplicate-bar case
+    /// deterministically.)
     pub fn resize(&self) {
         self.draw();
-        self.anchor();
     }
 
-    /// Close any gap between the cursor and the status line by scrolling the
-    /// conversation down into it. Asks the terminal for the cursor row, which
-    /// only works while the line reader is in key mode (it forwards the reply;
-    /// outside key mode the reply would be echoed). The terminal lock is held
-    /// from the query to the scroll, so no output can move the cursor between
-    /// them. Gives up after a short wait if no reply is forwarded.
-    fn anchor(&self) {
-        if !crate::lineedit::key_mode_active() {
-            return;
-        }
-        let Some((rows, _)) = *self.size.lock().unwrap() else { return };
-        with_term_lock(|| {
-            let (lock, signal) = &CURSOR_REPORT;
-            let mut report = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *report = (true, None);
-            emit("\x1b[6n");
-            let (mut report, _) = signal
-                .wait_timeout_while(report, CURSOR_REPORT_WAIT, |r| r.1.is_none())
-                .unwrap_or_else(|e| e.into_inner());
-            let row = report.1.take();
-            report.0 = false;
-            drop(report);
-            if let Some(row) = row {
-                emit(&anchor_sequence(scroll_region_bottom(rows).saturating_sub(row)));
-            }
-        });
-    }
-
-    /// Clear the screen and scrollback for a fresh session, then re-establish
-    /// the scroll region and redraw. A naive clear would fight the DECSTBM
-    /// region, so it is reset and re-confined here.
+    /// Clear the screen and scrollback for a fresh session, then redraw.
     pub fn clear(&self) {
-        {
-            let size = self.size.lock().unwrap();
-            let Some((rows, _cols)) = *size else { return };
-            // Drop the region, home the cursor, wipe the screen + scrollback,
-            // re-confine scrolling to every row but the pinned bottom one, and
-            // start on the last region row so the new conversation is
-            // bottom-anchored like the first.
-            let bottom = scroll_region_bottom(rows);
-            write_raw(&format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{bottom}r\x1b[{bottom};1H"));
-        }
+        write_raw("\x1b[H\x1b[2J\x1b[3J");
         self.draw();
     }
 
@@ -306,7 +190,7 @@ impl StatusLine {
     pub fn teardown(&self) {
         let mut size = self.size.lock().unwrap();
         if let Some((rows, _)) = size.take() {
-            write_raw(&format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b[r\x1b8"));
+            write_raw(&format!("\x1b7\x1b[{rows};1H\x1b[2K\x1b8"));
         }
     }
 }
@@ -635,66 +519,58 @@ mod tests {
     }
 
     #[test]
-    fn resize_sequence_erases_below_cursor_and_repins() {
-        // On resize the cursor sits at the conversation end (draws save/restore
-        // it there). Reset the region, erase from the cursor to the end of the
-        // display so any bar the terminal's resize reflow relocated below the
-        // conversation is wiped, then re-pin for the new size. The conversation
-        // above the cursor and the scrollback are left untouched.
-        let seq = resize_sequence(40);
-        assert!(seq.starts_with("\x1b7"), "cursor not saved first: {seq:?}");
-        assert!(seq.contains("\x1b[r"), "region not reset to full screen: {seq:?}");
-        // DECSTBM homes the cursor: it must be restored before erasing, or the
-        // erase starts at row 1 and wipes the conversation.
-        assert!(seq.contains("\x1b[r\x1b8\x1b[J"), "erase not from the restored cursor: {seq:?}");
-        assert!(seq.ends_with("\x1b[1;39r\x1b8"), "region not re-pinned / cursor not restored: {seq:?}");
+    fn draw_sequence_paints_the_bottom_row_and_restores_the_cursor() {
+        // The status line is drawn by absolute-positioning to the bottom row,
+        // with the cursor saved and restored around the jump so output
+        // continues uninterrupted. No DECSTBM scroll region is set: that is
+        // what lets Ghostty/iTerm2 reflow the conversation on resize.
+        let seq = draw_sequence("STATUS", 24);
+        assert_eq!(seq, "\x1b7\x1b[24;1H\x1b[2KSTATUS\x1b8");
+        assert!(!seq.contains('r'), "no scroll region may be set: {seq:?}");
     }
 
     #[test]
-    fn resize_sequence_addresses_no_absolute_row() {
-        // Erase-below is cursor-relative, so the sequence must never move to an
-        // absolute row — a row addressed after a shrink could be off-screen,
-        // and one after a grow could clobber conversation content.
-        for rows in [40, 24, 70, 110, 2, 1] {
-            let seq = resize_sequence(rows);
-            assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
-        }
+    fn resize_erases_a_stale_bar_only_when_the_terminal_grew() {
+        // Grew: the old bar sits above the new bottom row and would linger as a
+        // duplicate, so its former row is cleared before the bar is repainted.
+        assert_eq!(resize_erase_sequence(24, 30), "\x1b7\x1b[24;1H\x1b[2K\x1b8");
+        // Shrank: the old row is below the new bottom and already gone.
+        assert_eq!(resize_erase_sequence(30, 24), "");
+        // Unchanged height: `draw` clears and repaints that row anyway.
+        assert_eq!(resize_erase_sequence(24, 24), "");
+        // No DECSTBM scroll region (which ends in a literal 'r') is set.
+        assert!(!resize_erase_sequence(24, 30).contains('r'), "no scroll region may be set");
     }
 
     #[test]
-    fn parses_cursor_position_reports() {
-        assert_eq!(parse_cursor_report(b"\x1b[12;5R"), Some((12, 5)));
-        assert_eq!(parse_cursor_report(b"typed\x1b[3;1R"), Some((3, 1)), "takes the report after typeahead");
-        assert_eq!(parse_cursor_report(b"\x1b[12;5"), None, "incomplete");
-        assert_eq!(parse_cursor_report(b"\x1b[A"), None, "an arrow key is not a report");
-        assert_eq!(cursor_report_row(b"\x1b[7;40R"), Some(7));
+    fn draw_seq_folds_the_stale_bar_cleanup_before_the_repaint() {
+        // `draw_seq` composes the erase and the repaint into one sequence (the
+        // erase lives with the size-changing draw, not in `resize`, so whichever
+        // caller first observes the grown terminal clears the stale bar and the
+        // resize race cannot strand it). When the terminal grew from 24 to 30
+        // rows the old row (24) must be erased *before* the bar is painted at
+        // the new bottom (30).
+        let seq = format!("{}{}", resize_erase_sequence(24, 30), draw_sequence("STATUS", 30));
+        let erase_at = seq.find("\x1b[24;1H\x1b[2K").expect("old row erased");
+        let draw_at = seq.find("\x1b[30;1H").expect("bar painted at the new bottom");
+        assert!(erase_at < draw_at, "stale bar must be erased before the repaint: {seq:?}");
+        // Unchanged/shrunk height folds in no erase, only the repaint.
+        assert_eq!(
+            format!("{}{}", resize_erase_sequence(24, 24), draw_sequence("STATUS", 24)),
+            draw_sequence("STATUS", 24)
+        );
     }
 
     #[test]
-    fn anchor_scrolls_the_region_down_and_follows_with_the_cursor() {
-        assert_eq!(anchor_sequence(0), "");
-        // Insert blank lines at the top of the region (pushing the
-        // conversation down), then move the restored cursor down with it.
-        assert_eq!(anchor_sequence(3), "\x1b7\x1b[1;1H\x1b[3L\x1b8\x1b[3B");
-    }
-
-    #[test]
-    fn install_bottom_anchors_the_conversation() {
-        // Cursor on row 8 of 24: pin rows 1..=23, put the cursor back and
-        // scroll the conversation down 15 rows so it sits on row 23.
-        assert_eq!(install_sequence(24, Some((8, 1))), format!("\x1b[1;23r\x1b[8;1H{}", anchor_sequence(15)));
-        // Already on the last region row, on the status row, or unknown: just
-        // keep the cursor off the bottom row and pin the region.
-        let plain = "\n\x1b[1A\x1b7\x1b[1;23r\x1b8";
-        assert_eq!(install_sequence(24, Some((23, 1))), plain);
-        assert_eq!(install_sequence(24, Some((24, 1))), plain);
-        assert_eq!(install_sequence(24, None), plain);
-    }
-
-    #[test]
-    fn scroll_region_never_underflows_on_tiny_terminals() {
-        assert_eq!(scroll_region_bottom(1), 1);
-        assert_eq!(scroll_region_bottom(2), 1);
-        assert_eq!(scroll_region_bottom(24), 23);
+    fn reserve_bottom_row_keeps_the_prompt_one_row_up() {
+        // A blank bottom row is opened with `\n` (which only scrolls the
+        // conversation up when the cursor is already on the last row), the
+        // cursor steps back above it, and the row it lands on is cleared — so
+        // the prompt written next sits one row above the status line and the
+        // bottom row is left free for the bar. No DECSTBM region (which ends in
+        // 'r') is set, so the terminal stays free to reflow on resize.
+        let seq = reserve_bottom_row();
+        assert_eq!(seq, "\n\x1b[1A\r\x1b[2K");
+        assert!(!seq.contains('r'), "no scroll region may be set: {seq:?}");
     }
 }
