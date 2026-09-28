@@ -1304,33 +1304,25 @@ async fn main() -> Result<()> {
         let mut exit_armed = false;
         let mut separate = false;
         while running {
+            if let Some(status) = &status {
+                status.draw();
+            }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
                     // Serialise the prompt write under the terminal lock so it
-                    // cannot interleave with a status-line redraw from the
-                    // SIGWINCH handler and tear the cursor save/restore.
+                    // cannot move the cursor mid-way through the SIGWINCH
+                    // anchor's query-to-scroll critical section (status::anchor).
                     crate::status::with_term_lock(|| {
                         let mut out = io::stdout().lock();
                         if separate {
                             let _ = out.write_all(b"\n");
                         }
-                        // Reserve the bottom row for the status line by keeping
-                        // the prompt one row up. With no scroll region pinning
-                        // the bar, the prompt would otherwise land on the same
-                        // bottom row and paint over it; the status is repainted
-                        // last (below) so the reserved row shows the bar.
-                        if status.is_some() {
-                            let _ = out.write_all(crate::status::reserve_bottom_row().as_bytes());
-                        }
                         let _ = out.write_all(prompt.as_bytes());
                         let _ = out.flush();
                     });
                     view.prompt_redrawn();
-                }
-                if let Some(status) = &status {
-                    status.draw();
                 }
             };
             prompt(&terminal, separate);
