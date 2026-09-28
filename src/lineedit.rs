@@ -7,7 +7,8 @@
 //! Home/End and Alt/Option word jumps move it, Ctrl-Enter (or Cmd-Enter,
 //! via modifyOtherKeys/kitty-style key reporting) inserts a newline, and a
 //! bracketed paste keeps its line breaks instead of sending line by line.
-//! With mouse tracking on, clicking inside the input moves the cursor there.
+//! The mouse is never captured, so the terminal keeps its native wheel
+//! scrolling and text selection.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -290,33 +291,6 @@ impl EditView {
         (row, col)
     }
 
-    /// The character index whose glyph is at (`row`, `col`) from the prompt's
-    /// row, clamped into the input. Used to place the cursor on a mouse click.
-    fn char_at_position(&self, cols: usize, row: usize, col: usize) -> usize {
-        let cols = cols.max(1);
-        let (mut r, mut c) = self.prompt_start(cols);
-        for (idx, ch) in self.line.chars().enumerate() {
-            // Apply the pending wrap before locating this glyph, as
-            // `cursor_position` does: the first glyph after a filled row
-            // renders at (row + 1, column 0), not at the pending (row, cols)
-            // slot, so a click on it must match there.
-            if ch != '\n' && c == cols {
-                r += 1;
-                c = 0;
-            }
-            if r == row && c == col {
-                return idx;
-            }
-            if ch == '\n' {
-                r += 1;
-                c = 0;
-            } else {
-                c += 1;
-            }
-        }
-        self.line.chars().count()
-    }
-
     /// Reprint the prompt and the whole input with the cursor where
     /// `self.cursor` is, clearing whatever an earlier redraw (or the menu)
     /// left below. Only meaningful at the prompt; on the status line the
@@ -525,30 +499,6 @@ impl EditView {
         self.move_to(i);
     }
 
-    /// A mouse press at column `x`, row `y` (1-based screen coordinates):
-    /// place the cursor on the glyph there when the press is inside the
-    /// input's rows. Presses on the menu below or above the prompt are
-    /// ignored.
-    fn mouse_press(&mut self, x: u16, y: u16) {
-        if self.mode != EditMode::Prompt {
-            return;
-        }
-        let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        let cols = (cols as usize).max(1);
-        let content = self.content_rows(cols);
-        // A status line reserves the bottom row, so the prompt is anchored one
-        // row higher; without that offset a click on the status row counts as
-        // input and a click on the real prompt row is rejected.
-        let reserved = if self.status.is_some() { 1 } else { 0 };
-        let top = (rows as usize).saturating_sub(content + self.menu_rows + reserved) + 1;
-        let (row, col) = (y as usize, (x as usize).saturating_sub(1));
-        if row < top || row >= top + content {
-            return;
-        }
-        let idx = self.char_at_position(cols, row - top, col);
-        self.move_to(idx);
-    }
-
     fn take(&mut self) -> String {
         if self.menu_visible() {
             let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some());
@@ -616,15 +566,6 @@ fn write(text: &str) {
     });
 }
 
-/// Scroll the terminal's scrollback back a few lines, standing in for the
-/// wheel-up handling the terminal would do itself if mouse tracking were
-/// off. `CSI ? S` (XTSMGRAPHICS scrollback scroll) is supported by iTerm2,
-/// kitty, alacritty and foot; terminals without it ignore the sequence.
-/// There is no matching scroll-forward, so wheel-down stays inert.
-fn scroll_up() {
-    write("\x1b[?3S");
-}
-
 /// What a key press produced.
 pub enum Key {
     Line(String),
@@ -669,17 +610,17 @@ pub fn restore_terminal() {
     // Only undo the key-mode escapes if they were ever sent; a piped/non-TTY
     // session never entered key mode, so writing them would corrupt stdout.
     if KEY_MODE_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
-        write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
+        write("\x1b[?2004l\x1b[<u\x1b[>4;0m");
     }
 }
 
 /// Key-by-key input while alive: no echo, no line buffering, and control
 /// keys (Ctrl-C, Ctrl-O, which macOS would use to discard output) delivered
 /// as bytes. Output processing is left on. While active, the terminal is
-/// asked for bracketed paste, SGR mouse presses and modifyOtherKeys/kitty
-/// key reporting (so Ctrl/Cmd-Enter is distinguishable from Enter). Mouse
-/// tracking is press-only (1000): drag/motion tracking (1002/1003) would
-/// swallow the terminal's native text selection for no benefit.
+/// asked for bracketed paste and modifyOtherKeys/kitty key reporting (so
+/// Ctrl/Cmd-Enter is distinguishable from Enter). Mouse tracking is
+/// deliberately not enabled, so the terminal keeps its native wheel
+/// scrolling and text selection.
 struct KeyMode;
 
 impl KeyMode {
@@ -694,7 +635,7 @@ impl KeyMode {
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         if entered {
             KEY_MODE_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
-            write("\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>4;1m\x1b[>1u");
+            write("\x1b[?2004h\x1b[>4;1m\x1b[>1u");
         }
         entered.then_some(Self)
     }
@@ -723,11 +664,8 @@ enum Esc {
     /// An unmodified Enter reported as an escape sequence (kitty keyboard
     /// protocol `CSI 13 u`): submit the line, like a bare CR would.
     Submit,
-    Mouse { x: u16, y: u16 },
-    /// Wheel-up: the terminal would scroll its scrollback, but mouse
-    /// tracking diverts the event to us, so we scroll it ourselves.
-    WheelUp,
-    /// Something else (function keys, releases, motion, unknown sequences).
+    /// Something else (function keys, releases, motion, mouse events, unknown
+    /// sequences).
     Ignored,
 }
 
@@ -902,8 +840,6 @@ impl LineReader {
                                     Esc::Delete => shared.lock().unwrap().delete(),
                                     Esc::Newline => shared.lock().unwrap().insert("\n"),
                                     Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
-                                    Esc::Mouse { x, y } => shared.lock().unwrap().mouse_press(x, y),
-                                    Esc::WheelUp => scroll_up(),
                                     Esc::Ignored => {}
                                 }
                             }
@@ -960,20 +896,9 @@ fn parse_escape(seq: &[u8]) -> Esc {
         return Esc::Ignored;
     };
     let body = std::str::from_utf8(body).unwrap_or("");
-    // SGR mouse: < button ; column ; row, M for press and m for release.
-    if let Some(sgr) = body.strip_prefix('<') {
-        let parts: Vec<&str> = sgr.split(';').collect();
-        if parts.len() == 3 && *final_byte == b'M' {
-            let button: u16 = parts[0].parse().unwrap_or(64);
-            let (x, y) = (parts[1].parse().unwrap_or(0), parts[2].parse().unwrap_or(0));
-            // Button 0-2 is a press; 64 is wheel-up, 65 wheel-down, 32+ motion.
-            if button < 3 {
-                return Esc::Mouse { x, y };
-            }
-            if button == 64 {
-                return Esc::WheelUp;
-            }
-        }
+    // SGR mouse reports (CSI < … M/m). The mouse is no longer captured, so
+    // any that still arrive (e.g. left over from another program) are ignored.
+    if body.starts_with('<') {
         return Esc::Ignored;
     }
     // Bracketed paste markers are handled by the caller before this.
@@ -1222,26 +1147,6 @@ mod tests {
     }
 
     #[test]
-    fn maps_a_clicked_position_to_a_character() {
-        let mut v = view("hello world");
-        v.prompt_width = 2;
-        // Row 0, column 5 (0-based) is the 4th character.
-        assert_eq!(v.char_at_position(80, 0, 5), 3);
-        // Past the end clamps to the end of the input.
-        assert_eq!(v.char_at_position(80, 0, 60), 11);
-        // A newline: row 1 column 0 is the character after it.
-        let mut v = view("ab\ncd");
-        v.prompt_width = 2;
-        assert_eq!(v.char_at_position(80, 1, 0), 3);
-        // The first glyph after a soft wrap: with cols=4 and a width-2 prompt,
-        // "abcdef" renders 'c' at row 1, column 0 (a click there must land on
-        // it, not fall through to the end of the buffer).
-        let mut v = view("abcdef");
-        v.prompt_width = 2;
-        assert_eq!(v.char_at_position(4, 1, 0), 2);
-    }
-
-    #[test]
     fn parses_cursor_and_function_keys() {
         assert!(matches!(parse_escape(b"\x1b[D"), Esc::Left));
         assert!(matches!(parse_escape(b"\x1b[C"), Esc::Right));
@@ -1289,14 +1194,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_sgr_mouse_presses() {
-        match parse_escape(b"\x1b[<0;10;5M") {
-            Esc::Mouse { x, y } => assert_eq!((x, y), (10, 5)),
-            other => panic!("expected a mouse press, got {other:?}"),
-        }
-        // Releases and wheel-down are ignored; wheel-up scrolls the scrollback.
+    fn ignores_sgr_mouse_reports() {
+        // The mouse is no longer captured; any SGR mouse report that still
+        // arrives (press, release or wheel) is parsed and safely ignored.
+        assert!(matches!(parse_escape(b"\x1b[<0;10;5M"), Esc::Ignored));
         assert!(matches!(parse_escape(b"\x1b[<0;10;5m"), Esc::Ignored));
-        assert!(matches!(parse_escape(b"\x1b[<64;10;5M"), Esc::WheelUp));
+        assert!(matches!(parse_escape(b"\x1b[<64;10;5M"), Esc::Ignored));
         assert!(matches!(parse_escape(b"\x1b[<65;10;5M"), Esc::Ignored));
     }
 
