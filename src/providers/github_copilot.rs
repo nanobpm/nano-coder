@@ -58,8 +58,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 enum CopilotApi {
     /// OpenAI Chat Completions (`/chat/completions`) — the legacy default.
     Completions,
-    /// OpenAI Responses (`/responses`) — required by `gpt-*`, `grok-*`, and
-    /// other models Copilot only serves through the Responses endpoint.
+    /// OpenAI Responses (`/responses`) — required by GPT-5+ (`gpt-5`, `gpt-6`,
+    /// …), `grok-*`, and other models Copilot only serves through the Responses
+    /// endpoint. GPT-4.x and earlier route to Chat Completions instead.
     Responses,
     /// Anthropic Messages (`/v1/messages`) — used by Claude 4.x/5.x models.
     Messages,
@@ -78,8 +79,9 @@ impl CopilotApi {
 
 /// Route a Copilot model id to the upstream API it must be called through, using
 /// the same model-family rules as Pi's Copilot catalog
-/// (`/^claude-(haiku|sonnet|opus|fable)-[45]([.\-]|$)/` for Messages; `gpt-`,
-/// `grok-`, `oswe`, `mai-` prefixes for Responses).
+/// (`/^claude-(haiku|sonnet|opus|fable)-[45]([.\-]|$)/` for Messages; GPT-5+,
+/// `grok-`, `oswe`, `mai-` for Responses; GPT-4.x and earlier for Chat
+/// Completions).
 fn copilot_api_for_model(model_id: &str) -> CopilotApi {
     // Claude 4.x/5.x are served through the Anthropic Messages endpoint. Older
     // Claude (3.x) and everything else keep the legacy Chat Completions path.
@@ -96,7 +98,12 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
     if is_claude_4_or_5 {
         return CopilotApi::Messages;
     }
-    // GPT, Grok, OSWE and MAI-Code are only served via the Responses endpoint.
+    // GPT before 5 (gpt-4.1, gpt-4o, gpt-3.5-turbo) is Chat Completions only:
+    // Copilot rejects it on /responses with `unsupported_api_for_model`.
+    if model_id.strip_prefix("gpt-").and_then(leading_major_version).is_some_and(|major| major < 5) {
+        return CopilotApi::Completions;
+    }
+    // Newer GPT, Grok, OSWE and MAI-Code are only served via the Responses endpoint.
     if ["gpt-", "grok-", "oswe", "mai-"].iter().any(|prefix| model_id.starts_with(prefix)) {
         return CopilotApi::Responses;
     }
@@ -107,8 +114,8 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
 /// replayed across tool calls and (2) rejects a non-default `temperature`.
 ///
 /// Reasoning models are the Responses-routed families — OpenAI GPT‑5 and newer,
-/// Grok, OSWE and MAI‑Code — with `gpt-4.x` (and earlier `gpt-*`) the one
-/// non-reasoning exception, since those still accept a custom `temperature`.
+/// Grok, OSWE and MAI‑Code. `gpt-4.x` and earlier are routed to Chat
+/// Completions and do not reason (they accept a custom `temperature`).
 /// Non-Responses models (older Claude, the o‑series, Gemini, …) are not treated
 /// as reasoning models here: the Responses path is the only one this catalog
 /// routes reasoning models through.
@@ -561,7 +568,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn client(base: &str) -> GithubCopilotClient {
-        client_model(base, "gpt-4.1")
+        client_model(base, "gpt-5-mini")
     }
 
     fn client_model(base: &str, model: &str) -> GithubCopilotClient {
@@ -592,7 +599,7 @@ mod tests {
         .to_string()
     }
 
-    // `gpt-4.1` routes to the Responses endpoint, so its non-streamed reply is an
+    // `gpt-5-mini` routes to the Responses endpoint, so its non-streamed reply is an
     // `output` list, not Chat Completions `choices`.
     const CHAT_OK: &str = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"status":"completed"}"#;
 
@@ -608,8 +615,15 @@ mod tests {
         // Older Claude and unrelated `claude-*` ids stay on Chat Completions.
         assert_eq!(copilot_api_for_model("claude-3.5-sonnet"), Completions);
         assert_eq!(copilot_api_for_model("claude-sonnet-42"), Completions);
-        // GPT, Grok, OSWE, MAI-Code → Responses.
-        assert_eq!(copilot_api_for_model("gpt-4.1"), Responses);
+        // GPT before 5 → Chat Completions (Copilot rejects it on /responses).
+        assert_eq!(copilot_api_for_model("gpt-4.1"), Completions);
+        assert_eq!(copilot_api_for_model("gpt-4o"), Completions);
+        assert_eq!(copilot_api_for_model("gpt-4o-mini"), Completions);
+        assert_eq!(copilot_api_for_model("gpt-3.5-turbo"), Completions);
+        // Newer GPT, Grok, OSWE, MAI-Code → Responses.
+        assert_eq!(copilot_api_for_model("gpt-5"), Responses);
+        assert_eq!(copilot_api_for_model("gpt-5-mini"), Responses);
+        assert_eq!(copilot_api_for_model("gpt-5.6"), Responses);
         assert_eq!(copilot_api_for_model("gpt-6-astra"), Responses);
         assert_eq!(copilot_api_for_model("grok-code-fast-1"), Responses);
         assert_eq!(copilot_api_for_model("oswe-preview"), Responses);
@@ -826,7 +840,7 @@ mod tests {
         assert!(first.contains("copilot-integration-id: vscode-chat"));
         assert!(first.contains("x-initiator: user"));
         assert!(api_log[1].headers.to_lowercase().contains("x-initiator: agent"));
-        assert_eq!(api_log[0].body["model"], "gpt-4.1");
+        assert_eq!(api_log[0].body["model"], "gpt-5-mini");
     }
 
     #[tokio::test]
@@ -870,7 +884,7 @@ mod tests {
         // `max_prompt_tokens` is Copilot's enforced prompt budget and wins over
         // `max_context_window_tokens` when both are present.
         let window = detect_window(json!({
-            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+            "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": {
                 "max_prompt_tokens": 111,
                 "max_context_window_tokens": 999,
             } } }]
@@ -882,7 +896,7 @@ mod tests {
 
         // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
         let window = detect_window(json!({
-            "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {
+            "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": {
                 "max_context_window_tokens": 222,
             } } }]
         }))
@@ -893,7 +907,7 @@ mod tests {
 
         // Neither field present: no detection rather than a bogus default.
         assert!(
-            detect_window(json!({ "data": [{ "id": "gpt-4.1", "capabilities": { "limits": {} } }] }))
+            detect_window(json!({ "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": {} } }] }))
                 .await
                 .is_none()
         );
@@ -901,7 +915,7 @@ mod tests {
         // A non-positive budget is ignored, not treated as a window.
         assert!(
             detect_window(json!({
-                "data": [{ "id": "gpt-4.1", "capabilities": { "limits": { "max_prompt_tokens": 0 } } }]
+                "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": { "max_prompt_tokens": 0 } } }]
             }))
             .await
             .is_none()
