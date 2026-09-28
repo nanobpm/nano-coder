@@ -253,12 +253,21 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                 return None
             return [dq or sq or bare for dq, sq, bare
                     in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', m.group(1))]
+        def first_key_segment(key_part):
+            # First dotted-key segment of a `key = value` assignment's key
+            # (quoted segments keep dots/spaces), or None when there is none.
+            toks = re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', key_part)
+            if not toks:
+                return None
+            dq, sq, bare = toks[0]
+            return dq or sq or bare
         def strip_extra_body(cfg_lines, provider):
             # Drop an existing extra_body for `provider` (an inline
-            # `extra_body = {...}` under `[providers.<p>]`, or a
+            # `extra_body = {...}` or dotted `extra_body.<field> = ...`
+            # assignment under `[providers.<p>]`, or a
             # `[providers.<p>.extra_body]` sub-table and any of its own
             # sub-tables) so the merged table we emit is the only one — two
-            # tables for the same key would be invalid TOML.
+            # declarations of the same key would be invalid TOML.
             target = ["providers", provider, "extra_body"]
             kept, cur, dropping = [], [], False
             for line in cfg_lines:
@@ -270,7 +279,8 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                     continue
                 if dropping:
                     continue
-                if cur == ["providers", provider] and line.split("=", 1)[0].strip() == "extra_body":
+                if cur == ["providers", provider] and "=" in line \
+                        and first_key_segment(line.split("=", 1)[0]) == "extra_body":
                     continue
                 kept.append(line)
             return kept
