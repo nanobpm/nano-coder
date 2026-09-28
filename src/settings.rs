@@ -119,7 +119,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             }
             4 => {
                 let value: usize = Input::new()
-                    .with_prompt("Turn cap in LLM calls per input (0 = unbounded; normal mode asks before stopping, auto ignores it)")
+                    .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
                     .interact_text()?;
                 agent.config_mut().max_iterations = value;
