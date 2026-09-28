@@ -294,7 +294,14 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                 # emitting a duplicate. Match a bare or quoted provider header.
                 text = "\n".join(lines)
                 prov_pat = rf"(?:{re.escape(provider)}|{re.escape(json.dumps(provider))})"
-                if re.search(rf"(?m)^\[providers\.{prov_pat}\.extra_body\]", text) or re.search(rf"(?ms)^\[providers\.{prov_pat}\](?:(?!^\[).)*?^extra_body", text):
+                # Recognize the same indented/quoted/dotted forms strip_extra_body
+                # handles: an existing `[providers.<p>.extra_body]` sub-table, or an
+                # `extra_body`/`extra_body.<field>` key (bare or quoted, optionally
+                # indented) under `[providers.<p>]`. `[.=]` after the key name avoids
+                # matching unrelated keys such as `extra_body_extra`.
+                eb_key = r"[ \t]*(?:extra_body|\"extra_body\"|'extra_body')[ \t]*[.=]"
+                if re.search(rf"(?m)^[ \t]*\[providers\.{prov_pat}\.extra_body\]", text) \
+                        or re.search(rf"(?ms)^[ \t]*\[providers\.{prov_pat}\](?:(?!^[ \t]*\[).)*?^{eb_key}", text):
                     print(f"warning: providers.{provider} already sets extra_body and no TOML parser is "
                           f"available to merge it; --extra-body ignored for it", file=sys.stderr)
                     continue
