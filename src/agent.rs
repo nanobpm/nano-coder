@@ -926,7 +926,7 @@ impl Agent {
         // The history tools follow the compaction: a smart summary offers them,
         // any other replacement (standard compaction or a plain rebuild) drops
         // them. Track it explicitly so message text cannot spoof the state.
-        self.history_available = matches!(compaction, Some((_, CompactionMode::Smart)));
+        let history_available = matches!(compaction, Some((_, CompactionMode::Smart)));
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
@@ -940,6 +940,9 @@ impl Agent {
                 recorded_at: now,
             })?;
         }
+        // Flip the flag only once the durable replace record is appended, so a
+        // failed replacement leaves the active history state unchanged.
+        self.history_available = history_available;
         self.conversation = messages;
         self.pending_input = match (self.pending_input.take(), pending_position) {
             (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
