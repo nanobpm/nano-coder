@@ -161,7 +161,11 @@ def extra_body_arg(text):
 
     The merge path treats the value as a TOML table (it calls `.items()` on
     it), so a bare JSON array, string, or number would raise an
-    ``AttributeError`` deep in a worker rather than reporting bad CLI input."""
+    ``AttributeError`` deep in a worker rather than reporting bad CLI input.
+
+    A nested JSON ``null`` is also rejected here: TOML cannot represent it, and
+    `config_text` runs inside a worker, so leaving it to fail there would abort
+    the whole evaluation with a `SystemExit` instead of a clean CLI error."""
     try:
         value = json.loads(text)
     except json.JSONDecodeError as e:
@@ -170,6 +174,21 @@ def extra_body_arg(text):
         raise argparse.ArgumentTypeError(
             f"must be a JSON object (e.g. '{{\"chat_template_kwargs\": {{...}}}}'), "
             f"not a JSON {type(value).__name__}")
+
+    def reject_null(node, path):
+        if node is None:
+            where = "".join(path) or "the top level"
+            raise argparse.ArgumentTypeError(
+                f"contains a JSON null at {where}, which TOML cannot represent; "
+                f"remove the null field or give it a real value")
+        if isinstance(node, dict):
+            for k, v in node.items():
+                reject_null(v, path + [f".{k}"])
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                reject_null(v, path + [f"[{i}]"])
+
+    reject_null(value, [])
     return value
 
 
@@ -272,9 +291,10 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                 merged = extra_body
             else:
                 prov_conf = base_providers.get(provider)
+                has_extra_body = isinstance(prov_conf, dict) and "extra_body" in prov_conf
                 existing = prov_conf.get("extra_body") if isinstance(prov_conf, dict) else None
                 existing = existing if isinstance(existing, dict) else {}
-                if existing:
+                if has_extra_body:
                     lines = strip_extra_body(lines, provider)
                 merged = deep_merge(existing, extra_body)
             tail.append(f"[providers.{key}.extra_body]")
