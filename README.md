@@ -22,7 +22,7 @@ cargo install nano-coder             # or build from source
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
-- **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
+- **Status line** on the bottom row of the terminal (redrawn as output scrolls, so history reflows on resize), plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
 - **Project instructions**: `AGENTS.md` (or `CLAUDE.md`, `.github/copilot-instructions.md`) from the repository is added to the system prompt
 - **Safety**: built-in guards block destructive commands (`rm -rf /`, `DROP DATABASE`, force-pushing `main`, ...), user allow/deny rules, and an optional OS sandbox (Seatbelt on macOS, Landlock on Linux)
@@ -530,10 +530,10 @@ In an interactive terminal the bottom row shows the provider/model, context usag
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a terminal
-scroll region, follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
-directly above the status line (empty space collects at the top), so shrinking the window
-drops empty rows rather than pushing the conversation out of view.
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It is drawn on the
+bottom row and redrawn as output scrolls, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set.
+Because it does not confine the conversation to a terminal scroll region, the message history
+reflows when the window is resized (in terminals that reflow, such as Ghostty and iTerm2).
 
 The context window comes from, in order: `context_window` in the config, `context_window`
 on the provider, the window the endpoint reports, a built-in table of known models, then

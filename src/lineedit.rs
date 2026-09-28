@@ -202,13 +202,12 @@ impl EditView {
         self.draw_menu();
     }
 
-    /// The terminal was resized: the old menu rows may no longer fit under the
-    /// new scroll region, so blank the rows we reserved and redraw the menu
-    /// sized to the new terminal. Call after the status line re-establishes the
-    /// scroll region for the new size.
+    /// The terminal was resized: the old menu rows may no longer fit, so
+    /// blank the rows we reserved and redraw the menu sized to the new
+    /// terminal. Called after the status line redraws for the new size.
     pub fn resize(&mut self) {
-        // With a status line, its resize erased everything below the cursor
-        // (the menu included) and re-anchored the prompt, so only redraw.
+        // With a status line the conversation reflows on its own (no scroll
+        // region), so only the menu rows need tidying before the redraw.
         if self.menu_rows > 0 && self.status.is_none() {
             let (seq, _) = menu_sequence(self.menu_rows, &[], false);
             write(&seq);
@@ -267,18 +266,21 @@ impl EditView {
 /// Terminal output that shows `lines` below the cursor's row (which holds
 /// the prompt), given that `old_rows` rows are already in use there, and
 /// the number of rows in use afterwards. The cursor ends where it started.
-/// Rows are reserved with IND (ESC D), which scrolls at the bottom of the
-/// scroll region and keeps the column; the status line below the region is
-/// never touched. With `anchor` (a status line is pinned), rows the menu gives
-/// up are closed by scrolling the conversation back down, so the prompt stays
-/// directly above the status line.
-fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, usize) {
+///
+/// New rows are reserved with `\n`: at the bottom of the screen that scrolls
+/// the conversation up one row per reserved row, opening blank rows under the
+/// prompt. (The old design reserved rows with IND, which only scrolls inside
+/// a DECSTBM scroll region; there is no region any more, so that the terminal
+/// can reflow the conversation on resize.) The cursor save/restore around the
+/// draw leaves the prompt's cursor exactly where it was.
+fn menu_sequence(old_rows: usize, lines: &[String], _anchor: bool) -> (String, usize) {
     if old_rows == 0 && lines.is_empty() {
         return (String::new(), 0);
     }
     let mut seq = String::new();
     if lines.len() > old_rows {
-        seq.push_str(&"\x1bD".repeat(lines.len()));
+        // Open `lines.len()` rows below the prompt, then return to it.
+        seq.push_str(&"\n".repeat(lines.len()));
         seq.push_str(&format!("\x1b[{}A", lines.len()));
     }
     let rows = old_rows.max(lines.len());
@@ -290,11 +292,6 @@ fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, us
         }
     }
     seq.push_str("\x1b8");
-    if anchor && lines.len() < old_rows {
-        // The released rows scrolled away, so only the drawn lines remain.
-        seq.push_str(&crate::status::anchor_sequence((old_rows - lines.len()) as u16));
-        return (seq, lines.len());
-    }
     (seq, if lines.is_empty() { 0 } else { rows })
 }
 
@@ -335,14 +332,6 @@ const ESCAPE_SEQUENCE_WAIT_MS: i32 = 30;
 
 static ORIGINAL: OnceLock<libc::termios> = OnceLock::new();
 
-/// Whether a line reader is in key mode (no echo) and so will read — and
-/// forward — a cursor position report the terminal sends back.
-static KEY_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn key_mode_active() -> bool {
-    KEY_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 fn get_termios() -> Option<libc::termios> {
     let mut termios: libc::termios = unsafe { std::mem::zeroed() };
     (unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut termios) } == 0).then_some(termios)
@@ -369,14 +358,12 @@ impl KeyMode {
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         let entered = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0;
-        KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         entered.then_some(Self)
     }
 }
 
 impl Drop for KeyMode {
     fn drop(&mut self) {
-        KEY_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
         restore_terminal();
     }
 }
@@ -532,13 +519,11 @@ impl LineReader {
                                     break;
                                 }
                             }
-                            // Shift+Tab is ESC [ Z (backtab); everything else is
-                            // skipped, with a cursor position report forwarded to
-                            // the status line when it is waiting for one.
+                            // Shift+Tab is ESC [ Z (backtab); everything else
+                            // (arrow keys, cursor position reports, ...) is
+                            // skipped.
                             if seq == [0x1b, b'[', b'Z'] {
                                 send(Key::CycleMode);
-                            } else if let Some(row) = crate::status::cursor_report_row(&seq) {
-                                crate::status::cursor_reported(row);
                             }
                         }
                         None if menu => shared.lock().unwrap().hide_menu(),
@@ -596,7 +581,9 @@ mod tests {
         let lines = vec!["a".to_string(), "b".to_string()];
         let (seq, rows) = menu_sequence(0, &lines, false);
         assert_eq!(rows, 2);
-        assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
+        // Rows are opened with `\n` (scrolling the conversation up at the
+        // bottom of the screen) and the cursor returns to the prompt.
+        assert_eq!(seq, "\n\n\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
         // Narrowing reuses the rows and blanks the extra one.
         let (seq, rows) = menu_sequence(2, &lines[..1], false);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
@@ -606,19 +593,18 @@ mod tests {
     }
 
     #[test]
-    fn anchored_menu_scrolls_released_rows_back_down() {
+    fn menu_sequence_sets_no_scroll_region() {
+        // A DECSTBM region would confine the terminal's resize reflow; the
+        // menu must never set one, whatever the size change.
         let lines = vec!["a".to_string(), "b".to_string()];
-        // Opening is the same as unanchored: rows are reserved with IND.
-        assert_eq!(menu_sequence(0, &lines, true), menu_sequence(0, &lines, false));
-        // Narrowing blanks the extra row, then scrolls the conversation down
-        // one row into it so the prompt stays above the status line.
-        let (seq, rows) = menu_sequence(2, &lines[..1], true);
-        assert_eq!(rows, 1);
-        assert!(seq.ends_with(&format!("\x1b8{}", crate::status::anchor_sequence(1))), "{seq:?}");
-        // Closing scrolls down by every row the menu used.
-        let (seq, rows) = menu_sequence(2, &[], true);
-        assert_eq!(rows, 0);
-        assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
+        for (seq, _) in [
+            menu_sequence(0, &lines, true),
+            menu_sequence(2, &lines[..1], true),
+            menu_sequence(2, &[], true),
+            menu_sequence(0, &lines, false),
+        ] {
+            assert!(!seq.contains("\x1b[1;"), "no region may be set: {seq:?}");
+        }
     }
 
     #[test]

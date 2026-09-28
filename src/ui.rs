@@ -187,8 +187,8 @@ impl Renderer {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }
 
-    /// Wipe the screen and scrollback for a fresh session, re-pinning the
-    /// status line's scroll region, and reset the renderer's line state.
+    /// Wipe the screen and scrollback for a fresh session, and reset the
+    /// renderer's line state.
     pub fn clear_screen(&self) {
         match &self.status {
             Some(status) => status.clear(),
