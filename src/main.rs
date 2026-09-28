@@ -1086,7 +1086,35 @@ struct Args {
     deny: Vec<String>,
 }
 
+fn print_version() {
+    println!("nano-coder {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn print_help() {
+    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
+    println!("                  [--verbosity quiet|normal|verbose|debug]");
+    println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("       nano-coder --login github-copilot");
+    println!("       nano-coder --list-models PROVIDER[/model]");
+    println!("       nano-coder --version");
+}
+
 fn parse_args() -> Result<Args> {
+    // Handle early-exit flags before the value-consuming loop so a preceding
+    // value-taking option (e.g. `--model --version`) can't swallow them.
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
     let mut args = Args {
         acp: false,
         login: None,
@@ -1118,16 +1146,11 @@ fn parse_args() -> Result<Args> {
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
             "-V" | "--version" => {
-                println!("nano-coder {}", env!("CARGO_PKG_VERSION"));
+                print_version();
                 std::process::exit(0);
             }
             "-h" | "--help" => {
-                println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
-                println!("                  [--verbosity quiet|normal|verbose|debug]");
-                println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
-                println!("       nano-coder --login github-copilot");
-                println!("       nano-coder --list-models PROVIDER[/model]");
-                println!("       nano-coder --version");
+                print_help();
                 std::process::exit(0);
             }
             other => anyhow::bail!("unknown argument {other:?} (see --help)"),
