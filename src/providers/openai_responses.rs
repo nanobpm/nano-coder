@@ -657,7 +657,7 @@ mod tests {
         // Responses endpoint does not reject the request before generating.
         let body = build_body(&copilot_transport("gpt-6-astra"), &request(0.7));
         assert!(body.get("temperature").is_none(), "reasoning model kept temperature: {body}");
-        // gpt-4.1 routes through Responses but accepts a custom temperature.
+        // A non-reasoning model (gpt-4.1) keeps a custom temperature.
         let body = build_body(&copilot_transport("gpt-4.1"), &request(0.7));
         assert_eq!(body["temperature"], 0.7);
     }
