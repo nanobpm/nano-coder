@@ -181,13 +181,7 @@ impl EditView {
             crate::commands::complete_line(&context.config, &recents, &self.line)
         };
         match completed {
-            Some(done) => {
-                // The completion rewrites the whole command line, so move the
-                // cursor to the end before applying it; replacing at a mid-line
-                // cursor would corrupt the command.
-                self.cursor = self.line.chars().count();
-                self.replace_line(&done);
-            }
+            Some(done) => self.replace_line(&done),
             // Restore the documented space fallback for a slash line past its
             // command name (e.g. `/compact focus`, `/model value extra`) that
             // has no completion, while keeping Tab a no-op for a bare ambiguous
@@ -210,8 +204,12 @@ impl EditView {
     fn replace_line(&mut self, line: &str) {
         let shared = self.line.chars().zip(line.chars()).take_while(|(a, b)| a == b).count();
         let extra = self.line.chars().count().saturating_sub(shared);
-        if extra > 0 {
-            self.erase(extra);
+        // A completion rewrites the whole command line, so work from the end
+        // regardless of where the cursor sits; deleting/inserting at a mid-line
+        // cursor would corrupt the command.
+        self.cursor = self.line.chars().count();
+        for _ in 0..extra {
+            self.backspace();
         }
         let tail: String = line.chars().skip(shared).collect();
         if !tail.is_empty() {
@@ -1051,10 +1049,6 @@ fn read_paste(reader: &mut LineReader) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_view() -> SharedView {
-        EditView::shared(None, Arc::new(Mutex::new(EditContext::default())))
-    }
 
     /// A standalone view holding `line`, with no status line and drawing
     /// disabled (no terminal in tests).
