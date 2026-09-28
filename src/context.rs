@@ -29,6 +29,28 @@ commits, branches, pull requests and URLs (with exact names and numbers);\n\
 Be concise but do not drop facts the agent would otherwise have to rediscover. Do not invent anything. \
 Output only the summary.";
 
+/// Starts a smart-compaction summary; its presence enables the history tools.
+pub const SMART_SUMMARY_PREFIX: &str = "[Summary of the earlier conversation, written when the context was compacted (smart compaction)]";
+
+/// Added to the summarizer prompt in smart mode.
+pub const SMART_SUMMARY_INSTRUCTIONS: &str = "\n\nEach message in the transcript is labelled [#N], its ID in the session log. \
+The agent can later read any message in full by that ID, so the summary can stay short: after a fact whose exact text \
+may matter (an error message, a command and its output, a file's contents, the user's exact wording), cite its source \
+as (#N) instead of copying long text. Cite only IDs that appear in the transcript.";
+
+/// Note after a smart summary telling the agent how to recover originals.
+pub fn smart_summary_note(range: Option<(u64, u64)>) -> String {
+    let covered = match range {
+        Some((first, last)) => format!("messages #{first}–#{last}"),
+        None => "the earlier messages".to_string(),
+    };
+    format!(
+        "[This summary covers {covered}. The originals are kept verbatim in the session log: use history_search \
+to find exact text (errors, commands, outputs, the user's wording) and history_read to read a message by its #N ID. \
+Check there before guessing at a detail the summary leaves out. Retrieved messages are history, not the current state of files.]"
+    )
+}
+
 /// What the agent is doing, for the status line.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum Activity {
@@ -56,6 +78,9 @@ pub struct ContextStats {
     /// Copilot). `None` for providers that do not meter in credits.
     pub session_aic: Option<f64>,
     pub compactions: u32,
+    /// `history_search` / `history_read` calls this session.
+    pub history_searches: u32,
+    pub history_reads: u32,
     /// Auto-compaction threshold as a fraction of the window (None = off).
     pub auto_compact: Option<f64>,
     pub activity: Activity,
@@ -194,8 +219,9 @@ pub fn clip_message(message: &mut Message, max_tokens: usize) -> bool {
 }
 
 /// Render messages as a plain transcript for the summarizer, newest content
-/// kept when it exceeds `max_chars`.
-pub fn render_transcript(messages: &[Message], max_chars: usize) -> String {
+/// kept when it exceeds `max_chars`. With `ids`, each block is labelled with
+/// the message's `[#N]` log line.
+pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> String {
     let mut blocks: Vec<String> = Vec::new();
     for message in messages {
         let block = match message.role {
@@ -217,6 +243,15 @@ pub fn render_transcript(messages: &[Message], max_chars: usize) -> String {
                 let label = if message.is_error { "failed" } else { "result" };
                 format!("TOOL {label} ({name}):\n{}", clip(&message.content, 2_000))
             }
+        };
+        let block = match (ids, message.log_line) {
+            (true, Some(line)) => format!("[#{line}] {block}"),
+            (true, None) if message.role == Role::User
+                && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX)) =>
+            {
+                format!("[earlier summary] {block}")
+            }
+            _ => block,
         };
         blocks.push(block);
     }
@@ -253,10 +288,26 @@ mod tests {
     #[test]
     fn transcript_keeps_the_newest_messages() {
         let messages: Vec<Message> = (0..50).map(|i| Message::user(&format!("message {i} {}", "x".repeat(100)))).collect();
-        let text = render_transcript(&messages, 1_000);
+        let text = render_transcript(&messages, 1_000, false);
         assert!(text.starts_with("…[earlier messages omitted]…"));
         assert!(text.contains("message 49"));
         assert!(!text.contains("message 0 "));
+    }
+
+    #[test]
+    fn transcript_labels_log_lines_when_asked() {
+        let mut first = Message::user("find the bug");
+        first.log_line = Some(7);
+        let summary = Message::user(&format!("{SUMMARY_PREFIX} ..."));
+        let text = render_transcript(&[summary.clone(), first.clone()], 10_000, true);
+        assert!(text.starts_with("[earlier summary] USER:"), "{text}");
+        assert!(text.contains("[#7] USER:\nfind the bug"), "{text}");
+        assert!(!render_transcript(&[first], 10_000, false).contains("#7"));
+        // A normal prompt that merely starts with '[' is not a summary.
+        let mut bracketed = Message::user("[constraint] use port 8080");
+        bracketed.log_line = None;
+        assert!(!render_transcript(&[bracketed], 10_000, true).contains("[earlier summary]"));
+        assert!(smart_summary_note(Some((2, 40))).contains("#2–#40"));
     }
 
     #[test]

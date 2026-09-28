@@ -38,6 +38,8 @@ pub struct Config {
     pub auto_compact: bool,
     /// Fraction of the context window that triggers auto-compaction.
     pub auto_compact_threshold: f64,
+    /// How compaction treats the history it folds away (see `CompactionMode`).
+    pub compaction_mode: CompactionMode,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
     /// Start each message in the interactive CLI with the local time.
@@ -79,6 +81,7 @@ impl Default for Config {
             context_window: None,
             auto_compact: true,
             auto_compact_threshold: 0.8,
+            compaction_mode: CompactionMode::Standard,
             verbosity: crate::ui::Verbosity::Normal,
             timestamps: true,
             project_instructions: true,
@@ -117,6 +120,27 @@ impl Config {
 
     pub fn session_dir(&self) -> PathBuf {
         self.session_dir.clone().unwrap_or_else(crate::session::default_dir)
+    }
+}
+
+/// What compaction leaves the agent of the messages it folds away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// A summary only.
+    #[default]
+    Standard,
+    /// A summary citing `#N` log lines, plus `history_search` / `history_read`
+    /// to recover the original messages from the session log.
+    Smart,
+}
+
+impl CompactionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Smart => "smart",
+        }
     }
 }
 

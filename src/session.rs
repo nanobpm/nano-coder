@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::Message;
+use crate::llm::{Message, Role};
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -46,6 +46,9 @@ pub enum Record {
         /// Reported with `report_outcome` during the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::goal::Outcome>,
+        /// `history_search` / `history_read` calls made during the turn.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        history_calls: u32,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The conversation was replaced wholesale (compaction, system-prompt reset).
@@ -55,6 +58,15 @@ pub enum Record {
         /// mid-turn): the index of its user message in `messages`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_position: Option<usize>,
+        /// Compaction only: first and last log line folded into the summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summarized: Option<(u64, u64)>,
+        /// Compaction only: `standard` or `smart`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::config::CompactionMode>,
+        /// Compaction only: the `provider/model` in use, for comparing modes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
@@ -85,11 +97,25 @@ pub struct Restored {
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
+    /// Whether the last replacement was a smart compaction, so the resumed
+    /// session should offer the history tools without re-sniffing message text.
+    pub history_available: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 pub struct SessionLog {
     path: PathBuf,
     file: File,
+    /// Committed records in the file (the last line number written).
+    lines: u64,
+}
+
+/// Directory for complete copies of truncated tool output of session `id`.
+pub fn spill_dir_for(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.spill"))
 }
 
 pub fn default_dir() -> PathBuf {
@@ -142,7 +168,7 @@ impl SessionLog {
             created_at: now(),
         })?)?;
         file.sync_data()?;
-        Ok(Self { path, file })
+        Ok(Self { path, file, lines: 1 })
     }
 
     pub fn open(dir: &Path, id: &str) -> Result<(Self, Restored)> {
@@ -163,26 +189,77 @@ impl SessionLog {
             // Drop a torn trailing record so later appends stay line-aligned.
             file.set_len(committed as u64)?;
         }
-        Ok((Self { path, file }, restored))
+        let lines = bytes[..committed].split(|&b| b == b'\n').filter(|l| !l.is_empty()).count() as u64;
+        Ok((Self { path, file, lines }, restored))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn append(&mut self, record: &Record) -> Result<()> {
+    /// Append a record; returns its 1-based line number in the log.
+    pub fn append(&mut self, record: &Record) -> Result<u64> {
         self.file
             .write_all(&encode(record)?)
             .with_context(|| format!("append to session log {}", self.path.display()))?;
         if matches!(record, Record::TurnEnd { .. } | Record::Replace { .. }) {
             self.file.sync_data()?;
         }
-        Ok(())
+        self.lines += 1;
+        Ok(self.lines)
+    }
+}
+
+/// Compare two messages by their durable content, ignoring only the transient
+/// `timestamp`/`log_line` fields that differ between a direct record and the
+/// copy retained inside a later `replace` record. Durable provider content
+/// (including `thinking_blocks`) is compared, so two assistant messages with
+/// identical visible text/tool calls but different reasoning blocks are not
+/// treated as the same message.
+fn same_content(a: &Message, b: &Message) -> bool {
+    a.role == b.role
+        && a.content == b.content
+        && a.tool_calls == b.tool_calls
+        && a.tool_call_id == b.tool_call_id
+        && a.name == b.name
+        && a.is_error == b.is_error
+        && a.thinking_blocks == b.thinking_blocks
+}
+
+/// Backfill stable `[#N]` IDs onto a `replace` record's retained messages from
+/// the original message records they were folded from. Logs written before the
+/// stable-ID feature stored `replace` messages without `log_line`, so a later
+/// smart compaction would emit them without `[#N]` citations even though the
+/// original records are still present. Match each un-IDed retained message to
+/// the first not-yet-claimed original with identical content, preserving order
+/// so duplicate messages map to distinct originals. `summarized` (the folded
+/// line range, when the log recorded one) bounds the search to originals past
+/// the summary, so a duplicate whose earlier occurrence was folded into the
+/// summary is not mis-mapped to that folded copy; pre-range legacy logs fall
+/// back to the first content match. The system message is skipped: it is never
+/// `[#N]`-cited and carries no `log_line` in a live session, so backfilling it
+/// would make a reloaded session disagree with the in-memory one. Messages with
+/// no matching original (e.g. a freshly generated summary) are left un-IDed.
+fn backfill_log_lines(messages: &mut [Message], originals: &[Message], summarized: Option<(u64, u64)>) {
+    let floor = summarized.map_or(0, |(_, end)| end);
+    let mut claimed = vec![false; originals.len()];
+    for message in messages.iter_mut().filter(|m| m.log_line.is_none() && m.role != Role::System) {
+        if let Some((index, original)) = originals
+            .iter()
+            .enumerate()
+            .find(|(i, o)| !claimed[*i] && o.log_line.is_some_and(|line| line > floor) && same_content(o, message))
+        {
+            message.log_line = original.log_line;
+            claimed[index] = true;
+        }
     }
 }
 
 fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     let mut restored = Restored::default();
+    // Every direct message record seen so far, with its assigned `log_line`, so
+    // a later `replace` from a legacy log can recover the IDs of retained messages.
+    let mut originals: Vec<Message> = Vec::new();
     for (index, line) in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
         let record: Record =
             serde_json::from_slice(line).with_context(|| format!("decode record {}", index + 1))?;
@@ -202,7 +279,11 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             Record::Input { id, text, .. } => {
                 restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
             }
-            Record::Message(message) => restored.conversation.push(message),
+            Record::Message(mut message) => {
+                message.log_line.get_or_insert(index as u64 + 1);
+                originals.push(message.clone());
+                restored.conversation.push(message);
+            }
             Record::TurnEnd { input_id, response, outcome, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
                     restored.pending_input = None;
@@ -213,12 +294,16 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 };
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { messages, pending_position, .. } => {
+            Record::Replace { mut messages, pending_position, summarized, mode, .. } => {
+                backfill_log_lines(&mut messages, &originals, summarized);
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
                     (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
                     _ => None,
                 };
+                // A smart compaction offers the history tools; restore that
+                // state from the mode rather than sniffing the summary text.
+                restored.history_available = matches!(mode, Some(crate::config::CompactionMode::Smart));
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
         }
@@ -247,7 +332,7 @@ mod tests {
     }
 
     fn turn_end(id: &str) -> Record {
-        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, recorded_at: now() }
+        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, history_calls: 0, recorded_at: now() }
     }
 
     #[test]
@@ -278,11 +363,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s2").unwrap();
         log.append(&Record::Message(Message::user("a"))).unwrap();
-        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, recorded_at: now() })
+        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, summarized: None, mode: None, model: None, recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
         assert_eq!(restored.conversation, vec![Message::system("new")]);
+    }
+
+    #[test]
+    fn replace_backfills_log_lines_for_legacy_retained_messages() {
+        // A pre-feature log stores `replace` messages without `log_line`. Decoding
+        // must recover each retained message's ID from its original record so
+        // smart compaction can still cite it as `[#N]`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s5").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
+        log.append(&Record::Message(Message::user("first"))).unwrap(); // #3
+        log.append(&Record::Message(Message::assistant("reply"))).unwrap(); // #4
+        // Retained messages carry no `log_line`, as a legacy compaction would write.
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("first"), Message::assistant("reply"), Message::assistant("summary")],
+            pending_position: None,
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s5").unwrap();
+        let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
+        // System is skipped (never cited); "first" -> #3, "reply" -> #4 (record
+        // #1 is the session header); the freshly generated "summary" stays un-IDed.
+        assert_eq!(lines, vec![None, Some(3), Some(4), None]);
     }
 
     #[test]
@@ -292,12 +405,90 @@ mod tests {
         log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
         log.append(&Record::Message(Message::user("go"))).unwrap();
         let messages = vec![Message::system("sys"), Message::user("summary"), Message::user("go")];
-        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), recorded_at: now() })
+        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), summarized: None, mode: None, model: None, recorded_at: now() })
             .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();
-        assert_eq!(restored.conversation, messages);
+        // The retained "go" folds in original record #3, so its ID is backfilled.
+        let mut expected = messages.clone();
+        expected[2].log_line = Some(3);
+        assert_eq!(restored.conversation, expected);
         assert_eq!(restored.pending_input, Some(PendingInput { id: "in-1".into(), text: "go".into(), position: 2 }));
+    }
+
+    #[test]
+    fn backfill_uses_the_summarized_range_to_disambiguate_duplicates() {
+        // Two identical "same" messages; a smart compaction folds the first
+        // (records #2..=#4) into the summary and keeps only the later one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s6").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2 (folded)
+        log.append(&Record::Message(Message::user("same"))).unwrap(); // #3 (folded)
+        log.append(&Record::Message(Message::assistant("x"))).unwrap(); // #4 (folded)
+        log.append(&Record::Message(Message::user("same"))).unwrap(); // #5 (retained)
+        // The retained "same" carries no log_line, as a legacy write would.
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary"), Message::user("same")],
+            pending_position: None,
+            summarized: Some((2, 4)),
+            mode: Some(crate::config::CompactionMode::Smart),
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s6").unwrap();
+        // The range bounds the match past #4, so the retained "same" maps to the
+        // second occurrence (#5), not the folded first one (#3).
+        assert_eq!(restored.conversation[1].log_line, Some(5));
+        assert!(restored.history_available, "a smart replace offers the history tools");
+    }
+
+    #[test]
+    fn standard_replace_does_not_offer_history_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s7").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary")],
+            pending_position: None,
+            summarized: Some((2, 2)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        assert!(!restored.history_available, "a standard replace drops the history tools");
+    }
+
+    #[test]
+    fn backfill_distinguishes_messages_by_thinking_blocks() {
+        // Two assistant messages share visible text but carry different reasoning
+        // blocks. Backfill must not treat them as identical: the retained copy
+        // must recover the ID of the original with matching thinking blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
+        let think_a = Message { thinking_blocks: vec![serde_json::json!({"thinking": "a"})], ..Message::assistant("reply") };
+        let think_b = Message { thinking_blocks: vec![serde_json::json!({"thinking": "b"})], ..Message::assistant("reply") };
+        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
+        log.append(&Record::Message(think_a.clone())).unwrap(); // #3
+        log.append(&Record::Message(think_b.clone())).unwrap(); // #4
+        // A legacy replace retains only the second reasoning variant, un-IDed.
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary"), Message { log_line: None, ..think_b.clone() }],
+            pending_position: None,
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
+        // Maps to #4 (matching thinking blocks), not #3.
+        assert_eq!(restored.conversation[1].log_line, Some(4));
     }
 
     #[test]

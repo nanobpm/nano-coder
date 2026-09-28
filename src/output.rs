@@ -15,16 +15,44 @@ pub fn spill_dir() -> std::path::PathBuf {
 }
 
 /// Bound `text` to `limit` characters; when it is longer, save it whole in
-/// `dir` as `name` and point at that file from the truncation marker, so
-/// the model can search or page through the rest.
+/// `dir` and point at that file from the truncation marker, so the model can
+/// search or page through the rest. The spill never overwrites an existing
+/// file: for a persisted session the recorded paths must stay valid, so if
+/// `name` is taken (a reused tool-call ID after a resume or provider retry) a
+/// fresh `stem-2.ext`, `stem-3.ext`, … is reserved instead.
 pub fn bound_and_spill(text: &str, limit: usize, dir: &std::path::Path, name: &str) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    let path = dir.join(name);
-    let saved = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text)).is_ok();
-    let display = path.display().to_string();
-    bound_parts(text, Some(text), text.len() as u64, limit, saved.then_some(display.as_str())).0
+    let saved = std::fs::create_dir_all(dir).ok().and_then(|()| reserve_and_write(dir, name, text));
+    let display = saved.as_ref().map(|p| p.display().to_string());
+    bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref()).0
+}
+
+/// Write `text` to a new file in `dir` derived from `name`, never clobbering an
+/// existing spill. Probes `name`, then `stem-2.ext`, `stem-3.ext`, … with
+/// `create_new` until one is created, so paths already recorded in a session
+/// log keep pointing at their original contents. Returns the path written, or
+/// `None` on error.
+fn reserve_and_write(dir: &std::path::Path, name: &str, text: &str) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    for attempt in 1..=10_000u32 {
+        let candidate = if attempt == 1 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem}-{attempt}{ext}"))
+        };
+        match std::fs::File::create_new(&candidate) {
+            Ok(mut file) => return file.write_all(text.as_bytes()).ok().map(|()| candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Bound a complete in-memory string to `limit` characters.
@@ -124,6 +152,21 @@ mod tests {
         let path = dir.path().join("b.txt");
         assert_eq!(bounded, format!("ab...6 bytes truncated; complete output in {}...ij", path.display()));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "abcdefghij");
+    }
+
+    #[test]
+    fn spill_never_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // First long result claims the base name.
+        let first = bound_and_spill("abcdefghij", 4, dir.path(), "tool-x.txt");
+        assert!(first.contains("tool-x.txt"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("tool-x.txt")).unwrap(), "abcdefghij");
+        // A second result reusing the same name (e.g. a retried tool-call ID)
+        // must not clobber the first: it reserves a fresh suffixed name.
+        let second = bound_and_spill("klmnopqrst", 4, dir.path(), "tool-x.txt");
+        assert!(second.contains("tool-x-2.txt"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("tool-x.txt")).unwrap(), "abcdefghij");
+        assert_eq!(std::fs::read_to_string(dir.path().join("tool-x-2.txt")).unwrap(), "klmnopqrst");
     }
 
     #[test]

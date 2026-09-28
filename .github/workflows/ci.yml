@@ -24,5 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: compaction eval self-test (fake model)
+        run: cargo build && python3 eval/compaction/run.py --self-test --seeds 1 --filler-turns 4 --bin target/debug/nano-coder --out "$RUNNER_TEMP/eval"
       - name: npm launcher syntax
         run: node --check npm/nano-coder/bin/nano-coder && node --check npm/nano-coder/install.js && node --check scripts/npm-packages.mjs
