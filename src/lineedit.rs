@@ -616,6 +616,15 @@ fn write(text: &str) {
     });
 }
 
+/// Scroll the terminal's scrollback back a few lines, standing in for the
+/// wheel-up handling the terminal would do itself if mouse tracking were
+/// off. `CSI ? S` (XTSMGRAPHICS scrollback scroll) is supported by iTerm2,
+/// kitty, alacritty and foot; terminals without it ignore the sequence.
+/// There is no matching scroll-forward, so wheel-down stays inert.
+fn scroll_up() {
+    write("\x1b[?3S");
+}
+
 /// What a key press produced.
 pub enum Key {
     Line(String),
@@ -660,7 +669,7 @@ pub fn restore_terminal() {
     // Only undo the key-mode escapes if they were ever sent; a piped/non-TTY
     // session never entered key mode, so writing them would corrupt stdout.
     if KEY_MODE_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
-        write("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
+        write("\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m");
     }
 }
 
@@ -668,7 +677,9 @@ pub fn restore_terminal() {
 /// keys (Ctrl-C, Ctrl-O, which macOS would use to discard output) delivered
 /// as bytes. Output processing is left on. While active, the terminal is
 /// asked for bracketed paste, SGR mouse presses and modifyOtherKeys/kitty
-/// key reporting (so Ctrl/Cmd-Enter is distinguishable from Enter).
+/// key reporting (so Ctrl/Cmd-Enter is distinguishable from Enter). Mouse
+/// tracking is press-only (1000): drag/motion tracking (1002/1003) would
+/// swallow the terminal's native text selection for no benefit.
 struct KeyMode;
 
 impl KeyMode {
@@ -683,7 +694,7 @@ impl KeyMode {
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         if entered {
             KEY_MODE_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
-            write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[>4;1m\x1b[>1u");
+            write("\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>4;1m\x1b[>1u");
         }
         entered.then_some(Self)
     }
@@ -713,6 +724,9 @@ enum Esc {
     /// protocol `CSI 13 u`): submit the line, like a bare CR would.
     Submit,
     Mouse { x: u16, y: u16 },
+    /// Wheel-up: the terminal would scroll its scrollback, but mouse
+    /// tracking diverts the event to us, so we scroll it ourselves.
+    WheelUp,
     /// Something else (function keys, releases, motion, unknown sequences).
     Ignored,
 }
@@ -889,6 +903,7 @@ impl LineReader {
                                     Esc::Newline => shared.lock().unwrap().insert("\n"),
                                     Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
                                     Esc::Mouse { x, y } => shared.lock().unwrap().mouse_press(x, y),
+                                    Esc::WheelUp => scroll_up(),
                                     Esc::Ignored => {}
                                 }
                             }
@@ -951,9 +966,12 @@ fn parse_escape(seq: &[u8]) -> Esc {
         if parts.len() == 3 && *final_byte == b'M' {
             let button: u16 = parts[0].parse().unwrap_or(64);
             let (x, y) = (parts[1].parse().unwrap_or(0), parts[2].parse().unwrap_or(0));
-            // Button 0-2 is a press; 64+ is a wheel, 32+ is motion.
+            // Button 0-2 is a press; 64 is wheel-up, 65 wheel-down, 32+ motion.
             if button < 3 {
                 return Esc::Mouse { x, y };
+            }
+            if button == 64 {
+                return Esc::WheelUp;
             }
         }
         return Esc::Ignored;
@@ -1276,9 +1294,10 @@ mod tests {
             Esc::Mouse { x, y } => assert_eq!((x, y), (10, 5)),
             other => panic!("expected a mouse press, got {other:?}"),
         }
-        // Releases and wheel events are ignored.
+        // Releases and wheel-down are ignored; wheel-up scrolls the scrollback.
         assert!(matches!(parse_escape(b"\x1b[<0;10;5m"), Esc::Ignored));
-        assert!(matches!(parse_escape(b"\x1b[<64;10;5M"), Esc::Ignored));
+        assert!(matches!(parse_escape(b"\x1b[<64;10;5M"), Esc::WheelUp));
+        assert!(matches!(parse_escape(b"\x1b[<65;10;5M"), Esc::Ignored));
     }
 
     #[test]
