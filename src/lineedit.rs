@@ -332,7 +332,11 @@ impl EditView {
         // clear-to-end-of-screen (and any wrap) would reach the reserved bottom
         // row and paint over the bar. Reserve room first (see
         // `redraw_sequence`): open `content` rows so the prompt block plus a
-        // bottom row for the bar fit even for a multi-row paste.
+        // bottom row for the bar fit even for a multi-row paste. Input taller
+        // than the viewport cannot fit whatever we reserve, so the clamp caps
+        // it at `rows - 1`; `redraw_sequence` then appends the bar redraw last,
+        // so even when the over-tall input scrolls through the bottom row the
+        // bar is repainted on top and is never left covered.
         let reserve = if self.status.is_some() { content.min((rows as usize).saturating_sub(1)) } else { 0 };
         self.drawn_rows = content + self.menu_rows;
         self.drawn_cursor_row = cursor_row;
@@ -1147,6 +1151,21 @@ mod tests {
         let plain = redraw_sequence("", "abc def", 0, 0, 0, (0, 7), None);
         assert!(!plain.contains('\n'), "no rows reserved without a status bar: {plain:?}");
         assert!(plain.ends_with("\x1b[7C"), "ends at the cursor column: {plain:?}");
+    }
+
+    #[test]
+    fn redraw_repaints_the_bar_last_even_when_reserve_is_clamped() {
+        // Input taller than the viewport: `redraw` clamps `reserve` to
+        // `rows - 1` (here 3) so it cannot open a full block, and the long line
+        // scrolls through the bottom row. The bar redraw is still appended last,
+        // so it is repainted on top of the scrolled input and never left
+        // covered — the guarantee for an over-tall paste.
+        let bar = "\x1b7\x1b[24;1H\x1b[2KBAR\x1b8";
+        let tall = "x".repeat(500);
+        let seq = redraw_sequence("", &tall, 5, 3, 0, (5, 4), Some(bar));
+        assert!(seq.contains(&"\n".repeat(3)), "opens the clamped rows: {seq:?}");
+        assert!(seq.ends_with(bar), "repaints the bar last so it is never covered: {seq:?}");
+        assert!(!seq.contains('r'), "no scroll region command: {seq:?}");
     }
 
     #[test]

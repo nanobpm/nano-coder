@@ -74,6 +74,17 @@ fn draw_sequence(line: &str, rows: u16) -> String {
     format!("\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8")
 }
 
+/// Bytes that erase a stale status bar left at `old_rows` after a resize, or
+/// empty when there is nothing stale to clear. When the terminal grew
+/// (`old_rows < new_rows`) the old, absolutely positioned bar sits above the
+/// new bottom row and must be cleared before the bar is repainted lower down;
+/// when it shrank (or is unchanged) the old row is below the new bottom (or is
+/// the same row `draw` will clear anyway) so nothing need be erased. No scroll
+/// region is set, so the terminal stays free to reflow the conversation.
+fn resize_erase_sequence(old_rows: u16, new_rows: u16) -> String {
+    if old_rows < new_rows { format!("\x1b7\x1b[{old_rows};1H\x1b[2K\x1b8") } else { String::new() }
+}
+
 /// Bytes that reserve the terminal's bottom row for the status line by keeping
 /// whatever is written next one row higher.
 ///
@@ -146,9 +157,24 @@ impl StatusLine {
     }
 
     /// Redraw after the terminal was resized. With no scroll region, the
-    /// terminal itself reflows the conversation; all that is needed is to
-    /// paint the status line at the new bottom row.
+    /// terminal itself reflows the conversation; erase any stale bar the resize
+    /// left behind, then paint the status line at the new bottom row.
     pub fn resize(&self) {
+        // The bar is absolutely positioned at the (old) bottom row. When the
+        // terminal grows, that row is still on screen — now above the new
+        // bottom — so the old bar lingers as a duplicate status line until
+        // later output happens to cover it. Erase it before repainting at the
+        // new bottom. On shrink the old row is below the new bottom and already
+        // gone, so there is nothing to erase. (Terminal-specific reflow of that
+        // row makes this best-effort, per the module note, but it removes the
+        // common duplicate-bar case deterministically.)
+        let previous = self.size.lock().unwrap().map(|(rows, _)| rows);
+        if let (Some(old_rows), Some((new_rows, _))) = (previous, terminal_size()) {
+            let erase = resize_erase_sequence(old_rows, new_rows);
+            if !erase.is_empty() {
+                write_raw(&erase);
+            }
+        }
         self.draw();
     }
 
@@ -499,6 +525,19 @@ mod tests {
         let seq = draw_sequence("STATUS", 24);
         assert_eq!(seq, "\x1b7\x1b[24;1H\x1b[2KSTATUS\x1b8");
         assert!(!seq.contains('r'), "no scroll region may be set: {seq:?}");
+    }
+
+    #[test]
+    fn resize_erases_a_stale_bar_only_when_the_terminal_grew() {
+        // Grew: the old bar sits above the new bottom row and would linger as a
+        // duplicate, so its former row is cleared before the bar is repainted.
+        assert_eq!(resize_erase_sequence(24, 30), "\x1b7\x1b[24;1H\x1b[2K\x1b8");
+        // Shrank: the old row is below the new bottom and already gone.
+        assert_eq!(resize_erase_sequence(30, 24), "");
+        // Unchanged height: `draw` clears and repaints that row anyway.
+        assert_eq!(resize_erase_sequence(24, 24), "");
+        // No DECSTBM scroll region (which ends in a literal 'r') is set.
+        assert!(!resize_erase_sequence(24, 30).contains('r'), "no scroll region may be set");
     }
 
     #[test]
