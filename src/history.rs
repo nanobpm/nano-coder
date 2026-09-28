@@ -250,8 +250,20 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
             continue;
         }
         let text = searchable(message);
-        let found: Vec<_> = regex.find_iter(&text).collect();
-        if found.is_empty() {
+        // Count every match but retain only the first SNIPPETS_PER_MESSAGE
+        // distinct, non-overlapping regions, so a message with many matches
+        // does not allocate one `Match` per occurrence.
+        let mut match_count = 0usize;
+        let mut snippets: Vec<(usize, usize)> = Vec::new();
+        let mut shown_until = 0;
+        for m in regex.find_iter(&text) {
+            match_count += 1;
+            if snippets.len() < SNIPPETS_PER_MESSAGE && m.start() >= shown_until {
+                snippets.push((m.start(), m.end()));
+                shown_until = m.end() + SNIPPET_CHARS;
+            }
+        }
+        if match_count == 0 {
             continue;
         }
         total += 1;
@@ -260,8 +272,8 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
             continue;
         }
         let mut line = label(*id, message);
-        if found.len() > 1 {
-            line.push_str(&format!(" [{} matches]", found.len()));
+        if match_count > 1 {
+            line.push_str(&format!(" [{match_count} matches]"));
         }
         if message.role == Role::Assistant
             && let Some(sources) = preceding_tool_outputs(&messages, position[id])
@@ -271,20 +283,9 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
             line.push_str(&format!(" [after tool output {sources}]"));
         }
         line.push(':');
-        // Snippets of distinct, non-overlapping regions of the message.
-        let mut shown_until = 0;
-        let mut shown = 0;
-        for m in &found {
-            if shown == SNIPPETS_PER_MESSAGE {
-                break;
-            }
-            if m.start() < shown_until {
-                continue;
-            }
+        for &(start, end) in &snippets {
             line.push(' ');
-            line.push_str(&snippet(&text, m.start(), m.end()));
-            shown_until = m.end() + SNIPPET_CHARS;
-            shown += 1;
+            line.push_str(&snippet(&text, start, end));
         }
         hits.push(line);
     }
