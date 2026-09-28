@@ -526,6 +526,11 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             renderer.note(&format!("↧ queued #{id} ({n} waiting) — /queue remove {id} to drop"));
                         }
                     }
+                    // Blank Enter typed mid-turn is a no-op: dropping it here
+                    // stops it from being deferred into `queued` and replayed
+                    // as an empty line after the turn, which would delay the
+                    // real queued messages/commands behind it.
+                    TermInput::Line(line) if terminal.steerable && line.trim().is_empty() => {}
                     other => terminal.queued.push_back(other),
                 },
             }
