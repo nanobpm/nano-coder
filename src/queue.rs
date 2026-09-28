@@ -10,7 +10,7 @@
 //! A queued message is never injected while the agent is waiting for input:
 //! the drain happens only after the turn future has resolved (a pending
 //! `question`/turn-cap picker parks the loop inside the turn), and
-//! [`crate::Terminal::next_message`] re-checks that nothing is pending
+//! [`crate::Terminal::next`] re-checks that nothing is pending
 //! before handing a queued message over as a prompt.
 
 use std::collections::VecDeque;
