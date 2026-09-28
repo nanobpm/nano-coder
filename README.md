@@ -148,6 +148,7 @@ src/
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
 ├── ui.rs        # Verbosity levels and the streaming output renderer
+├── frame.rs     # App-owned frame renderer (renderer = "frame"): full redraw on resize
 ├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, mid-turn input on the status line)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
@@ -357,6 +358,7 @@ auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
+renderer = "legacy"                     # legacy | frame (app-owned redraw on resize, experimental)
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
 project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
@@ -561,6 +563,17 @@ support it. ACP mode doesn't stream text, but sends each response's reasoning as
 Every message (your prompt, answers, tool calls and results, thinking, notes) starts with
 the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
 shows when the message was sent. Turn this off with `timestamps = false`.
+
+**Renderer (experimental).** By default (`renderer = "legacy"`) the terminal owns the
+scrollback and reflows history itself on a resize, with the status line pinned to the bottom
+via a scroll region. Setting `renderer = "frame"` (or picking it in `/settings`) switches to
+an **app-owned frame renderer**: nano-coder composes the whole screen — transcript, input
+editor, then the status bar as the last line — into one frame and diff-renders it through a
+single writer, wrapped in synchronized-output markers so a half-drawn frame is never visible.
+On a width change it re-renders the entire frame (clearing the screen and scrollback) instead
+of relying on the terminal's native reflow, and resizes are debounced (~40ms) so a drag
+settles on one clean redraw. It never captures the mouse. This is opt-in for now; `legacy`
+remains the default.
 
 ## Status Line and Compaction
 

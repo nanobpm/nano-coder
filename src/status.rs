@@ -206,6 +206,12 @@ impl StatusLine {
         Some(status)
     }
 
+    /// The status bar as a plain string at `cols` columns (stats only, no
+    /// cursor positioning), for the app-owned frame renderer.
+    pub fn stats_line(&self, cols: usize) -> String {
+        render(&self.stats.lock().unwrap().clone(), cols)
+    }
+
     pub fn draw(&self) {
         // Target the real current terminal, never a stale cached size. A draw()
         // triggered by a Context event, the renderer or lineedit before the

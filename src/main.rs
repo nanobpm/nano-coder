@@ -16,6 +16,7 @@ mod commands;
 mod config;
 mod context;
 mod files;
+mod frame;
 mod goal;
 mod history;
 mod hooks;
@@ -1273,29 +1274,62 @@ async fn main() -> Result<()> {
             lineedit::restore_terminal();
             previous_hook(info);
         }));
-        let renderer = ui::Renderer::new(status.clone());
+        let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
         ui::install(renderer.clone());
         let sink = renderer.clone();
         agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
         agent.set_streaming(true);
         agent.refresh_stats();
+        let frame_mode = renderer.is_frame();
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext { config: agent.config().clone(), recents: recents.clone() }));
             lineedit::EditView::shared(status.clone(), context)
         };
+        if frame_mode {
+            // The app-owned frame renderer draws the editor row itself; route
+            // every edit through it instead of the inline/scroll-region path.
+            let renderer = renderer.clone();
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize| renderer.set_editor(line, cursor)));
+        }
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         {
             let view = view.clone();
             let status = status.clone();
+            let renderer = renderer.clone();
             tokio::spawn(async move {
+                // Debounce a burst of resizes (a window drag) into one render at
+                // the final size: after a resize, wait for ~40 ms of quiet.
+                let quiet = std::time::Duration::from_millis(40);
+                let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
-                    if let Some(status) = &status {
-                        status.resize();
+                    if !renderer.is_frame() {
+                        // Legacy: re-anchor immediately, as before.
+                        if let Some(status) = &status {
+                            status.resize();
+                        }
+                        view.lock().unwrap().resize();
+                        continue;
+                    }
+                    debounce.record(std::time::Instant::now());
+                    // Coalesce further resizes arriving within the quiet window.
+                    while debounce.pending() {
+                        tokio::select! {
+                            more = resized.recv() => match more {
+                                Some(()) => debounce.record(std::time::Instant::now()),
+                                None => break,
+                            },
+                            _ = tokio::time::sleep(quiet) => {
+                                if debounce.ready(std::time::Instant::now()) {
+                                    debounce.clear();
+                                }
+                            }
+                        }
                     }
                     view.lock().unwrap().resize();
+                    renderer.frame_resize();
                 }
             });
         }
@@ -1304,12 +1338,23 @@ async fn main() -> Result<()> {
         let mut exit_armed = false;
         let mut separate = false;
         while running {
-            if let Some(status) = &status {
+            if let Some(status) = &status
+                && !frame_mode
+            {
                 status.draw();
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
+                    if frame_mode {
+                        // The frame renderer owns the screen: refresh the editor
+                        // row (and thus the whole frame) instead of writing an
+                        // inline prompt.
+                        let (line, cursor) = view.snapshot();
+                        terminal.renderer.set_editor(&line, cursor);
+                        view.prompt_redrawn();
+                        return;
+                    }
                     let prompt = view.prompt();
                     // Serialise the prompt write under the terminal lock so it
                     // cannot move the cursor mid-way through the SIGWINCH
@@ -1338,7 +1383,11 @@ async fn main() -> Result<()> {
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        println!("\nMode: {mode} ({})", mode.describe());
+                        if frame_mode {
+                            terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
+                        } else {
+                            println!("\nMode: {mode} ({})", mode.describe());
+                        }
                         prompt(&terminal, false);
                     }
                     other => break other,
@@ -1349,7 +1398,11 @@ async fn main() -> Result<()> {
                 TermInput::Interrupt if exit_armed => break,
                 TermInput::Interrupt => {
                     exit_armed = true;
-                    println!("\n(Ctrl-C again to exit)");
+                    if frame_mode {
+                        terminal.renderer.note("(Ctrl-C again to exit)");
+                    } else {
+                        println!("\n(Ctrl-C again to exit)");
+                    }
                     continue;
                 }
                 TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
@@ -1358,6 +1411,9 @@ async fn main() -> Result<()> {
             exit_armed = false;
             if input.trim().is_empty() {
                 continue;
+            }
+            if frame_mode && !input.starts_with('/') {
+                terminal.renderer.frame_user_message(&input);
             }
 
             match run_command(&mut agent, &input, &mut terminal).await {

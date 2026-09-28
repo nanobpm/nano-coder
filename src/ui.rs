@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::AgentEvent;
+use crate::frame::{self, FrameRenderer, Item, Role};
 use crate::llm::ToolCall;
 use crate::plan::{Plan, PlanItem, Status};
 use crate::status::{self, StatusLine};
@@ -171,16 +172,180 @@ pub struct Renderer {
     /// Stdout is a terminal (in-place redraws are possible).
     tty: bool,
     expanded: AtomicBool,
+    /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
+    /// terminal. When set, all output is composed into one frame (transcript,
+    /// editor, status as the last line) and diff-rendered by a single writer,
+    /// instead of streaming into the terminal's scrollback.
+    frame: Option<Mutex<FrameState>>,
+}
+
+/// The mutable state behind the app-owned frame renderer.
+struct FrameState {
+    out: FrameRenderer<io::Stdout>,
+    /// The transcript, oldest first. A width change re-renders every item.
+    items: Vec<Item>,
+    /// The current input editor `(line, cursor)`.
+    editor: (String, usize),
+    /// Index of the assistant message currently being streamed into, so text
+    /// deltas append to one growing item rather than adding a line each.
+    stream: Option<usize>,
+    /// The reasoning block streaming in `(text, started)`, shown collapsed.
+    think: Option<(String, Instant)>,
 }
 
 impl Renderer {
-    pub fn new(status: Option<Arc<StatusLine>>) -> Arc<Self> {
+    pub fn new(status: Option<Arc<StatusLine>>, mode: crate::frame::RendererMode) -> Arc<Self> {
+        let tty = io::stdout().is_terminal();
+        let frame = (mode == crate::frame::RendererMode::Frame && tty).then(|| {
+            Mutex::new(FrameState {
+                out: FrameRenderer::new(io::stdout()),
+                items: Vec::new(),
+                editor: (String::new(), 0),
+                stream: None,
+                think: None,
+            })
+        });
         Arc::new(Self {
             state: Mutex::new(State { at_line_start: true, ..Default::default() }),
             status,
-            tty: io::stdout().is_terminal(),
+            tty,
             expanded: AtomicBool::new(false),
+            frame,
         })
+    }
+
+    /// Whether the app-owned frame renderer is active.
+    pub fn is_frame(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    /// Update the editor row (called by the line editor's frame hook) and
+    /// re-render the frame.
+    pub fn set_editor(&self, line: &str, cursor: usize) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.editor = (line.to_string(), cursor);
+            self.frame_render(&mut fs);
+        }
+    }
+
+    /// Re-render after a resize (or after a foreground picker clobbered the
+    /// screen): force a full redraw at the current size.
+    pub fn frame_resize(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.out.invalidate();
+            self.frame_render(&mut fs);
+        }
+    }
+
+    /// Compose the transcript, editor and status bar into one frame and render
+    /// it at the current terminal size.
+    fn frame_render(&self, fs: &mut FrameState) {
+        let (rows, cols) = status::terminal_size().unwrap_or((24, 80));
+        let width = (cols as usize).max(20);
+        let height = (rows as usize).max(1);
+        let transcript = frame::transcript_lines(&fs.items, width);
+        let editor = frame::editor_lines("› ", &fs.editor.0, fs.editor.1, width);
+        let status = self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default();
+        let composed = frame::compose(&transcript, &editor, &status);
+        let _ = fs.out.render(&composed, width, height);
+    }
+
+    /// End any in-flight streamed message/thinking so the next item starts
+    /// fresh.
+    fn frame_finish_stream(&self, fs: &mut FrameState) {
+        fs.stream = None;
+        if let Some((text, started)) = fs.think.take() {
+            let text = text.trim();
+            if !text.is_empty() {
+                fs.items.push(Item::Thinking {
+                    chars: text.chars().count(),
+                    seconds: started.elapsed().as_secs_f64(),
+                });
+            }
+        }
+    }
+
+    /// Map an agent event onto the transcript and re-render (frame mode).
+    fn frame_event(&self, fs: &mut FrameState, event: &AgentEvent) {
+        match event {
+            AgentEvent::ThinkingDelta { text } => {
+                fs.think.get_or_insert_with(|| (String::new(), Instant::now())).0.push_str(text);
+            }
+            AgentEvent::Thinking { text } => {
+                let started = fs.think.take().map(|(_, s)| s).unwrap_or_else(Instant::now);
+                let chars = text.trim().chars().count();
+                if chars > 0 {
+                    fs.items.push(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() });
+                }
+                fs.stream = None;
+            }
+            AgentEvent::TextDelta { text } => {
+                if text.is_empty() {
+                    return;
+                }
+                if let Some((_, started)) = fs.think.take() {
+                    let _ = started;
+                }
+                match fs.stream {
+                    Some(i) => {
+                        if let Some(Item::Message { text: existing, .. }) = fs.items.get_mut(i) {
+                            existing.push_str(text);
+                        }
+                    }
+                    None => {
+                        fs.items.push(Item::Message {
+                            role: Role::Assistant,
+                            text: (*text).to_string(),
+                        });
+                        fs.stream = Some(fs.items.len() - 1);
+                    }
+                }
+            }
+            AgentEvent::AssistantMessage { text, .. } => {
+                if fs.stream.is_none() && !text.is_empty() {
+                    fs.items.push(Item::Message {
+                        role: Role::Assistant,
+                        text: (*text).to_string(),
+                    });
+                }
+                self.frame_finish_stream(fs);
+            }
+            AgentEvent::Plan { plan } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(Item::Plan((*plan).clone()));
+            }
+            AgentEvent::ToolCall { call } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(Item::ToolCall {
+                    name: call.name.clone(),
+                    summary: tool_summary_text(call),
+                });
+            }
+            AgentEvent::ToolResult { ok, output, .. } => {
+                fs.items.push(Item::ToolResult {
+                    ok: *ok,
+                    output: (*output).to_string(),
+                    verbose: verbosity() >= Verbosity::Verbose,
+                });
+            }
+            AgentEvent::Compacted => {
+                self.frame_finish_stream(fs);
+                fs.items.push(Item::Note("⟳ context compacted".to_string()));
+            }
+            AgentEvent::Context | AgentEvent::UserMessage { .. } => {}
+        }
+        self.frame_render(fs);
+    }
+
+    /// Record a submitted user message in the transcript (frame mode).
+    pub fn frame_user_message(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(Item::Message { role: Role::User, text: text.to_string() });
+            self.frame_render(&mut fs);
+        }
     }
 
     fn width(&self) -> usize {
@@ -190,6 +355,15 @@ impl Renderer {
     /// Wipe the screen and scrollback for a fresh session, re-pinning the
     /// status line's scroll region, and reset the renderer's line state.
     pub fn clear_screen(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.clear();
+            fs.stream = None;
+            fs.think = None;
+            fs.out.invalidate();
+            self.frame_render(&mut fs);
+            return;
+        }
         match &self.status {
             Some(status) => status.clear(),
             None if self.tty => {
@@ -254,6 +428,12 @@ impl Renderer {
     }
 
     pub fn end_turn(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            self.frame_finish_stream(&mut fs);
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
         self.newline(&mut state);
@@ -268,6 +448,12 @@ impl Renderer {
     /// Print a short note on its own line (e.g. a queued steer). If an
     /// answer is streaming mid-line, the note waits for the line to end.
     pub fn note(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(Item::Note(text.to_string()));
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         if state.streamed_text && !state.at_line_start {
             state.deferred.push(format!("{}{DIM}{text}", stamp()));
@@ -278,6 +464,12 @@ impl Renderer {
 
     /// Print a note on its own line straight away.
     pub fn urgent_note(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(Item::Note(text.to_string()));
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         self.note_now(&mut state, text);
     }
@@ -289,6 +481,16 @@ impl Renderer {
     }
 
     pub fn event(&self, event: &AgentEvent) {
+        if let Some(frame) = &self.frame {
+            if verbosity() == Verbosity::Quiet
+                && !matches!(event, AgentEvent::AssistantMessage { .. })
+            {
+                return;
+            }
+            let mut fs = frame.lock().unwrap();
+            self.frame_event(&mut fs, event);
+            return;
+        }
         if matches!(event, AgentEvent::Context | AgentEvent::Compacted)
             && let Some(status) = &self.status
         {
@@ -500,6 +702,11 @@ impl Renderer {
     /// Ctrl-O: toggle between collapsed and expanded thinking. Returns true
     /// when it printed something at the prompt (the prompt must be redrawn).
     pub fn toggle_thinking(&self) -> bool {
+        if self.frame.is_some() {
+            // Reasoning is already shown collapsed in the transcript; there is
+            // no in-place expand/collapse in frame mode yet.
+            return false;
+        }
         let expanded = !self.expanded.fetch_xor(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         if let Some(block) = state.thinking.as_mut() {
@@ -573,6 +780,13 @@ fn plan_checklist(plan: &Plan, width: usize) -> String {
 }
 
 fn tool_summary(call: &ToolCall, width: usize) -> String {
+    let text = tool_summary_text(call);
+    format!("{DIM}{}{RESET}", fit(&text, width))
+}
+
+/// The raw one-line argument summary for a tool call (no colour, no fitting),
+/// for the frame renderer's [`Item::ToolCall`](crate::frame::Item).
+pub fn tool_summary_text(call: &ToolCall) -> String {
     let text = match &call.arguments {
         Value::Object(args) => ["command", "path", "file_path", "pattern", "url", "text"]
             .iter()
@@ -581,8 +795,7 @@ fn tool_summary(call: &ToolCall, width: usize) -> String {
         Value::String(raw) => raw.clone(),
         other => other.to_string(),
     };
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("{DIM}{}{RESET}", fit(&text, width))
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncate to `width` characters with an ellipsis.

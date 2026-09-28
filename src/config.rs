@@ -42,6 +42,9 @@ pub struct Config {
     pub compaction_mode: CompactionMode,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
+    /// Which interactive renderer to use: `legacy` (scroll region) or `frame`
+    /// (app-owned, re-renders on a width change).
+    pub renderer: crate::frame::RendererMode,
     /// Start each message in the interactive CLI with the local time.
     pub timestamps: bool,
     /// Add AGENTS.md (and the like) from the git root down to the working
@@ -83,6 +86,7 @@ impl Default for Config {
             auto_compact_threshold: 0.8,
             compaction_mode: CompactionMode::Standard,
             verbosity: crate::ui::Verbosity::Normal,
+            renderer: crate::frame::RendererMode::default(),
             timestamps: true,
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
@@ -246,5 +250,13 @@ mod tests {
         assert_eq!(resolved.name, "openai");
         assert_eq!(resolved.base_url, "http://localhost:8080/v1");
         assert_eq!(resolved.model, "llama3");
+    }
+
+    #[test]
+    fn defaults_to_the_legacy_renderer_and_parses_frame() {
+        let default: Config = toml::from_str("model = \"work/x\"").unwrap();
+        assert_eq!(default.renderer, crate::frame::RendererMode::Legacy);
+        let framed: Config = toml::from_str("model = \"work/x\"\nrenderer = \"frame\"").unwrap();
+        assert_eq!(framed.renderer, crate::frame::RendererMode::Frame);
     }
 }
