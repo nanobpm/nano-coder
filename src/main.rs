@@ -22,6 +22,7 @@ mod hooks;
 mod instructions;
 mod plan;
 mod lineedit;
+mod queue;
 mod recents;
 mod llm;
 mod mode;
@@ -183,9 +184,14 @@ struct Terminal {
     want: std::sync::mpsc::Sender<()>,
     outstanding: bool,
     events: mpsc::UnboundedReceiver<TermInput>,
-    /// Input read during a turn that is not a steer (piped prompts, commands).
+    /// Input read during a turn that is not a queue entry (piped prompts,
+    /// commands that must wait for the turn to finish).
     queued: VecDeque<TermInput>,
-    /// Lines typed during a turn steer it (only when stdin is a terminal).
+    /// Messages typed during a turn, waiting to run as later prompts.
+    /// Editable mid-turn with `/queue` (including removing entries).
+    messages: queue::MessageQueue,
+    /// Lines typed during a turn join the message queue (only when stdin is a
+    /// terminal); piped lines keep the legacy "queued as later prompts" path.
     steerable: bool,
     /// Where `/settings` saves changes.
     config_path: std::path::PathBuf,
@@ -296,6 +302,7 @@ impl Terminal {
             outstanding: false,
             events,
             queued: VecDeque::new(),
+            messages: queue::MessageQueue::default(),
             steerable: io::stdin().is_terminal(),
             config_path,
             view,
@@ -351,12 +358,45 @@ impl Terminal {
         }
     }
 
-    async fn next(&mut self) -> TermInput {
+    /// The next prompt input at the top-level loop. Deferred terminal input
+    /// (piped lines, commands typed mid-turn) comes first, then one queued
+    /// message — and a queued message is handed over only while the agent is
+    /// not waiting for input: a pending `question`/turn-cap picker owns the
+    /// terminal, and injecting a queued message there would answer a question
+    /// the user can see with a prompt they may already have edited or
+    /// removed. With nothing waiting this reads the terminal.
+    async fn next(&mut self, agent: &Agent) -> TermInput {
         if let Some(input) = self.queued.pop_front() {
             return input;
         }
+        if !self.messages.is_empty() && agent.questions().pending().is_none() {
+            let entry = self.messages.pop().expect("checked non-empty");
+            self.set_queue_status();
+            self.renderer.note(&format!("↧ queued #{}: {}", entry.id, entry.text.trim()));
+            return TermInput::Line(entry.text);
+        }
         self.request_line();
         self.recv().await
+    }
+
+    /// Queue a message typed mid-turn; returns its id.
+    fn queue_message(&mut self, text: &str) -> usize {
+        let id = self.messages.push(text);
+        self.set_queue_status();
+        id
+    }
+
+    /// Apply a `/queue` edit (`remove`/`edit`/`clear`) and say what happened.
+    fn edit_queue(&mut self, op: &queue::QueueOp) -> String {
+        let result = queue::apply(&mut self.messages, op);
+        self.set_queue_status();
+        result
+    }
+
+    /// Keep the status line's queue count in sync (None hides the segment).
+    fn set_queue_status(&self) {
+        let count = self.messages.len();
+        self.view.lock().unwrap().set_queue_count((count > 0).then_some(count));
     }
 
     async fn recv(&mut self) -> TermInput {
@@ -377,13 +417,14 @@ impl Terminal {
     }
 }
 
-/// Run a turn; typed lines steer it, and Ctrl-C or Esc Esc cancels it.
+/// Run a turn; typed lines join the message queue (one runs per following
+/// turn), `/queue` edits apply immediately, and Ctrl-C or Esc Esc cancels.
 async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Terminal) -> Result<agent::TurnOutcome> {
     let control = agent.control();
     let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
-        renderer.note("[running: type a message and Enter to steer, Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
+        renderer.note("[running: type a message and Enter to queue it (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
     // Blank line after LLM output.
     println!();
@@ -409,7 +450,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                 outcome = &mut turn => break outcome,
                 // A `question` tool call is waiting for an answer. The handler
                 // is parked on the blocking pool; answer it here, where we own
-                // the terminal.
+                // the terminal. While this picker is up the turn future cannot
+                // resolve, so the message queue is not drained: no queued
+                // message is injected as a prompt while the agent is asking
+                // for input (and `Terminal::next` re-checks before draining).
                 notified = question_rx.changed() => {
                     if notified.is_err() {
                         // Broker dropped (agent gone): nothing more to answer.
@@ -464,15 +508,24 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         renderer.event(&agent::AgentEvent::Context);
                         renderer.note(&format!("[mode: {mode} — {}]", mode.describe()));
                     }
-                    TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() && !line.trim().starts_with('/') => {
-                        control.steer(line.trim(), None);
-                        renderer.note(&format!("↳ steer: {}", line.trim()));
+                    TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() => {
+                        let text = line.trim();
+                        if let Some(op) = queue_command(text) {
+                            // `/queue` only touches the message queue, so it is
+                            // safe — and most useful — while a turn is running.
+                            match op {
+                                Ok(op) => renderer.note(&terminal.edit_queue(&op)),
+                                Err(usage) => renderer.note(&format!("[{usage}]")),
+                            }
+                        } else if text.starts_with('/') {
+                            renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
+                            terminal.queued.push_back(TermInput::Line(line));
+                        } else {
+                            let id = terminal.queue_message(text);
+                            let n = terminal.messages.len();
+                            renderer.note(&format!("↧ queued #{id} ({n} waiting) — /queue remove {id} to drop"));
+                        }
                     }
-                    TermInput::Line(line) if terminal.steerable && line.trim().starts_with('/') => {
-                        renderer.note(&format!("[commands wait for the turn to finish: {}]", line.trim()));
-                        terminal.queued.push_back(TermInput::Line(line));
-                    }
-                    TermInput::Line(line) if terminal.steerable => drop(line),
                     other => terminal.queued.push_back(other),
                 },
             }
@@ -482,13 +535,14 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     renderer.end_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
     let outcome = outcome?;
-    // A steer typed as the turn finished becomes the next prompt, unless the
-    // turn was cancelled.
+    // A steer typed as the turn finished queues behind what is already
+    // waiting, unless the turn was cancelled. (The interactive CLI queues
+    // rather than steers, so this is the ACP path.)
     for steer in control.take_pending() {
         if outcome.stop_reason == agent::StopReason::Cancelled {
             renderer.note(&format!("[steer dropped: {}]", steer.text));
         } else {
-            terminal.queued.push_back(TermInput::Line(steer.text));
+            terminal.queue_message(&steer.text);
         }
     }
     Ok(outcome)
@@ -681,6 +735,18 @@ async fn prompt_cap_reached(
     decision
 }
 
+/// The `/queue` edit a line asks for, if it is a `/queue` command. Unlike
+/// other commands, `/queue` only touches the message queue, so it runs even
+/// while a turn or compaction is in flight — that is when queue edits
+/// (removals included) are most useful.
+fn queue_command(text: &str) -> Option<std::result::Result<queue::QueueOp, String>> {
+    let args = match text.strip_prefix("/queue") {
+        Some(args) if args.is_empty() || args.starts_with(char::is_whitespace) => args,
+        _ => return None,
+    };
+    Some(queue::parse(args))
+}
+
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
 async fn run_compaction(
     agent: &mut Agent,
@@ -724,7 +790,23 @@ async fn run_compaction(
                     terminal.renderer.event(&agent::AgentEvent::Context);
                     eprintln!("[mode: {mode} — {}]", mode.describe());
                 }
-                other => terminal.queued.push_back(other),
+                other => {
+                    // `/queue` edits apply mid-compaction too; everything else
+                    // waits for the loop to pick it up afterwards.
+                    if let TermInput::Line(line) = &other
+                        && let Some(op) = queue_command(line.trim())
+                    {
+                        match op {
+                            Ok(op) => {
+                                let result = terminal.edit_queue(&op);
+                                terminal.renderer.note(&result);
+                            }
+                            Err(usage) => terminal.renderer.note(&format!("[{usage}]")),
+                        }
+                    } else {
+                        terminal.queued.push_back(other);
+                    }
+                }
             },
         }
     }
@@ -843,6 +925,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 println!("No plan yet. The agent makes one with the plan_add tool.");
             } else {
                 print!("{}", agent.plan().render(true, usize::MAX));
+            }
+            Ok(true)
+        }
+        _ if let Some(op) = queue_command(cmd) => {
+            // List is the read-only form; the edits (remove/edit/clear) were
+            // already applied mid-turn when typed then, and apply here at the
+            // prompt.
+            match op {
+                Ok(queue::QueueOp::List) => println!("{}", queue::describe(&terminal.messages)),
+                Ok(op) => println!("{}", terminal.edit_queue(&op)),
+                Err(usage) => println!("{usage}"),
             }
             Ok(true)
         }
@@ -1176,7 +1269,7 @@ async fn main() -> Result<()> {
                 status.draw();
             }
             let prompt = |terminal: &Terminal, separate: bool| {
-                if terminal.queued.is_empty() {
+                if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
                     let prompt = view.prompt();
                     // Serialise the prompt write under the terminal lock so it
@@ -1197,7 +1290,7 @@ async fn main() -> Result<()> {
             separate = false;
 
             let input = loop {
-                match terminal.next().await {
+                match terminal.next(&agent).await {
                     TermInput::ToggleThinking => {
                         if terminal.renderer.toggle_thinking() {
                             prompt(&terminal, false);

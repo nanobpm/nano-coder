@@ -32,6 +32,18 @@ impl MockLLMClient {
 
     fn pick_tool(content: &str) -> Option<(&'static str, serde_json::Value)> {
         let content = content.to_lowercase();
+        // "question"/"ask" drives the `question` tool, so the interactive
+        // picker flow (and the rule that a queued message is never injected
+        // while a question is pending) can be exercised without a model.
+        if content.contains("question") || content.contains("ask") {
+            return Some(("question", json!({
+                "questions": [{
+                    "question": "Which way should I go?",
+                    "header": "Direction",
+                    "options": [{ "label": "Left" }, { "label": "Right" }]
+                }]
+            })));
+        }
         if content.contains("time") || content.contains("clock") {
             return Some(("get_time", json!({})));
         }

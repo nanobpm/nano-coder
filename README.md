@@ -20,7 +20,7 @@ cargo install nano-coder             # or build from source
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/restart`, `/exit`
+- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -38,9 +38,14 @@ cargo run
 
 Starts the interactive REPL where you can chat with the agent and use slash commands.
 
-While a turn is running you can type a message and press Enter to **steer** it: the
-message joins the conversation before the next model call (even if the model had
-just produced its final answer, the turn continues with the steer). **Esc Esc** (twice within a second) or **Ctrl-C** cancels
+While a turn is running you can type a message and press Enter to **queue** it: the
+message waits in a queue and runs as a later prompt — one per turn, in the order you
+sent them. The status line shows how many are waiting. Edit the queue at any time
+(even mid-turn) with `/queue`: `/queue` lists the waiting messages, `/queue remove N`
+drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites one, and
+`/queue clear` empties the queue. A queued message is never injected while the agent is
+asking for input (the `question` tool's picker owns the terminal until you answer).
+**Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts.
 
@@ -136,9 +141,10 @@ src/
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
 ├── ui.rs        # Verbosity levels and the streaming output renderer
-├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, steering on the status line)
+├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, mid-turn input on the status line)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
+├── queue.rs     # The interactive message queue and the /queue editor
 ├── goal.rs      # report_outcome tool (completed / blocked / needs_input)
 ├── mode.rs      # Agent mode (normal / plan / auto) and the plan-mode tool gate
 ├── question.rs  # question tool and the mid-turn question / turn-cap rendezvous
@@ -294,6 +300,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
+- `/queue [list|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching the turn cap asks whether to keep going
@@ -531,7 +538,8 @@ enabled (e.g. `extra_body = { thinking = { type = "enabled", budget_tokens = 400
 error).
 
 **Input.** On a terminal, input is read key by key. While a turn runs, what you type shows
-on the status line; Enter sends it as a steer, Esc Esc or Ctrl-C cancels the turn. The prompt supports
+on the status line; Enter adds it to the message queue (one queued message runs per
+following turn; `/queue` lists, edits and removes them), Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and clicking with the mouse places the
 cursor. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
