@@ -61,25 +61,60 @@ def default_binary():
     return shutil.which("nano-coder") or "nano-coder"
 
 
+# Built-in provider presets nano-coder ships (src/providers/mod.rs `presets()`).
+# These are valid provider names even without a `[providers.<name>]` table, so a
+# spec like `github-copilot/gpt-4.1` resolves to the preset, not the default.
+PRESET_PROVIDERS = frozenset({
+    "openai", "anthropic", "openrouter", "fireworks", "groq", "together",
+    "deepseek", "kimi", "mistral", "gemini", "github-copilot", "qwen",
+    "ollama", "llamacpp", "mock",
+})
+
+
+def effective_providers(base):
+    """`(provider names, default_provider)` as nano-coder resolves them
+    (src/providers/mod.rs `effective_providers`, src/config.rs): the built-in
+    presets overlaid with configured `[providers.<name>]` tables, and the
+    effective default provider. `default_provider` defaults to `mock`; a
+    legacy top-level `api_key`/`base_url` promotes a `mock` default to
+    `openai`. Only top-level keys count — provider-table keys are ignored."""
+    text = Path(base).read_text() if base and Path(base).is_file() else ""
+    providers = set(PRESET_PROVIDERS) | set(re.findall(r"(?m)^\s*\[providers\.([^.\]\s]+)", text))
+    default, has_legacy, in_table = "mock", False, False
+    for line in text.splitlines():
+        if line.strip().startswith("["):
+            in_table = True
+            continue
+        if in_table:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key == "default_provider":
+            m = re.search(r'"([^"]+)"', line)
+            if m:
+                default = m.group(1)
+        elif key in ("api_key", "base_url"):
+            has_legacy = True
+    if default == "mock" and has_legacy:
+        default = "openai"
+    return providers, default
+
+
 def provider_for(model, base):
     """The provider table a model spec targets, matching nano-coder's rule
-    (src/providers/mod.rs): `provider/model` uses the head only when it is a
-    configured provider; otherwise the whole spec is a model on the config's
-    `default_provider`. So `gpt-4o` and `qwen3:8b` resolve to the default
-    provider, not to a bogus `gpt-4o`/`qwen3:8b` table."""
-    text = Path(base).read_text() if base and Path(base).is_file() else ""
-    providers = set(re.findall(r"(?m)^\s*\[providers\.([^.\]\s]+)", text))
-    m = re.search(r'(?m)^\s*default_provider\s*=\s*"([^"]+)"', text)
-    default = m.group(1) if m else None
+    (src/providers/mod.rs `parse_model_spec`): `provider/model` uses the head
+    only when it names a known provider — a built-in preset OR a configured
+    `[providers.<name>]` table; otherwise the whole spec is a model on the
+    config's `default_provider`. So `gpt-4o` and `qwen3:8b` resolve to the
+    default provider, while `github-copilot/gpt-4.1` resolves to the
+    `github-copilot` preset even with no table for it."""
+    providers, default = effective_providers(base)
     if "/" in model:
         head = model.split("/", 1)[0]
         if head in providers:
             return head
     elif model in providers:
         return model
-    # Fall back to the configured default; then any single provider; then the
-    # raw prefix (last resort when the base config lists neither).
-    return default or (next(iter(providers)) if len(providers) == 1 else model.split("/", 1)[0])
+    return default
 
 
 def config_text(base, session_dir, mode, extra_body=None, providers=()):
@@ -106,6 +141,9 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
     if extra_body:
         # Inline-table form of the JSON; appended per provider under test.
         def toml_value(v):
+            if v is None:
+                sys.exit("error: --extra-body contains a JSON null, which TOML cannot represent; "
+                         "remove the null field or give it a real value")
             if isinstance(v, bool):
                 return "true" if v else "false"
             if isinstance(v, dict):
