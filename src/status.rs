@@ -321,14 +321,14 @@ struct Segment {
 
 fn render_input(text: &str, queued: usize, cols: usize) -> String {
     let prefix = " ✎ queue › ";
-    let hint = "  Enter to queue ";
+    let hint_text = "  Enter to queue ";
     // The queue indicator yields its hint on narrow terminals, then goes
     // entirely, so the row never exceeds `cols`.
     let full = (queued > 0).then(|| format!("⏸{queued} queued · /queue to edit"));
     let short = (queued > 0).then(|| format!("⏸{queued}"));
     let fits = |i: &Option<String>| {
         let extra = i.as_deref().map_or(0, |i| i.chars().count() + 3);
-        prefix.chars().count() + text.chars().count().min(1) + 1 + hint.len() + extra <= cols
+        prefix.chars().count() + text.chars().count().min(1) + 1 + hint_text.len() + extra <= cols
     };
     let indicator = match (full, short) {
         (Some(f), Some(_)) if fits(&Some(f.clone())) => Some(f),
@@ -337,6 +337,10 @@ fn render_input(text: &str, queued: usize, cols: usize) -> String {
         _ => None,
     };
     let extra = indicator.as_deref().map_or(0, |i| i.chars().count() + 3);
+    // The hint is a fixed segment that `saturating_sub` can't shorten, so on a
+    // terminal too narrow to hold the prefix, cursor, indicator, and hint drop
+    // the hint entirely — otherwise the row would spill past `cols`.
+    let hint = if prefix.chars().count() + 1 + hint_text.len() + extra <= cols { hint_text } else { "" };
     let room = cols.saturating_sub(prefix.chars().count() + hint.len() + extra + 1);
     let count = text.chars().count();
     let shown: String = if count > room { text.chars().skip(count - room).collect() } else { text.to_string() };
@@ -547,6 +551,12 @@ mod tests {
         let line = visible(&render_input("a very long line being typed here", 3, 40));
         assert_eq!(line.chars().count(), 40, "{line:?}");
         assert!(line.contains("⏸3"), "{line:?}");
+
+        // Very narrow terminal: the hint is dropped so the row never overflows.
+        for cols in 20..=30 {
+            let line = visible(&render_input("typing here", 0, cols));
+            assert!(line.chars().count() <= cols, "row overflows at {cols} cols: {line:?}");
+        }
     }
 
     #[test]
