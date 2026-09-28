@@ -619,8 +619,9 @@ pub fn restore_terminal() {
 /// as bytes. Output processing is left on. While active, the terminal is
 /// asked for bracketed paste and modifyOtherKeys/kitty key reporting (so
 /// Ctrl/Cmd-Enter is distinguishable from Enter). Mouse tracking is
-/// deliberately not enabled, so the terminal keeps its native wheel
-/// scrolling and text selection.
+/// deliberately not enabled, and any mouse-tracking modes left active by a
+/// previously crashed TUI are cleared on entry, so the terminal keeps its
+/// native wheel scrolling and text selection.
 struct KeyMode;
 
 impl KeyMode {
@@ -635,7 +636,13 @@ impl KeyMode {
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         if entered {
             KEY_MODE_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
-            write("\x1b[?2004h\x1b[>4;1m\x1b[>1u");
+            // Clear any mouse-tracking modes (normal/button/any-event tracking
+            // and SGR extended reports) that a previously crashed TUI may have
+            // left enabled, so wheel and drag events reach the terminal's
+            // native scrollback/selection instead of being routed to us as
+            // reports we would only discard. Then enable bracketed paste and
+            // modifyOtherKeys/kitty key reporting.
+            write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004h\x1b[>4;1m\x1b[>1u");
         }
         entered.then_some(Self)
     }
@@ -813,6 +820,19 @@ impl LineReader {
                                 seq.push(b);
                                 if (0x40..=0x7e).contains(&b) {
                                     break;
+                                }
+                            }
+                            // Legacy X10/normal mouse reports are ESC [ M then
+                            // three raw coordinate bytes. The CSI reader stops
+                            // at M, so consume those three bytes here to keep
+                            // them from leaking into the input as text (mouse
+                            // modes are cleared on entry, but a report buffered
+                            // before then could still arrive).
+                            if seq == [0x1b, b'[', b'M'] {
+                                for _ in 0..3 {
+                                    if self.next_byte().is_none() {
+                                        break;
+                                    }
                                 }
                             }
                             // Shift+Tab is ESC [ Z (backtab); everything else is
