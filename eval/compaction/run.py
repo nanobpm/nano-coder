@@ -88,6 +88,25 @@ def _load_toml(text):
         return None
 
 
+def _toml_parses(text):
+    """`True`/`False` whether `text` is valid TOML, or `None` when no parser is
+    installed. Unlike `_load_toml`, this distinguishes a malformed document from
+    a missing parser so callers can validate emitted config rather than silently
+    falling back."""
+    try:
+        import tomllib as toml
+    except ModuleNotFoundError:
+        try:
+            import tomli as toml
+        except ModuleNotFoundError:
+            return None
+    try:
+        toml.loads(text)
+        return True
+    except Exception:
+        return False
+
+
 def _effective_providers_regex(text):
     """Best-effort fallback for when no TOML parser is installed. Handles
     bare, double-quoted and single-quoted `[providers.<name>]` keys and both
@@ -318,7 +337,23 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                 merged = deep_merge(existing, extra_body)
             tail.append(f"[providers.{key}.extra_body]")
             tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in merged.items()]
-    return "\n".join(head + lines + tail) + "\n"
+    result = "\n".join(head + lines + tail) + "\n"
+    if extra_body and _toml_parses(result) is False:
+        # A parser is available (so we read/merged the base) yet the emitted
+        # config is invalid TOML. This happens when a provider under test is
+        # written as an inline table — `foo = { ... }` under `[providers]`, or a
+        # root-level `providers = { foo = { ... } }` — because `[providers.<p>.
+        # extra_body]` cannot extend an inline table (whether or not it already
+        # had an extra_body). Reject with a clear error instead of writing an
+        # unusable config that fails opaquely when nano-coder loads it.
+        raise ValueError(
+            "--extra-body produced invalid TOML: a provider under test is defined "
+            "as a TOML inline table (e.g. `provider = { ... }` under `[providers]`, "
+            "or `providers = { ... }`), which `[providers.<name>.extra_body]` cannot "
+            "extend. Rewrite the affected provider as a standard `[providers.<name>]` "
+            "table (header form) to use --extra-body."
+        )
+    return result
 
 
 def fork_records(path, line):
