@@ -16,8 +16,10 @@ pub struct StatusLine {
     stats: SharedStats,
     /// Terminal rows and columns the scroll region was set for.
     size: Mutex<Option<(u16, u16)>>,
-    /// Text being typed during a turn (a steer), shown instead of the stats.
-    input: Mutex<Option<String>>,
+    /// Text being typed during a turn (a steer), with the cursor's character
+    /// index, shown instead of the stats. Stored raw and rendered at draw time
+    /// so the steer prefix, cursor and padding are applied exactly once.
+    input: Mutex<Option<(String, usize)>>,
 }
 
 pub fn terminal_size() -> Option<(u16, u16)> {
@@ -225,16 +227,18 @@ impl StatusLine {
             }
             Some(_) => String::new(),
         };
-        let line = match self.input.lock().unwrap().as_deref() {
-            Some(text) => render_input(text, cols as usize),
+        let line = match &*self.input.lock().unwrap() {
+            Some((text, cursor)) => render_input_with_cursor(text, *cursor, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
         write_raw(&format!("{prefix}\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
     }
 
-    /// Show `text` as a line being typed (None: back to the stats).
-    pub fn set_input(&self, text: Option<&str>) {
-        *self.input.lock().unwrap() = text.map(str::to_string);
+    /// Show `text` as a line being typed, with the cursor `cursor` characters
+    /// in (None: back to the stats). The text is stored raw and rendered at
+    /// draw time.
+    pub fn set_input(&self, text: Option<(&str, usize)>) {
+        *self.input.lock().unwrap() = text.map(|(t, c)| (t.to_string(), c));
         self.draw();
     }
 
@@ -315,16 +319,31 @@ struct Segment {
     priority: u8,
 }
 
-fn render_input(text: &str, cols: usize) -> String {
+/// The steer line with the cursor marked at `cursor` characters in, and
+/// newlines shown as `⏎` so multi-line input stays on one status row.
+pub fn render_input_with_cursor(text: &str, cursor: usize, cols: usize) -> String {
     let prefix = " ✎ steer › ";
     let hint = "  Enter to send ";
     let room = cols.saturating_sub(prefix.chars().count() + hint.len() + 1);
-    let count = text.chars().count();
-    let shown: String = if count > room { text.chars().skip(count - room).collect() } else { text.to_string() };
+    // Flatten to one row, marking where the cursor sits.
+    let flat: String = text.chars().map(|c| if c == '\n' { '⏎' } else { c }).collect();
+    let cursor = cursor.min(flat.chars().count());
+    // Keep the cursor visible: show the window of text around it.
+    let start = if flat.chars().count() > room {
+        cursor.saturating_sub(room / 2).min(flat.chars().count() - room)
+    } else {
+        0
+    };
+    let shown: String = flat.chars().skip(start).take(room).collect();
+    let cursor_col = cursor - start;
+    let before: String = shown.chars().take(cursor_col).collect();
+    let under: String = shown.chars().skip(cursor_col).take(1).collect();
+    let after: String = shown.chars().skip(cursor_col + 1).collect();
+    let cursor_glyph = if under.is_empty() { "█".to_string() } else { format!("\x1b[7m{under}\x1b[27m") };
     let used = prefix.chars().count() + shown.chars().count() + 1;
     let pad = cols.saturating_sub(used + hint.len());
     format!(
-        "{BG}\x1b[1;38;5;117m{prefix}\x1b[0;48;5;236;38;5;255m{shown}█{}\x1b[38;5;244m{hint}{RESET}",
+        "{BG}\x1b[1;38;5;117m{prefix}\x1b[0;48;5;236;38;5;255m{before}{cursor_glyph}{after}{}\x1b[38;5;244m{hint}{RESET}",
         " ".repeat(pad)
     )
 }
