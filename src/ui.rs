@@ -258,7 +258,10 @@ impl Renderer {
         let width = (cols as usize).max(1);
         let height = (rows as usize).max(1);
         let transcript = frame::transcript_lines(&fs.items, width);
-        let mut editor = frame::editor_lines("› ", &fs.editor.0, fs.editor.1, width);
+        // Prefix the editor prompt with the timestamp when timestamps are on,
+        // matching the legacy prompt so switching renderers keeps the setting.
+        let prompt = format!("{}› ", stamp());
+        let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
         }
@@ -346,6 +349,7 @@ impl Renderer {
                     None => {
                         fs.items.push(Item::Message {
                             role: Role::Assistant,
+                            stamp: stamp(),
                             text: (*text).to_string(),
                         });
                         fs.stream = Some(fs.items.len() - 1);
@@ -356,6 +360,7 @@ impl Renderer {
                 if fs.stream.is_none() && !text.is_empty() {
                     fs.items.push(Item::Message {
                         role: Role::Assistant,
+                        stamp: stamp(),
                         text: (*text).to_string(),
                     });
                 }
@@ -435,7 +440,7 @@ impl Renderer {
             // so there is no double entry.)
             AgentEvent::UserMessage { text } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(Item::Message { role: Role::User, text: (*text).to_string() });
+                fs.items.push(Item::Message { role: Role::User, stamp: stamp(), text: (*text).to_string() });
             }
             AgentEvent::Context => {}
         }
@@ -446,7 +451,7 @@ impl Renderer {
     pub fn frame_user_message(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            fs.items.push(Item::Message { role: Role::User, text: text.to_string() });
+            fs.items.push(Item::Message { role: Role::User, stamp: stamp(), text: text.to_string() });
             self.frame_render(&mut fs);
         }
     }
@@ -1015,7 +1020,7 @@ mod tests {
         // Replaying a resumed session (and mid-turn steer messages) surface as
         // `UserMessage` events; they must land in the transcript.
         r.event(&AgentEvent::UserMessage { text: "resumed prompt" });
-        let user = r.frame_items().iter().filter(|i| matches!(i, Item::Message { role: Role::User, text } if text == "resumed prompt")).count();
+        let user = r.frame_items().iter().filter(|i| matches!(i, Item::Message { role: Role::User, text, .. } if text == "resumed prompt")).count();
         assert_eq!(user, 1);
     }
 

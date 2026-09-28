@@ -93,8 +93,12 @@ pub enum Role {
 /// of the item and the width, so a width change just re-renders every item.
 #[derive(Debug, Clone)]
 pub enum Item {
-    /// A user or assistant message (plain text, wrapped to width).
-    Message { role: Role, text: String },
+    /// A user or assistant message (plain text, wrapped to width). `stamp` is
+    /// the pre-formatted timestamp prefix (e.g. `ui::stamp()`) captured when
+    /// the message was created; empty when timestamps are off. Storing it on
+    /// the item keeps rendering a pure function of item + width and preserves
+    /// the message's original time across re-renders (e.g. a width change).
+    Message { role: Role, stamp: String, text: String },
     /// A finished reasoning block, shown collapsed as a one-line summary.
     Thinking { chars: usize, seconds: f64 },
     /// A tool invocation: the tool name and a one-line argument summary.
@@ -119,20 +123,36 @@ pub enum Item {
 pub fn render_item(item: &Item, width: usize) -> Vec<String> {
     let width = width.max(1);
     match item {
-        Item::Message { role, text } => {
+        Item::Message { role, stamp, text } => {
             let prefix = match role {
                 Role::User => "› ",
                 Role::Assistant => "",
             };
-            let body = wrap_block(text, width.saturating_sub(prefix.chars().count()).max(1));
+            // Reserve the timestamp column for every line (continuation rows are
+            // indented under it, mirroring the legacy `ui::stamp_block`) and the
+            // `› ` marker column for the first line, so no row overflows `width`.
+            let stamp_w = visible_width(stamp);
+            let inner = width
+                .saturating_sub(stamp_w + prefix.chars().count())
+                .max(1);
+            let body = wrap_block(text, inner);
+            let pad = " ".repeat(stamp_w);
             body.into_iter()
                 .enumerate()
                 .map(|(i, line)| {
-                    if i == 0 && !prefix.is_empty() {
-                        format!("{DIM}{prefix}{RESET}{line}")
+                    // The stamp + marker prefix and the continuation indent are
+                    // fixed-width; bound every assembled row so an extremely
+                    // narrow frame can't overflow and wrap natively.
+                    let row = if i == 0 {
+                        if prefix.is_empty() {
+                            format!("{stamp}{line}")
+                        } else {
+                            format!("{stamp}{DIM}{prefix}{RESET}{line}")
+                        }
                     } else {
-                        line
-                    }
+                        format!("{pad}{line}")
+                    };
+                    fit(&row, width)
                 })
                 .collect()
         }
@@ -274,7 +294,9 @@ pub fn editor_lines(prompt: &str, text: &str, cursor: usize, width: usize) -> Ve
     if cursor >= text.chars().count() {
         marked.push(MARK);
     }
-    let inner = width.saturating_sub(prompt.chars().count()).max(1);
+    // The prompt may carry a timestamp with ANSI colour codes, so reserve its
+    // on-screen width by visible cells rather than raw `char` count.
+    let inner = width.saturating_sub(visible_width(prompt)).max(1);
     let mut lines: Vec<String> = Vec::new();
     for (i, logical) in marked.split('\n').enumerate() {
         let wrapped = if i == 0 {
@@ -377,6 +399,8 @@ fn visible_width(text: &str) -> usize {
 /// Truncate a (possibly ANSI-coloured) string to `width` terminal cells,
 /// appending an ellipsis and a reset when it overflows.
 fn fit(text: &str, width: usize) -> String {
+    let expanded = expand_tabs(text);
+    let text = expanded.as_str();
     if visible_width(text) <= width {
         return text.to_string();
     }
@@ -418,10 +442,53 @@ fn wrap_block(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+/// Expand tab characters to spaces (8-column tab stops) so layout width
+/// accounting stays exact. A literal `\t` has no `UnicodeWidthChar` width but
+/// the terminal advances it to the next tab stop, so leaving tabs in place lets
+/// tool output, model text, or pasted input emit rows wider than `width` and
+/// push the editor/status bar out of position. ANSI escape sequences are copied
+/// through without advancing the column.
+fn expand_tabs(line: &str) -> String {
+    const TAB: usize = 8;
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                while let Some(&n) = chars.peek() {
+                    out.push(chars.next().unwrap());
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c == '\t' {
+            let spaces = TAB - (col % TAB);
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            col += spaces;
+            continue;
+        }
+        out.push(c);
+        col += cell_width(c);
+    }
+    out
+}
+
 /// Wrap one logical line to `width` visible columns, preserving ANSI escape
 /// sequences (they take no columns) and breaking on spaces where possible.
 fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
+    let line = expand_tabs(line);
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut vis = 0usize;
@@ -732,6 +799,56 @@ mod tests {
     }
 
     #[test]
+    fn tabs_are_expanded_so_rows_never_overflow_the_width() {
+        // A literal tab has no `UnicodeWidthChar` width but the terminal
+        // advances it to the next tab stop; leaving it in would let a row emit
+        // wider than `width` and wrap natively. Expanded content must never
+        // exceed the width and must contain no tabs.
+        let text = "a\tb\tcategory\tvalue\tand some more trailing words here";
+        for width in 3..40 {
+            for line in wrap_ansi(text, width) {
+                assert!(
+                    visible_width(&line) <= width,
+                    "row overflows at width {width}: {line:?} (w={})",
+                    visible_width(&line)
+                );
+                assert!(!line.contains('\t'), "tab survived layout: {line:?}");
+            }
+        }
+        // Tabs advance to 8-column stops from the current column.
+        assert_eq!(expand_tabs("a\tb"), "a       b");
+        assert_eq!(expand_tabs("\tx"), "        x");
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
+    }
+
+    #[test]
+    fn message_stamp_is_shown_and_rows_stay_within_width() {
+        // A stamped message renders the timestamp on the first line, keeps every
+        // row within the width, and indents continuation rows under the stamp.
+        let stamp = format!("{DIM}12:34:56{RESET} ");
+        let item = Item::Message {
+            role: Role::User,
+            stamp: stamp.clone(),
+            text: "a fairly long user question that wraps onto several rows".into(),
+        };
+        for width in 4..40 {
+            let lines = render_item(&item, width);
+            for line in &lines {
+                assert!(
+                    visible_width(line) <= width,
+                    "row overflows at width {width}: {line:?} (w={})",
+                    visible_width(line)
+                );
+            }
+        }
+        let lines = render_item(&item, 30);
+        assert!(strip(&lines[0]).starts_with("12:34:56 › "), "{:?}", lines[0]);
+        // With timestamps off (empty stamp) the first row keeps the bare marker.
+        let bare = Item::Message { role: Role::User, stamp: String::new(), text: "hi".into() };
+        assert_eq!(strip(&render_item(&bare, 30)[0]), "› hi");
+    }
+
+    #[test]
     fn plan_header_is_bounded_to_the_width() {
         let plan = Plan::default();
         // Even at a pathologically narrow width the header row never exceeds it,
@@ -807,6 +924,7 @@ mod tests {
         let items = vec![
             Item::Message {
                 role: Role::Assistant,
+                stamp: String::new(),
                 text: "a fairly long assistant answer that should wrap".into(),
             },
             Item::ToolCall {
@@ -968,9 +1086,10 @@ mod emulator {
     fn sample_frame(width: usize) -> Vec<String> {
         let transcript = transcript_lines(
             &[
-                Item::Message { role: Role::User, text: "please summarise the plan".into() },
+                Item::Message { role: Role::User, stamp: String::new(), text: "please summarise the plan".into() },
                 Item::Message {
                     role: Role::Assistant,
+                    stamp: String::new(),
                     text: "here is a fairly long answer that is meant to wrap onto more than one row when the terminal is narrow".into(),
                 },
             ],
