@@ -1404,6 +1404,15 @@ async fn main() -> Result<()> {
                 }
             });
         }
+        // A resumed session loads its conversation before the sink is wired,
+        // so the app-owned frame opens empty. Replay the loaded history now
+        // (the sink is installed) to reconstruct the transcript into
+        // `FrameState`; `frame_event` populates user, assistant, tool and plan
+        // items. Only in frame mode — the legacy renderer would dump the whole
+        // conversation inline, which it has never done on resume.
+        if frame_mode && args.resume.is_some() {
+            agent.replay_history();
+        }
         let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
         let mut running = true;
         let mut exit_armed = false;

@@ -194,6 +194,11 @@ struct FrameState {
     stream: Option<usize>,
     /// The reasoning block streaming in `(text, started)`, shown collapsed.
     think: Option<(String, Instant)>,
+    /// True once reasoning has arrived as `ThinkingDelta`s this turn. It lets
+    /// the trailing full `Thinking` event skip re-emitting a summary that a
+    /// preceding `TextDelta` already finalized, which would otherwise duplicate
+    /// the reasoning line. Reset at each turn/message boundary.
+    think_streamed: bool,
 }
 
 impl Renderer {
@@ -207,6 +212,7 @@ impl Renderer {
                 queued: 0,
                 stream: None,
                 think: None,
+                think_streamed: false,
             })
         });
         Arc::new(Self {
@@ -265,6 +271,7 @@ impl Renderer {
     /// fresh.
     fn frame_finish_stream(&self, fs: &mut FrameState) {
         fs.stream = None;
+        fs.think_streamed = false;
         if let Some((text, started)) = fs.think.take() {
             let text = text.trim();
             if !text.is_empty() {
@@ -280,14 +287,33 @@ impl Renderer {
     fn frame_event(&self, fs: &mut FrameState, event: &AgentEvent) {
         match event {
             AgentEvent::ThinkingDelta { text } => {
+                fs.think_streamed = true;
                 fs.think.get_or_insert_with(|| (String::new(), Instant::now())).0.push_str(text);
             }
             AgentEvent::Thinking { text } => {
-                let started = fs.think.take().map(|(_, s)| s).unwrap_or_else(Instant::now);
-                let chars = text.trim().chars().count();
-                if chars > 0 {
-                    fs.items.push(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() });
+                match fs.think.take() {
+                    // Reasoning streamed as deltas but was not yet finalized by
+                    // a `TextDelta` (e.g. reasoning-only, or the answer is not
+                    // streamed): emit its summary now.
+                    Some((_, started)) => {
+                        let chars = text.trim().chars().count();
+                        if chars > 0 {
+                            fs.items.push(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() });
+                        }
+                    }
+                    // No pending reasoning. If deltas streamed this turn, a
+                    // preceding `TextDelta` already finalized the summary, so
+                    // skip to avoid duplicating it. Otherwise this is a
+                    // non-streamed block delivered whole — emit it.
+                    None if !fs.think_streamed => {
+                        let chars = text.trim().chars().count();
+                        if chars > 0 {
+                            fs.items.push(Item::Thinking { chars, seconds: 0.0 });
+                        }
+                    }
+                    None => {}
                 }
+                fs.think_streamed = false;
                 // Do NOT reset `fs.stream` here: a streamed assistant message
                 // may already be in flight (reasoning can arrive after the
                 // answer starts). Only `AssistantMessage` finalizes the stream;
@@ -401,7 +427,17 @@ impl Renderer {
                 self.frame_finish_stream(fs);
                 fs.items.push(Item::Note("⟳ context compacted".to_string()));
             }
-            AgentEvent::Context | AgentEvent::UserMessage { .. } => {}
+            // Steer/queued messages absorbed mid-turn arrive as `UserMessage`
+            // events; render them in the transcript. Replaying a resumed
+            // session also emits the loaded user turns through this arm so the
+            // frame reconstructs the full history. (The primary interactive
+            // prompt is recorded directly via `frame_user_message`, not here,
+            // so there is no double entry.)
+            AgentEvent::UserMessage { text } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(Item::Message { role: Role::User, text: (*text).to_string() });
+            }
+            AgentEvent::Context => {}
         }
         self.frame_render(fs);
     }
@@ -917,6 +953,71 @@ fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    impl Renderer {
+        /// Build a frame-mode renderer regardless of tty, for driving
+        /// `frame_event` in tests. Rendering writes to stdout (captured by the
+        /// test harness).
+        fn frame_for_test() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(State { at_line_start: true, ..Default::default() }),
+                status: None,
+                tty: true,
+                expanded: AtomicBool::new(false),
+                frame: Some(Mutex::new(FrameState {
+                    out: FrameRenderer::new(io::stdout()),
+                    items: Vec::new(),
+                    editor: (String::new(), 0),
+                    queued: 0,
+                    stream: None,
+                    think: None,
+                    think_streamed: false,
+                })),
+            })
+        }
+
+        #[cfg(test)]
+        fn frame_items(&self) -> Vec<Item> {
+            self.frame.as_ref().unwrap().lock().unwrap().items.clone()
+        }
+    }
+
+    #[test]
+    fn streamed_reasoning_then_text_emits_one_thinking_summary() {
+        let r = Renderer::frame_for_test();
+        // Reasoning streams as deltas, then the answer streams as text, then a
+        // trailing full `Thinking` event repeats the reasoning: the summary
+        // must appear exactly once, and the streamed answer exactly once.
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering the plan" });
+        r.event(&AgentEvent::TextDelta { text: "Here " });
+        r.event(&AgentEvent::TextDelta { text: "is the answer." });
+        r.event(&AgentEvent::Thinking { text: "pondering the plan" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+        let items = r.frame_items();
+        let thinking = items.iter().filter(|i| matches!(i, Item::Thinking { .. })).count();
+        let messages = items.iter().filter(|i| matches!(i, Item::Message { role: Role::Assistant, .. })).count();
+        assert_eq!(thinking, 1, "reasoning summary duplicated: {items:?}");
+        assert_eq!(messages, 1, "streamed answer duplicated: {items:?}");
+    }
+
+    #[test]
+    fn non_streamed_thinking_event_still_emits_summary() {
+        let r = Renderer::frame_for_test();
+        // No ThinkingDelta: a whole `Thinking` block must still show once.
+        r.event(&AgentEvent::Thinking { text: "quick thought" });
+        let thinking = r.frame_items().iter().filter(|i| matches!(i, Item::Thinking { .. })).count();
+        assert_eq!(thinking, 1);
+    }
+
+    #[test]
+    fn user_message_event_is_recorded_in_frame_transcript() {
+        let r = Renderer::frame_for_test();
+        // Replaying a resumed session (and mid-turn steer messages) surface as
+        // `UserMessage` events; they must land in the transcript.
+        r.event(&AgentEvent::UserMessage { text: "resumed prompt" });
+        let user = r.frame_items().iter().filter(|i| matches!(i, Item::Message { role: Role::User, text } if text == "resumed prompt")).count();
+        assert_eq!(user, 1);
+    }
 
     #[test]
     fn stamps_the_first_line_and_aligns_the_rest() {

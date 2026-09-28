@@ -182,12 +182,12 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
         let mut out = Vec::new();
         for (i, line) in lines.iter().take(PREVIEW_LINES).enumerate() {
             let lead = if i == 0 { mark } else { " " };
-            out.push(format!("  {color}{lead} {}{RESET}", fit(line, body)));
+            out.push(fit(&format!("  {color}{lead} {}{RESET}", fit(line, body)), width));
         }
         if lines.len() > PREVIEW_LINES {
-            out.push(format!(
-                "  {DIM}  … +{} lines{RESET}",
-                lines.len() - PREVIEW_LINES
+            out.push(fit(
+                &format!("  {DIM}  … +{} lines{RESET}", lines.len() - PREVIEW_LINES),
+                width,
             ));
         }
         return out;
@@ -197,9 +197,12 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
     } else {
         String::new()
     };
-    vec![format!(
-        "  {color}{mark} {}{more}{RESET}",
-        fit(lines[0], body.saturating_sub(more.len()))
+    vec![fit(
+        &format!(
+            "  {color}{mark} {}{more}{RESET}",
+            fit(lines[0], body.saturating_sub(more.len()))
+        ),
+        width,
     )]
 }
 
@@ -736,6 +739,20 @@ mod tests {
         for width in 3..20 {
             for line in plan_lines(&plan, width) {
                 assert!(visible_width(&line) <= width, "row overflows at {width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_count_rows_are_bounded_to_the_width() {
+        // A tool result whose count/summary row ("… +N lines" / "(+N lines)")
+        // could itself exceed a narrow frame and wrap, pushing later rows down.
+        let output = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        for width in 3..24 {
+            for verbose in [false, true] {
+                for line in tool_result_lines(true, &output, verbose, width) {
+                    assert!(visible_width(&line) <= width, "row overflows at {width}: {line:?}");
+                }
             }
         }
     }

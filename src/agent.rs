@@ -294,7 +294,8 @@ impl TurnControl {
 /// Live progress of a turn, for streaming to a client (ACP `session/update`).
 #[derive(Debug)]
 pub enum AgentEvent<'a> {
-    /// Only emitted when replaying history.
+    /// Emitted when replaying history and for steer/queued messages absorbed
+    /// mid-turn.
     UserMessage { text: &'a str },
     AssistantMessage { message_id: &'a str, text: &'a str },
     /// Streamed piece of the assistant's answer (only when streaming).
