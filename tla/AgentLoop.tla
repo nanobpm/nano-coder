@@ -21,11 +21,15 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Script,        \* sequence of [id, kind], kind \in {"text", "cmd", "cancel"}
-    MaxIter,       \* config.max_iterations
+    MaxIter,       \* config.max_iterations (0 at runtime = unbounded; see Unbounded)
     MaxTools,      \* tool calls per model response
-    FixedLeftover  \* TRUE: leftover steers keep their arrival position
+    FixedLeftover, \* TRUE: leftover steers keep their arrival position
+    Unbounded      \* TRUE models config.max_iterations = 0: the cap never stops a
+                   \* turn, so MaxIter serves only as the model-checking depth
+                   \* bound and reaching it is a benign truncation, not a stop.
 
 ASSUME MaxIter >= 1 /\ MaxTools >= 1 /\ FixedLeftover \in BOOLEAN
+       /\ Unbounded \in BOOLEAN
 
 N == Len(Script)
 Kind(m) == Script[m].kind
@@ -84,11 +88,16 @@ EndTurn(stop) ==
     /\ steers' = <<>> /\ marks' = <<>> /\ absorbed' = <<>>
 
 \* Top of an iteration of Agent::run_turn: stop, or absorb steers and call the model.
-\* `st` and `ab` are the steers/absorbed values on entry.
+\* `st` and `ab` are the steers/absorbed values on entry. Reaching MaxIter stops
+\* the turn with "max_turn_requests" only when the cap is enforced; when Unbounded
+\* (config.max_iterations = 0) MaxIter is merely the model-checking depth bound, so
+\* hitting it truncates the otherwise-endless loop as an ordinary "end_turn".
 LoopTop(it, st, ab) ==
     IF it = MaxIter \/ cancel
     THEN /\ steers = st /\ absorbed = ab   \* (the caller has not changed them)
-         /\ EndTurn(IF cancel THEN "cancelled" ELSE "max_turn_requests")
+         /\ EndTurn(CASE cancel -> "cancelled"
+                      [] Unbounded -> "end_turn"
+                      [] OTHER -> "max_turn_requests")
          /\ UNCHANGED tpc
     ELSE /\ absorbed' = ab \o st /\ steers' = <<>> /\ marks' = <<>>
          /\ tpc' = "call" /\ mode' = "turn"

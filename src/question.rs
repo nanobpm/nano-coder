@@ -162,7 +162,7 @@ impl QuestionBroker {
 /// Whether to keep going when the turn cap is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapDecision {
-    /// Extend the budget by another `max_iterations`.
+    /// Extend the budget by another `max_iterations` (never hit when it is 0).
     Continue,
     /// Stop the turn now.
     Stop,

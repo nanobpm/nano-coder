@@ -10,7 +10,7 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentMode {
-    /// Full tool access; the turn cap prompts before stopping.
+    /// Full tool access; a positive turn cap prompts before stopping.
     #[default]
     Normal,
     /// Read-only: mutating tools are gated, only analysis and output.
@@ -42,7 +42,7 @@ impl AgentMode {
 
     pub fn describe(self) -> &'static str {
         match self {
-            AgentMode::Normal => "full tools; the turn cap asks before stopping",
+            AgentMode::Normal => "full tools; a positive turn cap asks before stopping",
             AgentMode::Plan => "read-only: analysis and output, no changes",
             AgentMode::Auto => "no turn cap; questions auto-answered when you are away",
         }

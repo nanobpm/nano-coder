@@ -298,7 +298,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
-  - **Turn cap** (`max_iterations`): LLM calls per input; normal mode asks before stopping
+  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
@@ -310,7 +310,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/queue [list|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
-  - **normal** - full tools; reaching the turn cap asks whether to keep going
+  - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
   - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/providers` - List providers, endpoints and whether their API key is available
@@ -347,7 +347,7 @@ model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
 temperature = 0.7
 max_tokens = 4096
-max_iterations = 50                     # LLM calls per user input
+max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true

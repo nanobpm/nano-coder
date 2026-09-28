@@ -53,6 +53,16 @@ pub fn key_status(provider: &ProviderConfig) -> String {
     }
 }
 
+/// How the turn cap appears in the settings list. A finite cap notes that
+/// normal mode asks before stopping; an unbounded cap (0) never reaches that
+/// prompt, so the suffix is omitted to avoid contradicting the loop behavior.
+fn turn_cap_label(max_iterations: usize) -> String {
+    match max_iterations {
+        0 => "unbounded".to_string(),
+        n => format!("{n} LLM calls per input (normal mode asks before stopping)"),
+    }
+}
+
 pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
     let mut changes = Changes::default();
     loop {
@@ -63,7 +73,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             "Add or edit a provider".to_string(),
             format!("Temperature      {}", config.temperature),
             format!("Max tokens       {}", config.max_tokens),
-            format!("Turn cap         {} LLM calls per input (normal mode asks before stopping)", config.max_iterations),
+            format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
             format!(
                 "Context          {} window, auto-compact {}, {} compaction",
@@ -109,10 +119,10 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             }
             4 => {
                 let value: usize = Input::new()
-                    .with_prompt("Turn cap (LLM calls per input; normal mode asks before stopping, auto ignores it)")
+                    .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
                     .interact_text()?;
-                agent.config_mut().max_iterations = value.max(1);
+                agent.config_mut().max_iterations = value;
                 changes.max_iterations = true;
             }
             5 => {
@@ -558,6 +568,12 @@ fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_cap_label_marks_zero_as_unbounded() {
+        assert_eq!(turn_cap_label(0), "unbounded");
+        assert_eq!(turn_cap_label(50), "50 LLM calls per input (normal mode asks before stopping)");
+    }
 
     #[test]
     fn model_choice_maps_rows_to_steps() {

@@ -21,7 +21,7 @@ pub struct Config {
     pub api_key: Option<String>,
     /// Legacy: applied to `default_provider` (which becomes `openai` if it was `mock`).
     pub base_url: Option<String>,
-    /// Maximum LLM calls per user input.
+    /// Maximum LLM calls per user input; 0 means unbounded.
     pub max_iterations: usize,
     /// Persist conversations as JSONL session logs.
     pub persist_sessions: bool,
@@ -73,7 +73,7 @@ impl Default for Config {
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             api_key: None,
             base_url: None,
-            max_iterations: 50,
+            max_iterations: 0,
             persist_sessions: true,
             session_dir: None,
             bash_timeout_secs: crate::bash::DEFAULT_TIMEOUT_SECS,

@@ -4,6 +4,14 @@ Model-checked specifications of the harness's concurrency and crash-recovery
 behaviour. Each spec follows the code closely enough that a change to the
 modelled code should come with a change to the spec.
 
+The turn cap (`config.max_iterations`) is modelled by `MaxIter` together with an
+`Unbounded` flag. With `Unbounded = FALSE` the cap is enforced and reaching
+`MaxIter` ends the turn (`max_turn_requests` / the max-iterations note); with
+`Unbounded = TRUE` it models the `max_iterations = 0` default, where the cap
+never stops a turn and `MaxIter` is only the finite model-checking depth bound
+(reaching it truncates as an ordinary completion). Each spec is checked in both
+configurations.
+
 | Spec | Models | Properties |
 |------|--------|------------|
 | `AgentLoop.tla` (+ `MCAgentLoop.tla`) | One ACP session: `acp::run_acp`/`acp::run_turn` routing cancels, steers and other messages into a running `Agent::run_turn` | `AtMostOneReply`, `SendOrder`, `NoSteerAfterCancel`, `AllAnswered` (liveness) |
@@ -12,13 +20,14 @@ modelled code should come with a change to the spec.
 ## Running
 
 ```sh
-tla/check.sh          # AgentLoop + SessionRecovery (~1 min)
+tla/check.sh          # AgentLoop + SessionRecovery, bounded and unbounded caps (~1 min)
 tla/check.sh --deep   # also SessionRecoveryDeep.cfg: two crashes (~2 min more)
 ```
 
 The script needs Java and `tla2tools.jar` (set `TLA2TOOLS`, default
 `~/bin/tla2tools.jar`; download it from the TLA+ releases page). To run one spec:
-`java -cp tla2tools.jar tlc2.TLC -workers auto -config AgentLoop.cfg MCAgentLoop`.
+`java -cp tla2tools.jar tlc2.TLC -workers auto -config AgentLoop.cfg MCAgentLoop`
+(swap in `AgentLoopUnbounded.cfg` for the unbounded cap).
 
 ## Findings
 
