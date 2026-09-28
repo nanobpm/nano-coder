@@ -203,17 +203,22 @@ impl EditView {
     }
 
     /// The terminal was resized: the old menu rows may no longer fit, so
-    /// blank the rows we reserved and redraw the menu sized to the new
-    /// terminal. Called after the status line redraws for the new size.
+    /// redraw the menu sized to the new terminal, clearing any rows the old
+    /// (possibly taller) menu occupied, then repaint the status line last.
     pub fn resize(&mut self) {
-        // With a status line the conversation reflows on its own (no scroll
-        // region), so only the menu rows need tidying before the redraw.
-        if self.menu_rows > 0 && self.status.is_none() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], false);
-            write(&seq);
-        }
-        self.menu_rows = 0;
+        // Redraw the menu sized to the new terminal. Keep `menu_rows` as-is so
+        // `draw_menu` (through `menu_sequence`) blanks `max(old, new)` rows:
+        // that erases the old rows for *both* modes, so a resize that shrinks
+        // or removes the menu leaves no stale rows behind. Resetting the count
+        // first would make the redraw clear only the new rows and strand the
+        // surplus old ones on screen when a status line is active.
         self.draw_menu();
+        // The cleanup walks down from the prompt row and can reach the bottom
+        // row, so repaint the status line afterwards — it must be drawn last so
+        // the menu redraw cannot erase it.
+        if let Some(status) = &self.status {
+            status.resize();
+        }
     }
 
     /// Remove the last `n` characters.
