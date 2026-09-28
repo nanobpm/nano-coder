@@ -541,8 +541,8 @@ error).
 on the status line; Enter adds it to the message queue (one queued message runs per
 following turn; `/queue` lists, edits and removes them), Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
-Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and clicking with the mouse places the
-cursor. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
+Alt/Option-Left/Right (or Alt-B/Alt-F) move by word. The mouse is never captured, so the
+terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
 input and Ctrl-W deletes the word before the cursor. Ctrl-Enter (or Cmd-Enter) inserts a
 newline without sending, and pasted text keeps its line breaks as a single multi-line input
 instead of sending line by line. Ctrl-D exits on an empty line.
