@@ -253,21 +253,23 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                 return None
             return [dq or sq or bare for dq, sq, bare
                     in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', m.group(1))]
-        def first_key_segment(key_part):
-            # First dotted-key segment of a `key = value` assignment's key
-            # (quoted segments keep dots/spaces), or None when there is none.
-            toks = re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', key_part)
-            if not toks:
-                return None
-            dq, sq, bare = toks[0]
-            return dq or sq or bare
+        def key_segments(key_part):
+            # All dotted-key segments of a `key = value` assignment's key
+            # (quoted segments keep their dots/spaces).
+            return [dq or sq or bare for dq, sq, bare
+                    in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', key_part)]
         def strip_extra_body(cfg_lines, provider):
             # Drop an existing extra_body for `provider` (an inline
             # `extra_body = {...}` or dotted `extra_body.<field> = ...`
             # assignment under `[providers.<p>]`, or a
             # `[providers.<p>.extra_body]` sub-table and any of its own
             # sub-tables) so the merged table we emit is the only one — two
-            # declarations of the same key would be invalid TOML.
+            # declarations of the same key would be invalid TOML. Match on the
+            # full dotted path (`cur` + the assignment's key segments) so a
+            # fully-qualified root assignment such as
+            # `providers.<p>.extra_body = {...}` (or `providers.<p>.extra_body.x`)
+            # is stripped too, not just keys written under a `[providers.<p>]`
+            # header.
             target = ["providers", provider, "extra_body"]
             kept, cur, dropping = [], [], False
             for line in cfg_lines:
@@ -279,8 +281,8 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
                     continue
                 if dropping:
                     continue
-                if cur == ["providers", provider] and "=" in line \
-                        and first_key_segment(line.split("=", 1)[0]) == "extra_body":
+                if "=" in line \
+                        and (cur + key_segments(line.split("=", 1)[0]))[:len(target)] == target:
                     continue
                 kept.append(line)
             return kept
@@ -389,8 +391,17 @@ def reuse_cases(results_files):
                 question, expect, forbid = r["question"], r["expect"], r.get("forbid", [])
             else:
                 # Older results: rebuild the synthetic case from name and seed.
-                name, seed = r["case"].split("/s")
-                case = synthetic.build(name, int(seed), 15)
+                # Only the built-in `name/s<seed>` shape (a known synthetic case
+                # plus an integer seed) can be reconstructed; any other legacy
+                # case name (e.g. a custom `--cases` entry) is skipped rather than
+                # aborting the whole reuse run.
+                m = re.fullmatch(r"(.*)/s(\d+)", r["case"])
+                if not m or m.group(1) not in synthetic.CASES:
+                    print(f"warning: skipping {r['case']}: not a rebuildable synthetic case",
+                          file=sys.stderr)
+                    continue
+                name, seed = m.group(1), int(m.group(2))
+                case = synthetic.build(name, seed, 15)
                 question, expect, forbid = case["question"], case["expect"], case["forbid"]
                 text = json.dumps(records[:at])
                 if not matches_all(expect, text):
