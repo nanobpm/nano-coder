@@ -18,6 +18,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthChar;
 
 use crate::plan::{Plan, Status};
 
@@ -175,7 +176,7 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
     // wrap onto extra rows. Both result formats below use the same `body`.
     let body = width.saturating_sub(mark.chars().count() + 3).max(1);
     if lines.is_empty() {
-        return vec![format!("  {color}{mark} (no output){RESET}")];
+        return vec![fit(&format!("  {color}{mark} (no output){RESET}"), width)];
     }
     if verbose {
         let mut out = Vec::new();
@@ -301,6 +302,18 @@ pub fn compose(transcript: &[String], editor: &[String], status: &str) -> Vec<St
     frame
 }
 
+/// The dim queue indicator row shown under the editor in frame mode, mirroring
+/// the legacy status line's `⏸N queued · /queue to edit` hint. Returns `None`
+/// when nothing is queued.
+pub fn queue_indicator(queued: usize, width: usize) -> Option<String> {
+    (queued > 0).then(|| {
+        fit(
+            &format!("{DIM}⏸{queued} queued · /queue to edit{RESET}"),
+            width.max(1),
+        )
+    })
+}
+
 /// The index of the first line that differs between two frames, or `None` when
 /// they are identical. A shorter/longer frame differs at its first extra or
 /// missing line.
@@ -316,7 +329,9 @@ pub fn first_diff(prev: &[String], next: &[String]) -> Option<usize> {
 
 // --- Width-aware wrapping --------------------------------------------------
 
-/// Visible character count, ignoring ANSI escape sequences.
+/// Visible width in terminal cells, ignoring ANSI escape sequences. CJK
+/// characters and many emoji occupy two columns and combining marks zero, so
+/// this uses Unicode cell width rather than a raw scalar-value count.
 fn visible_width(text: &str) -> usize {
     let mut count = 0;
     let mut chars = text.chars().peekable();
@@ -332,12 +347,12 @@ fn visible_width(text: &str) -> usize {
             }
             continue;
         }
-        count += 1;
+        count += UnicodeWidthChar::width(c).unwrap_or(0);
     }
     count
 }
 
-/// Truncate a (possibly ANSI-coloured) string to `width` visible characters,
+/// Truncate a (possibly ANSI-coloured) string to `width` terminal cells,
 /// appending an ellipsis and a reset when it overflows.
 fn fit(text: &str, width: usize) -> String {
     if visible_width(text) <= width {
@@ -361,11 +376,12 @@ fn fit(text: &str, width: usize) -> String {
             }
             continue;
         }
-        if seen >= keep {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if seen + w > keep {
             break;
         }
         out.push(c);
-        seen += 1;
+        seen += w;
     }
     out.push('…');
     out.push_str(RESET);
@@ -434,8 +450,26 @@ fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
             }
             brk = None;
         }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        // A wide (2-cell) glyph that would spill past `width` starts a new row
+        // even when the running width has not yet reached `width`.
+        if w > 1 && vis + w > width && !cur.is_empty() {
+            match brk {
+                Some(byte) => {
+                    let rest = cur.split_off(byte);
+                    out.push(std::mem::take(&mut cur).trim_end().to_string());
+                    cur = rest.trim_start_matches(' ').to_string();
+                    vis = visible_width(&cur);
+                }
+                None => {
+                    out.push(std::mem::take(&mut cur));
+                    vis = 0;
+                }
+            }
+            brk = None;
+        }
         cur.push(c);
-        vis += 1;
+        vis += w;
     }
     out.push(cur);
     out
@@ -477,13 +511,13 @@ impl<W: Write> FrameRenderer<W> {
     pub fn render(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let width = width.max(1);
         let height = height.max(1);
-        if !self.started || width != self.width {
-            // A width change (or the first frame) reflows history: clear the
-            // screen AND scrollback, then write every line at the new width.
-            self.full_redraw(frame, height, true)?;
-        } else if height != self.height {
-            // Height-only: redraw the screen, but keep scrollback.
-            self.full_redraw(frame, height, false)?;
+        if !self.started || width != self.width || height != self.height {
+            // First frame, or a width/height change: re-emit every line at the
+            // new size. A full redraw always clears scrollback — the frame holds
+            // the entire transcript, so anything already in scrollback is a copy
+            // of what is about to be written; keeping it would leave a duplicate
+            // (stale) frame behind the fresh one.
+            self.full_redraw(frame, height)?;
         } else {
             self.differential(frame, height)?;
         }
@@ -494,23 +528,17 @@ impl<W: Write> FrameRenderer<W> {
         Ok(())
     }
 
-    fn full_redraw(
-        &mut self,
-        frame: &[String],
-        height: usize,
-        clear_scrollback: bool,
-    ) -> std::io::Result<()> {
+    fn full_redraw(&mut self, frame: &[String], height: usize) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
         // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
         // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
         // the whole screen, so `CRLF` scrolling must span every row or the
         // bottom status line can be pushed out of place.
         buf.push_str("\x1b[r");
-        buf.push_str(if clear_scrollback {
-            "\x1b[H\x1b[2J\x1b[3J"
-        } else {
-            "\x1b[H\x1b[2J"
-        });
+        // Clear the screen AND scrollback: a full redraw re-emits the whole
+        // transcript, so any surplus that scrolls off must not sit behind a
+        // stale copy of the previous frame.
+        buf.push_str("\x1b[H\x1b[2J\x1b[3J");
         // Bottom-anchor: when the frame is shorter than the screen, leave blank
         // rows at the top so the bar lands on the last row; when it is taller,
         // write from the top and let the surplus scroll into scrollback.
@@ -540,9 +568,10 @@ impl<W: Write> FrameRenderer<W> {
         // it has scrolled into scrollback and can't be rewritten in place.
         let prev_top = plen.saturating_sub(height);
         if plen != frame.len() || diff < prev_top {
-            // Line count changed, or the change is already in scrollback: redraw
-            // (without touching scrollback — only a width change clears it).
-            return self.full_redraw(frame, height, false);
+            // Line count changed, or the change is already in scrollback: fall
+            // back to a full redraw. It clears scrollback so re-emitting the
+            // whole transcript can't stack a duplicate copy behind the frame.
+            return self.full_redraw(frame, height);
         }
         let row = if plen <= height {
             (height - plen) + diff + 1
@@ -647,6 +676,28 @@ mod tests {
         for line in wrap_ansi("one two three four five six seven", 7) {
             assert!(visible_width(&line) <= 7, "{line:?}");
         }
+    }
+
+    #[test]
+    fn width_counts_terminal_cells_not_scalars() {
+        // CJK glyphs take two cells; combining marks take none.
+        assert_eq!(visible_width("你好"), 4);
+        assert_eq!(visible_width("e\u{0301}"), 1);
+        // Wrapping a run of wide glyphs never overflows the column budget.
+        for line in wrap_ansi("你好世界你好世界", 5) {
+            assert!(visible_width(&line) <= 5, "{line:?}");
+        }
+        // `fit` truncates on cells, so a wide-glyph string can't exceed width.
+        assert!(visible_width(&fit("你好世界", 5)) <= 5);
+    }
+
+    #[test]
+    fn queue_indicator_shows_only_when_queued() {
+        assert_eq!(queue_indicator(0, 40), None);
+        let line = queue_indicator(2, 40).unwrap();
+        assert!(strip(&line).contains("⏸2 queued · /queue to edit"), "{line:?}");
+        // The indicator is fit to the width like every other frame row.
+        assert!(visible_width(&queue_indicator(3, 6).unwrap()) <= 6);
     }
 
     #[test]

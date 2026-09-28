@@ -41,6 +41,7 @@ regex = "1.13.1"
 fastrand = "2.5.0"
 libc = "0.2.189"
 toml_edit = "0.22"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

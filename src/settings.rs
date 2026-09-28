@@ -163,8 +163,19 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                     .items(&labels)
                     .default(current)
                     .interact()?;
+                let previous = agent.config().renderer;
                 agent.config_mut().renderer = modes[choice];
                 changes.renderer = true;
+                if modes[choice] != previous {
+                    // The live renderer and the `frame_mode` branch in `main`
+                    // are fixed at startup, so a renderer switch only takes
+                    // effect on the next launch.
+                    println!(
+                        "Renderer set to {}. Restart nano-coder for it to take effect \
+                         (the active renderer is fixed for this session).",
+                        modes[choice]
+                    );
+                }
             }
             9 => save_and_report(agent.config(), &mut changes, config_path),
             _ => {

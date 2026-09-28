@@ -186,6 +186,9 @@ struct FrameState {
     items: Vec<Item>,
     /// The current input editor `(line, cursor)`.
     editor: (String, usize),
+    /// Messages queued while a turn is in flight, shown as an indicator row
+    /// under the editor (0 hides it).
+    queued: usize,
     /// Index of the assistant message currently being streamed into, so text
     /// deltas append to one growing item rather than adding a line each.
     stream: Option<usize>,
@@ -201,6 +204,7 @@ impl Renderer {
                 out: FrameRenderer::new(io::stdout()),
                 items: Vec::new(),
                 editor: (String::new(), 0),
+                queued: 0,
                 stream: None,
                 think: None,
             })
@@ -220,11 +224,13 @@ impl Renderer {
     }
 
     /// Update the editor row (called by the line editor's frame hook) and
-    /// re-render the frame.
-    pub fn set_editor(&self, line: &str, cursor: usize) {
+    /// re-render the frame. `queued` is the number of messages waiting behind
+    /// the current turn, shown as an indicator under the editor.
+    pub fn set_editor(&self, line: &str, cursor: usize, queued: usize) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
             fs.editor = (line.to_string(), cursor);
+            fs.queued = queued;
             self.frame_render(&mut fs);
         }
     }
@@ -246,7 +252,10 @@ impl Renderer {
         let width = (cols as usize).max(1);
         let height = (rows as usize).max(1);
         let transcript = frame::transcript_lines(&fs.items, width);
-        let editor = frame::editor_lines("› ", &fs.editor.0, fs.editor.1, width);
+        let mut editor = frame::editor_lines("› ", &fs.editor.0, fs.editor.1, width);
+        if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
+            editor.push(indicator);
+        }
         let status = self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default();
         let composed = frame::compose(&transcript, &editor, &status);
         let _ = fs.out.render(&composed, width, height);
@@ -285,8 +294,19 @@ impl Renderer {
                 if text.is_empty() {
                     return;
                 }
-                if let Some((_, started)) = fs.think.take() {
-                    let _ = started;
+                // Finalize any streamed reasoning into a Thinking item *before*
+                // the assistant message begins, so the summary is preserved and
+                // ordered ahead of the answer rather than dropped (or appended
+                // after it by the trailing `Thinking` event).
+                if let Some((think, started)) = fs.think.take() {
+                    let think = think.trim();
+                    if !think.is_empty() {
+                        fs.items.push(Item::Thinking {
+                            chars: think.chars().count(),
+                            seconds: started.elapsed().as_secs_f64(),
+                        });
+                        fs.stream = None;
+                    }
                 }
                 match fs.stream {
                     Some(i) => {
@@ -316,6 +336,50 @@ impl Renderer {
                 self.frame_finish_stream(fs);
                 fs.items.push(Item::Plan((*plan).clone()));
             }
+            // Mirror the legacy renderer's user-facing filtering: plan_add /
+            // plan_update are shown as the Plan checklist (the `Plan` event),
+            // not as raw tool calls, and report_outcome's summary follows as
+            // the answer, so only its status marker is shown.
+            AgentEvent::ToolCall { call } if quiet_plan_tool(&call.name) => {
+                self.frame_finish_stream(fs);
+            }
+            AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
+            AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
+                let _ = call;
+                fs.items.push(Item::ToolResult {
+                    ok: false,
+                    output: (*output).to_string(),
+                    verbose: verbosity() >= Verbosity::Verbose,
+                });
+            }
+            AgentEvent::ToolCall { call }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose =>
+            {
+                self.frame_finish_stream(fs);
+                // Derive the status from the parsed outcome so an invalid
+                // `report_outcome` is not rendered as a success.
+                let mark = match crate::goal::Status::from_args(&call.arguments) {
+                    Some(crate::goal::Status::Blocked) => "■ blocked".to_string(),
+                    Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
+                    Some(crate::goal::Status::Completed) => "✔ completed".to_string(),
+                    None => {
+                        let raw = crate::sanitize_terminal_text(
+                            call.arguments
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                        if raw.is_empty() {
+                            "• unknown".to_string()
+                        } else {
+                            format!("• {raw}")
+                        }
+                    }
+                };
+                fs.items.push(Item::Note(mark));
+            }
+            AgentEvent::ToolResult { call, ok: true, .. }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(Item::ToolCall {

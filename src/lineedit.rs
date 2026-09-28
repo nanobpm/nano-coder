@@ -66,9 +66,11 @@ pub struct EditContext {
 
 pub type SharedView = Arc<Mutex<EditView>>;
 
-/// Hook the app-owned frame renderer installs to receive `(line, cursor)` on
-/// every editor change instead of the editor writing escape sequences itself.
-pub type EditHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
+/// Hook the app-owned frame renderer installs to receive `(line, cursor,
+/// queued)` on every editor change instead of the editor writing escape
+/// sequences itself. `queued` is the number of messages waiting behind the
+/// current turn, shown as an indicator under the editor.
+pub type EditHook = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
 
 impl EditView {
     pub fn shared(status: Option<Arc<StatusLine>>, context: Arc<Mutex<EditContext>>) -> SharedView {
@@ -106,7 +108,7 @@ impl EditView {
     /// status line as before.
     fn draw_edit(&mut self) {
         if let Some(hook) = self.on_edit.clone() {
-            hook(&self.line, self.cursor);
+            hook(&self.line, self.cursor, self.queue_count);
             return;
         }
         match self.on_status() {
@@ -421,7 +423,7 @@ impl EditView {
     pub fn resize(&mut self) {
         if let Some(hook) = self.on_edit.clone() {
             // The frame renderer redraws every row at the new width itself.
-            hook(&self.line, self.cursor);
+            hook(&self.line, self.cursor, self.queue_count);
             return;
         }
         // With a status line, its resize erased everything below the cursor
@@ -556,7 +558,7 @@ impl EditView {
             self.cursor = 0;
             self.drawn_rows = 0;
             self.drawn_cursor_row = 0;
-            hook(&self.line, self.cursor);
+            hook(&self.line, self.cursor, self.queue_count);
             return line;
         }
         if self.menu_visible() {

@@ -473,6 +473,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // reader never resumes while a dialoguer is still active.
                         let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
+                        // The picker wrote over the owned frame via dialoguer;
+                        // force a full redraw so the next differential render
+                        // isn't computed against stale screen coordinates.
+                        renderer.frame_resize();
                     }
                 }
                 // The turn hit the cap in normal mode: ask whether to continue.
@@ -483,6 +487,8 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     let gate = terminal.suspend_input();
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
+                    // Repaint after the dialoguer picker clobbered the frame.
+                    renderer.frame_resize();
                 }
                 input = terminal.recv() => match input {
                     TermInput::Interrupt => {
@@ -910,6 +916,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         "/settings" => {
             let before = agent.config().model.clone();
             settings::run(agent, &terminal.config_path).await?;
+            // The settings dialog (dialoguer) wrote directly over the owned
+            // frame; force a full redraw so the frame renderer's next update
+            // isn't diffed against stale screen coordinates.
+            terminal.renderer.frame_resize();
             // Providers or the model may have changed. A model switched through
             // the settings dialog must land in the recents MRU just like one
             // switched with `/model`; a provider-only edit just refreshes the
@@ -1322,7 +1332,7 @@ async fn main() -> Result<()> {
             // The app-owned frame renderer draws the editor row itself; route
             // every edit through it instead of the inline/scroll-region path.
             let renderer = renderer.clone();
-            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize| renderer.set_editor(line, cursor)));
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize| renderer.set_editor(line, cursor, queued)));
         }
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -1384,7 +1394,7 @@ async fn main() -> Result<()> {
                         // row (and thus the whole frame) instead of writing an
                         // inline prompt.
                         let (line, cursor) = view.snapshot();
-                        terminal.renderer.set_editor(&line, cursor);
+                        terminal.renderer.set_editor(&line, cursor, 0);
                         view.prompt_redrawn();
                         return;
                     }
