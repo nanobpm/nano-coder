@@ -1194,7 +1194,13 @@ async fn main() -> Result<()> {
             agent.load_session(id)?;
         }
         eprintln!("ACP harness ready (provider: {}, model: {})", agent.provider_name(), agent.model_name());
-        acp::run_acp(&mut agent).await?;
+        let saw_valid = acp::run_acp(&mut agent).await?;
+        if !saw_valid {
+            eprintln!(
+                "no valid ACP requests received on stdin — is the client speaking ACP (JSON-RPC 2.0, one message per line)?"
+            );
+            std::process::exit(2);
+        }
     } else {
         // The interactive CLI answers `question` tool calls, but only when a
         // real terminal is attached: with piped stdin/stdout the picker cannot

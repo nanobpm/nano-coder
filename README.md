@@ -115,6 +115,13 @@ escalation). Redelivering the input returns the same outcome. See [Outcomes](#ou
 - `/providers` - lists providers
 - `/model provider/model` - switches model
 
+**Exit status.** Normal shutdown — stdin closing after at least one valid request was
+processed — exits `0`. If stdin reaches EOF without a single parseable JSON-RPC request
+(e.g. the client isn't speaking ACP), the harness prints
+`no valid ACP requests received on stdin …` to stderr and exits `2`, so a misconfigured
+caller can't mistake a no-op run for success. A non-JSON first line is called out
+explicitly (`input doesn't look like ACP JSON-RPC …`).
+
 ## Architecture
 
 ```

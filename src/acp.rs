@@ -4,6 +4,8 @@ use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -370,18 +372,37 @@ fn write_line(msg: &Value) {
     stdout.flush().unwrap();
 }
 
+/// Returns `true` if `msg` is shaped like a JSON-RPC 2.0 request/notification:
+/// an object carrying `"jsonrpc": "2.0"` and a string `method`. Bare JSON
+/// values such as `{}`, `null`, or `42` are rejected so that non-ACP input is
+/// not mistaken for a valid ACP session.
+fn is_jsonrpc_request(msg: &Value) -> bool {
+    msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && msg.get("method").and_then(Value::as_str).is_some()
+}
+
 /// Run the ACP protocol loop. Stdin is read concurrently with turns so that
 /// `session/cancel` and steering prompts reach a running turn.
-pub async fn run_acp(agent: &mut Agent) -> Result<()> {
+///
+/// Returns `true` if at least one valid JSON-RPC request was received on
+/// stdin. Returns `false` when stdin reached EOF without a single parseable
+/// request (e.g. the client isn't speaking ACP), so the caller can exit
+/// non-zero instead of masking a misconfiguration as success.
+pub async fn run_acp(agent: &mut Agent) -> Result<bool> {
     agent.set_event_sink(Box::new(|session_id, event| {
         if let Some(update) = update_for(event) {
             send_notification("session/update", json!({ "sessionId": session_id, "update": update }));
         }
     }));
 
+    // Set once any line parses into a valid JSON-RPC message.
+    let saw_valid = Arc::new(AtomicBool::new(false));
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let reader_saw_valid = Arc::clone(&saw_valid);
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut first_line = true;
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim();
             if line.is_empty() {
@@ -389,12 +410,30 @@ pub async fn run_acp(agent: &mut Agent) -> Result<()> {
             }
             match serde_json::from_str::<Value>(line) {
                 Ok(msg) => {
+                    // Only count input that actually looks like a JSON-RPC
+                    // request as "valid ACP": arbitrary valid JSON such as
+                    // `{}` or `null` is a no-op for `handle_message`, so a
+                    // non-ACP client that happens to emit valid JSON must not
+                    // be reported as a successful ACP session.
+                    if is_jsonrpc_request(&msg) {
+                        reader_saw_valid.store(true, Ordering::Relaxed);
+                    }
                     if tx.send(msg).is_err() {
                         break;
                     }
                 }
-                Err(e) => eprintln!("ACP parse error: {e}"),
+                Err(e) => {
+                    // A non-JSON first line usually means the client isn't
+                    // speaking ACP at all; say so plainly instead of only
+                    // surfacing a serde byte position.
+                    if first_line {
+                        eprintln!("input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): {e}");
+                    } else {
+                        eprintln!("ACP parse error: {e}");
+                    }
+                }
             }
+            first_line = false;
         }
     });
 
@@ -415,7 +454,7 @@ pub async fn run_acp(agent: &mut Agent) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(saw_valid.load(Ordering::Relaxed))
 }
 
 /// Run one prompt turn while routing concurrent messages: cancels and steers
@@ -564,5 +603,21 @@ mod tests {
         deferred.push_back(json!({"method": "cmd"}));
         requeue_steers(&mut deferred, vec![steer("b", 2), steer("c", 3)], &marks, None);
         assert_eq!(order(&deferred), ["b", "cmd", "c"]);
+    }
+
+    #[test]
+    fn only_jsonrpc_requests_count_as_valid_acp() {
+        // Genuine JSON-RPC requests/notifications are accepted.
+        assert!(is_jsonrpc_request(&json!({"jsonrpc": "2.0", "method": "initialize", "id": 1})));
+        assert!(is_jsonrpc_request(&json!({"jsonrpc": "2.0", "method": "session/cancel"})));
+
+        // Arbitrary valid JSON that isn't an ACP request must be rejected, so a
+        // non-ACP client emitting valid JSON isn't reported as success.
+        assert!(!is_jsonrpc_request(&json!({})));
+        assert!(!is_jsonrpc_request(&Value::Null));
+        assert!(!is_jsonrpc_request(&json!(42)));
+        assert!(!is_jsonrpc_request(&json!({"method": "initialize"})));
+        assert!(!is_jsonrpc_request(&json!({"jsonrpc": "2.0"})));
+        assert!(!is_jsonrpc_request(&json!({"jsonrpc": "2.0", "method": 1})));
     }
 }
