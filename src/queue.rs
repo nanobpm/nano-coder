@@ -135,7 +135,12 @@ pub fn parse(args: &str) -> Result<QueueOp, String> {
             }
             Ok(QueueOp::Edit { id, text: text.to_string() })
         }
-        "clear" => Ok(QueueOp::Clear),
+        "clear" => {
+            if !rest.is_empty() {
+                return Err(USAGE.to_string());
+            }
+            Ok(QueueOp::Clear)
+        }
         _ => Err(USAGE.to_string()),
     }
 }
@@ -254,6 +259,7 @@ mod tests {
         assert_eq!(parse("edit 2 try this instead"), Ok(QueueOp::Edit { id: 2, text: "try this instead".into() }));
         assert_eq!(parse("clear"), Ok(QueueOp::Clear));
 
+        assert!(parse("clear keep-this").is_err(), "clear rejects trailing arguments");
         assert!(parse("remove").is_err(), "remove needs an id");
         assert!(parse("remove x").is_err(), "ids are numbers");
         assert!(parse("edit 2").is_err(), "edit needs replacement text");
