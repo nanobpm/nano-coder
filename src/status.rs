@@ -386,6 +386,14 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     if let Some(aic) = stats.session_aic {
         segments.push(Segment { text: format!(" {aic:.1} AIC "), color: Some("\x1b[38;5;222m"), priority: 2 });
     }
+    // History-tool usage this session (smart compaction), shown once used.
+    if stats.history_searches + stats.history_reads > 0 {
+        segments.push(Segment {
+            text: format!(" hist {}s {}r ", stats.history_searches, stats.history_reads),
+            color: None,
+            priority: 1,
+        });
+    }
     let compact = match threshold {
         Some(t) => format!(" auto-compact {t:.0}%"),
         None => " auto-compact off".to_string(),
@@ -497,6 +505,15 @@ mod tests {
         let with_aic = ContextStats { session_aic: Some(0.0541), ..stats() };
         let line = visible(&render(&with_aic, 140));
         assert!(line.contains("0.1 AIC"), "{line:?}");
+    }
+
+    #[test]
+    fn shows_history_usage_only_when_used() {
+        // No history segment before the tools are used.
+        assert!(!visible(&render(&stats(), 140)).contains("hist "));
+        // It appears once a smart-compaction history tool has been called.
+        let used = ContextStats { history_searches: 3, history_reads: 1, ..stats() };
+        assert!(visible(&render(&used, 200)).contains("hist 3s 1r"), "{used:?}");
     }
 
     #[test]

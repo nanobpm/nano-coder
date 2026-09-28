@@ -194,7 +194,20 @@ pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
         let last = messages.last().map_or(0, |(line, _)| *line);
         bail!("no message #{id} in this session (IDs are log lines; the latest is #{last})");
     };
+    // Keep the read surface consistent with `search`, which excludes system
+    // messages: never expose the session's system prompt or project
+    // instructions through a guessed ID.
+    if message.role == Role::System {
+        bail!("message #{id} is a system message and cannot be read");
+    }
     let mut text = format!("{}\n", label(id, message));
+    // Reasoning-model assistant messages may carry their content only in
+    // thinking blocks, so include them to keep the "read in full" contract.
+    for block in &message.thinking_blocks {
+        if let Some(thought) = block.get("thinking").and_then(Value::as_str) {
+            text.push_str(&format!("[thinking] {thought}\n"));
+        }
+    }
     text.push_str(&message.content);
     for call in &message.tool_calls {
         text.push_str(&format!("\n[called {} id={} {}]", call.name, call.id, call.arguments));
@@ -272,5 +285,19 @@ mod tests {
         assert!(out.contains("complete output in"), "{out}");
         let err = read(&path, &json!({"id": 99}), dir.path()).unwrap_err();
         assert!(err.to_string().contains("latest is #6"), "{err}");
+        // System messages are not readable, matching search's exclusion.
+        let err = read(&path, &json!({"id": 2}), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("system message"), "{err}");
+    }
+
+    #[test]
+    fn read_includes_thinking_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        let mut thinker = Message::assistant("");
+        thinker.thinking_blocks = vec![json!({"type": "thinking", "thinking": "weigh the options", "signature": "sig"})];
+        log.append(&Record::Message(thinker)).unwrap();
+        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        assert!(out.contains("[thinking] weigh the options"), "{out}");
     }
 }

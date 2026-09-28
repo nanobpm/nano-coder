@@ -246,7 +246,11 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
         };
         let block = match (ids, message.log_line) {
             (true, Some(line)) => format!("[#{line}] {block}"),
-            (true, None) if message.role == Role::User && message.content.starts_with('[') => format!("[earlier summary] {block}"),
+            (true, None) if message.role == Role::User
+                && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX)) =>
+            {
+                format!("[earlier summary] {block}")
+            }
             _ => block,
         };
         blocks.push(block);
@@ -294,11 +298,15 @@ mod tests {
     fn transcript_labels_log_lines_when_asked() {
         let mut first = Message::user("find the bug");
         first.log_line = Some(7);
-        let summary = Message::user("[Summary of the earlier conversation] ...");
+        let summary = Message::user(&format!("{SUMMARY_PREFIX} ..."));
         let text = render_transcript(&[summary.clone(), first.clone()], 10_000, true);
         assert!(text.starts_with("[earlier summary] USER:"), "{text}");
         assert!(text.contains("[#7] USER:\nfind the bug"), "{text}");
         assert!(!render_transcript(&[first], 10_000, false).contains("#7"));
+        // A normal prompt that merely starts with '[' is not a summary.
+        let mut bracketed = Message::user("[constraint] use port 8080");
+        bracketed.log_line = None;
+        assert!(!render_transcript(&[bracketed], 10_000, true).contains("[earlier summary]"));
         assert!(smart_summary_note(Some((2, 40))).contains("#2–#40"));
     }
 
