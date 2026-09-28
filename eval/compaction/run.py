@@ -71,6 +71,51 @@ PRESET_PROVIDERS = frozenset({
 })
 
 
+def _load_toml(text):
+    """Parse `text` with a real TOML parser, or `None` if none is available.
+    `tomllib` is stdlib on Python 3.11+; `tomli` is the 3.10-and-earlier
+    back-port. A malformed config also yields `None` so callers fall back."""
+    try:
+        import tomllib as toml
+    except ModuleNotFoundError:
+        try:
+            import tomli as toml
+        except ModuleNotFoundError:
+            return None
+    try:
+        return toml.loads(text)
+    except Exception:
+        return None
+
+
+def _effective_providers_regex(text):
+    """Best-effort fallback for when no TOML parser is installed. Handles
+    bare, double-quoted and single-quoted `[providers.<name>]` keys and both
+    quote styles for a top-level `default_provider`, so it mirrors the real
+    parser for the common config forms without a dependency."""
+    header = re.compile(r"""(?m)^\s*\[providers\.\s*(?:"([^"]+)"|'([^']+)'|([^.\]\s"']+))""")
+    providers = set(PRESET_PROVIDERS)
+    for dq, sq, bare in header.findall(text):
+        providers.add(dq or sq or bare)
+    default, has_legacy, in_table = "mock", False, False
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            in_table = True
+            continue
+        if in_table:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key == "default_provider":
+            m = re.search(r"""(?:"([^"]*)"|'([^']*)')""", line)
+            if m:
+                default = m.group(1) if m.group(1) is not None else m.group(2)
+        elif key in ("api_key", "base_url"):
+            has_legacy = True
+    if default == "mock" and has_legacy:
+        default = "openai"
+    return providers, default
+
+
 def effective_providers(base):
     """`(provider names, default_provider)` as nano-coder resolves them
     (src/providers/mod.rs `effective_providers`, src/config.rs): the built-in
@@ -79,21 +124,15 @@ def effective_providers(base):
     legacy top-level `api_key`/`base_url` promotes a `mock` default to
     `openai`. Only top-level keys count — provider-table keys are ignored."""
     text = Path(base).read_text() if base and Path(base).is_file() else ""
-    providers = set(PRESET_PROVIDERS) | set(re.findall(r"(?m)^\s*\[providers\.([^.\]\s]+)", text))
-    default, has_legacy, in_table = "mock", False, False
-    for line in text.splitlines():
-        if line.strip().startswith("["):
-            in_table = True
-            continue
-        if in_table:
-            continue
-        key = line.split("=", 1)[0].strip()
-        if key == "default_provider":
-            m = re.search(r'"([^"]+)"', line)
-            if m:
-                default = m.group(1)
-        elif key in ("api_key", "base_url"):
-            has_legacy = True
+    data = _load_toml(text)
+    if data is None:
+        return _effective_providers_regex(text)
+    configured = data.get("providers")
+    configured = set(configured) if isinstance(configured, dict) else set()
+    providers = set(PRESET_PROVIDERS) | configured
+    default = data.get("default_provider")
+    default = default if isinstance(default, str) else "mock"
+    has_legacy = isinstance(data.get("api_key"), str) or isinstance(data.get("base_url"), str)
     if default == "mock" and has_legacy:
         default = "openai"
     return providers, default
