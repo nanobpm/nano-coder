@@ -37,6 +37,8 @@ pub struct EditView {
     /// Visible width of the prompt before the line (it starts with a
     /// timestamp when timestamps are on).
     prompt_width: usize,
+    /// Messages waiting in the queue (drives the status-line indicator).
+    queue_count: usize,
     /// Live configuration, for `/model` argument suggestions. Shared with the
     /// agent loop so a model/provider change is seen on the next keystroke.
     context: Arc<Mutex<EditContext>>,
@@ -70,6 +72,7 @@ impl EditView {
             menu_hidden: false,
             menu_enabled: false,
             prompt_width: 2,
+            queue_count: 0,
             context,
             drawn_rows: 0,
             drawn_cursor_row: 0,
@@ -80,9 +83,17 @@ impl EditView {
         self.mode = mode;
         if let Some(status) = &self.status {
             match mode {
-                EditMode::Turn if !self.line.is_empty() => self.show_on_status(status),
-                _ => status.set_input(None),
+                EditMode::Turn => self.show_on_status(status),
+                _ => status.set_input(None, 0),
             }
+        }
+    }
+
+    /// Update the queue indicator on the status line (None hides it).
+    pub fn set_queue_count(&mut self, count: Option<usize>) {
+        self.queue_count = count.unwrap_or(0);
+        if let Some(status) = self.on_status() {
+            self.show_on_status(status);
         }
     }
 
@@ -114,13 +125,15 @@ impl EditView {
         self.line_changed();
     }
 
-    /// The text with the cursor marked, for the status line. The status line
-    /// stores it raw and renders (prefix, cursor, padding) once at draw time.
+    /// The text with the cursor marked plus the queue count, for the status
+    /// line. The status line stores it raw and renders (prefix, cursor, queue,
+    /// padding) once at draw time. An empty line with messages queued still
+    /// shows the queue indicator.
     fn show_on_status(&self, status: &StatusLine) {
-        if self.line.is_empty() {
-            status.set_input(None);
+        if self.line.is_empty() && self.queue_count == 0 {
+            status.set_input(None, 0);
         } else {
-            status.set_input(Some((&self.line, self.cursor)));
+            status.set_input(Some((&self.line, self.cursor)), self.queue_count);
         }
     }
 
@@ -562,7 +575,7 @@ impl EditView {
         self.drawn_rows = 0;
         self.drawn_cursor_row = 0;
         match self.on_status() {
-            Some(status) => status.set_input(None),
+            Some(status) => self.show_on_status(status),
             None => {
                 // The input may occupy several rows; the cursor can be on any
                 // of them, so clear from here down before the newline.
@@ -1062,6 +1075,7 @@ mod tests {
             menu_hidden: false,
             menu_enabled: false,
             prompt_width: 2,
+            queue_count: 0,
             context: Arc::new(Mutex::new(EditContext::default())),
             drawn_rows: 0,
             drawn_cursor_row: 0,

@@ -32,6 +32,20 @@ impl MockLLMClient {
 
     fn pick_tool(content: &str) -> Option<(&'static str, serde_json::Value)> {
         let content = content.to_lowercase();
+        // "question"/"ask" drives the `question` tool, so the interactive
+        // picker flow (and the rule that a queued message is never injected
+        // while a question is pending) can be exercised without a model.
+        // Match as standalone words so ordinary prompts like "finish the task"
+        // (which merely *contain* "ask") don't trip the picker unexpectedly.
+        if has_word(&content, "question") || has_word(&content, "ask") {
+            return Some(("question", json!({
+                "questions": [{
+                    "question": "Which way should I go?",
+                    "header": "Direction",
+                    "options": [{ "label": "Left" }, { "label": "Right" }]
+                }]
+            })));
+        }
         if content.contains("time") || content.contains("clock") {
             return Some(("get_time", json!({})));
         }
@@ -52,6 +66,15 @@ impl MockLLMClient {
         }
         None
     }
+}
+
+/// True when `needle` appears in `haystack` as a standalone word (delimited by
+/// non-alphanumeric characters), so substrings like "ask" inside "task" don't
+/// match. Both arguments are expected to already be lowercase.
+fn has_word(haystack: &str, needle: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == needle)
 }
 
 /// Mock reasoning, produced when the user's latest message mentions "think".
