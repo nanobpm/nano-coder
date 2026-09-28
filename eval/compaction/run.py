@@ -197,16 +197,71 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
             if re.fullmatch(r"[A-Za-z0-9_-]+", name):
                 return name
             return json.dumps(name)
-        text = "\n".join(lines)
+        def deep_merge(base_body, override):
+            # Recursively overlay `override` onto `base_body`; a scalar/list in
+            # `override` replaces, but two tables merge so the CLI can set one
+            # nested field (e.g. chat_template_kwargs.enable_thinking) without
+            # dropping the base's siblings.
+            out = dict(base_body)
+            for k, v in override.items():
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = deep_merge(out[k], v)
+                else:
+                    out[k] = v
+            return out
+        def header_segments(line):
+            # Dotted-key segments of a `[table]`/`[[table]]` header (quoted
+            # segments keep dots/spaces), or None when `line` is not a header.
+            m = re.match(r"\s*\[\[?(.*?)\]\]?\s*(?:#.*)?$", line)
+            if not m:
+                return None
+            return [dq or sq or bare for dq, sq, bare
+                    in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', m.group(1))]
+        def strip_extra_body(cfg_lines, provider):
+            # Drop an existing extra_body for `provider` (an inline
+            # `extra_body = {...}` under `[providers.<p>]`, or a
+            # `[providers.<p>.extra_body]` sub-table and any of its own
+            # sub-tables) so the merged table we emit is the only one — two
+            # tables for the same key would be invalid TOML.
+            target = ["providers", provider, "extra_body"]
+            kept, cur, dropping = [], [], False
+            for line in cfg_lines:
+                segs = header_segments(line)
+                if segs is not None:
+                    cur, dropping = segs, segs[:len(target)] == target
+                    if not dropping:
+                        kept.append(line)
+                    continue
+                if dropping:
+                    continue
+                if cur == ["providers", provider] and line.split("=", 1)[0].strip() == "extra_body":
+                    continue
+                kept.append(line)
+            return kept
+        parsed = _load_toml("\n".join(lines))
+        base_providers = parsed.get("providers") if isinstance(parsed, dict) else None
         for provider in providers:
             key = toml_key(provider)
-            # Match an existing extra_body under either the bare or quoted header.
-            prov_pat = rf"(?:{re.escape(provider)}|{re.escape(json.dumps(provider))})"
-            if re.search(rf"(?m)^\[providers\.{prov_pat}\.extra_body\]", text) or re.search(rf"(?ms)^\[providers\.{prov_pat}\](?:(?!^\[).)*?^extra_body", text):
-                print(f"warning: providers.{provider} already sets extra_body; --extra-body ignored for it", file=sys.stderr)
-                continue
+            if base_providers is None:
+                # No TOML parser installed: we cannot read the existing table to
+                # merge it, so fall back to detecting and skipping rather than
+                # emitting a duplicate. Match a bare or quoted provider header.
+                text = "\n".join(lines)
+                prov_pat = rf"(?:{re.escape(provider)}|{re.escape(json.dumps(provider))})"
+                if re.search(rf"(?m)^\[providers\.{prov_pat}\.extra_body\]", text) or re.search(rf"(?ms)^\[providers\.{prov_pat}\](?:(?!^\[).)*?^extra_body", text):
+                    print(f"warning: providers.{provider} already sets extra_body and no TOML parser is "
+                          f"available to merge it; --extra-body ignored for it", file=sys.stderr)
+                    continue
+                merged = extra_body
+            else:
+                prov_conf = base_providers.get(provider)
+                existing = prov_conf.get("extra_body") if isinstance(prov_conf, dict) else None
+                existing = existing if isinstance(existing, dict) else {}
+                if existing:
+                    lines = strip_extra_body(lines, provider)
+                merged = deep_merge(existing, extra_body)
             tail.append(f"[providers.{key}.extra_body]")
-            tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in extra_body.items()]
+            tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in merged.items()]
     return "\n".join(head + lines + tail) + "\n"
 
 

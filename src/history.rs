@@ -48,13 +48,22 @@ fn line_starts_with(text: &str, marker: &str) -> bool {
 }
 
 /// Whether this message already consumed the one-time post-compaction history
-/// hint: it carries the hint text, or it is a history-tool call/result (which
-/// also clears the pending hint). Lets a resume keep the hint one-time per
-/// compaction instead of re-arming it every `--resume`.
+/// hint: it is the failed tool result that carries the hint text, or it is a
+/// history-tool call/result (which also clears the pending hint). Lets a resume
+/// keep the hint one-time per compaction instead of re-arming it every
+/// `--resume`. The checks are role-specific so user/assistant text that merely
+/// quotes the hint literal (e.g. after compaction folds it into a summary)
+/// cannot consume the one-time state: the hint is only ever appended to a tool
+/// result, and `tool_calls`/`name` are only meaningful on assistant/tool roles.
 pub fn consumes_hint(message: &Message) -> bool {
-    message.content.contains(FAILED_TOOL_HINT)
-        || message.name.as_deref().is_some_and(is_history_tool)
-        || message.tool_calls.iter().any(|call| is_history_tool(&call.name))
+    match message.role {
+        Role::Tool => {
+            message.content.contains(FAILED_TOOL_HINT)
+                || message.name.as_deref().is_some_and(is_history_tool)
+        }
+        Role::Assistant => message.tool_calls.iter().any(|call| is_history_tool(&call.name)),
+        _ => false,
+    }
 }
 
 const DEFAULT_LIMIT: usize = 20;
@@ -490,5 +499,22 @@ mod tests {
         log.append(&Record::Message(thinker)).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] weigh the options"), "{out}");
+    }
+
+    #[test]
+    fn hint_is_consumed_only_by_tool_results_and_history_calls() {
+        // The failed tool result that carries the hint consumes it.
+        assert!(consumes_hint(&Message::tool_error("c1", "bash", FAILED_TOOL_HINT)));
+        // User/assistant text that merely quotes the hint literal does not.
+        assert!(!consumes_hint(&Message::user(FAILED_TOOL_HINT)));
+        assert!(!consumes_hint(&Message::assistant(FAILED_TOOL_HINT)));
+        // A history-tool call (assistant) and its result (tool) both consume it.
+        let call = crate::llm::ToolCall { id: "h".into(), name: SEARCH_TOOL.into(), arguments: json!({}), item_id: None };
+        assert!(consumes_hint(&Message::assistant_with_tools("", vec![call])));
+        assert!(consumes_hint(&Message::tool_result("h", READ_TOOL, "results")));
+        // An assistant that only names a history tool in its text does not.
+        assert!(!consumes_hint(&Message::assistant(SEARCH_TOOL)));
+        // An ordinary tool result does not.
+        assert!(!consumes_hint(&Message::tool_result("c2", "bash", "ok")));
     }
 }

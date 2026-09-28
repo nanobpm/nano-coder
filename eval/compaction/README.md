@@ -117,7 +117,9 @@ eval/compaction/run.py --models macbook/qwen3.8-neo-coder \
 - `--shuffle` and `--max-minutes` time-box a sample of the jobs.
 - `--terse` asks for a one-line answer.
 - `--extra-body` is merged into requests of the providers under test, for
-  example to turn thinking off.
+  example to turn thinking off. If a provider already sets `extra_body` in your
+  config, the two are deep-merged (CLI fields win), so you can override one
+  nested field without dropping the rest.
 
 ## Self-test
 
