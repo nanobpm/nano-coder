@@ -9,7 +9,8 @@ jar="${TLA2TOOLS:-$HOME/bin/tla2tools.jar}"
 meta="$(mktemp -d)"
 trap 'rm -rf "$meta"' EXIT
 
-runs=("AgentLoop.cfg MCAgentLoop" "SessionRecovery.cfg SessionRecovery")
+runs=("AgentLoop.cfg MCAgentLoop" "AgentLoopUnbounded.cfg MCAgentLoop"
+      "SessionRecovery.cfg SessionRecovery" "SessionRecoveryUnbounded.cfg SessionRecovery")
 [[ "${1:-}" == "--deep" ]] && runs+=("SessionRecoveryDeep.cfg SessionRecovery")
 
 status=0
