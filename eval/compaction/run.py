@@ -156,6 +156,23 @@ def provider_for(model, base):
     return default
 
 
+def extra_body_arg(text):
+    """Parse a --extra-body value, requiring it to decode to a JSON object.
+
+    The merge path treats the value as a TOML table (it calls `.items()` on
+    it), so a bare JSON array, string, or number would raise an
+    ``AttributeError`` deep in a worker rather than reporting bad CLI input."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {e}")
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(
+            f"must be a JSON object (e.g. '{{\"chat_template_kwargs\": {{...}}}}'), "
+            f"not a JSON {type(value).__name__}")
+    return value
+
+
 def config_text(base, session_dir, mode, extra_body=None, providers=()):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
@@ -595,7 +612,7 @@ def main():
     p.add_argument("--reuse-compaction", action="append", metavar="RESULTS",
                    help="answer only: reuse compacted logs from earlier smart runs where the detail was lost "
                         "(skips writing a summary; for slow models). Implies --modes smart and no synthetic cases")
-    p.add_argument("--extra-body", type=json.loads, metavar="JSON",
+    p.add_argument("--extra-body", type=extra_body_arg, metavar="JSON",
                    help='merged into requests of the providers under test, e.g. \'{"chat_template_kwargs": {"enable_thinking": false}}\'')
     p.add_argument("--shuffle", action="store_true", help="run jobs in a random (seeded) order, for a time-boxed sample")
     p.add_argument("--max-minutes", type=float, help="start no new runs after this long; unstarted runs are skipped")
