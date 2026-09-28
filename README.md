@@ -285,7 +285,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
-  - **Turn cap** (`max_iterations`): LLM calls per input; normal mode asks before stopping
+  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); normal mode asks before stopping
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
@@ -333,7 +333,7 @@ model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
 temperature = 0.7
 max_tokens = 4096
-max_iterations = 50                     # LLM calls per user input
+max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true

@@ -1171,7 +1171,8 @@ impl Agent {
             .with_data("message_count", json!(self.conversation.len()));
         self.hooks.trigger(&ctx);
 
-        let max_iterations = self.config.max_iterations.max(1);
+        // A cap of 0 is unbounded.
+        let max_iterations = self.config.max_iterations;
         let mut final_response = None;
         let mut last_content = String::new();
         let mut cancelled = false;
@@ -1185,8 +1186,8 @@ impl Agent {
         let mut iteration = 0usize;
         loop {
             iteration += 1;
-            let budget = match self.control.mode() {
-                crate::mode::AgentMode::Auto => usize::MAX,
+            let budget = match (self.control.mode(), max_iterations) {
+                (crate::mode::AgentMode::Auto, _) | (_, 0) => usize::MAX,
                 _ => max_iterations.saturating_add(granted_extra),
             };
             if iteration > budget {
@@ -3081,6 +3082,19 @@ mod tests {
         agent.set_mode(crate::mode::AgentMode::Auto);
         let outcome = agent.run_turn(None, "go").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn, "auto mode runs past the cap");
+        assert_eq!(outcome.response, "done");
+        assert_eq!(seen.lock().unwrap().len(), 4, "all four model calls ran");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_turn_cap_is_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // More tool calls than any finite cap; a cap of 0 should run them all.
+        let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
+        agent.config.max_iterations = 0;
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn, "a cap of 0 is unbounded");
         assert_eq!(outcome.response, "done");
         assert_eq!(seen.lock().unwrap().len(), 4, "all four model calls ran");
     }
