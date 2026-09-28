@@ -76,12 +76,13 @@ pub fn definitions() -> Vec<ToolDefinition> {
              Returns matching messages as `#N role: snippet` lines (up to 3 matches each), where #N is the ID the \
              summary cites; read one whole with history_read. Prefer distinctive patterns (an error code or \
              phrase, an identifier, a flag) over common words, and use order=oldest for things from early on. \
+             An assistant message that follows tool output is often a paraphrase: read the output it names. \
              Results are history, not the current state of files.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Regular expression (case-insensitive); plain text works too" },
-                    "role": { "type": "string", "enum": ["user", "assistant", "tool"], "description": "Only messages with this role" },
+                    "role": { "type": "string", "enum": ["user", "assistant", "tool"], "description": "Only messages with this role. Command output and errors are in tool messages; omit role to search everything" },
                     "before": { "type": "integer", "description": "Only messages with an ID below this" },
                     "after": { "type": "integer", "description": "Only messages with an ID above this" },
                     "order": { "type": "string", "enum": ["newest", "oldest"], "description": "Result order (default newest first)" },
@@ -187,6 +188,18 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
     out
 }
 
+/// IDs of the tool results directly before message `index` (`#6` or
+/// `#4–#6`), if any.
+fn preceding_tool_outputs(messages: &[(u64, Message)], index: usize) -> Option<String> {
+    let tools: Vec<u64> =
+        messages[..index].iter().rev().take_while(|(_, m)| m.role == Role::Tool).map(|(id, _)| *id).collect();
+    match (tools.last(), tools.first()) {
+        (Some(first), Some(last)) if first == last => Some(format!("#{first}")),
+        (Some(first), Some(last)) => Some(format!("#{first}–#{last}")),
+        _ => None,
+    }
+}
+
 /// `history_search`: matching messages, newest first.
 pub fn search(path: &Path, args: &Value) -> Result<String> {
     let pattern = args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty())
@@ -210,15 +223,21 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
     let messages = load(path)?;
     let ordered: Box<dyn Iterator<Item = &(u64, Message)>> =
         if oldest_first { Box::new(messages.iter()) } else { Box::new(messages.iter().rev()) };
+    let position: std::collections::HashMap<u64, usize> = messages.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
     let mut hits = Vec::new();
     let mut total = 0;
     let mut omitted = (u64::MAX, 0u64);
+    // Matches the role filter hid, by role: models tend to search only their
+    // own (assistant) messages and miss the tool output holding the detail.
+    let mut hidden_by_role: std::collections::BTreeMap<&str, usize> = Default::default();
     for (id, message) in ordered {
-        if message.role == Role::System
-            || role.is_some_and(|r| r != role_name(&message.role))
-            || before.is_some_and(|b| *id >= b)
-            || after.is_some_and(|a| *id <= a)
-        {
+        if message.role == Role::System || before.is_some_and(|b| *id >= b) || after.is_some_and(|a| *id <= a) {
+            continue;
+        }
+        if role.is_some_and(|r| r != role_name(&message.role)) {
+            if regex.is_match(&searchable(message)) {
+                *hidden_by_role.entry(role_name(&message.role)).or_default() += 1;
+            }
             continue;
         }
         let text = searchable(message);
@@ -234,6 +253,13 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
         let mut line = label(*id, message);
         if found.len() > 1 {
             line.push_str(&format!(" [{} matches]", found.len()));
+        }
+        if message.role == Role::Assistant
+            && let Some(sources) = preceding_tool_outputs(&messages, position[id])
+        {
+            // An assistant message often paraphrases the output it just saw;
+            // point at the original so the paraphrase isn't taken as the source.
+            line.push_str(&format!(" [after tool output {sources}]"));
         }
         line.push(':');
         // Snippets of distinct, non-overlapping regions of the message.
@@ -253,10 +279,29 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
         }
         hits.push(line);
     }
+    let hidden = (!hidden_by_role.is_empty()).then(|| {
+        let counts: Vec<String> = hidden_by_role.iter().map(|(r, n)| format!("{n} {r}")).collect();
+        format!(
+            "[role={} hid {} matching message(s): {}. Tool messages hold command output and errors; \
+             search without role to include them]",
+            role.unwrap_or_default(),
+            hidden_by_role.values().sum::<usize>(),
+            counts.join(", ")
+        )
+    });
     if hits.is_empty() {
-        return Ok(format!("No messages match {pattern:?}."));
+        let mut out = format!("No {}messages match {pattern:?}.", role.map(|r| format!("{r} ")).unwrap_or_default());
+        if let Some(hidden) = hidden {
+            out.push('\n');
+            out.push_str(&hidden);
+        }
+        return Ok(out);
     }
     let mut out = hits.join("\n");
+    if let Some(hidden) = &hidden {
+        out.push('\n');
+        out.push_str(hidden);
+    }
     if total > hits.len() {
         let (which, bound) = if oldest_first { ("newer", "after") } else { ("older", "before") };
         let (first, last) = omitted;
@@ -347,7 +392,8 @@ mod tests {
         assert!(lines[2].starts_with("#3 user"), "{out}");
 
         let out = search(&path, &json!({"pattern": "auth", "role": "user"})).unwrap();
-        assert_eq!(out.lines().count(), 1);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() == 2 && lines[0].starts_with("#3 user") && lines[1].starts_with("[role=user hid"), "{out}");
         let out = search(&path, &json!({"pattern": "auth", "limit": 1})).unwrap();
         assert!(out.contains("[2 more older matching messages not shown (#3–#4)") && out.contains("order=oldest"), "{out}");
         let out = search(&path, &json!({"pattern": "auth", "order": "oldest", "limit": 1})).unwrap();
@@ -370,6 +416,41 @@ mod tests {
         log.append(&Record::Message(Message::tool_result("t1", "bash", &text))).unwrap();
         let out = search(log.path(), &json!({"pattern": "lease"})).unwrap();
         assert!(out.contains("[3 matches]") && out.contains("no method named `renew`"), "{out}");
+    }
+
+    #[test]
+    fn reports_matches_hidden_by_the_role_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log(dir.path());
+        // The error is only in the tool result (#5).
+        let out = search(&path, &json!({"pattern": "E0308", "role": "assistant"})).unwrap();
+        assert!(out.starts_with("No assistant messages match"), "{out}");
+        assert!(out.contains("role=assistant hid 1 matching message(s): 1 tool"), "{out}");
+        // Hits in the chosen role still show, plus the note.
+        let out = search(&path, &json!({"pattern": "auth", "role": "user"})).unwrap();
+        assert!(out.starts_with("#3 user") && out.contains("role=user hid"), "{out}");
+        // No note without a role filter, or when nothing is hidden.
+        assert!(!search(&path, &json!({"pattern": "E0308"})).unwrap().contains("hid"));
+        assert!(!search(&path, &json!({"pattern": "E0308", "role": "tool"})).unwrap().contains("hid"));
+    }
+
+    #[test]
+    fn assistant_hits_name_the_tool_output_they_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log(dir.path());
+        // #6 "fixed" follows the tool output #5; #4 follows a user message.
+        let out = search(&path, &json!({"pattern": "fixed"})).unwrap();
+        assert!(out.starts_with("#6 assistant") && out.contains("[after tool output #5]"), "{out}");
+        let out = search(&path, &json!({"pattern": "cargo test auth", "role": "assistant"})).unwrap();
+        assert!(out.starts_with("#4 assistant") && !out.contains("after tool output"), "{out}");
+
+        let mut log = crate::session::SessionLog::create(dir.path(), "multi").unwrap();
+        log.append(&Record::Message(Message::user("go"))).unwrap();
+        log.append(&Record::Message(Message::tool_result("a", "bash", "one"))).unwrap();
+        log.append(&Record::Message(Message::tool_result("b", "bash", "two"))).unwrap();
+        log.append(&Record::Message(Message::assistant("both said something"))).unwrap();
+        let out = search(log.path(), &json!({"pattern": "something"})).unwrap();
+        assert!(out.contains("[after tool output #3–#4]"), "{out}");
     }
 
     #[test]
