@@ -16,8 +16,9 @@ pub struct StatusLine {
     stats: SharedStats,
     /// Terminal rows and columns the scroll region was set for.
     size: Mutex<Option<(u16, u16)>>,
-    /// Text being typed during a turn (a steer), shown instead of the stats.
-    input: Mutex<Option<String>>,
+    /// Text being typed during a turn plus the queued-message count, shown
+    /// instead of the stats.
+    input: Mutex<Option<(String, usize)>>,
 }
 
 pub fn terminal_size() -> Option<(u16, u16)> {
@@ -225,16 +226,19 @@ impl StatusLine {
             }
             Some(_) => String::new(),
         };
-        let line = match self.input.lock().unwrap().as_deref() {
-            Some(text) => render_input(text, cols as usize),
+        let input = self.input.lock().unwrap().clone();
+        let line = match input {
+            Some((text, queued)) => render_input(&text, queued, cols as usize),
             None => render(&self.stats.lock().unwrap().clone(), cols as usize),
         };
         write_raw(&format!("{prefix}\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8"));
     }
 
-    /// Show `text` as a line being typed (None: back to the stats).
-    pub fn set_input(&self, text: Option<&str>) {
-        *self.input.lock().unwrap() = text.map(str::to_string);
+    /// Show `text` as a line being typed, with `queued` messages waiting
+    /// (None: back to the stats). An empty line with a non-zero count still
+    /// shows the queue indicator.
+    pub fn set_input(&self, text: Option<&str>, queued: usize) {
+        *self.input.lock().unwrap() = text.map(|t| (t.to_string(), queued));
         self.draw();
     }
 
@@ -315,16 +319,34 @@ struct Segment {
     priority: u8,
 }
 
-fn render_input(text: &str, cols: usize) -> String {
-    let prefix = " ✎ steer › ";
-    let hint = "  Enter to send ";
-    let room = cols.saturating_sub(prefix.chars().count() + hint.len() + 1);
+fn render_input(text: &str, queued: usize, cols: usize) -> String {
+    let prefix = " ✎ queue › ";
+    let hint = "  Enter to queue ";
+    // The queue indicator yields its hint on narrow terminals, then goes
+    // entirely, so the row never exceeds `cols`.
+    let full = (queued > 0).then(|| format!("⏸{queued} queued · /queue to edit"));
+    let short = (queued > 0).then(|| format!("⏸{queued}"));
+    let fits = |i: &Option<String>| {
+        let extra = i.as_deref().map_or(0, |i| i.chars().count() + 3);
+        prefix.chars().count() + text.chars().count().min(1) + 1 + hint.len() + extra <= cols
+    };
+    let indicator = match (full, short) {
+        (Some(f), Some(_)) if fits(&Some(f.clone())) => Some(f),
+        (Some(_), Some(s)) if fits(&Some(s.clone())) => Some(s),
+        (Some(_), _) if fits(&None) => None,
+        _ => None,
+    };
+    let extra = indicator.as_deref().map_or(0, |i| i.chars().count() + 3);
+    let room = cols.saturating_sub(prefix.chars().count() + hint.len() + extra + 1);
     let count = text.chars().count();
     let shown: String = if count > room { text.chars().skip(count - room).collect() } else { text.to_string() };
     let used = prefix.chars().count() + shown.chars().count() + 1;
-    let pad = cols.saturating_sub(used + hint.len());
+    let pad = cols.saturating_sub(used + hint.len() + extra);
+    let indicator = indicator
+        .map(|i| format!("\x1b[38;5;222m · {i}\x1b[38;5;244m"))
+        .unwrap_or_default();
     format!(
-        "{BG}\x1b[1;38;5;117m{prefix}\x1b[0;48;5;236;38;5;255m{shown}█{}\x1b[38;5;244m{hint}{RESET}",
+        "{BG}\x1b[1;38;5;117m{prefix}\x1b[0;48;5;236;38;5;255m{shown}█{}\x1b[38;5;244m{hint}{indicator}{RESET}",
         " ".repeat(pad)
     )
 }
@@ -501,6 +523,30 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn input_row_shows_the_queue_count() {
+        // Typing mid-turn: the row invites queueing and shows what waits.
+        let line = visible(&render_input("fix the typo", 2, 100));
+        assert!(line.contains("✎ queue › fix the typo"), "{line:?}");
+        assert!(line.contains("⏸2 queued · /queue to edit"), "{line:?}");
+        assert_eq!(line.chars().count(), 100, "fills the width: {line:?}");
+
+        // Nothing queued: just the line being typed, no indicator.
+        let line = visible(&render_input("fix the typo", 0, 100));
+        assert!(line.contains("✎ queue › fix the typo"), "{line:?}");
+        assert!(!line.contains("queued"), "{line:?}");
+
+        // An empty line with a waiting queue still shows the indicator.
+        let line = visible(&render_input("", 1, 100));
+        assert!(line.contains("⏸1 queued"), "{line:?}");
+
+        // Narrow terminal: the indicator collapses to the bare count and the
+        // line is truncated, but the row still fits.
+        let line = visible(&render_input("a very long line being typed here", 3, 40));
+        assert_eq!(line.chars().count(), 40, "{line:?}");
+        assert!(line.contains("⏸3"), "{line:?}");
     }
 
     #[test]

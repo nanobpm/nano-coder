@@ -29,6 +29,8 @@ pub struct EditView {
     /// Visible width of the prompt before the line (it starts with a
     /// timestamp when timestamps are on).
     prompt_width: usize,
+    /// Messages waiting in the queue (drives the status-line indicator).
+    queue_count: usize,
     /// Live configuration, for `/model` argument suggestions. Shared with the
     /// agent loop so a model/provider change is seen on the next keystroke.
     context: Arc<Mutex<EditContext>>,
@@ -53,17 +55,31 @@ impl EditView {
             menu_hidden: false,
             menu_enabled: false,
             prompt_width: 2,
+            queue_count: 0,
             context,
         }))
     }
 
     pub fn set_mode(&mut self, mode: EditMode) {
         self.mode = mode;
-        if let Some(status) = &self.status {
-            match mode {
-                EditMode::Turn if !self.line.is_empty() => status.set_input(Some(&self.line)),
-                _ => status.set_input(None),
+        self.refresh_status();
+    }
+
+    /// Update the queue indicator on the status line (None hides it).
+    pub fn set_queue_count(&mut self, count: Option<usize>) {
+        self.queue_count = count.unwrap_or(0);
+        self.refresh_status();
+    }
+
+    /// Push the mid-turn input row to the status line: the line being typed,
+    /// plus the queue count when messages are waiting.
+    fn refresh_status(&self) {
+        let Some(status) = &self.status else { return };
+        match self.mode {
+            EditMode::Turn if !self.line.is_empty() || self.queue_count > 0 => {
+                status.set_input(Some(&self.line), self.queue_count)
             }
+            _ => status.set_input(None, 0),
         }
     }
 
@@ -80,7 +96,7 @@ impl EditView {
     fn insert(&mut self, text: &str) {
         self.line.push_str(text);
         match self.on_status() {
-            Some(status) => status.set_input(Some(&self.line)),
+            Some(_) => self.refresh_status(),
             None => write(text),
         }
         self.line_changed();
@@ -227,7 +243,7 @@ impl EditView {
             }
         }
         match self.on_status() {
-            Some(status) => status.set_input((!self.line.is_empty()).then_some(self.line.as_str())),
+            Some(_) => self.refresh_status(),
             None => write(&"\x08 \x08".repeat(erased.chars().count())),
         }
         if !erased.is_empty() {
@@ -257,7 +273,7 @@ impl EditView {
         self.restamp_prompt();
         let line = std::mem::take(&mut self.line);
         match self.on_status() {
-            Some(status) => status.set_input(None),
+            Some(_) => self.refresh_status(),
             None => write("\r\n"),
         }
         line
