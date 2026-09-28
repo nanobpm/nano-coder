@@ -100,6 +100,10 @@ pub struct Restored {
     /// Whether the last replacement was a smart compaction, so the resumed
     /// session should offer the history tools without re-sniffing message text.
     pub history_available: bool,
+    /// Whether the one-time post-compaction history hint was already emitted
+    /// (or a history tool was already used) after the latest smart compaction,
+    /// so a resume does not append it a second time.
+    pub history_hint_consumed: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -281,6 +285,9 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             Record::Message(mut message) => {
                 message.log_line.get_or_insert(index as u64 + 1);
+                if crate::history::consumes_hint(&message) {
+                    restored.history_hint_consumed = true;
+                }
                 originals.push(message.clone());
                 restored.conversation.push(message);
             }
@@ -304,6 +311,9 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 // A smart compaction offers the history tools; restore that
                 // state from the mode rather than sniffing the summary text.
                 restored.history_available = matches!(mode, Some(crate::config::CompactionMode::Smart));
+                // The one-time hint re-arms with each compaction; only messages
+                // recorded after this replace can consume it.
+                restored.history_hint_consumed = false;
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
         }
@@ -461,6 +471,34 @@ mod tests {
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
         assert!(!restored.history_available, "a standard replace drops the history tools");
+    }
+
+    #[test]
+    fn hint_consumed_tracks_messages_after_the_latest_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s7b").unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::user("summary")],
+            pending_position: None,
+            summarized: Some((2, 2)),
+            mode: Some(crate::config::CompactionMode::Smart),
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        // Right after the smart compaction the hint is unconsumed.
+        let (_, restored) = SessionLog::open(dir.path(), "s7b").unwrap();
+        assert!(restored.history_available && !restored.history_hint_consumed);
+
+        // A failed tool result carrying the hint consumes it for this compaction.
+        let mut log = SessionLog::open(dir.path(), "s7b").unwrap().0;
+        let hinted = format!("Exit code: 1\n\n{}", crate::history::FAILED_TOOL_HINT);
+        log.append(&Record::Message(Message::tool_error("c1", "bash", &hinted))).unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7b").unwrap();
+        assert!(restored.history_hint_consumed, "a hint emitted after the replace is consumed");
     }
 
     #[test]

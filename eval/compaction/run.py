@@ -61,7 +61,157 @@ def default_binary():
     return shutil.which("nano-coder") or "nano-coder"
 
 
-def config_text(base, session_dir, mode):
+# Built-in provider presets nano-coder ships (src/providers/mod.rs `presets()`).
+# These are valid provider names even without a `[providers.<name>]` table, so a
+# spec like `github-copilot/gpt-4.1` resolves to the preset, not the default.
+PRESET_PROVIDERS = frozenset({
+    "openai", "anthropic", "openrouter", "fireworks", "groq", "together",
+    "deepseek", "kimi", "mistral", "gemini", "github-copilot", "qwen",
+    "ollama", "llamacpp", "mock",
+})
+
+
+def _load_toml(text):
+    """Parse `text` with a real TOML parser, or `None` if none is available.
+    `tomllib` is stdlib on Python 3.11+; `tomli` is the 3.10-and-earlier
+    back-port. A malformed config also yields `None` so callers fall back."""
+    try:
+        import tomllib as toml
+    except ModuleNotFoundError:
+        try:
+            import tomli as toml
+        except ModuleNotFoundError:
+            return None
+    try:
+        return toml.loads(text)
+    except Exception:
+        return None
+
+
+def _toml_parses(text):
+    """`True`/`False` whether `text` is valid TOML, or `None` when no parser is
+    installed. Unlike `_load_toml`, this distinguishes a malformed document from
+    a missing parser so callers can validate emitted config rather than silently
+    falling back."""
+    try:
+        import tomllib as toml
+    except ModuleNotFoundError:
+        try:
+            import tomli as toml
+        except ModuleNotFoundError:
+            return None
+    try:
+        toml.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def _effective_providers_regex(text):
+    """Best-effort fallback for when no TOML parser is installed. Handles
+    bare, double-quoted and single-quoted `[providers.<name>]` keys and both
+    quote styles for a top-level `default_provider`, so it mirrors the real
+    parser for the common config forms without a dependency."""
+    header = re.compile(r"""(?m)^\s*\[providers\.\s*(?:"([^"]+)"|'([^']+)'|([^.\]\s"']+))""")
+    providers = set(PRESET_PROVIDERS)
+    for dq, sq, bare in header.findall(text):
+        providers.add(dq or sq or bare)
+    default, has_legacy, in_table = "mock", False, False
+    for line in text.splitlines():
+        if line.lstrip().startswith("["):
+            in_table = True
+            continue
+        if in_table:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key == "default_provider":
+            m = re.search(r"""(?:"([^"]*)"|'([^']*)')""", line)
+            if m:
+                default = m.group(1) if m.group(1) is not None else m.group(2)
+        elif key in ("api_key", "base_url"):
+            has_legacy = True
+    if default == "mock" and has_legacy:
+        default = "openai"
+    return providers, default
+
+
+def effective_providers(base):
+    """`(provider names, default_provider)` as nano-coder resolves them
+    (src/providers/mod.rs `effective_providers`, src/config.rs): the built-in
+    presets overlaid with configured `[providers.<name>]` tables, and the
+    effective default provider. `default_provider` defaults to `mock`; a
+    legacy top-level `api_key`/`base_url` promotes a `mock` default to
+    `openai`. Only top-level keys count — provider-table keys are ignored."""
+    text = Path(base).read_text() if base and Path(base).is_file() else ""
+    data = _load_toml(text)
+    if data is None:
+        return _effective_providers_regex(text)
+    configured = data.get("providers")
+    configured = set(configured) if isinstance(configured, dict) else set()
+    providers = set(PRESET_PROVIDERS) | configured
+    default = data.get("default_provider")
+    default = default if isinstance(default, str) else "mock"
+    has_legacy = isinstance(data.get("api_key"), str) or isinstance(data.get("base_url"), str)
+    if default == "mock" and has_legacy:
+        default = "openai"
+    return providers, default
+
+
+def provider_for(model, base):
+    """The provider table a model spec targets, matching nano-coder's rule
+    (src/providers/mod.rs `parse_model_spec`): `provider/model` uses the head
+    only when it names a known provider — a built-in preset OR a configured
+    `[providers.<name>]` table; otherwise the whole spec is a model on the
+    config's `default_provider`. So `gpt-4o` and `qwen3:8b` resolve to the
+    default provider, while `github-copilot/gpt-4.1` resolves to the
+    `github-copilot` preset even with no table for it."""
+    providers, default = effective_providers(base)
+    if "/" in model:
+        head = model.split("/", 1)[0]
+        if head in providers:
+            return head
+    elif model in providers:
+        return model
+    return default
+
+
+def extra_body_arg(text):
+    """Parse a --extra-body value, requiring it to decode to a JSON object.
+
+    The merge path treats the value as a TOML table (it calls `.items()` on
+    it), so a bare JSON array, string, or number would raise an
+    ``AttributeError`` deep in a worker rather than reporting bad CLI input.
+
+    A nested JSON ``null`` is also rejected here: TOML cannot represent it, and
+    `config_text` runs inside a worker, so leaving it to fail there would abort
+    the whole evaluation with a `SystemExit` instead of a clean CLI error."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {e}")
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(
+            f"must be a JSON object (e.g. '{{\"chat_template_kwargs\": {{...}}}}'), "
+            f"not a JSON {type(value).__name__}")
+
+    def reject_null(node, path):
+        if node is None:
+            where = "".join(path) or "the top level"
+            raise argparse.ArgumentTypeError(
+                f"contains a JSON null at {where}, which TOML cannot represent; "
+                f"remove the null field or give it a real value")
+        if isinstance(node, dict):
+            for k, v in node.items():
+                reject_null(v, path + [f".{k}"])
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                reject_null(v, path + [f"[{i}]"])
+
+    reject_null(value, [])
+    return value
+
+
+def config_text(base, session_dir, mode, extra_body=None, providers=()):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
     lines = []
@@ -81,7 +231,129 @@ def config_text(base, session_dir, mode):
         "persist_sessions = true",
         "project_instructions = false",
     ]
-    return "\n".join(head + lines) + "\n"
+    tail = []
+    if extra_body:
+        # Inline-table form of the JSON; appended per provider under test.
+        def toml_value(v):
+            if v is None:
+                sys.exit("error: --extra-body contains a JSON null, which TOML cannot represent; "
+                         "remove the null field or give it a real value")
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, dict):
+                return "{ " + ", ".join(f"{json.dumps(k)} = {toml_value(x)}" for k, x in v.items()) + " }"
+            if isinstance(v, list):
+                return "[" + ", ".join(toml_value(x) for x in v) + "]"
+            return json.dumps(v)
+        def toml_key(name):
+            # A TOML dotted-key segment: bare when it is a valid bare key,
+            # otherwise a quoted key so provider names with dots/spaces (e.g.
+            # `my.provider`) address one table instead of nesting.
+            if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                return name
+            return json.dumps(name)
+        def deep_merge(base_body, override):
+            # Recursively overlay `override` onto `base_body`; a scalar/list in
+            # `override` replaces, but two tables merge so the CLI can set one
+            # nested field (e.g. chat_template_kwargs.enable_thinking) without
+            # dropping the base's siblings.
+            out = dict(base_body)
+            for k, v in override.items():
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = deep_merge(out[k], v)
+                else:
+                    out[k] = v
+            return out
+        def header_segments(line):
+            # Dotted-key segments of a `[table]`/`[[table]]` header (quoted
+            # segments keep dots/spaces), or None when `line` is not a header.
+            m = re.match(r"\s*\[\[?(.*?)\]\]?\s*(?:#.*)?$", line)
+            if not m:
+                return None
+            return [dq or sq or bare for dq, sq, bare
+                    in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', m.group(1))]
+        def key_segments(key_part):
+            # All dotted-key segments of a `key = value` assignment's key
+            # (quoted segments keep their dots/spaces).
+            return [dq or sq or bare for dq, sq, bare
+                    in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^.\s]+)', key_part)]
+        def strip_extra_body(cfg_lines, provider):
+            # Drop an existing extra_body for `provider` (an inline
+            # `extra_body = {...}` or dotted `extra_body.<field> = ...`
+            # assignment under `[providers.<p>]`, or a
+            # `[providers.<p>.extra_body]` sub-table and any of its own
+            # sub-tables) so the merged table we emit is the only one — two
+            # declarations of the same key would be invalid TOML. Match on the
+            # full dotted path (`cur` + the assignment's key segments) so a
+            # fully-qualified root assignment such as
+            # `providers.<p>.extra_body = {...}` (or `providers.<p>.extra_body.x`)
+            # is stripped too, not just keys written under a `[providers.<p>]`
+            # header.
+            target = ["providers", provider, "extra_body"]
+            kept, cur, dropping = [], [], False
+            for line in cfg_lines:
+                segs = header_segments(line)
+                if segs is not None:
+                    cur, dropping = segs, segs[:len(target)] == target
+                    if not dropping:
+                        kept.append(line)
+                    continue
+                if dropping:
+                    continue
+                if "=" in line \
+                        and (cur + key_segments(line.split("=", 1)[0]))[:len(target)] == target:
+                    continue
+                kept.append(line)
+            return kept
+        parsed = _load_toml("\n".join(lines))
+        base_providers = parsed.get("providers") if isinstance(parsed, dict) else None
+        for provider in providers:
+            key = toml_key(provider)
+            if base_providers is None:
+                # No TOML parser installed: we cannot read the existing table to
+                # merge it, so fall back to detecting and skipping rather than
+                # emitting a duplicate. Match a bare or quoted provider header.
+                text = "\n".join(lines)
+                prov_pat = rf"(?:{re.escape(provider)}|{re.escape(json.dumps(provider))})"
+                # Recognize the same indented/quoted/dotted forms strip_extra_body
+                # handles: an existing `[providers.<p>.extra_body]` sub-table, or an
+                # `extra_body`/`extra_body.<field>` key (bare or quoted, optionally
+                # indented) under `[providers.<p>]`. `[.=]` after the key name avoids
+                # matching unrelated keys such as `extra_body_extra`.
+                eb_key = r"[ \t]*(?:extra_body|\"extra_body\"|'extra_body')[ \t]*[.=]"
+                if re.search(rf"(?m)^[ \t]*\[providers\.{prov_pat}\.extra_body\]", text) \
+                        or re.search(rf"(?ms)^[ \t]*\[providers\.{prov_pat}\](?:(?!^[ \t]*\[).)*?^{eb_key}", text):
+                    print(f"warning: providers.{provider} already sets extra_body and no TOML parser is "
+                          f"available to merge it; --extra-body ignored for it", file=sys.stderr)
+                    continue
+                merged = extra_body
+            else:
+                prov_conf = base_providers.get(provider)
+                has_extra_body = isinstance(prov_conf, dict) and "extra_body" in prov_conf
+                existing = prov_conf.get("extra_body") if isinstance(prov_conf, dict) else None
+                existing = existing if isinstance(existing, dict) else {}
+                if has_extra_body:
+                    lines = strip_extra_body(lines, provider)
+                merged = deep_merge(existing, extra_body)
+            tail.append(f"[providers.{key}.extra_body]")
+            tail += [f"{json.dumps(k)} = {toml_value(v)}" for k, v in merged.items()]
+    result = "\n".join(head + lines + tail) + "\n"
+    if extra_body and _toml_parses(result) is False:
+        # A parser is available (so we read/merged the base) yet the emitted
+        # config is invalid TOML. This happens when a provider under test is
+        # written as an inline table — `foo = { ... }` under `[providers]`, or a
+        # root-level `providers = { foo = { ... } }` — because `[providers.<p>.
+        # extra_body]` cannot extend an inline table (whether or not it already
+        # had an extra_body). Reject with a clear error instead of writing an
+        # unusable config that fails opaquely when nano-coder loads it.
+        raise ValueError(
+            "--extra-body produced invalid TOML: a provider under test is defined "
+            "as a TOML inline table (e.g. `provider = { ... }` under `[providers]`, "
+            "or `providers = { ... }`), which `[providers.<name>.extra_body]` cannot "
+            "extend. Rewrite the affected provider as a standard `[providers.<name>]` "
+            "table (header form) to use --extra-body."
+        )
+    return result
 
 
 def fork_records(path, line):
@@ -130,6 +402,52 @@ def load_cases(args):
                     "cwd": spec.get("cwd"),
                 }
             out.append(case)
+    return out
+
+
+def reuse_cases(results_files):
+    """Compacted logs from earlier runs, cut right after the compaction, so a
+    new model only answers the question (no summary to write: the costly part
+    on a slow model). Keeps smart runs whose detail was lost and that did not
+    error; the summary was written by the earlier run's model."""
+    out = []
+    for file in results_files:
+        for line in open(file):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("mode") != "smart" or "error" in r or r.get("kept", r.get("summary_kept")):
+                continue
+            records = read_log(r["session"])
+            at = max((i for i, x in enumerate(records) if x["type"] == "replace" and "mode" in x["data"]), default=None)
+            if at is None:
+                continue
+            if "question" in r:
+                question, expect, forbid = r["question"], r["expect"], r.get("forbid", [])
+            else:
+                # Older results: rebuild the synthetic case from name and seed.
+                # Only the built-in `name/s<seed>` shape (a known synthetic case
+                # plus an integer seed) can be reconstructed; any other legacy
+                # case name (e.g. a custom `--cases` entry) is skipped rather than
+                # aborting the whole reuse run.
+                m = re.fullmatch(r"(.*)/s(\d+)", r["case"])
+                if not m or m.group(1) not in synthetic.CASES:
+                    print(f"warning: skipping {r['case']}: not a rebuildable synthetic case",
+                          file=sys.stderr)
+                    continue
+                name, seed = m.group(1), int(m.group(2))
+                case = synthetic.build(name, seed, 15)
+                question, expect, forbid = case["question"], case["expect"], case["forbid"]
+                text = json.dumps(records[:at])
+                if not matches_all(expect, text):
+                    print(f"warning: skipping {r['case']}: rebuilt answer not in its log", file=sys.stderr)
+                    continue
+            out.append({
+                "name": f"{r['case']}@{r['model'].split('/')[-1]}",
+                "records": records[:at + 1],
+                "question": question, "expect": expect, "forbid": forbid,
+                "precompacted": True,
+            })
     return out
 
 
@@ -220,8 +538,8 @@ def read_log(path):
     return records
 
 
-def run_one(args, case, model, mode, repeat, work_root):
-    run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}"
+def run_one(args, index, case, model, mode, repeat, work_root):
+    run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}-j{index}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
     if case.get("cwd") and args.tools == "all":
@@ -229,8 +547,9 @@ def run_one(args, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, mode))
-    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools, "session": str(session_dir / f"{session_id}.jsonl")}
+    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [provider_for(model, args.config)]))
+    result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
+              "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
     argv = [args.bin, "--acp", "--config", str(config), "--model", model]
     if args.tools == "history":
@@ -239,10 +558,14 @@ def run_one(args, case, model, mode, repeat, work_root):
     try:
         acp.call("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
         acp.call("session/load", {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []})
-        compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
-        result["compacted"] = bool(compacted and compacted.get("compacted"))
-        result["fallback"] = compacted.get("fallback") if compacted else None
-        acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": case["question"]}]})
+        if case.get("precompacted"):
+            result["compacted"], result["fallback"] = True, None
+        else:
+            compacted = acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": f"/compact --{mode}"}]})
+            result["compacted"] = bool(compacted and compacted.get("compacted"))
+            result["fallback"] = compacted.get("fallback") if compacted else None
+        question = case["question"] + (" Answer in one line." if args.terse else "")
+        acp.call("session/prompt", {"sessionId": session_id, "prompt": [{"type": "text", "text": question}]})
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
     finally:
@@ -369,6 +692,14 @@ def main():
     p.add_argument("--synthetic", default=",".join(synthetic.CASES),
                    help="comma-separated built-in cases ('' for none): " + ", ".join(synthetic.CASES))
     p.add_argument("--cases", action="append", help="JSON case file (repeatable)")
+    p.add_argument("--reuse-compaction", action="append", metavar="RESULTS",
+                   help="answer only: reuse compacted logs from earlier smart runs where the detail was lost "
+                        "(skips writing a summary; for slow models). Implies --modes smart and no synthetic cases")
+    p.add_argument("--extra-body", type=extra_body_arg, metavar="JSON",
+                   help='merged into requests of the providers under test, e.g. \'{"chat_template_kwargs": {"enable_thinking": false}}\'')
+    p.add_argument("--shuffle", action="store_true", help="run jobs in a random (seeded) order, for a time-boxed sample")
+    p.add_argument("--max-minutes", type=float, help="start no new runs after this long; unstarted runs are skipped")
+    p.add_argument("--terse", action="store_true", help='append "Answer in one line." to questions')
     p.add_argument("--seeds", type=int, default=2, help="variants per synthetic case")
     p.add_argument("--filler-turns", type=int, default=15, help="unrelated turns after the detail in synthetic cases")
     p.add_argument("--repeats", type=int, default=1)
@@ -396,7 +727,9 @@ def main():
         args.config, args.models = str(base), "fake/oracle"
     if not args.models:
         p.error("--models is required (or use --self-test)")
-    cases = load_cases(args)
+    if args.reuse_compaction:
+        args.modes, args.synthetic = "smart", ""
+    cases = load_cases(args) + (reuse_cases(args.reuse_compaction) if args.reuse_compaction else [])
     if not cases:
         sys.exit("no cases")
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -406,16 +739,32 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / f"{stamp}.jsonl"
     work_root = Path(tempfile.mkdtemp(prefix=f"compaction-eval-{stamp}-"))
-    jobs = [(c, m, mo, r) for c in cases for m in models for mo in modes for r in range(args.repeats)]
+    # A unique index per job keeps run_dir distinct even when two cases share a
+    # name (duplicate reuse entries, or the same case across --cases files), so
+    # parallel jobs never share and overwrite each other's config/session files.
+    jobs = [(i, c, m, mo, r) for i, (c, m, mo, r) in enumerate(
+        (c, m, mo, r) for c in cases for m in models for mo in modes for r in range(args.repeats))]
     print(f"{len(jobs)} runs ({len(cases)} cases x {len(models)} models x {len(modes)} modes x {args.repeats}); "
           f"logs in {work_root}; results in {results_path}", file=sys.stderr)
+
+    if args.shuffle:
+        import random
+        random.Random(0).shuffle(jobs)
+    deadline = time.monotonic() + args.max_minutes * 60 if args.max_minutes else None
+
+    def run_job(*job):
+        if deadline and time.monotonic() > deadline:
+            return None
+        return run_one(args, *job, work_root)
 
     results = []
     lock = threading.Lock()
     with open(results_path, "w") as sink, concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        futures = [pool.submit(run_one, args, *job, work_root) for job in jobs]
+        futures = [pool.submit(run_job, *job) for job in jobs]
         for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
             r = future.result()
+            if r is None:
+                continue
             with lock:
                 results.append(r)
                 sink.write(json.dumps(r) + "\n")

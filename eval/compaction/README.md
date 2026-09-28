@@ -97,6 +97,30 @@ Fork at a `turn_end` line; the harness warns if you don't. Questions should
 ask for something checkable, and `expect` should be specific enough that a
 guess won't match.
 
+## Slow models
+
+Writing the summary is most of a run's cost: hundreds of output tokens,
+which takes minutes on a slow local model. To test whether a model *uses*
+the history well, reuse compactions from an earlier run instead:
+
+```sh
+eval/compaction/run.py --models macbook/qwen3.8-neo-coder \
+  --reuse-compaction eval/compaction/results/<copilot-run>.jsonl \
+  --shuffle --max-minutes 20 --jobs 1 --timeout 1200 --terse \
+  --extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+- `--reuse-compaction` takes the smart runs from that file where the
+  detail was lost. It cuts each log right after its compaction, and the new
+  model only answers the question. The summary was written by the earlier
+  model, so this measures retrieval, not summarizing.
+- `--shuffle` and `--max-minutes` time-box a sample of the jobs.
+- `--terse` asks for a one-line answer.
+- `--extra-body` is merged into requests of the providers under test, for
+  example to turn thinking off. If a provider already sets `extra_body` in your
+  config, the two are deep-merged (CLI fields win), so you can override one
+  nested field without dropping the rest.
+
 ## Self-test
 
 `--self-test` starts `fake_llm.py`, an OpenAI-compatible endpoint that plays
