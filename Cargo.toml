@@ -15,6 +15,17 @@ exclude = ["tla/", "eval/", "target/", "npm/", "scripts/", ".github/", "TLA-plan
 name = "nano-coder"
 path = "src/main.rs"
 
+# Distributed binaries (GitHub releases, crates.io, npm) are built with
+# `cargo build --release`; without this profile they ship cargo's defaults,
+# which means unstripped symbols and no cross-crate optimisation. This keeps
+# the binary small and fast. Note: no `panic = "abort"` — main.rs installs a
+# panic hook that restores the terminal, and abort would skip it.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
