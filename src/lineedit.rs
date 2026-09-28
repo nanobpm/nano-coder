@@ -829,9 +829,26 @@ impl LineReader {
                             // modes are cleared on entry, but a report buffered
                             // before then could still arrive).
                             if seq == [0x1b, b'[', b'M'] {
+                                // A genuine report's three coordinate bytes
+                                // arrive atomically with the prefix, so only
+                                // consume them if they are already available.
+                                // Use bounded (non-blocking) reads so a bare or
+                                // partial `ESC [ M` typed/pasted as ordinary
+                                // input cannot make the prompt block waiting for
+                                // bytes that never come; push back anything we
+                                // read that does not complete the report so it
+                                // is processed as input rather than silently
+                                // swallowed.
+                                let mut coords = Vec::with_capacity(3);
                                 for _ in 0..3 {
-                                    if self.next_byte().is_none() {
-                                        break;
+                                    match self.byte_within(0) {
+                                        Some(b) => coords.push(b),
+                                        None => break,
+                                    }
+                                }
+                                if coords.len() < 3 {
+                                    for b in coords.into_iter().rev() {
+                                        self.pending.push_front(b);
                                     }
                                 }
                             }
