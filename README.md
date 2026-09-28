@@ -336,7 +336,7 @@ cargo run -- --resume sess-20260923T012518-7e7923f8
 
 Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
-`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules).
+`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
 ## Configuration
 
