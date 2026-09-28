@@ -121,6 +121,12 @@ impl EditView {
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
+            // Opening or closing menu rows scrolls the bottom of the screen,
+            // which can shift the status line off its reserved row, so repaint
+            // it last to keep the bar pinned to the bottom.
+            if let Some(status) = &self.status {
+                status.draw();
+            }
         }
     }
 

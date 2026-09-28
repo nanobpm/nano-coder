@@ -9,6 +9,11 @@
 //! keep its old line breaks. Leaving the region unset lets those terminals
 //! reflow the message history when the window is resized; the status line is
 //! simply redrawn at the (new) bottom row whenever output lands there.
+//!
+//! Because no scroll region pins the bar, the bottom row is instead kept free
+//! for it by reserving a row before the prompt is drawn (see
+//! [`reserve_bottom_row`]): the prompt is written one row up so ordinary output
+//! and the prompt can no longer paint over the status line.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -64,6 +69,22 @@ pub fn with_term_lock<R>(f: impl FnOnce() -> R) -> R {
 /// restored around the jump, so output continues uninterrupted.
 fn draw_sequence(line: &str, rows: u16) -> String {
     format!("\x1b7\x1b[{rows};1H\x1b[2K{line}\x1b8")
+}
+
+/// Bytes that reserve the terminal's bottom row for the status line by keeping
+/// whatever is written next one row higher.
+///
+/// With no DECSTBM scroll region to pin the bar, output and the prompt would
+/// otherwise land on the same bottom row the status line owns and paint over
+/// it. `\n` opens a blank row at the bottom — it scrolls the conversation up
+/// only when the cursor is already on the last row, otherwise it just steps
+/// down into an existing blank row — `\x1b[1A` steps the cursor back above that
+/// row, and `\r\x1b[2K` clears the row the caller is about to write. Emitting
+/// this before the prompt lands the prompt one row up and leaves the bottom row
+/// free for the status line, without holding a scroll region (so the terminal
+/// stays free to reflow the conversation on resize).
+pub fn reserve_bottom_row() -> &'static str {
+    "\n\x1b[1A\r\x1b[2K"
 }
 
 impl StatusLine {
@@ -360,6 +381,19 @@ mod tests {
         // what lets Ghostty/iTerm2 reflow the conversation on resize.
         let seq = draw_sequence("STATUS", 24);
         assert_eq!(seq, "\x1b7\x1b[24;1H\x1b[2KSTATUS\x1b8");
+        assert!(!seq.contains('r'), "no scroll region may be set: {seq:?}");
+    }
+
+    #[test]
+    fn reserve_bottom_row_keeps_the_prompt_one_row_up() {
+        // A blank bottom row is opened with `\n` (which only scrolls the
+        // conversation up when the cursor is already on the last row), the
+        // cursor steps back above it, and the row it lands on is cleared — so
+        // the prompt written next sits one row above the status line and the
+        // bottom row is left free for the bar. No DECSTBM region (which ends in
+        // 'r') is set, so the terminal stays free to reflow on resize.
+        let seq = reserve_bottom_row();
+        assert_eq!(seq, "\n\x1b[1A\r\x1b[2K");
         assert!(!seq.contains('r'), "no scroll region may be set: {seq:?}");
     }
 }
