@@ -117,6 +117,13 @@ impl EditView {
 
     pub fn set_mode(&mut self, mode: EditMode) {
         self.mode = mode;
+        if self.on_edit.is_some() {
+            // The frame renderer owns the screen: refresh through the hook
+            // rather than writing the legacy status row, which would corrupt
+            // the frame.
+            self.draw_edit();
+            return;
+        }
         if let Some(status) = &self.status {
             match mode {
                 EditMode::Turn => self.show_on_status(status),
@@ -128,6 +135,11 @@ impl EditView {
     /// Update the queue indicator on the status line (None hides it).
     pub fn set_queue_count(&mut self, count: Option<usize>) {
         self.queue_count = count.unwrap_or(0);
+        if self.on_edit.is_some() {
+            // Suppress the legacy status write in frame mode; re-render instead.
+            self.draw_edit();
+            return;
+        }
         if let Some(status) = self.on_status() {
             self.show_on_status(status);
         }

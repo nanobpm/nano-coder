@@ -109,6 +109,9 @@ pub enum Item {
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
     Note(String),
+    /// Verbatim command / informational output (e.g. `/help`, `/context`),
+    /// captured into the transcript so it can't corrupt the owned frame.
+    Output(String),
 }
 
 /// Render one transcript item to lines at `width`.
@@ -156,17 +159,21 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
             .into_iter()
             .map(|line| format!("{DIM}{line}{RESET}"))
             .collect(),
+        Item::Output(text) => wrap_block(text, width),
     }
 }
 
 fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec<String> {
-    let body = width.saturating_sub(4).max(1);
     let lines: Vec<&str> = output.trim_end().lines().collect();
     let (mark, color) = if ok {
         ("⎿", DIM)
     } else {
         ("⎿ error:", RED)
     };
+    // The prefix is two leading spaces, the marker, and one space; reserve its
+    // real width so the longer `⎿ error:` marker can't overflow `width` and
+    // wrap onto extra rows. Both result formats below use the same `body`.
+    let body = width.saturating_sub(mark.chars().count() + 3).max(1);
     if lines.is_empty() {
         return vec![format!("  {color}{mark} (no output){RESET}")];
     }
@@ -494,6 +501,11 @@ impl<W: Write> FrameRenderer<W> {
         clear_scrollback: bool,
     ) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
+        // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
+        // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
+        // the whole screen, so `CRLF` scrolling must span every row or the
+        // bottom status line can be pushed out of place.
+        buf.push_str("\x1b[r");
         buf.push_str(if clear_scrollback {
             "\x1b[H\x1b[2J\x1b[3J"
         } else {

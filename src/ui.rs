@@ -243,7 +243,7 @@ impl Renderer {
     /// it at the current terminal size.
     fn frame_render(&self, fs: &mut FrameState) {
         let (rows, cols) = status::terminal_size().unwrap_or((24, 80));
-        let width = (cols as usize).max(20);
+        let width = (cols as usize).max(1);
         let height = (rows as usize).max(1);
         let transcript = frame::transcript_lines(&fs.items, width);
         let editor = frame::editor_lines("› ", &fs.editor.0, fs.editor.1, width);
@@ -346,6 +346,19 @@ impl Renderer {
             fs.items.push(Item::Message { role: Role::User, text: text.to_string() });
             self.frame_render(&mut fs);
         }
+    }
+
+    /// Emit command / informational output (e.g. slash-command replies). In
+    /// frame mode it is captured as a transcript item so direct writes can't
+    /// corrupt the owned frame; otherwise it prints inline as before.
+    pub fn print_block(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(Item::Output(text.to_string()));
+            self.frame_render(&mut fs);
+            return;
+        }
+        println!("{text}");
     }
 
     fn width(&self) -> usize {
@@ -483,7 +496,10 @@ impl Renderer {
     pub fn event(&self, event: &AgentEvent) {
         if let Some(frame) = &self.frame {
             if verbosity() == Verbosity::Quiet
-                && !matches!(event, AgentEvent::AssistantMessage { .. })
+                && !matches!(
+                    event,
+                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context
+                )
             {
                 return;
             }

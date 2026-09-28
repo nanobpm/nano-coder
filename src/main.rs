@@ -427,8 +427,11 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to queue it (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
-    // Blank line after LLM output.
-    println!();
+    // Blank line after LLM output (legacy renderer only; the frame renderer
+    // owns the screen and must not receive stray direct writes).
+    if !renderer.is_frame() {
+        println!();
+    }
     renderer.begin_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
     let mut escape = DoubleEscape::default();
@@ -753,6 +756,16 @@ fn queue_command(text: &str) -> Option<std::result::Result<queue::QueueOp, Strin
     Some(queue::parse(args))
 }
 
+/// Emit a transient diagnostic: through the frame transcript in frame mode (a
+/// direct write would corrupt the owned frame), else to stderr as before.
+fn diag(renderer: &ui::Renderer, text: &str) {
+    if renderer.is_frame() {
+        renderer.note(text);
+    } else {
+        eprintln!("{text}");
+    }
+}
+
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
 async fn run_compaction(
     agent: &mut Agent,
@@ -772,15 +785,15 @@ async fn run_compaction(
             input = terminal.recv() => match input {
                 TermInput::Interrupt => {
                     control.cancel();
-                    eprintln!("[cancelling...]");
+                    diag(&terminal.renderer, "[cancelling...]");
                 }
                 TermInput::Escape if control.is_cancelled() => {}
                 TermInput::Escape => {
                     if escape.press(std::time::Instant::now()) {
                         control.cancel();
-                        eprintln!("[cancelling...]");
+                        diag(&terminal.renderer, "[cancelling...]");
                     } else {
-                        eprintln!("[Esc again to cancel]");
+                        diag(&terminal.renderer, "[Esc again to cancel]");
                     }
                 }
                 TermInput::ToggleThinking => {
@@ -794,7 +807,7 @@ async fn run_compaction(
                     // refresh while `/compact` is still running.
                     stats.lock().unwrap().mode = mode;
                     terminal.renderer.event(&agent::AgentEvent::Context);
-                    eprintln!("[mode: {mode} — {}]", mode.describe());
+                    diag(&terminal.renderer, &format!("[mode: {mode} — {}]", mode.describe()));
                 }
                 other => {
                     // `/queue` edits apply mid-compaction too; everything else
@@ -822,74 +835,76 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
     match cmd {
         "/exit" | "/quit" => Ok(false),
         "/help" => {
-            println!("{}", commands::help_text());
+            terminal.renderer.print_block(&commands::help_text());
             Ok(true)
         }
         _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
             let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
             let focus = focus.map(str::to_string);
-            println!("Compacting...");
+            terminal.renderer.print_block("Compacting...");
             match run_compaction(agent, mode, focus.as_deref(), terminal).await? {
-                Some(report) => println!("Conversation {report}"),
-                None => println!("Nothing to compact"),
+                Some(report) => terminal.renderer.print_block(&format!("Conversation {report}")),
+                None => terminal.renderer.print_block("Nothing to compact"),
             }
             Ok(true)
         }
         "/context" => {
             let stats = agent.context_stats().lock().unwrap().clone();
-            println!("Model:        {}/{}", stats.provider, stats.model);
-            println!(
+            let mut out: Vec<String> = Vec::new();
+            out.push(format!("Model:        {}/{}", stats.provider, stats.model));
+            out.push(format!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
                 if stats.calibrated { "" } else { "~" },
                 stats.tokens,
                 stats.window,
                 stats.percent(),
                 if stats.calibrated { ", anchored to reported usage" } else { ", estimated" }
-            );
-            println!("Messages:     {}", stats.messages);
+            ));
+            out.push(format!("Messages:     {}", stats.messages));
             let system_tokens = crate::context::text_tokens(&agent.system_prompt());
-            println!("System prompt: {} tokens", system_tokens);
+            out.push(format!("System prompt: {} tokens", system_tokens));
             let files = agent.project_instruction_files();
             if files.is_empty() {
-                println!("Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)");
+                out.push("Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)".to_string());
             } else {
-                println!("Instructions: {}", files.join(", "));
+                out.push(format!("Instructions: {}", files.join(", ")));
             }
             let skills = agent.skills();
             if !skills.is_empty() || !skills.warnings.is_empty() {
-                println!("Skills:       {} (/skills to list them)", skills.skills.len());
+                out.push(format!("Skills:       {} (/skills to list them)", skills.skills.len()));
             }
             if let Some((done, total)) = stats.plan {
-                println!("Plan:         {done}/{total} done (/plan to show it)");
+                out.push(format!("Plan:         {done}/{total} done (/plan to show it)"));
             }
-            println!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens);
+            out.push(format!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens));
             if let Some(aic) = stats.session_aic {
-                println!("AI Credits:   {aic:.2} used this session");
+                out.push(format!("AI Credits:   {aic:.2} used this session"));
             }
             match stats.auto_compact {
-                Some(t) => println!(
+                Some(t) => out.push(format!(
                     "Auto-compact: at {:.0}% (~{} tokens); compacted {} time(s)",
                     t * 100.0,
                     (stats.window as f64 * t) as usize,
                     stats.compactions
-                ),
-                None => println!("Auto-compact: off"),
+                )),
+                None => out.push("Auto-compact: off".to_string()),
             }
-            println!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str());
+            out.push(format!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str()));
             if stats.history_searches + stats.history_reads > 0 {
-                println!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads);
+                out.push(format!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads));
             }
-            println!("(context window {})", agent.context_window_with_source().1);
+            out.push(format!("(context window {})", agent.context_window_with_source().1));
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/settings" if terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive editor would race it for keystrokes.
             let config = agent.config();
-            println!("model: {}", config.model);
-            println!("temperature: {}", config.temperature);
-            println!("max_tokens: {}", config.max_tokens);
-            println!("(read-only: run /settings again at the prompt to edit)");
+            terminal.renderer.print_block(&format!(
+                "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
+                config.model, config.temperature, config.max_tokens
+            ));
             Ok(true)
         }
         "/settings" => {
@@ -907,30 +922,33 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/tools" => {
-            println!("Available tools:");
+            let mut out = vec!["Available tools:".to_string()];
             for def in agent.tool_definitions() {
-                println!("  {} - {}", def.name, def.description);
+                out.push(format!("  {} - {}", def.name, def.description));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/skills" => {
             let skills = agent.skills();
+            let mut out: Vec<String> = Vec::new();
             if skills.is_empty() {
-                println!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", "));
+                out.push(format!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", ")));
             }
             for skill in &skills.skills {
-                println!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display());
+                out.push(format!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display()));
             }
             for warning in &skills.warnings {
-                println!("Warning: {warning}");
+                out.push(format!("Warning: {warning}"));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/plan" => {
             if agent.plan().is_empty() {
-                println!("No plan yet. The agent makes one with the plan_add tool.");
+                terminal.renderer.print_block("No plan yet. The agent makes one with the plan_add tool.");
             } else {
-                print!("{}", agent.plan().render(true, usize::MAX));
+                terminal.renderer.print_block(agent.plan().render(true, usize::MAX).trim_end());
             }
             Ok(true)
         }
@@ -939,45 +957,50 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // already applied mid-turn when typed then, and apply here at the
             // prompt.
             match op {
-                Ok(queue::QueueOp::List) => println!("{}", queue::describe(&terminal.messages)),
-                Ok(op) => println!("{}", terminal.edit_queue(&op)),
-                Err(usage) => println!("{usage}"),
+                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages)),
+                Ok(op) => {
+                    let msg = terminal.edit_queue(&op);
+                    terminal.renderer.print_block(&msg);
+                }
+                Err(usage) => terminal.renderer.print_block(&usage),
             }
             Ok(true)
         }
         "/model" if terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive picker would race it for keystrokes.
-            println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
-            println!("(read-only: run /model again at the prompt to switch)");
+            terminal.renderer.print_block(&format!(
+                "Model: {} (provider {}, spec {:?})\n(read-only: run /model again at the prompt to switch)",
+                agent.model_name(), agent.provider_name(), agent.config().model
+            ));
             Ok(true)
         }
         "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
             // The picker reads keystrokes from stdin and draws on stderr, so it
             // needs both to be terminals; piped input/output just gets the
             // current model.
-            println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
+            terminal.renderer.print_block(&format!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model));
             Ok(true)
         }
         "/model" => {
             if let Some(spec) = settings::pick_model_interactive(agent).await? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent);
-                println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+                terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
             } else {
-                println!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name());
+                terminal.renderer.print_block(&format!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name()));
             }
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
             agent.set_model(cmd["/model ".len()..].trim()).await?;
             terminal.model_switched(agent);
-            println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+            terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
             Ok(true)
         }
         "/providers" => {
             let (user, default_provider) = agent.config().effective_providers();
-            println!("Providers (default: {default_provider}):");
+            let mut out = vec![format!("Providers (default: {default_provider}):")];
             for (name, provider) in providers::effective_providers(&user) {
                 let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
                 let key = settings::key_status(&provider);
@@ -985,14 +1008,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                     Some(providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
                     _ => "-".into(),
                 });
-                println!("  {name:<14} {kind:<14} {url:<55} {key}");
+                out.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/session" => {
             match (agent.session_id(), agent.session_path()) {
-                (Some(id), Some(path)) => println!("Session {id}: {}", path.display()),
-                _ => println!("Session persistence is disabled"),
+                (Some(id), Some(path)) => terminal.renderer.print_block(&format!("Session {id}: {}", path.display())),
+                _ => terminal.renderer.print_block("Session persistence is disabled"),
             }
             Ok(true)
         }
@@ -1003,36 +1027,38 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let id = agent.new_session()?;
             terminal.renderer.clear_screen();
             if agent.session_path().is_some() {
-                println!("Session: {id} (resume with --resume {id})");
+                terminal.renderer.print_block(&format!("Session: {id} (resume with --resume {id})"));
             } else {
-                println!("Session: {id}");
+                terminal.renderer.print_block(&format!("Session: {id}"));
             }
             Ok(true)
         }
         "/verbosity" => {
             let current = ui::verbosity();
-            println!("Verbosity: {current} ({})", current.describe());
+            let mut out = vec![format!("Verbosity: {current} ({})", current.describe())];
             for level in ui::Verbosity::ALL {
-                println!("  {:<8} {}", level.to_string(), level.describe());
+                out.push(format!("  {:<8} {}", level.to_string(), level.describe()));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/mode" => {
             let current = agent.mode();
-            println!("Mode: {current} ({})", current.describe());
+            let mut out = vec![format!("Mode: {current} ({})", current.describe())];
             for mode in mode::AgentMode::ALL {
-                println!("  {:<8} {}", mode.to_string(), mode.describe());
+                out.push(format!("  {:<8} {}", mode.to_string(), mode.describe()));
             }
-            println!("(Shift+Tab cycles; /mode NAME sets it directly)");
+            out.push("(Shift+Tab cycles; /mode NAME sets it directly)".to_string());
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         _ if cmd.starts_with("/mode ") => {
             match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
                 Ok(m) => {
                     agent.set_mode(m);
-                    println!("Mode set to {m} ({})", m.describe());
+                    terminal.renderer.print_block(&format!("Mode set to {m} ({})", m.describe()));
                 }
-                Err(e) => println!("{e}"),
+                Err(e) => terminal.renderer.print_block(&e),
             }
             Ok(true)
         }
@@ -1041,21 +1067,26 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 Ok(level) => {
                     ui::set_verbosity(level);
                     agent.config_mut().verbosity = level;
-                    println!("Verbosity set to {level} ({}); /settings saves it", level.describe());
+                    terminal.renderer.print_block(&format!("Verbosity set to {level} ({}); /settings saves it", level.describe()));
                 }
-                Err(e) => println!("{e}"),
+                Err(e) => terminal.renderer.print_block(&e),
             }
             Ok(true)
         }
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
-            if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("{}", ui::stamp_block(&outcome.response));
-            } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
-            } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                let last = outcome.response.lines().last().unwrap_or_default();
-                println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
+            // In frame mode the turn's response is already rendered from its
+            // events; re-printing it here would duplicate the answer and
+            // corrupt the owned frame.
+            if !terminal.renderer.is_frame() {
+                if ui::verbosity() == ui::Verbosity::Quiet {
+                    println!("{}", ui::stamp_block(&outcome.response));
+                } else if outcome.stop_reason == agent::StopReason::Cancelled {
+                    println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
+                } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
+                    let last = outcome.response.lines().last().unwrap_or_default();
+                    println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
+                }
             }
             Ok(true)
         }
@@ -1328,7 +1359,9 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    view.lock().unwrap().resize();
+                    // `frame_resize()` re-renders every row (editor included)
+                    // at the new size in one pass; calling `view.resize()` here
+                    // too would fire the edit hook and emit a second redraw.
                     renderer.frame_resize();
                 }
             });
@@ -1421,7 +1454,11 @@ async fn main() -> Result<()> {
                     running = continue_running;
                 }
                 Err(e) => {
-                    eprintln!("Error: {:#}", e);
+                    if frame_mode {
+                        terminal.renderer.note(&format!("Error: {:#}", e));
+                    } else {
+                        eprintln!("Error: {:#}", e);
+                    }
                 }
             }
             separate = true;
