@@ -288,7 +288,11 @@ impl Renderer {
                 if chars > 0 {
                     fs.items.push(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() });
                 }
-                fs.stream = None;
+                // Do NOT reset `fs.stream` here: a streamed assistant message
+                // may already be in flight (reasoning can arrive after the
+                // answer starts). Only `AssistantMessage` finalizes the stream;
+                // clearing it here would make that event see `None` and append
+                // the full response again, duplicating the streamed answer.
             }
             AgentEvent::TextDelta { text } => {
                 if text.is_empty() {
@@ -305,7 +309,6 @@ impl Renderer {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
                         });
-                        fs.stream = None;
                     }
                 }
                 match fs.stream {

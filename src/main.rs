@@ -475,8 +475,12 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         questions.resolve(answer);
                         // The picker wrote over the owned frame via dialoguer;
                         // force a full redraw so the next differential render
-                        // isn't computed against stale screen coordinates.
-                        renderer.frame_resize();
+                        // isn't computed against stale screen coordinates. If an
+                        // auto-away worker was orphaned it is still parked on
+                        // stdin holding the picker lock, so defer the repaint
+                        // behind that lock: never write the frame while a
+                        // dialoguer still owns the terminal (single-writer).
+                        deferred_frame_resize(&renderer, terminal.picker_lock());
                     }
                 }
                 // The turn hit the cap in normal mode: ask whether to continue.
@@ -487,8 +491,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     let gate = terminal.suspend_input();
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
-                    // Repaint after the dialoguer picker clobbered the frame.
-                    renderer.frame_resize();
+                    // Repaint after the dialoguer picker clobbered the frame,
+                    // deferred behind the picker lock so it never races an
+                    // orphaned worker still parked on stdin (see above).
+                    deferred_frame_resize(&renderer, terminal.picker_lock());
                 }
                 input = terminal.recv() => match input {
                     TermInput::Interrupt => {
@@ -611,6 +617,28 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
         }
         Some(i) => Ok(Some(q.options[i].label.clone())),
     }
+}
+
+/// Force a full frame redraw, but only once the picker lock is free.
+///
+/// A foreground dialoguer picker owns the terminal while it runs, and an
+/// auto-away `prompt_question` can return `Away` while its `spawn_blocking`
+/// worker is still parked on stdin holding the picker lock. Repainting the
+/// owned frame immediately would write it while that orphaned worker still
+/// owns the terminal, violating the single-writer assumption and letting the
+/// two tear each other's output. Awaiting the picker lock first defers the
+/// repaint until every picker (orphaned or not) has released the terminal; in
+/// the common case the lock is already free, so the redraw runs at once.
+/// Spawned so the turn loop is never blocked waiting on an away user.
+fn deferred_frame_resize(
+    renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+) {
+    let renderer = renderer.clone();
+    tokio::spawn(async move {
+        let _guard = picker_lock.lock_owned().await;
+        renderer.frame_resize();
+    });
 }
 
 /// Render a pending `question` and return the answer, plus an optional handle

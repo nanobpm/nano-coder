@@ -209,8 +209,9 @@ const PLAN_LINES: usize = 12;
 fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
     let body = width.saturating_sub(4).max(1);
     let (done, total) = plan.progress();
-    let mut out = vec![format!(
-        "{GREEN}●{RESET} {BOLD}Plan{RESET} {DIM}{done}/{total} done{RESET}"
+    let mut out = vec![fit(
+        &format!("{GREEN}●{RESET} {BOLD}Plan{RESET} {DIM}{done}/{total} done{RESET}"),
+        width,
     )];
     let live: Vec<&crate::plan::PlanItem> = plan
         .items
@@ -219,7 +220,7 @@ fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
         .collect();
     let collapse = live.len() > PLAN_LINES && done > 0;
     if collapse {
-        out.push(format!("  {GREEN}✔{RESET} {DIM}{done} done{RESET}"));
+        out.push(fit(&format!("  {GREEN}✔{RESET} {DIM}{done} done{RESET}"), width));
     }
     let visible: Vec<&&crate::plan::PlanItem> = live
         .iter()
@@ -227,7 +228,7 @@ fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
         .collect();
     for (shown, item) in visible.iter().enumerate() {
         if shown == PLAN_LINES {
-            out.push(format!("  {DIM}… +{} more{RESET}", visible.len() - shown));
+            out.push(fit(&format!("  {DIM}… +{} more{RESET}", visible.len() - shown), width));
             break;
         }
         let title = fit(&item.title, body);
@@ -257,8 +258,9 @@ pub fn editor_lines(prompt: &str, text: &str, cursor: usize, width: usize) -> Ve
     let width = width.max(1);
     let cursor = cursor.min(text.chars().count());
     // Mark the cursor with a sentinel that survives wrapping, then swap it for a
-    // reverse-video block once the lines are laid out.
-    const MARK: char = '\u{0}';
+    // reverse-video block once the lines are laid out. `cell_width` reserves one
+    // cell for it so a full row leaves room for the block.
+    const MARK: char = CURSOR_MARK;
     let mut marked = String::new();
     for (i, c) in text.chars().enumerate() {
         if i == cursor {
@@ -329,6 +331,23 @@ pub fn first_diff(prev: &[String], next: &[String]) -> Option<usize> {
 
 // --- Width-aware wrapping --------------------------------------------------
 
+/// The zero-width sentinel `editor_lines` injects at the cursor position; it is
+/// swapped for a one-cell reverse-video block after wrapping.
+const CURSOR_MARK: char = '\u{0}';
+
+/// A single character's terminal-cell width, treating the editor cursor
+/// sentinel as one cell. `CURSOR_MARK` is a control character (nominally zero
+/// width) but is replaced by a one-cell reverse-video block after layout, so
+/// reserving a cell for it here keeps a full editor row from spilling past the
+/// frame width and pushing the status bar down.
+fn cell_width(c: char) -> usize {
+    if c == CURSOR_MARK {
+        1
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
 /// Visible width in terminal cells, ignoring ANSI escape sequences. CJK
 /// characters and many emoji occupy two columns and combining marks zero, so
 /// this uses Unicode cell width rather than a raw scalar-value count.
@@ -347,7 +366,7 @@ fn visible_width(text: &str) -> usize {
             }
             continue;
         }
-        count += UnicodeWidthChar::width(c).unwrap_or(0);
+        count += cell_width(c);
     }
     count
 }
@@ -376,7 +395,7 @@ fn fit(text: &str, width: usize) -> String {
             }
             continue;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = cell_width(c);
         if seen + w > keep {
             break;
         }
@@ -450,7 +469,7 @@ fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
             }
             brk = None;
         }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = cell_width(c);
         // A wide (2-cell) glyph that would spill past `width` starts a new row
         // even when the running width has not yet reached `width`.
         if w > 1 && vis + w > width && !cur.is_empty() {
@@ -689,6 +708,36 @@ mod tests {
         }
         // `fit` truncates on cells, so a wide-glyph string can't exceed width.
         assert!(visible_width(&fit("你好世界", 5)) <= 5);
+    }
+
+    #[test]
+    fn cursor_marker_reserves_a_cell_on_a_full_row() {
+        // A line exactly filling the inner width with the cursor mid-row: the
+        // sentinel is replaced by a one-cell reverse-video block, so the row
+        // must be laid out reserving a cell for it and never exceed the width.
+        let width = 12;
+        let text: String = "abcdefghijklmnopqrstuvwxyz".chars().take(40).collect();
+        for cursor in 0..text.chars().count() {
+            for line in editor_lines("› ", &text, cursor, width) {
+                assert!(
+                    visible_width(&line) <= width,
+                    "row overflows at cursor {cursor}: {line:?} (w={})",
+                    visible_width(&line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_header_is_bounded_to_the_width() {
+        let plan = Plan::default();
+        // Even at a pathologically narrow width the header row never exceeds it,
+        // so native terminal wrapping can't push the editor/status rows down.
+        for width in 3..20 {
+            for line in plan_lines(&plan, width) {
+                assert!(visible_width(&line) <= width, "row overflows at {width}: {line:?}");
+            }
+        }
     }
 
     #[test]

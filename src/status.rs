@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::context::{Activity, ContextStats, SharedStats, format_rate, format_tokens};
+use unicode_width::UnicodeWidthChar;
 
 pub struct StatusLine {
     stats: SharedStats,
@@ -469,7 +470,7 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     }
 
     let width = |segments: &[Segment]| -> usize {
-        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + segments.len().saturating_sub(1)
+        segments.iter().map(|s| cell_width(&s.text)).sum::<usize>() + segments.len().saturating_sub(1)
     };
     while width(&segments) > cols && segments.len() > 1 {
         let lowest = segments.iter().enumerate().min_by_key(|(_, s)| s.priority).map(|(i, _)| i).unwrap();
@@ -483,8 +484,8 @@ fn render(stats: &ContextStats, cols: usize) -> String {
             line.push('│');
             used += 1;
         }
-        let text: String = segment.text.chars().take(cols.saturating_sub(used)).collect();
-        used += text.chars().count();
+        let text = fit_cells(&segment.text, cols.saturating_sub(used));
+        used += cell_width(&text);
         match segment.color {
             Some(color) => {
                 line.push_str(color);
@@ -497,6 +498,31 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     line.push_str(&" ".repeat(cols.saturating_sub(used)));
     line.push_str(RESET);
     line
+}
+
+/// Total terminal-cell width of `text`. The status segments are plain text
+/// (colours are applied separately), so no ANSI stripping is needed. CJK and
+/// wide emoji count as two cells so a status row never exceeds `cols` and gets
+/// wrapped by the terminal, which would break the editor/status last-row
+/// invariant.
+fn cell_width(text: &str) -> usize {
+    text.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+
+/// Hard-truncate `text` to at most `budget` terminal cells, never splitting a
+/// wide glyph across the boundary.
+fn fit_cells(text: &str, budget: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -571,6 +597,22 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn status_row_never_exceeds_cols_with_wide_glyphs() {
+        // A CJK cwd occupies two cells per glyph: the row must be budgeted and
+        // truncated by terminal cells so it never overflows `cols` (which would
+        // wrap and break the editor/status last-row invariant).
+        let wide = ContextStats { cwd: "/项目/工作目录/深层/路径".into(), ..stats() };
+        for cols in 10..=140 {
+            let line = visible(&render(&wide, cols));
+            assert!(
+                cell_width(&line) <= cols,
+                "row overflows at {cols} cols: cell_width={} {line:?}",
+                cell_width(&line)
+            );
+        }
     }
 
     #[test]
