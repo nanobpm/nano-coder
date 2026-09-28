@@ -860,7 +860,10 @@ impl Agent {
         // Whether the history tools are offered is durable state: restore it
         // from the log (the last replace's mode) rather than the message text.
         self.history_available = restored.history_available;
-        self.history_hint_pending = restored.history_available;
+        // Keep the post-compaction hint one-time per compaction: if it was
+        // already emitted (or a history tool already used) after the latest
+        // smart compaction, a resume must not append it again.
+        self.history_hint_pending = restored.history_available && !restored.history_hint_consumed;
         {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls

@@ -61,6 +61,27 @@ def default_binary():
     return shutil.which("nano-coder") or "nano-coder"
 
 
+def provider_for(model, base):
+    """The provider table a model spec targets, matching nano-coder's rule
+    (src/providers/mod.rs): `provider/model` uses the head only when it is a
+    configured provider; otherwise the whole spec is a model on the config's
+    `default_provider`. So `gpt-4o` and `qwen3:8b` resolve to the default
+    provider, not to a bogus `gpt-4o`/`qwen3:8b` table."""
+    text = Path(base).read_text() if base and Path(base).is_file() else ""
+    providers = set(re.findall(r"(?m)^\s*\[providers\.([^.\]\s]+)", text))
+    m = re.search(r'(?m)^\s*default_provider\s*=\s*"([^"]+)"', text)
+    default = m.group(1) if m else None
+    if "/" in model:
+        head = model.split("/", 1)[0]
+        if head in providers:
+            return head
+    elif model in providers:
+        return model
+    # Fall back to the configured default; then any single provider; then the
+    # raw prefix (last resort when the base config lists neither).
+    return default or (next(iter(providers)) if len(providers) == 1 else model.split("/", 1)[0])
+
+
 def config_text(base, session_dir, mode, extra_body=None, providers=()):
     """The user's config (for providers and keys) with eval overrides on top.
     Overridden top-level keys are removed from the base so TOML stays valid."""
@@ -94,7 +115,7 @@ def config_text(base, session_dir, mode, extra_body=None, providers=()):
             return json.dumps(v)
         text = "\n".join(lines)
         for provider in providers:
-            if f"[providers.{provider}.extra_body]" in text or re.search(rf"(?ms)^\[providers\.{re.escape(provider)}\].*?^extra_body", text):
+            if f"[providers.{provider}.extra_body]" in text or re.search(rf"(?ms)^\[providers\.{re.escape(provider)}\](?:(?!^\[).)*?^extra_body", text):
                 print(f"warning: providers.{provider} already sets extra_body; --extra-body ignored for it", file=sys.stderr)
                 continue
             tail.append(f"[providers.{provider}.extra_body]")
@@ -275,8 +296,8 @@ def read_log(path):
     return records
 
 
-def run_one(args, case, model, mode, repeat, work_root):
-    run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}"
+def run_one(args, index, case, model, mode, repeat, work_root):
+    run_dir = work_root / f"{case['name'].replace('/', '_')}-{model.replace('/', '_').replace(':', '_')}-{mode}-r{repeat}-j{index}"
     session_dir, cwd = run_dir / "sessions", run_dir / "cwd"
     cwd.mkdir(parents=True, exist_ok=True)
     if case.get("cwd") and args.tools == "all":
@@ -284,7 +305,7 @@ def run_one(args, case, model, mode, repeat, work_root):
     session_id = f"eval-{uuid.uuid4().hex[:12]}"
     write_log(case["records"], session_dir, session_id)
     config = run_dir / "config.toml"
-    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [model.split("/")[0]]))
+    config.write_text(config_text(args.config, session_dir, mode, args.extra_body, [provider_for(model, args.config)]))
     result = {"case": case["name"], "model": model, "mode": mode, "repeat": repeat, "tools": args.tools,
               "question": case["question"], "expect": case["expect"], "forbid": case["forbid"], "session": str(session_dir / f"{session_id}.jsonl")}
     started = time.monotonic()
@@ -476,7 +497,11 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / f"{stamp}.jsonl"
     work_root = Path(tempfile.mkdtemp(prefix=f"compaction-eval-{stamp}-"))
-    jobs = [(c, m, mo, r) for c in cases for m in models for mo in modes for r in range(args.repeats)]
+    # A unique index per job keeps run_dir distinct even when two cases share a
+    # name (duplicate reuse entries, or the same case across --cases files), so
+    # parallel jobs never share and overwrite each other's config/session files.
+    jobs = [(i, c, m, mo, r) for i, (c, m, mo, r) in enumerate(
+        (c, m, mo, r) for c in cases for m in models for mo in modes for r in range(args.repeats))]
     print(f"{len(jobs)} runs ({len(cases)} cases x {len(models)} models x {len(modes)} modes x {args.repeats}); "
           f"logs in {work_root}; results in {results_path}", file=sys.stderr)
 

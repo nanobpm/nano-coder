@@ -23,11 +23,38 @@ pub const FAILED_TOOL_HINT: &str = "[If you are looking for something from earli
 and its output, what the user asked for), it may only be in the conversation, not on disk: history_search finds the \
 original messages that the summary folded away.]";
 
-/// A tool call that failed, including a bash command that ran but exited
-/// non-zero (bash reports that as `Exit code: N`, not as an error).
+/// A tool call that failed, including a bash command that ran but reports a
+/// failure in its (successful) result: a non-zero exit (`Exit code: N`), a
+/// timeout, or a killing signal — `bash::run` returns all of these as `Ok`
+/// text, not as an error.
 pub fn looks_failed(tool: &str, ok: bool, result: &str) -> bool {
-    !is_history_tool(tool)
-        && (!ok || (tool == "bash" && (result.starts_with("Exit code: ") || result.contains("\nExit code: "))))
+    if is_history_tool(tool) {
+        return false;
+    }
+    if !ok {
+        return true;
+    }
+    tool == "bash" && BASH_FAILURE_MARKERS.iter().any(|marker| line_starts_with(result, marker))
+}
+
+/// Line prefixes `bash::run` uses to report a command that ran but failed (see
+/// `src/bash.rs`): a non-zero exit, a timeout, or termination by a signal.
+const BASH_FAILURE_MARKERS: [&str; 3] =
+    ["Exit code: ", "Error: command timed out ", "Terminated by signal "];
+
+/// Whether `marker` begins `text` or begins any line within it.
+fn line_starts_with(text: &str, marker: &str) -> bool {
+    text.starts_with(marker) || text.contains(&format!("\n{marker}"))
+}
+
+/// Whether this message already consumed the one-time post-compaction history
+/// hint: it carries the hint text, or it is a history-tool call/result (which
+/// also clears the pending hint). Lets a resume keep the hint one-time per
+/// compaction instead of re-arming it every `--resume`.
+pub fn consumes_hint(message: &Message) -> bool {
+    message.content.contains(FAILED_TOOL_HINT)
+        || message.name.as_deref().is_some_and(is_history_tool)
+        || message.tool_calls.iter().any(|call| is_history_tool(&call.name))
 }
 
 const DEFAULT_LIMIT: usize = 20;
@@ -350,6 +377,8 @@ mod tests {
         assert!(looks_failed("read_file", false, "no such file"));
         assert!(looks_failed("bash", true, "ls: /work: No such file\n\nExit code: 1"));
         assert!(looks_failed("bash", true, "Exit code: 2"));
+        assert!(looks_failed("bash", true, "Error: command timed out after 600s and was killed"));
+        assert!(looks_failed("bash", true, "partial output\nTerminated by signal 9"));
         assert!(!looks_failed("bash", true, "fine"));
         assert!(!looks_failed(SEARCH_TOOL, false, "bad pattern"));
     }

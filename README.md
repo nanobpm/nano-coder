@@ -584,9 +584,11 @@ It needs a session log, and falls back to a standard summary when `persist_sessi
   that the originals can be retrieved. Tool results clipped at compaction point at their ID.
 - **History tools.** Once a smart summary is in the context, the agent gets two tools
   over the current session's log (and only that one):
-  - `history_search(pattern, role?, before?, after?, limit?)` - case-insensitive regex (or
-    plain text) search, newest first, one `#N role name (time): snippet` line per match.
-    Earlier history lookups are not searched.
+  - `history_search(pattern, role?, before?, after?, order?, limit?)` - case-insensitive
+    regex (or plain text) search. Newest first by default (`order=oldest` for early
+    history); each matching message is one `#N role name (time): snippet` line with up to
+    three snippets (and a `[K matches]` count when more matched). Earlier history lookups
+    are not searched.
   - `history_read(id, max_output_length?)` - one message in full, bounded like other tool
     output (the whole is spilled to a file when it is longer).
   Before a smart compaction the tools are not offered, so they cost nothing.
