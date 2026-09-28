@@ -453,6 +453,22 @@ which becomes `openai` if it was `mock`.
 List a provider's models with `--list-models <provider>` (OpenAI-compatible endpoints and
 `github-copilot`).
 
+### Local servers on another machine (macOS)
+
+macOS Local Network privacy can block nano-coder from reaching a model server on your
+LAN (e.g. `http://192.168.0.141:8888/v1` or `http://merlin.local:11434/v1`). Requests fail
+with `tcp connect error … No route to host (os error 65)`, while `curl` to the same URL
+works. `localhost` is not affected.
+
+- Allow it in **System Settings → Privacy & Security → Local Network**. The prompt and the
+  entry go to the app that launched nano-coder (your terminal, or the editor running it over
+  ACP). A locally built binary is unsigned, so macOS may treat each rebuild as a new app and
+  ask again.
+- Or forward a local port, which needs no permission:
+  `ssh -N -L 18888:localhost:8888 user@192.168.0.141` (or `socat
+  TCP-LISTEN:18888,fork TCP:192.168.0.141:8888`), then set
+  `base_url = "http://127.0.0.1:18888/v1"`.
+
 ### GitHub Copilot (unofficial)
 
 The `github-copilot` provider uses a GitHub Copilot subscription by authenticating **as the
