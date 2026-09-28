@@ -636,13 +636,13 @@ impl KeyMode {
         KEY_MODE_ACTIVE.store(entered, std::sync::atomic::Ordering::SeqCst);
         if entered {
             KEY_MODE_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
-            // Clear any mouse-tracking modes (normal/button/any-event tracking
-            // and SGR extended reports) that a previously crashed TUI may have
-            // left enabled, so wheel and drag events reach the terminal's
-            // native scrollback/selection instead of being routed to us as
-            // reports we would only discard. Then enable bracketed paste and
-            // modifyOtherKeys/kitty key reporting.
-            write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004h\x1b[>4;1m\x1b[>1u");
+            // Clear any mouse-tracking modes (normal/hilite/button/any-event
+            // tracking and SGR extended reports) that a previously crashed TUI
+            // may have left enabled, so wheel and drag events reach the
+            // terminal's native scrollback/selection instead of being routed to
+            // us as reports we would only discard. Then enable bracketed paste
+            // and modifyOtherKeys/kitty key reporting.
+            write("\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004h\x1b[>4;1m\x1b[>1u");
         }
         entered.then_some(Self)
     }
