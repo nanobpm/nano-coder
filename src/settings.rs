@@ -53,11 +53,13 @@ pub fn key_status(provider: &ProviderConfig) -> String {
     }
 }
 
-/// How the turn cap appears in the settings list.
+/// How the turn cap appears in the settings list. A finite cap notes that
+/// normal mode asks before stopping; an unbounded cap (0) never reaches that
+/// prompt, so the suffix is omitted to avoid contradicting the loop behavior.
 fn turn_cap_label(max_iterations: usize) -> String {
     match max_iterations {
         0 => "unbounded".to_string(),
-        n => format!("{n} LLM calls per input"),
+        n => format!("{n} LLM calls per input (normal mode asks before stopping)"),
     }
 }
 
@@ -71,7 +73,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             "Add or edit a provider".to_string(),
             format!("Temperature      {}", config.temperature),
             format!("Max tokens       {}", config.max_tokens),
-            format!("Turn cap         {} (normal mode asks before stopping)", turn_cap_label(config.max_iterations)),
+            format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
             format!(
                 "Context          {} window, auto-compact {}, {} compaction",
@@ -570,7 +572,7 @@ mod tests {
     #[test]
     fn turn_cap_label_marks_zero_as_unbounded() {
         assert_eq!(turn_cap_label(0), "unbounded");
-        assert_eq!(turn_cap_label(50), "50 LLM calls per input");
+        assert_eq!(turn_cap_label(50), "50 LLM calls per input (normal mode asks before stopping)");
     }
 
     #[test]

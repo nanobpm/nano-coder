@@ -17,13 +17,16 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS
     Ids,            \* input ids the client submits
     MaxTools,       \* max tool calls in one model response
-    MaxIter,        \* config.max_iterations
+    MaxIter,        \* config.max_iterations (0 at runtime = unbounded; see Unbounded)
     MaxCrashes,
     MaxCancels,
     MaxCompactions,
-    MaxErrors       \* model/provider errors (turn aborts, input stays pending)
+    MaxErrors,      \* model/provider errors (turn aborts, input stays pending)
+    Unbounded       \* TRUE models config.max_iterations = 0: the cap never ends a
+                    \* turn (no MaxIterResp), so MaxIter is only the model-checking
+                    \* depth bound and reaching it truncates with a final answer.
 
-ASSUME MaxIter >= 1 /\ MaxTools >= 1
+ASSUME MaxIter >= 1 /\ MaxTools >= 1 /\ Unbounded \in BOOLEAN
 
 \* Responses: 0 = "[turn cancelled]", 1 = max-iterations note, >= 2 = model answers.
 CancelledResp == 0
@@ -146,13 +149,27 @@ PushUser ==
     /\ UNCHANGED <<synced, alive, done, pend, cur, iter, left, resp, cancel, acked,
                    crashes, cancels, compactions, errors>>
 
-\* Top of the iteration loop: cancelled, or out of iterations.
+\* Top of the iteration loop: cancelled, or out of iterations. The cap only ends
+\* a turn when it is enforced; when Unbounded (config.max_iterations = 0) the loop
+\* never stops here on iteration count -- see BoundReached for the model-checking
+\* truncation.
 LoopEnd ==
     /\ alive /\ pc = "loop"
-    /\ cancel \/ iter = MaxIter
+    /\ cancel \/ (~Unbounded /\ iter = MaxIter)
     /\ resp' = IF cancel THEN CancelledResp ELSE MaxIterResp
     /\ pc' = "finish"
     /\ UNCHANGED <<log, synced, alive, conv, done, pend, cur, iter, left, cancel, acked,
+                   crashes, cancels, compactions, errors>>
+
+\* Unbounded truncation: the real max_iterations = 0 loop has no cap, so to keep
+\* the state space finite MaxIter is a model-checking depth bound whose boundary
+\* forces an ordinary final answer (never the MaxIterResp cap note).
+BoundReached ==
+    /\ alive /\ pc = "loop" /\ ~cancel /\ Unbounded /\ iter = MaxIter
+    /\ conv' = Append(conv, Msg("answer", Answer))
+    /\ Log(<<Rec("msg", Msg("answer", Answer), 0)>>)
+    /\ resp' = Answer /\ pc' = "finish"
+    /\ UNCHANGED <<synced, alive, done, pend, cur, iter, left, cancel, acked,
                    crashes, cancels, compactions, errors>>
 
 \* compact_with: summarize conv[1..split-1]; the kept tail starts at a user or
@@ -255,13 +272,13 @@ Restart ==
 
 Next ==
     \/ \E i \in Ids : Deliver(i)
-    \/ PushUser \/ LoopEnd \/ Compact \/ CallModel \/ ModelCancelled \/ ModelError
+    \/ PushUser \/ LoopEnd \/ BoundReached \/ Compact \/ CallModel \/ ModelCancelled \/ ModelError
     \/ ToolResult \/ Finish \/ Cancel \/ Crash \/ Restart
 
 \* The client keeps redelivering unacknowledged inputs; the harness keeps running.
 Fairness ==
     /\ \A i \in Ids : WF_vars(Deliver(i) /\ ~\E p \in acked : p[1] = i)
-    /\ WF_vars(PushUser) /\ WF_vars(LoopEnd) /\ WF_vars(CallModel)
+    /\ WF_vars(PushUser) /\ WF_vars(LoopEnd) /\ WF_vars(BoundReached) /\ WF_vars(CallModel)
     /\ WF_vars(ModelCancelled) /\ WF_vars(ToolResult) /\ WF_vars(Finish)
     /\ WF_vars(Restart)
 
