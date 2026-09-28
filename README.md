@@ -466,7 +466,7 @@ works. `localhost` is not affected.
   ask again.
 - Or forward a local port, which needs no permission:
   `ssh -N -L 18888:localhost:8888 user@192.168.0.141` (or `socat
-  TCP-LISTEN:18888,fork TCP:192.168.0.141:8888`), then set
+  TCP-LISTEN:18888,bind=127.0.0.1,fork TCP:192.168.0.141:8888`), then set
   `base_url = "http://127.0.0.1:18888/v1"`.
 
 ### GitHub Copilot (unofficial)
