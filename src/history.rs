@@ -348,6 +348,10 @@ pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
             text.push_str(&format!("[thinking] {thought}\n"));
         }
     }
+    // Other providers' reasoning is logged as plain text instead.
+    if message.thinking_blocks.is_empty() && !message.thinking.is_empty() {
+        text.push_str(&format!("[thinking] {}\n", message.thinking));
+    }
     text.push_str(&message.content);
     for call in &message.tool_calls {
         text.push_str(&format!("\n[called {} id={} {}]", call.name, call.id, call.arguments));
@@ -387,6 +391,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ids: Vec<u64> = load(&log(dir.path())).unwrap().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn read_includes_logged_thinking_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        let thought = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
+        log.append(&Record::Message(thought)).unwrap();
+        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
 
     #[test]

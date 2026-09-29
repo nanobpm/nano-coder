@@ -54,6 +54,19 @@ pub struct Message {
     /// to the log only inside `replace` records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_line: Option<u64>,
+    /// Assistant messages: the reasoning text the model produced for this
+    /// response. Kept in the session log (for the trajectory view and
+    /// `history_read`); not sent to providers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
+    /// Assistant messages: the token usage the provider reported for the
+    /// request that produced this message. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
+    /// Assistant messages: wall-clock time of the request that produced this
+    /// message, in milliseconds. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl Message {
@@ -68,6 +81,9 @@ impl Message {
             name: None,
             timestamp: None,
             log_line: None,
+            thinking: String::new(),
+            usage: None,
+            duration_ms: None,
         }
     }
 
@@ -117,13 +133,14 @@ pub struct LLMResponse {
 }
 
 /// Token usage information
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
     /// AI Credits the request cost, when the provider reports them (GitHub
     /// Copilot's `copilot_usage.total_nano_aiu`, converted to credits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aic: Option<f64>,
 }
 
@@ -399,6 +416,25 @@ impl ThinkSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trajectory_fields_round_trip_and_stay_out_of_plain_messages() {
+        let message = Message {
+            thinking: "because".into(),
+            usage: Some(TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: None }),
+            duration_ms: Some(42),
+            ..Message::assistant("hi")
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["thinking"], "because");
+        assert_eq!(json["usage"], serde_json::json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}));
+        assert_eq!(json["duration_ms"], 42);
+        assert_eq!(serde_json::from_value::<Message>(json).unwrap(), message);
+        // Unset fields are not written, and logs from before they existed load.
+        let plain = serde_json::to_value(Message::assistant("hi")).unwrap();
+        assert_eq!(plain, serde_json::json!({"role": "assistant", "content": "hi"}));
+        assert_eq!(serde_json::from_value::<Message>(plain).unwrap(), Message::assistant("hi"));
+    }
 
     #[test]
     fn splits_think_tags_across_chunks() {
