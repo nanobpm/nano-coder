@@ -174,7 +174,10 @@ fn write_atomically(path: &Path, content: &str, expect: Option<&[u8]>) -> Result
 /// relaxed rule found it (None for an exact match).
 struct Located {
     ranges: Vec<(usize, usize)>,
-    new: String,
+    /// One replacement per `ranges` entry, each normalized to its own region's
+    /// line-ending style. A single match (and every relaxed match) has exactly
+    /// one; `replace_all` may have several, one per occurrence.
+    news: Vec<String>,
     how: Option<&'static str>,
 }
 
@@ -223,7 +226,13 @@ fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
 /// `read_file` prefixes each line with a right-aligned number and a tab. If
 /// the model copied those into `old_string` (every non-blank line has one),
 /// strip them from both strings.
-fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String, u64)> {
+///
+/// Returns `Ok(None)` when `old` is not copied `read_file` output. Returns `Err`
+/// when `old` is numbered but `new_string` also carries a prefix-shaped line
+/// whose number falls in `old`'s range: that form is ambiguous (is the number
+/// copied metadata or an intended TSV cell?), so rather than silently drop the
+/// field we reject it and ask for unnumbered content.
+fn strip_line_numbers(old: &str, new: &str) -> Result<Option<(String, String, u64)>> {
     fn prefix_num(line: &str) -> Option<(u64, &str)> {
         // `read_file` right-aligns the number in a field at least six wide
         // (`{:>6}\t`). Require that exact padded shape so a genuine TSV cell
@@ -241,28 +250,31 @@ fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String, u64)> {
     // TSV data whose leading integers merely look prefix-shaped is not
     // consecutive, so it can't retarget an unrelated block by being stripped.
     let lines: Vec<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
-    let nums: Vec<u64> = lines.iter().map(|l| prefix_num(l).map(|(n, _)| n)).collect::<Option<_>>()?;
+    let nums: Vec<u64> = match lines.iter().map(|l| prefix_num(l).map(|(n, _)| n)).collect::<Option<_>>() {
+        Some(nums) => nums,
+        None => return Ok(None),
+    };
     if nums.is_empty() || nums.windows(2).any(|w| w[1] != w[0] + 1) {
-        return None;
+        return Ok(None);
     }
     let (lo, hi) = (nums[0], *nums.last().unwrap());
-    // Strip the prefix from every `old` line (it's all line-numbered), but from
-    // `new` only where the number falls in `old`'s line range: otherwise a
-    // legitimate new TSV row like `123456\tabc` would be silently dropped rather
-    // than written, since its own prefix is intended content, not metadata.
+    // Strip the prefix from every `old` line (it's all line-numbered). `new` is
+    // different: a prefix-shaped line there is ambiguous — it may be a copied
+    // line number, or a genuine TSV cell the model means to write verbatim.
+    // Range membership can't tell those apart (a real row can reuse one of
+    // `old`'s numbers), so reject any numbered `new` line rather than silently
+    // drop a field that was intended as content.
+    if new.lines().any(|l| prefix_num(l).is_some_and(|(n, _)| (lo..=hi).contains(&n))) {
+        bail!(
+            "new_string line(s) start with a number in old_string's copied line range {lo}..={hi}; \
+             that prefix is ambiguous (line number or intended content?). Resubmit new_string \
+             without the leading line-number field."
+        );
+    }
     let strip_old = |s: &str| {
         s.split('\n').map(|l| prefix_num(l).map_or(l, |(_, rest)| rest)).collect::<Vec<_>>().join("\n")
     };
-    let strip_new = |s: &str| {
-        s.split('\n')
-            .map(|l| match prefix_num(l) {
-                Some((n, rest)) if (lo..=hi).contains(&n) => rest,
-                _ => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    Some((strip_old(old), strip_new(new), lo))
+    Ok(Some((strip_old(old), new.to_string(), lo)))
 }
 
 /// The 1-based line number that byte offset `at` falls on in `text`.
@@ -411,7 +423,7 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
             new = reindent(&new, had, want)?;
         }
     }
-    Ok(Some(Located { ranges: vec![(start, end)], new: to_endings_at(text, start, end, &new), how: Some(how) }))
+    Ok(Some(Located { ranges: vec![(start, end)], news: vec![to_endings_at(text, start, end, &new)], how: Some(how) }))
 }
 
 /// Find where `old` is in `text`: exactly first (as the model saw it, then
@@ -424,57 +436,49 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
     // line-number-stripped candidate): a match is accepted only where it sits.
     let mut attempts: Vec<(String, String, Option<&'static str>, Option<u64>)> =
         vec![(old.to_string(), new.to_string(), None, None)];
-    if let Some((o, n, lo)) = strip_line_numbers(old, new) {
+    if let Some((o, n, lo)) = strip_line_numbers(old, new)? {
         attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
     }
     for (o, n, how, at_line) in &attempts {
-        // Match `o` literally first, then rewritten to the file's endings. The
-        // literal pass must run even when `o` isn't initially present: in a
-        // mixed-ending file an LF-region `old` doesn't literally match until the
-        // CRLF rewrite has been ruled out, and rewriting first would mis-anchor
-        // the region (and its line-ending style) to a distant CRLF line.
-        let mut candidates: Vec<&str> = vec![o.as_str()];
-        let normalized;
-        if !text.contains(o.as_str()) {
-            normalized = to_file_endings(text, o);
-            if normalized != *o {
-                candidates.push(normalized.as_str());
-            }
+        // Gather matches for every distinct representation of `o` — the literal
+        // form and the file-ending-rewritten form — before enforcing uniqueness
+        // or applying `replace_all`. In a mixed-ending file `old = "a\nb"` can
+        // match both an LF block and a CRLF block; considering only the literal
+        // form would see one match and edit just the LF block even though
+        // `read_file` shows two identical blocks.
+        let normalized = to_file_endings(text, o);
+        let candidates: Vec<&str> = if normalized != *o { vec![o.as_str(), normalized.as_str()] } else { vec![o.as_str()] };
+        // For a stripped candidate, keep only matches that actually start on
+        // the line its (consecutive) numbers name. Genuine TSV data whose
+        // leading integers merely look prefix-shaped won't sit on that line,
+        // so it can't retarget an unrelated block by being stripped.
+        let mut ranges: Vec<(usize, usize)> = candidates
+            .iter()
+            .flat_map(|c| text.match_indices(c))
+            .map(|(at, m)| (at, at + m.len()))
+            .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        if ranges.is_empty() {
+            continue;
         }
-        for o in candidates {
-            // For a stripped candidate, keep only matches that actually start on
-            // the line its (consecutive) numbers name. Genuine TSV data whose
-            // leading integers merely look prefix-shaped won't sit on that line,
-            // so it can't retarget an unrelated block by being stripped.
-            let ranges: Vec<(usize, usize)> = text
-                .match_indices(o)
-                .map(|(at, _)| (at, at + o.len()))
-                .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
-                .collect();
-            // Normalize `n` to the line ending of the matched region, not the
-            // whole file: in a mixed-ending file an LF-region replacement must
-            // not pick up CRLF from a distant line (and vice versa). `n` is
-            // normalized even when `o` matched literally: a single-line `o` in a
-            // CRLF region must not leave a multiline `n` with LF endings and
-            // split that region's endings. For `replace_all` every occurrence
-            // shares one region style.
-            let new_for = |r: (usize, usize)| to_endings_at(text, r.0, r.1, n);
-            match ranges.len() {
-                0 => continue,
-                1 => {
-                    let new = new_for(ranges[0]);
-                    return Ok(Located { ranges, new, how: *how });
-                }
-                // `replace_all` only ever applies to the exact, literal attempt:
-                // a relaxed (stripped) match must be unique per the PR contract.
-                _ if replace_all && how.is_none() => {
-                    let new = new_for(ranges[0]);
-                    return Ok(Located { ranges, new, how: *how });
-                }
-                count => bail!(
-                    "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
-                ),
-            }
+        // Normalize each replacement to its own region's line ending, not the
+        // whole file's or the first occurrence's: in a mixed-ending file an
+        // LF-region replacement must not pick up CRLF from a distant line (and
+        // vice versa), and under `replace_all` two occurrences may sit in
+        // regions of different styles. `n` is normalized even when `o` matched
+        // literally: a single-line `o` in a CRLF region must not leave a
+        // multiline `n` with LF endings and split that region's endings.
+        let news: Vec<String> = ranges.iter().map(|&(s, e)| to_endings_at(text, s, e, n)).collect();
+        match ranges.len() {
+            1 => return Ok(Located { ranges, news, how: *how }),
+            // `replace_all` only ever applies to the exact, literal attempt:
+            // a relaxed (stripped) match must be unique per the PR contract.
+            _ if replace_all && how.is_none() => return Ok(Located { ranges, news, how: *how }),
+            count => bail!(
+                "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
+            ),
         }
     }
     for trim_start in [false, true] {
@@ -570,11 +574,16 @@ fn near_miss(text: &str, old: &str) -> String {
     if k == 0 {
         return String::new();
     }
-    let windows = 0..=lines.len() - k;
+    // This is a diagnostic on an already-failed edit, so keep it cheap: score at
+    // most `MAX_SCAN` windows rather than every file-line offset (a naive scan is
+    // O(file_lines x old_lines)), and reuse one char-count map per `want` line
+    // instead of allocating one per line pair.
+    const MAX_SCAN: usize = 2000;
+    let span = lines.len() - k + 1;
+    let windows = 0..span.min(MAX_SCAN);
+    let trimmed: Vec<&str> = want.iter().map(|l| l.trim()).collect();
     let line_score = |i: usize| {
-        (0..k)
-            .filter(|&j| !want[j].trim().is_empty() && lines[i + j].trim() == want[j].trim())
-            .count()
+        (0..k).filter(|&j| !trimmed[j].is_empty() && lines[i + j].trim() == trimmed[j]).count()
     };
     let (best, i) = windows
         .clone()
@@ -592,22 +601,35 @@ fn near_miss(text: &str, old: &str) -> String {
     }
     // No whole line agrees: rank windows by shared characters so even a
     // misspelled single line gets a hint. Diagnostic only — the edit already failed.
-    let char_overlap = |a: &str, b: &str| {
-        let mut counts = std::collections::HashMap::new();
-        for c in a.chars() {
-            *counts.entry(c).or_insert(0i32) += 1;
-        }
-        b.chars()
-            .filter(|c| {
-                let e = counts.entry(*c).or_insert(0);
-                *e > 0 && {
-                    *e -= 1;
-                    true
-                }
+    // Build each `want` line's char counts once and reuse the map across windows.
+    let want_counts: Vec<std::collections::HashMap<char, i32>> = trimmed
+        .iter()
+        .map(|w| {
+            let mut m = std::collections::HashMap::new();
+            for c in w.chars() {
+                *m.entry(c).or_insert(0) += 1;
+            }
+            m
+        })
+        .collect();
+    let sim_score = |i: usize| {
+        (0..k)
+            .map(|j| {
+                let mut counts = want_counts[j].clone();
+                lines[i + j]
+                    .trim()
+                    .chars()
+                    .filter(|c| {
+                        let e = counts.entry(*c).or_insert(0);
+                        *e > 0 && {
+                            *e -= 1;
+                            true
+                        }
+                    })
+                    .count()
             })
-            .count()
+            .sum::<usize>()
     };
-    let sim_score = |i: usize| (0..k).map(|j| char_overlap(want[j].trim(), lines[i + j].trim())).sum::<usize>();
     let (sbest, si) = windows.map(|i| (sim_score(i), i)).max_by_key(|&(s, i)| (s, std::cmp::Reverse(i))).unwrap();
     if sbest == 0 {
         return String::new();
@@ -654,13 +676,13 @@ pub fn edit_file(args: &Value) -> Result<String> {
     check_fresh(&path, &bytes)?;
     let text = String::from_utf8(bytes.clone()).map_err(|_| anyhow!("{} is not valid UTF-8", path.display()))?;
     let found = locate(&text, old, new, replace_all).map_err(|e| anyhow!("{}: {e}", path.display()))?;
-    let mut updated = String::with_capacity(text.len() + found.new.len());
+    let mut updated = String::with_capacity(text.len() + found.news.iter().map(String::len).sum::<usize>());
     let mut last = 0;
     let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(found.ranges.len());
-    for &(start, end) in &found.ranges {
+    for (&(start, end), repl) in found.ranges.iter().zip(&found.news) {
         updated.push_str(&text[last..start]);
         let at = updated.len();
-        updated.push_str(&found.new);
+        updated.push_str(repl);
         new_ranges.push((at, updated.len()));
         last = end;
     }
@@ -1166,5 +1188,47 @@ mod tests {
             .to_string();
         assert!(err.contains("changed"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\nCHANGED\n");
+    }
+
+    #[test]
+    fn prefix_shaped_new_string_in_copied_range_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // old copies read_file's numbered line `     1\tabc`; new carries a
+        // prefix-shaped line whose number (1) falls in old's copied range. That
+        // form is ambiguous — is `1` copied metadata or an intended TSV cell? —
+        // so rather than silently strip the field the edit is rejected with
+        // guidance, and the file is left untouched.
+        let p = read_fixture(&dir, "amb.tsv", "abc\ndef\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "     1\tabc", "new_string": "     1\txyz" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abc\ndef\n");
+    }
+
+    #[test]
+    fn old_matching_both_ending_styles_is_not_treated_as_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file holds an LF block `a\nb` and a CRLF block `a\r\nb`, which
+        // read_file displays identically. `old = "a\nb"` therefore matches twice
+        // — once per representation — and must not be treated as unique (which
+        // would edit only the LF block).
+        let p = read_fixture(&dir, "both.txt", "a\nb\na\r\nb\r\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "a\nb", "new_string": "x\ny" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("occurs 2 times"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\na\r\nb\r\n");
+    }
+
+    #[test]
+    fn replace_all_normalizes_each_occurrence_to_its_own_region() {
+        let dir = tempfile::tempdir().unwrap();
+        // A single-line `old` occurs in both an LF and a CRLF region. The
+        // multiline replacement must be normalized per occurrence: LF for the
+        // first, CRLF for the second, not one style applied to both.
+        let p = read_fixture(&dir, "ra.txt", "mark\nmark\r\n");
+        edit_file(&json!({ "path": p, "old_string": "mark", "new_string": "x\ny", "replace_all": true })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "x\ny\nx\r\ny\r\n");
     }
 }
