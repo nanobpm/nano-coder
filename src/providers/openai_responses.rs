@@ -432,6 +432,20 @@ mod tests {
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
     }
 
+    #[test]
+    fn trajectory_data_is_never_sent() {
+        let body = |assistant: Message| {
+            let messages = [Message::user("q"), assistant];
+            build_body(&transport(), &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None })
+        };
+        assert_eq!(body(Message {
+                thinking: "private reasoning".into(),
+                usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+                duration_ms: Some(1234),
+                ..Message::assistant("answer")
+            }), body(Message::assistant("answer")));
+    }
+
     fn copilot_transport(model: &str) -> HttpTransport {
         let user: HashMap<String, ProviderConfig> = HashMap::new();
         HttpTransport::new(resolve(&format!("github-copilot/{model}"), &user, "mock").unwrap()).unwrap()

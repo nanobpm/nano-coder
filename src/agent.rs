@@ -1260,6 +1260,9 @@ impl Agent {
             }
 
             let mut overflow_retried = false;
+            // Reset per attempt, so the recorded duration is the request that
+            // produced the response, not earlier overflowed attempts.
+            let mut request_started;
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Rebuilt every retry iteration, not just once before the loop:
@@ -1321,6 +1324,7 @@ impl Agent {
                     }
                 };
                 let streaming = self.streaming && event_sink.is_some();
+                request_started = Instant::now();
                 let mut call = if streaming {
                     self.client.chat_stream(&request, &on_stream)
                 } else {
@@ -1403,7 +1407,16 @@ impl Agent {
                 cancelled = true;
                 break;
             };
+            let duration_ms = u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.record_usage(&response, true);
+            // Log-only trajectory data carried by the assistant message.
+            let trajectory = |message: Message| Message {
+                thinking_blocks: response.thinking_blocks.clone(),
+                thinking: response.thinking.clone(),
+                usage: response.usage.clone(),
+                duration_ms: Some(duration_ms),
+                ..message
+            };
 
             // Trigger after_llm_response hook
             let usage = response.usage.as_ref().map(|u| {
@@ -1420,7 +1433,7 @@ impl Agent {
                 self.emit(AgentEvent::Thinking { text: &response.thinking });
             }
             if response.tool_calls.is_empty() {
-                self.push(Message { thinking_blocks: response.thinking_blocks.clone(), ..Message::assistant(&response.content) })?;
+                self.push(trajectory(Message::assistant(&response.content)))?;
                 self.emit_assistant_text(&response.content);
                 // A steer that arrived while the answer was being written gets
                 // a reply in this turn rather than being left for the next.
@@ -1433,10 +1446,7 @@ impl Agent {
             }
 
             last_content = response.content.clone();
-            self.push(Message {
-                thinking_blocks: response.thinking_blocks.clone(),
-                ..Message::assistant_with_tools(&response.content, response.tool_calls.clone())
-            })?;
+            self.push(trajectory(Message::assistant_with_tools(&response.content, response.tool_calls.clone())))?;
             self.emit_assistant_text(&response.content);
             for tool_call in &response.tool_calls {
                 if self.control.is_cancelled() {
@@ -1983,9 +1993,10 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
 
-    /// `message` without its timestamp, for comparing with a constructed one.
+    /// `message` without its timestamp (or other timing), for comparing with a
+    /// constructed one.
     fn unstamped(message: &Message) -> Message {
-        Message { timestamp: None, log_line: None, ..message.clone() }
+        Message { timestamp: None, log_line: None, duration_ms: None, ..message.clone() }
     }
 
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
@@ -2014,6 +2025,28 @@ mod tests {
 
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn logs_thinking_usage_and_duration_with_assistant_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = |n| Some(crate::llm::TokenUsage { prompt_tokens: n, completion_tokens: 1, total_tokens: n + 1, aic: None });
+        let responses = vec![
+            LLMResponse { thinking: "call the tool".into(), usage: usage(10), ..tool_call("c1") },
+            LLMResponse { thinking: "now answer".into(), usage: usage(20), ..text("done") },
+        ];
+        let (mut agent, _) = agent(responses, dir.path());
+        agent.new_session().unwrap();
+        assert_eq!(agent.send_message("ping").await.unwrap(), "done");
+        let path = agent.session_path().unwrap().to_path_buf();
+        let logged: Vec<Message> = history::load(&path).unwrap().into_iter().map(|(_, m)| m).collect();
+        let assistants: Vec<&Message> = logged.iter().filter(|m| m.role == Role::Assistant).collect();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!((assistants[0].thinking.as_str(), assistants[0].usage.clone()), ("call the tool", usage(10)));
+        assert_eq!((assistants[1].thinking.as_str(), assistants[1].usage.clone()), ("now answer", usage(20)));
+        assert!(assistants.iter().all(|m| m.duration_ms.is_some()));
+        // Only assistant messages carry trajectory data.
+        assert!(logged.iter().filter(|m| m.role != Role::Assistant).all(|m| m.duration_ms.is_none() && m.usage.is_none()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

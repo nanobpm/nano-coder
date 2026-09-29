@@ -565,6 +565,19 @@ mod tests {
         resolve("test/some-model", &user, "mock").unwrap()
     }
 
+    #[test]
+    fn trajectory_data_is_never_sent() {
+        let logged = Message {
+            thinking: "private reasoning".into(),
+            usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+            duration_ms: Some(1234),
+            ..Message::assistant("answer")
+        };
+        for replay in [false, true] {
+            assert_eq!(encode_message(&logged, replay), encode_message(&Message::assistant("answer"), replay));
+        }
+    }
+
     fn conversation() -> Vec<Message> {
         vec![
             Message::system("sys"),

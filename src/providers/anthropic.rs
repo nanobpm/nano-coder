@@ -378,6 +378,18 @@ mod tests {
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
 
+    #[test]
+    fn trajectory_data_is_never_sent() {
+        let logged = Message {
+            thinking: "private reasoning".into(),
+            usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+            duration_ms: Some(1234),
+            ..Message::assistant("answer")
+        };
+        let plain = Message::assistant("answer");
+        assert_eq!(encode_messages(&[Message::user("q"), logged]), encode_messages(&[Message::user("q"), plain]));
+    }
+
     fn client(base_url: &str) -> AnthropicClient {
         let mut user = HashMap::new();
         user.insert(

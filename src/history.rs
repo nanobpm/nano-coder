@@ -343,10 +343,18 @@ pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
     let mut text = format!("{}\n", label(id, message));
     // Reasoning-model assistant messages may carry their content only in
     // thinking blocks, so include them to keep the "read in full" contract.
+    let mut emitted_thinking = false;
     for block in &message.thinking_blocks {
         if let Some(thought) = block.get("thinking").and_then(Value::as_str) {
             text.push_str(&format!("[thinking] {thought}\n"));
+            emitted_thinking = true;
         }
+    }
+    // Other providers' reasoning is logged as plain text instead. Replay blocks
+    // (OpenAI `reasoning_content`, Responses `reasoning`) carry no readable
+    // `thinking`, so emit the logged text whenever no block produced one.
+    if !emitted_thinking && !message.thinking.is_empty() {
+        text.push_str(&format!("[thinking] {}\n", message.thinking));
     }
     text.push_str(&message.content);
     for call in &message.tool_calls {
@@ -387,6 +395,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ids: Vec<u64> = load(&log(dir.path())).unwrap().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn read_includes_logged_thinking_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        let thought = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
+        log.append(&Record::Message(thought)).unwrap();
+        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
 
     #[test]
@@ -500,6 +518,20 @@ mod tests {
         log.append(&Record::Message(thinker)).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] weigh the options"), "{out}");
+    }
+
+    #[test]
+    fn read_includes_plain_thinking_alongside_replay_blocks() {
+        // OpenAI/Responses replay blocks carry no readable `thinking`, so the
+        // logged reasoning text must still be shown (the fallback must not be
+        // gated on the block vector being empty).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        let mut thinker = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
+        thinker.thinking_blocks = vec![json!({"type": "reasoning_content", "text": "check auth.rs first"})];
+        log.append(&Record::Message(thinker)).unwrap();
+        let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
+        assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
 
     #[test]
