@@ -421,7 +421,19 @@ impl EditView {
             seq.push_str(&format!("\x1b[{cursor_col}C"));
         }
         // The menu's rows stay reserved (blank) until `draw_menu` refills them.
-        self.drawn_rows = content + self.menu_rows;
+        let drawn = content + self.menu_rows;
+        // A shorter input (Backspace/Ctrl-U on a wrapped line) uses fewer rows
+        // than the last redraw. Blanking the released rows above only leaves
+        // them empty, so with a pinned status line the prompt would sit above a
+        // blank gap. Collapse those rows the way `menu_sequence` does — scroll
+        // the conversation back down so the prompt stays directly above the
+        // status line, preserving the bottom-anchor invariant. The anchor saves
+        // and restores the cursor and moves it down with the content, so the
+        // edit cursor stays on its character.
+        if self.status.is_some() && old > drawn {
+            seq.push_str(&crate::status::anchor_sequence((old - drawn) as u16));
+        }
+        self.drawn_rows = drawn;
         self.drawn_cursor_row = cursor_row;
         seq
     }
@@ -1645,6 +1657,45 @@ mod tests {
         v.mode = EditMode::Prompt;
         let seq = v.redraw_sequence(80, "");
         assert!(!seq.contains("\x1b[J"), "{seq:?}");
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
+    }
+
+    #[test]
+    fn shrinking_wrapped_input_collapses_released_rows_under_the_status_line() {
+        // With a pinned status line, a wrapped input that becomes shorter frees
+        // rows above the status line. Blanking them alone leaves the prompt
+        // above a gap, so the redraw must scroll the conversation back down with
+        // the anchor helper (as `menu_sequence` does), keeping the prompt
+        // directly above the status line.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": wraps to 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.status = Some(Arc::new(crate::status::StatusLine::for_test()));
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        // First redraw records the 3-row draw.
+        let _ = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 3);
+        // Delete back to a single row (Ctrl-U to one char): "a" fits one row.
+        v.line = "a".into();
+        v.cursor = 1;
+        let seq = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 1, "one content row now");
+        // Two rows were released, so the conversation scrolls down two rows.
+        assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
+    }
+
+    #[test]
+    fn shrinking_input_without_a_status_line_does_not_anchor() {
+        // No status line: there is no bottom-anchor invariant, so a shorter
+        // input must not emit the anchor scroll (which would corrupt output).
+        let mut v = view("aaaaaaaa");
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        let _ = v.redraw_sequence(4, "");
+        v.line = "a".into();
+        v.cursor = 1;
+        let seq = v.redraw_sequence(4, "");
         assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
     }
 }

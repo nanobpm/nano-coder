@@ -207,6 +207,17 @@ impl StatusLine {
         Some(status)
     }
 
+    /// A detached status line with no terminal side effects, for tests that
+    /// need `EditView::status` to be `Some` without installing a real one.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            stats: SharedStats::default(),
+            size: Mutex::new(Some((24, 80))),
+            input: Mutex::new(None),
+        }
+    }
+
     /// The status bar as a plain string at `cols` columns (stats only, no
     /// cursor positioning), for the app-owned frame renderer.
     pub fn stats_line(&self, cols: usize) -> String {
