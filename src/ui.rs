@@ -214,6 +214,13 @@ struct FrameState {
     /// and only restamps on submission, so mirror that by refreshing this only
     /// at a turn boundary.
     prompt_stamp: String,
+    /// A transient hint shown on the status bar (e.g. "(Ctrl-C again to
+    /// exit)") instead of as a transcript item. Transient notes are
+    /// cursor-relevant feedback: as a transcript item they would trigger a
+    /// full-screen clear and land above the editor row, so the user — watching
+    /// the cursor — would never see them. Rendered in place of the stats until
+    /// the next status refresh or turn boundary.
+    transient: Option<String>,
 }
 
 impl Renderer {
@@ -229,6 +236,7 @@ impl Renderer {
                 think: None,
                 think_streamed: false,
                 prompt_stamp: stamp(),
+                transient: None,
             })
         });
         Arc::new(Self {
@@ -283,7 +291,12 @@ impl Renderer {
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
         }
-        let status = self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default();
+        // A transient hint (e.g. "(Ctrl-C again to exit)") takes over the
+        // status bar so it is seen where the cursor is; otherwise the stats.
+        let status = match &fs.transient {
+            Some(text) => frame::transient_status(text, width),
+            None => self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default(),
+        };
         let composed = frame::compose(&transcript, &editor, &status);
         let _ = fs.out.render(&composed, width, height);
     }
@@ -559,6 +572,8 @@ impl Renderer {
     }
 
     pub fn begin_turn(&self) {
+        // A turn starting supersedes any transient prompt-level hint.
+        self.clear_transient();
         let mut state = self.state.lock().unwrap();
         state.in_turn = true;
         state.at_line_start = true;
@@ -572,6 +587,8 @@ impl Renderer {
             // the legacy editor, which restamps on submission) so the next
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
+            // The turn is over; any transient hint no longer applies.
+            fs.transient = None;
             self.frame_render(&mut fs);
             return;
         }
@@ -608,6 +625,34 @@ impl Renderer {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
             fs.items.push(stamped(Item::Note(text.to_string())));
+            self.frame_render(&mut fs);
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        self.note_now(&mut state, text);
+    }
+
+    /// Clear any transient status-bar hint (frame mode only; a no-op in legacy
+    /// mode, where transients are ordinary printed lines).
+    fn clear_transient(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            if fs.transient.take().is_some() {
+                self.frame_render(&mut fs);
+            }
+        }
+    }
+
+    /// Show a short transient hint where the user is looking, without adding
+    /// it to the transcript. In frame mode it takes over the status bar (a
+    /// transcript `Item::Note` would trigger a full-screen clear and land above
+    /// the editor row, so the user watching the cursor never sees it); in
+    /// legacy mode it prints inline like `note`. Use for cursor-relevant
+    /// feedback such as "(Ctrl-C again to exit)".
+    pub fn transient_note(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.transient = Some(text.to_string());
             self.frame_render(&mut fs);
             return;
         }
@@ -998,6 +1043,7 @@ mod tests {
                     think: None,
                     think_streamed: false,
                     prompt_stamp: stamp(),
+                    transient: None,
                 })),
             })
         }
@@ -1006,6 +1052,36 @@ mod tests {
         fn frame_items(&self) -> Vec<StampedItem> {
             self.frame.as_ref().unwrap().lock().unwrap().items.clone()
         }
+
+        #[cfg(test)]
+        fn frame_transient(&self) -> Option<String> {
+            self.frame.as_ref().unwrap().lock().unwrap().transient.clone()
+        }
+    }
+
+    #[test]
+    fn transient_note_stays_out_of_the_transcript_and_clears_on_turn_end() {
+        let r = Renderer::frame_for_test();
+        r.transient_note("(Ctrl-C again to exit)");
+        // The hint is on the status bar, not a transcript item (a transcript
+        // note would trigger a full-screen clear and land above the editor).
+        assert_eq!(r.frame_transient().as_deref(), Some("(Ctrl-C again to exit)"));
+        assert!(
+            r.frame_items().iter().all(|i| !matches!(&i.item, Item::Note(t) if t.contains("Ctrl-C"))),
+            "transient note leaked into the transcript: {:?}",
+            r.frame_items()
+        );
+        // A turn boundary clears it so the hint does not stick.
+        r.end_turn();
+        assert_eq!(r.frame_transient(), None);
+    }
+
+    #[test]
+    fn begin_turn_supersedes_a_transient_hint() {
+        let r = Renderer::frame_for_test();
+        r.transient_note("(Ctrl-C again to exit)");
+        r.begin_turn();
+        assert_eq!(r.frame_transient(), None);
     }
 
     #[test]
