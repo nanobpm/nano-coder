@@ -168,8 +168,12 @@ fn to_file_endings(text: &str, s: &str) -> String {
 /// strip them from both strings.
 fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String)> {
     fn prefixed(line: &str) -> Option<&str> {
-        let (num, rest) = line.trim_start().split_once('\t')?;
-        (!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
+        // `read_file` right-aligns the number in a field at least six wide
+        // (`{:>6}\t`). Require that exact padded shape so a genuine TSV cell
+        // like `1\tfoo` isn't mistaken for a line-number prefix and stripped.
+        let (field, rest) = line.split_once('\t')?;
+        let num = field.trim_start_matches(' ');
+        (field.len() >= 6 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
     }
     let lines: Vec<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() || !lines.iter().all(|l| prefixed(l).is_some()) {
@@ -209,28 +213,44 @@ fn leading_ws(s: &str) -> &str {
 /// Re-indent `text` by the difference between `had` (the replacement's own
 /// indentation) and `want` (the file's). The shift is applied to *every*
 /// non-blank line, including lines indented less than `had`: deepening prepends
-/// the extra whitespace, dedenting drops it from the front. A plain
-/// `strip_prefix(had)` would leave shallower lines untouched and move them
-/// outside their block.
-fn reindent(text: &str, had: &str, want: &str) -> String {
-    text.split('\n')
+/// the extra whitespace, dedenting drops that many leading whitespace
+/// *characters* from the front (so multibyte whitespace can't be split). When
+/// `had` and `want` use incompatible whitespace (e.g. spaces vs tabs) neither
+/// is a prefix of the other, so no unambiguous delta exists and we reject the
+/// relaxed match rather than corrupt lines by leaving shallower ones in place.
+fn reindent(text: &str, had: &str, want: &str) -> Result<String> {
+    enum Shift<'a> {
+        Deepen(&'a str),
+        Dedent(usize),
+    }
+    let shift = if let Some(extra) = want.strip_prefix(had) {
+        Shift::Deepen(extra)
+    } else if let Some(dropped) = had.strip_prefix(want) {
+        Shift::Dedent(dropped.chars().count())
+    } else {
+        bail!(
+            "can't re-indent relaxed match: replacement indentation {had:?} and file indentation \
+             {want:?} use incompatible whitespace; copy the file's exact indentation into new_string"
+        );
+    };
+    Ok(text
+        .split('\n')
         .map(|l| {
             if l.trim().is_empty() {
                 l.to_string()
-            } else if let Some(extra) = want.strip_prefix(had) {
-                format!("{extra}{l}")
-            } else if had.starts_with(want) {
-                let ws = leading_ws(l);
-                l[(had.len() - want.len()).min(ws.len())..].to_string()
             } else {
-                match l.strip_prefix(had) {
-                    Some(rest) => format!("{want}{rest}"),
-                    None => l.to_string(),
+                match shift {
+                    Shift::Deepen(extra) => format!("{extra}{l}"),
+                    Shift::Dedent(drop) => {
+                        let ws = leading_ws(l);
+                        let kept: String = ws.chars().skip(drop).collect();
+                        format!("{kept}{}", &l[ws.len()..])
+                    }
                 }
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
 }
 
 /// Match `old` line by line, ignoring trailing whitespace (`trim_start`:
@@ -264,7 +284,7 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
     if trim_start && let Some(j) = lines.iter().position(|l| !l.trim().is_empty()) {
         let (want, had) = (leading_ws(file_line(i + j)), leading_ws(lines[j]));
         if want != had {
-            new = reindent(&new, had, want);
+            new = reindent(&new, had, want)?;
         }
     }
     Ok(Some(Located { ranges: vec![(start, end)], new: to_file_endings(text, &new), how: Some(how) }))
@@ -394,7 +414,11 @@ pub fn write_file(args: &Value) -> Result<String> {
     let path = path_arg(args)?;
     let content = string_arg(args, "content")?;
     let existed = path.exists();
-    if existed && let Ok(current) = std::fs::read(&path) {
+    if existed {
+        // Propagate a read failure instead of silently skipping the freshness
+        // check: an unreadable-but-writable file would otherwise be overwritten
+        // without the prior-read / stale-content guarantees.
+        let current = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         check_fresh(&path, &current)?;
     }
     write_atomically(&path, content)?;
@@ -694,5 +718,60 @@ mod tests {
         assert!(out.starts_with("Replaced 2 occurrence(s)"), "{out}");
         // Both edited regions are rendered, separated by a gap marker.
         assert!(out.contains("     5\tDONE\n") && out.contains("    25\tDONE\n") && out.contains("   ...\n"), "{out}");
+    }
+
+    #[test]
+    fn unpadded_tsv_number_is_not_treated_as_a_line_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        // `1\tfoo` is genuine TSV, not a read_file prefix (which pads to >=6
+        // wide). With no exact match, stripping `1\t` must NOT let the edit
+        // retarget the unrelated `foo` line.
+        let p = read_fixture(&dir, "t.tsv", "1\tfoo\n2\tbar\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "1\tfoo\nmissing", "new_string": "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "1\tfoo\n2\tbar\n");
+    }
+
+    #[test]
+    fn incompatible_indentation_rejects_the_relaxed_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // File uses a tab; old_string uses spaces. Neither indentation is a
+        // prefix of the other, so the relaxed match is rejected, not applied.
+        let p = read_fixture(&dir, "mix.py", "def f():\n\treturn 1\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "    return 1", "new_string": "    return 2" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("incompatible whitespace"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "def f():\n\treturn 1\n");
+    }
+
+    #[test]
+    fn dedent_across_multibyte_whitespace_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        // File indents each line with an ideographic space (U+3000, 3 bytes);
+        // old_string adds one ASCII space, so the dedent delta is a single
+        // *byte*. Slicing by byte would split the 3-byte space and panic; the
+        // char-safe path drops one whole leading whitespace character instead.
+        let p = read_fixture(&dir, "u.txt", "top\n\u{3000}a\n\u{3000}b\n");
+        let out = edit_file(&json!({
+            "path": p, "old_string": "\u{3000} a\n\u{3000} b", "new_string": "\u{3000} A\n\u{3000} B"
+        }))
+        .unwrap();
+        assert!(out.contains("ignoring indentation"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "top\n A\n B\n");
+    }
+
+    #[test]
+    fn overwrite_propagates_read_errors_instead_of_skipping_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("d");
+        std::fs::create_dir(&sub).unwrap();
+        // A directory can't be read as a file: write_file must surface the read
+        // error rather than treat it as a new file and clobber the path.
+        let err = write_file(&json!({ "path": sub.to_str().unwrap(), "content": "x" })).unwrap_err().to_string();
+        assert!(err.contains("read "), "{err}");
+        assert!(sub.is_dir(), "{err}");
     }
 }
