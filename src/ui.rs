@@ -634,7 +634,7 @@ impl Renderer {
 
     /// Clear any transient status-bar hint (frame mode only; a no-op in legacy
     /// mode, where transients are ordinary printed lines).
-    fn clear_transient(&self) {
+    pub fn clear_transient(&self) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
             if fs.transient.take().is_some() {

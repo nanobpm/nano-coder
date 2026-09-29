@@ -191,6 +191,21 @@ impl DoublePress {
             }
         }
     }
+
+    /// When armed (a first press is waiting for its pair), the instant at which
+    /// the window lapses and the arm re-starts; `None` when not armed. Callers
+    /// use this to bound the wait for the second press so any hint shown while
+    /// armed can be cleared the moment the arm expires.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.last.map(|last| last + self.window)
+    }
+
+    /// Drop a pending arm so the next press starts a fresh pair. Used when the
+    /// window has lapsed with no second press, to keep any displayed hint in
+    /// sync with the (now disarmed) detector.
+    fn disarm(&mut self) {
+        self.last = None;
+    }
 }
 
 /// Detects a double Esc press.
@@ -1494,7 +1509,25 @@ async fn main() -> Result<()> {
             separate = false;
 
             let input = loop {
-                match terminal.next(&agent).await {
+                let next = terminal.next(&agent);
+                // While the Ctrl-C exit hint is armed, bound the wait on the
+                // exit window: if the second press never comes, clear the stale
+                // "(Ctrl-C again to exit)" hint and disarm the detector so the
+                // visible instruction stays in sync with the armed state (a
+                // press after the window re-arms rather than exits).
+                let event = if let Some(deadline) = exit_press.deadline() {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
+                        Ok(event) => event,
+                        Err(_) => {
+                            exit_press.disarm();
+                            terminal.renderer.clear_transient();
+                            continue;
+                        }
+                    }
+                } else {
+                    next.await
+                };
+                match event {
                     TermInput::ToggleThinking => {
                         if terminal.renderer.toggle_thinking() {
                             prompt(&terminal, false);
@@ -1609,6 +1642,26 @@ mod tests {
         assert!(!exit.press(t));
         assert!(!exit.press(t + Duration::from_millis(2500)), "outside the window: re-arm");
         assert!(exit.press(t + Duration::from_millis(2600)), "and the next press completes");
+    }
+
+    #[test]
+    fn double_press_deadline_arms_and_disarm_clears_it() {
+        // The exit-hint lifecycle: arming a first press exposes the window's
+        // deadline so the caller can bound its wait and clear the stale hint
+        // when the window lapses; disarming (the timeout path) resets it so a
+        // later press starts a fresh pair instead of completing the old one.
+        let window = Duration::from_millis(2000);
+        let mut exit = DoublePress::new(window);
+        let t = Instant::now();
+        assert_eq!(exit.deadline(), None, "not armed before any press");
+        assert!(!exit.press(t), "first press arms");
+        assert_eq!(exit.deadline(), Some(t + window), "armed: deadline is press + window");
+        // Simulate the window lapsing with no second press: disarm.
+        exit.disarm();
+        assert_eq!(exit.deadline(), None, "disarmed: no pending deadline");
+        // A press after disarming re-arms rather than exiting.
+        assert!(!exit.press(t + Duration::from_millis(2500)), "post-timeout press re-arms");
+        assert_eq!(exit.deadline(), Some(t + Duration::from_millis(2500) + window));
     }
 
     #[test]
