@@ -218,8 +218,9 @@ struct FrameState {
     /// exit)") instead of as a transcript item. Transient notes are
     /// cursor-relevant feedback: as a transcript item they would trigger a
     /// full-screen clear and land above the editor row, so the user — watching
-    /// the cursor — would never see them. Rendered in place of the stats until
-    /// the next status refresh or turn boundary.
+    /// the cursor — would never see them. Rendered in place of the stats, it
+    /// persists across ordinary status refreshes (which only re-render it) and
+    /// is cleared explicitly by `clear_transient`, `begin_turn`, or `end_turn`.
     transient: Option<String>,
 }
 
