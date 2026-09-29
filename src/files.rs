@@ -123,15 +123,28 @@ pub fn read_file(args: &Value) -> Result<String> {
     Ok(output::bound_output(&out, MAX_READ_BYTES).0)
 }
 
-/// Write `content` to `path` via a temp file + rename. When `expect` is `Some`
-/// (the bytes the caller based this write on), re-read and re-validate freshness
+/// What the caller expected the target to be when the write was planned. The
+/// rename is validated against this immediately before committing so a change
+/// that races the write fails instead of being silently clobbered.
+enum Expect<'a> {
+    /// The target did not exist at plan time; the rename must not overwrite a
+    /// file that appeared in the meantime (a concurrent create).
+    Absent,
+    /// The target existed with exactly these bytes at plan time.
+    Bytes(&'a [u8]),
+}
+
+/// Write `content` to `path` via a temp file + rename, re-validating `expect`
 /// immediately before the rename: the earlier check at read time leaves a window
-/// in which an editor or formatter can change the file, and the rename would then
-/// clobber that newer content. Re-checking right before committing shrinks the
-/// window to the rename itself so a mid-call change fails instead of being lost.
-/// (A change in the remaining micro-window is still possible; fully closing it
-/// needs OS-level compare-and-swap/locking, which this does not attempt.)
-fn write_atomically(path: &Path, content: &str, expect: Option<&[u8]>) -> Result<()> {
+/// in which an editor or formatter can change the file (`Expect::Bytes`), or
+/// another process can create a not-yet-existing one (`Expect::Absent`), and the
+/// rename would then clobber that newer content. Re-checking right before
+/// committing shrinks the window to the rename itself so a mid-call change fails
+/// instead of being lost. (A change in the remaining micro-window is still
+/// possible; fully closing it needs OS-level compare-and-swap/locking, which this
+/// does not attempt.) The temp file is removed on every pre-rename error path so
+/// the proposed contents never leak under its predictable name.
+fn write_atomically(path: &Path, content: &str, expect: Expect<'_>) -> Result<()> {
     // Write through symlinks: renaming onto the link would replace it with a file.
     let resolved;
     let path = if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
@@ -147,27 +160,47 @@ fn write_atomically(path: &Path, content: &str, expect: Option<&[u8]>) -> Result
     let name = path.file_name().ok_or_else(|| anyhow!("{} is not a file path", path.display()))?;
     let tmp = path.with_file_name(format!(".{}.tmp-{}", name.to_string_lossy(), std::process::id()));
     std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        std::fs::set_permissions(&tmp, meta.permissions()).ok();
-    }
-    if let Some(expected) = expect {
-        let current = std::fs::read(path).with_context(|| format!("re-read {}", path.display()))?;
-        if let Err(e) = check_fresh(path, &current) {
-            std::fs::remove_file(&tmp).ok();
-            return Err(e);
+    // Once the temp file exists, every exit before a successful rename must remove
+    // it. Do the pre-rename validation and rename in a closure and clean up `tmp`
+    // on any error, so no path (including a failed re-read) leaks the temp file.
+    let commit = || -> Result<()> {
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, meta.permissions()).ok();
         }
-        // `check_fresh` compares against what the model last saw, which can be
-        // stale if the file changed after the caller's own read; also require the
-        // bytes to still be exactly what this write was planned against.
-        if current != expected {
-            std::fs::remove_file(&tmp).ok();
-            bail!(
-                "{} changed while the edit was being prepared; read it again before changing it",
-                path.display()
-            );
+        match expect {
+            Expect::Bytes(expected) => {
+                let current =
+                    std::fs::read(path).with_context(|| format!("re-read {}", path.display()))?;
+                check_fresh(path, &current)?;
+                // `check_fresh` compares against what the model last saw, which can be
+                // stale if the file changed after the caller's own read; also require the
+                // bytes to still be exactly what this write was planned against.
+                if current != expected {
+                    bail!(
+                        "{} changed while the edit was being prepared; read it again before changing it",
+                        path.display()
+                    );
+                }
+            }
+            Expect::Absent => {
+                // The target did not exist when the write was planned. If it now
+                // exists, another process or the user created it in the meantime and
+                // the rename would silently overwrite it — fail instead of clobbering.
+                if path.exists() {
+                    bail!(
+                        "{} was created while the write was being prepared; read it again before overwriting it",
+                        path.display()
+                    );
+                }
+            }
         }
+        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+    };
+    let committed = commit();
+    if committed.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+    committed
 }
 
 /// A located edit: replace each of `ranges` in the text with `new`. `how` says which
@@ -695,7 +728,11 @@ pub fn write_file(args: &Value) -> Result<String> {
     } else {
         None
     };
-    write_atomically(&path, content, current.as_deref())?;
+    write_atomically(
+        &path,
+        content,
+        current.as_deref().map_or(Expect::Absent, Expect::Bytes),
+    )?;
     remember(&path, content.as_bytes());
     Ok(format!(
         "{} {} ({} bytes)",
@@ -731,7 +768,7 @@ pub fn edit_file(args: &Value) -> Result<String> {
         last = end;
     }
     updated.push_str(&text[last..]);
-    write_atomically(&path, &updated, Some(&bytes))?;
+    write_atomically(&path, &updated, Expect::Bytes(&bytes))?;
     remember(&path, updated.as_bytes());
     Ok(format!(
         "Replaced {} occurrence(s) in {}{}:\n{}",
@@ -1309,5 +1346,44 @@ mod tests {
         let big: String = (0..3000).map(|i| format!("line{i}\n")).collect();
         let hint = near_miss(&big, "line");
         assert!(hint.contains("scanned"), "{hint}");
+    }
+
+    fn temp_file_present(dir: &Path, name: &str) -> bool {
+        let prefix = format!(".{name}.tmp-");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+    }
+
+    #[test]
+    fn absent_target_write_refuses_to_clobber_a_concurrent_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.txt");
+        // The write was planned against an absent target, but the file now exists
+        // (a concurrent create). The no-replace commit must refuse rather than
+        // silently overwrite the newer file, and must not leak its temp file.
+        std::fs::write(&path, "created by someone else\n").unwrap();
+        let err = write_atomically(&path, "our contents\n", Expect::Absent).unwrap_err().to_string();
+        assert!(err.contains("was created while"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created by someone else\n");
+        assert!(!temp_file_present(dir.path(), "race.txt"), "temp file leaked");
+    }
+
+    #[test]
+    fn failed_pre_rename_validation_removes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.txt");
+        std::fs::write(&path, "on disk\n").unwrap();
+        remember(&path, b"on disk\n");
+        // The bytes the write was planned against differ from what is on disk, so
+        // the pre-rename validation fails — and the temp file it wrote must be
+        // cleaned up rather than left behind under its predictable name.
+        let err = write_atomically(&path, "new\n", Expect::Bytes(b"planned-against\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed while"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "on disk\n");
+        assert!(!temp_file_present(dir.path(), "t.txt"), "temp file leaked");
     }
 }
