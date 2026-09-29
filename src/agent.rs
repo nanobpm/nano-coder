@@ -1457,7 +1457,7 @@ impl Agent {
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
-                let result = if let Some(error) = tool_call.raw_arguments_error() {
+                let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
                     // don't let a handler misreport it as a missing field —

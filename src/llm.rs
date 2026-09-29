@@ -206,20 +206,57 @@ impl ToolCall {
 
     /// Model-facing error explaining that the arguments arrived malformed and
     /// the call must be retried. `None` when the arguments decoded fine.
-    pub fn raw_arguments_error(&self) -> Option<String> {
+    ///
+    /// The recovery advice is tailored to `stop_reason`: malformed JSON has two
+    /// very different causes, and the wrong advice loops forever. A truncated
+    /// transport stream is transient, so retrying the *same* call fixes it — but
+    /// a call cut off because the model hit the output-token limit will be cut
+    /// off again every time it retries the same arguments, so there the model
+    /// must make a *smaller* call. When the provider reports a length/truncation
+    /// stop reason we say so explicitly; otherwise we keep the message
+    /// cause-neutral rather than flatly asserting a transient error.
+    pub fn raw_arguments_error(&self, stop_reason: Option<&str>) -> Option<String> {
         self.invalid_arguments().map(|raw| {
             let shown: String = raw.chars().take(300).collect();
             let truncated = if raw.chars().count() > 300 { "…" } else { "" };
-            format!(
-                "the arguments for `{}` arrived as malformed JSON (usually a truncated response), \
-                 so the call was not run: `{shown}{truncated}`. \
-                 This is a transient transport error, not a problem with the tool or the argument \
-                 values — do not work around it (for example by splitting the content or shrinking \
-                 the call); simply retry the same `{}` call with the same arguments.",
-                self.name, self.name
-            )
+            if stop_reason_is_length(stop_reason) {
+                format!(
+                    "the arguments for `{}` were cut off because the response hit the output-token \
+                     limit (stop reason `{}`), so the call was not run: `{shown}{truncated}`. \
+                     Retrying the same call will hit the same limit — make a smaller call instead, \
+                     for example by splitting the work across multiple `{}` calls or reducing the \
+                     argument size so the full JSON fits within the limit.",
+                    self.name,
+                    stop_reason.unwrap_or("length"),
+                    self.name
+                )
+            } else {
+                format!(
+                    "the arguments for `{}` arrived as malformed JSON (usually a truncated \
+                     response), so the call was not run: `{shown}{truncated}`. \
+                     If this was a transient transport error, simply retry the same `{}` call with \
+                     the same arguments; if it keeps happening, the response was probably truncated \
+                     by the output-token limit, so make a smaller call instead (for example by \
+                     splitting the content).",
+                    self.name, self.name
+                )
+            }
         })
     }
+}
+
+/// Whether a provider stop reason means the response was truncated because it
+/// hit the output-token limit (as opposed to a transient transport failure).
+/// Covers the length/truncation signals across providers: OpenAI chat
+/// (`length`), Anthropic (`max_tokens`), and OpenAI Responses (`incomplete` /
+/// `max_output_tokens`).
+fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|reason| {
+        matches!(
+            reason.to_ascii_lowercase().as_str(),
+            "length" | "max_tokens" | "max_output_tokens" | "incomplete"
+        )
+    })
 }
 
 /// Everything a provider needs to produce one completion.
@@ -399,7 +436,7 @@ mod tests {
         let call = ToolCall::from_raw_arguments("c1".into(), "write_file".into(), raw, None);
         assert_eq!(call.arguments, json!({}), "malformed args leave the object empty");
         assert_eq!(call.invalid_arguments(), Some(raw));
-        let error = call.raw_arguments_error().expect("malformed args report an error");
+        let error = call.raw_arguments_error(None).expect("malformed args report an error");
         assert!(error.contains("write_file"), "names the tool: {error}");
         assert!(error.contains("malformed JSON"), "explains the failure: {error}");
         assert!(error.contains("retry the same"), "tells the model to retry: {error}");
@@ -409,14 +446,36 @@ mod tests {
         // A well-formed call reports no error.
         let ok = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: json!({"path": "/tmp/x"}), item_id: None, malformed_arguments: None };
         assert!(ok.invalid_arguments().is_none());
-        assert!(ok.raw_arguments_error().is_none());
+        assert!(ok.raw_arguments_error(None).is_none());
+    }
+
+    #[test]
+    fn raw_arguments_error_tailors_advice_to_stop_reason() {
+        let raw = r#"{"path":"/tmp/x","content":"abc"#;
+        let call = ToolCall::from_raw_arguments("c1".into(), "write_file".into(), raw, None);
+
+        // A length/truncation stop reason means retrying the same call loops
+        // forever, so the advice tells the model to make a smaller call and
+        // does NOT claim a transient transport error.
+        for reason in ["length", "max_tokens", "max_output_tokens", "incomplete"] {
+            let error = call.raw_arguments_error(Some(reason)).expect("malformed args report an error");
+            assert!(error.contains("output-token limit"), "names the cause for {reason}: {error}");
+            assert!(error.contains("smaller call"), "advises shrinking for {reason}: {error}");
+            assert!(!error.contains("retry the same"), "does not tell it to repeat for {reason}: {error}");
+        }
+
+        // An unknown / non-length stop reason keeps the cause-neutral message
+        // (retry, but shrink if it recurs) rather than asserting transient.
+        let error = call.raw_arguments_error(Some("tool_use")).expect("malformed args report an error");
+        assert!(error.contains("retry the same"), "offers a retry: {error}");
+        assert!(error.contains("truncated by the output-token limit"), "hedges on recurrence: {error}");
     }
 
     #[test]
     fn raw_arguments_error_truncates_long_payloads() {
         let raw = format!(r#"{{"content":"{}"#, "x".repeat(1000));
         let call = ToolCall::from_raw_arguments("c".into(), "write_file".into(), &raw, None);
-        let error = call.raw_arguments_error().unwrap();
+        let error = call.raw_arguments_error(None).unwrap();
         // Only the first 300 chars of the payload are echoed, with an ellipsis.
         assert!(error.contains('…'), "truncated payload is marked: {error}");
         assert!(error.len() < raw.len() + 400, "error stays bounded");
