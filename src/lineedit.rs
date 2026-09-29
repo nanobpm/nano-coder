@@ -220,8 +220,7 @@ impl EditView {
         let at = self.byte_of(self.cursor);
         self.line.insert_str(at, text);
         self.cursor += text.chars().count();
-        self.draw_edit();
-        self.line_changed();
+        self.mutated();
     }
 
     /// The text with the cursor marked plus the queue count, for the status
@@ -240,6 +239,22 @@ impl EditView {
         self.menu_hidden = false;
         self.history.edited();
         self.draw_menu();
+    }
+
+    /// Redraw after a text mutation. The legacy path needs both renders:
+    /// `draw_edit` reprints the input row and `line_changed` -> `draw_menu`
+    /// draws the menu below it. The frame path composes the whole frame
+    /// (input + menu) in a single hook call, so a leading `draw_edit` here
+    /// would only recompose and re-emit the entire transcript an extra time
+    /// per keystroke (and, after an Esc, render the hidden then reopened menu
+    /// as two frames). `line_changed` already resets `menu_hidden` before the
+    /// frame draw, so routing frame-mode mutations through it alone yields a
+    /// single, correct O(history) render.
+    fn mutated(&mut self) {
+        if self.on_edit.is_none() {
+            self.draw_edit();
+        }
+        self.line_changed();
     }
 
     fn menu_visible(&self) -> bool {
@@ -656,8 +671,7 @@ impl EditView {
         self.cursor -= 1;
         let at = self.byte_of(self.cursor);
         self.line.remove(at);
-        self.draw_edit();
-        self.line_changed();
+        self.mutated();
     }
 
     /// Remove the character under the cursor (Delete).
@@ -667,8 +681,7 @@ impl EditView {
         }
         let at = self.byte_of(self.cursor);
         self.line.remove(at);
-        self.draw_edit();
-        self.line_changed();
+        self.mutated();
     }
 
     /// Remove the word before the cursor, plus any whitespace separating it
@@ -687,8 +700,7 @@ impl EditView {
         let to = self.byte_of(self.cursor);
         self.line.replace_range(from..to, "");
         self.cursor = start;
-        self.draw_edit();
-        self.line_changed();
+        self.mutated();
     }
 
     /// Clear the whole input (Ctrl-U).
@@ -698,8 +710,7 @@ impl EditView {
         }
         self.line.clear();
         self.cursor = 0;
-        self.draw_edit();
-        self.line_changed();
+        self.mutated();
     }
 
     /// Move the cursor, updating the status line or the terminal cursor.
@@ -1431,6 +1442,41 @@ mod tests {
         assert!(view.menu_visible(), "a `/` line's frame menu reports visible");
         view.hide_menu();
         assert!(!view.menu_visible(), "Esc-hiding the frame menu clears visibility");
+    }
+
+    #[test]
+    fn frame_mutation_invokes_the_draw_hook_once() {
+        // In frame mode a text mutation must recompose the frame exactly once:
+        // the hook clones the whole transcript, so the old `draw_edit()` +
+        // `line_changed()` pair (two O(history) renders per keystroke) was
+        // wasteful, and after an Esc it even drew the hidden then reopened menu
+        // as separate frames. `mutated()` routes frame-mode changes through a
+        // single hook invocation.
+        let calls = Arc::new(Mutex::new(0usize));
+        let mut view = view("");
+        view.mode = EditMode::Prompt;
+        view.menu_enabled = true;
+        let counter = calls.clone();
+        view.on_edit = Some(Arc::new(move |_: &str, _: usize, _: usize, _: &[String]| {
+            *counter.lock().unwrap() += 1;
+        }));
+
+        *calls.lock().unwrap() = 0;
+        view.insert("/");
+        assert_eq!(*calls.lock().unwrap(), 1, "insert renders the frame once");
+
+        *calls.lock().unwrap() = 0;
+        view.backspace();
+        assert_eq!(*calls.lock().unwrap(), 1, "backspace renders the frame once");
+
+        // After Esc hides the menu, the next mutation reopens it in a single
+        // render rather than drawing the hidden then reopened menu separately.
+        view.insert("/");
+        view.hide_menu();
+        *calls.lock().unwrap() = 0;
+        view.insert("h");
+        assert_eq!(*calls.lock().unwrap(), 1, "post-Esc mutation renders once");
+        assert!(view.menu_visible(), "the mutation reopened the menu");
     }
 
     #[test]
