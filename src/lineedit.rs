@@ -265,13 +265,17 @@ impl EditView {
             crate::commands::menu(&self.line, cols as usize, max_rows)
         };
         let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
-        // Keep `drawn_rows` (content + menu) in step with the menu height: when
-        // the menu shrinks under a pinned status line `menu_sequence` has
-        // already anchored the released rows away, so the next `redraw_sequence`
-        // must reprint against the collapsed height. Leaving `drawn_rows` at the
-        // stale, larger total would make it read `old > drawn` and anchor those
-        // same rows a second time, over-climbing and dropping transcript rows.
-        self.drawn_rows = (self.drawn_rows + used).saturating_sub(self.menu_rows);
+        // Recompute `drawn_rows` (content + menu) from the *current* content
+        // height plus the freshly measured menu, rather than adjusting the old
+        // total by a `used - menu_rows` delta. The delta is only correct while
+        // the `drawn_rows == content + menu_rows` invariant holds, but `resize`
+        // zeroes `menu_rows` before calling here while `drawn_rows` still
+        // carries the old menu height — so a delta would stack the new menu on
+        // top of the stale one (e.g. a resize with a three-row menu recording
+        // six), and the next `redraw_sequence` would climb past the real prompt
+        // and overwrite transcript rows. Measuring content directly keeps
+        // `drawn_rows` honest in every path (line change and resize alike).
+        self.drawn_rows = self.content_rows(cols as usize) + used;
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
@@ -401,15 +405,15 @@ impl EditView {
                 seen += len;
             } else {
                 // The char-indexed cursor lands inside this cluster (e.g. between
-                // a base glyph and its combining mark): advance only the scalars
-                // up to it, each as its own cell, so the position tracks the
-                // cursor rather than snapping past the whole cluster.
-                let mut buf = [0u8; 4];
-                for c in cluster.chars().take(idx - seen) {
-                    let (r, cc) = advance_cluster(row, col, cols, c.encode_utf8(&mut buf));
-                    row = r;
-                    col = cc;
-                }
+                // a base glyph and its combining mark, or between the scalars of
+                // a ZWJ sequence). The terminal renders the whole cluster as one
+                // unit on its start row, so an interior index owns no cell of its
+                // own; advancing its scalars independently (each as a cell) could
+                // wrap the cursor onto a later row than the cluster actually
+                // occupies, leaving `cursor_row` below `end_row` so the next
+                // redraw climbs above the prompt. Rest at the cluster's start
+                // boundary — the rendered position the cursor genuinely shares —
+                // rather than descending into it.
                 break;
             }
         }
@@ -1305,6 +1309,28 @@ mod tests {
     }
 
     #[test]
+    fn draw_menu_recomputes_drawn_rows_and_ignores_stale_menu_height() {
+        // `resize()` zeroes `menu_rows` before calling `draw_menu` while
+        // `drawn_rows` still carries the old menu height. A delta update would
+        // add the new menu on top of that stale total; `draw_menu` must instead
+        // recompute from the real content height so `drawn_rows` collapses back
+        // to `content + menu`.
+        let mut v = view("");
+        v.menu_enabled = true;
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        // The resize state: menu released to 0 but drawn_rows still stale-large.
+        v.menu_rows = 0;
+        v.drawn_rows = 6;
+        v.draw_menu();
+        // An empty line has no command menu, so the new menu is 0 rows and the
+        // one-row prompt is the entire content: drawn_rows must be 1, not the
+        // stale 6 (delta) nor 6-plus-anything.
+        assert_eq!(v.menu_rows, 0);
+        assert_eq!(v.drawn_rows, 1, "recomputed from content height, not the stale delta");
+    }
+
+    #[test]
     fn tab_completes_commands_and_is_a_space_elsewhere() {
         let mut v = view("/comp");
         v.tab();
@@ -1465,6 +1491,30 @@ mod tests {
         view.replace_line("abc\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
         assert_eq!(view.content_rows(4), 2, "the emoji cluster wraps whole to row 1");
         assert_eq!(view.cursor_position(4), (1, 2), "cluster placed atomically on row 1");
+    }
+
+    #[test]
+    fn cursor_inside_a_cluster_rests_on_the_cluster_start_row() {
+        // A char cursor can land between the scalars of a ZWJ family emoji
+        // (movement steps by scalar). Measured per scalar the interior index
+        // would count six cells and spill onto a second row on a narrow
+        // terminal, even though the cluster renders as one two-cell glyph on a
+        // single row. `position_at` must snap the interior index to the
+        // cluster's rendered start boundary, never a phantom later row, or
+        // `redraw_sequence` climbs above the prompt.
+        let mut view = view("");
+        view.prompt_width = 0;
+        view.insert("abc\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"); // wraps whole to row 1 at cols=4
+        // Cursor between the man and the first ZWJ: index 4 (a,b,c,man).
+        view.cursor = 4;
+        assert_eq!(
+            view.cursor_position(4),
+            (0, 3),
+            "interior index rests before the cluster (row 0), not a scalar-counted later row"
+        );
+        // Past the whole cluster: the end boundary, advanced atomically.
+        view.cursor = view.line.chars().count();
+        assert_eq!(view.cursor_position(4), (1, 2), "past the cluster: its end boundary on row 1");
     }
 
     #[test]
