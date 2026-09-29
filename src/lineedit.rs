@@ -114,10 +114,11 @@ pub struct EditContext {
 pub type SharedView = Arc<Mutex<EditView>>;
 
 /// Hook the app-owned frame renderer installs to receive `(line, cursor,
-/// queued)` on every editor change instead of the editor writing escape
+/// queued, menu)` on every editor change instead of the editor writing escape
 /// sequences itself. `queued` is the number of messages waiting behind the
-/// current turn, shown as an indicator under the editor.
-pub type EditHook = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
+/// current turn, shown as an indicator under the editor; `menu` is the command
+/// type-ahead rows to draw under the editor (empty when there is none).
+pub type EditHook = Arc<dyn Fn(&str, usize, usize, &[String]) + Send + Sync>;
 
 impl EditView {
     pub fn shared(status: Option<Arc<StatusLine>>, context: Arc<Mutex<EditContext>>) -> SharedView {
@@ -140,23 +141,20 @@ impl EditView {
     }
 
     /// Route editor drawing through the app-owned frame renderer: every change
-    /// calls `hook(line, cursor)` instead of writing escape sequences, and the
-    /// inline command menu (which writes directly) is disabled.
+    /// calls the hook instead of writing escape sequences. The inline command
+    /// menu (which writes directly) is disabled; the menu rows are handed to
+    /// the hook instead, for the frame renderer to draw under the editor.
     pub fn set_edit_hook(&mut self, hook: EditHook) {
         self.on_edit = Some(hook);
         self.menu_enabled = false;
-    }
-
-    /// The current line and cursor (a character index), for the frame renderer.
-    pub fn snapshot(&self) -> (String, usize) {
-        (self.line.clone(), self.cursor)
     }
 
     /// Redraw the editor: through the frame hook when set, else inline / on the
     /// status line as before.
     fn draw_edit(&mut self) {
         if let Some(hook) = self.on_edit.clone() {
-            hook(&self.line, self.cursor, self.queue_count);
+            let menu = self.frame_menu();
+            hook(&self.line, self.cursor, self.queue_count, &menu);
             return;
         }
         match self.on_status() {
@@ -242,8 +240,43 @@ impl EditView {
         self.menu_rows > 0
     }
 
+    /// The command menu rows for the current line: argument type-ahead past
+    /// the command name, else the matching commands (empty for non-`/` lines
+    /// or when hidden with Esc).
+    fn menu_lines(&self, cols: usize, max_rows: usize) -> Vec<String> {
+        if self.menu_hidden {
+            Vec::new()
+        } else if crate::commands::has_argument_menu(&self.line) {
+            // Past the command name: argument type-ahead for the commands
+            // with a known argument set (`/model`, `/mode`, `/verbosity`).
+            let context = self.context.lock().unwrap();
+            let recents = context.recents.lock().unwrap().models().to_vec();
+            let found = crate::commands::suggestions(&context.config, &recents, &self.line);
+            crate::commands::suggestion_menu(&found, &self.line, cols, max_rows)
+        } else {
+            crate::commands::menu(&self.line, cols, max_rows)
+        }
+    }
+
+    /// The menu rows for the frame renderer: shown at the prompt only (as the
+    /// inline menu is), sized so editor + menu + status bar fit the terminal.
+    fn frame_menu(&self) -> Vec<String> {
+        if self.mode != EditMode::Prompt {
+            return Vec::new();
+        }
+        let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
+        let cols = (cols as usize).max(1);
+        let max_rows = menu_max_rows(rows as usize, self.content_rows(cols), true);
+        self.menu_lines(cols, max_rows)
+    }
+
     /// Redraw the command menu below the prompt for the current line.
     fn draw_menu(&mut self) {
+        if self.on_edit.is_some() {
+            // The frame renderer draws the menu as part of the frame.
+            self.draw_edit();
+            return;
+        }
         if !self.menu_enabled || self.mode != EditMode::Prompt {
             return;
         }
@@ -260,18 +293,7 @@ impl EditView {
         // (`rows - 1`, or `rows - 2` with a status line).
         let content = self.content_rows(cols as usize);
         let max_rows = menu_max_rows(rows as usize, content, self.status.is_some());
-        let lines = if self.menu_hidden {
-            Vec::new()
-        } else if crate::commands::has_argument_menu(&self.line) {
-            // Past the command name: argument type-ahead for the commands
-            // with a known argument set (`/model`, `/mode`, `/verbosity`).
-            let context = self.context.lock().unwrap();
-            let recents = context.recents.lock().unwrap().models().to_vec();
-            let found = crate::commands::suggestions(&context.config, &recents, &self.line);
-            crate::commands::suggestion_menu(&found, &self.line, cols as usize, max_rows)
-        } else {
-            crate::commands::menu(&self.line, cols as usize, max_rows)
-        };
+        let lines = self.menu_lines(cols as usize, max_rows);
         // The edit cursor was left on its row by the preceding redraw
         // (`drawn_cursor_row`); the input's rendered end row is its last content
         // row. Draw the menu below that end row, not below an earlier edit row,
@@ -549,9 +571,10 @@ impl EditView {
     /// sized to the new terminal. Call after the status line re-establishes the
     /// scroll region for the new size.
     pub fn resize(&mut self) {
-        if let Some(hook) = self.on_edit.clone() {
-            // The frame renderer redraws every row at the new width itself.
-            hook(&self.line, self.cursor, self.queue_count);
+        if self.on_edit.is_some() {
+            // The frame renderer redraws every row (menu included) at the new
+            // width itself.
+            self.draw_edit();
             return;
         }
         let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
@@ -749,7 +772,8 @@ impl EditView {
             self.cursor = 0;
             self.drawn_rows = 0;
             self.drawn_cursor_row = 0;
-            hook(&self.line, self.cursor, self.queue_count);
+            self.menu_hidden = false;
+            hook(&self.line, self.cursor, self.queue_count, &[]);
             return line;
         }
         if self.menu_visible() {
@@ -1073,7 +1097,15 @@ impl LineReader {
     /// return value is a `Key::Line` or `Key::Eof`.
     pub fn read_line(&mut self, view: &SharedView, send: &dyn Fn(Key)) -> Key {
         let _mode = KeyMode::enter();
-        view.lock().unwrap().menu_enabled = true;
+        {
+            // The inline menu writes escape sequences (IND scrolls, cursor
+            // save/restore) straight to the terminal. Under the frame renderer
+            // (an edit hook is set) those writes scroll the frame behind its
+            // back, leaving a stale copy of the editor row on every key press
+            // of a `/` line — so only enable it for the inline renderer.
+            let mut v = view.lock().unwrap();
+            v.menu_enabled = v.on_edit.is_none();
+        }
         let shared = view;
         loop {
             let Some(byte) = self.first_byte() else { return Key::Eof };
@@ -1997,7 +2029,7 @@ mod tests {
         // the hook branch — but it must still record and reset history so
         // Up/Down recall works in that render path too.
         let mut view = view("");
-        view.set_edit_hook(Arc::new(|_, _, _| {}));
+        view.set_edit_hook(Arc::new(|_, _, _, _| {}));
         view.line = "first".into();
         view.take();
         view.line = "second".into();
@@ -2219,5 +2251,186 @@ mod tests {
         v.cursor = 1;
         let seq = v.redraw_sequence(4, "");
         assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
+    }
+
+    /// A VT emulator with a scroll region above a pinned status row, DECSC/
+    /// DECRC, IND and IL: enough for `redraw_sequence` + `menu_sequence`.
+    struct Vt {
+        grid: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+        bottom: usize,
+        saved: (usize, usize),
+    }
+
+    impl Vt {
+        fn new(rows: usize, cols: usize, status: bool) -> Self {
+            let mut grid = vec![vec![' '; cols]; rows];
+            let bottom = if status { rows - 2 } else { rows - 1 };
+            if status {
+                grid[rows - 1] = "STATUS".chars().chain(std::iter::repeat(' ')).take(cols).collect();
+            }
+            Vt { grid, row: bottom, col: 0, bottom, saved: (0, 0) }
+        }
+        fn index(&mut self) {
+            if self.row == self.bottom {
+                let cols = self.grid[0].len();
+                self.grid.remove(0);
+                self.grid.insert(self.bottom, vec![' '; cols]);
+            } else {
+                self.row += 1;
+            }
+        }
+        fn feed(&mut self, seq: &str) {
+            let cols = self.grid[0].len();
+            let mut it = seq.chars().peekable();
+            while let Some(c) = it.next() {
+                match c {
+                    '\x1b' => match it.next().unwrap() {
+                        '7' => self.saved = (self.row, self.col),
+                        '8' => (self.row, self.col) = self.saved,
+                        'D' => self.index(),
+                        '[' => {
+                            let mut params = String::new();
+                            while let Some(d) = it.next_if(|d| d.is_ascii_digit() || *d == ';') {
+                                params.push(d);
+                            }
+                            let nums: Vec<usize> = params.split(';').map(|n| n.parse().unwrap_or(1)).collect();
+                            let n = nums[0];
+                            match it.next().unwrap() {
+                                'A' => self.row = self.row.saturating_sub(n),
+                                'B' => self.row = (self.row + n).min(self.bottom),
+                                'C' => self.col = (self.col + n).min(cols - 1),
+                                'K' => self.grid[self.row] = vec![' '; cols],
+                                'H' => {
+                                    self.row = nums[0] - 1;
+                                    self.col = nums.get(1).copied().unwrap_or(1) - 1;
+                                }
+                                'L' => {
+                                    for _ in 0..n {
+                                        self.grid.remove(self.bottom);
+                                        self.grid.insert(self.row, vec![' '; cols]);
+                                    }
+                                }
+                                'm' => {}
+                                other => panic!("unexpected CSI {other}"),
+                            }
+                        }
+                        other => panic!("unexpected ESC {other}"),
+                    },
+                    '\r' => self.col = 0,
+                    _ => {
+                        if self.col < cols {
+                            self.grid[self.row][self.col] = c;
+                            self.col += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fn prompts(&self) -> usize {
+            self.grid.iter().filter(|r| r.iter().collect::<String>().starts_with("> ")).count()
+        }
+        fn dump(&self) -> Vec<String> {
+            self.grid.iter().map(|r| r.iter().collect::<String>().trim_end().to_string()).collect()
+        }
+    }
+
+    /// One key press at the prompt as the editor performs it: redraw the
+    /// input, then redraw the (type-ahead narrowed) command menu.
+    fn press(v: &mut EditView, term: &mut Vt, c: char, rows: usize, cols: usize) {
+        v.line.push(c);
+        v.cursor += 1;
+        term.feed(&v.redraw_sequence(cols, ""));
+        let content = v.content_rows(cols);
+        let max_rows = menu_max_rows(rows, content, v.status.is_some());
+        let lines = crate::commands::menu(&v.line, cols, max_rows);
+        let below = content.saturating_sub(1).saturating_sub(v.drawn_cursor_row);
+        let old_rows = v.menu_rows.min(max_rows);
+        let (seq, used) = menu_sequence(old_rows, &lines, v.status.is_some(), below);
+        v.drawn_rows = content + used;
+        v.menu_rows = used;
+        term.feed(&seq);
+    }
+
+    #[test]
+    fn narrowing_the_command_menu_does_not_stack_prompts() {
+        for (with_status, rows, start, typed) in [
+            (false, 30, 0, "/co"), (true, 30, 0, "/co"), (true, 10, 0, "/co"), (true, 10, 0, "/zzz"),
+            (true, 30, 10, "/co"), (true, 10, 3, "/mo"), (false, 10, 3, "/mo"),
+        ] {
+            let cols = 80;
+            let mut term = Vt::new(rows, cols, with_status);
+            term.row -= start;
+            let mut v = view("");
+            v.mode = EditMode::Prompt;
+            v.prompt_width = 2;
+            if with_status {
+                v.status = Some(Arc::new(crate::status::StatusLine::for_test()));
+            }
+            term.feed("> ");
+            v.drawn_rows = 1;
+            for c in typed.chars() {
+                press(&mut v, &mut term, c, rows, cols);
+                assert_eq!(term.prompts(), 1, "status={with_status} rows={rows} start={start} {typed} after {c:?}: {:#?}", term.dump());
+            }
+        }
+    }
+
+    #[test]
+    fn read_line_keeps_the_inline_menu_off_under_the_frame_renderer() {
+        // Regression: `read_line` re-enabled the inline command menu that
+        // `set_edit_hook` disabled, so typing `/...` in frame mode wrote raw
+        // menu scrolls under the frame and stacked the editor row per key.
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+        view.lock().unwrap().mode = EditMode::Prompt;
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"/he\r".iter());
+        let _ = reader.read_line(&view, &|_| {});
+        let v = view.lock().unwrap();
+        assert!(!v.menu_enabled, "inline menu must stay off with an edit hook");
+        assert_eq!(v.menu_rows, 0, "no inline menu rows were drawn");
+    }
+
+    #[test]
+    fn frame_hook_receives_the_command_menu_at_the_prompt() {
+        type Renders = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+        let seen: Renders = Arc::default();
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        {
+            let seen = seen.clone();
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line, _, _, menu| {
+                seen.lock().unwrap().push((line.to_string(), menu.to_vec()));
+            }));
+        }
+        view.lock().unwrap().mode = EditMode::Prompt;
+        let last = |line: &str| {
+            seen.lock().unwrap().iter().rev().find(|(l, _)| l == line).map(|(_, m)| m.clone()).unwrap()
+        };
+        let plain = |rows: Vec<String>| -> Vec<String> {
+            let re = regex::Regex::new("\x1b\\[[0-9;]*m").unwrap();
+            rows.iter().map(|r| re.replace_all(r, "").into_owned()).collect()
+        };
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"/he\r".iter());
+        let _ = reader.read_line(&view, &|_| {});
+        let slash = plain(last("/"));
+        assert!(slash.len() > 1, "a bare `/` lists commands: {slash:?}");
+        let narrowed = plain(last("/he"));
+        assert!(!narrowed.is_empty() && narrowed.iter().all(|r| r.contains("/help")), "{narrowed:?}");
+        assert!(narrowed.len() < slash.len(), "typing narrows the menu");
+        // After Enter the editor is empty and the menu is gone.
+        assert!(last("").is_empty());
+        // Plain text never opens a menu; during a turn there is none either.
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"hi\r".iter());
+        let _ = reader.read_line(&view, &|_| {});
+        assert!(last("hi").is_empty());
+        view.lock().unwrap().mode = EditMode::Turn;
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"/x\r".iter());
+        let _ = reader.read_line(&view, &|_| {});
+        assert!(last("/x").is_empty(), "no menu during a turn");
     }
 }

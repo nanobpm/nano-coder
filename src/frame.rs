@@ -27,9 +27,9 @@ use crate::plan::{Plan, Status};
 #[serde(rename_all = "lowercase")]
 pub enum RendererMode {
     /// The scroll-region renderer: the terminal owns scrollback and reflow.
-    #[default]
     Legacy,
     /// The app-owned frame renderer: nano-coder re-renders on a width change.
+    #[default]
     Frame,
 }
 
@@ -430,6 +430,11 @@ fn visible_width(text: &str) -> usize {
 
 /// Truncate a (possibly ANSI-coloured) string to `width` terminal cells,
 /// appending an ellipsis and a reset when it overflows.
+/// [`fit`] for callers outside the frame layer (e.g. the command menu rows).
+pub fn fit_line(text: &str, width: usize) -> String {
+    fit(text, width)
+}
+
 fn fit(text: &str, width: usize) -> String {
     let expanded = sanitize(text);
     let text = expanded.as_str();
@@ -803,7 +808,7 @@ mod tests {
         assert_eq!("frame".parse::<RendererMode>(), Ok(RendererMode::Frame));
         assert_eq!("Legacy".parse::<RendererMode>(), Ok(RendererMode::Legacy));
         assert!("fancy".parse::<RendererMode>().is_err());
-        assert_eq!(RendererMode::default(), RendererMode::Legacy);
+        assert_eq!(RendererMode::default(), RendererMode::Frame);
         assert_eq!(RendererMode::Frame.to_string(), "frame");
     }
 

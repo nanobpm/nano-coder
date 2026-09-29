@@ -1480,7 +1480,9 @@ async fn main() -> Result<()> {
             // The app-owned frame renderer draws the editor row itself; route
             // every edit through it instead of the inline/scroll-region path.
             let renderer = renderer.clone();
-            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize| renderer.set_editor(line, cursor, queued)));
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
+                renderer.set_editor(line, cursor, queued, menu)
+            }));
         }
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -1553,8 +1555,8 @@ async fn main() -> Result<()> {
                         // The frame renderer owns the screen: refresh the editor
                         // row (and thus the whole frame) instead of writing an
                         // inline prompt.
-                        let (line, cursor) = view.snapshot();
-                        terminal.renderer.set_editor(&line, cursor, 0);
+                        // `prompt_redrawn` re-renders the editor (and its
+                        // command menu) through the edit hook.
                         view.prompt_redrawn();
                         return;
                     }

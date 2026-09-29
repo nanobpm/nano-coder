@@ -197,6 +197,8 @@ struct FrameState {
     /// Messages queued while a turn is in flight, shown as an indicator row
     /// under the editor (0 hides it).
     queued: usize,
+    /// The command type-ahead rows drawn under the editor (empty: none).
+    menu: Vec<String>,
     /// Index of the assistant message currently being streamed into, so text
     /// deltas append to one growing item rather than adding a line each.
     stream: Option<usize>,
@@ -233,6 +235,7 @@ impl Renderer {
                 items: Vec::new(),
                 editor: (String::new(), 0),
                 queued: 0,
+                menu: Vec::new(),
                 stream: None,
                 think: None,
                 think_streamed: false,
@@ -256,12 +259,14 @@ impl Renderer {
 
     /// Update the editor row (called by the line editor's frame hook) and
     /// re-render the frame. `queued` is the number of messages waiting behind
-    /// the current turn, shown as an indicator under the editor.
-    pub fn set_editor(&self, line: &str, cursor: usize, queued: usize) {
+    /// the current turn, shown as an indicator under the editor; `menu` is the
+    /// command type-ahead, drawn under the editor.
+    pub fn set_editor(&self, line: &str, cursor: usize, queued: usize, menu: &[String]) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
             fs.editor = (line.to_string(), cursor);
             fs.queued = queued;
+            fs.menu = menu.to_vec();
             self.frame_render(&mut fs);
         }
     }
@@ -292,6 +297,7 @@ impl Renderer {
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
         }
+        editor.extend(fs.menu.iter().map(|row| frame::fit_line(row, width)));
         // A transient hint (e.g. "(Ctrl-C again to exit)") takes over the
         // status bar so it is seen where the cursor is; otherwise the stats.
         let status = match &fs.transient {
@@ -1040,6 +1046,7 @@ mod tests {
                     items: Vec::new(),
                     editor: (String::new(), 0),
                     queued: 0,
+                    menu: Vec::new(),
                     stream: None,
                     think: None,
                     think_streamed: false,
