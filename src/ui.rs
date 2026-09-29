@@ -207,6 +207,13 @@ struct FrameState {
     /// preceding `TextDelta` already finalized, which would otherwise duplicate
     /// the reasoning line. Reset at each turn/message boundary.
     think_streamed: bool,
+    /// The timestamp shown on the editor prompt, captured when a fresh prompt
+    /// starts and held stable while the user types. Regenerating it on every
+    /// render (keystroke, live status tick) would make the prompt stamp — and
+    /// its width — drift mid-line; the legacy editor stamps once at prompt draw
+    /// and only restamps on submission, so mirror that by refreshing this only
+    /// at a turn boundary.
+    prompt_stamp: String,
 }
 
 impl Renderer {
@@ -221,6 +228,7 @@ impl Renderer {
                 stream: None,
                 think: None,
                 think_streamed: false,
+                prompt_stamp: stamp(),
             })
         });
         Arc::new(Self {
@@ -268,7 +276,9 @@ impl Renderer {
         let transcript = frame::transcript_lines(&fs.items, width);
         // Prefix the editor prompt with the timestamp when timestamps are on,
         // matching the legacy prompt so switching renderers keeps the setting.
-        let prompt = format!("{}› ", stamp());
+        // Use the stamp captured at prompt start (not `stamp()`), so it stays
+        // fixed while the user types rather than ticking every render.
+        let prompt = format!("{}› ", fs.prompt_stamp);
         let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
@@ -558,6 +568,10 @@ impl Renderer {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
             self.frame_finish_stream(&mut fs);
+            // A fresh prompt starts now the turn is done: restamp it (matching
+            // the legacy editor, which restamps on submission) so the next
+            // prompt reflects the current time, then holds steady while typing.
+            fs.prompt_stamp = stamp();
             self.frame_render(&mut fs);
             return;
         }
@@ -983,6 +997,7 @@ mod tests {
                     stream: None,
                     think: None,
                     think_streamed: false,
+                    prompt_stamp: stamp(),
                 })),
             })
         }

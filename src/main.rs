@@ -1021,7 +1021,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/model" => {
-            if let Some(spec) = settings::pick_model_interactive(agent).await? {
+            let picked = settings::pick_model_interactive(agent).await;
+            // The picker (dialoguer) wrote directly over the owned frame; force
+            // a full redraw so the next differential render isn't diffed against
+            // stale screen coordinates. Do it before propagating any error so
+            // the frame is repaired on the error path too.
+            terminal.renderer.frame_resize();
+            if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent);
                 terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));

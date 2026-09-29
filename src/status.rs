@@ -510,11 +510,19 @@ fn cell_width(text: &str) -> usize {
 }
 
 /// Hard-truncate `text` to at most `budget` terminal cells, never splitting a
-/// wide glyph across the boundary.
+/// wide glyph across the boundary. Control characters are dropped rather than
+/// emitted: values folded into a status segment (`cwd`, model/provider text, …)
+/// can carry a newline, carriage return, tab or ESC. Those measure zero cells
+/// via `cell_width`, so they'd slip past the width budget yet still add extra
+/// rows or move/clear the cursor at draw time, breaking the frame's exact
+/// last-row invariant.
 fn fit_cells(text: &str, budget: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars() {
+        if c.is_control() {
+            continue;
+        }
         let w = UnicodeWidthChar::width(c).unwrap_or(0);
         if used + w > budget {
             break;
@@ -597,6 +605,23 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn strips_control_chars_from_segments() {
+        // A cwd (or model/provider) carrying control bytes must never emit them
+        // into the status row: a newline/CR/ESC would add rows or move the
+        // cursor, breaking the frame's last-row invariant even though those
+        // bytes measure zero cells and slip past the width budget.
+        let evil = ContextStats { cwd: "/tmp/a\nb\r\x1b[2Jc\td".into(), ..stats() };
+        let line = render(&evil, 140);
+        assert!(!line.contains('\n'), "newline leaked: {line:?}");
+        assert!(!line.contains('\r'), "carriage return leaked: {line:?}");
+        assert!(!line.contains('\t'), "tab leaked: {line:?}");
+        assert!(!line.contains('\x1b') || visible(&line).chars().all(|c| !c.is_control()),
+            "control leaked into visible text: {:?}", visible(&line));
+        // The surrounding real path characters survive.
+        assert!(visible(&line).contains("abcd") || visible(&line).contains("/tmp/a"), "{line:?}");
     }
 
     #[test]
