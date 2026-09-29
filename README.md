@@ -643,7 +643,9 @@ It needs a session log, and falls back to a standard summary when `persist_sessi
 - **Recorded detail.** Each assistant message in the log also keeps the model's reasoning
   text (`thinking`), the request's token `usage` and its wall-clock `duration_ms`. These
   are for inspecting a session later (see #57) and `history_read`, which includes the
-  reasoning. They are never sent back to the model.
+  reasoning. These recorded log fields themselves are never sent back to the model. This
+  is separate from `replay_reasoning` (see above): when a provider has reasoning replay
+  enabled, its reasoning blocks are still returned to the model as that provider requires.
 - **Citing summary.** The summarizer sees each message labelled `[#N]` and is asked to cite
   `(#N)` for details whose exact text may matter (errors, commands, outputs, the user's
   wording) instead of copying them. The summary ends with the range it covers and a note
