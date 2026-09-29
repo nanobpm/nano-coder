@@ -159,7 +159,13 @@ fn write_atomically(path: &Path, content: &str, expect: Expect<'_>) -> Result<()
     }
     let name = path.file_name().ok_or_else(|| anyhow!("{} is not a file path", path.display()))?;
     let tmp = path.with_file_name(format!(".{}.tmp-{}", name.to_string_lossy(), std::process::id()));
-    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    // A partial write (e.g. `ENOSPC`) can create the temp file and still fail, so
+    // remove it on the write-error path too — every exit that has touched `tmp`
+    // must clean it up, not just the pre-rename validation below.
+    if let Err(e) = std::fs::write(&tmp, content) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
     // Once the temp file exists, every exit before a successful rename must remove
     // it. Do the pre-rename validation and rename in a closure and clean up `tmp`
     // on any error, so no path (including a failed re-read) leaks the temp file.
@@ -183,14 +189,20 @@ fn write_atomically(path: &Path, content: &str, expect: Expect<'_>) -> Result<()
                 }
             }
             Expect::Absent => {
-                // The target did not exist when the write was planned. If it now
-                // exists, another process or the user created it in the meantime and
-                // the rename would silently overwrite it — fail instead of clobbering.
-                if path.exists() {
-                    bail!(
+                // The target did not exist when the write was planned. If a
+                // directory entry now exists, another process or the user created
+                // it in the meantime and the rename would silently overwrite it —
+                // fail instead of clobbering. Use `symlink_metadata` rather than
+                // `Path::exists()`: the latter follows symlinks and reports `false`
+                // for a dangling one, so a symlink created in the window would be
+                // clobbered. Propagate stat errors other than `NotFound`.
+                match path.symlink_metadata() {
+                    Ok(_) => bail!(
                         "{} was created while the write was being prepared; read it again before overwriting it",
                         path.display()
-                    );
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
                 }
             }
         }
@@ -269,16 +281,21 @@ fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
 /// field we reject it and ask for unnumbered content.
 fn strip_line_numbers(old: &str, new: &str) -> Result<Option<(String, String, u64)>> {
     fn prefix_num(line: &str) -> Option<(u64, &str)> {
-        // `read_file` right-aligns the number in a field at least six wide
-        // (`{:>6}\t`). Require that exact padded shape so a genuine TSV cell
-        // like `1\tfoo` isn't mistaken for a line-number prefix and stripped.
+        // `read_file` renders the number as `{:>6}\t` (right-aligned, space-padded
+        // to at least six wide). Require the field to equal that exact rendering so
+        // a genuine TSV cell like `1\tfoo`, a zero-padded `000002`, or an
+        // over-padded field — none of which `read_file` emits — isn't mistaken for
+        // a line-number prefix and stripped.
         let (field, rest) = line.split_once('\t')?;
-        let num = field.trim_start_matches(' ');
-        if field.len() >= 6 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
-            Some((num.parse().ok()?, rest))
-        } else {
-            None
+        let digits = field.trim_start_matches(' ');
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
         }
+        let num: u64 = digits.parse().ok()?;
+        if field != format!("{num:>6}") {
+            return None;
+        }
+        Some((num, rest))
     }
     // `old` must look like copied `read_file` output: every non-blank line
     // carries a prefix AND the numbers are a consecutive ascending run. Genuine
@@ -551,6 +568,14 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         }
     }
     for trim_start in [false, true] {
+        // Evaluate every attempt under this relaxed rule before returning. The
+        // literal and line-number-stripped candidates can each match a different
+        // location (e.g. `"     2\tfoo"` matches a prefix-shaped row on line 1 after
+        // trimming trailing whitespace, while its stripped `foo` matches line 2).
+        // Returning the first would silently pick one valid interpretation over
+        // another, so reject the edit as ambiguous unless every attempt that
+        // matches lands on the same range.
+        let mut chosen: Option<Located> = None;
         for (o, n, _, at_line) in &attempts {
             if let Some(found) = match_lines(text, o, n, trim_start)? {
                 // A stripped candidate's line-matched range must also land on the
@@ -558,8 +583,20 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
                 if at_line.is_some_and(|lo| line_at(text, found.ranges[0].0) != lo) {
                     continue;
                 }
-                return Ok(found);
+                match &chosen {
+                    None => chosen = Some(found),
+                    Some(prev) if prev.ranges == found.ranges => {}
+                    Some(prev) => bail!(
+                        "old_string matches multiple distinct locations under relaxed matching \
+                         (lines {} and {}); add surrounding context to make it unique",
+                        line_at(text, prev.ranges[0].0),
+                        line_at(text, found.ranges[0].0)
+                    ),
+                }
             }
+        }
+        if let Some(found) = chosen {
+            return Ok(found);
         }
     }
     bail!("old_string not found; read the file and copy the text exactly{}", near_miss(text, &attempts.last().unwrap().0))
@@ -1385,5 +1422,36 @@ mod tests {
         assert!(err.contains("changed while"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "on disk\n");
         assert!(!temp_file_present(dir.path(), "t.txt"), "temp file leaked");
+    }
+
+    #[test]
+    fn line_number_prefix_requires_exact_six_wide_rendering() {
+        // `read_file` renders the prefix as `{:>6}\t`, e.g. `     2\t` (five spaces).
+        // A zero-padded or over-padded field is not something `read_file` emits, so
+        // it must not be stripped as a line-number prefix (which could retarget an
+        // unrelated `foo`).
+        assert!(strip_line_numbers("000002\tfoo\n", "bar\n").unwrap().is_none());
+        assert!(strip_line_numbers("      2\tfoo\n", "bar\n").unwrap().is_none());
+        // The exact `{:>6}` rendering is still recognized and stripped.
+        let (old, _new, lo) = strip_line_numbers("     2\tfoo\n", "bar\n").unwrap().unwrap();
+        assert_eq!(lo, 2);
+        assert_eq!(old, "foo\n");
+    }
+
+    #[test]
+    fn relaxed_matching_rejects_ambiguity_across_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Line 1 is a prefix-shaped row that matches the literal `old_string` once
+        // trailing whitespace is trimmed; line 2 matches the line-number-stripped
+        // form (`foo`). Two distinct valid interpretations must be rejected rather
+        // than silently resolved to the first attempt.
+        let p = read_fixture(&dir, "amb.txt", "     2\tfoo\nfoo\n");
+        let err = edit_file(&json!({
+            "path": p, "old_string": "     2\tfoo   ", "new_string": "bar"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("multiple distinct locations"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "     2\tfoo\nfoo\n");
     }
 }
