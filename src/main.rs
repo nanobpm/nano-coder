@@ -20,6 +20,7 @@ mod frame;
 mod goal;
 mod history;
 mod hooks;
+mod input_history;
 mod instructions;
 mod plan;
 mod lineedit;
