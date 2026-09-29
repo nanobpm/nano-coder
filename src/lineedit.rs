@@ -796,11 +796,15 @@ fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool, below: usize) 
         return (String::new(), 0);
     }
     let mut seq = String::new();
-    if lines.len() > old_rows {
+    if !lines.is_empty() {
         // Ensure enough rows exist below the edit cursor for the descent to the
-        // input's rendered end row (`below`) plus the grown menu. `\x1bD` scrolls
-        // only at the bottom margin, so feeding this many is a no-op when the
-        // rows already exist and scrolls exactly the shortfall when they don't.
+        // input's rendered end row (`below`) plus the menu. `\x1bD` scrolls only
+        // at the bottom margin, so feeding this many is a no-op when the rows
+        // already exist and scrolls exactly the shortfall when they don't. Run
+        // it whenever a non-empty menu is drawn, not just when the menu itself
+        // grew: the input can gain a wrapped row (raising `below`) while the
+        // menu keeps the same entry count, and that new row must still be
+        // reserved or the menu's tail entries overwrite each other.
         seq.push_str(&"\x1bD".repeat(below + lines.len()));
         seq.push_str(&format!("\x1b[{}A", below + lines.len()));
     }
@@ -1361,9 +1365,10 @@ mod tests {
         let (seq, rows) = menu_sequence(0, &lines, false, 0);
         assert_eq!(rows, 2);
         assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
-        // Narrowing reuses the rows and blanks the extra one.
+        // Narrowing reuses the rows and blanks the extra one. The reservation
+        // descent still runs (a no-op here since the rows already exist).
         let (seq, rows) = menu_sequence(2, &lines[..1], false, 0);
-        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+        assert_eq!((seq.as_str(), rows), ("\x1bD\x1b[1A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
         let (seq, rows) = menu_sequence(2, &[], false, 0);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
         assert_eq!(menu_sequence(0, &[], false, 0), (String::new(), 0));
@@ -1384,9 +1389,30 @@ mod tests {
             seq,
             "\x1bD\x1bD\x1bD\x1bD\x1b[4A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
         );
-        // Reusing already-reserved rows needs no scroll, but still descends.
+        // Reusing already-reserved rows needs no scroll, but the reservation
+        // descent still runs (a no-op) and it still descends to the end row.
         let (seq, rows) = menu_sequence(2, &lines[..1], false, 2);
-        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+        assert_eq!((seq.as_str(), rows), ("\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+    }
+
+    #[test]
+    fn menu_reservation_reruns_when_the_input_grows_but_the_menu_does_not() {
+        // Regression: the reservation descent used to run only when the menu
+        // grew (`lines.len() > old_rows`). When the input instead gained a
+        // wrapped row (raising `below`) while the menu kept the same entry
+        // count, no rows were reserved for the new content row, so the trailing
+        // `\x1b[1B` descent clamped at the bottom margin and the menu's tail
+        // entries overwrote each other. Copilot's example: a one-row input with
+        // a two-row menu growing to two input rows left only the second menu row
+        // visible. The reservation must run for any non-empty menu, scrolling
+        // the one-row shortfall.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let (seq, rows) = menu_sequence(2, &lines, false, 1);
+        assert_eq!(rows, 2);
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
     }
 
     #[test]
