@@ -306,7 +306,7 @@ fn strip_line_numbers(old: &str, new: &str) -> Result<Option<(String, String, u6
         Some(nums) => nums,
         None => return Ok(None),
     };
-    if nums.is_empty() || nums.windows(2).any(|w| w[1] != w[0] + 1) {
+    if nums.is_empty() || nums.windows(2).any(|w| w[0].checked_add(1) != Some(w[1])) {
         return Ok(None);
     }
     let (lo, hi) = (nums[0], *nums.last().unwrap());
@@ -1436,6 +1436,19 @@ mod tests {
         let (old, _new, lo) = strip_line_numbers("     2\tfoo\n", "bar\n").unwrap().unwrap();
         assert_eq!(lo, 2);
         assert_eq!(old, "foo\n");
+    }
+
+    #[test]
+    fn line_number_prefix_at_u64_max_does_not_overflow() {
+        // A prefix-shaped line whose number is `u64::MAX` parses and renders to
+        // itself (20 digits, no padding), so it reaches the consecutiveness check.
+        // A following line must not trigger `max + 1` overflow (which panics in
+        // debug builds); it should simply be treated as non-consecutive.
+        assert!(
+            strip_line_numbers("18446744073709551615\tfoo\n18446744073709551615\tbar\n", "baz\n")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
