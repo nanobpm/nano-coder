@@ -16,6 +16,7 @@ mod commands;
 mod config;
 mod context;
 mod files;
+mod frame;
 mod goal;
 mod history;
 mod hooks;
@@ -426,8 +427,11 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: type a message and Enter to queue it (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
-    // Blank line after LLM output.
-    println!();
+    // Blank line after LLM output (legacy renderer only; the frame renderer
+    // owns the screen and must not receive stray direct writes).
+    if !renderer.is_frame() {
+        println!();
+    }
     renderer.begin_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
     let mut escape = DoubleEscape::default();
@@ -469,6 +473,14 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // reader never resumes while a dialoguer is still active.
                         let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
+                        // The picker wrote over the owned frame via dialoguer;
+                        // force a full redraw so the next differential render
+                        // isn't computed against stale screen coordinates. If an
+                        // auto-away worker was orphaned it is still parked on
+                        // stdin holding the picker lock, so defer the repaint
+                        // behind that lock: never write the frame while a
+                        // dialoguer still owns the terminal (single-writer).
+                        deferred_frame_resize(&renderer, terminal.picker_lock());
                     }
                 }
                 // The turn hit the cap in normal mode: ask whether to continue.
@@ -479,6 +491,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     let gate = terminal.suspend_input();
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
+                    // Repaint after the dialoguer picker clobbered the frame,
+                    // deferred behind the picker lock so it never races an
+                    // orphaned worker still parked on stdin (see above).
+                    deferred_frame_resize(&renderer, terminal.picker_lock());
                 }
                 input = terminal.recv() => match input {
                     TermInput::Interrupt => {
@@ -601,6 +617,28 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
         }
         Some(i) => Ok(Some(q.options[i].label.clone())),
     }
+}
+
+/// Force a full frame redraw, but only once the picker lock is free.
+///
+/// A foreground dialoguer picker owns the terminal while it runs, and an
+/// auto-away `prompt_question` can return `Away` while its `spawn_blocking`
+/// worker is still parked on stdin holding the picker lock. Repainting the
+/// owned frame immediately would write it while that orphaned worker still
+/// owns the terminal, violating the single-writer assumption and letting the
+/// two tear each other's output. Awaiting the picker lock first defers the
+/// repaint until every picker (orphaned or not) has released the terminal; in
+/// the common case the lock is already free, so the redraw runs at once.
+/// Spawned so the turn loop is never blocked waiting on an away user.
+fn deferred_frame_resize(
+    renderer: &std::sync::Arc<ui::Renderer>,
+    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+) {
+    let renderer = renderer.clone();
+    tokio::spawn(async move {
+        let _guard = picker_lock.lock_owned().await;
+        renderer.frame_resize();
+    });
 }
 
 /// Render a pending `question` and return the answer, plus an optional handle
@@ -752,6 +790,16 @@ fn queue_command(text: &str) -> Option<std::result::Result<queue::QueueOp, Strin
     Some(queue::parse(args))
 }
 
+/// Emit a transient diagnostic: through the frame transcript in frame mode (a
+/// direct write would corrupt the owned frame), else to stderr as before.
+fn diag(renderer: &ui::Renderer, text: &str) {
+    if renderer.is_frame() {
+        renderer.note(text);
+    } else {
+        eprintln!("{text}");
+    }
+}
+
 /// Run an explicit compaction; Ctrl-C or Esc Esc cancels it.
 async fn run_compaction(
     agent: &mut Agent,
@@ -771,15 +819,15 @@ async fn run_compaction(
             input = terminal.recv() => match input {
                 TermInput::Interrupt => {
                     control.cancel();
-                    eprintln!("[cancelling...]");
+                    diag(&terminal.renderer, "[cancelling...]");
                 }
                 TermInput::Escape if control.is_cancelled() => {}
                 TermInput::Escape => {
                     if escape.press(std::time::Instant::now()) {
                         control.cancel();
-                        eprintln!("[cancelling...]");
+                        diag(&terminal.renderer, "[cancelling...]");
                     } else {
-                        eprintln!("[Esc again to cancel]");
+                        diag(&terminal.renderer, "[Esc again to cancel]");
                     }
                 }
                 TermInput::ToggleThinking => {
@@ -793,7 +841,7 @@ async fn run_compaction(
                     // refresh while `/compact` is still running.
                     stats.lock().unwrap().mode = mode;
                     terminal.renderer.event(&agent::AgentEvent::Context);
-                    eprintln!("[mode: {mode} — {}]", mode.describe());
+                    diag(&terminal.renderer, &format!("[mode: {mode} — {}]", mode.describe()));
                 }
                 other => {
                     // `/queue` edits apply mid-compaction too; everything else
@@ -821,79 +869,85 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
     match cmd {
         "/exit" | "/quit" => Ok(false),
         "/help" => {
-            println!("{}", commands::help_text());
+            terminal.renderer.print_block(&commands::help_text());
             Ok(true)
         }
         _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
             let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
             let focus = focus.map(str::to_string);
-            println!("Compacting...");
+            terminal.renderer.print_block("Compacting...");
             match run_compaction(agent, mode, focus.as_deref(), terminal).await? {
-                Some(report) => println!("Conversation {report}"),
-                None => println!("Nothing to compact"),
+                Some(report) => terminal.renderer.print_block(&format!("Conversation {report}")),
+                None => terminal.renderer.print_block("Nothing to compact"),
             }
             Ok(true)
         }
         "/context" => {
             let stats = agent.context_stats().lock().unwrap().clone();
-            println!("Model:        {}/{}", stats.provider, stats.model);
-            println!(
+            let mut out: Vec<String> = Vec::new();
+            out.push(format!("Model:        {}/{}", stats.provider, stats.model));
+            out.push(format!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
                 if stats.calibrated { "" } else { "~" },
                 stats.tokens,
                 stats.window,
                 stats.percent(),
                 if stats.calibrated { ", anchored to reported usage" } else { ", estimated" }
-            );
-            println!("Messages:     {}", stats.messages);
+            ));
+            out.push(format!("Messages:     {}", stats.messages));
             let system_tokens = crate::context::text_tokens(&agent.system_prompt());
-            println!("System prompt: {} tokens", system_tokens);
+            out.push(format!("System prompt: {} tokens", system_tokens));
             let files = agent.project_instruction_files();
             if files.is_empty() {
-                println!("Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)");
+                out.push("Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)".to_string());
             } else {
-                println!("Instructions: {}", files.join(", "));
+                out.push(format!("Instructions: {}", files.join(", ")));
             }
             let skills = agent.skills();
             if !skills.is_empty() || !skills.warnings.is_empty() {
-                println!("Skills:       {} (/skills to list them)", skills.skills.len());
+                out.push(format!("Skills:       {} (/skills to list them)", skills.skills.len()));
             }
             if let Some((done, total)) = stats.plan {
-                println!("Plan:         {done}/{total} done (/plan to show it)");
+                out.push(format!("Plan:         {done}/{total} done (/plan to show it)"));
             }
-            println!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens);
+            out.push(format!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens));
             if let Some(aic) = stats.session_aic {
-                println!("AI Credits:   {aic:.2} used this session");
+                out.push(format!("AI Credits:   {aic:.2} used this session"));
             }
             match stats.auto_compact {
-                Some(t) => println!(
+                Some(t) => out.push(format!(
                     "Auto-compact: at {:.0}% (~{} tokens); compacted {} time(s)",
                     t * 100.0,
                     (stats.window as f64 * t) as usize,
                     stats.compactions
-                ),
-                None => println!("Auto-compact: off"),
+                )),
+                None => out.push("Auto-compact: off".to_string()),
             }
-            println!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str());
+            out.push(format!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str()));
             if stats.history_searches + stats.history_reads > 0 {
-                println!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads);
+                out.push(format!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads));
             }
-            println!("(context window {})", agent.context_window_with_source().1);
+            out.push(format!("(context window {})", agent.context_window_with_source().1));
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/settings" if terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive editor would race it for keystrokes.
             let config = agent.config();
-            println!("model: {}", config.model);
-            println!("temperature: {}", config.temperature);
-            println!("max_tokens: {}", config.max_tokens);
-            println!("(read-only: run /settings again at the prompt to edit)");
+            terminal.renderer.print_block(&format!(
+                "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
+                config.model, config.temperature, config.max_tokens
+            ));
             Ok(true)
         }
         "/settings" => {
             let before = agent.config().model.clone();
             settings::run(agent, &terminal.config_path).await?;
+            // The settings dialog (dialoguer) wrote directly over the owned
+            // frame; force a full redraw so the frame renderer's next update
+            // isn't diffed against stale screen coordinates.
+            terminal.renderer.frame_resize();
             // Providers or the model may have changed. A model switched through
             // the settings dialog must land in the recents MRU just like one
             // switched with `/model`; a provider-only edit just refreshes the
@@ -906,30 +960,33 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/tools" => {
-            println!("Available tools:");
+            let mut out = vec!["Available tools:".to_string()];
             for def in agent.tool_definitions() {
-                println!("  {} - {}", def.name, def.description);
+                out.push(format!("  {} - {}", def.name, def.description));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/skills" => {
             let skills = agent.skills();
+            let mut out: Vec<String> = Vec::new();
             if skills.is_empty() {
-                println!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", "));
+                out.push(format!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", ")));
             }
             for skill in &skills.skills {
-                println!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display());
+                out.push(format!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display()));
             }
             for warning in &skills.warnings {
-                println!("Warning: {warning}");
+                out.push(format!("Warning: {warning}"));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/plan" => {
             if agent.plan().is_empty() {
-                println!("No plan yet. The agent makes one with the plan_add tool.");
+                terminal.renderer.print_block("No plan yet. The agent makes one with the plan_add tool.");
             } else {
-                print!("{}", agent.plan().render(true, usize::MAX));
+                terminal.renderer.print_block(agent.plan().render(true, usize::MAX).trim_end());
             }
             Ok(true)
         }
@@ -938,45 +995,56 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // already applied mid-turn when typed then, and apply here at the
             // prompt.
             match op {
-                Ok(queue::QueueOp::List) => println!("{}", queue::describe(&terminal.messages)),
-                Ok(op) => println!("{}", terminal.edit_queue(&op)),
-                Err(usage) => println!("{usage}"),
+                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages)),
+                Ok(op) => {
+                    let msg = terminal.edit_queue(&op);
+                    terminal.renderer.print_block(&msg);
+                }
+                Err(usage) => terminal.renderer.print_block(&usage),
             }
             Ok(true)
         }
         "/model" if terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive picker would race it for keystrokes.
-            println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
-            println!("(read-only: run /model again at the prompt to switch)");
+            terminal.renderer.print_block(&format!(
+                "Model: {} (provider {}, spec {:?})\n(read-only: run /model again at the prompt to switch)",
+                agent.model_name(), agent.provider_name(), agent.config().model
+            ));
             Ok(true)
         }
         "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
             // The picker reads keystrokes from stdin and draws on stderr, so it
             // needs both to be terminals; piped input/output just gets the
             // current model.
-            println!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model);
+            terminal.renderer.print_block(&format!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model));
             Ok(true)
         }
         "/model" => {
-            if let Some(spec) = settings::pick_model_interactive(agent).await? {
+            let picked = settings::pick_model_interactive(agent).await;
+            // The picker (dialoguer) wrote directly over the owned frame; force
+            // a full redraw so the next differential render isn't diffed against
+            // stale screen coordinates. Do it before propagating any error so
+            // the frame is repaired on the error path too.
+            terminal.renderer.frame_resize();
+            if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent);
-                println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+                terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
             } else {
-                println!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name());
+                terminal.renderer.print_block(&format!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name()));
             }
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
             agent.set_model(cmd["/model ".len()..].trim()).await?;
             terminal.model_switched(agent);
-            println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+            terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
             Ok(true)
         }
         "/providers" => {
             let (user, default_provider) = agent.config().effective_providers();
-            println!("Providers (default: {default_provider}):");
+            let mut out = vec![format!("Providers (default: {default_provider}):")];
             for (name, provider) in providers::effective_providers(&user) {
                 let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
                 let key = settings::key_status(&provider);
@@ -984,14 +1052,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                     Some(providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
                     _ => "-".into(),
                 });
-                println!("  {name:<14} {kind:<14} {url:<55} {key}");
+                out.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/session" => {
             match (agent.session_id(), agent.session_path()) {
-                (Some(id), Some(path)) => println!("Session {id}: {}", path.display()),
-                _ => println!("Session persistence is disabled"),
+                (Some(id), Some(path)) => terminal.renderer.print_block(&format!("Session {id}: {}", path.display())),
+                _ => terminal.renderer.print_block("Session persistence is disabled"),
             }
             Ok(true)
         }
@@ -1002,36 +1071,38 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let id = agent.new_session()?;
             terminal.renderer.clear_screen();
             if agent.session_path().is_some() {
-                println!("Session: {id} (resume with --resume {id})");
+                terminal.renderer.print_block(&format!("Session: {id} (resume with --resume {id})"));
             } else {
-                println!("Session: {id}");
+                terminal.renderer.print_block(&format!("Session: {id}"));
             }
             Ok(true)
         }
         "/verbosity" => {
             let current = ui::verbosity();
-            println!("Verbosity: {current} ({})", current.describe());
+            let mut out = vec![format!("Verbosity: {current} ({})", current.describe())];
             for level in ui::Verbosity::ALL {
-                println!("  {:<8} {}", level.to_string(), level.describe());
+                out.push(format!("  {:<8} {}", level.to_string(), level.describe()));
             }
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/mode" => {
             let current = agent.mode();
-            println!("Mode: {current} ({})", current.describe());
+            let mut out = vec![format!("Mode: {current} ({})", current.describe())];
             for mode in mode::AgentMode::ALL {
-                println!("  {:<8} {}", mode.to_string(), mode.describe());
+                out.push(format!("  {:<8} {}", mode.to_string(), mode.describe()));
             }
-            println!("(Shift+Tab cycles; /mode NAME sets it directly)");
+            out.push("(Shift+Tab cycles; /mode NAME sets it directly)".to_string());
+            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         _ if cmd.starts_with("/mode ") => {
             match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
                 Ok(m) => {
                     agent.set_mode(m);
-                    println!("Mode set to {m} ({})", m.describe());
+                    terminal.renderer.print_block(&format!("Mode set to {m} ({})", m.describe()));
                 }
-                Err(e) => println!("{e}"),
+                Err(e) => terminal.renderer.print_block(&e),
             }
             Ok(true)
         }
@@ -1040,21 +1111,26 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 Ok(level) => {
                     ui::set_verbosity(level);
                     agent.config_mut().verbosity = level;
-                    println!("Verbosity set to {level} ({}); /settings saves it", level.describe());
+                    terminal.renderer.print_block(&format!("Verbosity set to {level} ({}); /settings saves it", level.describe()));
                 }
-                Err(e) => println!("{e}"),
+                Err(e) => terminal.renderer.print_block(&e),
             }
             Ok(true)
         }
         _ => {
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
-            if ui::verbosity() == ui::Verbosity::Quiet {
-                println!("{}", ui::stamp_block(&outcome.response));
-            } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
-            } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                let last = outcome.response.lines().last().unwrap_or_default();
-                println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
+            // In frame mode the turn's response is already rendered from its
+            // events; re-printing it here would duplicate the answer and
+            // corrupt the owned frame.
+            if !terminal.renderer.is_frame() {
+                if ui::verbosity() == ui::Verbosity::Quiet {
+                    println!("{}", ui::stamp_block(&outcome.response));
+                } else if outcome.stop_reason == agent::StopReason::Cancelled {
+                    println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
+                } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
+                    let last = outcome.response.lines().last().unwrap_or_default();
+                    println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
+                }
             }
             Ok(true)
         }
@@ -1273,43 +1349,98 @@ async fn main() -> Result<()> {
             lineedit::restore_terminal();
             previous_hook(info);
         }));
-        let renderer = ui::Renderer::new(status.clone());
+        let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
         ui::install(renderer.clone());
         let sink = renderer.clone();
         agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
         agent.set_streaming(true);
         agent.refresh_stats();
+        let frame_mode = renderer.is_frame();
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext { config: agent.config().clone(), recents: recents.clone() }));
             lineedit::EditView::shared(status.clone(), context)
         };
+        if frame_mode {
+            // The app-owned frame renderer draws the editor row itself; route
+            // every edit through it instead of the inline/scroll-region path.
+            let renderer = renderer.clone();
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize| renderer.set_editor(line, cursor, queued)));
+        }
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         {
             let view = view.clone();
             let status = status.clone();
+            let renderer = renderer.clone();
             tokio::spawn(async move {
+                // Debounce a burst of resizes (a window drag) into one render at
+                // the final size: after a resize, wait for ~40 ms of quiet.
+                let quiet = std::time::Duration::from_millis(40);
+                let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
-                    if let Some(status) = &status {
-                        status.resize();
+                    if !renderer.is_frame() {
+                        // Legacy: re-anchor immediately, as before.
+                        if let Some(status) = &status {
+                            status.resize();
+                        }
+                        view.lock().unwrap().resize();
+                        continue;
                     }
-                    view.lock().unwrap().resize();
+                    debounce.record(std::time::Instant::now());
+                    // Coalesce further resizes arriving within the quiet window.
+                    while debounce.pending() {
+                        tokio::select! {
+                            more = resized.recv() => match more {
+                                Some(()) => debounce.record(std::time::Instant::now()),
+                                None => break,
+                            },
+                            _ = tokio::time::sleep(quiet) => {
+                                if debounce.ready(std::time::Instant::now()) {
+                                    debounce.clear();
+                                }
+                            }
+                        }
+                    }
+                    // `frame_resize()` re-renders every row (editor included)
+                    // at the new size in one pass; calling `view.resize()` here
+                    // too would fire the edit hook and emit a second redraw.
+                    renderer.frame_resize();
                 }
             });
+        }
+        // A resumed session loads its conversation before the sink is wired,
+        // so the app-owned frame opens empty. Replay the loaded history now
+        // (the sink is installed) to reconstruct the transcript into
+        // `FrameState`; `frame_event` populates user, assistant, tool and plan
+        // items. Only in frame mode — the legacy renderer would dump the whole
+        // conversation inline, which it has never done on resume.
+        if frame_mode && args.resume.is_some() {
+            agent.replay_history();
         }
         let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
         let mut running = true;
         let mut exit_armed = false;
         let mut separate = false;
         while running {
-            if let Some(status) = &status {
+            if let Some(status) = &status
+                && !frame_mode
+            {
                 status.draw();
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
+                    if frame_mode {
+                        // The frame renderer owns the screen: refresh the editor
+                        // row (and thus the whole frame) instead of writing an
+                        // inline prompt.
+                        let (line, cursor) = view.snapshot();
+                        terminal.renderer.set_editor(&line, cursor, 0);
+                        view.prompt_redrawn();
+                        return;
+                    }
                     let prompt = view.prompt();
                     // Serialise the prompt write under the terminal lock so it
                     // cannot move the cursor mid-way through the SIGWINCH
@@ -1338,7 +1469,11 @@ async fn main() -> Result<()> {
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        println!("\nMode: {mode} ({})", mode.describe());
+                        if frame_mode {
+                            terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
+                        } else {
+                            println!("\nMode: {mode} ({})", mode.describe());
+                        }
                         prompt(&terminal, false);
                     }
                     other => break other,
@@ -1349,7 +1484,11 @@ async fn main() -> Result<()> {
                 TermInput::Interrupt if exit_armed => break,
                 TermInput::Interrupt => {
                     exit_armed = true;
-                    println!("\n(Ctrl-C again to exit)");
+                    if frame_mode {
+                        terminal.renderer.note("(Ctrl-C again to exit)");
+                    } else {
+                        println!("\n(Ctrl-C again to exit)");
+                    }
                     continue;
                 }
                 TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
@@ -1359,13 +1498,20 @@ async fn main() -> Result<()> {
             if input.trim().is_empty() {
                 continue;
             }
+            if frame_mode && !input.starts_with('/') {
+                terminal.renderer.frame_user_message(&input);
+            }
 
             match run_command(&mut agent, &input, &mut terminal).await {
                 Ok(continue_running) => {
                     running = continue_running;
                 }
                 Err(e) => {
-                    eprintln!("Error: {:#}", e);
+                    if frame_mode {
+                        terminal.renderer.note(&format!("Error: {:#}", e));
+                    } else {
+                        eprintln!("Error: {:#}", e);
+                    }
                 }
             }
             separate = true;

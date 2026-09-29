@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::context::{Activity, ContextStats, SharedStats, format_rate, format_tokens};
+use unicode_width::UnicodeWidthChar;
 
 pub struct StatusLine {
     stats: SharedStats,
@@ -204,6 +205,12 @@ impl StatusLine {
         let status = Arc::new(Self { stats, size: Mutex::new(Some((rows, cols))), input: Mutex::new(None) });
         status.draw();
         Some(status)
+    }
+
+    /// The status bar as a plain string at `cols` columns (stats only, no
+    /// cursor positioning), for the app-owned frame renderer.
+    pub fn stats_line(&self, cols: usize) -> String {
+        render(&self.stats.lock().unwrap().clone(), cols)
     }
 
     pub fn draw(&self) {
@@ -463,7 +470,7 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     }
 
     let width = |segments: &[Segment]| -> usize {
-        segments.iter().map(|s| s.text.chars().count()).sum::<usize>() + segments.len().saturating_sub(1)
+        segments.iter().map(|s| cell_width(&s.text)).sum::<usize>() + segments.len().saturating_sub(1)
     };
     while width(&segments) > cols && segments.len() > 1 {
         let lowest = segments.iter().enumerate().min_by_key(|(_, s)| s.priority).map(|(i, _)| i).unwrap();
@@ -477,8 +484,8 @@ fn render(stats: &ContextStats, cols: usize) -> String {
             line.push('│');
             used += 1;
         }
-        let text: String = segment.text.chars().take(cols.saturating_sub(used)).collect();
-        used += text.chars().count();
+        let text = fit_cells(&segment.text, cols.saturating_sub(used));
+        used += cell_width(&text);
         match segment.color {
             Some(color) => {
                 line.push_str(color);
@@ -491,6 +498,39 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     line.push_str(&" ".repeat(cols.saturating_sub(used)));
     line.push_str(RESET);
     line
+}
+
+/// Total terminal-cell width of `text`. The status segments are plain text
+/// (colours are applied separately), so no ANSI stripping is needed. CJK and
+/// wide emoji count as two cells so a status row never exceeds `cols` and gets
+/// wrapped by the terminal, which would break the editor/status last-row
+/// invariant.
+fn cell_width(text: &str) -> usize {
+    text.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+
+/// Hard-truncate `text` to at most `budget` terminal cells, never splitting a
+/// wide glyph across the boundary. Control characters are dropped rather than
+/// emitted: values folded into a status segment (`cwd`, model/provider text, …)
+/// can carry a newline, carriage return, tab or ESC. Those measure zero cells
+/// via `cell_width`, so they'd slip past the width budget yet still add extra
+/// rows or move/clear the cursor at draw time, breaking the frame's exact
+/// last-row invariant.
+fn fit_cells(text: &str, budget: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        if c.is_control() {
+            continue;
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -565,6 +605,39 @@ mod tests {
     fn marks_uncalibrated_estimates() {
         let line = visible(&render(&ContextStats { calibrated: false, ..stats() }, 140));
         assert!(line.contains("ctx ~96.5k"), "{line:?}");
+    }
+
+    #[test]
+    fn strips_control_chars_from_segments() {
+        // A cwd (or model/provider) carrying control bytes must never emit them
+        // into the status row: a newline/CR/ESC would add rows or move the
+        // cursor, breaking the frame's last-row invariant even though those
+        // bytes measure zero cells and slip past the width budget.
+        let evil = ContextStats { cwd: "/tmp/a\nb\r\x1b[2Jc\td".into(), ..stats() };
+        let line = render(&evil, 140);
+        assert!(!line.contains('\n'), "newline leaked: {line:?}");
+        assert!(!line.contains('\r'), "carriage return leaked: {line:?}");
+        assert!(!line.contains('\t'), "tab leaked: {line:?}");
+        assert!(!line.contains('\x1b') || visible(&line).chars().all(|c| !c.is_control()),
+            "control leaked into visible text: {:?}", visible(&line));
+        // The surrounding real path characters survive.
+        assert!(visible(&line).contains("abcd") || visible(&line).contains("/tmp/a"), "{line:?}");
+    }
+
+    #[test]
+    fn status_row_never_exceeds_cols_with_wide_glyphs() {
+        // A CJK cwd occupies two cells per glyph: the row must be budgeted and
+        // truncated by terminal cells so it never overflows `cols` (which would
+        // wrap and break the editor/status last-row invariant).
+        let wide = ContextStats { cwd: "/项目/工作目录/深层/路径".into(), ..stats() };
+        for cols in 10..=140 {
+            let line = visible(&render(&wide, cols));
+            assert!(
+                cell_width(&line) <= cols,
+                "row overflows at {cols} cols: cell_width={} {line:?}",
+                cell_width(&line)
+            );
+        }
     }
 
     #[test]

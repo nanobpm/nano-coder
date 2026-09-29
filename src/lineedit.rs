@@ -51,6 +51,10 @@ pub struct EditView {
     /// prompt row before reprinting, so a wrapped/newline row is never
     /// mistaken for the prompt row.
     drawn_cursor_row: usize,
+    /// Set in the app-owned frame renderer (`renderer = "frame"`): the editor
+    /// no longer writes escape sequences itself. Instead each change calls this
+    /// with `(line, cursor)` so the single frame writer redraws the editor row.
+    on_edit: Option<EditHook>,
 }
 
 /// What the argument type-ahead needs from the agent loop.
@@ -61,6 +65,12 @@ pub struct EditContext {
 }
 
 pub type SharedView = Arc<Mutex<EditView>>;
+
+/// Hook the app-owned frame renderer installs to receive `(line, cursor,
+/// queued)` on every editor change instead of the editor writing escape
+/// sequences itself. `queued` is the number of messages waiting behind the
+/// current turn, shown as an indicator under the editor.
+pub type EditHook = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
 
 impl EditView {
     pub fn shared(status: Option<Arc<StatusLine>>, context: Arc<Mutex<EditContext>>) -> SharedView {
@@ -77,11 +87,45 @@ impl EditView {
             context,
             drawn_rows: 0,
             drawn_cursor_row: 0,
+            on_edit: None,
         }))
+    }
+
+    /// Route editor drawing through the app-owned frame renderer: every change
+    /// calls `hook(line, cursor)` instead of writing escape sequences, and the
+    /// inline command menu (which writes directly) is disabled.
+    pub fn set_edit_hook(&mut self, hook: EditHook) {
+        self.on_edit = Some(hook);
+        self.menu_enabled = false;
+    }
+
+    /// The current line and cursor (a character index), for the frame renderer.
+    pub fn snapshot(&self) -> (String, usize) {
+        (self.line.clone(), self.cursor)
+    }
+
+    /// Redraw the editor: through the frame hook when set, else inline / on the
+    /// status line as before.
+    fn draw_edit(&mut self) {
+        if let Some(hook) = self.on_edit.clone() {
+            hook(&self.line, self.cursor, self.queue_count);
+            return;
+        }
+        match self.on_status() {
+            Some(status) => self.show_on_status(status),
+            None => self.redraw(),
+        }
     }
 
     pub fn set_mode(&mut self, mode: EditMode) {
         self.mode = mode;
+        if self.on_edit.is_some() {
+            // The frame renderer owns the screen: refresh through the hook
+            // rather than writing the legacy status row, which would corrupt
+            // the frame.
+            self.draw_edit();
+            return;
+        }
         if let Some(status) = &self.status {
             match mode {
                 EditMode::Turn => self.show_on_status(status),
@@ -93,6 +137,11 @@ impl EditView {
     /// Update the queue indicator on the status line (None hides it).
     pub fn set_queue_count(&mut self, count: Option<usize>) {
         self.queue_count = count.unwrap_or(0);
+        if self.on_edit.is_some() {
+            // Suppress the legacy status write in frame mode; re-render instead.
+            self.draw_edit();
+            return;
+        }
         if let Some(status) = self.on_status() {
             self.show_on_status(status);
         }
@@ -119,10 +168,7 @@ impl EditView {
         let at = self.byte_of(self.cursor);
         self.line.insert_str(at, text);
         self.cursor += text.chars().count();
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
         self.line_changed();
     }
 
@@ -375,6 +421,11 @@ impl EditView {
     /// sized to the new terminal. Call after the status line re-establishes the
     /// scroll region for the new size.
     pub fn resize(&mut self) {
+        if let Some(hook) = self.on_edit.clone() {
+            // The frame renderer redraws every row at the new width itself.
+            hook(&self.line, self.cursor, self.queue_count);
+            return;
+        }
         // With a status line, its resize erased everything below the cursor
         // (the menu included) and re-anchored the prompt, so only redraw.
         if self.menu_rows > 0 && self.status.is_none() {
@@ -400,10 +451,7 @@ impl EditView {
         self.cursor -= 1;
         let at = self.byte_of(self.cursor);
         self.line.remove(at);
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
         self.line_changed();
     }
 
@@ -414,10 +462,7 @@ impl EditView {
         }
         let at = self.byte_of(self.cursor);
         self.line.remove(at);
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
         self.line_changed();
     }
 
@@ -437,10 +482,7 @@ impl EditView {
         let to = self.byte_of(self.cursor);
         self.line.replace_range(from..to, "");
         self.cursor = start;
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
         self.line_changed();
     }
 
@@ -451,10 +493,7 @@ impl EditView {
         }
         self.line.clear();
         self.cursor = 0;
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
         self.line_changed();
     }
 
@@ -465,10 +504,7 @@ impl EditView {
             return;
         }
         self.cursor = idx;
-        match self.on_status() {
-            Some(status) => self.show_on_status(status),
-            None => self.redraw(),
-        }
+        self.draw_edit();
     }
 
     fn move_left(&mut self) {
@@ -513,6 +549,18 @@ impl EditView {
     }
 
     fn take(&mut self) -> String {
+        if let Some(hook) = self.on_edit.clone() {
+            // The frame renderer owns the screen: no menu teardown or newline;
+            // the submitted line becomes a transcript item and the editor row
+            // is redrawn empty.
+            self.restamp_prompt();
+            let line = std::mem::take(&mut self.line);
+            self.cursor = 0;
+            self.drawn_rows = 0;
+            self.drawn_cursor_row = 0;
+            hook(&self.line, self.cursor, self.queue_count);
+            return line;
+        }
         if self.menu_visible() {
             let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some());
             write(&seq);
@@ -1059,6 +1107,7 @@ mod tests {
             context: Arc::new(Mutex::new(EditContext::default())),
             drawn_rows: 0,
             drawn_cursor_row: 0,
+            on_edit: None,
         };
         view.mode = EditMode::Turn;
         view

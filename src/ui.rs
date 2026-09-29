@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::AgentEvent;
+use crate::frame::{self, FrameRenderer, Item, Role, StampedItem};
 use crate::llm::ToolCall;
 use crate::plan::{Plan, PlanItem, Status};
 use crate::status::{self, StatusLine};
@@ -127,6 +128,14 @@ pub fn stamp() -> String {
     if TIMESTAMPS.load(Ordering::Relaxed) { format!("{DIM}{}{RESET} ", chrono::Local::now().format("%H:%M:%S")) } else { String::new() }
 }
 
+/// Pair a frame transcript item with the current timestamp, so every item
+/// (message, tool call/result, plan, thinking, note, output) is stamped
+/// consistently — matching the legacy renderer, where `ui::stamp()` prefixes
+/// every interactive item when `timestamps` is on (the default).
+fn stamped(item: Item) -> StampedItem {
+    StampedItem { stamp: stamp(), item }
+}
+
 const THINK: &str = "\x1b[38;5;245m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
@@ -171,16 +180,309 @@ pub struct Renderer {
     /// Stdout is a terminal (in-place redraws are possible).
     tty: bool,
     expanded: AtomicBool,
+    /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
+    /// terminal. When set, all output is composed into one frame (transcript,
+    /// editor, status as the last line) and diff-rendered by a single writer,
+    /// instead of streaming into the terminal's scrollback.
+    frame: Option<Mutex<FrameState>>,
+}
+
+/// The mutable state behind the app-owned frame renderer.
+struct FrameState {
+    out: FrameRenderer<io::Stdout>,
+    /// The transcript, oldest first. A width change re-renders every item.
+    items: Vec<StampedItem>,
+    /// The current input editor `(line, cursor)`.
+    editor: (String, usize),
+    /// Messages queued while a turn is in flight, shown as an indicator row
+    /// under the editor (0 hides it).
+    queued: usize,
+    /// Index of the assistant message currently being streamed into, so text
+    /// deltas append to one growing item rather than adding a line each.
+    stream: Option<usize>,
+    /// The reasoning block streaming in `(text, started)`, shown collapsed.
+    think: Option<(String, Instant)>,
+    /// True once reasoning has arrived as `ThinkingDelta`s this turn. It lets
+    /// the trailing full `Thinking` event skip re-emitting a summary that a
+    /// preceding `TextDelta` already finalized, which would otherwise duplicate
+    /// the reasoning line. Reset at each turn/message boundary.
+    think_streamed: bool,
+    /// The timestamp shown on the editor prompt, captured when a fresh prompt
+    /// starts and held stable while the user types. Regenerating it on every
+    /// render (keystroke, live status tick) would make the prompt stamp — and
+    /// its width — drift mid-line; the legacy editor stamps once at prompt draw
+    /// and only restamps on submission, so mirror that by refreshing this only
+    /// at a turn boundary.
+    prompt_stamp: String,
 }
 
 impl Renderer {
-    pub fn new(status: Option<Arc<StatusLine>>) -> Arc<Self> {
+    pub fn new(status: Option<Arc<StatusLine>>, mode: crate::frame::RendererMode) -> Arc<Self> {
+        let tty = io::stdout().is_terminal();
+        let frame = (mode == crate::frame::RendererMode::Frame && tty).then(|| {
+            Mutex::new(FrameState {
+                out: FrameRenderer::new(io::stdout()),
+                items: Vec::new(),
+                editor: (String::new(), 0),
+                queued: 0,
+                stream: None,
+                think: None,
+                think_streamed: false,
+                prompt_stamp: stamp(),
+            })
+        });
         Arc::new(Self {
             state: Mutex::new(State { at_line_start: true, ..Default::default() }),
             status,
-            tty: io::stdout().is_terminal(),
+            tty,
             expanded: AtomicBool::new(false),
+            frame,
         })
+    }
+
+    /// Whether the app-owned frame renderer is active.
+    pub fn is_frame(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    /// Update the editor row (called by the line editor's frame hook) and
+    /// re-render the frame. `queued` is the number of messages waiting behind
+    /// the current turn, shown as an indicator under the editor.
+    pub fn set_editor(&self, line: &str, cursor: usize, queued: usize) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.editor = (line.to_string(), cursor);
+            fs.queued = queued;
+            self.frame_render(&mut fs);
+        }
+    }
+
+    /// Re-render after a resize (or after a foreground picker clobbered the
+    /// screen): force a full redraw at the current size.
+    pub fn frame_resize(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.out.invalidate();
+            self.frame_render(&mut fs);
+        }
+    }
+
+    /// Compose the transcript, editor and status bar into one frame and render
+    /// it at the current terminal size.
+    fn frame_render(&self, fs: &mut FrameState) {
+        let (rows, cols) = status::terminal_size().unwrap_or((24, 80));
+        let width = (cols as usize).max(1);
+        let height = (rows as usize).max(1);
+        let transcript = frame::transcript_lines(&fs.items, width);
+        // Prefix the editor prompt with the timestamp when timestamps are on,
+        // matching the legacy prompt so switching renderers keeps the setting.
+        // Use the stamp captured at prompt start (not `stamp()`), so it stays
+        // fixed while the user types rather than ticking every render.
+        let prompt = format!("{}› ", fs.prompt_stamp);
+        let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
+        if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
+            editor.push(indicator);
+        }
+        let status = self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default();
+        let composed = frame::compose(&transcript, &editor, &status);
+        let _ = fs.out.render(&composed, width, height);
+    }
+
+    /// End any in-flight streamed message/thinking so the next item starts
+    /// fresh.
+    fn frame_finish_stream(&self, fs: &mut FrameState) {
+        fs.stream = None;
+        fs.think_streamed = false;
+        if let Some((text, started)) = fs.think.take() {
+            let text = text.trim();
+            if !text.is_empty() {
+                fs.items.push(stamped(Item::Thinking {
+                    chars: text.chars().count(),
+                    seconds: started.elapsed().as_secs_f64(),
+                }));
+            }
+        }
+    }
+
+    /// Map an agent event onto the transcript and re-render (frame mode).
+    fn frame_event(&self, fs: &mut FrameState, event: &AgentEvent) {
+        match event {
+            AgentEvent::ThinkingDelta { text } => {
+                fs.think_streamed = true;
+                fs.think.get_or_insert_with(|| (String::new(), Instant::now())).0.push_str(text);
+            }
+            AgentEvent::Thinking { text } => {
+                match fs.think.take() {
+                    // Reasoning streamed as deltas but was not yet finalized by
+                    // a `TextDelta` (e.g. reasoning-only, or the answer is not
+                    // streamed): emit its summary now.
+                    Some((_, started)) => {
+                        let chars = text.trim().chars().count();
+                        if chars > 0 {
+                            fs.items.push(stamped(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() }));
+                        }
+                    }
+                    // No pending reasoning. If deltas streamed this turn, a
+                    // preceding `TextDelta` already finalized the summary, so
+                    // skip to avoid duplicating it. Otherwise this is a
+                    // non-streamed block delivered whole — emit it.
+                    None if !fs.think_streamed => {
+                        let chars = text.trim().chars().count();
+                        if chars > 0 {
+                            fs.items.push(stamped(Item::Thinking { chars, seconds: 0.0 }));
+                        }
+                    }
+                    None => {}
+                }
+                fs.think_streamed = false;
+                // Do NOT reset `fs.stream` here: a streamed assistant message
+                // may already be in flight (reasoning can arrive after the
+                // answer starts). Only `AssistantMessage` finalizes the stream;
+                // clearing it here would make that event see `None` and append
+                // the full response again, duplicating the streamed answer.
+            }
+            AgentEvent::TextDelta { text } => {
+                if text.is_empty() {
+                    return;
+                }
+                // Finalize any streamed reasoning into a Thinking item *before*
+                // the assistant message begins, so the summary is preserved and
+                // ordered ahead of the answer rather than dropped (or appended
+                // after it by the trailing `Thinking` event).
+                if let Some((think, started)) = fs.think.take() {
+                    let think = think.trim();
+                    if !think.is_empty() {
+                        fs.items.push(stamped(Item::Thinking {
+                            chars: think.chars().count(),
+                            seconds: started.elapsed().as_secs_f64(),
+                        }));
+                    }
+                }
+                match fs.stream {
+                    Some(i) => {
+                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) = fs.items.get_mut(i) {
+                            existing.push_str(text);
+                        }
+                    }
+                    None => {
+                        fs.items.push(stamped(Item::Message {
+                            role: Role::Assistant,
+                            text: (*text).to_string(),
+                        }));
+                        fs.stream = Some(fs.items.len() - 1);
+                    }
+                }
+            }
+            AgentEvent::AssistantMessage { text, .. } => {
+                if fs.stream.is_none() && !text.is_empty() {
+                    fs.items.push(stamped(Item::Message {
+                        role: Role::Assistant,
+                        text: (*text).to_string(),
+                    }));
+                }
+                self.frame_finish_stream(fs);
+            }
+            AgentEvent::Plan { plan } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Plan((*plan).clone())));
+            }
+            // Mirror the legacy renderer's user-facing filtering: plan_add /
+            // plan_update are shown as the Plan checklist (the `Plan` event),
+            // not as raw tool calls, and report_outcome's summary follows as
+            // the answer, so only its status marker is shown.
+            AgentEvent::ToolCall { call } if quiet_plan_tool(&call.name) => {
+                self.frame_finish_stream(fs);
+            }
+            AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
+            AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
+                let _ = call;
+                fs.items.push(stamped(Item::ToolResult {
+                    ok: false,
+                    output: (*output).to_string(),
+                    verbose: verbosity() >= Verbosity::Verbose,
+                }));
+            }
+            AgentEvent::ToolCall { call }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose =>
+            {
+                self.frame_finish_stream(fs);
+                // Derive the status from the parsed outcome so an invalid
+                // `report_outcome` is not rendered as a success.
+                let mark = match crate::goal::Status::from_args(&call.arguments) {
+                    Some(crate::goal::Status::Blocked) => "■ blocked".to_string(),
+                    Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
+                    Some(crate::goal::Status::Completed) => "✔ completed".to_string(),
+                    None => {
+                        let raw = crate::sanitize_terminal_text(
+                            call.arguments
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                        if raw.is_empty() {
+                            "• unknown".to_string()
+                        } else {
+                            format!("• {raw}")
+                        }
+                    }
+                };
+                fs.items.push(stamped(Item::Note(mark)));
+            }
+            AgentEvent::ToolResult { call, ok: true, .. }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
+            AgentEvent::ToolCall { call } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::ToolCall {
+                    name: call.name.clone(),
+                    summary: tool_summary_text(call),
+                }));
+            }
+            AgentEvent::ToolResult { ok, output, .. } => {
+                fs.items.push(stamped(Item::ToolResult {
+                    ok: *ok,
+                    output: (*output).to_string(),
+                    verbose: verbosity() >= Verbosity::Verbose,
+                }));
+            }
+            AgentEvent::Compacted => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Note("⟳ context compacted".to_string())));
+            }
+            // Steer/queued messages absorbed mid-turn arrive as `UserMessage`
+            // events; render them in the transcript. Replaying a resumed
+            // session also emits the loaded user turns through this arm so the
+            // frame reconstructs the full history. (The primary interactive
+            // prompt is recorded directly via `frame_user_message`, not here,
+            // so there is no double entry.)
+            AgentEvent::UserMessage { text } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
+            }
+            AgentEvent::Context => {}
+        }
+        self.frame_render(fs);
+    }
+
+    /// Record a submitted user message in the transcript (frame mode).
+    pub fn frame_user_message(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(stamped(Item::Message { role: Role::User, text: text.to_string() }));
+            self.frame_render(&mut fs);
+        }
+    }
+
+    /// Emit command / informational output (e.g. slash-command replies). In
+    /// frame mode it is captured as a transcript item so direct writes can't
+    /// corrupt the owned frame; otherwise it prints inline as before.
+    pub fn print_block(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(stamped(Item::Output(text.to_string())));
+            self.frame_render(&mut fs);
+            return;
+        }
+        println!("{text}");
     }
 
     fn width(&self) -> usize {
@@ -190,6 +492,15 @@ impl Renderer {
     /// Wipe the screen and scrollback for a fresh session, re-pinning the
     /// status line's scroll region, and reset the renderer's line state.
     pub fn clear_screen(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.clear();
+            fs.stream = None;
+            fs.think = None;
+            fs.out.invalidate();
+            self.frame_render(&mut fs);
+            return;
+        }
         match &self.status {
             Some(status) => status.clear(),
             None if self.tty => {
@@ -254,6 +565,16 @@ impl Renderer {
     }
 
     pub fn end_turn(&self) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            self.frame_finish_stream(&mut fs);
+            // A fresh prompt starts now the turn is done: restamp it (matching
+            // the legacy editor, which restamps on submission) so the next
+            // prompt reflects the current time, then holds steady while typing.
+            fs.prompt_stamp = stamp();
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
         self.newline(&mut state);
@@ -268,6 +589,12 @@ impl Renderer {
     /// Print a short note on its own line (e.g. a queued steer). If an
     /// answer is streaming mid-line, the note waits for the line to end.
     pub fn note(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(stamped(Item::Note(text.to_string())));
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         if state.streamed_text && !state.at_line_start {
             state.deferred.push(format!("{}{DIM}{text}", stamp()));
@@ -278,6 +605,12 @@ impl Renderer {
 
     /// Print a note on its own line straight away.
     pub fn urgent_note(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            let mut fs = frame.lock().unwrap();
+            fs.items.push(stamped(Item::Note(text.to_string())));
+            self.frame_render(&mut fs);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         self.note_now(&mut state, text);
     }
@@ -289,6 +622,19 @@ impl Renderer {
     }
 
     pub fn event(&self, event: &AgentEvent) {
+        if let Some(frame) = &self.frame {
+            if verbosity() == Verbosity::Quiet
+                && !matches!(
+                    event,
+                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context
+                )
+            {
+                return;
+            }
+            let mut fs = frame.lock().unwrap();
+            self.frame_event(&mut fs, event);
+            return;
+        }
         if matches!(event, AgentEvent::Context | AgentEvent::Compacted)
             && let Some(status) = &self.status
         {
@@ -500,6 +846,11 @@ impl Renderer {
     /// Ctrl-O: toggle between collapsed and expanded thinking. Returns true
     /// when it printed something at the prompt (the prompt must be redrawn).
     pub fn toggle_thinking(&self) -> bool {
+        if self.frame.is_some() {
+            // Reasoning is already shown collapsed in the transcript; there is
+            // no in-place expand/collapse in frame mode yet.
+            return false;
+        }
         let expanded = !self.expanded.fetch_xor(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         if let Some(block) = state.thinking.as_mut() {
@@ -573,6 +924,13 @@ fn plan_checklist(plan: &Plan, width: usize) -> String {
 }
 
 fn tool_summary(call: &ToolCall, width: usize) -> String {
+    let text = tool_summary_text(call);
+    format!("{DIM}{}{RESET}", fit(&text, width))
+}
+
+/// The raw one-line argument summary for a tool call (no colour, no fitting),
+/// for the frame renderer's [`Item::ToolCall`](crate::frame::Item).
+pub fn tool_summary_text(call: &ToolCall) -> String {
     let text = match &call.arguments {
         Value::Object(args) => ["command", "path", "file_path", "pattern", "url", "text"]
             .iter()
@@ -581,8 +939,7 @@ fn tool_summary(call: &ToolCall, width: usize) -> String {
         Value::String(raw) => raw.clone(),
         other => other.to_string(),
     };
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("{DIM}{}{RESET}", fit(&text, width))
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Truncate to `width` characters with an ellipsis.
@@ -621,6 +978,72 @@ fn strip_ansi(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    impl Renderer {
+        /// Build a frame-mode renderer regardless of tty, for driving
+        /// `frame_event` in tests. Rendering writes to stdout (captured by the
+        /// test harness).
+        fn frame_for_test() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(State { at_line_start: true, ..Default::default() }),
+                status: None,
+                tty: true,
+                expanded: AtomicBool::new(false),
+                frame: Some(Mutex::new(FrameState {
+                    out: FrameRenderer::new(io::stdout()),
+                    items: Vec::new(),
+                    editor: (String::new(), 0),
+                    queued: 0,
+                    stream: None,
+                    think: None,
+                    think_streamed: false,
+                    prompt_stamp: stamp(),
+                })),
+            })
+        }
+
+        #[cfg(test)]
+        fn frame_items(&self) -> Vec<StampedItem> {
+            self.frame.as_ref().unwrap().lock().unwrap().items.clone()
+        }
+    }
+
+    #[test]
+    fn streamed_reasoning_then_text_emits_one_thinking_summary() {
+        let r = Renderer::frame_for_test();
+        // Reasoning streams as deltas, then the answer streams as text, then a
+        // trailing full `Thinking` event repeats the reasoning: the summary
+        // must appear exactly once, and the streamed answer exactly once.
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering the plan" });
+        r.event(&AgentEvent::TextDelta { text: "Here " });
+        r.event(&AgentEvent::TextDelta { text: "is the answer." });
+        r.event(&AgentEvent::Thinking { text: "pondering the plan" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+        let items = r.frame_items();
+        let thinking = items.iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
+        let messages = items.iter().filter(|i| matches!(i.item, Item::Message { role: Role::Assistant, .. })).count();
+        assert_eq!(thinking, 1, "reasoning summary duplicated: {items:?}");
+        assert_eq!(messages, 1, "streamed answer duplicated: {items:?}");
+    }
+
+    #[test]
+    fn non_streamed_thinking_event_still_emits_summary() {
+        let r = Renderer::frame_for_test();
+        // No ThinkingDelta: a whole `Thinking` block must still show once.
+        r.event(&AgentEvent::Thinking { text: "quick thought" });
+        let thinking = r.frame_items().iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
+        assert_eq!(thinking, 1);
+    }
+
+    #[test]
+    fn user_message_event_is_recorded_in_frame_transcript() {
+        let r = Renderer::frame_for_test();
+        // Replaying a resumed session (and mid-turn steer messages) surface as
+        // `UserMessage` events; they must land in the transcript.
+        r.event(&AgentEvent::UserMessage { text: "resumed prompt" });
+        let user = r.frame_items().iter().filter(|i| matches!(&i.item, Item::Message { role: Role::User, text, .. } if text == "resumed prompt")).count();
+        assert_eq!(user, 1);
+    }
 
     #[test]
     fn stamps_the_first_line_and_aligns_the_rest() {

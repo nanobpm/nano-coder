@@ -25,12 +25,13 @@ struct Changes {
     system_prompt: bool,
     compaction: bool,
     verbosity: bool,
+    renderer: bool,
     providers: BTreeSet<String>,
 }
 
 impl Changes {
     fn any(&self) -> bool {
-        self.model || self.temperature || self.max_tokens || self.max_iterations || self.system_prompt || self.compaction || self.verbosity || !self.providers.is_empty()
+        self.model || self.temperature || self.max_tokens || self.max_iterations || self.system_prompt || self.compaction || self.verbosity || self.renderer || !self.providers.is_empty()
     }
 }
 
@@ -82,6 +83,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 config.compaction_mode.as_str()
             ),
             format!("Verbosity        {} ({})", config.verbosity, config.verbosity.describe()),
+            format!("Renderer         {} ({})", config.renderer, config.renderer.describe()),
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
@@ -146,7 +148,36 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 crate::ui::set_verbosity(levels[choice]);
                 changes.verbosity = true;
             }
-            8 => save_and_report(agent.config(), &mut changes, config_path),
+            8 => {
+                let modes = crate::frame::RendererMode::ALL;
+                let labels: Vec<String> = modes
+                    .iter()
+                    .map(|m| format!("{m:<7} {}", m.describe()))
+                    .collect();
+                let current = modes
+                    .iter()
+                    .position(|m| *m == agent.config().renderer)
+                    .unwrap_or(0);
+                let choice = Select::new()
+                    .with_prompt("Renderer")
+                    .items(&labels)
+                    .default(current)
+                    .interact()?;
+                let previous = agent.config().renderer;
+                agent.config_mut().renderer = modes[choice];
+                changes.renderer = true;
+                if modes[choice] != previous {
+                    // The live renderer and the `frame_mode` branch in `main`
+                    // are fixed at startup, so a renderer switch only takes
+                    // effect on the next launch.
+                    println!(
+                        "Renderer set to {}. Restart nano-coder for it to take effect \
+                         (the active renderer is fixed for this session).",
+                        modes[choice]
+                    );
+                }
+            }
+            9 => save_and_report(agent.config(), &mut changes, config_path),
             _ => {
                 if changes.any()
                     && Confirm::new()
@@ -515,6 +546,9 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     }
     if changes.verbosity {
         doc["verbosity"] = toml_edit::value(config.verbosity.to_string());
+    }
+    if changes.renderer {
+        doc["renderer"] = toml_edit::value(config.renderer.to_string());
     }
     if changes.compaction {
         doc["auto_compact"] = toml_edit::value(config.auto_compact);
