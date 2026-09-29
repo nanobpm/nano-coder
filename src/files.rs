@@ -167,23 +167,45 @@ fn to_file_endings(text: &str, s: &str) -> String {
 /// the model copied those into `old_string` (every non-blank line has one),
 /// strip them from both strings.
 fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String)> {
-    fn prefixed(line: &str) -> Option<&str> {
+    fn prefix_num(line: &str) -> Option<(u64, &str)> {
         // `read_file` right-aligns the number in a field at least six wide
         // (`{:>6}\t`). Require that exact padded shape so a genuine TSV cell
         // like `1\tfoo` isn't mistaken for a line-number prefix and stripped.
         let (field, rest) = line.split_once('\t')?;
         let num = field.trim_start_matches(' ');
-        (field.len() >= 6 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
+        if field.len() >= 6 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+            Some((num.parse().ok()?, rest))
+        } else {
+            None
+        }
     }
+    // `old` must look like copied `read_file` output: every non-blank line
+    // carries a prefix AND the numbers are a consecutive ascending run. Genuine
+    // TSV data whose leading integers merely look prefix-shaped is not
+    // consecutive, so it can't retarget an unrelated block by being stripped.
     let lines: Vec<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() || !lines.iter().all(|l| prefixed(l).is_some()) {
+    let nums: Vec<u64> = lines.iter().map(|l| prefix_num(l).map(|(n, _)| n)).collect::<Option<_>>()?;
+    if nums.is_empty() || nums.windows(2).any(|w| w[1] != w[0] + 1) {
         return None;
     }
-    let strip = |s: &str| {
-        let body: Vec<&str> = s.split('\n').map(|l| prefixed(l).unwrap_or(l)).collect();
-        body.join("\n")
+    let (lo, hi) = (nums[0], *nums.last().unwrap());
+    // Strip the prefix from every `old` line (it's all line-numbered), but from
+    // `new` only where the number falls in `old`'s line range: otherwise a
+    // legitimate new TSV row like `123456\tabc` would be silently dropped rather
+    // than written, since its own prefix is intended content, not metadata.
+    let strip_old = |s: &str| {
+        s.split('\n').map(|l| prefix_num(l).map_or(l, |(_, rest)| rest)).collect::<Vec<_>>().join("\n")
     };
-    Some((strip(old), strip(new)))
+    let strip_new = |s: &str| {
+        s.split('\n')
+            .map(|l| match prefix_num(l) {
+                Some((n, rest)) if (lo..=hi).contains(&n) => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Some((strip_old(old), strip_new(new)))
 }
 
 /// The file's lines as (start, end-of-content, end-including-terminator)
@@ -281,8 +303,38 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
     let start = spans[i].0;
     let end = if ends_nl { spans[i + k - 1].2 } else { spans[i + k - 1].1 };
     let mut new = new.to_string();
-    if trim_start && let Some(j) = lines.iter().position(|l| !l.trim().is_empty()) {
-        let (want, had) = (leading_ws(file_line(i + j)), leading_ws(lines[j]));
+    if trim_start && let Some(j0) = lines.iter().position(|l| !l.trim().is_empty()) {
+        let (want, had) = (leading_ws(file_line(i + j0)), leading_ws(lines[j0]));
+        // The indentation-ignoring match trims every line independently, so a
+        // span whose indentation shifts non-uniformly still matches. Re-indenting
+        // `new` by the first line's delta alone would then move later lines out of
+        // their block, so require every matched line to share the first line's
+        // indentation mapping and reject the match as ambiguous otherwise. (When
+        // the first line's delta is zero this demands the file's indentation match
+        // `old`'s exactly, catching spans that only differ deeper down.)
+        let consistent = |had_j: &str, want_j: &str| {
+            if let Some(extra) = want.strip_prefix(had) {
+                want_j.strip_prefix(had_j) == Some(extra)
+            } else if let Some(dropped) = had.strip_prefix(want) {
+                had_j.strip_prefix(want_j) == Some(dropped)
+            } else {
+                // Incompatible whitespace on the first line; `reindent` rejects it below.
+                true
+            }
+        };
+        for (j, ol) in lines.iter().enumerate() {
+            if ol.trim().is_empty() {
+                continue;
+            }
+            if !consistent(leading_ws(ol), leading_ws(file_line(i + j))) {
+                bail!(
+                    "old_string matches at line {} ignoring indentation, but its indentation shifts \
+                     non-uniformly (line {} differs); copy the file's exact indentation into old_string",
+                    i + 1,
+                    i + j + 1
+                );
+            }
+        }
         if want != had {
             new = reindent(&new, had, want)?;
         }
@@ -773,5 +825,49 @@ mod tests {
         let err = write_file(&json!({ "path": sub.to_str().unwrap(), "content": "x" })).unwrap_err().to_string();
         assert!(err.contains("read "), "{err}");
         assert!(sub.is_dir(), "{err}");
+    }
+
+    #[test]
+    fn new_string_tsv_row_is_not_stripped_as_a_line_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file's first line is plain `abc`; read_file shows it as `     1\tabc`.
+        // old copies that numbered line, but new is a genuine six-digit TSV row
+        // that must be written verbatim, not stripped to `abc`.
+        let p = read_fixture(&dir, "n.tsv", "abc\ndef\n");
+        let out =
+            edit_file(&json!({ "path": p, "old_string": "     1\tabc", "new_string": "123456\tabc" })).unwrap();
+        assert!(out.contains("line numbers"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "123456\tabc\ndef\n");
+    }
+
+    #[test]
+    fn nonconsecutive_numeric_prefixes_are_not_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        // Padded but NON-consecutive leading integers are TSV data, not read_file
+        // line numbers (which are always consecutive), so they must not be
+        // stripped to retarget the unrelated `foo`/`bar` lines.
+        let p = read_fixture(&dir, "d.tsv", "foo\nbar\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "123456\tfoo\n999999\tbar", "new_string": "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo\nbar\n");
+    }
+
+    #[test]
+    fn nonuniform_indentation_rejects_the_relaxed_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first matched line's indentation matches the file (zero delta), but
+        // a later line is indented differently in the file than in old_string.
+        // Re-indenting new by the first line's delta would change block structure,
+        // so the ambiguous match must be rejected rather than silently applied.
+        let p = read_fixture(&dir, "nu.py", "if a:\n    x = 1\n        y = 2\n");
+        let err = edit_file(&json!({
+            "path": p, "old_string": "    x = 1\n    y = 2", "new_string": "    x = 9\n    y = 9"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-uniformly"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "if a:\n    x = 1\n        y = 2\n");
     }
 }
