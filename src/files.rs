@@ -92,15 +92,18 @@ pub fn read_file(args: &Value) -> Result<String> {
     if bytes.iter().take(8192).any(|b| *b == 0) {
         bail!("{} looks like a binary file ({} bytes)", path.display(), bytes.len());
     }
-    remember(&path, &bytes);
     let text = String::from_utf8_lossy(&bytes);
     let total = text.lines().count();
     if total == 0 {
+        remember(&path, &bytes);
         return Ok(format!("({} is empty)", path.display()));
     }
     if offset > total {
         bail!("offset {offset} is past the end of {} ({total} lines)", path.display());
     }
+    // Record the hash only once the read has succeeded, so a failed
+    // out-of-range read can't authorize a later edit the model never saw.
+    remember(&path, &bytes);
     let mut out = String::new();
     for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
         let line = if line.chars().count() > MAX_LINE_CHARS {
@@ -203,6 +206,33 @@ fn leading_ws(s: &str) -> &str {
     &s[..s.len() - s.trim_start().len()]
 }
 
+/// Re-indent `text` by the difference between `had` (the replacement's own
+/// indentation) and `want` (the file's). The shift is applied to *every*
+/// non-blank line, including lines indented less than `had`: deepening prepends
+/// the extra whitespace, dedenting drops it from the front. A plain
+/// `strip_prefix(had)` would leave shallower lines untouched and move them
+/// outside their block.
+fn reindent(text: &str, had: &str, want: &str) -> String {
+    text.split('\n')
+        .map(|l| {
+            if l.trim().is_empty() {
+                l.to_string()
+            } else if let Some(extra) = want.strip_prefix(had) {
+                format!("{extra}{l}")
+            } else if had.starts_with(want) {
+                let ws = leading_ws(l);
+                l[(had.len() - want.len()).min(ws.len())..].to_string()
+            } else {
+                match l.strip_prefix(had) {
+                    Some(rest) => format!("{want}{rest}"),
+                    None => l.to_string(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Match `old` line by line, ignoring trailing whitespace (`trim_start`:
 /// all leading and trailing whitespace). Only a unique match is used; with
 /// `trim_start` the replacement is re-indented by the difference between the
@@ -234,14 +264,7 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
     if trim_start && let Some(j) = lines.iter().position(|l| !l.trim().is_empty()) {
         let (want, had) = (leading_ws(file_line(i + j)), leading_ws(lines[j]));
         if want != had {
-            new = new
-                .split('\n')
-                .map(|l| match l.strip_prefix(had) {
-                    Some(rest) if !l.trim().is_empty() => format!("{want}{rest}"),
-                    _ => l.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            new = reindent(&new, had, want);
         }
     }
     Ok(Some(Located { ranges: vec![(start, end)], new: to_file_endings(text, &new), how: Some(how) }))
@@ -300,17 +323,41 @@ fn numbered(lines: &[&str], lo: usize, hi: usize) -> String {
     }
 }
 
-/// The edited region of `text` (bytes `start..end`) with three lines of
-/// context either side, so the model can check the result without a re-read.
-fn snippet(text: &str, start: usize, end: usize) -> String {
+/// The edited regions of `text` (each `start..end` in bytes) with three lines
+/// of context either side, so the model can check the result without a re-read.
+/// Overlapping or adjacent regions merge; a gap between distant regions is
+/// shown as `...`. Each rendered region respects the 40-line cap.
+fn snippet(text: &str, ranges: &[(usize, usize)]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return "(the file is now empty)\n".into();
     }
-    let first = text[..start].matches('\n').count().min(lines.len() - 1);
-    let region = &text[start..end];
-    let last = (first + region.strip_suffix('\n').unwrap_or(region).matches('\n').count()).min(lines.len() - 1);
-    numbered(&lines, first.saturating_sub(3), (last + 3).min(lines.len() - 1))
+    let max = lines.len() - 1;
+    let mut spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|&(start, end)| {
+            let first = text[..start].matches('\n').count().min(max);
+            let region = &text[start..end];
+            let last = (first + region.strip_suffix('\n').unwrap_or(region).matches('\n').count()).min(max);
+            (first.saturating_sub(3), (last + 3).min(max))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (lo, hi) in spans {
+        match merged.last_mut() {
+            Some(prev) if lo <= prev.1 + 1 => prev.1 = prev.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    let mut out = String::new();
+    for (idx, &(lo, hi)) in merged.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("   ...\n");
+        }
+        out.push_str(&numbered(&lines, lo, hi));
+    }
+    out
 }
 
 /// For a failed match: the window of the file sharing the most (trimmed,
@@ -377,13 +424,12 @@ pub fn edit_file(args: &Value) -> Result<String> {
     let found = locate(&text, old, new, replace_all).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     let mut updated = String::with_capacity(text.len() + found.new.len());
     let mut last = 0;
-    let mut first_new = 0;
-    for (n, &(start, end)) in found.ranges.iter().enumerate() {
+    let mut new_ranges: Vec<(usize, usize)> = Vec::with_capacity(found.ranges.len());
+    for &(start, end) in &found.ranges {
         updated.push_str(&text[last..start]);
-        if n == 0 {
-            first_new = updated.len();
-        }
+        let at = updated.len();
         updated.push_str(&found.new);
+        new_ranges.push((at, updated.len()));
         last = end;
     }
     updated.push_str(&text[last..]);
@@ -394,7 +440,7 @@ pub fn edit_file(args: &Value) -> Result<String> {
         found.ranges.len(),
         path.display(),
         found.how.map(|h| format!(" (matched {h})")).unwrap_or_default(),
-        snippet(&updated, first_new, first_new + found.new.len())
+        snippet(&updated, &new_ranges)
     ))
 }
 
@@ -609,5 +655,44 @@ mod tests {
         assert!(out.starts_with("Replaced 1 occurrence(s) in "), "{out}");
         assert!(out.contains("     7\tline 7\n") && out.contains("    10\tten\n    11\tTEN\n"), "{out}");
         assert!(out.contains("    14\tline 13\n") && !out.contains("line 14") && !out.contains("line 6\n"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_read_does_not_authorize_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let p = path.to_str().unwrap();
+        // An out-of-range read fails and must NOT mark the file as seen.
+        assert!(read_file(&json!({ "path": p, "offset": 99 })).is_err());
+        let err = edit_file(&json!({ "path": p, "old_string": "one", "new_string": "x" })).unwrap_err().to_string();
+        assert!(err.contains("has not been read"), "{err}");
+    }
+
+    #[test]
+    fn reindent_shifts_lines_shallower_than_the_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // File is indented deeper (8 then 4) than old_string (4 then 0); the
+        // shallower replacement line must shift with the block, not stay at 0.
+        let p = read_fixture(&dir, "d.py", "if a:\n        x = 1\n    y = 2\n");
+        let out = edit_file(&json!({
+            "path": p, "old_string": "    x = 1\ny = 2", "new_string": "    x = 9\ny = 9"
+        }))
+        .unwrap();
+        assert!(out.contains("ignoring indentation"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "if a:\n        x = 9\n    y = 9\n");
+    }
+
+    #[test]
+    fn replace_all_result_shows_every_changed_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String =
+            (1..=30).map(|n| if n == 5 || n == 25 { "mark\n".into() } else { format!("line {n}\n") }).collect();
+        let p = read_fixture(&dir, "ra.txt", &body);
+        let out =
+            edit_file(&json!({ "path": p, "old_string": "mark", "new_string": "DONE", "replace_all": true })).unwrap();
+        assert!(out.starts_with("Replaced 2 occurrence(s)"), "{out}");
+        // Both edited regions are rendered, separated by a gap marker.
+        assert!(out.contains("     5\tDONE\n") && out.contains("    25\tDONE\n") && out.contains("   ...\n"), "{out}");
     }
 }
