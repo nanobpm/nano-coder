@@ -278,7 +278,16 @@ impl EditView {
         // so a wrapped command edited on an earlier row does not have its tail
         // rows painted over by the menu.
         let below = content.saturating_sub(1).saturating_sub(self.drawn_cursor_row);
-        let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some(), below);
+        // `self.menu_rows` is the *old* menu height. When wrapping grows
+        // `content`, `max_rows` can drop below it, so passing the stale larger
+        // count would make `menu_sequence` clear `max(old_rows, lines.len())`
+        // rows that no longer fit below the taller content: the extra
+        // cursor-down clamps at the bottom margin and erases the last freshly
+        // drawn entry (e.g. a 5-row terminal with a status line, content 1→2
+        // and menu 3→2, leaves only one entry). Cap the reusable old height to
+        // the rows that still fit below the new content.
+        let old_rows = self.menu_rows.min(max_rows);
+        let (seq, used) = menu_sequence(old_rows, &lines, self.status.is_some(), below);
         // Recompute `drawn_rows` (content + menu) from the *current* content
         // height plus the freshly measured menu, rather than adjusting the old
         // total by a `used - menu_rows` delta. The delta is only correct while
@@ -1409,6 +1418,40 @@ mod tests {
         let lines = vec!["a".to_string(), "b".to_string()];
         let (seq, rows) = menu_sequence(2, &lines, false, 1);
         assert_eq!(rows, 2);
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
+    }
+
+    #[test]
+    fn stale_menu_height_is_capped_to_the_rows_that_still_fit() {
+        // Regression: `draw_menu` passed the *old* `menu_rows` to
+        // `menu_sequence`. When wrapping grew the content, `max_rows` dropped
+        // below the old menu height, but the stale larger count made
+        // `menu_sequence` clear `max(old_rows, lines.len())` rows that no longer
+        // fit below the taller content: the extra cursor-down clamped at the
+        // bottom margin and erased the last freshly drawn entry.
+        //
+        // Copilot's example: a five-row terminal with a status line, content
+        // 1→2 and menu 3→2, must leave both new entries — not one. `draw_menu`
+        // now caps the reusable old height to `max_rows` (the rows that still
+        // fit below the new content) before calling `menu_sequence`.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let max_rows = menu_max_rows(5, 2, true);
+        assert_eq!(max_rows, 2);
+        let old_menu_rows = 3;
+        // Uncapped, the stale count clears three rows: the third `\x1b[2K`
+        // clamps at the bottom margin and erases the last drawn entry.
+        let (stale_seq, _) = menu_sequence(old_menu_rows, &lines, true, 1);
+        assert_eq!(stale_seq.matches("\x1b[2K").count(), 3);
+        // Capped to the rows that still fit, exactly the two entries are drawn
+        // — no over-clear, no spurious anchor scroll-back.
+        let capped = old_menu_rows.min(max_rows);
+        assert_eq!(capped, 2);
+        let (seq, rows) = menu_sequence(capped, &lines, true, 1);
+        assert_eq!(rows, 2);
+        assert_eq!(seq.matches("\x1b[2K").count(), 2);
         assert_eq!(
             seq,
             "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
