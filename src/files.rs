@@ -166,7 +166,7 @@ fn to_file_endings(text: &str, s: &str) -> String {
 /// `read_file` prefixes each line with a right-aligned number and a tab. If
 /// the model copied those into `old_string` (every non-blank line has one),
 /// strip them from both strings.
-fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String)> {
+fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String, u64)> {
     fn prefix_num(line: &str) -> Option<(u64, &str)> {
         // `read_file` right-aligns the number in a field at least six wide
         // (`{:>6}\t`). Require that exact padded shape so a genuine TSV cell
@@ -205,7 +205,12 @@ fn strip_line_numbers(old: &str, new: &str) -> Option<(String, String)> {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Some((strip_old(old), strip_new(new)))
+    Some((strip_old(old), strip_new(new), lo))
+}
+
+/// The 1-based line number that byte offset `at` falls on in `text`.
+fn line_at(text: &str, at: usize) -> u64 {
+    text[..at].bytes().filter(|&b| b == b'\n').count() as u64 + 1
 }
 
 /// The file's lines as (start, end-of-content, end-including-terminator)
@@ -233,42 +238,43 @@ fn leading_ws(s: &str) -> &str {
 }
 
 /// Re-indent `text` by the difference between `had` (the replacement's own
-/// indentation) and `want` (the file's). The shift is applied to *every*
-/// non-blank line, including lines indented less than `had`: deepening prepends
-/// the extra whitespace, dedenting drops that many leading whitespace
-/// *characters* from the front (so multibyte whitespace can't be split). When
-/// `had` and `want` use incompatible whitespace (e.g. spaces vs tabs) neither
-/// is a prefix of the other, so no unambiguous delta exists and we reject the
-/// relaxed match rather than corrupt lines by leaving shallower ones in place.
+/// indentation) and `want` (the file's). A line carrying the replacement's base
+/// indentation `had` is rebased onto `want`, keeping any deeper indentation that
+/// follows the common prefix so tab/space structure survives a mixed-whitespace
+/// shift (e.g. `had = "\t    "`, `want = "\t"` yields `"\t"`, not one space). A
+/// line shallower than `had` still shifts with the block: deepening prepends the
+/// extra whitespace, dedenting drops that many leading whitespace *characters*
+/// (so multibyte whitespace can't be split). When `had` and `want` use
+/// incompatible whitespace (e.g. spaces vs tabs) neither is a prefix of the
+/// other, so no unambiguous delta exists and we reject the relaxed match rather
+/// than corrupt lines.
 fn reindent(text: &str, had: &str, want: &str) -> Result<String> {
-    enum Shift<'a> {
-        Deepen(&'a str),
-        Dedent(usize),
-    }
-    let shift = if let Some(extra) = want.strip_prefix(had) {
-        Shift::Deepen(extra)
-    } else if let Some(dropped) = had.strip_prefix(want) {
-        Shift::Dedent(dropped.chars().count())
-    } else {
+    if !want.starts_with(had) && !had.starts_with(want) {
         bail!(
             "can't re-indent relaxed match: replacement indentation {had:?} and file indentation \
              {want:?} use incompatible whitespace; copy the file's exact indentation into new_string"
         );
-    };
+    }
     Ok(text
         .split('\n')
         .map(|l| {
             if l.trim().is_empty() {
-                l.to_string()
+                return l.to_string();
+            }
+            let ws = leading_ws(l);
+            let rest = &l[ws.len()..];
+            if let Some(deeper) = ws.strip_prefix(had) {
+                // Carries the base indentation: rebase onto the file's `want`,
+                // preserving whatever nests below the common prefix.
+                format!("{want}{deeper}{rest}")
+            } else if let Some(extra) = want.strip_prefix(had) {
+                // Deepen a line shallower than the base by the block delta.
+                format!("{extra}{l}")
             } else {
-                match shift {
-                    Shift::Deepen(extra) => format!("{extra}{l}"),
-                    Shift::Dedent(drop) => {
-                        let ws = leading_ws(l);
-                        let kept: String = ws.chars().skip(drop).collect();
-                        format!("{kept}{}", &l[ws.len()..])
-                    }
-                }
+                // Dedent a line shallower than the base, char-safely.
+                let drop = had.chars().count() - want.chars().count();
+                let kept: String = ws.chars().skip(drop).collect();
+                format!("{kept}{rest}")
             }
         })
         .collect::<Vec<_>>()
@@ -348,29 +354,47 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
 /// unique; fuzzier matching (edit distance) is deliberately not attempted,
 /// since a wrong guess edits the wrong code.
 fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located> {
-    let mut attempts = vec![(old.to_string(), new.to_string(), None)];
-    if let Some((o, n)) = strip_line_numbers(old, new) {
-        attempts.push((o, n, Some("after removing read_file line numbers")));
+    // Each attempt carries the file line its numbers claim (`Some` only for the
+    // line-number-stripped candidate): a match is accepted only where it sits.
+    let mut attempts: Vec<(String, String, Option<&'static str>, Option<u64>)> =
+        vec![(old.to_string(), new.to_string(), None, None)];
+    if let Some((o, n, lo)) = strip_line_numbers(old, new) {
+        attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
     }
-    for (o, n, how) in &attempts {
+    for (o, n, how, at_line) in &attempts {
         let (o, n) = if text.contains(o.as_str()) {
             (o.clone(), n.clone())
         } else {
             (to_file_endings(text, o), to_file_endings(text, n))
         };
-        let ranges: Vec<(usize, usize)> = text.match_indices(o.as_str()).map(|(at, _)| (at, at + o.len())).collect();
+        // For a stripped candidate, keep only matches that actually start on the
+        // line its (consecutive) numbers name. Genuine TSV data whose leading
+        // integers merely look prefix-shaped won't sit on that line, so it can't
+        // retarget an unrelated block by being stripped.
+        let ranges: Vec<(usize, usize)> = text
+            .match_indices(o.as_str())
+            .map(|(at, _)| (at, at + o.len()))
+            .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
+            .collect();
         match ranges.len() {
             0 => {}
             1 => return Ok(Located { ranges, new: n, how: *how }),
-            _ if replace_all => return Ok(Located { ranges, new: n, how: *how }),
+            // `replace_all` only ever applies to the exact, literal attempt: a
+            // relaxed (stripped) match must be unique per the PR contract.
+            _ if replace_all && how.is_none() => return Ok(Located { ranges, new: n, how: *how }),
             count => bail!(
                 "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
             ),
         }
     }
     for trim_start in [false, true] {
-        for (o, n, _) in &attempts {
+        for (o, n, _, at_line) in &attempts {
             if let Some(found) = match_lines(text, o, n, trim_start)? {
+                // A stripped candidate's line-matched range must also land on the
+                // line its numbers name, else the "prefix" was genuine data.
+                if at_line.is_some_and(|lo| line_at(text, found.ranges[0].0) != lo) {
+                    continue;
+                }
                 return Ok(found);
             }
         }
@@ -398,7 +422,9 @@ fn numbered(lines: &[&str], lo: usize, hi: usize) -> String {
 /// The edited regions of `text` (each `start..end` in bytes) with three lines
 /// of context either side, so the model can check the result without a re-read.
 /// Overlapping or adjacent regions merge; a gap between distant regions is
-/// shown as `...`. Each rendered region respects the 40-line cap.
+/// shown as `...`. Each rendered region respects the 40-line cap, and a global
+/// budget bounds the total so a `replace_all` with many distant matches can't
+/// flood the output — omitted regions are noted.
 fn snippet(text: &str, ranges: &[(usize, usize)]) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -422,18 +448,31 @@ fn snippet(text: &str, ranges: &[(usize, usize)]) -> String {
             _ => merged.push((lo, hi)),
         }
     }
+    const MAX_SNIPPET_LINES: usize = 40;
     let mut out = String::new();
+    let mut used = 0;
     for (idx, &(lo, hi)) in merged.iter().enumerate() {
+        let region = numbered(&lines, lo, hi);
+        let region_lines = region.matches('\n').count();
+        // Always show the first region; stop once the global budget is spent.
+        if idx > 0 && used + region_lines > MAX_SNIPPET_LINES {
+            out.push_str(&format!("   ... ({} more edited region(s) not shown)\n", merged.len() - idx));
+            break;
+        }
         if idx > 0 {
             out.push_str("   ...\n");
         }
-        out.push_str(&numbered(&lines, lo, hi));
+        out.push_str(&region);
+        used += region_lines;
     }
     out
 }
 
 /// For a failed match: the window of the file sharing the most (trimmed,
-/// non-blank) lines with `old`, so the next attempt can copy it exactly.
+/// non-blank) lines with `old`, so the next attempt can copy it exactly. When no
+/// whole line agrees (e.g. a misspelled single line), fall back to a per-line
+/// character-overlap score — used only for the diagnostic hint, never to select
+/// an edit — so a miss still points at the closest candidate.
 fn near_miss(text: &str, old: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let (want, _) = old_lines(old);
@@ -441,25 +480,49 @@ fn near_miss(text: &str, old: &str) -> String {
     if k == 0 {
         return String::new();
     }
-    let score = |i: usize| {
+    let windows = 0..=lines.len() - k;
+    let line_score = |i: usize| {
         (0..k)
             .filter(|&j| !want[j].trim().is_empty() && lines[i + j].trim() == want[j].trim())
             .count()
     };
-    let Some((best, i)) = (0..=lines.len() - k).map(|i| (score(i), i)).max_by_key(|&(s, i)| (s, std::cmp::Reverse(i)))
-    else {
-        return String::new();
+    let (best, i) = windows
+        .clone()
+        .map(|i| (line_score(i), i))
+        .max_by_key(|&(s, i)| (s, std::cmp::Reverse(i)))
+        .unwrap();
+    if best > 0 {
+        let of = want.iter().filter(|l| !l.trim().is_empty()).count();
+        return format!(
+            ". Closest match ({best} of {of} lines agree), lines {}-{}:\n{}",
+            i + 1,
+            i + k,
+            numbered(&lines, i, i + k - 1)
+        );
+    }
+    // No whole line agrees: rank windows by shared characters so even a
+    // misspelled single line gets a hint. Diagnostic only — the edit already failed.
+    let char_overlap = |a: &str, b: &str| {
+        let mut counts = std::collections::HashMap::new();
+        for c in a.chars() {
+            *counts.entry(c).or_insert(0i32) += 1;
+        }
+        b.chars()
+            .filter(|c| {
+                let e = counts.entry(*c).or_insert(0);
+                *e > 0 && {
+                    *e -= 1;
+                    true
+                }
+            })
+            .count()
     };
-    if best == 0 {
+    let sim_score = |i: usize| (0..k).map(|j| char_overlap(want[j].trim(), lines[i + j].trim())).sum::<usize>();
+    let (sbest, si) = windows.map(|i| (sim_score(i), i)).max_by_key(|&(s, i)| (s, std::cmp::Reverse(i))).unwrap();
+    if sbest == 0 {
         return String::new();
     }
-    let of = want.iter().filter(|l| !l.trim().is_empty()).count();
-    format!(
-        ". Closest match ({best} of {of} lines agree), lines {}-{}:\n{}",
-        i + 1,
-        i + k,
-        numbered(&lines, i, i + k - 1)
-    )
+    format!(". Closest lines {}-{} (no lines match exactly):\n{}", si + 1, si + k, numbered(&lines, si, si + k - 1))
 }
 
 pub fn write_file(args: &Value) -> Result<String> {
@@ -803,16 +866,92 @@ mod tests {
     fn dedent_across_multibyte_whitespace_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         // File indents each line with an ideographic space (U+3000, 3 bytes);
-        // old_string adds one ASCII space, so the dedent delta is a single
-        // *byte*. Slicing by byte would split the 3-byte space and panic; the
-        // char-safe path drops one whole leading whitespace character instead.
+        // old_string adds one ASCII space. The replacement is rebased onto the
+        // file's exact indentation (the ideographic space), byte-safely — slicing
+        // the delta by byte count would split the 3-byte space and panic.
         let p = read_fixture(&dir, "u.txt", "top\n\u{3000}a\n\u{3000}b\n");
         let out = edit_file(&json!({
             "path": p, "old_string": "\u{3000} a\n\u{3000} b", "new_string": "\u{3000} A\n\u{3000} B"
         }))
         .unwrap();
         assert!(out.contains("ignoring indentation"), "{out}");
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "top\n A\n B\n");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "top\n\u{3000}A\n\u{3000}B\n");
+    }
+
+    #[test]
+    fn mixed_whitespace_shift_preserves_the_common_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        // File indents with a tab; old_string indents with a tab plus four
+        // spaces. Dedenting must rebase onto the file's tab (dropping only the
+        // trailing spaces), not blindly drop four leading characters (which would
+        // leave a single space and corrupt the tab/space structure).
+        let p = read_fixture(&dir, "mx.py", "def f():\n\tx = 1\n");
+        let out = edit_file(&json!({
+            "path": p, "old_string": "\t    x = 1", "new_string": "\t    x = 2"
+        }))
+        .unwrap();
+        assert!(out.contains("ignoring indentation"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "def f():\n\tx = 2\n");
+    }
+
+    #[test]
+    fn consecutive_tsv_numbers_do_not_retarget_an_unrelated_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // `123456\tfoo\n123457\tbar` is padded and consecutive, so it looks like a
+        // read_file prefix, but the file has `foo`/`bar` at lines 1-2, not
+        // 123456-123457. Validating the numbers against the match's file position
+        // rejects the stripped attempt rather than editing the unrelated block.
+        let p = read_fixture(&dir, "tsv.tsv", "foo\nbar\n");
+        let err = edit_file(&json!({
+            "path": p, "old_string": "123456\tfoo\n123457\tbar", "new_string": "x"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo\nbar\n");
+    }
+
+    #[test]
+    fn replace_all_does_not_apply_to_a_stripped_relaxed_match() {
+        let dir = tempfile::tempdir().unwrap();
+        // `     1\tfoo` is a read_file prefix for line 1's `foo`. With replace_all
+        // it must NOT relax to every `foo`; the stripped candidate is validated to
+        // the line its number names (line 1) and edits only that occurrence.
+        let p = read_fixture(&dir, "ra2.txt", "foo\nbar\nfoo\n");
+        let out = edit_file(&json!({
+            "path": p, "old_string": "     1\tfoo", "new_string": "FOO", "replace_all": true
+        }))
+        .unwrap();
+        assert!(out.starts_with("Replaced 1 occurrence(s)"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "FOO\nbar\nfoo\n");
+    }
+
+    #[test]
+    fn a_misspelled_single_line_still_gets_a_closest_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        // No whole trimmed line agrees, so the line-count score is 0; the
+        // character-overlap fallback still points at the closest line.
+        let p = read_fixture(&dir, "sp.rs", "fn main() {\n    let value = compute();\n}\n");
+        let err = edit_file(&json!({ "path": p, "old_string": "let valeu = compute();", "new_string": "z" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert!(err.contains("no lines match exactly"), "{err}");
+        assert!(err.contains("    let value = compute();"), "{err}");
+    }
+
+    #[test]
+    fn snippet_output_is_globally_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Many distant matches would each render a region; the global cap bounds
+        // total output and notes the omitted regions instead of flooding.
+        let body: String = (1..=200).map(|n| if n % 10 == 0 { "mark\n".into() } else { format!("line {n}\n") }).collect();
+        let p = read_fixture(&dir, "big.txt", &body);
+        let out =
+            edit_file(&json!({ "path": p, "old_string": "mark", "new_string": "DONE", "replace_all": true })).unwrap();
+        assert!(out.starts_with("Replaced 20 occurrence(s)"), "{out}");
+        assert!(out.contains("more edited region(s) not shown"), "{out}");
+        assert!(out.lines().count() < 60, "output should stay bounded: {out}");
     }
 
     #[test]
