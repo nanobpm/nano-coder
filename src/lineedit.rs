@@ -538,14 +538,19 @@ impl EditView {
             write(&seq);
         }
         self.menu_rows = 0;
-        self.draw_menu();
-        // The status resize re-anchored the prompt and the non-status branch
-        // above restored the cursor to the prompt row, so it now sits on the
-        // prompt's first row.
-        self.drawn_cursor_row = 0;
-        // Reflow moved the input's rows; reprint it with the cursor back
-        // where it belongs.
+        // Reflow moved the input's rows. Reprint the input FIRST, while the
+        // menu is still released: `redraw` clears only the content rows and
+        // places the real cursor on the edit character at the new width,
+        // recording that row in `drawn_cursor_row`. Drawing the menu before
+        // this redraw would fold the menu rows into `drawn_rows`, so the redraw
+        // would erase them again and the menu would vanish on every resize —
+        // and resetting `drawn_cursor_row` without moving the cursor would
+        // leave it on a stale wrapped row so the redraw climbs from the wrong
+        // place. Input first, then the menu, keeps both honest.
         self.redraw();
+        // The input is reprinted and the cursor placed; now refill the menu
+        // under it, sized to the new terminal.
+        self.draw_menu();
     }
 
     /// Remove the character before the cursor (Backspace).
@@ -1328,6 +1333,51 @@ mod tests {
         // stale 6 (delta) nor 6-plus-anything.
         assert_eq!(v.menu_rows, 0);
         assert_eq!(v.drawn_rows, 1, "recomputed from content height, not the stale delta");
+    }
+
+    #[test]
+    fn draw_menu_keeps_the_menu_rows_it_reserves() {
+        // Regression for "resize removes the open command menu": `resize` used
+        // to draw the menu and then `redraw`, whose clear of all `drawn_rows`
+        // (menu included) erased the menu it had just drawn. Now `resize`
+        // redraws the input first and only then draws the menu, so the menu
+        // rows stay reserved and visible. Lock the invariant in at the
+        // `draw_menu` level: after it runs, `drawn_rows` covers the menu.
+        let mut v = view("/");
+        v.menu_enabled = true;
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        // As at the end of `resize`'s input-first pass: menu released, only the
+        // one-row prompt counted.
+        v.menu_rows = 0;
+        v.drawn_rows = 1;
+        v.draw_menu();
+        let content = v.content_rows(80);
+        assert!(v.menu_rows > 0, "a bare `/` opens the command menu");
+        assert_eq!(
+            v.drawn_rows,
+            content + v.menu_rows,
+            "drawn_rows must keep the freshly drawn menu, not erase it"
+        );
+    }
+
+    #[test]
+    fn redraw_records_the_edit_cursor_row_for_the_next_climb() {
+        // Regression for "resize resets the cursor row without moving the
+        // cursor": `resize` no longer zeroes `drawn_cursor_row`; it lets the
+        // input-first `redraw` record where the edit cursor genuinely rests at
+        // the new width, so the next redraw climbs the right amount. A wrapped
+        // line with the cursor at its end sits on the last content row.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": wraps to 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        let _ = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 3, "three content rows at 4 cols");
+        assert_eq!(
+            v.drawn_cursor_row, 2,
+            "cursor rests on the last wrapped row, recomputed — not reset to 0"
+        );
     }
 
     #[test]
