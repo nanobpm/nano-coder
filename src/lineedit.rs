@@ -555,6 +555,20 @@ impl EditView {
         // the cursor actually is.
         let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
         self.drawn_cursor_row = self.cursor_position(cols).0;
+        // `drawn_rows` still carries the OLD-width span (content + menu). With a
+        // status line, `StatusLine::resize` just anchored the edit cursor at the
+        // bottom margin and erased/scrolled away everything below it, so only
+        // the prompt-through-cursor rows survive; without one the input merely
+        // reflowed to its new-width height. `redraw` opens by clearing that many
+        // rows: walking down clamps at the bottom margin, but the matching climb
+        // up is unconditional, so a stale (too-tall) span lands the cursor above
+        // the prompt and reprints over the transcript. Reset it to the actual
+        // post-resize span first.
+        self.drawn_rows = if self.status.is_some() {
+            self.drawn_cursor_row + 1
+        } else {
+            self.content_rows(cols)
+        };
         // Reprint the input FIRST, while the menu is still released: `redraw`
         // clears only the content rows and places the real cursor on the edit
         // character at the new width, recording that row in `drawn_cursor_row`.
@@ -1456,6 +1470,48 @@ mod tests {
             seq.starts_with("\x1b[2A"),
             "redraw must climb from the recomputed cursor row (2), not the stale 0; got {seq:?}",
         );
+    }
+
+    #[test]
+    fn resize_resets_drawn_rows_to_the_post_resize_span_before_redraw() {
+        // Regression for "resize leaves drawn_rows at the old-width span": a
+        // status-anchored `StatusLine::resize` anchors the edit cursor at the
+        // bottom margin and erases everything below it, so only the
+        // prompt-through-cursor rows survive. If `drawn_rows` still holds the old
+        // (taller) content+menu span, `redraw`'s clear loop walks down that many
+        // rows — clamping at the bottom margin — but climbs the full span back
+        // up, landing above the prompt and reprinting over the transcript. So
+        // `resize` resets `drawn_rows` to the surviving span (through the cursor
+        // when status-anchored) first. Model a wrapped input whose cursor sits
+        // before the end, with a stale tall span left from the old width.
+        let mut v = view("aaaaaaaa"); // 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.status = Some(Arc::new(crate::status::StatusLine::for_test()));
+        v.drawn_rows = 6; // stale old-width span (content + a menu).
+        let new_cols = 4;
+        v.cursor = 4; // mid-input: the edit cursor rests before the last row.
+        v.drawn_cursor_row = v.cursor_position(new_cols).0;
+        assert!(
+            v.drawn_cursor_row < v.content_rows(new_cols) - 1,
+            "the cursor must sit before the input's end row for this case",
+        );
+        // The reset `resize` performs before `redraw`: through the cursor.
+        v.drawn_rows = v.drawn_cursor_row + 1;
+        let span = v.drawn_rows;
+        assert!(span < 6, "the reset span must be shorter than the stale count");
+        let seq = v.redraw_sequence(new_cols, "");
+        assert_eq!(
+            seq.matches("\x1b[2K").count(),
+            span,
+            "clear loop must blank exactly the post-resize span, not the stale 6; got {seq:?}",
+        );
+        if span > 1 {
+            assert!(
+                seq.contains(&format!("\x1b[{}A", span - 1)),
+                "the up-climb must match the rows walked down so the cursor never rises above the prompt; got {seq:?}",
+            );
+        }
     }
 
     #[test]
