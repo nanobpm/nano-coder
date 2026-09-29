@@ -542,33 +542,39 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             _ => unreachable!(),
                         };
                         let text = line.trim();
-                        if let Some(op) = queue_command(text) {
-                            // `/queue` only touches the message queue, so it is
-                            // safe — and most useful — while a turn is running.
-                            match op {
-                                Ok(op) => renderer.note(&terminal.edit_queue(&op)),
-                                Err(usage) => renderer.note(&format!("[{usage}]")),
+                        match classify_steer_input(text, steer) {
+                            SteerRoute::QueueCommand(op) => {
+                                // `/queue` only touches the message queue, so it is
+                                // safe — and most useful — while a turn is running.
+                                match op {
+                                    Ok(op) => renderer.note(&terminal.edit_queue(&op)),
+                                    Err(usage) => renderer.note(&format!("[{usage}]")),
+                                }
                             }
-                        } else if text.starts_with('/') {
-                            renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
-                            terminal.queued.push_back(TermInput::Line(line));
-                        } else if steer {
-                            // The agent adds it to the conversation before its
-                            // next model call; if the turn ends first it is
-                            // queued (see below).
-                            control.steer(text, None);
-                            // The frame renderer shows the steer as a user
-                            // message once absorbed; the legacy one shows only
-                            // this note, so it carries the text.
-                            if renderer.is_frame() {
-                                renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
-                            } else {
-                                renderer.note(&format!("↪ steer: {text} — read at the agent's next step (Ctrl-Enter queues instead)"));
+                            SteerRoute::DeferCommand => {
+                                renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
+                                terminal.queued.push_back(TermInput::Line(line));
                             }
-                        } else {
-                            let id = terminal.queue_message(text);
-                            let n = terminal.messages.len();
-                            renderer.note(&format!("↧ queued #{id} ({n} waiting) — /queue remove {id} to drop"));
+                            SteerRoute::Steer => {
+                                // The agent adds it to the conversation before its
+                                // next model call; if the turn ends first it is
+                                // queued (see below).
+                                control.steer(text, None);
+                                // The frame renderer shows the steer as a user
+                                // message once absorbed; the legacy one shows only
+                                // this note, so it carries the text.
+                                if renderer.is_frame() {
+                                    renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
+                                } else {
+                                    renderer.note(&format!("↪ steer: {text} — read at the agent's next step (Ctrl-Enter queues instead)"));
+                                }
+                            }
+                            SteerRoute::Enqueue => {
+                                let id = terminal.queue_message(text);
+                                let n = terminal.messages.len();
+                                renderer.note(&format!("↧ queued #{id} ({n} waiting) — /queue remove {id} to drop"));
+                            }
+                            SteerRoute::Ignore => {}
                         }
                     }
                     other => terminal.queued.push_back(other),
@@ -815,6 +821,40 @@ fn queue_command(text: &str) -> Option<std::result::Result<queue::QueueOp, Strin
         _ => return None,
     };
     Some(queue::parse(args))
+}
+
+/// The routing decision for a line typed mid-turn, factored out of the live
+/// `select!` loop so the steer/queue/command split can be unit-tested without
+/// a running turn. `text` is already trimmed; `steer` is true for a plain
+/// Enter (`TermInput::Line`) and false for Ctrl-Enter (`TermInput::Queue`).
+enum SteerRoute {
+    /// Blank input: dropped as a no-op.
+    Ignore,
+    /// A `/queue` edit — applied to the message queue even mid-turn.
+    QueueCommand(std::result::Result<queue::QueueOp, String>),
+    /// A non-`/queue` slash command: deferred until the turn finishes.
+    DeferCommand,
+    /// Plain Enter: steer the running turn.
+    Steer,
+    /// Ctrl-Enter: append to the message queue for a later turn.
+    Enqueue,
+}
+
+/// Classify a mid-turn line into its routing action. Order matters: `/queue`
+/// edits run live, other slash commands defer, and otherwise the Enter vs
+/// Ctrl-Enter distinction decides steer vs enqueue.
+fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
+    if text.is_empty() {
+        SteerRoute::Ignore
+    } else if let Some(op) = queue_command(text) {
+        SteerRoute::QueueCommand(op)
+    } else if text.starts_with('/') {
+        SteerRoute::DeferCommand
+    } else if steer {
+        SteerRoute::Steer
+    } else {
+        SteerRoute::Enqueue
+    }
 }
 
 /// Emit a transient diagnostic: through the frame transcript in frame mode (a
@@ -1586,5 +1626,27 @@ mod tests {
         assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
         assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
         assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn classify_steer_input_routes_line_queue_and_commands() {
+        // Plain Enter (`TermInput::Line`, steer = true) steers the running turn.
+        assert!(matches!(classify_steer_input("keep going", true), SteerRoute::Steer));
+        // Ctrl-Enter (`TermInput::Queue`, steer = false) enqueues for a later turn.
+        assert!(matches!(classify_steer_input("keep going", false), SteerRoute::Enqueue));
+        // A regression that swapped these two would flip the feature's core
+        // behaviour while still routing the same text — the pair above catches it.
+
+        // `/queue` edits run live regardless of the Enter vs Ctrl-Enter flag.
+        assert!(matches!(classify_steer_input("/queue add hello", true), SteerRoute::QueueCommand(_)));
+        assert!(matches!(classify_steer_input("/queue add hello", false), SteerRoute::QueueCommand(_)));
+
+        // Any other slash command defers until the turn finishes.
+        assert!(matches!(classify_steer_input("/help", true), SteerRoute::DeferCommand));
+        assert!(matches!(classify_steer_input("/model", false), SteerRoute::DeferCommand));
+
+        // Blank input is a no-op on both paths.
+        assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
+        assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
     }
 }
