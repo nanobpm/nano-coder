@@ -14,32 +14,44 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::input_history::InputHistory;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::status::StatusLine;
 
-/// Advance a wrap position by one input character, measured in terminal cells.
+/// Advance a wrap position by one input grapheme cluster, measured in terminal
+/// cells.
 ///
 /// `col` is the column the next cell would be written to (`0..=cols`, where
 /// `cols` is a pending wrap left by a row filled exactly). Terminals lay glyphs
-/// out by cell width, not scalar count: CJK ideographs and most emoji occupy
-/// two cells and never straddle the right edge — when only the trailing cell is
-/// free the terminal leaves it blank and wraps the glyph whole — while
-/// combining marks occupy zero. A `'\n'` starts a fresh row.
-fn advance_cell(row: usize, col: usize, cols: usize, c: char) -> (usize, usize) {
-    if c == '\n' {
+/// out by *cluster*, not by scalar: a base letter and its combining marks
+/// render in one place, and a ZWJ/emoji sequence renders as one glyph — so the
+/// cluster must advance atomically or a trailing combining mark straddling the
+/// right edge would spuriously start a new row and an emoji sequence would be
+/// split across the boundary. CJK ideographs and most emoji occupy two cells
+/// and never straddle the right edge — when the remaining cells cannot hold the
+/// cluster the terminal leaves them blank and wraps the glyph whole — while a
+/// lone combining mark occupies zero cells and stays on the preceding glyph. A
+/// `'\n'` cluster starts a fresh row.
+fn advance_cluster(row: usize, col: usize, cols: usize, cluster: &str) -> (usize, usize) {
+    if cluster == "\n" {
         return (row + 1, 0);
     }
     let (mut row, mut col) = (row, col);
+    let w = UnicodeWidthStr::width(cluster);
+    // A zero-width cluster (a lone combining mark) attaches to the cell already
+    // written and neither advances the column nor flushes a pending wrap.
+    if w == 0 {
+        return (row, col);
+    }
     // A row filled exactly is a pending wrap: the next cell starts a new row.
     if col >= cols {
         row += 1;
         col = 0;
     }
-    let w = UnicodeWidthChar::width(c).unwrap_or(0);
-    // A double-width glyph cannot occupy a lone trailing cell; the terminal
-    // wraps it whole, leaving that cell blank.
-    if w == 2 && col + 1 == cols {
+    // A cluster that cannot fit in the cells left on this row is wrapped whole;
+    // the terminal leaves the trailing cells blank rather than splitting it.
+    if w > 1 && col + w > cols {
         row += 1;
         col = 0;
     }
@@ -253,6 +265,13 @@ impl EditView {
             crate::commands::menu(&self.line, cols as usize, max_rows)
         };
         let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
+        // Keep `drawn_rows` (content + menu) in step with the menu height: when
+        // the menu shrinks under a pinned status line `menu_sequence` has
+        // already anchored the released rows away, so the next `redraw_sequence`
+        // must reprint against the collapsed height. Leaving `drawn_rows` at the
+        // stale, larger total would make it read `old > drawn` and anchor those
+        // same rows a second time, over-climbing and dropping transcript rows.
+        self.drawn_rows = (self.drawn_rows + used).saturating_sub(self.menu_rows);
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
@@ -329,8 +348,8 @@ impl EditView {
             return 1;
         }
         let (mut row, mut col) = self.prompt_start(cols);
-        for c in self.line.chars() {
-            let (r, cc) = advance_cell(row, col, cols, c);
+        for cluster in self.line.graphemes(true) {
+            let (r, cc) = advance_cluster(row, col, cols, cluster);
             row = r;
             col = cc;
         }
@@ -368,10 +387,31 @@ impl EditView {
     fn position_at(&self, idx: usize, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let (mut row, mut col) = self.prompt_start(cols);
-        for c in self.line.chars().take(idx) {
-            let (r, cc) = advance_cell(row, col, cols, c);
-            row = r;
-            col = cc;
+        let mut seen = 0;
+        for cluster in self.line.graphemes(true) {
+            if seen >= idx {
+                break;
+            }
+            let len = cluster.chars().count();
+            if seen + len <= idx {
+                // The whole cluster lies before the cursor: advance it atomically.
+                let (r, cc) = advance_cluster(row, col, cols, cluster);
+                row = r;
+                col = cc;
+                seen += len;
+            } else {
+                // The char-indexed cursor lands inside this cluster (e.g. between
+                // a base glyph and its combining mark): advance only the scalars
+                // up to it, each as its own cell, so the position tracks the
+                // cursor rather than snapping past the whole cluster.
+                let mut buf = [0u8; 4];
+                for c in cluster.chars().take(idx - seen) {
+                    let (r, cc) = advance_cluster(row, col, cols, c.encode_utf8(&mut buf));
+                    row = r;
+                    col = cc;
+                }
+                break;
+            }
         }
         (row, col)
     }
@@ -1395,6 +1435,36 @@ mod tests {
         view.insert("e\u{0301}");
         assert_eq!(view.cursor_position(80), (0, 3), "combining mark adds no column");
         assert_eq!(view.content_rows(80), 1);
+    }
+
+    #[test]
+    fn combining_mark_stays_with_a_base_that_fills_the_last_column() {
+        // "> " plus a 2-cell content span on cols=4. "ab" fills the span exactly
+        // (pending wrap at col 4), and the combining acute belongs to the base
+        // "b" already written in the last cell — it must not take the pending-wrap
+        // branch and spill onto a new row. The cluster "b\u{0301}" stays whole.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("ab\u{0301}");
+        assert_eq!(view.content_rows(4), 1, "combining mark stays on the base's row");
+        assert_eq!(view.cursor_position(4), (0, 4), "pending wrap, cursor at cols");
+    }
+
+    #[test]
+    fn zwj_emoji_cluster_wraps_whole_not_scalar_by_scalar() {
+        // A ZWJ family emoji is one grapheme cluster. Counted per scalar it would
+        // measure six cells (three people at two each) and split across a row
+        // boundary; measured as a cluster it is two cells and moves as a unit.
+        let mut view = view("");
+        view.prompt_width = 0;
+        view.insert("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+        assert_eq!(view.content_rows(8), 1, "the family emoji is one two-cell glyph");
+        assert_eq!(view.cursor_position(8), (0, 2), "two cells, not six");
+        // With only one free cell before it on a cols=4 row, the whole cluster
+        // wraps rather than splitting its people across the boundary.
+        view.replace_line("abc\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+        assert_eq!(view.content_rows(4), 2, "the emoji cluster wraps whole to row 1");
+        assert_eq!(view.cursor_position(4), (1, 2), "cluster placed atomically on row 1");
     }
 
     #[test]
