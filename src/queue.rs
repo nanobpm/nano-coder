@@ -95,9 +95,12 @@ pub enum QueueOp {
     Edit { id: usize, text: String },
     /// Empty the queue (`/queue clear`).
     Clear,
+    /// Queue a message (`/queue add text`), for terminals where Ctrl-Enter
+    /// can't be told apart from Enter.
+    Add(String),
 }
 
-const USAGE: &str = "usage: /queue [list] | /queue remove N... | /queue edit N text | /queue clear";
+const USAGE: &str = "usage: /queue [list] | /queue add text | /queue remove N... | /queue edit N text | /queue clear";
 
 /// Parse the arguments after `/queue` (empty means list).
 pub fn parse(args: &str) -> Result<QueueOp, String> {
@@ -108,6 +111,8 @@ pub fn parse(args: &str) -> Result<QueueOp, String> {
     let (sub, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     let rest = rest.trim();
     match sub {
+        "add" if rest.is_empty() => Err(USAGE.to_string()),
+        "add" => Ok(QueueOp::Add(rest.to_string())),
         "remove" | "rm" | "delete" => {
             let mut ids = Vec::new();
             for word in rest.split_whitespace() {
@@ -164,6 +169,10 @@ pub fn apply(queue: &mut MessageQueue, op: &QueueOp) -> String {
                 format!("No queued message with id {id} ({})", queue_summary(queue))
             }
         }
+        QueueOp::Add(text) => {
+            let id = queue.push(text.clone());
+            format!("↧ queued #{id} ({}) — /queue remove {id} to drop", queue_summary(queue))
+        }
         QueueOp::Clear => {
             let n = queue.clear();
             format!("Cleared {n} queued message{}", plural(n))
@@ -174,7 +183,7 @@ pub fn apply(queue: &mut MessageQueue, op: &QueueOp) -> String {
 /// One line per waiting message, oldest first.
 pub fn describe(queue: &MessageQueue) -> String {
     if queue.is_empty() {
-        return "Queue is empty. Type a message while a turn runs to queue it.".to_string();
+        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.".to_string();
     }
     let mut out = format!("Queued ({}):", queue.len());
     for entry in queue.list() {
@@ -291,7 +300,7 @@ mod tests {
         assert!(missing.contains("No queued message with id 7"), "{missing}");
 
         assert!(apply(&mut queue, &QueueOp::Clear).contains("Cleared 2"));
-        assert_eq!(apply(&mut queue, &QueueOp::List), "Queue is empty. Type a message while a turn runs to queue it.");
+        assert_eq!(apply(&mut queue, &QueueOp::List), "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.");
     }
 
     #[test]
@@ -301,5 +310,16 @@ mod tests {
         let shown = preview(&long, 10);
         assert_eq!(shown.chars().count(), 10);
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn add_queues_a_message() {
+        assert_eq!(parse("add fix the build").unwrap(), QueueOp::Add("fix the build".into()));
+        assert!(parse("add").is_err());
+        assert!(parse("add   ").is_err());
+        let mut queue = MessageQueue::default();
+        let note = apply(&mut queue, &QueueOp::Add("later".into()));
+        assert!(note.starts_with("↧ queued #") && note.contains("/queue remove"), "{note}");
+        assert_eq!(queue.len(), 1);
     }
 }

@@ -329,20 +329,21 @@ struct Segment {
     priority: u8,
 }
 
-/// The queue line with the cursor marked at `cursor` characters in, newlines
+/// The mid-turn input line with the cursor marked at `cursor` characters in, newlines
 /// shown as `⏎` so multi-line input stays on one status row, and a count of the
 /// messages already queued. The queue indicator yields its hint on narrow
 /// terminals, then goes entirely, so the row never exceeds `cols`.
 pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> String {
-    let prefix = " ✎ queue › ";
-    let hint_text = "  Enter to queue ";
-    // The queue indicator yields its hint on narrow terminals, then goes
-    // entirely, so the row never exceeds `cols`.
+    let prefix = " ✎ steer › ";
+    let hint_text = "  Enter steers · Ctrl-Enter queues ";
+    // On narrow terminals the key hint goes first, then the queue indicator
+    // shortens to the bare count, then goes entirely, so the row never
+    // exceeds `cols`.
     let full = (queued > 0).then(|| format!("⏸{queued} queued · /queue to edit"));
     let short = (queued > 0).then(|| format!("⏸{queued}"));
     let fits = |i: &Option<String>| {
         let extra = i.as_deref().map_or(0, |i| i.chars().count() + 3);
-        prefix.chars().count() + text.chars().count().min(1) + 1 + hint_text.len() + extra <= cols
+        prefix.chars().count() + text.chars().count().min(1) + 1 + extra <= cols
     };
     let indicator = match (full, short) {
         (Some(f), Some(_)) if fits(&Some(f.clone())) => Some(f),
@@ -353,11 +354,11 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     // The hint is a fixed segment that `saturating_sub` can't shorten, so on a
     // terminal too narrow to hold the prefix, cursor, indicator, and hint drop
     // the hint entirely — otherwise the row would spill past `cols`.
-    let hint = if prefix.chars().count() + 1 + hint_text.len() + extra <= cols { hint_text } else { "" };
+    let hint = if prefix.chars().count() + 1 + hint_text.chars().count() + extra <= cols { hint_text } else { "" };
     // Flatten to one row, marking where the cursor sits.
     let flat: String = text.chars().map(|c| if c == '\n' { '⏎' } else { c }).collect();
     let cursor = cursor.min(flat.chars().count());
-    let room = cols.saturating_sub(prefix.chars().count() + hint.len() + extra + 1);
+    let room = cols.saturating_sub(prefix.chars().count() + hint.chars().count() + extra + 1);
     // Keep the cursor visible: show the window of text around it.
     let start = if flat.chars().count() > room {
         cursor.saturating_sub(room / 2).min(flat.chars().count() - room)
@@ -371,7 +372,7 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     let after: String = shown.chars().skip(cursor_col + 1).collect();
     let cursor_glyph = if under.is_empty() { "█".to_string() } else { format!("\x1b[7m{under}\x1b[27m") };
     let used = prefix.chars().count() + shown.chars().count() + 1;
-    let pad = cols.saturating_sub(used + hint.len() + extra);
+    let pad = cols.saturating_sub(used + hint.chars().count() + extra);
     let indicator = indicator
         .map(|i| format!("\x1b[38;5;222m · {i}\x1b[38;5;244m"))
         .unwrap_or_default();
@@ -644,13 +645,13 @@ mod tests {
     fn input_row_shows_the_queue_count() {
         // Typing mid-turn: the row invites queueing and shows what waits.
         let line = visible(&render_input("fix the typo", 12, 2, 100));
-        assert!(line.contains("✎ queue › fix the typo"), "{line:?}");
+        assert!(line.contains("✎ steer › fix the typo"), "{line:?}");
         assert!(line.contains("⏸2 queued · /queue to edit"), "{line:?}");
         assert_eq!(line.chars().count(), 100, "fills the width: {line:?}");
 
         // Nothing queued: just the line being typed, no indicator.
         let line = visible(&render_input("fix the typo", 12, 0, 100));
-        assert!(line.contains("✎ queue › fix the typo"), "{line:?}");
+        assert!(line.contains("✎ steer › fix the typo"), "{line:?}");
         assert!(!line.contains("queued"), "{line:?}");
 
         // An empty line with a waiting queue still shows the indicator.
@@ -676,7 +677,7 @@ mod tests {
         // to `⏎`, the character under the cursor stays visible (reverse video is
         // stripped here), and the queue indicator still shows the count.
         let line = visible(&render_input("first line\nsecond line", 4, 2, 100));
-        assert!(line.contains("✎ queue › firs"), "{line:?}");
+        assert!(line.contains("✎ steer › firs"), "{line:?}");
         assert!(line.contains("⏎"), "newline shown as a glyph: {line:?}");
         assert!(line.contains("⏸2 queued · /queue to edit"), "{line:?}");
         assert!(line.chars().count() <= 100, "never overflows the width: {line:?}");

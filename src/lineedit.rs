@@ -5,7 +5,8 @@
 //!
 //! The input is a (possibly multi-line) buffer with a cursor: arrow keys,
 //! Home/End and Alt/Option word jumps move it, Ctrl-Enter (or Cmd-Enter,
-//! via modifyOtherKeys/kitty-style key reporting) inserts a newline, and a
+//! via modifyOtherKeys/kitty-style key reporting) inserts a newline at the
+//! prompt and queues the line during a turn (where Enter steers), and a
 //! bracketed paste keeps its line breaks instead of sending line by line.
 //! The mouse is never captured, so the terminal keeps its native wheel
 //! scrolling and text selection.
@@ -663,6 +664,9 @@ fn write(text: &str) {
 /// What a key press produced.
 pub enum Key {
     Line(String),
+    /// Ctrl- or Cmd-Enter during a turn: queue the line for a later turn
+    /// (a plain Enter during a turn steers the running one).
+    Queue(String),
     Eof,
     Interrupt,
     ToggleThinking,
@@ -763,7 +767,8 @@ enum Esc {
     WordLeft,
     WordRight,
     Delete,
-    /// Ctrl- or Cmd-Enter: insert a newline instead of sending.
+    /// Ctrl- or Cmd-Enter: queue the line during a turn; at the prompt,
+    /// insert a newline instead of sending.
     Newline,
     /// An unmodified Enter reported as an escape sequence (kitty keyboard
     /// protocol `CSI 13 u`): submit the line, like a bare CR would.
@@ -974,7 +979,13 @@ impl LineReader {
                                     Esc::WordLeft => shared.lock().unwrap().move_word_left(),
                                     Esc::WordRight => shared.lock().unwrap().move_word_right(),
                                     Esc::Delete => shared.lock().unwrap().delete(),
-                                    Esc::Newline => shared.lock().unwrap().insert("\n"),
+                                    Esc::Newline => {
+                                        let mut view = shared.lock().unwrap();
+                                        if view.mode == EditMode::Turn {
+                                            return Key::Queue(view.take() + "\n");
+                                        }
+                                        view.insert("\n");
+                                    }
                                     Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
                                     Esc::Ignored => {}
                                 }
@@ -1466,5 +1477,24 @@ mod tests {
         view.line = "/model  ol".into();
         view.tab();
         assert_eq!(view.line, "/model ollama", "irregular spacing canonicalizes without panicking");
+    }
+
+    /// Read one key from `bytes` with the editor in `mode`.
+    fn read_key(mode: EditMode, bytes: &[u8]) -> Key {
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        view.lock().unwrap().mode = mode;
+        let mut reader = LineReader::default();
+        reader.pending.extend(bytes.iter());
+        reader.read_line(&view, &|_| {})
+    }
+
+    #[test]
+    fn enter_steers_and_ctrl_enter_queues_during_a_turn() {
+        assert!(matches!(read_key(EditMode::Turn, b"go left\r"), Key::Line(l) if l == "go left\n"));
+        // modifyOtherKeys and kitty Ctrl-Enter, and Cmd-Enter.
+        for seq in [&b"\x1b[27;5;13~"[..], b"\x1b[13;5u", b"\x1b[27;9;13~"] {
+            let bytes = [&b"later"[..], seq].concat();
+            assert!(matches!(read_key(EditMode::Turn, &bytes), Key::Queue(l) if l == "later\n"), "{seq:?}");
+        }
     }
 }

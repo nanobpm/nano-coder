@@ -38,16 +38,25 @@ cargo run
 
 Starts the interactive REPL where you can chat with the agent and use slash commands.
 
-While a turn is running you can type a message and press Enter to **queue** it: the
-message waits in a queue and runs as a later prompt — one per turn, in the order you
-sent them. The status line shows how many are waiting. Edit the queue at any time
+While a turn is running you can type a message and press **Enter** to **steer** the
+agent: the message is added to the conversation before the agent's next step (after the
+tool calls in flight finish), so it can change course without the turn being cancelled.
+A steer that arrives as the turn finishes is queued instead, and one that arrives as the
+turn is cancelled is dropped (with a note showing its text).
+
+Press **Ctrl-Enter** (or Cmd-Enter) instead to **queue** the message: it waits in a queue
+and runs as a later prompt — one per turn, in the order you sent them. Ctrl-Enter needs a
+terminal that reports modified keys (modifyOtherKeys or the kitty keyboard protocol, e.g.
+xterm, kitty, WezTerm, Ghostty, iTerm2); elsewhere use `/queue add message`. The status
+line shows how many are waiting. Edit the queue at any time
 (even mid-turn) with `/queue`: `/queue` lists the waiting messages, `/queue remove N`
 drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites one, and
 `/queue clear` empties the queue. A queued message is never injected while the agent is
 asking for input (the `question` tool's picker owns the terminal until you answer).
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
-With piped (non-terminal) stdin, lines read during a turn are queued as later prompts.
+With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
+(never steer).
 
 ### ACP Headless Mode (--acp flag)
 
@@ -309,7 +318,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
-- `/queue [list|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
+- `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one: scroll the provider list, then the model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
@@ -548,14 +557,15 @@ enabled (e.g. `extra_body = { thinking = { type = "enabled", budget_tokens = 400
 error).
 
 **Input.** On a terminal, input is read key by key. While a turn runs, what you type shows
-on the status line; Enter adds it to the message queue (one queued message runs per
-following turn; `/queue` lists, edits and removes them), Esc Esc or Ctrl-C cancels the turn. The prompt supports
+on the status line; Enter sends it to steer the running turn, Ctrl-Enter (or Cmd-Enter)
+adds it to the message queue (one queued message runs per following turn; `/queue` lists,
+edits and removes them), and Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
 the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
-input and Ctrl-W deletes the word before the cursor. Ctrl-Enter (or Cmd-Enter) inserts a
-newline without sending, and pasted text keeps its line breaks as a single multi-line input
+input and Ctrl-W deletes the word before the cursor. At the prompt between turns,
+Ctrl-Enter (or Cmd-Enter) inserts a newline without sending, and pasted text keeps its line breaks as a single multi-line input
 instead of sending line by line. Ctrl-D exits on an empty line.
 
 Streaming uses server-sent events. Set `stream = false` on a provider whose endpoint doesn't

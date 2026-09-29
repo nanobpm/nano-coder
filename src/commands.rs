@@ -21,7 +21,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/settings", args: "", description: "View/edit settings" },
     Command { name: "/verbosity", args: "[quiet|normal|verbose|debug]", description: "Show or set output detail" },
     Command { name: "/plan", args: "", description: "Show the agent's task plan with notes" },
-    Command { name: "/queue", args: "[list|remove N...|edit N text|clear]", description: "Show or edit the queued messages" },
+    Command { name: "/queue", args: "[list|add text|remove N...|edit N text|clear]", description: "Show or edit the queued messages" },
     Command { name: "/tools", args: "", description: "List available tools" },
     Command { name: "/skills", args: "", description: "List skills the agent can load" },
     Command { name: "/model", args: "[provider/model]", description: "Show the model and pick a new one (or switch directly)" },
@@ -224,7 +224,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("\n  {:width$}  {}", synopsis(c), c.description));
     }
     out.push_str("\nType / to list commands as you type; Tab completes commands and /model, /mode, /verbosity arguments; Esc hides the list.");
-    out.push_str("\nKeys: Enter during a turn queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
+    out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
     out
 }
 
