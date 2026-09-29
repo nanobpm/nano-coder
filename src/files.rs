@@ -527,17 +527,27 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
             .collect();
         ranges.sort_unstable();
         ranges.dedup();
-        // Coalesce overlapping cross-representation ranges: the LF and CRLF
-        // forms of one logical occurrence overlap (in `a\r\nb`, `old = "\nb"`
-        // matches `\r\nb` at 1..4 and its literal `\nb` suffix at 2..4). They
-        // are the SAME occurrence, so keep only the first of any overlapping
-        // group — otherwise it is miscounted as a second occurrence and, under
-        // `replace_all`, rebuilding slices `text[end..start]` and panics.
-        // Distinct occurrences never overlap, so this preserves them.
+        // Coalesce overlapping cross-representation ranges, but ONLY when one is
+        // contained in the other: the LF and CRLF forms of one logical
+        // occurrence overlap with a shared end (in `a\r\nb`, `old = "\nb"`
+        // matches `\r\nb` at 1..4 and its literal `\nb` suffix at 2..4). Those
+        // are the SAME occurrence, so keep only the first — otherwise it is
+        // miscounted as a second occurrence and, under `replace_all`, rebuilding
+        // slices `text[end..start]` and panics. A range that merely *crosses*
+        // the previous one without being contained (in `a\r\na\na`,
+        // `old = "a\na"` yields CRLF `0..4` and LF `3..6`) is a DISTINCT
+        // occurrence that physically overlaps its neighbour; the two cannot both
+        // be edited, so reject it as ambiguous rather than silently dropping it.
+        // Ranges are sorted by (start, end), so any later range starts no
+        // earlier — containment reduces to `r.1 <= prev.1`.
         let mut deduped: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
         for r in ranges {
-            if deduped.last().is_none_or(|&(_, e)| r.0 >= e) {
-                deduped.push(r);
+            match deduped.last() {
+                Some(&(_, e)) if r.1 <= e => {} // contained: same occurrence, drop
+                Some(&(_, e)) if r.0 < e => bail!(
+                    "old_string matches overlapping occurrences ambiguously; add surrounding context to disambiguate"
+                ),
+                _ => deduped.push(r),
             }
         }
         let ranges = deduped;
@@ -730,7 +740,11 @@ fn near_miss(text: &str, old: &str) -> String {
     }
     // No whole line agrees: rank windows by shared characters so even a
     // misspelled single line gets a hint. Diagnostic only — the edit already failed.
-    // Build each `want` line's char counts once and reuse the map across windows.
+    // Build each `want` line's char counts once, then score each window against a
+    // single REUSED scratch map (cleared, never reallocated) so the fallback does
+    // NOT allocate — or clone `want_counts` — once per window/line pair. The score
+    // is the multiset intersection size: sum over `want` chars of
+    // min(want_count, line_count).
     let want_counts: Vec<std::collections::HashMap<char, i32>> = trimmed
         .iter()
         .map(|w| {
@@ -741,25 +755,27 @@ fn near_miss(text: &str, old: &str) -> String {
             m
         })
         .collect();
-    let sim_score = |i: usize| {
-        (0..k)
-            .map(|j| {
-                let mut counts = want_counts[j].clone();
-                lines[i + j]
-                    .trim()
-                    .chars()
-                    .filter(|c| {
-                        let e = counts.entry(*c).or_insert(0);
-                        *e > 0 && {
-                            *e -= 1;
-                            true
-                        }
-                    })
-                    .count()
-            })
-            .sum::<usize>()
-    };
-    let (sbest, si) = windows.map(|i| (sim_score(i), i)).max_by_key(|&(s, i)| (s, std::cmp::Reverse(i))).unwrap();
+    let mut scratch: std::collections::HashMap<char, i32> = std::collections::HashMap::new();
+    let (mut sbest, mut si) = (0usize, 0usize);
+    for i in windows {
+        let mut score = 0usize;
+        for j in 0..k {
+            scratch.clear();
+            for c in lines[i + j].trim().chars() {
+                *scratch.entry(c).or_insert(0) += 1;
+            }
+            score += want_counts[j]
+                .iter()
+                .map(|(c, &wc)| wc.min(scratch.get(c).copied().unwrap_or(0)))
+                .sum::<i32>() as usize;
+        }
+        // Strictly-greater keeps the earliest (smallest-i) window among ties,
+        // matching the line-score pass's `(s, Reverse(i))` preference.
+        if score > sbest {
+            sbest = score;
+            si = i;
+        }
+    }
     if sbest == 0 {
         return String::new();
     }
@@ -1427,6 +1443,23 @@ mod tests {
         let p = read_fixture(&dir, "ov.txt", "a\r\nb");
         edit_file(&json!({ "path": p, "old_string": "\nb", "new_string": "\nB", "replace_all": true })).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nB");
+    }
+
+    #[test]
+    fn crossing_crlf_and_lf_ranges_are_ambiguous_not_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        // In `a\r\na\na`, `old = "a\na"` matches the CRLF form `a\r\na` (0..4)
+        // and the literal LF form `a\na` (3..6). These CROSS (3 < 4 < 6) without
+        // one containing the other, so they are two DISTINCT overlapping
+        // occurrences — not one. They must not be silently collapsed to a single
+        // match (which would edit the wrong occurrence, or panic under
+        // `replace_all` slicing `text[4..3]`); the edit must be rejected as
+        // ambiguous instead.
+        let p = read_fixture(&dir, "cross.txt", "a\r\na\na");
+        let err = edit_file(&json!({ "path": p, "old_string": "a\na", "new_string": "X", "replace_all": true })).unwrap_err();
+        assert!(err.to_string().contains("ambiguously"), "unexpected error: {err}");
+        // The file is left untouched.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\na\na");
     }
 
     #[test]
