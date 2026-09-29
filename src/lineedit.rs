@@ -154,6 +154,12 @@ impl EditView {
     fn draw_edit(&mut self) {
         if let Some(hook) = self.on_edit.clone() {
             let menu = self.frame_menu();
+            // Track the frame menu's height so `menu_visible()` reflects the menu
+            // the frame path actually draws. `read_line` uses `menu_visible()` to
+            // decide whether a bare Esc hides the menu or is emitted as
+            // `Key::Escape`; without this the frame menu never reported visible
+            // and Esc could not close it.
+            self.menu_rows = menu.len();
             hook(&self.line, self.cursor, self.queue_count, &menu);
             return;
         }
@@ -266,7 +272,18 @@ impl EditView {
         }
         let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
         let cols = (cols as usize).max(1);
-        let max_rows = menu_max_rows(rows as usize, self.content_rows(cols), true);
+        // Size the menu against the frame editor's *real* rendered height, not
+        // the legacy `content_rows`: in frame mode `prompt_width` stays at 2
+        // (the legacy `prompt()` is never called) and `content_rows` omits the
+        // frame-only queue-indicator row and the reserved cursor cell. Measuring
+        // with `frame::editor_lines` (the same helper the frame renderer draws
+        // with) and reserving the queue row keeps `editor + queue + menu +
+        // status` within the terminal, so a narrow or exactly-full input can no
+        // longer make an oversized menu push the prompt off-screen.
+        let prompt = format!("{}› ", crate::ui::stamp());
+        let editor = crate::frame::editor_lines(&prompt, &self.line, self.cursor, cols).len();
+        let queue = (self.queue_count > 0) as usize;
+        let max_rows = menu_max_rows(rows as usize, editor + queue, true);
         self.menu_lines(cols, max_rows)
     }
 
@@ -773,6 +790,7 @@ impl EditView {
             self.drawn_rows = 0;
             self.drawn_cursor_row = 0;
             self.menu_hidden = false;
+            self.menu_rows = 0;
             hook(&self.line, self.cursor, self.queue_count, &[]);
             return line;
         }
@@ -1398,6 +1416,21 @@ mod tests {
         assert_eq!(view.line, "run a\u{a0}");
         view.erase_word();
         assert_eq!(view.line, "run ");
+    }
+
+    #[test]
+    fn frame_menu_marks_menu_visible_so_esc_can_hide_it() {
+        // In frame mode the editor is drawn through the hook, not inline, so the
+        // menu height must still be recorded in `menu_rows`: `read_line` gates a
+        // bare Esc on `menu_visible()`, and without this a `/` line's frame menu
+        // could never be closed with Esc.
+        let mut view = view("/");
+        view.mode = EditMode::Prompt;
+        view.on_edit = Some(Arc::new(|_: &str, _: usize, _: usize, _: &[String]| {}));
+        view.draw_edit();
+        assert!(view.menu_visible(), "a `/` line's frame menu reports visible");
+        view.hide_menu();
+        assert!(!view.menu_visible(), "Esc-hiding the frame menu clears visibility");
     }
 
     #[test]
