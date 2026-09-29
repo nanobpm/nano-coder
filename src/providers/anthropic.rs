@@ -531,6 +531,38 @@ mod tests {
     }
 
     #[test]
+    fn finish_preserves_truncated_tool_call_arguments_as_malformed() {
+        // A tool call whose `input_json_delta` stream is truncated (here by the
+        // output-token limit) accumulates invalid JSON. `finish` must keep the
+        // raw text as dedicated `malformed_arguments` metadata rather than
+        // erasing it to `{}`, so the dispatch loop can tell a truncated stream
+        // apart from omitted arguments.
+        let events = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"write_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/big.txt\",\"content\":\"..."}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        let response = accumulator.finish();
+        assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
+        let call = &response.tool_calls[0];
+        // The truncated text is preserved verbatim as malformed metadata...
+        assert_eq!(
+            call.invalid_arguments(),
+            Some("{\"path\":\"/tmp/big.txt\",\"content\":\"...")
+        );
+        // ...and `arguments` holds no fabricated field for a handler to
+        // misreport as present-but-empty.
+        assert_eq!(call.arguments, json!({}));
+    }
+
+    #[test]
     fn skips_reasoning_blocks_from_openai_compatible_providers() {
         let assistant = Message {
             thinking_blocks: vec![json!({"type": "reasoning_content", "text": "from kimi"})],

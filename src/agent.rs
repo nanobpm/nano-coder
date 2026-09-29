@@ -2028,6 +2028,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_tool_call_skips_handler_and_reports_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tool call whose argument JSON never decoded (a truncated stream).
+        let malformed = LLMResponse {
+            tool_calls: vec![ToolCall::from_raw_arguments("c1".into(), "echo".into(), "{\"text\":", None)],
+            ..Default::default()
+        };
+        let (mut agent, seen) = agent(vec![malformed, text("recovered")], dir.path());
+        assert_eq!(agent.send_message("ping").await.unwrap(), "recovered");
+
+        // The dispatch loop short-circuits before any handler: the tool result
+        // is the actionable malformed-arguments error, not a handler response.
+        let second = &seen.lock().unwrap()[1];
+        let result = second.iter().find(|m| m.role == Role::Tool).expect("a tool result was recorded");
+        let error = &result.content;
+        assert!(error.contains("malformed JSON"), "got: {error}");
+        assert!(error.contains("echo"), "names the tool: {error}");
+        // The handler never ran: `echo` would have produced `pong`, but the
+        // malformed call has no decodable `text` to echo.
+        assert_ne!(error, "pong");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resumes_sessions_and_deduplicates_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let (mut first, _) = agent(vec![text("one")], dir.path());
