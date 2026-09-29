@@ -14,7 +14,50 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::input_history::InputHistory;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use crate::status::StatusLine;
+
+/// Advance a wrap position by one input grapheme cluster, measured in terminal
+/// cells.
+///
+/// `col` is the column the next cell would be written to (`0..=cols`, where
+/// `cols` is a pending wrap left by a row filled exactly). Terminals lay glyphs
+/// out by *cluster*, not by scalar: a base letter and its combining marks
+/// render in one place, and a ZWJ/emoji sequence renders as one glyph — so the
+/// cluster must advance atomically or a trailing combining mark straddling the
+/// right edge would spuriously start a new row and an emoji sequence would be
+/// split across the boundary. CJK ideographs and most emoji occupy two cells
+/// and never straddle the right edge — when the remaining cells cannot hold the
+/// cluster the terminal leaves them blank and wraps the glyph whole — while a
+/// lone combining mark occupies zero cells and stays on the preceding glyph. A
+/// `'\n'` cluster starts a fresh row.
+fn advance_cluster(row: usize, col: usize, cols: usize, cluster: &str) -> (usize, usize) {
+    if cluster == "\n" {
+        return (row + 1, 0);
+    }
+    let (mut row, mut col) = (row, col);
+    let w = UnicodeWidthStr::width(cluster);
+    // A zero-width cluster (a lone combining mark) attaches to the cell already
+    // written and neither advances the column nor flushes a pending wrap.
+    if w == 0 {
+        return (row, col);
+    }
+    // A row filled exactly is a pending wrap: the next cell starts a new row.
+    if col >= cols {
+        row += 1;
+        col = 0;
+    }
+    // A cluster that cannot fit in the cells left on this row is wrapped whole;
+    // the terminal leaves the trailing cells blank rather than splitting it.
+    if w > 1 && col + w > cols {
+        row += 1;
+        col = 0;
+    }
+    col += w;
+    (row, col)
+}
 
 /// Where the line being typed is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,10 +248,18 @@ impl EditView {
             return;
         }
         let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        // Reserve the prompt row, plus the status row only when a status line
-        // is present (none under AGENTIC_NO_STATUS or a short terminal).
-        let reserved = if self.status.is_some() { 2 } else { 1 };
-        let max_rows = (rows as usize).saturating_sub(reserved).min(16);
+        // The input may wrap across several rows and the menu is drawn below
+        // that whole rendered height, so reserve the *full* content height —
+        // plus the status row when one is pinned — not just a single prompt
+        // row. Capping the menu to the rows that remain keeps
+        // `content + menu (+ status)` within the terminal, so
+        // `menu_sequence`'s IND descent never scrolls the prompt (or an
+        // earlier edit row) off the top and clamps the save/restore at row 1.
+        // When no rows remain the menu is suppressed (`max_rows == 0` yields
+        // no entries). For a single-row input this matches the old reserve
+        // (`rows - 1`, or `rows - 2` with a status line).
+        let content = self.content_rows(cols as usize);
+        let max_rows = menu_max_rows(rows as usize, content, self.status.is_some());
         let lines = if self.menu_hidden {
             Vec::new()
         } else if crate::commands::has_argument_menu(&self.line) {
@@ -221,7 +272,33 @@ impl EditView {
         } else {
             crate::commands::menu(&self.line, cols as usize, max_rows)
         };
-        let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
+        // The edit cursor was left on its row by the preceding redraw
+        // (`drawn_cursor_row`); the input's rendered end row is its last content
+        // row. Draw the menu below that end row, not below an earlier edit row,
+        // so a wrapped command edited on an earlier row does not have its tail
+        // rows painted over by the menu.
+        let below = content.saturating_sub(1).saturating_sub(self.drawn_cursor_row);
+        // `self.menu_rows` is the *old* menu height. When wrapping grows
+        // `content`, `max_rows` can drop below it, so passing the stale larger
+        // count would make `menu_sequence` clear `max(old_rows, lines.len())`
+        // rows that no longer fit below the taller content: the extra
+        // cursor-down clamps at the bottom margin and erases the last freshly
+        // drawn entry (e.g. a 5-row terminal with a status line, content 1→2
+        // and menu 3→2, leaves only one entry). Cap the reusable old height to
+        // the rows that still fit below the new content.
+        let old_rows = self.menu_rows.min(max_rows);
+        let (seq, used) = menu_sequence(old_rows, &lines, self.status.is_some(), below);
+        // Recompute `drawn_rows` (content + menu) from the *current* content
+        // height plus the freshly measured menu, rather than adjusting the old
+        // total by a `used - menu_rows` delta. The delta is only correct while
+        // the `drawn_rows == content + menu_rows` invariant holds, but `resize`
+        // zeroes `menu_rows` before calling here while `drawn_rows` still
+        // carries the old menu height — so a delta would stack the new menu on
+        // top of the stale one (e.g. a resize with a three-row menu recording
+        // six), and the next `redraw_sequence` would climb past the real prompt
+        // and overwrite transcript rows. Measuring content directly keeps
+        // `drawn_rows` honest in every path (line change and resize alike).
+        self.drawn_rows = content + used;
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
@@ -298,20 +375,10 @@ impl EditView {
             return 1;
         }
         let (mut row, mut col) = self.prompt_start(cols);
-        for c in self.line.chars() {
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                // Pending wrap, matching `cursor_position`: a row filled
-                // exactly leaves the cursor on it, and only the *next*
-                // character starts a new row.
-                if col == cols {
-                    row += 1;
-                    col = 0;
-                }
-                col += 1;
-            }
+        for cluster in self.line.graphemes(true) {
+            let (r, cc) = advance_cluster(row, col, cols, cluster);
+            row = r;
+            col = cc;
         }
         row + 1
     }
@@ -339,18 +406,38 @@ impl EditView {
     /// cursor on it at column `cols` (a pending wrap), and printing one more
     /// character wraps to the next row.
     fn cursor_position(&self, cols: usize) -> (usize, usize) {
+        self.position_at(self.cursor, cols)
+    }
+
+    /// Row and column after the first `idx` characters of the line, counted
+    /// as for [`cursor_position`](Self::cursor_position).
+    fn position_at(&self, idx: usize, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let (mut row, mut col) = self.prompt_start(cols);
-        for c in self.line.chars().take(self.cursor) {
-            if c == '\n' {
-                row += 1;
-                col = 0;
+        let mut seen = 0;
+        for cluster in self.line.graphemes(true) {
+            if seen >= idx {
+                break;
+            }
+            let len = cluster.chars().count();
+            if seen + len <= idx {
+                // The whole cluster lies before the cursor: advance it atomically.
+                let (r, cc) = advance_cluster(row, col, cols, cluster);
+                row = r;
+                col = cc;
+                seen += len;
             } else {
-                if col == cols {
-                    row += 1;
-                    col = 0;
-                }
-                col += 1;
+                // The char-indexed cursor lands inside this cluster (e.g. between
+                // a base glyph and its combining mark, or between the scalars of
+                // a ZWJ sequence). The terminal renders the whole cluster as one
+                // unit on its start row, so an interior index owns no cell of its
+                // own; advancing its scalars independently (each as a cell) could
+                // wrap the cursor onto a later row than the cluster actually
+                // occupies, leaving `cursor_row` below `end_row` so the next
+                // redraw climbs above the prompt. Rest at the cluster's start
+                // boundary — the rendered position the cursor genuinely shares —
+                // rather than descending into it.
+                break;
             }
         }
         (row, col)
@@ -365,36 +452,71 @@ impl EditView {
             return;
         }
         let (_rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        let cols = (cols as usize).max(1);
+        let seq = self.redraw_sequence((cols as usize).max(1), &crate::ui::stamp());
+        write(&seq);
+    }
+
+    /// The bytes for [`redraw`](Self::redraw) at a `cols`-wide terminal, and
+    /// the bookkeeping update for the next redraw.
+    ///
+    /// Every cursor movement is relative to where the cursor actually is. In
+    /// particular the cursor is not saved and restored (DECSC/DECRC) around the
+    /// print: that saves an absolute screen row, and when printing a wrapped
+    /// input scrolls the screen the prompt moves up while the saved row does
+    /// not, leaving the cursor rows below the prompt. The next redraw then
+    /// reprints from the wrong row, stacking a stale copy of the input on
+    /// every key press.
+    fn redraw_sequence(&mut self, cols: usize, stamp: &str) -> String {
         let content = self.content_rows(cols);
         let (cursor_row, cursor_col) = self.cursor_position(cols);
-        let clear_below = self.drawn_rows.saturating_sub(content).saturating_sub(cursor_row);
-        // The cursor was left `drawn_cursor_row` rows below the prompt's first
-        // row (a wrapped or newline row); climb back to the prompt row before
-        // reprinting, or the prompt lands on a content row and overwrites the
-        // tail of the input.
-        let up = self.drawn_cursor_row;
-        self.drawn_rows = content + self.menu_rows;
-        self.drawn_cursor_row = cursor_row;
-        let stamp = crate::ui::stamp();
+        let (end_row, _) = self.position_at(self.line.chars().count(), cols);
         let mut seq = String::new();
-        if up > 0 {
-            seq.push_str(&format!("\x1b[{up}A"));
+        // Climb from where the last redraw left the cursor to the prompt row.
+        if self.drawn_cursor_row > 0 {
+            seq.push_str(&format!("\x1b[{}A", self.drawn_cursor_row));
         }
-        seq.push_str(&format!("\x1b7\r{stamp}> {}\x1b[J", self.line));
-        if clear_below > 0 {
-            seq.push_str(&format!("\x1b[{clear_below}B\x1b[J"));
+        seq.push('\r');
+        // Blank the rows the last redraw used (menu included), row by row
+        // rather than with erase-below, which would also wipe the status line
+        // pinned under the scroll region. These rows already exist on screen,
+        // so moving down them never scrolls.
+        let old = self.drawn_rows.max(1);
+        for i in 0..old {
+            if i > 0 {
+                seq.push_str("\x1b[1B");
+            }
+            seq.push_str("\x1b[2K");
         }
-        seq.push_str("\x1b8");
-        if cursor_row > 0 {
-            seq.push_str(&format!("\x1b[{cursor_row}B"));
+        if old > 1 {
+            seq.push_str(&format!("\x1b[{}A", old - 1));
         }
+        // Print. This may scroll the screen; the cursor ends at the end of
+        // the input, `end_row` rows below the prompt wherever it now is.
+        seq.push_str(&format!("\r{stamp}> {}", self.line));
+        // Walk back from the end of the input to the edit cursor.
+        if end_row > cursor_row {
+            seq.push_str(&format!("\x1b[{}A", end_row - cursor_row));
+        }
+        seq.push('\r');
         if cursor_col > 0 {
-            seq.push_str(&format!("\r\x1b[{cursor_col}C"));
-        } else {
-            seq.push('\r');
+            seq.push_str(&format!("\x1b[{cursor_col}C"));
         }
-        write(&seq);
+        // The menu's rows stay reserved (blank) until `draw_menu` refills them.
+        let drawn = content + self.menu_rows;
+        // A shorter input (Backspace/Ctrl-U on a wrapped line) uses fewer rows
+        // than the last redraw. Blanking the released rows above only leaves
+        // them empty, so with a pinned status line the prompt would sit above a
+        // blank gap. Collapse those rows the way `menu_sequence` does — scroll
+        // the conversation back down so the prompt stays directly above the
+        // status line, preserving the bottom-anchor invariant. The anchor saves
+        // and restores the cursor and moves it down with the content, so the
+        // edit cursor stays on its character.
+        if self.status.is_some() && old > drawn {
+            seq.push_str(&crate::status::anchor_sequence((old - drawn) as u16));
+        }
+        self.drawn_rows = drawn;
+        self.drawn_cursor_row = cursor_row;
+        seq
     }
 
     /// On Enter: rewrite the prompt's timestamp with the time the line was
@@ -432,21 +554,58 @@ impl EditView {
             hook(&self.line, self.cursor, self.queue_count);
             return;
         }
+        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
         // With a status line, its resize erased everything below the cursor
-        // (the menu included) and re-anchored the prompt, so only redraw.
+        // (the menu included) and re-anchored the prompt, so only redraw needs
+        // to run. Without one, blank the old menu rows explicitly. The menu was
+        // drawn below the input's END row — which, when a wrapped line is edited
+        // on an earlier row, sits `below` rows past the cursor — so the teardown
+        // must descend that far first. Passing `below = 0` would instead clear
+        // the rows immediately under the cursor (the input tail), leaving the
+        // real menu rows stale when the resized menu is shorter or gone. Compute
+        // the cursor-to-end distance at the NEW width, matching the reflow the
+        // rest of this function assumes and the same descent `draw_menu` uses to
+        // place the menu.
         if self.menu_rows > 0 && self.status.is_none() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], false);
+            let cursor_row = self.cursor_position(cols).0;
+            let below = self.content_rows(cols).saturating_sub(1).saturating_sub(cursor_row);
+            let (seq, _) = menu_sequence(self.menu_rows, &[], false, below);
             write(&seq);
         }
         self.menu_rows = 0;
-        self.draw_menu();
-        // The status resize re-anchored the prompt and the non-status branch
-        // above restored the cursor to the prompt row, so it now sits on the
-        // prompt's first row.
-        self.drawn_cursor_row = 0;
-        // Reflow moved the input's rows; reprint it with the cursor back
-        // where it belongs.
+        // Reflow moved the input's rows. `redraw` opens by climbing
+        // `drawn_cursor_row` rows from the real cursor to the prompt row, but
+        // that value was recorded at the OLD width — after the reflow the
+        // cursor sits a different number of rows below the prompt, so retaining
+        // it (or resetting it to 0 unconditionally) makes the climb start from
+        // the wrong row and reprint over the transcript. Recompute the cursor's
+        // prompt-relative row at the NEW width first, so the climb matches where
+        // the cursor actually is.
+        self.drawn_cursor_row = self.cursor_position(cols).0;
+        // `drawn_rows` still carries the OLD-width span (content + menu). With a
+        // status line, `StatusLine::resize` just anchored the edit cursor at the
+        // bottom margin and erased/scrolled away everything below it, so only
+        // the prompt-through-cursor rows survive; without one the input merely
+        // reflowed to its new-width height. `redraw` opens by clearing that many
+        // rows: walking down clamps at the bottom margin, but the matching climb
+        // up is unconditional, so a stale (too-tall) span lands the cursor above
+        // the prompt and reprints over the transcript. Reset it to the actual
+        // post-resize span first.
+        self.drawn_rows = if self.status.is_some() {
+            self.drawn_cursor_row + 1
+        } else {
+            self.content_rows(cols)
+        };
+        // Reprint the input FIRST, while the menu is still released: `redraw`
+        // clears only the content rows and places the real cursor on the edit
+        // character at the new width, recording that row in `drawn_cursor_row`.
+        // Drawing the menu before this redraw would fold the menu rows into
+        // `drawn_rows`, so the redraw would erase them again and the menu would
+        // vanish on every resize. Input first, then the menu, keeps both honest.
         self.redraw();
+        // The input is reprinted and the cursor placed; now refill the menu
+        // under it, sized to the new terminal.
+        self.draw_menu();
     }
 
     /// Remove the character before the cursor (Backspace).
@@ -594,7 +753,7 @@ impl EditView {
             return line;
         }
         if self.menu_visible() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some());
+            let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some(), 0);
             write(&seq);
             self.menu_rows = 0;
         }
@@ -618,6 +777,21 @@ impl EditView {
     }
 }
 
+/// The number of command-menu rows that fit below a `content`-row input on a
+/// `rows`-high terminal, leaving the status row (`has_status`) intact and never
+/// exceeding the menu's own 16-row cap. Reserving the *full* rendered content
+/// height — not just a single prompt row — keeps `content + menu (+ status)`
+/// within the terminal, so `menu_sequence`'s IND descent never scrolls the
+/// input (or the prompt) off the top and clamps the cursor save/restore at the
+/// top row. Zero means no room remains, which suppresses the menu. For a
+/// single-row input this matches the historical reserve (`rows - 1`, or
+/// `rows - 2` with a status line).
+fn menu_max_rows(rows: usize, content: usize, has_status: bool) -> usize {
+    rows.saturating_sub(content)
+        .saturating_sub(has_status as usize)
+        .min(16)
+}
+
 /// Terminal output that shows `lines` below the cursor's row (which holds
 /// the prompt), given that `old_rows` rows are already in use there, and
 /// the number of rows in use afterwards. The cursor ends where it started.
@@ -626,17 +800,32 @@ impl EditView {
 /// never touched. With `anchor` (a status line is pinned), rows the menu gives
 /// up are closed by scrolling the conversation back down, so the prompt stays
 /// directly above the status line.
-fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, usize) {
+fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool, below: usize) -> (String, usize) {
     if old_rows == 0 && lines.is_empty() {
         return (String::new(), 0);
     }
     let mut seq = String::new();
-    if lines.len() > old_rows {
-        seq.push_str(&"\x1bD".repeat(lines.len()));
-        seq.push_str(&format!("\x1b[{}A", lines.len()));
+    if !lines.is_empty() {
+        // Ensure enough rows exist below the edit cursor for the descent to the
+        // input's rendered end row (`below`) plus the menu. `\x1bD` scrolls only
+        // at the bottom margin, so feeding this many is a no-op when the rows
+        // already exist and scrolls exactly the shortfall when they don't. Run
+        // it whenever a non-empty menu is drawn, not just when the menu itself
+        // grew: the input can gain a wrapped row (raising `below`) while the
+        // menu keeps the same entry count, and that new row must still be
+        // reserved or the menu's tail entries overwrite each other.
+        seq.push_str(&"\x1bD".repeat(below + lines.len()));
+        seq.push_str(&format!("\x1b[{}A", below + lines.len()));
     }
     let rows = old_rows.max(lines.len());
     seq.push_str("\x1b7");
+    // Descend from the edit cursor to the input's rendered end row before
+    // drawing, so the menu lands below the whole (wrapped) input rather than
+    // over its tail rows when the cursor is being edited on an earlier row.
+    // The `\x1b8` at the end restores the cursor to the saved edit position.
+    if below > 0 {
+        seq.push_str(&format!("\x1b[{below}B"));
+    }
     for i in 0..rows {
         seq.push_str("\x1b[1B\r\x1b[2K");
         if let Some(line) = lines.get(i) {
@@ -1182,31 +1371,312 @@ mod tests {
     #[test]
     fn menu_rows_are_reserved_drawn_and_cleared() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let (seq, rows) = menu_sequence(0, &lines, false);
+        let (seq, rows) = menu_sequence(0, &lines, false, 0);
         assert_eq!(rows, 2);
         assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
-        // Narrowing reuses the rows and blanks the extra one.
-        let (seq, rows) = menu_sequence(2, &lines[..1], false);
-        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
-        let (seq, rows) = menu_sequence(2, &[], false);
+        // Narrowing reuses the rows and blanks the extra one. The reservation
+        // descent still runs (a no-op here since the rows already exist).
+        let (seq, rows) = menu_sequence(2, &lines[..1], false, 0);
+        assert_eq!((seq.as_str(), rows), ("\x1bD\x1b[1A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+        let (seq, rows) = menu_sequence(2, &[], false, 0);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
-        assert_eq!(menu_sequence(0, &[], false), (String::new(), 0));
+        assert_eq!(menu_sequence(0, &[], false, 0), (String::new(), 0));
+    }
+
+    #[test]
+    fn menu_is_drawn_below_the_input_end_row_not_the_edit_row() {
+        // A wrapped command edited on an earlier row leaves the cursor `below`
+        // rows above the input's rendered end row. The menu must descend to the
+        // end row before painting so it lands beneath the whole input, not over
+        // its tail rows, and must return the cursor to the edit position.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let (seq, rows) = menu_sequence(0, &lines, false, 2);
+        assert_eq!(rows, 2);
+        // Reserve descent+menu rows, then descend two rows to the end row before
+        // drawing each menu row, restoring the edit cursor at the end.
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1bD\x1b[4A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
+        // Reusing already-reserved rows needs no scroll, but the reservation
+        // descent still runs (a no-op) and it still descends to the end row.
+        let (seq, rows) = menu_sequence(2, &lines[..1], false, 2);
+        assert_eq!((seq.as_str(), rows), ("\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+    }
+
+    #[test]
+    fn menu_reservation_reruns_when_the_input_grows_but_the_menu_does_not() {
+        // Regression: the reservation descent used to run only when the menu
+        // grew (`lines.len() > old_rows`). When the input instead gained a
+        // wrapped row (raising `below`) while the menu kept the same entry
+        // count, no rows were reserved for the new content row, so the trailing
+        // `\x1b[1B` descent clamped at the bottom margin and the menu's tail
+        // entries overwrote each other. Copilot's example: a one-row input with
+        // a two-row menu growing to two input rows left only the second menu row
+        // visible. The reservation must run for any non-empty menu, scrolling
+        // the one-row shortfall.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let (seq, rows) = menu_sequence(2, &lines, false, 1);
+        assert_eq!(rows, 2);
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
+    }
+
+    #[test]
+    fn stale_menu_height_is_capped_to_the_rows_that_still_fit() {
+        // Regression: `draw_menu` passed the *old* `menu_rows` to
+        // `menu_sequence`. When wrapping grew the content, `max_rows` dropped
+        // below the old menu height, but the stale larger count made
+        // `menu_sequence` clear `max(old_rows, lines.len())` rows that no longer
+        // fit below the taller content: the extra cursor-down clamped at the
+        // bottom margin and erased the last freshly drawn entry.
+        //
+        // Copilot's example: a five-row terminal with a status line, content
+        // 1→2 and menu 3→2, must leave both new entries — not one. `draw_menu`
+        // now caps the reusable old height to `max_rows` (the rows that still
+        // fit below the new content) before calling `menu_sequence`.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let max_rows = menu_max_rows(5, 2, true);
+        assert_eq!(max_rows, 2);
+        let old_menu_rows = 3;
+        // Uncapped, the stale count clears three rows: the third `\x1b[2K`
+        // clamps at the bottom margin and erases the last drawn entry.
+        let (stale_seq, _) = menu_sequence(old_menu_rows, &lines, true, 1);
+        assert_eq!(stale_seq.matches("\x1b[2K").count(), 3);
+        // Capped to the rows that still fit, exactly the two entries are drawn
+        // — no over-clear, no spurious anchor scroll-back.
+        let capped = old_menu_rows.min(max_rows);
+        assert_eq!(capped, 2);
+        let (seq, rows) = menu_sequence(capped, &lines, true, 1);
+        assert_eq!(rows, 2);
+        assert_eq!(seq.matches("\x1b[2K").count(), 2);
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
+    }
+
+    #[test]
+    fn menu_height_reserves_the_full_wrapped_content_height() {
+        // Regression: `max_rows` reserved only one prompt row, so a wrapped
+        // input plus a tall menu could exceed the scroll region. Drawing it then
+        // fed IND scrolls that pushed the edit row (and prompt) off the top, and
+        // the matching cursor-up clamped at row 1 — saving/restoring the wrong
+        // position. The reserve must count the whole rendered content height.
+        //
+        // Copilot's example: a five-row terminal with a status line and a
+        // three-row input must leave at most one menu row (5 - 3 - 1), never
+        // three, so `content + menu + status` stays within the terminal.
+        assert_eq!(menu_max_rows(5, 3, true), 1);
+        // Without a status line one more row is free.
+        assert_eq!(menu_max_rows(5, 3, false), 2);
+        // When the content already fills the usable rows the menu is suppressed.
+        assert_eq!(menu_max_rows(4, 3, true), 0);
+        assert_eq!(menu_max_rows(3, 3, false), 0);
+        // A single-row input matches the historical reserve (`rows - 1`, or
+        // `rows - 2` with a status line), capped at the menu's own 16 rows.
+        assert_eq!(menu_max_rows(24, 1, false), 16);
+        assert_eq!(menu_max_rows(10, 1, false), 9);
+        assert_eq!(menu_max_rows(10, 1, true), 8);
     }
 
     #[test]
     fn anchored_menu_scrolls_released_rows_back_down() {
         let lines = vec!["a".to_string(), "b".to_string()];
         // Opening is the same as unanchored: rows are reserved with IND.
-        assert_eq!(menu_sequence(0, &lines, true), menu_sequence(0, &lines, false));
+        assert_eq!(menu_sequence(0, &lines, true, 0), menu_sequence(0, &lines, false, 0));
         // Narrowing blanks the extra row, then scrolls the conversation down
         // one row into it so the prompt stays above the status line.
-        let (seq, rows) = menu_sequence(2, &lines[..1], true);
+        let (seq, rows) = menu_sequence(2, &lines[..1], true, 0);
         assert_eq!(rows, 1);
         assert!(seq.ends_with(&format!("\x1b8{}", crate::status::anchor_sequence(1))), "{seq:?}");
         // Closing scrolls down by every row the menu used.
-        let (seq, rows) = menu_sequence(2, &[], true);
+        let (seq, rows) = menu_sequence(2, &[], true, 0);
         assert_eq!(rows, 0);
         assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
+    }
+
+    #[test]
+    fn draw_menu_recomputes_drawn_rows_and_ignores_stale_menu_height() {
+        // `resize()` zeroes `menu_rows` before calling `draw_menu` while
+        // `drawn_rows` still carries the old menu height. A delta update would
+        // add the new menu on top of that stale total; `draw_menu` must instead
+        // recompute from the real content height so `drawn_rows` collapses back
+        // to `content + menu`.
+        let mut v = view("");
+        v.menu_enabled = true;
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        // The resize state: menu released to 0 but drawn_rows still stale-large.
+        v.menu_rows = 0;
+        v.drawn_rows = 6;
+        v.draw_menu();
+        // An empty line has no command menu, so the new menu is 0 rows and the
+        // one-row prompt is the entire content: drawn_rows must be 1, not the
+        // stale 6 (delta) nor 6-plus-anything.
+        assert_eq!(v.menu_rows, 0);
+        assert_eq!(v.drawn_rows, 1, "recomputed from content height, not the stale delta");
+    }
+
+    #[test]
+    fn draw_menu_keeps_the_menu_rows_it_reserves() {
+        // Regression for "resize removes the open command menu": `resize` used
+        // to draw the menu and then `redraw`, whose clear of all `drawn_rows`
+        // (menu included) erased the menu it had just drawn. Now `resize`
+        // redraws the input first and only then draws the menu, so the menu
+        // rows stay reserved and visible. Lock the invariant in at the
+        // `draw_menu` level: after it runs, `drawn_rows` covers the menu.
+        let mut v = view("/");
+        v.menu_enabled = true;
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        // As at the end of `resize`'s input-first pass: menu released, only the
+        // one-row prompt counted.
+        v.menu_rows = 0;
+        v.drawn_rows = 1;
+        v.draw_menu();
+        let content = v.content_rows(80);
+        assert!(v.menu_rows > 0, "a bare `/` opens the command menu");
+        assert_eq!(
+            v.drawn_rows,
+            content + v.menu_rows,
+            "drawn_rows must keep the freshly drawn menu, not erase it"
+        );
+    }
+
+    #[test]
+    fn redraw_records_the_edit_cursor_row_for_the_next_climb() {
+        // Regression for "resize resets the cursor row without moving the
+        // cursor": `resize` no longer zeroes `drawn_cursor_row`; it lets the
+        // input-first `redraw` record where the edit cursor genuinely rests at
+        // the new width, so the next redraw climbs the right amount. A wrapped
+        // line with the cursor at its end sits on the last content row.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": wraps to 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        let _ = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 3, "three content rows at 4 cols");
+        assert_eq!(
+            v.drawn_cursor_row, 2,
+            "cursor rests on the last wrapped row, recomputed — not reset to 0"
+        );
+    }
+
+    #[test]
+    fn resize_recomputes_the_cursor_row_at_the_new_width_before_climbing() {
+        // Regression for "resize redraws retain a cursor-row offset calculated
+        // for the old terminal width": `redraw` opens by climbing
+        // `drawn_cursor_row` rows from the real cursor to the prompt. That value
+        // was recorded at the OLD width; after a reflow the cursor sits a
+        // different number of rows below the prompt, so `resize` must recompute
+        // it at the NEW width first. Model the offending case: a line that sat
+        // on the prompt row at a wide terminal (drawn_cursor_row == 0) narrows
+        // so it now wraps and the cursor rests on the last row.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": one row at 40 cols, 3 rows at 4.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        // As left by the last redraw at the old wide width: cursor on row 0.
+        v.drawn_cursor_row = 0;
+        v.drawn_rows = 1;
+        assert_eq!(
+            v.cursor_position(40).0,
+            0,
+            "at 40 cols the cursor sits on the prompt row",
+        );
+        // The recompute `resize` performs before `redraw` at the new width.
+        let new_cols = 4;
+        v.drawn_cursor_row = v.cursor_position(new_cols).0;
+        assert_eq!(v.drawn_cursor_row, 2, "at 4 cols the cursor is two rows down");
+        let seq = v.redraw_sequence(new_cols, "");
+        assert!(
+            seq.starts_with("\x1b[2A"),
+            "redraw must climb from the recomputed cursor row (2), not the stale 0; got {seq:?}",
+        );
+    }
+
+    #[test]
+    fn resize_resets_drawn_rows_to_the_post_resize_span_before_redraw() {
+        // Regression for "resize leaves drawn_rows at the old-width span": a
+        // status-anchored `StatusLine::resize` anchors the edit cursor at the
+        // bottom margin and erases everything below it, so only the
+        // prompt-through-cursor rows survive. If `drawn_rows` still holds the old
+        // (taller) content+menu span, `redraw`'s clear loop walks down that many
+        // rows — clamping at the bottom margin — but climbs the full span back
+        // up, landing above the prompt and reprinting over the transcript. So
+        // `resize` resets `drawn_rows` to the surviving span (through the cursor
+        // when status-anchored) first. Model a wrapped input whose cursor sits
+        // before the end, with a stale tall span left from the old width.
+        let mut v = view("aaaaaaaa"); // 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.status = Some(Arc::new(crate::status::StatusLine::for_test()));
+        v.drawn_rows = 6; // stale old-width span (content + a menu).
+        let new_cols = 4;
+        v.cursor = 4; // mid-input: the edit cursor rests before the last row.
+        v.drawn_cursor_row = v.cursor_position(new_cols).0;
+        assert!(
+            v.drawn_cursor_row < v.content_rows(new_cols) - 1,
+            "the cursor must sit before the input's end row for this case",
+        );
+        // The reset `resize` performs before `redraw`: through the cursor.
+        v.drawn_rows = v.drawn_cursor_row + 1;
+        let span = v.drawn_rows;
+        assert!(span < 6, "the reset span must be shorter than the stale count");
+        let seq = v.redraw_sequence(new_cols, "");
+        assert_eq!(
+            seq.matches("\x1b[2K").count(),
+            span,
+            "clear loop must blank exactly the post-resize span, not the stale 6; got {seq:?}",
+        );
+        if span > 1 {
+            assert!(
+                seq.contains(&format!("\x1b[{}A", span - 1)),
+                "the up-climb must match the rows walked down so the cursor never rises above the prompt; got {seq:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn resize_menu_teardown_descends_to_the_input_end_before_clearing() {
+        // Regression for "no-status resize teardown erases input-tail rows, not
+        // the menu": without a status line `resize` blanks the old menu rows
+        // itself via `menu_sequence(menu_rows, &[], false, below)`. The menu
+        // sits below the input's END row, so when a wrapped line is edited on an
+        // earlier row the teardown must descend `below` rows (cursor-to-end)
+        // first. A `below` of 0 would clear the rows just under the cursor — the
+        // input tail — leaving the real menu rows stale when the resized menu is
+        // shorter or gone. Model a wrapped input with the cursor before its end.
+        let mut v = view("aaaaaaaa"); // 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        let cols = 4;
+        v.cursor = 4; // mid-input: the edit cursor rests before the last row.
+        let cursor_row = v.cursor_position(cols).0;
+        let end_row = v.content_rows(cols) - 1;
+        assert!(cursor_row < end_row, "the cursor must sit before the input's end row");
+        // The distance `resize` now computes for the teardown.
+        let below = v.content_rows(cols).saturating_sub(1).saturating_sub(cursor_row);
+        assert_eq!(below, end_row - cursor_row, "below is the cursor-to-end distance");
+        assert!(below > 0, "a mid-input cursor leaves rows between it and the menu");
+        // The teardown descends `below` rows before clearing the two menu rows,
+        // so it blanks the menu — not the input-tail rows immediately below the
+        // cursor — leaving no stale menu rows behind.
+        let menu_rows = 2;
+        let (seq, used) = menu_sequence(menu_rows, &[], false, below);
+        assert_eq!(used, 0, "the teardown draws no menu");
+        assert!(
+            seq.contains(&format!("\x1b7\x1b[{below}B")),
+            "teardown must descend to the input end before clearing; got {seq:?}",
+        );
+        assert_eq!(
+            seq.matches("\x1b[2K").count(),
+            menu_rows,
+            "teardown clears exactly the menu rows below the input end; got {seq:?}",
+        );
     }
 
     #[test]
@@ -1301,6 +1771,99 @@ mod tests {
         assert_eq!(view.cursor_position(4), (1, 4), "the last char fills the row: pending wrap");
         view.move_to(2);
         assert_eq!(view.cursor_position(4), (0, 4), "pending wrap stays on the row");
+    }
+
+    #[test]
+    fn wide_glyphs_wrap_by_terminal_cells_not_scalar_count() {
+        // Each CJK ideograph occupies two terminal cells, so three of them fill
+        // a six-cell content span. On a cols=8 terminal the prompt takes 2 cells
+        // ("> "), leaving 6 for the input: the three fill row 0 exactly (pending
+        // wrap) and a fourth wraps onto row 1.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("一二三");
+        assert_eq!(view.content_rows(8), 1, "three double-width glyphs fill one 6-cell row");
+        assert_eq!(view.cursor_position(8), (0, 8), "row filled exactly: pending wrap at cols");
+        view.insert("四");
+        assert_eq!(view.content_rows(8), 2, "the fourth wide glyph wraps to a new row");
+        assert_eq!(view.cursor_position(8), (1, 2));
+    }
+
+    #[test]
+    fn wide_glyph_wraps_whole_off_a_lone_trailing_cell() {
+        // cols=5 leaves 3 content cells after "> ". One wide glyph takes cols 2-3,
+        // leaving a single free cell; the next wide glyph cannot fit there, so the
+        // terminal wraps it whole rather than splitting it across the boundary.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("一二");
+        assert_eq!(view.content_rows(5), 2);
+        assert_eq!(view.cursor_position(5), (1, 2), "second wide glyph wrapped whole to row 1");
+    }
+
+    #[test]
+    fn combining_marks_take_no_cells() {
+        // A base letter plus a combining acute renders in one cell, so it must
+        // not advance the wrap column past its base.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("e\u{0301}");
+        assert_eq!(view.cursor_position(80), (0, 3), "combining mark adds no column");
+        assert_eq!(view.content_rows(80), 1);
+    }
+
+    #[test]
+    fn combining_mark_stays_with_a_base_that_fills_the_last_column() {
+        // "> " plus a 2-cell content span on cols=4. "ab" fills the span exactly
+        // (pending wrap at col 4), and the combining acute belongs to the base
+        // "b" already written in the last cell — it must not take the pending-wrap
+        // branch and spill onto a new row. The cluster "b\u{0301}" stays whole.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("ab\u{0301}");
+        assert_eq!(view.content_rows(4), 1, "combining mark stays on the base's row");
+        assert_eq!(view.cursor_position(4), (0, 4), "pending wrap, cursor at cols");
+    }
+
+    #[test]
+    fn zwj_emoji_cluster_wraps_whole_not_scalar_by_scalar() {
+        // A ZWJ family emoji is one grapheme cluster. Counted per scalar it would
+        // measure six cells (three people at two each) and split across a row
+        // boundary; measured as a cluster it is two cells and moves as a unit.
+        let mut view = view("");
+        view.prompt_width = 0;
+        view.insert("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+        assert_eq!(view.content_rows(8), 1, "the family emoji is one two-cell glyph");
+        assert_eq!(view.cursor_position(8), (0, 2), "two cells, not six");
+        // With only one free cell before it on a cols=4 row, the whole cluster
+        // wraps rather than splitting its people across the boundary.
+        view.replace_line("abc\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+        assert_eq!(view.content_rows(4), 2, "the emoji cluster wraps whole to row 1");
+        assert_eq!(view.cursor_position(4), (1, 2), "cluster placed atomically on row 1");
+    }
+
+    #[test]
+    fn cursor_inside_a_cluster_rests_on_the_cluster_start_row() {
+        // A char cursor can land between the scalars of a ZWJ family emoji
+        // (movement steps by scalar). Measured per scalar the interior index
+        // would count six cells and spill onto a second row on a narrow
+        // terminal, even though the cluster renders as one two-cell glyph on a
+        // single row. `position_at` must snap the interior index to the
+        // cluster's rendered start boundary, never a phantom later row, or
+        // `redraw_sequence` climbs above the prompt.
+        let mut view = view("");
+        view.prompt_width = 0;
+        view.insert("abc\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"); // wraps whole to row 1 at cols=4
+        // Cursor between the man and the first ZWJ: index 4 (a,b,c,man).
+        view.cursor = 4;
+        assert_eq!(
+            view.cursor_position(4),
+            (0, 3),
+            "interior index rests before the cluster (row 0), not a scalar-counted later row"
+        );
+        // Past the whole cluster: the end boundary, advanced atomically.
+        view.cursor = view.line.chars().count();
+        assert_eq!(view.cursor_position(4), (1, 2), "past the cluster: its end boundary on row 1");
     }
 
     #[test]
@@ -1496,5 +2059,165 @@ mod tests {
             let bytes = [&b"later"[..], seq].concat();
             assert!(matches!(read_key(EditMode::Turn, &bytes), Key::Queue(l) if l == "later\n"), "{seq:?}");
         }
+    }
+
+    /// A minimal terminal: printing with auto-wrap (pending wrap at the last
+    /// column) and scrolling at the bottom, CR, LF, and the CSI moves and
+    /// erases `redraw_sequence` emits.
+    struct Term {
+        grid: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+        pending: bool,
+    }
+
+    impl Term {
+        fn new(rows: usize, cols: usize) -> Self {
+            Term { grid: vec![vec![' '; cols]; rows], row: rows - 1, col: 0, pending: false }
+        }
+        fn scroll(&mut self) {
+            let cols = self.grid[0].len();
+            self.grid.remove(0);
+            self.grid.push(vec![' '; cols]);
+        }
+        fn newline(&mut self) {
+            if self.row + 1 == self.grid.len() {
+                self.scroll();
+            } else {
+                self.row += 1;
+            }
+        }
+        fn feed(&mut self, seq: &str) {
+            let cols = self.grid[0].len();
+            let mut chars = seq.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\x1b' => {
+                        assert_eq!(chars.next(), Some('['), "only CSI expected in {seq:?}");
+                        let mut n = String::new();
+                        while let Some(d) = chars.next_if(|d| d.is_ascii_digit()) {
+                            n.push(d);
+                        }
+                        let n: usize = n.parse().unwrap_or(1);
+                        self.pending = false;
+                        match chars.next().unwrap() {
+                            'A' => self.row = self.row.saturating_sub(n),
+                            'B' => self.row = (self.row + n).min(self.grid.len() - 1),
+                            'C' => self.col = (self.col + n).min(cols - 1),
+                            'K' => self.grid[self.row] = vec![' '; cols],
+                            'm' => {}
+                            other => panic!("unexpected CSI {other}"),
+                        }
+                    }
+                    '\r' => {
+                        self.col = 0;
+                        self.pending = false;
+                    }
+                    '\n' => {
+                        // OPOST/ONLCR: a newline is CRLF.
+                        self.col = 0;
+                        self.pending = false;
+                        self.newline();
+                    }
+                    _ => {
+                        if self.pending {
+                            self.col = 0;
+                            self.pending = false;
+                            self.newline();
+                        }
+                        self.grid[self.row][self.col] = c;
+                        if self.col + 1 == cols {
+                            self.pending = true;
+                        } else {
+                            self.col += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fn lines(&self) -> Vec<String> {
+            self.grid.iter().map(|r| r.iter().collect::<String>().trim_end().to_string()).collect()
+        }
+    }
+
+    #[test]
+    fn redraw_that_scrolls_keeps_the_prompt_in_place() {
+        // A 10-wide, 4-row screen with the prompt on the bottom row. Editing
+        // at the start of the line while the input wraps scrolls the screen on
+        // each growth; the input must be reprinted over itself, not stacked.
+        let (cols, rows) = (10, 4);
+        let mut term = Term::new(rows, cols);
+        let mut v = view("");
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        for c in "xxxxxxx".chars() {
+            v.line.push(c);
+            v.cursor += 1;
+            term.feed(&v.redraw_sequence(cols, ""));
+        }
+        v.cursor = 0;
+        term.feed(&v.redraw_sequence(cols, ""));
+        for c in "abcdefghijklm".chars() {
+            v.line.insert(v.byte_of(v.cursor), c);
+            v.cursor += 1;
+            term.feed(&v.redraw_sequence(cols, ""));
+            // Exactly one prompt on screen, and the cursor where the model says.
+            let prompts = term.lines().iter().filter(|l| l.starts_with("> ")).count();
+            assert_eq!(prompts, 1, "stacked copies after {c:?}: {:#?}", term.lines());
+            let (row, col) = v.cursor_position(cols);
+            let content = v.content_rows(cols);
+            assert_eq!(term.row, rows - content + row, "cursor row after {c:?}");
+            assert_eq!(term.col, col.min(cols - 1), "cursor column after {c:?}");
+        }
+        assert_eq!(term.lines()[1..], ["> abcdefgh", "ijklmxxxxx", "xx"]);
+    }
+
+    #[test]
+    fn redraw_leaves_rows_below_the_input_alone() {
+        // No erase-below: the status line under the input must survive.
+        let mut v = view("hello");
+        v.mode = EditMode::Prompt;
+        let seq = v.redraw_sequence(80, "");
+        assert!(!seq.contains("\x1b[J"), "{seq:?}");
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
+    }
+
+    #[test]
+    fn shrinking_wrapped_input_collapses_released_rows_under_the_status_line() {
+        // With a pinned status line, a wrapped input that becomes shorter frees
+        // rows above the status line. Blanking them alone leaves the prompt
+        // above a gap, so the redraw must scroll the conversation back down with
+        // the anchor helper (as `menu_sequence` does), keeping the prompt
+        // directly above the status line.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": wraps to 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.status = Some(Arc::new(crate::status::StatusLine::for_test()));
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        // First redraw records the 3-row draw.
+        let _ = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 3);
+        // Delete back to a single row (Ctrl-U to one char): "a" fits one row.
+        v.line = "a".into();
+        v.cursor = 1;
+        let seq = v.redraw_sequence(4, "");
+        assert_eq!(v.drawn_rows, 1, "one content row now");
+        // Two rows were released, so the conversation scrolls down two rows.
+        assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
+    }
+
+    #[test]
+    fn shrinking_input_without_a_status_line_does_not_anchor() {
+        // No status line: there is no bottom-anchor invariant, so a shorter
+        // input must not emit the anchor scroll (which would corrupt output).
+        let mut v = view("aaaaaaaa");
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        let _ = v.redraw_sequence(4, "");
+        v.line = "a".into();
+        v.cursor = 1;
+        let seq = v.redraw_sequence(4, "");
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
     }
 }
