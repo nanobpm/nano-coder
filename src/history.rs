@@ -365,7 +365,7 @@ mod tests {
         let mut log = SessionLog::create(dir, "h").unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
         log.append(&Record::Message(Message::user("fix the flaky test in auth.rs"))).unwrap();
-        let call = crate::llm::ToolCall { id: "c1".into(), name: "bash".into(), arguments: json!({"command": "cargo test auth"}), item_id: None };
+        let call = crate::llm::ToolCall { id: "c1".into(), name: "bash".into(), arguments: json!({"command": "cargo test auth"}), item_id: None, malformed_arguments: None };
         log.append(&Record::Message(Message::assistant_with_tools("", vec![call]))).unwrap();
         let long = format!("{}error[E0308]: mismatched types at auth.rs:42{}", "a ".repeat(400), " b".repeat(400));
         log.append(&Record::Message(Message::tool_error("c1", "bash", &long))).unwrap();
@@ -510,7 +510,7 @@ mod tests {
         assert!(!consumes_hint(&Message::user(FAILED_TOOL_HINT)));
         assert!(!consumes_hint(&Message::assistant(FAILED_TOOL_HINT)));
         // A history-tool call (assistant) and its result (tool) both consume it.
-        let call = crate::llm::ToolCall { id: "h".into(), name: SEARCH_TOOL.into(), arguments: json!({}), item_id: None };
+        let call = crate::llm::ToolCall { id: "h".into(), name: SEARCH_TOOL.into(), arguments: json!({}), item_id: None, malformed_arguments: None };
         assert!(consumes_hint(&Message::assistant_with_tools("", vec![call])));
         assert!(consumes_hint(&Message::tool_result("h", READ_TOOL, "results")));
         // An assistant that only names a history tool in its text does not.

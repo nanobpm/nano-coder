@@ -16,14 +16,10 @@ const MAX_LINE_CHARS: usize = 2000;
 const MAX_READ_BYTES: usize = 100_000;
 
 fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
-    // A malformed-arguments marker means the model's JSON never decoded; the
-    // dispatch loop normally rejects these calls first, so this is a backstop.
-    if args.get(crate::llm::INVALID_ARGS_KEY).is_some() {
-        bail!(
-            "the arguments arrived as malformed JSON and could not be parsed; \
-             retry the tool call with the same arguments"
-        );
-    }
+    // A malformed-arguments failure means the model's JSON never decoded; the
+    // dispatch loop rejects these calls before any tool runs (via
+    // `ToolCall::raw_arguments_error`), so by the time a handler sees
+    // `arguments` it is always well-formed JSON.
     match args.get(name) {
         None => bail!("missing required argument {name:?}"),
         Some(Value::Null) => bail!("argument {name:?} is null; provide a string value"),
@@ -271,9 +267,6 @@ mod tests {
         // Wrong JSON type.
         let err = write_file(&json!({ "path": 42, "content": "x" })).unwrap_err();
         assert!(err.to_string().contains("must be a string, got a number"), "{err}");
-        // Malformed-arguments marker is reported as a transport problem.
-        let err = write_file(&json!({ crate::llm::INVALID_ARGS_KEY: "{\"path\":" })).unwrap_err();
-        assert!(err.to_string().contains("malformed JSON"), "{err}");
     }
 
     #[test]

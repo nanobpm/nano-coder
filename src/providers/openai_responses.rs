@@ -161,28 +161,22 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
                     thinking_blocks.push(item.clone());
                 }
             }
-            Some("function_call") => tool_calls.push(ToolCall {
-                id: item
+            Some("function_call") => {
+                let id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                name: item
+                    .to_string();
+                let name = item
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                arguments: ToolCall::decode_arguments(
-                    item.get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ),
-                item_id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }),
+                    .to_string();
+                let raw = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                tool_calls.push(ToolCall::from_raw_arguments(id, name, raw, item_id));
+            }
             _ => {}
         }
     }
@@ -349,15 +343,13 @@ impl StreamAccumulator {
             .into_iter()
             .filter(|(_, call)| !call.name.is_empty())
             .enumerate()
-            .map(|(position, (_, call))| ToolCall {
-                id: if call.id.is_empty() {
-                    format!("call_{position}")
-                } else {
-                    call.id
-                },
-                name: call.name,
-                arguments: ToolCall::decode_arguments(&call.arguments),
-                item_id: call.item_id,
+            .map(|(position, (_, call))| {
+                ToolCall::from_raw_arguments(
+                    if call.id.is_empty() { format!("call_{position}") } else { call.id },
+                    call.name,
+                    &call.arguments,
+                    call.item_id,
+                )
             })
             .collect();
         LLMResponse {
@@ -451,6 +443,7 @@ mod tests {
                     name: "get_time".into(),
                     arguments: json!({"tz": "utc"}),
                     item_id: None,
+                    malformed_arguments: None,
                 }],
             ),
             Message::tool_result("call_1", "get_time", "noon"),
@@ -592,6 +585,7 @@ mod tests {
                         name: "bash".into(),
                         arguments: json!({}),
                         item_id: None,
+                        malformed_arguments: None,
                     }],
                 )
             },

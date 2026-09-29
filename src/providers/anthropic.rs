@@ -100,12 +100,15 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
                     blocks.push(json!({"type": "text", "text": message.content}));
                 }
                 for call in &message.tool_calls {
-                    // Replay malformed arguments verbatim (they are stored as a
-                    // bare string) so the provider sees the same text; only
-                    // non-string, non-object shapes collapse to `{}`.
+                    // Anthropic requires `tool_use.input` to be an object. A
+                    // malformed call carries its raw text as dedicated
+                    // metadata, not in `arguments`, so it replays as the empty
+                    // object it was decoded to. Legacy session logs (pre-change)
+                    // could still hold malformed arguments as a bare
+                    // `Value::String`; those upgrade to `{}` here rather than
+                    // emitting an invalid string `input`.
                     let input = match &call.arguments {
                         Value::Object(_) => call.arguments.clone(),
-                        Value::String(raw) => Value::String(raw.clone()),
                         _ => json!({}),
                     };
                     blocks.push(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}));
@@ -149,6 +152,7 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
                 name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
                 item_id: None,
+                malformed_arguments: None,
             }),
             _ => {}
         }
@@ -272,15 +276,12 @@ impl StreamAccumulator {
                         response.thinking_blocks.push(block);
                     }
                 }
-                Block::ToolUse { id, name, json } => response.tool_calls.push(ToolCall {
-                    id,
-                    name,
-                    // Keep malformed JSON marked (under INVALID_ARGS_KEY)
-                    // instead of erasing it to `{}`, so the dispatch loop can
-                    // tell a truncated stream apart from omitted arguments.
-                    arguments: ToolCall::decode_arguments(&json),
-                    item_id: None,
-                }),
+                Block::ToolUse { id, name, json } => {
+                    // Keep malformed JSON as dedicated metadata instead of
+                    // erasing it to `{}`, so the dispatch loop can tell a
+                    // truncated stream apart from omitted arguments.
+                    response.tool_calls.push(ToolCall::from_raw_arguments(id, name, &json, None))
+                }
             }
         }
         response
@@ -399,14 +400,9 @@ mod tests {
             Message::assistant_with_tools(
                 "checking",
                 vec![
-                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None },
-                    // Malformed arguments arrive marked under INVALID_ARGS_KEY.
-                    ToolCall {
-                        id: "t2".into(),
-                        name: "bash".into(),
-                        arguments: crate::llm::ToolCall::decode_arguments("{bad"),
-                        item_id: None,
-                    },
+                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None },
+                    // Malformed arguments arrive as dedicated metadata.
+                    ToolCall::from_raw_arguments("t2".into(), "bash".into(), "{bad", None),
                 ],
             ),
             Message::tool_result("t1", "get_time", "noon"),
@@ -426,8 +422,9 @@ mod tests {
         let encoded = body["messages"].as_array().unwrap();
         assert_eq!(encoded.len(), 3);
         assert_eq!(encoded[1]["content"][1]["type"], "tool_use");
-        // The malformed call replays its marked arguments (an object), not `{}`.
-        assert_eq!(encoded[1]["content"][2]["input"], json!({ crate::llm::INVALID_ARGS_KEY: "{bad" }));
+        // Anthropic requires tool_use.input to be an object: the malformed call
+        // replays as the empty object it was decoded to, never a bare string.
+        assert_eq!(encoded[1]["content"][2]["input"], json!({}));
         assert_eq!(encoded[2]["role"], "user");
         assert_eq!(encoded[2]["content"].as_array().unwrap().len(), 2);
         assert_eq!(encoded[2]["content"][1]["tool_use_id"], "t2");

@@ -135,17 +135,12 @@ pub fn copilot_aic(value: &Value) -> Option<f64> {
     Some(nano / 1e9)
 }
 
-/// Reserved key marking tool-call arguments whose raw JSON could not be
-/// decoded (a truncated or malformed stream). The value is the verbatim text
-/// the model produced. No real tool schema uses this key, so it survives
-/// validation and is visible to the dispatch loop.
-pub const INVALID_ARGS_KEY: &str = "__invalid_json";
-
 /// Tool-call requested by LLM. `arguments` is normally the decoded JSON
 /// object. When the model produced invalid JSON (e.g. a truncated stream),
-/// it is kept verbatim under [`INVALID_ARGS_KEY`] in an otherwise empty
-/// object, so the failure is explicit and replayable instead of looking like
-/// a missing argument.
+/// the failure is recorded out-of-band in [`ToolCall::malformed_arguments`]
+/// and `arguments` is left empty, so the failure is explicit and replayable
+/// instead of looking like a missing argument — and so no key is reserved in
+/// the model-controlled argument object.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Call id (`call_*`) used to pair a tool result with its call; stable
@@ -160,20 +155,40 @@ pub struct ToolCall {
     /// no separate item id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    /// The verbatim argument text when it could not be decoded as JSON (a
+    /// truncated or malformed stream). Kept as dedicated metadata rather than
+    /// inside `arguments` so it can never collide with a legitimate argument
+    /// key the model produced, and so it is not replayed to the model as part
+    /// of the argument object. `None` when the arguments decoded fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub malformed_arguments: Option<String>,
 }
 
 impl ToolCall {
-    pub fn decode_arguments(raw: &str) -> Value {
+    /// Build a call from the raw argument text a provider streamed. Valid JSON
+    /// becomes `arguments`; malformed JSON is kept verbatim in
+    /// `malformed_arguments` with `arguments` left empty, so the dispatch loop
+    /// can reject the call with a clear retry error instead of running a tool
+    /// against garbage or misreporting a missing field.
+    pub fn from_raw_arguments(id: String, name: String, raw: &str, item_id: Option<String>) -> Self {
+        let (arguments, malformed_arguments) = Self::split_arguments(raw);
+        Self { id, name, arguments, item_id, malformed_arguments }
+    }
+
+    /// Decode raw argument text into the argument object, returning the
+    /// verbatim text separately when decoding failed. Empty input is an empty
+    /// object with no failure.
+    fn split_arguments(raw: &str) -> (Value, Option<String>) {
         if raw.trim().is_empty() {
-            return json!({});
+            return (json!({}), None);
         }
         match serde_json::from_str(raw) {
-            Ok(value) => value,
-            // Keep the malformed text under a reserved key rather than
-            // dropping it: an empty object would look like the model omitted
-            // every argument, and a bare string would be re-sent verbatim and
-            // fail again on replay.
-            Err(_) => json!({ INVALID_ARGS_KEY: raw }),
+            Ok(value) => (value, None),
+            // Keep the malformed text as dedicated metadata rather than
+            // dropping it: an empty object alone would look like the model
+            // omitted every argument, and a bare string would be re-sent
+            // verbatim and fail again on replay.
+            Err(_) => (json!({}), Some(raw.to_string())),
         }
     }
 
@@ -186,7 +201,7 @@ impl ToolCall {
 
     /// The raw malformed argument text, when decoding failed.
     pub fn invalid_arguments(&self) -> Option<&str> {
-        self.arguments.get(INVALID_ARGS_KEY).and_then(Value::as_str)
+        self.malformed_arguments.as_deref()
     }
 
     /// Model-facing error explaining that the arguments arrived malformed and
@@ -371,16 +386,18 @@ mod tests {
     #[test]
     fn decodes_valid_arguments_and_marks_invalid_ones() {
         // Valid JSON decodes normally; empty input is an empty object.
-        assert_eq!(ToolCall::decode_arguments(r#"{"path":"/tmp/x"}"#), json!({"path": "/tmp/x"}));
-        assert_eq!(ToolCall::decode_arguments(""), json!({}));
-        assert_eq!(ToolCall::decode_arguments("   "), json!({}));
+        let valid = ToolCall::from_raw_arguments("c".into(), "write_file".into(), r#"{"path":"/tmp/x"}"#, None);
+        assert_eq!(valid.arguments, json!({"path": "/tmp/x"}));
+        assert_eq!(valid.invalid_arguments(), None);
+        assert!(ToolCall::from_raw_arguments("c".into(), "t".into(), "", None).arguments.is_object());
+        assert!(ToolCall::from_raw_arguments("c".into(), "t".into(), "   ", None).invalid_arguments().is_none());
 
-        // Malformed JSON is preserved under the reserved key, not dropped.
+        // Malformed JSON is preserved as dedicated metadata, not folded into
+        // the argument object (so it can never collide with a real argument
+        // key, and is not replayed to the model as an argument).
         let raw = r#"{"path":"/tmp/x","content":"abc"#;
-        let decoded = ToolCall::decode_arguments(raw);
-        assert_eq!(decoded, json!({ INVALID_ARGS_KEY: raw }));
-
-        let call = ToolCall { id: "c1".into(), name: "write_file".into(), arguments: decoded, item_id: None };
+        let call = ToolCall::from_raw_arguments("c1".into(), "write_file".into(), raw, None);
+        assert_eq!(call.arguments, json!({}), "malformed args leave the object empty");
         assert_eq!(call.invalid_arguments(), Some(raw));
         let error = call.raw_arguments_error().expect("malformed args report an error");
         assert!(error.contains("write_file"), "names the tool: {error}");
@@ -390,7 +407,7 @@ mod tests {
         assert!(error.contains(r#"{"path":"/tmp/x"#), "shows the raw text: {error}");
 
         // A well-formed call reports no error.
-        let ok = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: json!({"path": "/tmp/x"}), item_id: None };
+        let ok = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: json!({"path": "/tmp/x"}), item_id: None, malformed_arguments: None };
         assert!(ok.invalid_arguments().is_none());
         assert!(ok.raw_arguments_error().is_none());
     }
@@ -398,7 +415,7 @@ mod tests {
     #[test]
     fn raw_arguments_error_truncates_long_payloads() {
         let raw = format!(r#"{{"content":"{}"#, "x".repeat(1000));
-        let call = ToolCall { id: "c".into(), name: "write_file".into(), arguments: ToolCall::decode_arguments(&raw), item_id: None };
+        let call = ToolCall::from_raw_arguments("c".into(), "write_file".into(), &raw, None);
         let error = call.raw_arguments_error().unwrap();
         // Only the first 300 chars of the payload are echoed, with an ellipsis.
         assert!(error.contains('…'), "truncated payload is marked: {error}");
