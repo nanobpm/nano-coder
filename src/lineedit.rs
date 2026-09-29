@@ -14,7 +14,38 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::input_history::InputHistory;
+use unicode_width::UnicodeWidthChar;
+
 use crate::status::StatusLine;
+
+/// Advance a wrap position by one input character, measured in terminal cells.
+///
+/// `col` is the column the next cell would be written to (`0..=cols`, where
+/// `cols` is a pending wrap left by a row filled exactly). Terminals lay glyphs
+/// out by cell width, not scalar count: CJK ideographs and most emoji occupy
+/// two cells and never straddle the right edge — when only the trailing cell is
+/// free the terminal leaves it blank and wraps the glyph whole — while
+/// combining marks occupy zero. A `'\n'` starts a fresh row.
+fn advance_cell(row: usize, col: usize, cols: usize, c: char) -> (usize, usize) {
+    if c == '\n' {
+        return (row + 1, 0);
+    }
+    let (mut row, mut col) = (row, col);
+    // A row filled exactly is a pending wrap: the next cell starts a new row.
+    if col >= cols {
+        row += 1;
+        col = 0;
+    }
+    let w = UnicodeWidthChar::width(c).unwrap_or(0);
+    // A double-width glyph cannot occupy a lone trailing cell; the terminal
+    // wraps it whole, leaving that cell blank.
+    if w == 2 && col + 1 == cols {
+        row += 1;
+        col = 0;
+    }
+    col += w;
+    (row, col)
+}
 
 /// Where the line being typed is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,19 +330,9 @@ impl EditView {
         }
         let (mut row, mut col) = self.prompt_start(cols);
         for c in self.line.chars() {
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                // Pending wrap, matching `cursor_position`: a row filled
-                // exactly leaves the cursor on it, and only the *next*
-                // character starts a new row.
-                if col == cols {
-                    row += 1;
-                    col = 0;
-                }
-                col += 1;
-            }
+            let (r, cc) = advance_cell(row, col, cols, c);
+            row = r;
+            col = cc;
         }
         row + 1
     }
@@ -348,16 +369,9 @@ impl EditView {
         let cols = cols.max(1);
         let (mut row, mut col) = self.prompt_start(cols);
         for c in self.line.chars().take(idx) {
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                if col == cols {
-                    row += 1;
-                    col = 0;
-                }
-                col += 1;
-            }
+            let (r, cc) = advance_cell(row, col, cols, c);
+            row = r;
+            col = cc;
         }
         (row, col)
     }
@@ -1342,6 +1356,45 @@ mod tests {
         assert_eq!(view.cursor_position(4), (1, 4), "the last char fills the row: pending wrap");
         view.move_to(2);
         assert_eq!(view.cursor_position(4), (0, 4), "pending wrap stays on the row");
+    }
+
+    #[test]
+    fn wide_glyphs_wrap_by_terminal_cells_not_scalar_count() {
+        // Each CJK ideograph occupies two terminal cells, so three of them fill
+        // a six-cell content span. On a cols=8 terminal the prompt takes 2 cells
+        // ("> "), leaving 6 for the input: the three fill row 0 exactly (pending
+        // wrap) and a fourth wraps onto row 1.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("一二三");
+        assert_eq!(view.content_rows(8), 1, "three double-width glyphs fill one 6-cell row");
+        assert_eq!(view.cursor_position(8), (0, 8), "row filled exactly: pending wrap at cols");
+        view.insert("四");
+        assert_eq!(view.content_rows(8), 2, "the fourth wide glyph wraps to a new row");
+        assert_eq!(view.cursor_position(8), (1, 2));
+    }
+
+    #[test]
+    fn wide_glyph_wraps_whole_off_a_lone_trailing_cell() {
+        // cols=5 leaves 3 content cells after "> ". One wide glyph takes cols 2-3,
+        // leaving a single free cell; the next wide glyph cannot fit there, so the
+        // terminal wraps it whole rather than splitting it across the boundary.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("一二");
+        assert_eq!(view.content_rows(5), 2);
+        assert_eq!(view.cursor_position(5), (1, 2), "second wide glyph wrapped whole to row 1");
+    }
+
+    #[test]
+    fn combining_marks_take_no_cells() {
+        // A base letter plus a combining acute renders in one cell, so it must
+        // not advance the wrap column past its base.
+        let mut view = view("");
+        view.prompt_width = 2;
+        view.insert("e\u{0301}");
+        assert_eq!(view.cursor_position(80), (0, 3), "combining mark adds no column");
+        assert_eq!(view.content_rows(80), 1);
     }
 
     #[test]
