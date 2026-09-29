@@ -248,10 +248,18 @@ impl EditView {
             return;
         }
         let (rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        // Reserve the prompt row, plus the status row only when a status line
-        // is present (none under AGENTIC_NO_STATUS or a short terminal).
-        let reserved = if self.status.is_some() { 2 } else { 1 };
-        let max_rows = (rows as usize).saturating_sub(reserved).min(16);
+        // The input may wrap across several rows and the menu is drawn below
+        // that whole rendered height, so reserve the *full* content height —
+        // plus the status row when one is pinned — not just a single prompt
+        // row. Capping the menu to the rows that remain keeps
+        // `content + menu (+ status)` within the terminal, so
+        // `menu_sequence`'s IND descent never scrolls the prompt (or an
+        // earlier edit row) off the top and clamps the save/restore at row 1.
+        // When no rows remain the menu is suppressed (`max_rows == 0` yields
+        // no entries). For a single-row input this matches the old reserve
+        // (`rows - 1`, or `rows - 2` with a status line).
+        let content = self.content_rows(cols as usize);
+        let max_rows = menu_max_rows(rows as usize, content, self.status.is_some());
         let lines = if self.menu_hidden {
             Vec::new()
         } else if crate::commands::has_argument_menu(&self.line) {
@@ -269,7 +277,6 @@ impl EditView {
         // row. Draw the menu below that end row, not below an earlier edit row,
         // so a wrapped command edited on an earlier row does not have its tail
         // rows painted over by the menu.
-        let content = self.content_rows(cols as usize);
         let below = content.saturating_sub(1).saturating_sub(self.drawn_cursor_row);
         let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some(), below);
         // Recompute `drawn_rows` (content + menu) from the *current* content
@@ -759,6 +766,21 @@ impl EditView {
         }
         line
     }
+}
+
+/// The number of command-menu rows that fit below a `content`-row input on a
+/// `rows`-high terminal, leaving the status row (`has_status`) intact and never
+/// exceeding the menu's own 16-row cap. Reserving the *full* rendered content
+/// height — not just a single prompt row — keeps `content + menu (+ status)`
+/// within the terminal, so `menu_sequence`'s IND descent never scrolls the
+/// input (or the prompt) off the top and clamps the cursor save/restore at the
+/// top row. Zero means no room remains, which suppresses the menu. For a
+/// single-row input this matches the historical reserve (`rows - 1`, or
+/// `rows - 2` with a status line).
+fn menu_max_rows(rows: usize, content: usize, has_status: bool) -> usize {
+    rows.saturating_sub(content)
+        .saturating_sub(has_status as usize)
+        .min(16)
 }
 
 /// Terminal output that shows `lines` below the cursor's row (which holds
@@ -1365,6 +1387,30 @@ mod tests {
         // Reusing already-reserved rows needs no scroll, but still descends.
         let (seq, rows) = menu_sequence(2, &lines[..1], false, 2);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+    }
+
+    #[test]
+    fn menu_height_reserves_the_full_wrapped_content_height() {
+        // Regression: `max_rows` reserved only one prompt row, so a wrapped
+        // input plus a tall menu could exceed the scroll region. Drawing it then
+        // fed IND scrolls that pushed the edit row (and prompt) off the top, and
+        // the matching cursor-up clamped at row 1 — saving/restoring the wrong
+        // position. The reserve must count the whole rendered content height.
+        //
+        // Copilot's example: a five-row terminal with a status line and a
+        // three-row input must leave at most one menu row (5 - 3 - 1), never
+        // three, so `content + menu + status` stays within the terminal.
+        assert_eq!(menu_max_rows(5, 3, true), 1);
+        // Without a status line one more row is free.
+        assert_eq!(menu_max_rows(5, 3, false), 2);
+        // When the content already fills the usable rows the menu is suppressed.
+        assert_eq!(menu_max_rows(4, 3, true), 0);
+        assert_eq!(menu_max_rows(3, 3, false), 0);
+        // A single-row input matches the historical reserve (`rows - 1`, or
+        // `rows - 2` with a status line), capped at the menu's own 16 rows.
+        assert_eq!(menu_max_rows(24, 1, false), 16);
+        assert_eq!(menu_max_rows(10, 1, false), 9);
+        assert_eq!(menu_max_rows(10, 1, true), 8);
     }
 
     #[test]
