@@ -339,6 +339,14 @@ fn line_at(text: &str, at: usize) -> u64 {
     text[..at].bytes().filter(|&b| b == b'\n').count() as u64 + 1
 }
 
+/// Whether byte offset `at` sits at the start of a physical line — either the
+/// file start or immediately after a newline (`\n`, which also terminates a
+/// `\r\n` line). A stripped line-number candidate must begin here, not merely
+/// somewhere on its named line, so it can't retarget a mid-line substring.
+fn at_line_start(text: &str, at: usize) -> bool {
+    at == 0 || text.as_bytes()[at - 1] == b'\n'
+}
+
 /// The file's lines as (start, end-of-content, end-including-terminator)
 /// byte offsets.
 fn line_spans(text: &str) -> Vec<(usize, usize, usize)> {
@@ -506,14 +514,16 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         let normalized = to_file_endings(text, o);
         let candidates: Vec<&str> = if normalized != *o { vec![o.as_str(), normalized.as_str()] } else { vec![o.as_str()] };
         // For a stripped candidate, keep only matches that actually start on
-        // the line its (consecutive) numbers name. Genuine TSV data whose
-        // leading integers merely look prefix-shaped won't sit on that line,
-        // so it can't retarget an unrelated block by being stripped.
+        // the line its (consecutive) numbers name AND begin at that physical
+        // line's boundary — a match landing mid-line (e.g. `foo` inside line 2's
+        // `prefix foo suffix`) is a genuine substring, not the numbered row, so
+        // stripping must not retarget it. Genuine TSV data whose leading integers
+        // merely look prefix-shaped won't sit at that line start either.
         let mut ranges: Vec<(usize, usize)> = candidates
             .iter()
             .flat_map(|c| text.match_indices(c))
             .map(|(at, m)| (at, at + m.len()))
-            .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
+            .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo && at_line_start(text, at)))
             .collect();
         ranges.sort_unstable();
         ranges.dedup();
@@ -1288,6 +1298,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "FOO\n\nBAR\n");
+    }
+
+    #[test]
+    fn stripped_line_number_match_must_begin_at_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Numbered `old_string` claims line 2 but its stripped content `foo` also
+        // occurs mid-line inside line 2's `prefix foo suffix`. The stripped
+        // candidate is anchored to line 2, yet the only occurrence there starts
+        // mid-line, not at the line boundary — that is a genuine substring, not
+        // the numbered row. The edit must be rejected, not silently retarget the
+        // interior `foo`.
+        let p = read_fixture(&dir, "m.txt", "alpha\nprefix foo suffix\n");
+        let err = edit_file(&json!({
+            "path": p, "old_string": "     2\tfoo", "new_string": "BAR"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\nprefix foo suffix\n");
     }
 
     #[test]
