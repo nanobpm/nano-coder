@@ -150,6 +150,7 @@ src/
 ├── ui.rs        # Verbosity levels and the streaming output renderer
 ├── frame.rs     # App-owned frame renderer (renderer = "frame"): full redraw on resize
 ├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, mid-turn input on the status line)
+├── input_history.rs # Up/Down recall of submitted lines (session-scoped)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
 ├── queue.rs     # The interactive message queue and the /queue editor
@@ -550,7 +551,8 @@ error).
 on the status line; Enter adds it to the message queue (one queued message runs per
 following turn; `/queue` lists, edits and removes them), Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
-Alt/Option-Left/Right (or Alt-B/Alt-F) move by word. The mouse is never captured, so the
+Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
+the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
 input and Ctrl-W deletes the word before the cursor. Ctrl-Enter (or Cmd-Enter) inserts a
 newline without sending, and pasted text keeps its line breaks as a single multi-line input

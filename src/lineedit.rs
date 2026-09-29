@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::input_history::InputHistory;
 use crate::status::StatusLine;
 
 /// Where the line being typed is shown.
@@ -55,6 +56,8 @@ pub struct EditView {
     /// no longer writes escape sequences itself. Instead each change calls this
     /// with `(line, cursor)` so the single frame writer redraws the editor row.
     on_edit: Option<EditHook>,
+    /// Submitted lines, browsed with Up/Down.
+    history: InputHistory,
 }
 
 /// What the argument type-ahead needs from the agent loop.
@@ -88,6 +91,7 @@ impl EditView {
             drawn_rows: 0,
             drawn_cursor_row: 0,
             on_edit: None,
+            history: InputHistory::default(),
         }))
     }
 
@@ -186,6 +190,7 @@ impl EditView {
 
     fn line_changed(&mut self) {
         self.menu_hidden = false;
+        self.history.edited();
         self.draw_menu();
     }
 
@@ -548,6 +553,30 @@ impl EditView {
         self.move_to(i);
     }
 
+    /// Up: replace the input with the previous history entry (the first press
+    /// saves the line being typed; Down past the newest entry restores it).
+    /// At the oldest entry the line stays put.
+    fn history_up(&mut self) {
+        let Some(entry) = self.history.up(&self.line).map(str::to_string) else { return };
+        self.set_line(&entry);
+    }
+
+    /// Down: the next-newer history entry, or the saved draft past the newest.
+    fn history_down(&mut self) {
+        let Some(entry) = self.history.down().map(str::to_string) else { return };
+        self.set_line(&entry);
+    }
+
+    /// Swap the whole input for a recalled entry, keeping the menu and the
+    /// history position in sync without tripping the "line changed" reset.
+    fn set_line(&mut self, line: &str) {
+        self.line = line.to_string();
+        self.cursor = line.chars().count();
+        self.menu_hidden = false;
+        self.draw_edit();
+        self.draw_menu();
+    }
+
     fn take(&mut self) -> String {
         if let Some(hook) = self.on_edit.clone() {
             // The frame renderer owns the screen: no menu teardown or newline;
@@ -555,6 +584,8 @@ impl EditView {
             // is redrawn empty.
             self.restamp_prompt();
             let line = std::mem::take(&mut self.line);
+            self.history.record(&line);
+            self.history.edited();
             self.cursor = 0;
             self.drawn_rows = 0;
             self.drawn_cursor_row = 0;
@@ -569,6 +600,8 @@ impl EditView {
         self.menu_hidden = false;
         self.restamp_prompt();
         let line = std::mem::take(&mut self.line);
+        self.history.record(&line);
+        self.history.edited();
         self.cursor = 0;
         self.drawn_rows = 0;
         self.drawn_cursor_row = 0;
@@ -722,6 +755,9 @@ impl Drop for KeyMode {
 enum Esc {
     Left,
     Right,
+    /// Up/Down: recall an older/newer input from the history.
+    HistoryUp,
+    HistoryDown,
     Home,
     End,
     WordLeft,
@@ -931,6 +967,8 @@ impl LineReader {
                                 match parse_escape(&seq) {
                                     Esc::Left => shared.lock().unwrap().move_left(),
                                     Esc::Right => shared.lock().unwrap().move_right(),
+                                    Esc::HistoryUp => shared.lock().unwrap().history_up(),
+                                    Esc::HistoryDown => shared.lock().unwrap().history_down(),
                                     Esc::Home => shared.lock().unwrap().move_home(),
                                     Esc::End => shared.lock().unwrap().move_end(),
                                     Esc::WordLeft => shared.lock().unwrap().move_word_left(),
@@ -983,6 +1021,8 @@ fn parse_escape(seq: &[u8]) -> Esc {
         // SS3 application cursor keys and Home/End.
         [0x1b, b'O', b'D'] => return Esc::Left,
         [0x1b, b'O', b'C'] => return Esc::Right,
+        [0x1b, b'O', b'A'] => return Esc::HistoryUp,
+        [0x1b, b'O', b'B'] => return Esc::HistoryDown,
         [0x1b, b'O', b'H'] => return Esc::Home,
         [0x1b, b'O', b'F'] => return Esc::End,
         // Alt-b / Alt-f (readline word jumps), sent as ESC b / ESC f.
@@ -1003,25 +1043,30 @@ fn parse_escape(seq: &[u8]) -> Esc {
     match (*final_byte, body) {
         (b'D', "") => Esc::Left,
         (b'C', "") => Esc::Right,
+        (b'A', "") => Esc::HistoryUp,
+        (b'B', "") => Esc::HistoryDown,
         (b'H', "") => Esc::Home,
         (b'F', "") => Esc::End,
         (b'Z', "") => Esc::Ignored, // Shift-Tab
         (b'~', "3") => Esc::Delete,
         (b'~', "1" | "7") => Esc::Home,
         (b'~', "4" | "8") => Esc::End,
-        // CSI 1 ; modifier {C,D,H,F} and CSI modifier {C,D,H,F}:
+        // CSI 1 ; modifier {A,B,C,D,H,F} and CSI modifier {A,B,C,D,H,F}:
         // xterm modifier encoding is 1 + (shift=1, alt=2, ctrl=4).
-        (dir @ (b'C' | b'D' | b'H' | b'F'), params) => {
+        (dir @ (b'A' | b'B' | b'C' | b'D' | b'H' | b'F'), params) => {
             let encoded: u16 = params.rsplit(';').next().and_then(|m| m.parse().ok()).unwrap_or(1);
             let bits = encoded.saturating_sub(1);
             // Shift alone selects text in a GUI editor; here it is a plain
-            // move. Alt (bit 1) or Ctrl (bit 2) jump by word.
+            // move (or history recall for Up/Down). Alt (bit 1) or Ctrl
+            // (bit 2) jump by word on Left/Right.
             let word = bits & 0b110 != 0;
             match (dir, word) {
                 (b'C', true) => Esc::WordRight,
                 (b'D', true) => Esc::WordLeft,
                 (b'C', false) => Esc::Right,
                 (b'D', false) => Esc::Left,
+                (b'A', _) => Esc::HistoryUp,
+                (b'B', _) => Esc::HistoryDown,
                 (b'H', _) => Esc::Home,
                 (b'F', _) => Esc::End,
                 _ => Esc::Ignored,
@@ -1108,6 +1153,7 @@ mod tests {
             drawn_rows: 0,
             drawn_cursor_row: 0,
             on_edit: None,
+            history: InputHistory::default(),
         };
         view.mode = EditMode::Turn;
         view
@@ -1259,9 +1305,14 @@ mod tests {
         assert!(matches!(parse_escape(b"\x1b[3~"), Esc::Delete));
         assert!(matches!(parse_escape(b"\x1b[1~"), Esc::Home));
         assert!(matches!(parse_escape(b"\x1b[4~"), Esc::End));
-        // Up/down are not editing keys.
-        assert!(matches!(parse_escape(b"\x1b[A"), Esc::Ignored));
-        assert!(matches!(parse_escape(b"\x1b[B"), Esc::Ignored));
+        // Up/down recall input history.
+        assert!(matches!(parse_escape(b"\x1b[A"), Esc::HistoryUp));
+        assert!(matches!(parse_escape(b"\x1b[B"), Esc::HistoryDown));
+        assert!(matches!(parse_escape(b"\x1bOA"), Esc::HistoryUp));
+        assert!(matches!(parse_escape(b"\x1bOB"), Esc::HistoryDown));
+        // Modified up/down (Ctrl/Shift/Alt) still recall history.
+        assert!(matches!(parse_escape(b"\x1b[1;5A"), Esc::HistoryUp));
+        assert!(matches!(parse_escape(b"\x1b[1;2B"), Esc::HistoryDown));
     }
 
     #[test]
@@ -1309,6 +1360,78 @@ mod tests {
         let mut reader = LineReader::default();
         reader.pending.extend(b"one\r\ntwo\rthree\nfour\x1b[201~".iter());
         assert_eq!(read_paste(&mut reader), "one\ntwo\nthree\nfour");
+    }
+
+    #[test]
+    fn up_down_recalls_submitted_lines_and_the_draft() {
+        let mut view = view("");
+        view.line = "first".into();
+        view.take();
+        view.line = "second".into();
+        view.take();
+        // A draft in progress is saved by the first Up and restored by Down.
+        view.insert("draft");
+        view.history_up();
+        assert_eq!(view.line, "second");
+        assert_eq!(view.cursor, view.line.chars().count(), "cursor at the end");
+        view.history_up();
+        assert_eq!(view.line, "first");
+        view.history_up();
+        assert_eq!(view.line, "first", "at the oldest: unchanged");
+        view.history_down();
+        assert_eq!(view.line, "second");
+        view.history_down();
+        assert_eq!(view.line, "draft");
+        view.history_down();
+        assert_eq!(view.line, "draft", "not browsing: unchanged");
+    }
+
+    #[test]
+    fn editing_a_recalled_line_restarts_browsing_from_the_newest() {
+        let mut view = view("");
+        view.line = "first".into();
+        view.take();
+        view.line = "second".into();
+        view.take();
+        view.history_up();
+        assert_eq!(view.line, "second");
+        view.insert("!");
+        view.history_up();
+        assert_eq!(view.line, "second", "the edit reset browsing to the newest");
+        // Down from the newest entry restores the edited line: like readline,
+        // editing a recalled entry makes it the draft Down returns to.
+        view.history_down();
+        assert_eq!(view.line, "second!");
+    }
+
+    #[test]
+    fn take_skips_repeats_but_history_up_still_works() {
+        let mut view = view("");
+        view.line = "same".into();
+        view.take();
+        view.line = "same".into();
+        view.take();
+        view.history_up();
+        assert_eq!(view.line, "same");
+        view.history_up();
+        assert_eq!(view.line, "same", "one entry only: still the oldest");
+    }
+
+    #[test]
+    fn frame_mode_submission_records_history() {
+        // With an edit hook installed (renderer = "frame"), `take` returns from
+        // the hook branch — but it must still record and reset history so
+        // Up/Down recall works in that render path too.
+        let mut view = view("");
+        view.set_edit_hook(Arc::new(|_, _, _| {}));
+        view.line = "first".into();
+        view.take();
+        view.line = "second".into();
+        view.take();
+        view.history_up();
+        assert_eq!(view.line, "second");
+        view.history_up();
+        assert_eq!(view.line, "first");
     }
 
     #[test]
