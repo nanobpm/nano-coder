@@ -123,7 +123,15 @@ pub fn read_file(args: &Value) -> Result<String> {
     Ok(output::bound_output(&out, MAX_READ_BYTES).0)
 }
 
-fn write_atomically(path: &Path, content: &str) -> Result<()> {
+/// Write `content` to `path` via a temp file + rename. When `expect` is `Some`
+/// (the bytes the caller based this write on), re-read and re-validate freshness
+/// immediately before the rename: the earlier check at read time leaves a window
+/// in which an editor or formatter can change the file, and the rename would then
+/// clobber that newer content. Re-checking right before committing shrinks the
+/// window to the rename itself so a mid-call change fails instead of being lost.
+/// (A change in the remaining micro-window is still possible; fully closing it
+/// needs OS-level compare-and-swap/locking, which this does not attempt.)
+fn write_atomically(path: &Path, content: &str, expect: Option<&[u8]>) -> Result<()> {
     // Write through symlinks: renaming onto the link would replace it with a file.
     let resolved;
     let path = if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
@@ -142,6 +150,23 @@ fn write_atomically(path: &Path, content: &str) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
         std::fs::set_permissions(&tmp, meta.permissions()).ok();
     }
+    if let Some(expected) = expect {
+        let current = std::fs::read(path).with_context(|| format!("re-read {}", path.display()))?;
+        if let Err(e) = check_fresh(path, &current) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        // `check_fresh` compares against what the model last saw, which can be
+        // stale if the file changed after the caller's own read; also require the
+        // bytes to still be exactly what this write was planned against.
+        if current != expected {
+            std::fs::remove_file(&tmp).ok();
+            bail!(
+                "{} changed while the edit was being prepared; read it again before changing it",
+                path.display()
+            );
+        }
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
 }
 
@@ -157,6 +182,38 @@ struct Located {
 /// `\r`, so the model writes `\n` even for CRLF files.
 fn to_file_endings(text: &str, s: &str) -> String {
     if text.contains("\r\n") && !s.contains('\r') {
+        s.replace('\n', "\r\n")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The line ending to use for a replacement over `text[start..end]`. The
+/// region's own style wins: a multiline region that already ends a line LF stays
+/// LF even if a distant line is CRLF. A single-line region has no internal
+/// newline of its own, so it falls back to the line terminator it sits on (the
+/// one the edit changes), else the file's first line ending.
+fn ending_for(text: &str, start: usize, end: usize) -> &'static str {
+    let lo = start.min(text.len());
+    let hi = end.min(text.len()).max(lo);
+    let ls = text[..lo].rfind('\n').map_or(0, |i| i + 1);
+    let le = text[ls..].find('\n').map_or(text.len(), |i| ls + i);
+    let line_crlf = text[ls..le].ends_with('\r');
+    if text[lo..hi].contains('\n') {
+        // Multiline region: the terminator of the line the region starts on.
+        return if line_crlf { "\r\n" } else { "\n" };
+    }
+    // Single-line region: the terminator of the line containing it, else the
+    // file's first line ending.
+    let file_crlf = text.split_inclusive('\n').next().is_some_and(|l| l.ends_with("\r\n"));
+    if line_crlf || file_crlf { "\r\n" } else { "\n" }
+}
+
+/// Convert `s` to the line ending used by the region `text[start..end]`:
+/// `read_file` shows lines without `\r`, so the model writes `\n` even for CRLF
+/// files.
+fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
+    if ending_for(text, start, end) == "\r\n" && !s.contains('\r') {
         s.replace('\n', "\r\n")
     } else {
         s.to_string()
@@ -298,8 +355,13 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
     }
     let norm = |s: &str| if trim_start { s.trim().to_string() } else { s.trim_end().to_string() };
     let file_line = |i: usize| &text[spans[i].0..spans[i].1];
+    // Normalize each side once (O(file_lines + old_lines)), then anchor on the
+    // first line and verify the full window only where it matches, instead of
+    // re-normalizing up to `k` lines at every start (O(file_lines x old_lines)).
+    let file_norm: Vec<String> = (0..spans.len()).map(|i| norm(file_line(i))).collect();
+    let old_norm: Vec<String> = lines.iter().map(|l| norm(l)).collect();
     let hits: Vec<usize> = (0..=spans.len() - k)
-        .filter(|&i| (0..k).all(|j| norm(file_line(i + j)) == norm(lines[j])))
+        .filter(|&i| file_norm[i] == old_norm[0] && (1..k).all(|j| file_norm[i + j] == old_norm[j]))
         .collect();
     let how = if trim_start { "ignoring indentation" } else { "ignoring trailing whitespace" };
     let i = match hits.as_slice() {
@@ -349,7 +411,7 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
             new = reindent(&new, had, want)?;
         }
     }
-    Ok(Some(Located { ranges: vec![(start, end)], new: to_file_endings(text, &new), how: Some(how) }))
+    Ok(Some(Located { ranges: vec![(start, end)], new: to_endings_at(text, start, end, &new), how: Some(how) }))
 }
 
 /// Find where `old` is in `text`: exactly first (as the model saw it, then
@@ -366,32 +428,53 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
     }
     for (o, n, how, at_line) in &attempts {
-        // Match `o` literally when it's already present (a single-line candidate
-        // has no newline, so it's found verbatim even in a CRLF file); otherwise
-        // rewrite it to the file's endings. `n` is *always* normalized to the
-        // file's endings, independent of whether `o` needed it: a single-line
-        // `o` that matched literally must not leave a multiline `n` with LF
-        // endings and split a CRLF file's line endings.
-        let o = if text.contains(o.as_str()) { o.clone() } else { to_file_endings(text, o) };
-        let n = to_file_endings(text, n);
-        // For a stripped candidate, keep only matches that actually start on the
-        // line its (consecutive) numbers name. Genuine TSV data whose leading
-        // integers merely look prefix-shaped won't sit on that line, so it can't
-        // retarget an unrelated block by being stripped.
-        let ranges: Vec<(usize, usize)> = text
-            .match_indices(o.as_str())
-            .map(|(at, _)| (at, at + o.len()))
-            .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
-            .collect();
-        match ranges.len() {
-            0 => {}
-            1 => return Ok(Located { ranges, new: n, how: *how }),
-            // `replace_all` only ever applies to the exact, literal attempt: a
-            // relaxed (stripped) match must be unique per the PR contract.
-            _ if replace_all && how.is_none() => return Ok(Located { ranges, new: n, how: *how }),
-            count => bail!(
-                "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
-            ),
+        // Match `o` literally first, then rewritten to the file's endings. The
+        // literal pass must run even when `o` isn't initially present: in a
+        // mixed-ending file an LF-region `old` doesn't literally match until the
+        // CRLF rewrite has been ruled out, and rewriting first would mis-anchor
+        // the region (and its line-ending style) to a distant CRLF line.
+        let mut candidates: Vec<&str> = vec![o.as_str()];
+        let normalized;
+        if !text.contains(o.as_str()) {
+            normalized = to_file_endings(text, o);
+            if normalized != *o {
+                candidates.push(normalized.as_str());
+            }
+        }
+        for o in candidates {
+            // For a stripped candidate, keep only matches that actually start on
+            // the line its (consecutive) numbers name. Genuine TSV data whose
+            // leading integers merely look prefix-shaped won't sit on that line,
+            // so it can't retarget an unrelated block by being stripped.
+            let ranges: Vec<(usize, usize)> = text
+                .match_indices(o)
+                .map(|(at, _)| (at, at + o.len()))
+                .filter(|&(at, _)| at_line.is_none_or(|lo| line_at(text, at) == lo))
+                .collect();
+            // Normalize `n` to the line ending of the matched region, not the
+            // whole file: in a mixed-ending file an LF-region replacement must
+            // not pick up CRLF from a distant line (and vice versa). `n` is
+            // normalized even when `o` matched literally: a single-line `o` in a
+            // CRLF region must not leave a multiline `n` with LF endings and
+            // split that region's endings. For `replace_all` every occurrence
+            // shares one region style.
+            let new_for = |r: (usize, usize)| to_endings_at(text, r.0, r.1, n);
+            match ranges.len() {
+                0 => continue,
+                1 => {
+                    let new = new_for(ranges[0]);
+                    return Ok(Located { ranges, new, how: *how });
+                }
+                // `replace_all` only ever applies to the exact, literal attempt:
+                // a relaxed (stripped) match must be unique per the PR contract.
+                _ if replace_all && how.is_none() => {
+                    let new = new_for(ranges[0]);
+                    return Ok(Located { ranges, new, how: *how });
+                }
+                count => bail!(
+                    "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
+                ),
+            }
         }
     }
     for trim_start in [false, true] {
@@ -536,14 +619,17 @@ pub fn write_file(args: &Value) -> Result<String> {
     let path = path_arg(args)?;
     let content = string_arg(args, "content")?;
     let existed = path.exists();
-    if existed {
+    let current = if existed {
         // Propagate a read failure instead of silently skipping the freshness
         // check: an unreadable-but-writable file would otherwise be overwritten
         // without the prior-read / stale-content guarantees.
         let current = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         check_fresh(&path, &current)?;
-    }
-    write_atomically(&path, content)?;
+        Some(current)
+    } else {
+        None
+    };
+    write_atomically(&path, content, current.as_deref())?;
     remember(&path, content.as_bytes());
     Ok(format!(
         "{} {} ({} bytes)",
@@ -566,7 +652,7 @@ pub fn edit_file(args: &Value) -> Result<String> {
     }
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     check_fresh(&path, &bytes)?;
-    let text = String::from_utf8(bytes).map_err(|_| anyhow!("{} is not valid UTF-8", path.display()))?;
+    let text = String::from_utf8(bytes.clone()).map_err(|_| anyhow!("{} is not valid UTF-8", path.display()))?;
     let found = locate(&text, old, new, replace_all).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     let mut updated = String::with_capacity(text.len() + found.new.len());
     let mut last = 0;
@@ -579,7 +665,7 @@ pub fn edit_file(args: &Value) -> Result<String> {
         last = end;
     }
     updated.push_str(&text[last..]);
-    write_atomically(&path, &updated)?;
+    write_atomically(&path, &updated, Some(&bytes))?;
     remember(&path, updated.as_bytes());
     Ok(format!(
         "Replaced {} occurrence(s) in {}{}:\n{}",
@@ -1042,5 +1128,43 @@ mod tests {
         .to_string();
         assert!(err.contains("non-uniformly"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "if a:\n    x = 1\n        y = 2\n");
+    }
+
+    #[test]
+    fn edit_in_lf_region_of_mixed_file_keeps_lf_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file mixes endings: first line CRLF, the rest LF. Editing the
+        // LF-only region with a multiline replacement must not convert the
+        // replacement to CRLF just because a distant line uses CRLF.
+        let p = read_fixture(&dir, "mix.txt", "a\r\nb\nc\n");
+        edit_file(&json!({ "path": p, "old_string": "b\nc", "new_string": "x\ny" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nx\ny\n");
+    }
+
+    #[test]
+    fn edit_in_crlf_region_of_mixed_file_converts_replacement_to_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mirror image: an LF first line, then CRLF. The matched region is CRLF,
+        // so the replacement's newlines become CRLF even though the file also
+        // contains an LF line.
+        let p = read_fixture(&dir, "mix2.txt", "a\nb\r\nc\r\n");
+        edit_file(&json!({ "path": p, "old_string": "b\nc", "new_string": "x\ny" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nx\r\ny\r\n");
+    }
+
+    #[test]
+    fn edit_fails_when_file_changes_mid_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // If the file on disk no longer matches the bytes the edit was planned
+        // against when the rename is about to commit, the write must fail rather
+        // than clobber the newer content. (The mid-call window is exercised here
+        // by changing the file after read_file but before the edit's re-check.)
+        let p = read_fixture(&dir, "race.txt", "one\ntwo\n");
+        std::fs::write(&p, "one\nCHANGED\n").unwrap();
+        let err = edit_file(&json!({ "path": p, "old_string": "two", "new_string": "2" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\nCHANGED\n");
     }
 }
