@@ -1536,16 +1536,17 @@ async fn main() -> Result<()> {
                         }
                     }
                     // Regenerate the editor's command-menu rows at the new size
-                    // first: `frame_resize()` only re-fits the *stored* menu rows
-                    // to the new width, so on its own a shrink leaves a menu with
-                    // too many rows (it can push the prompt off-screen) and a
-                    // widen leaves labels truncated to the old width. `view.resize()`
-                    // re-runs `frame_menu` through the edit hook so `FrameState.menu`
-                    // is sized to the new terminal; `frame_resize()` then forces one
-                    // full invalidated redraw of every row. The extra render is cheap
-                    // — SIGWINCH is debounced to a single event per resize burst.
+                    // and redraw in a single pass. `view.resize()` re-runs
+                    // `frame_menu` through the edit hook so `FrameState.menu` is
+                    // sized to the new terminal, then renders; because the frame
+                    // renderer's `render` detects the changed width/height it
+                    // already performs one full invalidated redraw of every row
+                    // (clearing scrollback). Calling `frame_resize()` afterwards
+                    // would invalidate that just-rendered frame and re-emit the
+                    // entire transcript a second time — a redundant O(history)
+                    // redraw on every resize — so the hook-driven redraw is the
+                    // sole one here.
                     view.lock().unwrap().resize();
-                    renderer.frame_resize();
                 }
             });
         }

@@ -600,8 +600,9 @@ In an interactive terminal the bottom row shows the provider/model, context usag
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a terminal
-scroll region, follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. In the legacy
+renderer it uses a terminal scroll region (DECSTBM); the default frame renderer instead composes
+the bar as the frame's final row. Either way it follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.
 
