@@ -149,6 +149,9 @@ fn register_hooks(agent: &mut Agent) {
 /// Terminal input, read on demand so `/settings` prompts can use stdin directly.
 enum TermInput {
     Line(String),
+    /// Ctrl/Cmd-Enter during a turn: queue for a later turn instead of
+    /// steering the running one.
+    Queue(String),
     Eof,
     Interrupt,
     /// Ctrl-O: expand or collapse thinking.
@@ -259,6 +262,7 @@ impl Terminal {
                 let send = |key: lineedit::Key| {
                     let _ = lines.send(match key {
                         lineedit::Key::Line(line) => TermInput::Line(line),
+                        lineedit::Key::Queue(line) => TermInput::Queue(line),
                         lineedit::Key::Eof => TermInput::Eof,
                         lineedit::Key::Interrupt => TermInput::Interrupt,
                         lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
@@ -418,14 +422,16 @@ impl Terminal {
     }
 }
 
-/// Run a turn; typed lines join the message queue (one runs per following
-/// turn), `/queue` edits apply immediately, and Ctrl-C or Esc Esc cancels.
+/// Run a turn. A line sent with Enter steers it (the agent reads it at its
+/// next step); Ctrl/Cmd-Enter or `/queue add` queues it instead (one queued
+/// message runs per following turn). `/queue` edits apply immediately, and
+/// Ctrl-C or Esc Esc cancels.
 async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Terminal) -> Result<agent::TurnOutcome> {
     let control = agent.control();
     let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
-        renderer.note("[running: type a message and Enter to queue it (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
+        renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
     }
     // Blank line after LLM output (legacy renderer only; the frame renderer
     // owns the screen and must not receive stray direct writes).
@@ -524,7 +530,17 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         renderer.event(&agent::AgentEvent::Context);
                         renderer.note(&format!("[mode: {mode} — {}]", mode.describe()));
                     }
-                    TermInput::Line(line) if terminal.steerable && !line.trim().is_empty() => {
+                    // A blank Enter typed mid-turn is a no-op: dropping it here
+                    // stops it from being deferred into `queued` and replayed
+                    // as an empty line after the turn, which would delay the
+                    // real queued messages/commands behind it.
+                    TermInput::Line(line) | TermInput::Queue(line) if terminal.steerable && line.trim().is_empty() => {}
+                    input @ (TermInput::Line(_) | TermInput::Queue(_)) if terminal.steerable => {
+                        let (line, steer) = match input {
+                            TermInput::Line(line) => (line, true),
+                            TermInput::Queue(line) => (line, false),
+                            _ => unreachable!(),
+                        };
                         let text = line.trim();
                         if let Some(op) = queue_command(text) {
                             // `/queue` only touches the message queue, so it is
@@ -536,17 +552,25 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         } else if text.starts_with('/') {
                             renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
                             terminal.queued.push_back(TermInput::Line(line));
+                        } else if steer {
+                            // The agent adds it to the conversation before its
+                            // next model call; if the turn ends first it is
+                            // queued (see below).
+                            control.steer(text, None);
+                            // The frame renderer shows the steer as a user
+                            // message once absorbed; the legacy one shows only
+                            // this note, so it carries the text.
+                            if renderer.is_frame() {
+                                renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
+                            } else {
+                                renderer.note(&format!("↪ steer: {text} — read at the agent's next step (Ctrl-Enter queues instead)"));
+                            }
                         } else {
                             let id = terminal.queue_message(text);
                             let n = terminal.messages.len();
                             renderer.note(&format!("↧ queued #{id} ({n} waiting) — /queue remove {id} to drop"));
                         }
                     }
-                    // Blank Enter typed mid-turn is a no-op: dropping it here
-                    // stops it from being deferred into `queued` and replayed
-                    // as an empty line after the turn, which would delay the
-                    // real queued messages/commands behind it.
-                    TermInput::Line(line) if terminal.steerable && line.trim().is_empty() => {}
                     other => terminal.queued.push_back(other),
                 },
             }
@@ -557,8 +581,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
     let outcome = outcome?;
     // A steer typed as the turn finished queues behind what is already
-    // waiting, unless the turn was cancelled. (The interactive CLI queues
-    // rather than steers, so this is the ACP path.)
+    // waiting, unless the turn was cancelled.
     for steer in control.take_pending() {
         if outcome.stop_reason == agent::StopReason::Cancelled {
             renderer.note(&format!("[steer dropped: {}]", steer.text));
@@ -1492,7 +1515,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
-                TermInput::Line(line) => line.trim().to_string(),
+                TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
             };
             exit_armed = false;
             if input.trim().is_empty() {
