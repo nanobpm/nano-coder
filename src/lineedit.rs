@@ -538,10 +538,22 @@ impl EditView {
             hook(&self.line, self.cursor, self.queue_count);
             return;
         }
+        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
         // With a status line, its resize erased everything below the cursor
-        // (the menu included) and re-anchored the prompt, so only redraw.
+        // (the menu included) and re-anchored the prompt, so only redraw needs
+        // to run. Without one, blank the old menu rows explicitly. The menu was
+        // drawn below the input's END row — which, when a wrapped line is edited
+        // on an earlier row, sits `below` rows past the cursor — so the teardown
+        // must descend that far first. Passing `below = 0` would instead clear
+        // the rows immediately under the cursor (the input tail), leaving the
+        // real menu rows stale when the resized menu is shorter or gone. Compute
+        // the cursor-to-end distance at the NEW width, matching the reflow the
+        // rest of this function assumes and the same descent `draw_menu` uses to
+        // place the menu.
         if self.menu_rows > 0 && self.status.is_none() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], false, 0);
+            let cursor_row = self.cursor_position(cols).0;
+            let below = self.content_rows(cols).saturating_sub(1).saturating_sub(cursor_row);
+            let (seq, _) = menu_sequence(self.menu_rows, &[], false, below);
             write(&seq);
         }
         self.menu_rows = 0;
@@ -553,7 +565,6 @@ impl EditView {
         // the wrong row and reprint over the transcript. Recompute the cursor's
         // prompt-relative row at the NEW width first, so the climb matches where
         // the cursor actually is.
-        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
         self.drawn_cursor_row = self.cursor_position(cols).0;
         // `drawn_rows` still carries the OLD-width span (content + menu). With a
         // status line, `StatusLine::resize` just anchored the edit cursor at the
@@ -1512,6 +1523,45 @@ mod tests {
                 "the up-climb must match the rows walked down so the cursor never rises above the prompt; got {seq:?}",
             );
         }
+    }
+
+    #[test]
+    fn resize_menu_teardown_descends_to_the_input_end_before_clearing() {
+        // Regression for "no-status resize teardown erases input-tail rows, not
+        // the menu": without a status line `resize` blanks the old menu rows
+        // itself via `menu_sequence(menu_rows, &[], false, below)`. The menu
+        // sits below the input's END row, so when a wrapped line is edited on an
+        // earlier row the teardown must descend `below` rows (cursor-to-end)
+        // first. A `below` of 0 would clear the rows just under the cursor — the
+        // input tail — leaving the real menu rows stale when the resized menu is
+        // shorter or gone. Model a wrapped input with the cursor before its end.
+        let mut v = view("aaaaaaaa"); // 3 rows at 4 cols.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        let cols = 4;
+        v.cursor = 4; // mid-input: the edit cursor rests before the last row.
+        let cursor_row = v.cursor_position(cols).0;
+        let end_row = v.content_rows(cols) - 1;
+        assert!(cursor_row < end_row, "the cursor must sit before the input's end row");
+        // The distance `resize` now computes for the teardown.
+        let below = v.content_rows(cols).saturating_sub(1).saturating_sub(cursor_row);
+        assert_eq!(below, end_row - cursor_row, "below is the cursor-to-end distance");
+        assert!(below > 0, "a mid-input cursor leaves rows between it and the menu");
+        // The teardown descends `below` rows before clearing the two menu rows,
+        // so it blanks the menu — not the input-tail rows immediately below the
+        // cursor — leaving no stale menu rows behind.
+        let menu_rows = 2;
+        let (seq, used) = menu_sequence(menu_rows, &[], false, below);
+        assert_eq!(used, 0, "the teardown draws no menu");
+        assert!(
+            seq.contains(&format!("\x1b7\x1b[{below}B")),
+            "teardown must descend to the input end before clearing; got {seq:?}",
+        );
+        assert_eq!(
+            seq.matches("\x1b[2K").count(),
+            menu_rows,
+            "teardown clears exactly the menu rows below the input end; got {seq:?}",
+        );
     }
 
     #[test]
