@@ -242,9 +242,10 @@ fn leading_ws(s: &str) -> &str {
 /// indentation `had` is rebased onto `want`, keeping any deeper indentation that
 /// follows the common prefix so tab/space structure survives a mixed-whitespace
 /// shift (e.g. `had = "\t    "`, `want = "\t"` yields `"\t"`, not one space). A
-/// line shallower than `had` still shifts with the block: deepening prepends the
-/// extra whitespace, dedenting drops that many leading whitespace *characters*
-/// (so multibyte whitespace can't be split). When `had` and `want` use
+/// line shallower than `had` still shifts with the block: deepening appends the
+/// extra whitespace after the line's own indentation (so a mixed-whitespace line
+/// keeps its leading tabs/spaces in order), dedenting drops that many leading
+/// whitespace *characters* (so multibyte whitespace can't be split). When `had` and `want` use
 /// incompatible whitespace (e.g. spaces vs tabs) neither is a prefix of the
 /// other, so no unambiguous delta exists and we reject the relaxed match rather
 /// than corrupt lines.
@@ -269,7 +270,10 @@ fn reindent(text: &str, had: &str, want: &str) -> Result<String> {
                 format!("{want}{deeper}{rest}")
             } else if let Some(extra) = want.strip_prefix(had) {
                 // Deepen a line shallower than the base by the block delta.
-                format!("{extra}{l}")
+                // Append the delta *after* the line's own indentation so a
+                // mixed-whitespace line keeps its leading tabs/spaces in order
+                // (prepending `extra` would put spaces before an existing tab).
+                format!("{ws}{extra}{rest}")
             } else {
                 // Dedent a line shallower than the base, char-safely.
                 let drop = had.chars().count() - want.chars().count();
@@ -362,11 +366,14 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
     }
     for (o, n, how, at_line) in &attempts {
-        let (o, n) = if text.contains(o.as_str()) {
-            (o.clone(), n.clone())
-        } else {
-            (to_file_endings(text, o), to_file_endings(text, n))
-        };
+        // Match `o` literally when it's already present (a single-line candidate
+        // has no newline, so it's found verbatim even in a CRLF file); otherwise
+        // rewrite it to the file's endings. `n` is *always* normalized to the
+        // file's endings, independent of whether `o` needed it: a single-line
+        // `o` that matched literally must not leave a multiline `n` with LF
+        // endings and split a CRLF file's line endings.
+        let o = if text.contains(o.as_str()) { o.clone() } else { to_file_endings(text, o) };
+        let n = to_file_endings(text, n);
         // For a stripped candidate, keep only matches that actually start on the
         // line its (consecutive) numbers name. Genuine TSV data whose leading
         // integers merely look prefix-shaped won't sit on that line, so it can't
@@ -892,6 +899,33 @@ mod tests {
         .unwrap();
         assert!(out.contains("ignoring indentation"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "def f():\n\tx = 2\n");
+    }
+
+    #[test]
+    fn mixed_whitespace_deepen_appends_delta_after_existing_indentation() {
+        let dir = tempfile::tempdir().unwrap();
+        // File is deeper than old_string (tab+8sp / tab+6sp vs tab+4sp / tab+2sp),
+        // so the block deepens by four spaces. The shallower second line keeps its
+        // own tab+2sp indentation with the delta appended (tab+6sp) — prepending
+        // the delta would put spaces before the tab and corrupt the structure.
+        let p = read_fixture(&dir, "dp.py", "if a:\n\t        x = 1\n\t      y = 2\n");
+        let out = edit_file(&json!({
+            "path": p, "old_string": "\t    x = 1\n\t  y = 2", "new_string": "\t    x = 9\n\t  y = 9"
+        }))
+        .unwrap();
+        assert!(out.contains("ignoring indentation"), "{out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "if a:\n\t        x = 9\n\t      y = 9\n");
+    }
+
+    #[test]
+    fn single_line_match_normalizes_multiline_replacement_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        // A single-line old_string has no newline, so it matches literally even in
+        // a CRLF file. The multiline replacement must still be rewritten to CRLF,
+        // not left with LF endings that would split the file's line endings.
+        let p = read_fixture(&dir, "crlf.txt", "a\r\nb\r\nc\r\n");
+        edit_file(&json!({ "path": p, "old_string": "b", "new_string": "x\ny" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nx\r\ny\r\nc\r\n");
     }
 
     #[test]
