@@ -248,13 +248,21 @@ impl ToolCall {
 /// Whether a provider stop reason means the response was truncated because it
 /// hit the output-token limit (as opposed to a transient transport failure).
 /// Covers the length/truncation signals across providers: OpenAI chat
-/// (`length`), Anthropic (`max_tokens`), and OpenAI Responses (`incomplete` /
-/// `max_output_tokens`).
+/// (`length`), Anthropic (`max_tokens`), and OpenAI Responses
+/// (`max_output_tokens`).
+///
+/// Note the bare OpenAI Responses `incomplete` status is deliberately NOT a
+/// length signal: `incomplete` only says the response stopped early, not why —
+/// it can also mean a content filter or other non-length reason. The Responses
+/// provider resolves `incomplete` to its nested `incomplete_details.reason`
+/// (e.g. `max_output_tokens`) before it reaches here, so only a genuine
+/// length reason is classified as one and a generic `incomplete` keeps the
+/// cause-neutral advice.
 fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
         matches!(
             reason.to_ascii_lowercase().as_str(),
-            "length" | "max_tokens" | "max_output_tokens" | "incomplete"
+            "length" | "max_tokens" | "max_output_tokens"
         )
     })
 }
@@ -457,18 +465,25 @@ mod tests {
         // A length/truncation stop reason means retrying the same call loops
         // forever, so the advice tells the model to make a smaller call and
         // does NOT claim a transient transport error.
-        for reason in ["length", "max_tokens", "max_output_tokens", "incomplete"] {
+        for reason in ["length", "max_tokens", "max_output_tokens"] {
             let error = call.raw_arguments_error(Some(reason)).expect("malformed args report an error");
             assert!(error.contains("output-token limit"), "names the cause for {reason}: {error}");
             assert!(error.contains("smaller call"), "advises shrinking for {reason}: {error}");
             assert!(!error.contains("retry the same"), "does not tell it to repeat for {reason}: {error}");
         }
 
-        // An unknown / non-length stop reason keeps the cause-neutral message
-        // (retry, but shrink if it recurs) rather than asserting transient.
-        let error = call.raw_arguments_error(Some("tool_use")).expect("malformed args report an error");
-        assert!(error.contains("retry the same"), "offers a retry: {error}");
-        assert!(error.contains("truncated by the output-token limit"), "hedges on recurrence: {error}");
+        // An unknown / non-length stop reason — including a bare OpenAI Responses
+        // `incomplete` status, which does not by itself prove an output-token
+        // limit — keeps the cause-neutral message (retry, but shrink if it
+        // recurs) rather than asserting a definite length stop.
+        for reason in ["tool_use", "incomplete"] {
+            let error = call.raw_arguments_error(Some(reason)).expect("malformed args report an error");
+            assert!(error.contains("retry the same"), "offers a retry for {reason}: {error}");
+            assert!(
+                error.contains("truncated by the output-token limit"),
+                "hedges on recurrence for {reason}: {error}"
+            );
+        }
     }
 
     #[test]
