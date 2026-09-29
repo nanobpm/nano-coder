@@ -365,6 +365,14 @@ pub fn queue_indicator(queued: usize, width: usize) -> Option<String> {
     })
 }
 
+/// A transient hint rendered in place of the status bar (e.g. "(Ctrl-C again
+/// to exit)"), so cursor-relevant feedback is seen where the cursor is rather
+/// than as a transcript row that triggers a full-screen clear. Plain dim text,
+/// bounded to `width`.
+pub fn transient_status(text: &str, width: usize) -> String {
+    fit(&format!("{DIM}{text}{RESET}"), width.max(1))
+}
+
 /// The index of the first line that differs between two frames, or `None` when
 /// they are identical. A shorter/longer frame differs at its first extra or
 /// missing line.

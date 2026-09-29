@@ -163,6 +163,52 @@ enum TermInput {
 /// Esc twice within this window cancels the running turn.
 const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// Ctrl-C twice within this window exits the interactive CLI. Time-based (not
+/// "next line" based) so an interleaved keystroke or a queued/empty line
+/// between the two presses cannot silently disarm the exit.
+const DOUBLE_INTERRUPT_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Detects a double press of the same key within a window. The window is
+/// time-based: a press that lands after the window has elapsed starts a fresh
+/// pair rather than completing the old one, so unrelated input in between does
+/// not consume or reset the gesture.
+struct DoublePress {
+    window: std::time::Duration,
+    last: Option<std::time::Instant>,
+}
+
+impl DoublePress {
+    fn new(window: std::time::Duration) -> Self {
+        Self { window, last: None }
+    }
+
+    /// Record a press at `now`; true when it completes a double press.
+    fn press(&mut self, now: std::time::Instant) -> bool {
+        match self.last.take() {
+            Some(last) if now.duration_since(last) <= self.window => true,
+            _ => {
+                self.last = Some(now);
+                false
+            }
+        }
+    }
+
+    /// When armed (a first press is waiting for its pair), the instant at which
+    /// the window lapses and the arm re-starts; `None` when not armed. Callers
+    /// use this to bound the wait for the second press so any hint shown while
+    /// armed can be cleared the moment the arm expires.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.last.map(|last| last + self.window)
+    }
+
+    /// Drop a pending arm so the next press starts a fresh pair. Used when the
+    /// window has lapsed with no second press, to keep any displayed hint in
+    /// sync with the (now disarmed) detector.
+    fn disarm(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Detects a double Esc press.
 #[derive(Default)]
 struct DoubleEscape {
@@ -1422,7 +1468,10 @@ async fn main() -> Result<()> {
         }
         let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
         let mut running = true;
-        let mut exit_armed = false;
+        // Ctrl-C twice within the window exits; time-based so an interleaved
+        // key or a queued/empty line cannot silently disarm it (see
+        // `DoublePress`). The note stays visible until the window lapses.
+        let mut exit_press = DoublePress::new(DOUBLE_INTERRUPT_WINDOW);
         let mut separate = false;
         while running {
             if let Some(status) = &status
@@ -1461,7 +1510,25 @@ async fn main() -> Result<()> {
             separate = false;
 
             let input = loop {
-                match terminal.next(&agent).await {
+                let next = terminal.next(&agent);
+                // While the Ctrl-C exit hint is armed, bound the wait on the
+                // exit window: if the second press never comes, clear the stale
+                // "(Ctrl-C again to exit)" hint and disarm the detector so the
+                // visible instruction stays in sync with the armed state (a
+                // press after the window re-arms rather than exits).
+                let event = if let Some(deadline) = exit_press.deadline() {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
+                        Ok(event) => event,
+                        Err(_) => {
+                            exit_press.disarm();
+                            terminal.renderer.clear_transient();
+                            continue;
+                        }
+                    }
+                } else {
+                    next.await
+                };
+                match event {
                     TermInput::ToggleThinking => {
                         if terminal.renderer.toggle_thinking() {
                             prompt(&terminal, false);
@@ -1482,20 +1549,20 @@ async fn main() -> Result<()> {
             };
             let input = match input {
                 TermInput::Eof => break,
-                TermInput::Interrupt if exit_armed => break,
                 TermInput::Interrupt => {
-                    exit_armed = true;
-                    if frame_mode {
-                        terminal.renderer.note("(Ctrl-C again to exit)");
-                    } else {
-                        println!("\n(Ctrl-C again to exit)");
+                    if exit_press.press(std::time::Instant::now()) {
+                        break;
                     }
+                    // Show the hint where the user is actually looking: as a
+                    // transient on the status line / editor row (both
+                    // renderers), not as a transcript item that triggers a
+                    // full-screen clear in frame mode.
+                    terminal.renderer.transient_note("(Ctrl-C again to exit)");
                     continue;
                 }
                 TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
                 TermInput::Line(line) => line.trim().to_string(),
             };
-            exit_armed = false;
             if input.trim().is_empty() {
                 continue;
             }
@@ -1552,6 +1619,50 @@ mod tests {
         // Too slow: the second press re-arms instead of cancelling.
         assert!(!escape.press(t + Duration::from_millis(1600)));
         assert!(escape.press(t + Duration::from_millis(1700)));
+    }
+
+    #[test]
+    fn double_press_is_time_based_not_disarmed_by_other_input() {
+        // The Ctrl-C exit gesture: two presses within the window exit, and —
+        // unlike the old `exit_armed` bool — input arriving between the presses
+        // (a stray key, a queued/empty line) must not reset the arm, because
+        // the arm lives in the detector's timestamp, not in loop state.
+        let mut exit = DoublePress::new(Duration::from_millis(2000));
+        let t = Instant::now();
+        assert!(!exit.press(t), "first press arms, does not exit");
+        // … the user hits Enter (an empty line) here; the loop no longer
+        // touches the detector, so the arm survives …
+        assert!(
+            exit.press(t + Duration::from_millis(1200)),
+            "second press within the window exits even after interleaved input"
+        );
+        // A completed pair is consumed: the next press starts a fresh pair.
+        assert!(!exit.press(t + Duration::from_millis(1300)));
+        // Too slow: a press after the window re-arms instead of exiting.
+        let mut exit = DoublePress::new(Duration::from_millis(2000));
+        assert!(!exit.press(t));
+        assert!(!exit.press(t + Duration::from_millis(2500)), "outside the window: re-arm");
+        assert!(exit.press(t + Duration::from_millis(2600)), "and the next press completes");
+    }
+
+    #[test]
+    fn double_press_deadline_arms_and_disarm_clears_it() {
+        // The exit-hint lifecycle: arming a first press exposes the window's
+        // deadline so the caller can bound its wait and clear the stale hint
+        // when the window lapses; disarming (the timeout path) resets it so a
+        // later press starts a fresh pair instead of completing the old one.
+        let window = Duration::from_millis(2000);
+        let mut exit = DoublePress::new(window);
+        let t = Instant::now();
+        assert_eq!(exit.deadline(), None, "not armed before any press");
+        assert!(!exit.press(t), "first press arms");
+        assert_eq!(exit.deadline(), Some(t + window), "armed: deadline is press + window");
+        // Simulate the window lapsing with no second press: disarm.
+        exit.disarm();
+        assert_eq!(exit.deadline(), None, "disarmed: no pending deadline");
+        // A press after disarming re-arms rather than exiting.
+        assert!(!exit.press(t + Duration::from_millis(2500)), "post-timeout press re-arms");
+        assert_eq!(exit.deadline(), Some(t + Duration::from_millis(2500) + window));
     }
 
     #[test]
