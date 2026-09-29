@@ -264,7 +264,14 @@ impl EditView {
         } else {
             crate::commands::menu(&self.line, cols as usize, max_rows)
         };
-        let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some());
+        // The edit cursor was left on its row by the preceding redraw
+        // (`drawn_cursor_row`); the input's rendered end row is its last content
+        // row. Draw the menu below that end row, not below an earlier edit row,
+        // so a wrapped command edited on an earlier row does not have its tail
+        // rows painted over by the menu.
+        let content = self.content_rows(cols as usize);
+        let below = content.saturating_sub(1).saturating_sub(self.drawn_cursor_row);
+        let (seq, used) = menu_sequence(self.menu_rows, &lines, self.status.is_some(), below);
         // Recompute `drawn_rows` (content + menu) from the *current* content
         // height plus the freshly measured menu, rather than adjusting the old
         // total by a `used - menu_rows` delta. The delta is only correct while
@@ -275,7 +282,7 @@ impl EditView {
         // six), and the next `redraw_sequence` would climb past the real prompt
         // and overwrite transcript rows. Measuring content directly keeps
         // `drawn_rows` honest in every path (line change and resize alike).
-        self.drawn_rows = self.content_rows(cols as usize) + used;
+        self.drawn_rows = content + used;
         self.menu_rows = used;
         if !seq.is_empty() {
             write(&seq);
@@ -534,7 +541,7 @@ impl EditView {
         // With a status line, its resize erased everything below the cursor
         // (the menu included) and re-anchored the prompt, so only redraw.
         if self.menu_rows > 0 && self.status.is_none() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], false);
+            let (seq, _) = menu_sequence(self.menu_rows, &[], false, 0);
             write(&seq);
         }
         self.menu_rows = 0;
@@ -705,7 +712,7 @@ impl EditView {
             return line;
         }
         if self.menu_visible() {
-            let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some());
+            let (seq, _) = menu_sequence(self.menu_rows, &[], self.status.is_some(), 0);
             write(&seq);
             self.menu_rows = 0;
         }
@@ -737,17 +744,28 @@ impl EditView {
 /// never touched. With `anchor` (a status line is pinned), rows the menu gives
 /// up are closed by scrolling the conversation back down, so the prompt stays
 /// directly above the status line.
-fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool) -> (String, usize) {
+fn menu_sequence(old_rows: usize, lines: &[String], anchor: bool, below: usize) -> (String, usize) {
     if old_rows == 0 && lines.is_empty() {
         return (String::new(), 0);
     }
     let mut seq = String::new();
     if lines.len() > old_rows {
-        seq.push_str(&"\x1bD".repeat(lines.len()));
-        seq.push_str(&format!("\x1b[{}A", lines.len()));
+        // Ensure enough rows exist below the edit cursor for the descent to the
+        // input's rendered end row (`below`) plus the grown menu. `\x1bD` scrolls
+        // only at the bottom margin, so feeding this many is a no-op when the
+        // rows already exist and scrolls exactly the shortfall when they don't.
+        seq.push_str(&"\x1bD".repeat(below + lines.len()));
+        seq.push_str(&format!("\x1b[{}A", below + lines.len()));
     }
     let rows = old_rows.max(lines.len());
     seq.push_str("\x1b7");
+    // Descend from the edit cursor to the input's rendered end row before
+    // drawing, so the menu lands below the whole (wrapped) input rather than
+    // over its tail rows when the cursor is being edited on an earlier row.
+    // The `\x1b8` at the end restores the cursor to the saved edit position.
+    if below > 0 {
+        seq.push_str(&format!("\x1b[{below}B"));
+    }
     for i in 0..rows {
         seq.push_str("\x1b[1B\r\x1b[2K");
         if let Some(line) = lines.get(i) {
@@ -1293,29 +1311,49 @@ mod tests {
     #[test]
     fn menu_rows_are_reserved_drawn_and_cleared() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let (seq, rows) = menu_sequence(0, &lines, false);
+        let (seq, rows) = menu_sequence(0, &lines, false, 0);
         assert_eq!(rows, 2);
         assert_eq!(seq, "\x1bD\x1bD\x1b[2A\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
         // Narrowing reuses the rows and blanks the extra one.
-        let (seq, rows) = menu_sequence(2, &lines[..1], false);
+        let (seq, rows) = menu_sequence(2, &lines[..1], false, 0);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
-        let (seq, rows) = menu_sequence(2, &[], false);
+        let (seq, rows) = menu_sequence(2, &[], false, 0);
         assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b8", 0));
-        assert_eq!(menu_sequence(0, &[], false), (String::new(), 0));
+        assert_eq!(menu_sequence(0, &[], false, 0), (String::new(), 0));
+    }
+
+    #[test]
+    fn menu_is_drawn_below_the_input_end_row_not_the_edit_row() {
+        // A wrapped command edited on an earlier row leaves the cursor `below`
+        // rows above the input's rendered end row. The menu must descend to the
+        // end row before painting so it lands beneath the whole input, not over
+        // its tail rows, and must return the cursor to the edit position.
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let (seq, rows) = menu_sequence(0, &lines, false, 2);
+        assert_eq!(rows, 2);
+        // Reserve descent+menu rows, then descend two rows to the end row before
+        // drawing each menu row, restoring the edit cursor at the end.
+        assert_eq!(
+            seq,
+            "\x1bD\x1bD\x1bD\x1bD\x1b[4A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
+        );
+        // Reusing already-reserved rows needs no scroll, but still descends.
+        let (seq, rows) = menu_sequence(2, &lines[..1], false, 2);
+        assert_eq!((seq.as_str(), rows), ("\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
     }
 
     #[test]
     fn anchored_menu_scrolls_released_rows_back_down() {
         let lines = vec!["a".to_string(), "b".to_string()];
         // Opening is the same as unanchored: rows are reserved with IND.
-        assert_eq!(menu_sequence(0, &lines, true), menu_sequence(0, &lines, false));
+        assert_eq!(menu_sequence(0, &lines, true, 0), menu_sequence(0, &lines, false, 0));
         // Narrowing blanks the extra row, then scrolls the conversation down
         // one row into it so the prompt stays above the status line.
-        let (seq, rows) = menu_sequence(2, &lines[..1], true);
+        let (seq, rows) = menu_sequence(2, &lines[..1], true, 0);
         assert_eq!(rows, 1);
         assert!(seq.ends_with(&format!("\x1b8{}", crate::status::anchor_sequence(1))), "{seq:?}");
         // Closing scrolls down by every row the menu used.
-        let (seq, rows) = menu_sequence(2, &[], true);
+        let (seq, rows) = menu_sequence(2, &[], true, 0);
         assert_eq!(rows, 0);
         assert!(seq.ends_with(&crate::status::anchor_sequence(2)), "{seq:?}");
     }
