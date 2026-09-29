@@ -1437,23 +1437,30 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Interactive CLI mode
-        println!("nano-coder v{}", env!("CARGO_PKG_VERSION"));
-        println!("Model: {} (provider: {})", agent.model_name(), agent.provider_name());
+        // Interactive CLI mode: build the startup banner. In frame mode the
+        // renderer owns the screen and its first full redraw clears the
+        // scrollback, so `println!`-ing the banner here would wipe it before it
+        // is ever seen. Collect the lines now and emit them once the renderer
+        // exists (below): seeded into the owned transcript in frame mode, or
+        // printed inline as before in legacy mode.
+        let mut banner = vec![
+            format!("nano-coder v{}", env!("CARGO_PKG_VERSION")),
+            format!("Model: {} (provider: {})", agent.model_name(), agent.provider_name()),
+        ];
         if let Some(id) = agent.session_id() {
-            println!("Session: {id} (resume with --resume {id})");
+            banner.push(format!("Session: {id} (resume with --resume {id})"));
         }
         for file in agent.project_instruction_files() {
-            println!("Instructions: {file}");
+            banner.push(format!("Instructions: {file}"));
         }
         let skills = agent.skills();
         if !skills.is_empty() {
-            println!("Skills: {}", skills.names().join(", "));
+            banner.push(format!("Skills: {}", skills.names().join(", ")));
         }
         for warning in &skills.warnings {
-            println!("Skills warning: {warning}");
+            banner.push(format!("Skills warning: {warning}"));
         }
-        println!("Type /help for commands\n");
+        banner.push("Type /help for commands".to_string());
 
         // Main loop
         let status = status::StatusLine::install(agent.context_stats());
@@ -1470,6 +1477,15 @@ async fn main() -> Result<()> {
         agent.set_streaming(true);
         agent.refresh_stats();
         let frame_mode = renderer.is_frame();
+        // Emit the startup banner now the renderer exists. In frame mode seed it
+        // into the owned transcript via `print_block` so the first full redraw
+        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // inline, with the trailing blank line the banner has always had.
+        if frame_mode {
+            renderer.print_block(&banner.join("\n"));
+        } else {
+            println!("{}\n", banner.join("\n"));
+        }
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
         let view = {
@@ -1519,9 +1535,16 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    // `frame_resize()` re-renders every row (editor included)
-                    // at the new size in one pass; calling `view.resize()` here
-                    // too would fire the edit hook and emit a second redraw.
+                    // Regenerate the editor's command-menu rows at the new size
+                    // first: `frame_resize()` only re-fits the *stored* menu rows
+                    // to the new width, so on its own a shrink leaves a menu with
+                    // too many rows (it can push the prompt off-screen) and a
+                    // widen leaves labels truncated to the old width. `view.resize()`
+                    // re-runs `frame_menu` through the edit hook so `FrameState.menu`
+                    // is sized to the new terminal; `frame_resize()` then forces one
+                    // full invalidated redraw of every row. The extra render is cheap
+                    // — SIGWINCH is debounced to a single event per resize burst.
+                    view.lock().unwrap().resize();
                     renderer.frame_resize();
                 }
             });
