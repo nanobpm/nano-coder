@@ -269,8 +269,8 @@ fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
 }
 
 /// `read_file` prefixes each line with a right-aligned number and a tab. If
-/// the model copied those into `old_string` (every non-blank line has one),
-/// strip them from `old_string` only. `new_string` is not transformed: a
+/// the model copied those into `old_string` (every physical line has one, blank
+/// content lines included), strip them from `old_string` only. `new_string` is not transformed: a
 /// prefix-shaped line there is either genuine content (kept verbatim) or, when
 /// its number falls in `old_string`'s copied range, rejected as ambiguous.
 ///
@@ -297,11 +297,16 @@ fn strip_line_numbers(old: &str, new: &str) -> Result<Option<(String, String, u6
         }
         Some((num, rest))
     }
-    // `old` must look like copied `read_file` output: every non-blank line
-    // carries a prefix AND the numbers are a consecutive ascending run. Genuine
-    // TSV data whose leading integers merely look prefix-shaped is not
-    // consecutive, so it can't retarget an unrelated block by being stripped.
-    let lines: Vec<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
+    // `old` must look like copied `read_file` output: EVERY physical line
+    // carries a prefix AND the numbers are a consecutive ascending run. Blank
+    // lines are not exempt — `read_file` numbers empty-content lines too, so a
+    // bare blank line means the input was not copied verbatim. Filtering blanks
+    // out would let `"     1\tfoo\n\n     2\tbar"` pass as numbered, strip to
+    // `"foo\n\nbar"`, and anchor an edit at line `1` even though the intervening
+    // blank line pushes `bar` to line 3 — misaligning the numbering. Genuine TSV
+    // data whose leading integers merely look prefix-shaped is not consecutive,
+    // so it can't retarget an unrelated block by being stripped.
+    let lines: Vec<&str> = old.lines().collect();
     let nums: Vec<u64> = match lines.iter().map(|l| prefix_num(l).map(|(n, _)| n)).collect::<Option<_>>() {
         Some(nums) => nums,
         None => return Ok(None),
@@ -1251,6 +1256,38 @@ mod tests {
             .to_string();
         assert!(err.contains("not found"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo\nbar\n");
+    }
+
+    #[test]
+    fn bare_blank_line_in_numbered_old_is_not_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        // `read_file` numbers blank content lines too, so a *bare* blank line in
+        // numbered `old_string` means the input was not copied verbatim. Stripping
+        // it anyway would anchor the edit at line 1 even though the blank line
+        // pushes `bar` to line 3, misaligning the numbering. Require a prefix on
+        // every physical line: the malformed input must fall back to a literal
+        // (unfound) match, not silently retarget lines 1-3.
+        let p = read_fixture(&dir, "b.txt", "foo\n\nbar\n");
+        let err = edit_file(&json!({
+            "path": p, "old_string": "     1\tfoo\n\n     2\tbar", "new_string": "x"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "foo\n\nbar\n");
+    }
+
+    #[test]
+    fn numbered_old_with_prefixed_blank_line_strips_and_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        // A faithful copy of `read_file` output keeps the blank line's prefix
+        // (`     2\t`), so numbering stays aligned and the block strips and edits.
+        let p = read_fixture(&dir, "b.txt", "foo\n\nbar\n");
+        edit_file(&json!({
+            "path": p, "old_string": "     1\tfoo\n     2\t\n     3\tbar", "new_string": "FOO\n\nBAR"
+        }))
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "FOO\n\nBAR\n");
     }
 
     #[test]
