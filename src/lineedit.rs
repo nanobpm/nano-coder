@@ -339,9 +339,15 @@ impl EditView {
     /// cursor on it at column `cols` (a pending wrap), and printing one more
     /// character wraps to the next row.
     fn cursor_position(&self, cols: usize) -> (usize, usize) {
+        self.position_at(self.cursor, cols)
+    }
+
+    /// Row and column after the first `idx` characters of the line, counted
+    /// as for [`cursor_position`](Self::cursor_position).
+    fn position_at(&self, idx: usize, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let (mut row, mut col) = self.prompt_start(cols);
-        for c in self.line.chars().take(self.cursor) {
+        for c in self.line.chars().take(idx) {
             if c == '\n' {
                 row += 1;
                 col = 0;
@@ -365,36 +371,59 @@ impl EditView {
             return;
         }
         let (_rows, cols) = crate::status::terminal_size().unwrap_or((24, 80));
-        let cols = (cols as usize).max(1);
+        let seq = self.redraw_sequence((cols as usize).max(1), &crate::ui::stamp());
+        write(&seq);
+    }
+
+    /// The bytes for [`redraw`](Self::redraw) at a `cols`-wide terminal, and
+    /// the bookkeeping update for the next redraw.
+    ///
+    /// Every cursor movement is relative to where the cursor actually is. In
+    /// particular the cursor is not saved and restored (DECSC/DECRC) around the
+    /// print: that saves an absolute screen row, and when printing a wrapped
+    /// input scrolls the screen the prompt moves up while the saved row does
+    /// not, leaving the cursor rows below the prompt. The next redraw then
+    /// reprints from the wrong row, stacking a stale copy of the input on
+    /// every key press.
+    fn redraw_sequence(&mut self, cols: usize, stamp: &str) -> String {
         let content = self.content_rows(cols);
         let (cursor_row, cursor_col) = self.cursor_position(cols);
-        let clear_below = self.drawn_rows.saturating_sub(content).saturating_sub(cursor_row);
-        // The cursor was left `drawn_cursor_row` rows below the prompt's first
-        // row (a wrapped or newline row); climb back to the prompt row before
-        // reprinting, or the prompt lands on a content row and overwrites the
-        // tail of the input.
-        let up = self.drawn_cursor_row;
+        let (end_row, _) = self.position_at(self.line.chars().count(), cols);
+        let mut seq = String::new();
+        // Climb from where the last redraw left the cursor to the prompt row.
+        if self.drawn_cursor_row > 0 {
+            seq.push_str(&format!("\x1b[{}A", self.drawn_cursor_row));
+        }
+        seq.push('\r');
+        // Blank the rows the last redraw used (menu included), row by row
+        // rather than with erase-below, which would also wipe the status line
+        // pinned under the scroll region. These rows already exist on screen,
+        // so moving down them never scrolls.
+        let old = self.drawn_rows.max(1);
+        for i in 0..old {
+            if i > 0 {
+                seq.push_str("\x1b[1B");
+            }
+            seq.push_str("\x1b[2K");
+        }
+        if old > 1 {
+            seq.push_str(&format!("\x1b[{}A", old - 1));
+        }
+        // Print. This may scroll the screen; the cursor ends at the end of
+        // the input, `end_row` rows below the prompt wherever it now is.
+        seq.push_str(&format!("\r{stamp}> {}", self.line));
+        // Walk back from the end of the input to the edit cursor.
+        if end_row > cursor_row {
+            seq.push_str(&format!("\x1b[{}A", end_row - cursor_row));
+        }
+        seq.push('\r');
+        if cursor_col > 0 {
+            seq.push_str(&format!("\x1b[{cursor_col}C"));
+        }
+        // The menu's rows stay reserved (blank) until `draw_menu` refills them.
         self.drawn_rows = content + self.menu_rows;
         self.drawn_cursor_row = cursor_row;
-        let stamp = crate::ui::stamp();
-        let mut seq = String::new();
-        if up > 0 {
-            seq.push_str(&format!("\x1b[{up}A"));
-        }
-        seq.push_str(&format!("\x1b7\r{stamp}> {}\x1b[J", self.line));
-        if clear_below > 0 {
-            seq.push_str(&format!("\x1b[{clear_below}B\x1b[J"));
-        }
-        seq.push_str("\x1b8");
-        if cursor_row > 0 {
-            seq.push_str(&format!("\x1b[{cursor_row}B"));
-        }
-        if cursor_col > 0 {
-            seq.push_str(&format!("\r\x1b[{cursor_col}C"));
-        } else {
-            seq.push('\r');
-        }
-        write(&seq);
+        seq
     }
 
     /// On Enter: rewrite the prompt's timestamp with the time the line was
@@ -1496,5 +1525,126 @@ mod tests {
             let bytes = [&b"later"[..], seq].concat();
             assert!(matches!(read_key(EditMode::Turn, &bytes), Key::Queue(l) if l == "later\n"), "{seq:?}");
         }
+    }
+
+    /// A minimal terminal: printing with auto-wrap (pending wrap at the last
+    /// column) and scrolling at the bottom, CR, LF, and the CSI moves and
+    /// erases `redraw_sequence` emits.
+    struct Term {
+        grid: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+        pending: bool,
+    }
+
+    impl Term {
+        fn new(rows: usize, cols: usize) -> Self {
+            Term { grid: vec![vec![' '; cols]; rows], row: rows - 1, col: 0, pending: false }
+        }
+        fn scroll(&mut self) {
+            let cols = self.grid[0].len();
+            self.grid.remove(0);
+            self.grid.push(vec![' '; cols]);
+        }
+        fn newline(&mut self) {
+            if self.row + 1 == self.grid.len() {
+                self.scroll();
+            } else {
+                self.row += 1;
+            }
+        }
+        fn feed(&mut self, seq: &str) {
+            let cols = self.grid[0].len();
+            let mut chars = seq.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\x1b' => {
+                        assert_eq!(chars.next(), Some('['), "only CSI expected in {seq:?}");
+                        let mut n = String::new();
+                        while let Some(d) = chars.next_if(|d| d.is_ascii_digit()) {
+                            n.push(d);
+                        }
+                        let n: usize = n.parse().unwrap_or(1);
+                        self.pending = false;
+                        match chars.next().unwrap() {
+                            'A' => self.row = self.row.saturating_sub(n),
+                            'B' => self.row = (self.row + n).min(self.grid.len() - 1),
+                            'C' => self.col = (self.col + n).min(cols - 1),
+                            'K' => self.grid[self.row] = vec![' '; cols],
+                            'm' => {}
+                            other => panic!("unexpected CSI {other}"),
+                        }
+                    }
+                    '\r' => {
+                        self.col = 0;
+                        self.pending = false;
+                    }
+                    '\n' => {
+                        // OPOST/ONLCR: a newline is CRLF.
+                        self.col = 0;
+                        self.pending = false;
+                        self.newline();
+                    }
+                    _ => {
+                        if self.pending {
+                            self.col = 0;
+                            self.pending = false;
+                            self.newline();
+                        }
+                        self.grid[self.row][self.col] = c;
+                        if self.col + 1 == cols {
+                            self.pending = true;
+                        } else {
+                            self.col += 1;
+                        }
+                    }
+                }
+            }
+        }
+        fn lines(&self) -> Vec<String> {
+            self.grid.iter().map(|r| r.iter().collect::<String>().trim_end().to_string()).collect()
+        }
+    }
+
+    #[test]
+    fn redraw_that_scrolls_keeps_the_prompt_in_place() {
+        // A 10-wide, 4-row screen with the prompt on the bottom row. Editing
+        // at the start of the line while the input wraps scrolls the screen on
+        // each growth; the input must be reprinted over itself, not stacked.
+        let (cols, rows) = (10, 4);
+        let mut term = Term::new(rows, cols);
+        let mut v = view("");
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        for c in "xxxxxxx".chars() {
+            v.line.push(c);
+            v.cursor += 1;
+            term.feed(&v.redraw_sequence(cols, ""));
+        }
+        v.cursor = 0;
+        term.feed(&v.redraw_sequence(cols, ""));
+        for c in "abcdefghijklm".chars() {
+            v.line.insert(v.byte_of(v.cursor), c);
+            v.cursor += 1;
+            term.feed(&v.redraw_sequence(cols, ""));
+            // Exactly one prompt on screen, and the cursor where the model says.
+            let prompts = term.lines().iter().filter(|l| l.starts_with("> ")).count();
+            assert_eq!(prompts, 1, "stacked copies after {c:?}: {:#?}", term.lines());
+            let (row, col) = v.cursor_position(cols);
+            let content = v.content_rows(cols);
+            assert_eq!(term.row, rows - content + row, "cursor row after {c:?}");
+            assert_eq!(term.col, col.min(cols - 1), "cursor column after {c:?}");
+        }
+        assert_eq!(term.lines()[1..], ["> abcdefgh", "ijklmxxxxx", "xx"]);
+    }
+
+    #[test]
+    fn redraw_leaves_rows_below_the_input_alone() {
+        // No erase-below: the status line under the input must survive.
+        let mut v = view("hello");
+        v.mode = EditMode::Prompt;
+        let seq = v.redraw_sequence(80, "");
+        assert!(!seq.contains("\x1b[J"), "{seq:?}");
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "{seq:?}");
     }
 }
