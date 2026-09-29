@@ -201,8 +201,14 @@ The harness exposes 6 lifecycle hook events:
 - `read_file` - Numbered lines of a text file; `path`, optional `offset` (1-based) and `limit`
   (default 2000 lines). Refuses binary files.
 - `write_file` - Create or overwrite a file (`path`, `content`), creating parent directories.
-- `edit_file` - Replace exact text (`path`, `old_string`, `new_string`, optional `replace_all`).
-  Fails unless `old_string` matches exactly once (or `replace_all` is set).
+- `edit_file` - Replace text (`path`, `old_string`, `new_string`, optional `replace_all`).
+  Fails unless `old_string` matches exactly once (or `replace_all` is set). With no exact match,
+  it retries ignoring `read_file` line-number prefixes, then trailing whitespace, then
+  indentation (re-indenting `new_string` to fit), and uses such a match only if it is unique;
+  otherwise the error shows the closest lines. Returns the edited lines with 3 lines of context.
+- `edit_file`, and `write_file` over an existing file, require the file to have been read with
+  `read_file` (or written by these tools) in this process, and to be unchanged on disk since.
+  Otherwise they ask the model to read it again, so an edit can't land on stale text.
 - `plan_add`, `plan_update`, `plan_show` - The agent's task plan (see [Task Plans](#task-plans)).
 - `report_outcome` - Report the task `completed`, `blocked` or `needs_input`, with a `summary`; ends
   the turn (see [Outcomes](#outcomes)).
