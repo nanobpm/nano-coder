@@ -16,9 +16,32 @@ const MAX_LINE_CHARS: usize = 2000;
 const MAX_READ_BYTES: usize = 100_000;
 
 fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
-    args.get(name)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("missing string argument {name:?}"))
+    // A malformed-arguments marker means the model's JSON never decoded; the
+    // dispatch loop normally rejects these calls first, so this is a backstop.
+    if args.get(crate::llm::INVALID_ARGS_KEY).is_some() {
+        bail!(
+            "the arguments arrived as malformed JSON and could not be parsed; \
+             retry the tool call with the same arguments"
+        );
+    }
+    match args.get(name) {
+        None => bail!("missing required argument {name:?}"),
+        Some(Value::Null) => bail!("argument {name:?} is null; provide a string value"),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| anyhow!("argument {name:?} must be a string, got {}", type_name(value))),
+    }
+}
+
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn path_arg(args: &Value) -> Result<PathBuf> {
@@ -235,6 +258,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "z b q\n");
         assert!(edit_file(&json!({ "path": p, "old_string": "nope", "new_string": "x" })).is_err());
         assert!(write_file(&json!({ "path": p, "content": "new" })).unwrap().starts_with("Overwrote"));
+    }
+
+    #[test]
+    fn string_arg_distinguishes_missing_null_and_wrong_type() {
+        // Missing field.
+        let err = write_file(&json!({ "content": "x" })).unwrap_err();
+        assert!(err.to_string().contains("missing required argument \"path\""), "{err}");
+        // Explicit null.
+        let err = write_file(&json!({ "path": null, "content": "x" })).unwrap_err();
+        assert!(err.to_string().contains("\"path\" is null"), "{err}");
+        // Wrong JSON type.
+        let err = write_file(&json!({ "path": 42, "content": "x" })).unwrap_err();
+        assert!(err.to_string().contains("must be a string, got a number"), "{err}");
+        // Malformed-arguments marker is reported as a transport problem.
+        let err = write_file(&json!({ crate::llm::INVALID_ARGS_KEY: "{\"path\":" })).unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"), "{err}");
     }
 
     #[test]

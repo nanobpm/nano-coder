@@ -100,7 +100,14 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
                     blocks.push(json!({"type": "text", "text": message.content}));
                 }
                 for call in &message.tool_calls {
-                    let input = if call.arguments.is_object() { call.arguments.clone() } else { json!({}) };
+                    // Replay malformed arguments verbatim (they are stored as a
+                    // bare string) so the provider sees the same text; only
+                    // non-string, non-object shapes collapse to `{}`.
+                    let input = match &call.arguments {
+                        Value::Object(_) => call.arguments.clone(),
+                        Value::String(raw) => Value::String(raw.clone()),
+                        _ => json!({}),
+                    };
                     blocks.push(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}));
                 }
                 if blocks.is_empty() {
@@ -268,10 +275,10 @@ impl StreamAccumulator {
                 Block::ToolUse { id, name, json } => response.tool_calls.push(ToolCall {
                     id,
                     name,
-                    arguments: match ToolCall::decode_arguments(&json) {
-                        Value::Object(map) => Value::Object(map),
-                        _ => json!({}),
-                    },
+                    // Keep malformed JSON marked (under INVALID_ARGS_KEY)
+                    // instead of erasing it to `{}`, so the dispatch loop can
+                    // tell a truncated stream apart from omitted arguments.
+                    arguments: ToolCall::decode_arguments(&json),
                     item_id: None,
                 }),
             }
@@ -393,7 +400,13 @@ mod tests {
                 "checking",
                 vec![
                     ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None },
-                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad"), item_id: None },
+                    // Malformed arguments arrive marked under INVALID_ARGS_KEY.
+                    ToolCall {
+                        id: "t2".into(),
+                        name: "bash".into(),
+                        arguments: crate::llm::ToolCall::decode_arguments("{bad"),
+                        item_id: None,
+                    },
                 ],
             ),
             Message::tool_result("t1", "get_time", "noon"),
@@ -413,7 +426,8 @@ mod tests {
         let encoded = body["messages"].as_array().unwrap();
         assert_eq!(encoded.len(), 3);
         assert_eq!(encoded[1]["content"][1]["type"], "tool_use");
-        assert_eq!(encoded[1]["content"][2]["input"], json!({}));
+        // The malformed call replays its marked arguments (an object), not `{}`.
+        assert_eq!(encoded[1]["content"][2]["input"], json!({ crate::llm::INVALID_ARGS_KEY: "{bad" }));
         assert_eq!(encoded[2]["role"], "user");
         assert_eq!(encoded[2]["content"].as_array().unwrap().len(), 2);
         assert_eq!(encoded[2]["content"][1]["tool_use_id"], "t2");

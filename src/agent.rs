@@ -1457,7 +1457,13 @@ impl Agent {
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
-                let result = if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
+                let result = if let Some(error) = tool_call.raw_arguments_error() {
+                    // The argument JSON arrived malformed (usually a truncated
+                    // stream). Don't run anything against garbage arguments and
+                    // don't let a handler misreport it as a missing field —
+                    // hand the model a clear, actionable error so it retries.
+                    Err(anyhow::anyhow!(error))
+                } else if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))

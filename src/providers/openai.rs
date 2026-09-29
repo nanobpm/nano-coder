@@ -628,7 +628,9 @@ mod tests {
         }), false)
         .unwrap();
         assert_eq!(response.tool_calls[0].arguments["command"], "ls");
-        assert_eq!(response.tool_calls[1].arguments, Value::String("{oops".into()));
+        // Bad JSON is preserved under the reserved marker key, not dropped.
+        assert_eq!(response.tool_calls[1].arguments, json!({ crate::llm::INVALID_ARGS_KEY: "{oops" }));
+        assert_eq!(response.tool_calls[1].invalid_arguments(), Some("{oops"));
         assert_eq!(response.usage.unwrap().total_tokens, 7);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
     }
