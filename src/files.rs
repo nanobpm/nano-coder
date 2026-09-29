@@ -225,7 +225,9 @@ fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
 
 /// `read_file` prefixes each line with a right-aligned number and a tab. If
 /// the model copied those into `old_string` (every non-blank line has one),
-/// strip them from both strings.
+/// strip them from `old_string` only. `new_string` is not transformed: a
+/// prefix-shaped line there is either genuine content (kept verbatim) or, when
+/// its number falls in `old_string`'s copied range, rejected as ambiguous.
 ///
 /// Returns `Ok(None)` when `old` is not copied `read_file` output. Returns `Err`
 /// when `old` is numbered but `new_string` also carries a prefix-shaped line
@@ -432,14 +434,14 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
 /// unique; fuzzier matching (edit distance) is deliberately not attempted,
 /// since a wrong guess edits the wrong code.
 fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located> {
-    // Each attempt carries the file line its numbers claim (`Some` only for the
-    // line-number-stripped candidate): a match is accepted only where it sits.
-    let mut attempts: Vec<(String, String, Option<&'static str>, Option<u64>)> =
-        vec![(old.to_string(), new.to_string(), None, None)];
-    if let Some((o, n, lo)) = strip_line_numbers(old, new)? {
-        attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
-    }
-    for (o, n, how, at_line) in &attempts {
+    // One matching attempt: the text to find, its replacement, a note on how it
+    // was derived, and (for the line-number-stripped candidate) the file line
+    // its numbers claim — a stripped match is accepted only where it sits.
+    type Attempt = (String, String, Option<&'static str>, Option<u64>);
+    // Try to match one attempt exactly: the literal text and its
+    // file-ending-rewritten form. `Ok(None)` means it doesn't occur; `Err` is a
+    // genuine ambiguity (multiple occurrences without `replace_all`).
+    let exact = |(o, n, how, at_line): &Attempt| -> Result<Option<Located>> {
         // Gather matches for every distinct representation of `o` — the literal
         // form and the file-ending-rewritten form — before enforcing uniqueness
         // or applying `replace_all`. In a mixed-ending file `old = "a\nb"` can
@@ -460,8 +462,22 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
             .collect();
         ranges.sort_unstable();
         ranges.dedup();
+        // Coalesce overlapping cross-representation ranges: the LF and CRLF
+        // forms of one logical occurrence overlap (in `a\r\nb`, `old = "\nb"`
+        // matches `\r\nb` at 1..4 and its literal `\nb` suffix at 2..4). They
+        // are the SAME occurrence, so keep only the first of any overlapping
+        // group — otherwise it is miscounted as a second occurrence and, under
+        // `replace_all`, rebuilding slices `text[end..start]` and panics.
+        // Distinct occurrences never overlap, so this preserves them.
+        let mut deduped: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            if deduped.last().is_none_or(|&(_, e)| r.0 >= e) {
+                deduped.push(r);
+            }
+        }
+        let ranges = deduped;
         if ranges.is_empty() {
-            continue;
+            return Ok(None);
         }
         // Normalize each replacement to its own region's line ending, not the
         // whole file's or the first occurrence's: in a mixed-ending file an
@@ -472,13 +488,33 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         // multiline `n` with LF endings and split that region's endings.
         let news: Vec<String> = ranges.iter().map(|&(s, e)| to_endings_at(text, s, e, n)).collect();
         match ranges.len() {
-            1 => return Ok(Located { ranges, news, how: *how }),
+            1 => Ok(Some(Located { ranges, news, how: *how })),
             // `replace_all` only ever applies to the exact, literal attempt:
             // a relaxed (stripped) match must be unique per the PR contract.
-            _ if replace_all && how.is_none() => return Ok(Located { ranges, news, how: *how }),
+            _ if replace_all && how.is_none() => Ok(Some(Located { ranges, news, how: *how })),
             count => bail!(
                 "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
             ),
+        }
+    };
+
+    // Exact-match the literal candidate FIRST. The line-number-stripped
+    // candidate is built lazily, only after the literal text fails to match
+    // exactly: its ambiguity error (a prefix-shaped `new_string` line) must not
+    // reject an otherwise valid exact edit whose literal text merely happens to
+    // be prefix-shaped (e.g. replacing a real `     1\tabc` TSV row in place).
+    let literal: Attempt = (old.to_string(), new.to_string(), None, None);
+    if let Some(found) = exact(&literal)? {
+        return Ok(found);
+    }
+    let mut attempts: Vec<Attempt> = vec![literal];
+    if let Some((o, n, lo)) = strip_line_numbers(old, new)? {
+        attempts.push((o, n, Some("after removing read_file line numbers"), Some(lo)));
+    }
+    // Now exact-match the stripped candidate (the literal one already missed).
+    for attempt in attempts.iter().skip(1) {
+        if let Some(found) = exact(attempt)? {
+            return Ok(found);
         }
     }
     for trim_start in [false, true] {
@@ -581,6 +617,14 @@ fn near_miss(text: &str, old: &str) -> String {
     const MAX_SCAN: usize = 2000;
     let span = lines.len() - k + 1;
     let windows = 0..span.min(MAX_SCAN);
+    // When the file has more candidate windows than we scan, the result is the
+    // closest match *within the scanned prefix*, not a global one; qualify the
+    // message so a near match past the boundary isn't implied to be absent.
+    let scope = if span > MAX_SCAN {
+        format!(" (nearest within the first {} of {span} candidate positions scanned)", span.min(MAX_SCAN))
+    } else {
+        String::new()
+    };
     let trimmed: Vec<&str> = want.iter().map(|l| l.trim()).collect();
     let line_score = |i: usize| {
         (0..k).filter(|&j| !trimmed[j].is_empty() && lines[i + j].trim() == trimmed[j]).count()
@@ -593,7 +637,7 @@ fn near_miss(text: &str, old: &str) -> String {
     if best > 0 {
         let of = want.iter().filter(|l| !l.trim().is_empty()).count();
         return format!(
-            ". Closest match ({best} of {of} lines agree), lines {}-{}:\n{}",
+            ". Closest match ({best} of {of} lines agree){scope}, lines {}-{}:\n{}",
             i + 1,
             i + k,
             numbered(&lines, i, i + k - 1)
@@ -634,7 +678,7 @@ fn near_miss(text: &str, old: &str) -> String {
     if sbest == 0 {
         return String::new();
     }
-    format!(". Closest lines {}-{} (no lines match exactly):\n{}", si + 1, si + k, numbered(&lines, si, si + k - 1))
+    format!(". Closest lines {}-{} (no lines match exactly){scope}:\n{}", si + 1, si + k, numbered(&lines, si, si + k - 1))
 }
 
 pub fn write_file(args: &Value) -> Result<String> {
@@ -1230,5 +1274,40 @@ mod tests {
         let p = read_fixture(&dir, "ra.txt", "mark\nmark\r\n");
         edit_file(&json!({ "path": p, "old_string": "mark", "new_string": "x\ny", "replace_all": true })).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "x\ny\nx\r\ny\r\n");
+    }
+
+    #[test]
+    fn overlapping_crlf_and_lf_ranges_are_one_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        // In `a\r\nb`, `old = "\nb"` matches both the CRLF form `\r\nb` (1..4)
+        // and its literal `\nb` suffix (2..4) — the SAME occurrence. These
+        // overlapping cross-representation ranges must be coalesced: not counted
+        // as two (a false ambiguity) and not rebuilt as-is under `replace_all`,
+        // which would slice `text[end..start]` and panic.
+        let p = read_fixture(&dir, "ov.txt", "a\r\nb");
+        edit_file(&json!({ "path": p, "old_string": "\nb", "new_string": "\nB", "replace_all": true })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\nB");
+    }
+
+    #[test]
+    fn literal_prefix_shaped_row_is_edited_in_place_not_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file literally contains a padded, prefix-shaped TSV row. Replacing
+        // it with another prefix-shaped row is a valid EXACT edit: the literal
+        // text matches before any line-number-stripped candidate is built, so
+        // the strip's ambiguity check must not reject it.
+        let p = read_fixture(&dir, "tsv.txt", "     1\tabc\n");
+        edit_file(&json!({ "path": p, "old_string": "     1\tabc", "new_string": "     1\txyz" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "     1\txyz\n");
+    }
+
+    #[test]
+    fn near_miss_qualifies_a_truncated_scan() {
+        // With more candidate windows than the scan cap, the hint must not claim
+        // a global closest match — it qualifies with the scanned range so a near
+        // match past the boundary is not implied to be absent.
+        let big: String = (0..3000).map(|i| format!("line{i}\n")).collect();
+        let hint = near_miss(&big, "line");
+        assert!(hint.contains("scanned"), "{hint}");
     }
 }
