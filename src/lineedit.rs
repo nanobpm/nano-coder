@@ -538,15 +538,22 @@ impl EditView {
             write(&seq);
         }
         self.menu_rows = 0;
-        // Reflow moved the input's rows. Reprint the input FIRST, while the
-        // menu is still released: `redraw` clears only the content rows and
-        // places the real cursor on the edit character at the new width,
-        // recording that row in `drawn_cursor_row`. Drawing the menu before
-        // this redraw would fold the menu rows into `drawn_rows`, so the redraw
-        // would erase them again and the menu would vanish on every resize —
-        // and resetting `drawn_cursor_row` without moving the cursor would
-        // leave it on a stale wrapped row so the redraw climbs from the wrong
-        // place. Input first, then the menu, keeps both honest.
+        // Reflow moved the input's rows. `redraw` opens by climbing
+        // `drawn_cursor_row` rows from the real cursor to the prompt row, but
+        // that value was recorded at the OLD width — after the reflow the
+        // cursor sits a different number of rows below the prompt, so retaining
+        // it (or resetting it to 0 unconditionally) makes the climb start from
+        // the wrong row and reprint over the transcript. Recompute the cursor's
+        // prompt-relative row at the NEW width first, so the climb matches where
+        // the cursor actually is.
+        let cols = crate::status::terminal_size().map(|(_, c)| c as usize).unwrap_or(80).max(1);
+        self.drawn_cursor_row = self.cursor_position(cols).0;
+        // Reprint the input FIRST, while the menu is still released: `redraw`
+        // clears only the content rows and places the real cursor on the edit
+        // character at the new width, recording that row in `drawn_cursor_row`.
+        // Drawing the menu before this redraw would fold the menu rows into
+        // `drawn_rows`, so the redraw would erase them again and the menu would
+        // vanish on every resize. Input first, then the menu, keeps both honest.
         self.redraw();
         // The input is reprinted and the cursor placed; now refill the menu
         // under it, sized to the new terminal.
@@ -1377,6 +1384,39 @@ mod tests {
         assert_eq!(
             v.drawn_cursor_row, 2,
             "cursor rests on the last wrapped row, recomputed — not reset to 0"
+        );
+    }
+
+    #[test]
+    fn resize_recomputes_the_cursor_row_at_the_new_width_before_climbing() {
+        // Regression for "resize redraws retain a cursor-row offset calculated
+        // for the old terminal width": `redraw` opens by climbing
+        // `drawn_cursor_row` rows from the real cursor to the prompt. That value
+        // was recorded at the OLD width; after a reflow the cursor sits a
+        // different number of rows below the prompt, so `resize` must recompute
+        // it at the NEW width first. Model the offending case: a line that sat
+        // on the prompt row at a wide terminal (drawn_cursor_row == 0) narrows
+        // so it now wraps and the cursor rests on the last row.
+        let mut v = view("aaaaaaaa"); // 8 chars after "> ": one row at 40 cols, 3 rows at 4.
+        v.mode = EditMode::Prompt;
+        v.prompt_width = 2;
+        v.cursor = v.line.chars().count();
+        // As left by the last redraw at the old wide width: cursor on row 0.
+        v.drawn_cursor_row = 0;
+        v.drawn_rows = 1;
+        assert_eq!(
+            v.cursor_position(40).0,
+            0,
+            "at 40 cols the cursor sits on the prompt row",
+        );
+        // The recompute `resize` performs before `redraw` at the new width.
+        let new_cols = 4;
+        v.drawn_cursor_row = v.cursor_position(new_cols).0;
+        assert_eq!(v.drawn_cursor_row, 2, "at 4 cols the cursor is two rows down");
+        let seq = v.redraw_sequence(new_cols, "");
+        assert!(
+            seq.starts_with("\x1b[2A"),
+            "redraw must climb from the recomputed cursor row (2), not the stale 0; got {seq:?}",
         );
     }
 
