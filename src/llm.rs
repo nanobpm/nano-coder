@@ -135,8 +135,12 @@ pub fn copilot_aic(value: &Value) -> Option<f64> {
     Some(nano / 1e9)
 }
 
-/// Tool call requested by LLM. `arguments` is the decoded JSON object; if the
-/// model produced invalid JSON it is kept verbatim as a `Value::String`.
+/// Tool-call requested by LLM. `arguments` is normally the decoded JSON
+/// object. When the model produced invalid JSON (e.g. a truncated stream),
+/// the failure is recorded out-of-band in [`ToolCall::malformed_arguments`]
+/// and `arguments` is left empty, so the failure is explicit and replayable
+/// instead of looking like a missing argument — and so no key is reserved in
+/// the model-controlled argument object.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Call id (`call_*`) used to pair a tool result with its call; stable
@@ -151,14 +155,41 @@ pub struct ToolCall {
     /// no separate item id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
+    /// The verbatim argument text when it could not be decoded as JSON (a
+    /// truncated or malformed stream). Kept as dedicated metadata rather than
+    /// inside `arguments` so it can never collide with a legitimate argument
+    /// key the model produced, and so it is not replayed to the model as part
+    /// of the argument object. `None` when the arguments decoded fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub malformed_arguments: Option<String>,
 }
 
 impl ToolCall {
-    pub fn decode_arguments(raw: &str) -> Value {
+    /// Build a call from the raw argument text a provider streamed. Valid JSON
+    /// becomes `arguments`; malformed JSON is kept verbatim in
+    /// `malformed_arguments` with `arguments` left empty, so the dispatch loop
+    /// can reject the call with a clear retry error instead of running a tool
+    /// against garbage or misreporting a missing field.
+    pub fn from_raw_arguments(id: String, name: String, raw: &str, item_id: Option<String>) -> Self {
+        let (arguments, malformed_arguments) = Self::split_arguments(raw);
+        Self { id, name, arguments, item_id, malformed_arguments }
+    }
+
+    /// Decode raw argument text into the argument object, returning the
+    /// verbatim text separately when decoding failed. Empty input is an empty
+    /// object with no failure.
+    fn split_arguments(raw: &str) -> (Value, Option<String>) {
         if raw.trim().is_empty() {
-            return json!({});
+            return (json!({}), None);
         }
-        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+        match serde_json::from_str(raw) {
+            Ok(value) => (value, None),
+            // Keep the malformed text as dedicated metadata rather than
+            // dropping it: an empty object alone would look like the model
+            // omitted every argument, and a bare string would be re-sent
+            // verbatim and fail again on replay.
+            Err(_) => (json!({}), Some(raw.to_string())),
+        }
     }
 
     pub fn encoded_arguments(&self) -> String {
@@ -167,6 +198,73 @@ impl ToolCall {
             other => other.to_string(),
         }
     }
+
+    /// The raw malformed argument text, when decoding failed.
+    pub fn invalid_arguments(&self) -> Option<&str> {
+        self.malformed_arguments.as_deref()
+    }
+
+    /// Model-facing error explaining that the arguments arrived malformed and
+    /// the call must be retried. `None` when the arguments decoded fine.
+    ///
+    /// The recovery advice is tailored to `stop_reason`: malformed JSON has two
+    /// very different causes, and the wrong advice loops forever. A truncated
+    /// transport stream is transient, so retrying the *same* call fixes it — but
+    /// a call cut off because the model hit the output-token limit will be cut
+    /// off again every time it retries the same arguments, so there the model
+    /// must make a *smaller* call. When the provider reports a length/truncation
+    /// stop reason we say so explicitly; otherwise we keep the message
+    /// cause-neutral rather than flatly asserting a transient error.
+    pub fn raw_arguments_error(&self, stop_reason: Option<&str>) -> Option<String> {
+        self.invalid_arguments().map(|raw| {
+            let shown: String = raw.chars().take(300).collect();
+            let truncated = if raw.chars().count() > 300 { "…" } else { "" };
+            if stop_reason_is_length(stop_reason) {
+                format!(
+                    "the arguments for `{}` were cut off because the response hit the output-token \
+                     limit (stop reason `{}`), so the call was not run: `{shown}{truncated}`. \
+                     Retrying the same call will hit the same limit — make a smaller call instead, \
+                     for example by splitting the work across multiple `{}` calls or reducing the \
+                     argument size so the full JSON fits within the limit.",
+                    self.name,
+                    stop_reason.unwrap_or("length"),
+                    self.name
+                )
+            } else {
+                format!(
+                    "the arguments for `{}` arrived as malformed JSON (usually a truncated \
+                     response), so the call was not run: `{shown}{truncated}`. \
+                     If this was a transient transport error, simply retry the same `{}` call with \
+                     the same arguments; if it keeps happening, the response was probably truncated \
+                     by the output-token limit, so make a smaller call instead (for example by \
+                     splitting the content).",
+                    self.name, self.name
+                )
+            }
+        })
+    }
+}
+
+/// Whether a provider stop reason means the response was truncated because it
+/// hit the output-token limit (as opposed to a transient transport failure).
+/// Covers the length/truncation signals across providers: OpenAI chat
+/// (`length`), Anthropic (`max_tokens`), and OpenAI Responses
+/// (`max_output_tokens`).
+///
+/// Note the bare OpenAI Responses `incomplete` status is deliberately NOT a
+/// length signal: `incomplete` only says the response stopped early, not why —
+/// it can also mean a content filter or other non-length reason. The Responses
+/// provider resolves `incomplete` to its nested `incomplete_details.reason`
+/// (e.g. `max_output_tokens`) before it reaches here, so only a genuine
+/// length reason is classified as one and a generic `incomplete` keeps the
+/// cause-neutral advice.
+fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|reason| {
+        matches!(
+            reason.to_ascii_lowercase().as_str(),
+            "length" | "max_tokens" | "max_output_tokens"
+        )
+    })
 }
 
 /// Everything a provider needs to produce one completion.
@@ -328,5 +426,73 @@ mod tests {
         assert_eq!(copilot_aic(&serde_json::json!({"usage": {}})), None);
         // A zero cost is still reported (0x-multiplier models are free).
         assert_eq!(copilot_aic(&serde_json::json!({"copilot_usage": {"total_nano_aiu": 0}})), Some(0.0));
+    }
+
+    #[test]
+    fn decodes_valid_arguments_and_marks_invalid_ones() {
+        // Valid JSON decodes normally; empty input is an empty object.
+        let valid = ToolCall::from_raw_arguments("c".into(), "write_file".into(), r#"{"path":"/tmp/x"}"#, None);
+        assert_eq!(valid.arguments, json!({"path": "/tmp/x"}));
+        assert_eq!(valid.invalid_arguments(), None);
+        assert!(ToolCall::from_raw_arguments("c".into(), "t".into(), "", None).arguments.is_object());
+        assert!(ToolCall::from_raw_arguments("c".into(), "t".into(), "   ", None).invalid_arguments().is_none());
+
+        // Malformed JSON is preserved as dedicated metadata, not folded into
+        // the argument object (so it can never collide with a real argument
+        // key, and is not replayed to the model as an argument).
+        let raw = r#"{"path":"/tmp/x","content":"abc"#;
+        let call = ToolCall::from_raw_arguments("c1".into(), "write_file".into(), raw, None);
+        assert_eq!(call.arguments, json!({}), "malformed args leave the object empty");
+        assert_eq!(call.invalid_arguments(), Some(raw));
+        let error = call.raw_arguments_error(None).expect("malformed args report an error");
+        assert!(error.contains("write_file"), "names the tool: {error}");
+        assert!(error.contains("malformed JSON"), "explains the failure: {error}");
+        assert!(error.contains("retry the same"), "tells the model to retry: {error}");
+        // The malformed payload is echoed so the model can see what arrived.
+        assert!(error.contains(r#"{"path":"/tmp/x"#), "shows the raw text: {error}");
+
+        // A well-formed call reports no error.
+        let ok = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: json!({"path": "/tmp/x"}), item_id: None, malformed_arguments: None };
+        assert!(ok.invalid_arguments().is_none());
+        assert!(ok.raw_arguments_error(None).is_none());
+    }
+
+    #[test]
+    fn raw_arguments_error_tailors_advice_to_stop_reason() {
+        let raw = r#"{"path":"/tmp/x","content":"abc"#;
+        let call = ToolCall::from_raw_arguments("c1".into(), "write_file".into(), raw, None);
+
+        // A length/truncation stop reason means retrying the same call loops
+        // forever, so the advice tells the model to make a smaller call and
+        // does NOT claim a transient transport error.
+        for reason in ["length", "max_tokens", "max_output_tokens"] {
+            let error = call.raw_arguments_error(Some(reason)).expect("malformed args report an error");
+            assert!(error.contains("output-token limit"), "names the cause for {reason}: {error}");
+            assert!(error.contains("smaller call"), "advises shrinking for {reason}: {error}");
+            assert!(!error.contains("retry the same"), "does not tell it to repeat for {reason}: {error}");
+        }
+
+        // An unknown / non-length stop reason — including a bare OpenAI Responses
+        // `incomplete` status, which does not by itself prove an output-token
+        // limit — keeps the cause-neutral message (retry, but shrink if it
+        // recurs) rather than asserting a definite length stop.
+        for reason in ["tool_use", "incomplete"] {
+            let error = call.raw_arguments_error(Some(reason)).expect("malformed args report an error");
+            assert!(error.contains("retry the same"), "offers a retry for {reason}: {error}");
+            assert!(
+                error.contains("truncated by the output-token limit"),
+                "hedges on recurrence for {reason}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_arguments_error_truncates_long_payloads() {
+        let raw = format!(r#"{{"content":"{}"#, "x".repeat(1000));
+        let call = ToolCall::from_raw_arguments("c".into(), "write_file".into(), &raw, None);
+        let error = call.raw_arguments_error(None).unwrap();
+        // Only the first 300 chars of the payload are echoed, with an ellipsis.
+        assert!(error.contains('…'), "truncated payload is marked: {error}");
+        assert!(error.len() < raw.len() + 400, "error stays bounded");
     }
 }

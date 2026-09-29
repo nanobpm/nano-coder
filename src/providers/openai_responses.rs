@@ -161,28 +161,22 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
                     thinking_blocks.push(item.clone());
                 }
             }
-            Some("function_call") => tool_calls.push(ToolCall {
-                id: item
+            Some("function_call") => {
+                let id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                name: item
+                    .to_string();
+                let name = item
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                arguments: ToolCall::decode_arguments(
-                    item.get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                ),
-                item_id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }),
+                    .to_string();
+                let raw = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+                tool_calls.push(ToolCall::from_raw_arguments(id, name, raw, item_id));
+            }
             _ => {}
         }
     }
@@ -193,13 +187,31 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
             usage.aic = crate::llm::copilot_aic(value);
             usage
         }),
-        stop_reason: value
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        stop_reason: response_stop_reason(value),
         thinking,
         thinking_blocks,
     })
+}
+
+/// Resolve a Responses object's stop reason. The bare `incomplete` status is
+/// not itself proof the output-token limit was hit — a response can be
+/// `incomplete` for other reasons (e.g. a content filter). OpenAI nests the
+/// real cause in `incomplete_details.reason` (e.g. `max_output_tokens`), so
+/// when the status is `incomplete` we surface that nested reason instead of the
+/// generic status, falling back to the bare status only when no reason is
+/// given. Every other status is passed through verbatim. This keeps the
+/// malformed-argument classifier (`stop_reason_is_length`) from misreporting a
+/// non-length `incomplete` as an output-token-limit failure.
+fn response_stop_reason(response: &Value) -> Option<String> {
+    let status = response.get("status").and_then(Value::as_str)?;
+    if status == "incomplete" {
+        let reason = response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+        return Some(reason.unwrap_or(status).to_string());
+    }
+    Some(status.to_string())
 }
 
 fn parse_usage(usage: Option<&Value>) -> Option<TokenUsage> {
@@ -320,8 +332,8 @@ impl StreamAccumulator {
                         usage.aic = crate::llm::copilot_aic(&event);
                         self.usage = Some(usage);
                     }
-                    if let Some(status) = response.get("status").and_then(Value::as_str) {
-                        self.stop_reason = Some(status.to_string());
+                    if let Some(reason) = response_stop_reason(response) {
+                        self.stop_reason = Some(reason);
                     }
                 }
             }
@@ -349,15 +361,13 @@ impl StreamAccumulator {
             .into_iter()
             .filter(|(_, call)| !call.name.is_empty())
             .enumerate()
-            .map(|(position, (_, call))| ToolCall {
-                id: if call.id.is_empty() {
-                    format!("call_{position}")
-                } else {
-                    call.id
-                },
-                name: call.name,
-                arguments: ToolCall::decode_arguments(&call.arguments),
-                item_id: call.item_id,
+            .map(|(position, (_, call))| {
+                ToolCall::from_raw_arguments(
+                    if call.id.is_empty() { format!("call_{position}") } else { call.id },
+                    call.name,
+                    &call.arguments,
+                    call.item_id,
+                )
             })
             .collect();
         LLMResponse {
@@ -451,6 +461,7 @@ mod tests {
                     name: "get_time".into(),
                     arguments: json!({"tz": "utc"}),
                     item_id: None,
+                    malformed_arguments: None,
                 }],
             ),
             Message::tool_result("call_1", "get_time", "noon"),
@@ -536,6 +547,43 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_status_resolves_to_nested_reason_not_bare_incomplete() {
+        // A bare `incomplete` status is not proof the output-token limit was hit
+        // — the real cause lives in `incomplete_details.reason`. Non-streaming:
+        // a genuine length stop surfaces `max_output_tokens`...
+        let length = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [],
+        });
+        assert_eq!(parse_response(&length, false).unwrap().stop_reason.as_deref(), Some("max_output_tokens"));
+
+        // ...a non-length incomplete surfaces its own reason, never the misleading
+        // bare `incomplete`, so the malformed-argument classifier stays honest.
+        let filtered = json!({
+            "status": "incomplete",
+            "incomplete_details": { "reason": "content_filter" },
+            "output": [],
+        });
+        assert_eq!(parse_response(&filtered, false).unwrap().stop_reason.as_deref(), Some("content_filter"));
+
+        // With no nested reason we fall back to the bare status (cause-neutral).
+        let bare = json!({ "status": "incomplete", "output": [] });
+        assert_eq!(parse_response(&bare, false).unwrap().stop_reason.as_deref(), Some("incomplete"));
+
+        // Streaming path resolves the nested reason the same way.
+        let events = [
+            json!({"type": "response.incomplete", "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {"input_tokens": 1, "output_tokens": 2}}}),
+        ];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        assert_eq!(accumulator.finish().stop_reason.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
     fn parses_copilot_aic_from_response_and_stream() {
         // Non-streaming: `copilot_usage` is a sibling of `usage`.
         let value = json!({
@@ -592,6 +640,7 @@ mod tests {
                         name: "bash".into(),
                         arguments: json!({}),
                         item_id: None,
+                        malformed_arguments: None,
                     }],
                 )
             },

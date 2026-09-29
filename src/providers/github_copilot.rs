@@ -823,7 +823,7 @@ mod tests {
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
-            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}), item_id: None }]),
+            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}), item_id: None, malformed_arguments: None }]),
             Message::tool_result("c", "t", "ok"),
         ];
         let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };

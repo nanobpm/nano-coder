@@ -147,21 +147,18 @@ pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
                         Some(Value::Null) | None => String::new(),
                         Some(other) => other.to_string(),
                     };
-                    ToolCall {
-                        id: call
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| !id.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| format!("call_{index}")),
-                        name: function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: ToolCall::decode_arguments(&raw),
-                        item_id: None,
-                    }
+                    let id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("call_{index}"));
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    ToolCall::from_raw_arguments(id, name, &raw, None)
                 })
                 .collect()
         })
@@ -286,11 +283,8 @@ impl StreamAccumulator {
             .into_iter()
             .enumerate()
             .filter(|(_, (_, name, _))| !name.is_empty())
-            .map(|(index, (id, name, raw))| ToolCall {
-                id: if id.is_empty() { format!("call_{index}") } else { id },
-                name,
-                arguments: ToolCall::decode_arguments(&raw),
-                item_id: None,
+            .map(|(index, (id, name, raw))| {
+                ToolCall::from_raw_arguments(if id.is_empty() { format!("call_{index}") } else { id }, name, &raw, None)
             })
             .collect();
         LLMResponse {
@@ -577,7 +571,7 @@ mod tests {
             Message::user("what time is it?"),
             Message::assistant_with_tools(
                 "",
-                vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: json!({}), item_id: None }],
+                vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
             ),
             Message::tool_result("c1", "get_time", "noon"),
         ]
@@ -628,7 +622,10 @@ mod tests {
         }), false)
         .unwrap();
         assert_eq!(response.tool_calls[0].arguments["command"], "ls");
-        assert_eq!(response.tool_calls[1].arguments, Value::String("{oops".into()));
+        // Bad JSON is preserved as dedicated metadata, not folded into the
+        // argument object.
+        assert_eq!(response.tool_calls[1].arguments, json!({}));
+        assert_eq!(response.tool_calls[1].invalid_arguments(), Some("{oops"));
         assert_eq!(response.usage.unwrap().total_tokens, 7);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
     }
@@ -908,7 +905,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.thinking, "Let me check.more");
         assert_eq!(response.content, "Checking");
-        assert_eq!(response.tool_calls, vec![ToolCall { id: "call_a".into(), name: "bash".into(), arguments: json!({"command": "ls"}), item_id: None }]);
+        assert_eq!(response.tool_calls, vec![ToolCall { id: "call_a".into(), name: "bash".into(), arguments: json!({"command": "ls"}), item_id: None, malformed_arguments: None }]);
         assert_eq!(response.usage.unwrap().total_tokens, 17);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
         assert_eq!(*seen.lock().unwrap(), vec!["R:Let me ", "R:check.", "R:more", "T:Checking"]);

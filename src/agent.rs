@@ -1457,7 +1457,13 @@ impl Agent {
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
-                let result = if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
+                let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
+                    // The argument JSON arrived malformed (usually a truncated
+                    // stream). Don't run anything against garbage arguments and
+                    // don't let a handler misreport it as a missing field —
+                    // hand the model a clear, actionable error so it retries.
+                    Err(anyhow::anyhow!(error))
+                } else if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
@@ -2001,7 +2007,7 @@ mod tests {
 
     fn tool_call(id: &str) -> LLMResponse {
         LLMResponse {
-            tool_calls: vec![ToolCall { id: id.into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None }],
+            tool_calls: vec![ToolCall { id: id.into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         }
     }
@@ -2019,6 +2025,29 @@ mod tests {
         assert_eq!(second[2].role, Role::Assistant);
         assert_eq!(second[2].tool_calls[0].id, "c1");
         assert_eq!(unstamped(&second[3]), Message::tool_result("c1", "echo", "pong"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_tool_call_skips_handler_and_reports_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tool call whose argument JSON never decoded (a truncated stream).
+        let malformed = LLMResponse {
+            tool_calls: vec![ToolCall::from_raw_arguments("c1".into(), "echo".into(), "{\"text\":", None)],
+            ..Default::default()
+        };
+        let (mut agent, seen) = agent(vec![malformed, text("recovered")], dir.path());
+        assert_eq!(agent.send_message("ping").await.unwrap(), "recovered");
+
+        // The dispatch loop short-circuits before any handler: the tool result
+        // is the actionable malformed-arguments error, not a handler response.
+        let second = &seen.lock().unwrap()[1];
+        let result = second.iter().find(|m| m.role == Role::Tool).expect("a tool result was recorded");
+        let error = &result.content;
+        assert!(error.contains("malformed JSON"), "got: {error}");
+        assert!(error.contains("echo"), "names the tool: {error}");
+        // The handler never ran: `echo` would have produced `pong`, but the
+        // malformed call has no decodable `text` to echo.
+        assert_ne!(error, "pong");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2050,7 +2079,7 @@ mod tests {
         log.append(&Record::Message(Message::user("run it"))).unwrap();
         log.append(&Record::Message(Message::assistant_with_tools(
             "",
-            vec![ToolCall { id: "c9".into(), name: "echo".into(), arguments: json!({}), item_id: None }],
+            vec![ToolCall { id: "c9".into(), name: "echo".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
         )))
         .unwrap();
         drop(log);
@@ -2322,7 +2351,7 @@ mod tests {
     async fn auto_compaction_mid_turn_keeps_the_turn_going() {
         let dir = tempfile::tempdir().unwrap();
         let big = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "big".into(), arguments: json!({}), item_id: None }],
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "big".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
@@ -2607,11 +2636,11 @@ mod tests {
         std::fs::write(repo.join("pkg/AGENTS.md"), "Never edit generated files.").unwrap();
         let file = repo.join("pkg/lib.rs");
         let read = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r1".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None }],
+            tool_calls: vec![ToolCall { id: "r1".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         };
         let again = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r2".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None }],
+            tool_calls: vec![ToolCall { id: "r2".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![read, again, text("done")], dir.path());
@@ -2634,7 +2663,7 @@ mod tests {
     }
 
     fn call(id: &str, name: &str, arguments: Value) -> LLMResponse {
-        LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments, item_id: None }], ..Default::default() }
+        LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments, item_id: None, malformed_arguments: None }], ..Default::default() }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2720,7 +2749,7 @@ mod tests {
     }
 
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}), item_id: None }
+        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}), item_id: None, malformed_arguments: None }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2729,7 +2758,7 @@ mod tests {
         let batch = LLMResponse {
             tool_calls: vec![
                 report("o1", "completed", "Opened PR #5"),
-                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None },
+                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None, malformed_arguments: None },
             ],
             ..Default::default()
         };
@@ -2845,7 +2874,7 @@ mod tests {
     async fn failed_tool_reports_failed_status_and_replay_covers_history() {
         let dir = tempfile::tempdir().unwrap();
         let broken = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "broken".into(), arguments: json!({}), item_id: None }],
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "broken".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![broken, text("sorry")], dir.path());
@@ -3056,8 +3085,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = LLMResponse {
             tool_calls: vec![
-                ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "sleep 30"}), item_id: None },
-                ToolCall { id: "e1".into(), name: "echo".into(), arguments: json!({"text": "never"}), item_id: None },
+                ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "sleep 30"}), item_id: None, malformed_arguments: None },
+                ToolCall { id: "e1".into(), name: "echo".into(), arguments: json!({"text": "never"}), item_id: None, malformed_arguments: None },
             ],
             ..Default::default()
         };
@@ -3104,7 +3133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The model tries to call `bash` (mutating), then answers with text.
         let calls = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "rm -rf /"}), item_id: None }],
+            tool_calls: vec![ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "rm -rf /"}), item_id: None, malformed_arguments: None }],
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![calls, text("cannot do that in plan mode")], dir.path());

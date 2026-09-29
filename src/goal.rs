@@ -162,6 +162,7 @@ mod tests {
             name: TOOL_NAME.into(),
             arguments: json!({"status": status, "summary": id}),
             item_id: None,
+            malformed_arguments: None,
         };
         let messages = vec![
             Message::user("go"),

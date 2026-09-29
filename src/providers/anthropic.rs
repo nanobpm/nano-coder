@@ -100,7 +100,17 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
                     blocks.push(json!({"type": "text", "text": message.content}));
                 }
                 for call in &message.tool_calls {
-                    let input = if call.arguments.is_object() { call.arguments.clone() } else { json!({}) };
+                    // Anthropic requires `tool_use.input` to be an object. A
+                    // malformed call carries its raw text as dedicated
+                    // metadata, not in `arguments`, so it replays as the empty
+                    // object it was decoded to. Legacy session logs (pre-change)
+                    // could still hold malformed arguments as a bare
+                    // `Value::String`; those upgrade to `{}` here rather than
+                    // emitting an invalid string `input`.
+                    let input = match &call.arguments {
+                        Value::Object(_) => call.arguments.clone(),
+                        _ => json!({}),
+                    };
                     blocks.push(json!({"type": "tool_use", "id": call.id, "name": call.name, "input": input}));
                 }
                 if blocks.is_empty() {
@@ -142,6 +152,7 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
                 name: block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
                 arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
                 item_id: None,
+                malformed_arguments: None,
             }),
             _ => {}
         }
@@ -265,15 +276,12 @@ impl StreamAccumulator {
                         response.thinking_blocks.push(block);
                     }
                 }
-                Block::ToolUse { id, name, json } => response.tool_calls.push(ToolCall {
-                    id,
-                    name,
-                    arguments: match ToolCall::decode_arguments(&json) {
-                        Value::Object(map) => Value::Object(map),
-                        _ => json!({}),
-                    },
-                    item_id: None,
-                }),
+                Block::ToolUse { id, name, json } => {
+                    // Keep malformed JSON as dedicated metadata instead of
+                    // erasing it to `{}`, so the dispatch loop can tell a
+                    // truncated stream apart from omitted arguments.
+                    response.tool_calls.push(ToolCall::from_raw_arguments(id, name, &json, None))
+                }
             }
         }
         response
@@ -392,8 +400,9 @@ mod tests {
             Message::assistant_with_tools(
                 "checking",
                 vec![
-                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None },
-                    ToolCall { id: "t2".into(), name: "bash".into(), arguments: json!("{bad"), item_id: None },
+                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None },
+                    // Malformed arguments arrive as dedicated metadata.
+                    ToolCall::from_raw_arguments("t2".into(), "bash".into(), "{bad", None),
                 ],
             ),
             Message::tool_result("t1", "get_time", "noon"),
@@ -413,6 +422,8 @@ mod tests {
         let encoded = body["messages"].as_array().unwrap();
         assert_eq!(encoded.len(), 3);
         assert_eq!(encoded[1]["content"][1]["type"], "tool_use");
+        // Anthropic requires tool_use.input to be an object: the malformed call
+        // replays as the empty object it was decoded to, never a bare string.
         assert_eq!(encoded[1]["content"][2]["input"], json!({}));
         assert_eq!(encoded[2]["role"], "user");
         assert_eq!(encoded[2]["content"].as_array().unwrap().len(), 2);
@@ -517,6 +528,38 @@ mod tests {
         let encoded = encode_messages(&[Message::user("hello"), assistant]);
         assert_eq!(encoded[1]["content"][0], json!({"type": "thinking", "thinking": "Plan.", "signature": "sig"}));
         assert_eq!(encoded[1]["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn finish_preserves_truncated_tool_call_arguments_as_malformed() {
+        // A tool call whose `input_json_delta` stream is truncated (here by the
+        // output-token limit) accumulates invalid JSON. `finish` must keep the
+        // raw text as dedicated `malformed_arguments` metadata rather than
+        // erasing it to `{}`, so the dispatch loop can tell a truncated stream
+        // apart from omitted arguments.
+        let events = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"write_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/big.txt\",\"content\":\"..."}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut accumulator = StreamAccumulator::default();
+        let sink: StreamSink<'_> = &|_| {};
+        for event in events {
+            accumulator.push(&event.to_string(), sink).unwrap();
+        }
+        let response = accumulator.finish();
+        assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
+        let call = &response.tool_calls[0];
+        // The truncated text is preserved verbatim as malformed metadata...
+        assert_eq!(
+            call.invalid_arguments(),
+            Some("{\"path\":\"/tmp/big.txt\",\"content\":\"...")
+        );
+        // ...and `arguments` holds no fabricated field for a handler to
+        // misreport as present-but-empty.
+        assert_eq!(call.arguments, json!({}));
     }
 
     #[test]
