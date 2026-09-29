@@ -579,17 +579,21 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     .await;
     renderer.end_turn();
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
-    let outcome = outcome?;
     // A steer typed as the turn finished queues behind what is already
-    // waiting, unless the turn was cancelled.
+    // waiting, unless the turn was cancelled. Drain it before propagating any
+    // turn error too: `start_turn` does not clear pending steers, so a steer
+    // left behind on the error path would be silently absorbed into the next
+    // unrelated prompt instead of landing in the visible queue. Only a
+    // successful cancelled outcome drops it.
+    let cancelled = matches!(&outcome, Ok(o) if o.stop_reason == agent::StopReason::Cancelled);
     for steer in control.take_pending() {
-        if outcome.stop_reason == agent::StopReason::Cancelled {
+        if cancelled {
             renderer.note(&format!("[steer dropped: {}]", steer.text));
         } else {
             terminal.queue_message(&steer.text);
         }
     }
-    Ok(outcome)
+    outcome
 }
 
 /// How long auto mode waits for the user before answering a question itself.

@@ -183,7 +183,7 @@ pub fn apply(queue: &mut MessageQueue, op: &QueueOp) -> String {
 /// One line per waiting message, oldest first.
 pub fn describe(queue: &MessageQueue) -> String {
     if queue.is_empty() {
-        return "Queue is empty. Type a message while a turn runs to queue it.".to_string();
+        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.".to_string();
     }
     let mut out = format!("Queued ({}):", queue.len());
     for entry in queue.list() {
@@ -300,7 +300,7 @@ mod tests {
         assert!(missing.contains("No queued message with id 7"), "{missing}");
 
         assert!(apply(&mut queue, &QueueOp::Clear).contains("Cleared 2"));
-        assert_eq!(apply(&mut queue, &QueueOp::List), "Queue is empty. Type a message while a turn runs to queue it.");
+        assert_eq!(apply(&mut queue, &QueueOp::List), "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.");
     }
 
     #[test]

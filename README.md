@@ -56,7 +56,7 @@ asking for input (the `question` tool's picker owns the terminal until you answe
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
-(never steers).
+(never steer).
 
 ### ACP Headless Mode (--acp flag)
 
