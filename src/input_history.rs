@@ -26,8 +26,7 @@ impl InputHistory {
     /// line are not kept (repeats still reset browsing via `edited`, which the
     /// editor calls on the same key press).
     pub fn record(&mut self, line: &str) {
-        let line = line.trim();
-        if line.is_empty() || self.lines.last().is_some_and(|last| last == line) {
+        if line.trim().is_empty() || self.lines.last().is_some_and(|last| last == line) {
             return;
         }
         self.lines.push(line.to_string());
@@ -126,7 +125,9 @@ mod tests {
         history.record("one");
         history.record("one");
         history.record(" one ");
-        assert_eq!(history.lines.len(), 1);
+        // Blanks and exact repeats are skipped, but whitespace variants are
+        // stored verbatim — the recalled line matches what was submitted.
+        assert_eq!(history.lines, vec!["one".to_string(), " one ".to_string()]);
         for i in 0..(MAX_ENTRIES + 10) {
             history.record(&format!("line {i}"));
         }

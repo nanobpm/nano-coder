@@ -584,6 +584,8 @@ impl EditView {
             // is redrawn empty.
             self.restamp_prompt();
             let line = std::mem::take(&mut self.line);
+            self.history.record(&line);
+            self.history.edited();
             self.cursor = 0;
             self.drawn_rows = 0;
             self.drawn_cursor_row = 0;
@@ -1413,6 +1415,23 @@ mod tests {
         assert_eq!(view.line, "same");
         view.history_up();
         assert_eq!(view.line, "same", "one entry only: still the oldest");
+    }
+
+    #[test]
+    fn frame_mode_submission_records_history() {
+        // With an edit hook installed (renderer = "frame"), `take` returns from
+        // the hook branch — but it must still record and reset history so
+        // Up/Down recall works in that render path too.
+        let mut view = view("");
+        view.set_edit_hook(Arc::new(|_, _, _| {}));
+        view.line = "first".into();
+        view.take();
+        view.line = "second".into();
+        view.take();
+        view.history_up();
+        assert_eq!(view.line, "second");
+        view.history_up();
+        assert_eq!(view.line, "first");
     }
 
     #[test]
