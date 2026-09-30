@@ -110,7 +110,9 @@ impl Entry {
 #[derive(Default)]
 struct ScopeFile {
     entries: Vec<Entry>,
-    unknown: Vec<String>,
+    /// Raw bytes of records we could not parse, kept byte-for-byte so a later
+    /// rewrite re-emits them unchanged (never lossy-decoded).
+    unknown: Vec<Vec<u8>>,
 }
 
 /// A per-machine memory store rooted at a `memory/` directory. `project` is the
@@ -168,8 +170,11 @@ impl Store {
                 // torn line, or a field a newer nano-coder wrote) is preserved
                 // verbatim, not dropped: every rewrite (save/search/forget/
                 // prune) re-emits it via `write_all`, so a record we cannot
-                // parse today is never silently deleted.
-                Err(_) => unknown.push(String::from_utf8_lossy(line).into_owned()),
+                // parse today is never silently deleted. Keep the raw *bytes*:
+                // `from_utf8_lossy` would replace invalid UTF-8 with U+FFFD and
+                // a later rewrite would permanently corrupt the original line
+                // (Copilot finding, src/memory.rs).
+                Err(_) => unknown.push(line.to_vec()),
             }
         }
         if self.expiry_days > 0 {
@@ -583,31 +588,45 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_
 /// share (and clobber) one temp file or make each other's rename fail. Any
 /// `unknown` lines (records we could not parse on load) are re-emitted verbatim
 /// so a rewrite never deletes a malformed hand-edit or a newer-version record.
-fn write_all(path: &Path, entries: &[Entry], unknown: &[String]) -> Result<()> {
+fn write_all(path: &Path, entries: &[Entry], unknown: &[Vec<u8>]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut body = String::new();
+    let mut body: Vec<u8> = Vec::new();
     for entry in entries {
-        body.push_str(&serde_json::to_string(entry)?);
-        body.push('\n');
+        body.extend_from_slice(serde_json::to_string(entry)?.as_bytes());
+        body.push(b'\n');
     }
     for line in unknown {
-        body.push_str(line);
-        body.push('\n');
+        // Unknown records are stored as raw bytes and re-emitted unchanged, so
+        // a malformed or future-version line survives a rewrite byte-for-byte.
+        body.extend_from_slice(line);
+        body.push(b'\n');
     }
     let tmp = path.with_extension(format!("jsonl.tmp.{}.{:08x}", std::process::id(), fastrand::u32(..)));
     // Create the (empty) temp file first, then copy the target's permissions
     // onto it, and only then write the body. Writing first (the previous order)
     // briefly placed the full contents in an umask-created `0644`/`0664` sibling
     // that another local user could read or monitor before the restrictive
-    // permissions were applied (Copilot finding, src/memory.rs). The temp file
-    // is created with the process umask, so a rename would otherwise silently
-    // widen a user-protected `0600` memory file to `0644`/`0664`, exposing it to
-    // other local users. Copy the existing target's permissions onto the temp
-    // file first (as `src/files.rs` does); a missing target (first save) keeps
-    // the umask default. Clean up the temp file if the chmod itself fails.
-    let mut file = std::fs::File::create(&tmp)?;
+    // permissions were applied (Copilot finding, src/memory.rs).
+    //
+    // Two cases for the temp file's permissions:
+    //   * New scope (no existing target): there is no metadata to copy, so the
+    //     file would keep its umask-created mode (typically `0644`) and the
+    //     rename would make that the permanent memory file — exposing memories
+    //     (and any secret the heuristic misses) to other local accounts. Create
+    //     it `0600` on Unix so a new memory file is owner-only from birth.
+    //   * Existing scope: copy the target's permissions onto the temp file (as
+    //     `src/files.rs` does) so a rename never widens a user-protected `0600`
+    //     file to the umask default. Clean up the temp file if the chmod fails.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
     if let Ok(meta) = std::fs::metadata(path)
         && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
     {
@@ -617,7 +636,7 @@ fn write_all(path: &Path, entries: &[Entry], unknown: &[String]) -> Result<()> {
     // Write the body only after the restrictive permissions are in place, and
     // remove the temp file if the write itself fails so a partial body is never
     // left behind in a readable sibling.
-    if let Err(e) = std::io::Write::write_all(&mut file, body.as_bytes()) {
+    if let Err(e) = std::io::Write::write_all(&mut file, &body) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -630,14 +649,26 @@ fn write_all(path: &Path, entries: &[Entry], unknown: &[String]) -> Result<()> {
 
 /// A best-effort advisory lock on a scope, held for the duration of a
 /// read-modify-write transaction so two nano-coder processes sharing the memory
-/// directory serialize instead of losing each other's entries. Released on
-/// drop. If the lock is still held after the wait budget the acquire fails
-/// rather than breaking it: the timeout measures how long *this* waiter has
-/// waited, not how old the lock is, so a live holder mid-transaction (a large
-/// store, a scheduling pause) must never have its lock deleted out from under
-/// it — that would admit an overlapping writer and let the original holder
-/// delete the replacement's lock on drop.
-struct FileLock(PathBuf);
+/// directory serialize instead of losing each other's entries.
+///
+/// On Unix this is an OS advisory lock (`flock(LOCK_EX)`) on a `*.jsonl.lock`
+/// file. Because the lock is held by the *process* (via the open file
+/// description), the kernel releases it automatically when the process exits —
+/// including on a crash or `SIGKILL` — so a dead holder can never leave the
+/// scope permanently locked (the previous `create_new` lock-file design left
+/// the file behind on a crash, blocking every later op until a user manually
+/// deleted it; Copilot finding, src/memory.rs). If the lock is still held after
+/// the wait budget the acquire fails rather than breaking it: the timeout
+/// measures how long *this* waiter has waited, not how old the lock is, so a
+/// live holder mid-transaction must never be preempted. Released on drop.
+struct FileLock {
+    #[cfg(unix)]
+    file: std::fs::File,
+    /// Path of the lock file, kept only for the non-Unix fallback (which uses
+    /// lock-file creation as the mutex and must remove it on drop).
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
 
 impl FileLock {
     fn acquire(path: &Path) -> Result<Self> {
@@ -646,21 +677,51 @@ impl FileLock {
             std::fs::create_dir_all(parent)?;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-                Ok(_) => return Ok(FileLock(lock)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Open (creating if needed) the lock file. The lock is the `flock`
+            // on it, not the file's existence, so a stale file from a crashed
+            // process is harmless: it is unlocked and can be re-locked at once.
+            // We never write to it, so don't truncate.
+            let file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&lock)?;
+            let fd = file.as_raw_fd();
+            loop {
+                // Non-blocking exclusive lock; retry until the wait budget runs
+                // out so a live holder is never preempted mid-transaction.
+                let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    return Ok(FileLock { file });
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                     if std::time::Instant::now() >= deadline {
-                        // Still held after the wait budget. It may be a live
-                        // holder or a crashed one; we cannot prove which, so we
-                        // fail instead of deleting a lock that could be live.
-                        // A genuinely abandoned lock is cleared by removing the
-                        // stale `*.jsonl.lock` file.
                         bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
                 }
-                Err(e) => return Err(e.into()),
+                return Err(err.into());
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Portable fallback: lock-file creation as the mutex. A crash can
+            // leave the file behind; it is cleared by removing the stale
+            // `*.jsonl.lock` file.
+            loop {
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                    Ok(_) => return Ok(FileLock { path: lock }),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if std::time::Instant::now() >= deadline {
+                            bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
     }
@@ -668,7 +729,18 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Explicitly release the advisory lock; closing the file (on drop)
+            // would also release it, but doing so explicitly is clearer. The
+            // lock file itself is left behind — unlocked, it blocks no one.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -702,10 +774,19 @@ pub fn project_key(cwd: &Path) -> Option<String> {
                     // and `/work/b/../origin.git` even though both point to
                     // the same `/work/origin.git` — fragmenting project memory
                     // across repositories that share one origin (Copilot
-                    // finding, src/memory.rs). Collapse the components
-                    // lexically (no filesystem access: the target need not
-                    // exist) before deriving the key.
-                    let resolved = normalize_path(&Path::new(root).join(url));
+                    // finding, src/memory.rs). Resolve to a single stable key.
+                    //
+                    // Lexically collapsing `..` is *wrong* when an earlier
+                    // component is a symlink: `root/link/../origin.git` with
+                    // `link` pointing outside `root` resolves somewhere other
+                    // than `root/origin.git`, so collapsing would make unrelated
+                    // remotes share a memory file (Copilot finding,
+                    // src/memory.rs). Prefer filesystem-aware canonicalization
+                    // (it resolves symlinks) when the target exists; when it
+                    // does not, keep the unresolved joined path verbatim rather
+                    // than collapsing a `..` whose meaning we cannot verify.
+                    let joined = Path::new(root).join(url);
+                    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
                     return Some(normalize_remote(&resolved.to_string_lossy()));
                 }
             }
@@ -713,32 +794,6 @@ pub fn project_key(cwd: &Path) -> Option<String> {
         }
     }
     git_output(cwd, &["rev-parse", "--show-toplevel"]).map(|root| root.trim().to_string()).filter(|r| !r.is_empty())
-}
-
-/// Collapse `.` and `..` components lexically, without touching the filesystem
-/// (the target need not exist). The root/prefix is preserved; a `..` that would
-/// climb above the root (or a leading `..` in a relative path) is kept verbatim
-/// so the result stays a valid, equivalent path. Used to give repositories that
-/// resolve the same relative origin a single stable project key.
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Pop the last normal component; otherwise keep the `..` (it is
-                // either leading in a relative path or climbs above the root).
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(part) => out.push(part),
-            Component::RootDir => out.push(component.as_os_str()),
-            Component::Prefix(_) => out.push(component.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Whether a remote string is a relative local path (e.g. `./repo.git` or
@@ -1370,6 +1425,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn write_all_creates_new_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        let path = store.path(Scope::User).unwrap();
+        // A brand-new scope has no existing target to copy permissions from, so
+        // the temp file would otherwise keep its umask-created `0644`/`0664` and
+        // the rename would make that the permanent memory file — readable by
+        // other local accounts (Copilot finding, src/memory.rs). It must be
+        // created owner-only (`0600`) from birth.
+        assert!(!path.exists(), "precondition: no memory file yet");
+        let entry = store.save(Scope::User, "first fact", None, None).unwrap();
+        write_all(&path, std::slice::from_ref(&entry), &[]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new memory file not owner-only: {mode:#o}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_lock_file_does_not_block_acquisition() {
+        // A lock file left behind by a crashed process (SIGKILL) must not block
+        // later operations: the lock is the `flock` on the file, not the file's
+        // existence, so a stale unlocked file can be re-locked immediately
+        // (Copilot finding, src/memory.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        let path = store.path(Scope::User).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Simulate the abandoned lock file a crash would leave behind.
+        let lock = path.with_extension("jsonl.lock");
+        std::fs::write(&lock, b"").unwrap();
+        // Acquisition must succeed at once despite the stale file.
+        let guard = FileLock::acquire(&path).expect("stale lock file must not block acquisition");
+        drop(guard);
+        // And a held lock is released on drop, so a second acquire succeeds.
+        let guard = FileLock::acquire(&path).expect("released lock must be re-acquirable");
+        drop(guard);
+    }
+
+    #[test]
     fn index_is_dated_framed_and_capped() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -1455,6 +1551,30 @@ mod tests {
         // The parseable entries are intact.
         let ids: Vec<_> = store.all().unwrap().into_iter().map(|(_, e)| e.id).collect();
         assert!(ids.contains(&keep.id), "existing entry kept: {ids:?}");
+    }
+
+    #[test]
+    fn preserves_malformed_utf8_records_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        store.save(Scope::User, "a real fact", None, None).unwrap();
+        // A hand-edit appends a record containing invalid UTF-8 (a torn write).
+        // `from_utf8_lossy` would replace those bytes with U+FFFD, so a later
+        // rewrite would permanently corrupt the line; storing the raw bytes
+        // preserves it exactly (Copilot finding, src/memory.rs).
+        let path = store.path(Scope::User).unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let torn: &[u8] = b"{\"id\":\"torn\",\"text\":\"bad \xF0\x9F bytes\"}";
+        raw.extend_from_slice(torn);
+        raw.push(b'\n');
+        std::fs::write(&path, &raw).unwrap();
+        // A mutating op rewrites the scope; the torn line must survive unchanged.
+        store.save(Scope::User, "another fact", None, None).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after.windows(torn.len()).any(|w| w == torn),
+            "malformed UTF-8 record must be preserved byte-for-byte: {after:?}"
+        );
     }
 
     #[test]
@@ -1575,6 +1695,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo_a = dir.path().join("team-a").join("repo");
         let repo_b = dir.path().join("team-b").join("repo");
+        // Distinct per-team origins so canonicalization resolves each repo's
+        // `../origin.git` to a different real path.
+        std::fs::create_dir_all(dir.path().join("team-a").join("origin.git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("team-b").join("origin.git")).unwrap();
         for repo in [&repo_a, &repo_b] {
             std::fs::create_dir_all(repo).unwrap();
             let init = std::process::Command::new("git").arg("-C").arg(repo).args(["init", "-q"]).output().unwrap();
@@ -1605,6 +1729,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo_a = dir.path().join("a");
         let repo_b = dir.path().join("b");
+        // Create the shared origin so filesystem canonicalization can resolve
+        // `a/../origin.git` and `b/../origin.git` to the same real path.
+        std::fs::create_dir_all(dir.path().join("origin.git")).unwrap();
         for repo in [&repo_a, &repo_b] {
             std::fs::create_dir_all(repo).unwrap();
             let init = std::process::Command::new("git").arg("-C").arg(repo).args(["init", "-q"]).output().unwrap();
@@ -1620,21 +1747,46 @@ mod tests {
         let key_a = project_key(&repo_a).expect("repo a has a project key");
         let key_b = project_key(&repo_b).expect("repo b has a project key");
         assert_eq!(key_a, key_b, "repos sharing one relative origin must share a key, got {key_a} vs {key_b}");
-        // The collapsed path names the shared origin, not a per-repo `a/../` fragment.
+        // The canonicalized path names the shared origin, not a per-repo `a/../` fragment.
         assert!(!key_a.contains(".."), "key must not retain an uncollapsed `..`, got: {key_a}");
     }
 
     #[test]
-    fn normalize_path_collapses_dot_components_lexically() {
-        // `..` pops the last normal component; the root is preserved.
-        assert_eq!(normalize_path(Path::new("/work/a/../origin.git")), PathBuf::from("/work/origin.git"));
-        // `.` is dropped; `..` pops the immediately-preceding normal component (`b`).
-        assert_eq!(normalize_path(Path::new("/work/a/./b/../c")), PathBuf::from("/work/a/c"));
-        // A leading/escaping `..` is kept verbatim (cannot pop the root).
-        assert_eq!(normalize_path(Path::new("/../origin.git")), PathBuf::from("/../origin.git"));
-        assert_eq!(normalize_path(Path::new("../rel/repo.git")), PathBuf::from("../rel/repo.git"));
-        // A path with nothing to collapse is returned unchanged.
-        assert_eq!(normalize_path(Path::new("/srv/repo.git")), PathBuf::from("/srv/repo.git"));
+    fn relative_local_origin_resolves_symlinked_parent() {
+        // Lexically collapsing `..` is wrong when an earlier component is a
+        // symlink: `<root>/link/../origin.git` with `link` pointing outside
+        // `root` resolves somewhere other than `<root>/origin.git`. The key
+        // must come from filesystem-aware canonicalization, not a lexical
+        // collapse, so two repos whose relative origins only *textually* share
+        // a `..` do not collide (Copilot finding, src/memory.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The real origin lives outside `root`, under `elsewhere/`.
+        let origin = root.join("elsewhere").join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        // `root/link` is a symlink into `elsewhere`, so `link/../origin.git`
+        // resolves to `elsewhere/origin.git`, NOT `root/origin.git`.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(root.join("elsewhere"), root.join("link")).unwrap();
+        let repo = root.join("link").join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git").arg("-C").arg(&repo).args(["init", "-q"]).output().unwrap();
+        assert!(init.status.success());
+        let add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "../origin.git"])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let key = project_key(&repo).expect("repo has a project key");
+        // Canonicalization resolves through the symlink to the real origin, so
+        // the key names `elsewhere/origin.git`, not the lexically-collapsed
+        // (and wrong) `root/origin.git`.
+        let want = normalize_remote(&std::fs::canonicalize(&origin).unwrap().to_string_lossy());
+        assert_eq!(key, want, "symlinked relative origin must canonicalize, got {key} want {want}");
     }
 
     #[test]
