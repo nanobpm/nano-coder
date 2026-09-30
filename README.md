@@ -333,6 +333,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
+- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use. When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`). `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -352,7 +353,7 @@ cargo run -- --model ollama/qwen2.5:1.5b
 cargo run -- --resume sess-20260923T012518-7e7923f8
 ```
 
-Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 

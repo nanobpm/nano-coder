@@ -207,6 +207,75 @@ impl SessionLog {
     }
 }
 
+/// Every committed record from a session log, in order, for offline tools
+/// like the trajectory view. Unlike [`SessionLog::open`], this does not fold
+/// records into a [`Restored`] snapshot: it returns them verbatim so a reader
+/// can reconstruct the turn-by-turn ledger (inputs, per-message
+/// thinking/usage/timing, tool results, compactions). A torn trailing line
+/// from a crash is discarded, exactly as on resume.
+pub fn read_records(dir: &Path, id: &str) -> Result<Vec<Record>> {
+    validate_id(id)?;
+    read_records_at(&path_for(dir, id), Some(id))
+}
+
+/// [`read_records`] for a known log path (the live session's own file).
+/// `expected_id`, when given, is checked against the session header's `id` so a
+/// renamed or misplaced log is rejected rather than read as the wrong session;
+/// pass `None` for the live session's own file, whose path is authoritative.
+pub fn read_records_at(path: &Path, expected_id: Option<&str>) -> Result<Vec<Record>> {
+    let bytes = fs::read(path).with_context(|| format!("read session log {}", path.display()))?;
+    // Require at least one committed (newline-terminated) record; a log with none
+    // is empty or torn, and treating it as an empty trajectory would be
+    // misleading.
+    let committed = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .ok_or_else(|| anyhow!("session log {} has no committed records", path.display()))?;
+    let mut records = Vec::new();
+    for (index, line) in bytes[..committed].split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
+        let record: Record = serde_json::from_slice(line)
+            .with_context(|| format!("decode record {} of {}", index + 1, path.display()))?;
+        // Enforce the same invariants `SessionLog::open` does: the first record
+        // must be a session header of a supported format version.
+        match &record {
+            Record::Session { version, id, .. } => {
+                if index != 0 {
+                    bail!("session record must be first (found at record {})", index + 1);
+                }
+                if *version != FORMAT_VERSION {
+                    bail!("unsupported session format version {version} (this build supports {FORMAT_VERSION})");
+                }
+                // Match `SessionLog::open`: a log whose header id differs from the
+                // requested id was renamed or misplaced, so refuse to read it as
+                // the requested session.
+                if let Some(expected) = expected_id
+                    && id != expected
+                {
+                    bail!("session log header id {id:?} does not match {expected:?}");
+                }
+            }
+            _ if index == 0 => bail!("session log {} does not start with a session header", path.display()),
+            _ => {}
+        }
+        // Number messages by log line, as `SessionLog::open` does, so the
+        // trajectory cites the same `#N` IDs as `history_read` and smart
+        // summaries.
+        let mut record = record;
+        if let Record::Message(message) = &mut record {
+            message.log_line.get_or_insert(index as u64 + 1);
+        }
+        records.push(record);
+    }
+    // A log made up solely of newline bytes passes the `rposition` check but
+    // filters down to zero records, so the session-header invariant above is
+    // never enforced. Reject it rather than return a misleading empty ledger.
+    if records.is_empty() {
+        bail!("session log {} has no decodable records", path.display());
+    }
+    Ok(records)
+}
+
 /// Compare two messages by their durable content, ignoring only the transient
 /// `timestamp`/`log_line` fields that differ between a direct record and the
 /// copy retained inside a later `replace` record. Durable provider content
@@ -590,5 +659,25 @@ mod tests {
             serde_json::to_string(&record).unwrap(),
             r#"{"type":"message","data":{"role":"tool","content":"ok","tool_call_id":"c1","name":"bash"}}"#
         );
+    }
+
+    #[test]
+    fn read_records_rejects_a_header_id_that_differs_from_the_requested_id() {
+        // A log written for session "real" but read back as "renamed" (a renamed
+        // or misplaced file) must be rejected, matching SessionLog::open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), "renamed");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"data\":{\"version\":1,\"id\":\"real\",\"created_at\":\"2026-01-01T00:00:00Z\"}}\n",
+        )
+        .unwrap();
+        let err = read_records(dir.path(), "renamed").err().unwrap();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+        // The live-session path (no expected id) accepts the same file: its own
+        // path is authoritative, so no id check applies.
+        assert!(read_records_at(&path, None).is_ok());
+        // And an explicit matching id accepts it too.
+        assert!(read_records_at(&path, Some("real")).is_ok());
     }
 }
