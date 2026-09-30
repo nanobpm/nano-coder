@@ -369,14 +369,26 @@ impl Terminal {
     /// After a successful model switch: hoist the spec in the `/model`
     /// type-ahead (persisted), and refresh the config the line editor's
     /// argument suggestions read.
-    fn model_switched(&mut self, agent: &Agent) {
-        let spec = agent.config().model.clone();
+    /// `previous` is the spec switched away from. It was in use until now, so
+    /// it is recorded too, just behind the new one: the model a session
+    /// started with is offered as well, and `/model` then Enter switches back.
+    fn model_switched(&mut self, agent: &Agent, previous: &str) {
+        let (user, default_provider) = agent.config().effective_providers();
+        let all = providers::effective_providers(&user);
+        let previous = recents::canonical(previous, &all, &default_provider);
+        let spec = recents::canonical(&agent.config().model, &all, &default_provider);
         {
             let mut recents = self.recents.lock().unwrap();
+            recents.record(&previous);
             recents.record(&spec);
             recents::save(&self.recents_path, &recents);
         }
         self.sync_context(agent);
+    }
+
+    /// The recently used `provider/model` specs, most recent first.
+    fn recent_models(&self) -> Vec<String> {
+        self.recents.lock().unwrap().models().to_vec()
     }
 
     /// Refresh the config the line editor's argument suggestions read, after
@@ -1058,21 +1070,16 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
-            let before = agent.config().model.clone();
-            settings::run(agent, &terminal.config_path).await?;
+            settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await?;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
-            // Providers or the model may have changed. A model switched through
-            // the settings dialog must land in the recents MRU just like one
-            // switched with `/model`; a provider-only edit just refreshes the
-            // config the line editor's argument suggestions read.
-            if agent.config().model != before {
-                terminal.model_switched(agent);
-            } else {
-                terminal.sync_context(agent);
-            }
+            // Each model switch made in the dialog was recorded into the recents
+            // MRU as it happened, so here just refresh the config the line
+            // editor's argument suggestions read (providers or the model may
+            // have changed).
+            terminal.sync_context(agent);
             Ok(true)
         }
         "/tools" => {
@@ -1148,7 +1155,12 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/model" => {
-            let picked = settings::pick_model_interactive(agent).await;
+            // Capture the model actually in use (resolved by the live
+            // client) before switching, so a provider-default edit made in the
+            // same session cannot rewrite which model we record leaving.
+            let before = format!("{}/{}", agent.provider_name(), agent.model_name());
+            let recent = terminal.recent_models();
+            let picked = settings::pick_model_interactive(agent, &recent).await;
             // The picker (dialoguer) wrote directly over the owned frame; force
             // a full redraw so the next differential render isn't diffed against
             // stale screen coordinates. Do it before propagating any error so
@@ -1156,7 +1168,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             terminal.renderer.frame_resize();
             if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
-                terminal.model_switched(agent);
+                terminal.model_switched(agent, &before);
                 terminal.renderer.print_block(&format!(
                     "Model set to {} (provider {})",
                     agent.model_name(),
@@ -1172,8 +1184,12 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
+            // Capture the model actually in use (resolved by the live
+            // client) before switching, so a provider-default edit made in the
+            // same session cannot rewrite which model we record leaving.
+            let before = format!("{}/{}", agent.provider_name(), agent.model_name());
             agent.set_model(cmd["/model ".len()..].trim()).await?;
-            terminal.model_switched(agent);
+            terminal.model_switched(agent, &before);
             terminal.renderer.print_block(&format!(
                 "Model set to {} (provider {})",
                 agent.model_name(),
@@ -1517,7 +1533,20 @@ async fn main() -> Result<()> {
             println!("{}\n", banner.join("\n"));
         }
         let recents_path = recents::default_path();
-        let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
+        let recents: recents::SharedRecents = {
+            let mut loaded = recents::load(&recents_path);
+            // Migrate a legacy file recorded before entries were canonicalized,
+            // so a raw default-provider spec (`meta-llama/llama-4`) is not
+            // hidden by the picker's provider filter on the first `/model`. The
+            // migration is gated on a persisted format marker and runs once; on
+            // success we save the upgraded file so later loads skip it (and so a
+            // removed provider's canonical entry is never reinterpreted).
+            let (user, default_provider) = agent.config().effective_providers();
+            if loaded.canonicalize(&providers::effective_providers(&user), &default_provider) {
+                recents::save(&recents_path, &loaded);
+            }
+            Arc::new(Mutex::new(loaded))
+        };
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),
