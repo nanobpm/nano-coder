@@ -498,10 +498,26 @@ impl Renderer {
     /// Emit machine-readable output verbatim (e.g. `/trajectory --json`). The
     /// frame transcript wraps `Item::Output` to the terminal width and prefixes
     /// a timestamp, which hard-breaks long JSON string values and puts text
-    /// before the opening `{`, so export modes must bypass it; printing raw
-    /// leaves the frame's diff state untouched, and the next differential
-    /// render simply repaints over it.
+    /// before the opening `{`, so export modes must bypass it. In frame mode
+    /// the raw text is written at whatever cursor the last render left and can
+    /// scroll or overwrite rows the renderer still believes it owns, so the
+    /// frame is restored immediately afterwards: `invalidate` makes that
+    /// render a full redraw (clearing screen and scrollback), which re-anchors
+    /// the frame at the bottom of the terminal with the export preserved in
+    /// the scrollback above it. The lock is dropped across the print so the
+    /// write can't interleave with a render.
     pub fn print_raw(&self, text: &str) {
+        if let Some(frame) = &self.frame {
+            {
+                let mut fs = frame.lock().unwrap();
+                self.frame_finish_stream(&mut fs);
+            }
+            println!("{text}");
+            let mut fs = frame.lock().unwrap();
+            fs.out.invalidate();
+            self.frame_render(&mut fs);
+            return;
+        }
         println!("{text}");
     }
 

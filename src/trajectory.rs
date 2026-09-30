@@ -187,20 +187,50 @@ impl Turn {
             .count();
         let tools = call_rows + orphaned_results;
         // One model call per assistant request. A THINK row is the same request's
-        // reasoning, so counting it too would report two calls for one request;
-        // with a separate THINK row the request's usage/duration live on it, so
-        // the request is seen there. The final-answer row the agent itself
-        // appends after `report_outcome` (`Message::assistant(&response)` in
-        // agent.rs) is not a request — it carries no usage/duration and has no
-        // THINK row — so it is excluded; a turn completed by one request would
-        // otherwise summarize as `2 calls`.
-        let calls = self
-            .rows
-            .iter()
-            .filter(|r| {
-                matches!(r.kind, RowKind::Assistant | RowKind::Think) && (r.usage.is_some() || r.duration_ms.is_some())
-            })
-            .count();
+        // reasoning, so an assistant row accompanied by one is not counted again
+        // (with a separate THINK row the request's usage/duration live on it).
+        // The one row that is NOT a request is the final-answer row the agent
+        // itself appends after `report_outcome` (`Message::assistant(&response)`
+        // in agent.rs): it is the turn's LAST assistant row, carries no
+        // usage/duration, and its text is the persisted `TurnEnd.response`
+        // verbatim. Logs written before per-request metrics existed have no
+        // usage/duration on ANY row; there every assistant/think row is a real
+        // request, so only that specifically identifiable synthetic row is
+        // excluded — otherwise a completed legacy turn would summarize as
+        // `(no activity)`.
+        let any_metrics = self.rows.iter().any(|r| {
+            matches!(r.kind, RowKind::Assistant | RowKind::Think) && (r.usage.is_some() || r.duration_ms.is_some())
+        });
+        let last_assistant = self.rows.iter().rposition(|r| matches!(r.kind, RowKind::Assistant));
+        let mut seen_think = false;
+        let mut calls = 0usize;
+        for (i, r) in self.rows.iter().enumerate() {
+            match r.kind {
+                RowKind::Think => {
+                    seen_think = true;
+                    calls += 1;
+                }
+                RowKind::Assistant => {
+                    let synthetic_answer = Some(i) == last_assistant
+                        && self.response.is_some()
+                        && r.usage.is_none()
+                        && r.duration_ms.is_none()
+                        && self.response.as_deref() == Some(r.text.as_str());
+                    if synthetic_answer {
+                        continue;
+                    }
+                    // With metrics anywhere, a metrics-free assistant row that
+                    // follows a THINK row is the same request's answer (the
+                    // metrics live on the THINK row) — already counted. In a
+                    // metrics-free (legacy) turn it is a real request.
+                    if any_metrics && r.usage.is_none() && r.duration_ms.is_none() && seen_think {
+                        continue;
+                    }
+                    calls += 1;
+                }
+                _ => {}
+            }
+        }
         let out: i64 =
             self.rows.iter().filter_map(|r| r.usage.as_ref()).map(|u| u.completion_tokens).filter(|&t| t > 0).sum();
         let duration: u64 = self.rows.iter().filter_map(|r| r.duration_ms).sum();
@@ -659,17 +689,24 @@ mod tests {
     }
 
     fn records() -> Vec<Record> {
+        let mut first = assistant("", "let me look");
+        first.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "a.rs"}),
+            ..Default::default()
+        }];
         vec![
             Record::Session { version: 1, id: "sess-x".into(), created_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::system("sys") }),
             Record::Input { id: "in-1".into(), text: "add a feature".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("add a feature") }),
-            Record::Message(assistant("", "let me look")),
+            Record::Message(first),
             Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "read_file", "ok") }),
-            Record::Message(assistant("done", "")),
+            Record::Message(assistant("feature added", "")),
             Record::TurnEnd {
                 input_id: "in-1".into(),
-                response: "done".into(),
+                response: "feature added".into(),
                 outcome: Some(Outcome { status: crate::goal::Status::Completed, summary: "done".into() }),
                 history_calls: 0,
                 recorded_at: now(),
@@ -734,15 +771,16 @@ mod tests {
         let turn = &traj.turns[0];
         assert_eq!(turn.number, 1);
         assert_eq!(turn.input.as_deref(), Some("add a feature"));
-        // user(opening), think, assistant(tool-call), tool, assistant(final).
+        // user(opening), think, assistant(tool-call), CALL, tool, assistant(final).
         let labels: Vec<String> = turn.rows.iter().map(|r| r.label()).collect();
         assert_eq!(labels[0], "USER");
         assert_eq!(labels[1], "THINK");
         assert!(labels[2].starts_with("ASSISTANT"));
-        assert!(labels[3].starts_with("TOOL read_file"), "{:?}", labels[3]);
-        assert!(labels[3].contains("ok"));
-        assert_eq!(labels[4], "ASSISTANT");
-        assert_eq!(turn.response.as_deref(), Some("done"));
+        assert_eq!(labels[3], "CALL read_file");
+        assert!(labels[4].starts_with("TOOL read_file"), "{:?}", labels[4]);
+        assert!(labels[4].contains("ok"));
+        assert_eq!(labels[5], "ASSISTANT");
+        assert_eq!(turn.response.as_deref(), Some("feature added"));
         assert!(turn.summary().contains("tool"));
         // Two assistant requests (one with reasoning, one final), not three:
         // the THINK row is the same request as its ASSISTANT row.
@@ -786,6 +824,35 @@ mod tests {
         // …but only the real request is counted as a model call.
         assert!(turn.summary().contains("1 call"), "{}", turn.summary());
         assert!(!turn.summary().contains("2 calls"), "{}", turn.summary());
+    }
+
+    #[test]
+    fn legacy_assistant_rows_without_metrics_still_count_as_calls() {
+        // Logs written before per-request metrics existed carry no usage and no
+        // duration_ms on any row. Their assistant messages are real requests and
+        // must still be counted; only the specifically identifiable synthetic
+        // final-answer row (its text matches the persisted turn response) is
+        // excluded.
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            // A real legacy request: no usage, no duration_ms.
+            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("working on it") }),
+            // The synthetic final answer appended after `report_outcome`.
+            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::TurnEnd {
+                input_id: "i".into(),
+                response: "done".into(),
+                outcome: Some(Outcome { status: crate::goal::Status::Completed, summary: "done".into() }),
+                history_calls: 0,
+                recorded_at: now(),
+            },
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let turn = &traj.turns[0];
+        assert!(turn.summary().contains("1 call"), "{}", turn.summary());
+        assert!(!turn.summary().contains("no activity"), "{}", turn.summary());
     }
 
     #[test]
