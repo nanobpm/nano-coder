@@ -167,6 +167,8 @@ enum TermInput {
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
     CycleMode,
+    /// An unknown `/command` refused by the editor (kept there, unsent): why.
+    Rejected(String),
 }
 
 /// "Model set to …", plus a warning when the new model ignores a temperature
@@ -396,6 +398,7 @@ impl Terminal {
                         lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
                         lineedit::Key::Escape => TermInput::Escape,
                         lineedit::Key::CycleMode => TermInput::CycleMode,
+                        lineedit::Key::Rejected(note) => TermInput::Rejected(note),
                     });
                 };
                 for () in want_rx {
@@ -693,8 +696,14 @@ impl Terminal {
         // or the next `request_line` would queue a second concurrent reader
         // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
         // is emitted the same way and belongs in this set.
-        if !matches!(input, TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode)
-        {
+        if !matches!(
+            input,
+            TermInput::Interrupt
+                | TermInput::ToggleThinking
+                | TermInput::Escape
+                | TermInput::CycleMode
+                | TermInput::Rejected(_)
+        ) {
             self.outstanding = false;
         }
         input
@@ -798,6 +807,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     TermInput::ToggleThinking => {
                         renderer.toggle_thinking();
                     }
+                    TermInput::Rejected(note) => renderer.transient_note(&note),
                     TermInput::CycleMode => {
                         // `control` is a shared handle, so this works while the
                         // turn future holds a `&mut` borrow of the agent.
@@ -846,6 +856,8 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 // The agent adds it to the conversation before its
                                 // next model call; if the turn ends first it is
                                 // queued (see below).
+                                // `//…` steers with a message that starts with `/`.
+                                let text = commands::unescape_prompt(text).unwrap_or(text);
                                 control.steer(text, None);
                                 // The frame renderer shows the steer as a user
                                 // message once absorbed; the legacy one shows only
@@ -883,7 +895,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         if cancelled {
             renderer.note(&format!("[steer dropped: {}]", steer.text));
         } else {
-            terminal.queue_message(&steer.text);
+            // Queued lines run through `run_command`: re-escape a steer that
+            // starts with `/` so it is sent as a message, not refused.
+            let text = if steer.text.starts_with('/') { format!("/{}", steer.text) } else { steer.text.clone() };
+            terminal.queue_message(&text);
         }
     }
     outcome
@@ -1161,7 +1176,7 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::QueueCommand(op)
     } else if let Some(arg) = text.strip_prefix("/thinking ").map(str::trim).filter(|a| !a.is_empty()) {
         SteerRoute::Thinking(thinking_arg(arg))
-    } else if text.starts_with('/') {
+    } else if text.starts_with('/') && commands::unescape_prompt(text).is_none() {
         SteerRoute::DeferCommand
     } else if steer {
         SteerRoute::Steer
@@ -1222,6 +1237,7 @@ async fn run_compaction(
                 TermInput::ToggleThinking => {
                     terminal.renderer.toggle_thinking();
                 }
+                TermInput::Rejected(note) => terminal.renderer.transient_note(&note),
                 TermInput::CycleMode => {
                     let mode = control.cycle_mode();
                     // Mirror the prompt/turn `CycleMode` path: refresh the
@@ -1841,7 +1857,19 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        _ if cmd.starts_with('/') && commands::unescape_prompt(cmd).is_none() => {
+            // Never send a `/…` line to the model: the editor refuses unknown
+            // commands, and this catches the rest (a known command with
+            // arguments it doesn't take, or a line queued before this check).
+            let note = commands::rejection(cmd).unwrap_or_else(|| {
+                format!("Can't run {cmd:?}: unexpected arguments (/help lists commands and their arguments)")
+            });
+            terminal.renderer.print_block(&note);
+            Ok(true)
+        }
         _ => {
+            // `//…` is a prompt that starts with `/`.
+            let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
             // In frame mode the turn's response is already rendered from its
             // events; re-printing it here would duplicate the answer and
@@ -2437,6 +2465,14 @@ async fn main() -> Result<()> {
                             prompt(&terminal, false);
                         }
                     }
+                    TermInput::Rejected(note) => {
+                        terminal.renderer.transient_note(&note);
+                        if !frame_mode {
+                            // Legacy: the note printed a line; redraw the
+                            // prompt with the refused text still in it.
+                            prompt(&terminal, false);
+                        }
+                    }
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
@@ -2463,14 +2499,18 @@ async fn main() -> Result<()> {
                     terminal.renderer.transient_note("(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode => continue,
+                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_) => {
+                    continue;
+                }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
             };
             if input.trim().is_empty() {
                 continue;
             }
-            if terminal.renderer.is_frame() && !input.starts_with('/') {
-                terminal.renderer.frame_user_message(&input);
+            // A refused `/command` note no longer applies once a line is sent.
+            terminal.renderer.clear_transient();
+            if frame_mode && (!input.starts_with('/') || commands::unescape_prompt(&input).is_some()) {
+                terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
             match run_command(&mut agent, &input, &mut terminal).await {
@@ -2685,6 +2725,13 @@ mod tests {
         assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
         assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
         assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn slash_escaped_lines_steer_or_queue_instead_of_deferring() {
+        assert!(matches!(classify_steer_input("//usr/lib is big", true), SteerRoute::Steer));
+        assert!(matches!(classify_steer_input("//usr/lib is big", false), SteerRoute::Enqueue));
+        assert!(matches!(classify_steer_input("/plan", true), SteerRoute::DeferCommand));
     }
 
     #[test]

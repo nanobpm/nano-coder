@@ -72,6 +72,72 @@ pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>,
 }
 
 /// Commands whose name starts with `prefix`.
+/// Why a submitted `/…` line can't be sent: its first word is not a command.
+/// `None` for anything else (not a `/` line, a known command, or a `//`
+/// escaped prompt). Such a line is never sent to the model, since a mistyped
+/// command (`/exin`) is not something the user meant to say to it.
+pub fn rejection(line: &str) -> Option<String> {
+    let line = line.trim();
+    let word = line.split_whitespace().next()?;
+    if !word.starts_with('/') || word.starts_with("//") || COMMANDS.iter().any(|c| c.name == word) {
+        return None;
+    }
+    let mut note = format!("Unknown command {word}");
+    if let Some(close) = closest(word) {
+        note.push_str(&format!(". Did you mean {close}?"));
+    }
+    if word[1..].contains('/') {
+        // Looks like a path: say how to send it as a prompt.
+        note.push_str(&format!(" To send a message starting with a path, type //{}", &word[1..]));
+    } else {
+        note.push_str(" (/help lists commands)");
+    }
+    Some(note)
+}
+
+/// A `//…` line is a prompt that starts with `/`: the text with one `/`
+/// removed. `None` for other lines.
+pub fn unescape_prompt(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix('/').filter(|rest| rest.starts_with('/'))
+}
+
+/// The command closest to a mistyped `word`: the only one it is a prefix of,
+/// else the nearest by edit distance within two edits.
+fn closest(word: &str) -> Option<&'static str> {
+    if let [only] = matching(word).as_slice() {
+        return Some(only.name);
+    }
+    let len = word.chars().count();
+    COMMANDS
+        .iter()
+        .map(|c| (edit_distance(word, c.name), len.abs_diff(c.name.chars().count()), c.name))
+        .filter(|(d, _, _)| *d <= 2)
+        // Fewest edits; on a tie, the same length (`/modle` -> `/model`, not `/mode`).
+        .min_by_key(|(d, len_diff, _)| (*d, *len_diff))
+        .map(|(_, _, name)| name)
+}
+
+/// Edit distance over chars where swapping two adjacent characters is one
+/// edit, like inserting, deleting or replacing one (optimal string alignment).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    d[0] = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
 pub fn matching(prefix: &str) -> Vec<&'static Command> {
     COMMANDS.iter().filter(|c| c.name.starts_with(prefix)).collect()
 }
@@ -269,7 +335,7 @@ pub fn help_text() -> String {
     for c in COMMANDS {
         out.push_str(&format!("\n  {:width$}  {}", synopsis(c), c.description));
     }
-    out.push_str("\nType / to list commands as you type; Tab completes commands and /model, /mode, /verbosity arguments; Esc hides the list.");
+    out.push_str("\nType / to list commands as you type; Tab completes commands and /model, /mode, /verbosity arguments; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.");
     out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
     out
 }
@@ -346,6 +412,42 @@ fn fit(plain: &str, cols: usize, styles: &[(usize, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_commands_are_rejected_with_a_suggestion() {
+        let note = rejection("/exin").unwrap();
+        assert!(note.starts_with("Unknown command /exin. Did you mean /exit?"), "{note}");
+        assert!(note.contains("/help lists commands"), "{note}");
+        // A unique prefix suggests its command; a distant word suggests nothing.
+        assert!(rejection("/traj").unwrap().contains("Did you mean /trajectory?"));
+        assert!(!rejection("/frobnicate").unwrap().contains("Did you mean"));
+        // With arguments, and with surrounding whitespace.
+        assert!(rejection("  /modle gpt-4o ").unwrap().contains("Did you mean /model?"));
+        // A path: explain the `//` escape.
+        let note = rejection("/usr/lib is 4 GB, why?").unwrap();
+        assert!(note.contains("type //usr/lib"), "{note}");
+        // Not rejected: known commands (with args), `//` prompts, plain text.
+        for ok in ["/exit", "/model gpt-4o", "/compact --smart focus", "//usr/lib", "hello /exin", "", "   "] {
+            assert_eq!(rejection(ok), None, "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn slash_slash_escapes_a_prompt() {
+        assert_eq!(unescape_prompt("//usr/lib is big"), Some("/usr/lib is big"));
+        assert_eq!(unescape_prompt("  //x"), Some("/x"));
+        assert_eq!(unescape_prompt("/exit"), None);
+        assert_eq!(unescape_prompt("hello"), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_edits() {
+        assert_eq!(edit_distance("/exin", "/exit"), 1);
+        assert_eq!(edit_distance("/modle", "/model"), 1, "a swap is one edit");
+        assert_eq!(edit_distance("/modle", "/mode"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("same", "same"), 0);
+    }
 
     fn plain(row: &str) -> String {
         regex::Regex::new("\x1b\\[[0-9;]*m").unwrap().replace_all(row, "").into_owned()
