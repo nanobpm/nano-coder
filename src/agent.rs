@@ -1674,13 +1674,18 @@ impl Agent {
 
     /// `max_tokens` for the next request: the configured value, lowered so the
     /// estimated prompt plus the reservation fits the context window (with a
-    /// margin for estimation error), but never below MIN_OUTPUT_RESERVE.
+    /// margin for estimation error). Aims to keep MIN_OUTPUT_RESERVE of output
+    /// space, but never requests more than the room actually left: when fewer
+    /// than MIN_OUTPUT_RESERVE tokens remain and pre-send compaction is
+    /// unavailable (`auto_compact` disabled) or suppressed by the `compact_floor`
+    /// guard, capping to the real room keeps `prompt + max_tokens` inside the
+    /// window instead of overflowing it. Always at least 1 so the request is valid.
     fn request_max_tokens(&self) -> i64 {
         let configured = self.config.max_tokens.max(1) as usize;
         let (tokens, _) = self.estimate_context_tokens();
         let window = self.context_window();
         let room = window.saturating_sub(tokens + output_margin(window));
-        configured.min(room.max(MIN_OUTPUT_RESERVE)) as i64
+        configured.min(room).max(1) as i64
     }
 
     async fn compact_logged(
@@ -2554,6 +2559,28 @@ mod tests {
         let (Some(max_tokens), false) = seen[1] else { panic!("{seen:?}") };
         assert!((MIN_OUTPUT_RESERVE as i64..16_384).contains(&max_tokens), "lowered: {max_tokens}");
         // The prompt estimate here includes the final "done", a few tokens.
+        assert!(tokens + max_tokens as usize <= window, "{tokens} + {max_tokens} > {window}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_tokens_is_capped_to_the_room_when_compaction_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // A small window nearly filled by one tool result leaves fewer than
+        // MIN_OUTPUT_RESERVE tokens free. With auto_compact disabled there is no
+        // pre-send compaction to open room, so the request must cap max_tokens to
+        // the real room instead of flooring it to MIN_OUTPUT_RESERVE and pushing
+        // prompt + max_tokens past the window.
+        let window = 12_000;
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
+        agent.config.auto_compact = false;
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let (tokens, _) = agent.estimate_context_tokens();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "no compaction when disabled: {seen:?}");
+        let (Some(max_tokens), false) = seen[1] else { panic!("{seen:?}") };
+        assert!(max_tokens >= 1, "request stays valid: {max_tokens}");
+        assert!((max_tokens as usize) < MIN_OUTPUT_RESERVE, "capped below the floor: {max_tokens}");
         assert!(tokens + max_tokens as usize <= window, "{tokens} + {max_tokens} > {window}");
     }
 
