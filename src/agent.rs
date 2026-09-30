@@ -974,10 +974,6 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
-        // Reset the mode *before* rendering the system prompt so the memory
-        // index guidance reflects the fresh session's default (Normal) mode —
-        // otherwise a previous Plan mode would suppress the save guidance.
-        self.control.set_mode(crate::mode::AgentMode::default());
         // ACP sets the session cwd before this runs; rekey memory so the project
         // scope (and the index folded into the prompt below) matches it.
         self.rekey_memory();
@@ -986,13 +982,23 @@ impl Agent {
         // prompt they render) untouched, rather than pairing the old
         // conversation with newly discovered instructions.
         let (instructions, skills) = self.discover_project_instructions();
+        // Render the prompt with the fresh session's default (Normal) mode's
+        // writability — a previous Plan mode would otherwise suppress the memory
+        // save guidance. Do *not* reset `control` here: the live session must
+        // stay untouched until staging below succeeds, so a `SessionLog::create`
+        // / initial-append failure cannot leave the current session switched out
+        // of Plan/Auto mode while `new_session` returns an error (failure-
+        // atomic staging; Copilot finding, src/agent.rs).
+        let default_mode = crate::mode::AgentMode::default();
+        let writable = self.config.memory.writable() && default_mode != crate::mode::AgentMode::Plan;
         let system = Message {
             timestamp: Some(session::now()),
-            ..Message::system(&self.system_prompt_from(&instructions, &skills))
+            ..Message::system(&self.system_prompt_for(&instructions, &skills, writable))
         };
         // Stage the new log before mutating any live state so a disk/permission
         // failure leaves the current session (conversation, id, log,
-        // instructions, skills) intact instead of detaching the agent from it.
+        // instructions, skills, mode) intact instead of detaching the agent
+        // from it.
         let session = if self.config.persist_sessions {
             let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
             log.append(&Record::Message(system.clone()))?;
@@ -1000,7 +1006,9 @@ impl Agent {
         } else {
             None
         };
-        // Staging succeeded — now commit all live state.
+        // Staging succeeded — now commit all live state, including the mode
+        // reset deferred from above.
+        self.control.set_mode(default_mode);
         self.instructions = instructions;
         self.skills = skills;
         self.conversation = vec![system];
@@ -1182,14 +1190,22 @@ impl Agent {
 
     /// Render the system prompt from a given instruction/skill set, so a new
     /// session can build its prompt from freshly discovered temporaries before
-    /// committing them to `self`.
+    /// committing them to `self`. Uses the current mode's memory writability.
     fn system_prompt_from(&self, instructions: &Option<ProjectInstructions>, skills: &Skills) -> String {
+        self.system_prompt_for(instructions, skills, self.memory_writable())
+    }
+
+    /// Render the system prompt with an explicit memory-writability value, so a
+    /// caller can render for a mode other than the one currently committed to
+    /// `control` (e.g. a fresh session's default mode before that mode is
+    /// applied). `system_prompt_from` is this with the live writability.
+    fn system_prompt_for(&self, instructions: &Option<ProjectInstructions>, skills: &Skills, writable: bool) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
         let memory = self
             .memory
             .as_ref()
             .filter(|_| self.config.memory.enabled())
-            .map(|store| store.index(self.memory_writable()))
+            .map(|store| store.index(writable))
             .unwrap_or_default();
         format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
     }

@@ -47,7 +47,7 @@ const SNIPPET_CHARS: usize = 240;
 const DEFAULT_LIMIT: usize = 20;
 
 /// Which store an entry lives in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     User,
@@ -308,6 +308,9 @@ impl Store {
         let now = crate::session::now();
         let mut hits: Vec<(Scope, Entry)> = Vec::new();
         let mut total = 0;
+        // Loaded scope files retained for the deferred `last_used` bump (only
+        // populated on a mutating search).
+        let mut loaded: Vec<(Scope, std::path::PathBuf, ScopeFile)> = Vec::new();
         for scope in scopes {
             // A missing project scope (outside a repo) is not an error here.
             let path = match self.path(scope) {
@@ -324,36 +327,59 @@ impl Store {
             // so a failure here is a real permission/I/O/pruning error — even
             // when the caller explicitly asked for `scope: "project"`. Surface
             // it rather than report a misleading "no memories match".
-            let mut file = self.read_scope_file(scope, !read_only)?;
-            let mut bumped = false;
-            for entry in &mut file.entries {
+            let file = self.read_scope_file(scope, !read_only)?;
+            for entry in &file.entries {
                 let haystack = match &entry.evidence {
                     Some(evidence) => format!("{}\n{evidence}", entry.text),
                     None => entry.text.clone(),
                 };
                 if regex.is_match(&haystack) {
                     total += 1;
-                    // Clone the hit *before* bumping the persisted entry's
-                    // `last_used`. The clone is what the MRU sort below orders,
-                    // and it must carry the entry's *previous* timestamp: if the
-                    // bump landed first every match would share `now`, the sort
-                    // would degenerate to file/scope order, and the promised MRU
-                    // ordering would be lost.
+                    // Collect the hit with its *previous* `last_used`. The MRU
+                    // sort below orders on that prior stamp: bumping before the
+                    // sort would give every match the same `now`, degenerating
+                    // the ordering to file/scope order. The bump itself is
+                    // deferred until the globally visible hits are known (see
+                    // below), so only the entries actually returned are touched.
                     hits.push((scope, entry.clone()));
-                    if !read_only {
-                        entry.last_used = now;
-                        bumped = true;
-                    }
                 }
             }
-            if bumped {
-                write_all(&path, &file.entries, &file.unknown)?;
+            // Keep the loaded entries so the `last_used` bump can be applied to
+            // exactly the returned hits once the global MRU ranking is known.
+            if !read_only {
+                loaded.push((scope, path, file));
             }
         }
         if hits.is_empty() {
             return Ok(format!("No memories match {pattern:?}."));
         }
         hits.sort_by_key(|(_, e)| std::cmp::Reverse(e.last_used));
+        // Bump `last_used` only for the hits actually returned. Stamping every
+        // regex match — including ones beyond the global limit that are never
+        // shown — would keep unseen memories from expiring and give them all
+        // the same timestamp, collapsing subsequent MRU ordering to scope/file
+        // order (Copilot finding, src/memory.rs).
+        if !read_only {
+            let mut per_scope: std::collections::HashMap<Scope, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            for (scope, entry) in hits.iter().take(limit) {
+                per_scope.entry(*scope).or_default().insert(entry.id.clone());
+            }
+            for (scope, path, mut file) in loaded {
+                let mut bumped = false;
+                if let Some(ids) = per_scope.get(&scope) {
+                    for entry in &mut file.entries {
+                        if ids.contains(&entry.id) {
+                            entry.last_used = now;
+                            bumped = true;
+                        }
+                    }
+                }
+                if bumped {
+                    write_all(&path, &file.entries, &file.unknown)?;
+                }
+            }
+        }
         let mut lines: Vec<String> = Vec::new();
         for (scope, entry) in hits.iter().take(limit) {
             let mut line = format!("{} {} {}", scope.as_str(), entry.label(), snippet(&regex, &entry.text));
@@ -784,11 +810,16 @@ pub fn project_key(cwd: &Path) -> Option<String> {
                     // than `root/origin.git`, so collapsing would make unrelated
                     // remotes share a memory file (Copilot finding,
                     // src/memory.rs). Prefer filesystem-aware canonicalization
-                    // (it resolves symlinks) when the target exists; when it
-                    // does not, keep the unresolved joined path verbatim rather
-                    // than collapsing a `..` whose meaning we cannot verify.
+                    // (it resolves symlinks) when the target exists. When it
+                    // does not, canonicalize the longest *existing* prefix and
+                    // append the missing tail (as `instructions.rs` does for
+                    // not-yet-written files): the fallback that kept the raw
+                    // joined path left `..` unresolved, so the same repository
+                    // key changed when the target later appeared/disappeared and
+                    // sibling repositories pointing at one missing origin derived
+                    // different stores (Copilot finding, src/memory.rs).
                     let joined = Path::new(root).join(url);
-                    let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
+                    let resolved = canonicalize_existing(&joined);
                     return Some(normalize_remote(&resolved.to_string_lossy()));
                 }
             }
@@ -917,12 +948,32 @@ fn normalize_remote(url: &str) -> String {
         s.to_string()
     };
     let trimmed = s.trim_end_matches('/');
-    // Strip a trailing `.git` only for URI/SCP remotes. On a local path `.git`
-    // is an ordinary filename suffix, and stripping it makes the key
-    // non-injective: `/srv/project.git` and `/srv/project` would collapse onto
-    // one project key and share a JSONL memory file, exposing project-scoped
-    // memories to each other even though they can be distinct repositories.
-    if uri || scp { trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string() } else { trimmed.to_string() }
+    // Preserve a trailing `.git` on every remote form. Stripping it is not
+    // injective: a server may expose distinct repositories at `host/org/repo`
+    // and `host/org/repo.git`, and stripping would collapse both onto one
+    // project key — sharing a JSONL memory file and surfacing one repository's
+    // facts in the other. The same non-injectivity already applies to local
+    // paths (`/srv/project.git` vs `/srv/project`). Only a host known to treat
+    // the two URLs as aliases could strip safely, and we cannot know that here,
+    // so keep the suffix verbatim (Copilot finding, src/memory.rs).
+    trimmed.to_string()
+}
+
+/// Canonicalize the longest existing prefix of `path`, so a path whose tail
+/// does not exist yet still resolves symlinked roots — mirroring
+/// `instructions.rs`. Unlike `std::fs::canonicalize` (which fails outright when
+/// any component is missing, leaving `..` unresolved), this keeps the key
+/// stable whether or not the target currently exists.
+fn canonicalize_existing(path: &Path) -> PathBuf {
+    for base in path.ancestors() {
+        if let Ok(real) = base.canonicalize() {
+            return match path.strip_prefix(base) {
+                Ok(rest) if !rest.as_os_str().is_empty() => real.join(rest),
+                _ => real,
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 /// A filesystem-safe file stem for a project key. Distinct keys always map to
@@ -1651,26 +1702,35 @@ mod tests {
         // relative path resolves under that user's home), so stripping it would
         // let `alice@host:repo.git` and `bob@host:repo.git` collide on one key
         // (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "git@github.com/nanobpm/nano-coder");
+        // A trailing `.git` is preserved on every remote form. Stripping it is
+        // not injective: a server may expose distinct repositories at
+        // `host/org/repo` and `host/org/repo.git`, and stripping would collapse
+        // both onto one key (Copilot finding, src/memory.rs). The same applies
+        // to local paths, so the suffix is now kept verbatim everywhere.
+        assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "git@github.com/nanobpm/nano-coder.git");
         assert_ne!(normalize_remote("alice@host.example:repo.git"), normalize_remote("bob@host.example:repo.git"));
-        assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
+        assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder.git");
         assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "example.com/a/b");
+        // `.git` and non-`.git` remotes that would previously collide now keep
+        // distinct keys (Copilot finding, src/memory.rs).
+        assert_ne!(normalize_remote("https://github.com/org/repo.git"), normalize_remote("https://github.com/org/repo"));
+        assert_ne!(normalize_remote("git@host:org/repo.git"), normalize_remote("git@host:org/repo"));
         // Query strings / fragments (which can carry credentials like
         // `?access_token=…`) are stripped so they never leak into the key.
         assert_eq!(
             normalize_remote("https://github.com/nanobpm/nano-coder.git?access_token=secret"),
-            "github.com/nanobpm/nano-coder"
+            "github.com/nanobpm/nano-coder.git"
         );
-        assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "github.com/a/b");
+        assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "github.com/a/b.git");
         // A scheme URL's port is preserved, so it cannot collide with an
         // SCP-style path or a URL carrying that number as a path segment
         // (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "github.com:2222/a/b");
+        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "github.com:2222/a/b.git");
         assert_ne!(normalize_remote("ssh://host:2222/org/repo"), normalize_remote("https://host/2222/org/repo"));
         // A legal `@` in the repository PATH is preserved: credential stripping
         // applies only to the authority, so repos differing only after an `@`
         // don't collapse onto one key (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("https://one.example/repo@v2.git"), "one.example/repo@v2");
+        assert_eq!(normalize_remote("https://one.example/repo@v2.git"), "one.example/repo@v2.git");
         assert_ne!(
             normalize_remote("https://one.example/repo@v2.git"),
             normalize_remote("https://two.example/other@v2.git")
@@ -1679,9 +1739,9 @@ mod tests {
         // common ones: an `ftp://` (or uppercase-scheme) remote with
         // credentials must not leak `user:pass@` into the key (Copilot
         // finding, src/memory.rs).
-        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "host/repo");
-        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "example.com/a/b");
-        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "github.com/org/repo");
+        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "host/repo.git");
+        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "example.com/a/b.git");
+        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "github.com/org/repo.git");
         // Query/fragment stripping applies only to remotes with a recognised
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct
@@ -1689,10 +1749,10 @@ mod tests {
         assert_eq!(normalize_remote("/srv/repo#blue.git"), "/srv/repo#blue.git");
         assert_ne!(normalize_remote("/srv/repo#blue.git"), normalize_remote("/srv/repo#red.git"));
         assert_eq!(normalize_remote("/srv/repo.git?x=1"), "/srv/repo.git?x=1");
-        // A trailing `.git` is stripped only for URI/SCP remotes; on a local
-        // path it is an ordinary filename suffix and is preserved so that
-        // `/srv/project.git` and `/srv/project` keep distinct keys instead of
-        // sharing one memory file (Copilot finding, src/memory.rs).
+        // On a local path `.git` is an ordinary filename suffix and is
+        // preserved, so `/srv/project.git` and `/srv/project` keep distinct
+        // keys instead of sharing one memory file (Copilot finding,
+        // src/memory.rs).
         assert_eq!(normalize_remote("./rel/repo.git"), "./rel/repo.git");
         assert_eq!(normalize_remote("../rel/repo.git"), "../rel/repo.git");
         assert_eq!(normalize_remote("/srv/project.git"), "/srv/project.git");
