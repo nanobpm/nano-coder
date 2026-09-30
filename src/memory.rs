@@ -886,21 +886,35 @@ fn dos_drive_prefix(s: &str) -> bool {
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
-/// A git remote URL reduced to a stable `host/path` label, dropping the scheme
-/// and any credentials. A trailing `.git` is deliberately *preserved*: it is
-/// part of the repository identity, and stripping it is non-injective —
-/// `host/org/repo` and `host/org/repo.git` can be two distinct repositories
-/// that would otherwise collapse onto one project key and share a memory file.
+/// A git remote URL reduced to a stable identity key. A trailing `.git` is
+/// deliberately *preserved*: it is part of the repository identity, and
+/// stripping it is non-injective — `host/org/repo` and `host/org/repo.git` can
+/// be two distinct repositories that would otherwise collapse onto one project
+/// key and share a memory file.
+///
+/// The URI *scheme* is likewise part of the identity: `https://host/org/repo`
+/// and `ssh://host/org/repo` can expose different repositories at those
+/// protocol namespaces, so dropping the scheme would make them share one JSONL
+/// file and disclose project-scoped memories to each other (the same
+/// collision-avoidance already applied to `.git`, ports and SCP usernames). The
+/// scheme is therefore kept on the key. Credentials are still stripped from the
+/// authority so a `user:pass@` never leaks into the key, the prompt label or the
+/// on-disk filename.
 fn normalize_remote(url: &str) -> String {
     let s = url.trim();
     // Recognise any syntactically valid URI scheme (`scheme://…`), not just a
     // fixed allow-list: an unrecognised scheme such as `ftp://user:pass@host/r`
     // (or an uppercase `HTTPS://…`) must still get authority-credential
     // stripping, or the credential leaks into the prompt label and readable
-    // filename.
+    // filename. The scheme is captured (lowercased) so it can be re-attached to
+    // the identity key after the credentials are removed — keeping the key
+    // injective across protocols (Copilot finding, src/memory.rs).
     static SCHEME: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://").expect("scheme regex compiles"));
-    let uri = SCHEME.is_match(s);
+        LazyLock::new(|| Regex::new(r"^([A-Za-z][A-Za-z0-9+.-]*)://").expect("scheme regex compiles"));
+    let scheme: Option<String> = SCHEME
+        .captures(s)
+        .map(|c| c[1].to_ascii_lowercase());
+    let uri = scheme.is_some();
     let owned;
     let s: &str = if uri {
         owned = SCHEME.replace(s, "").into_owned();
@@ -972,7 +986,15 @@ fn normalize_remote(url: &str) -> String {
     // paths (`/srv/project.git` vs `/srv/project`). Only a host known to treat
     // the two URLs as aliases could strip safely, and we cannot know that here,
     // so keep the suffix verbatim (Copilot finding, src/memory.rs).
-    trimmed.to_string()
+    //
+    // Re-attach the lowercased scheme so `https://host/org/repo` and
+    // `ssh://host/org/repo` keep distinct identity keys (Copilot finding,
+    // src/memory.rs). SCP-style and local-path remotes carry no scheme, so they
+    // are returned unchanged.
+    match scheme {
+        Some(scheme) => format!("{scheme}://{trimmed}"),
+        None => trimmed.to_string(),
+    }
 }
 
 /// Canonicalize the longest existing prefix of `path`, so a path whose tail
@@ -1034,7 +1056,20 @@ fn snippet(regex: &regex::Regex, text: &str) -> String {
     let from = text[..start].char_indices().rev().nth(lead.saturating_sub(1)).map_or(0, |(i, _)| i);
     let room = SNIPPET_CHARS.saturating_sub(text[from..start].chars().count());
     let to = text[end..].char_indices().nth(room).map_or(text.len(), |(i, _)| end + i);
-    let mut out: String = text[from..to].split_whitespace().collect::<Vec<_>>().join(" ");
+    // `split_whitespace` collapses whitespace but keeps escaped C0/C1 controls
+    // (ESC, BEL, …) that a hand-edited JSONL `text` can carry (e.g. `\^[[2J`).
+    // The legacy renderer writes this tool result straight to the terminal, so
+    // unlike `/memory` this path could clear or manipulate it. Map every line
+    // break / control char to a space before joining, exactly as the prompt
+    // index does, so the returned snippet is terminal-safe (Copilot finding,
+    // src/memory.rs).
+    let mut out: String = text[from..to]
+        .chars()
+        .map(|c| if is_line_break(c) { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if from > 0 {
         out.insert(0, '…');
     }
@@ -1112,7 +1147,14 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // `{'api_key':'secret'}` carry a closing quote between the key word and the
     // `:`. Permit one optional quote (`"` or `'`) there — and an optional opening
     // quote on the value — so these JSON/YAML-style assignments are not bypassed.
-    let assignment = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*["']?\s*[:=]\s*["']?(\S+)"#;
+    //
+    // The two-word labels may be written with a space as well as `_`/`-`
+    // (`API key`, `client secret`, `access key`): natural prose rarely uses the
+    // identifier form, so the copular rule below already accepts a single space
+    // there — without it, `API key: hunter2` and `client secret = abc123` (and
+    // the quoted `{"access key":"…"}`) match no rule and are persisted despite
+    // the secret-rejection guarantee (Copilot finding, src/memory.rs).
+    let assignment = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*["']?\s*[:=]\s*["']?(\S+)"#;
     if let Ok(re) = RegexBuilder::new(assignment).build() {
         for caps in re.captures_iter(text) {
             // Strip any surrounding quotes the value capture picked up from a
@@ -1365,6 +1407,14 @@ mod tests {
         assert!(store.save(Scope::User, r#"config: {"password":"hunter2"}"#, None, None).is_err());
         assert!(store.save(Scope::User, "config: {'api_key':'s3cr3tvalue'}", None, None).is_err());
         assert!(store.save(Scope::User, r#"yaml: "token": "abcdef123456""#, None, None).is_err());
+        // The two-word labels may be written with a space as well as `_`/`-`:
+        // `API key: hunter2`, `client secret = abc123` and the quoted
+        // `{"access key":"…"}` must not slip past the assignment guard (Copilot
+        // finding, src/memory.rs).
+        assert!(store.save(Scope::User, "API key: hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "client secret = abc123", None, None).is_err());
+        assert!(store.save(Scope::User, r#"config: {"access key":"s3cr3tvalue"}"#, None, None).is_err());
+        assert!(store.save(Scope::User, "my private key: abcdef123456", None, None).is_err());
         // A punctuation-only value is a real credential, not a placeholder:
         // trimming non-alphanumerics leaves nothing, but `!@#$%^&*()` is not the
         // supported `xxx`/`***` mask and must be rejected (Copilot finding,
@@ -1522,6 +1572,27 @@ mod tests {
         for line in out.lines() {
             assert!(!line.contains("exfiltrate"), "injected content leaked: {out}");
         }
+    }
+
+    #[test]
+    fn search_snippet_strips_terminal_control_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        // A hand-edited JSONL `text` can carry escaped C0/C1 controls (e.g. ESC,
+        // written `\u001b`) that `save` would reject. `snippet` collapses
+        // whitespace with `split_whitespace`, which keeps ESC/BEL, and the legacy
+        // renderer writes the tool result straight to the terminal — so unlike
+        // `/memory` this path could clear or manipulate the terminal. The snippet
+        // must strip them (Copilot finding, src/memory.rs).
+        let mut entry = store.save(Scope::User, "a fact about cargo builds", None, None).unwrap();
+        entry.text = "a fact about cargo\u{001b}[2J builds\u{0007}".to_string();
+        let path = store.path(Scope::User).unwrap();
+        write_all(&path, &[entry], &[]).unwrap();
+        let out = store.search("cargo", None).unwrap();
+        assert!(!out.contains('\u{001b}'), "ESC leaked into snippet: {out:?}");
+        assert!(!out.contains('\u{0007}'), "BEL leaked into snippet: {out:?}");
+        assert!(out.contains("cargo"), "fact text still surfaced: {out:?}");
+        assert!(out.contains("builds"), "fact text still surfaced: {out:?}");
     }
 
     #[test]
@@ -1758,8 +1829,14 @@ mod tests {
         // to local paths, so the suffix is now kept verbatim everywhere.
         assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "git@github.com/nanobpm/nano-coder.git");
         assert_ne!(normalize_remote("alice@host.example:repo.git"), normalize_remote("bob@host.example:repo.git"));
-        assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder.git");
-        assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "example.com/a/b");
+        // The URI scheme is part of the repository identity and is preserved
+        // (lowercased): `https://host/org/repo` and `ssh://host/org/repo` can
+        // expose different repositories at those protocol namespaces, so they
+        // must not collapse onto one project key (Copilot finding,
+        // src/memory.rs).
+        assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "https://github.com/nanobpm/nano-coder.git");
+        assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "https://example.com/a/b");
+        assert_ne!(normalize_remote("https://host/org/repo"), normalize_remote("ssh://host/org/repo"));
         // `.git` and non-`.git` remotes that would previously collide now keep
         // distinct keys (Copilot finding, src/memory.rs).
         assert_ne!(normalize_remote("https://github.com/org/repo.git"), normalize_remote("https://github.com/org/repo"));
@@ -1768,18 +1845,18 @@ mod tests {
         // `?access_token=…`) are stripped so they never leak into the key.
         assert_eq!(
             normalize_remote("https://github.com/nanobpm/nano-coder.git?access_token=secret"),
-            "github.com/nanobpm/nano-coder.git"
+            "https://github.com/nanobpm/nano-coder.git"
         );
-        assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "github.com/a/b.git");
+        assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");
         // A scheme URL's port is preserved, so it cannot collide with an
         // SCP-style path or a URL carrying that number as a path segment
         // (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "github.com:2222/a/b.git");
+        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "ssh://github.com:2222/a/b.git");
         assert_ne!(normalize_remote("ssh://host:2222/org/repo"), normalize_remote("https://host/2222/org/repo"));
         // A legal `@` in the repository PATH is preserved: credential stripping
         // applies only to the authority, so repos differing only after an `@`
         // don't collapse onto one key (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("https://one.example/repo@v2.git"), "one.example/repo@v2.git");
+        assert_eq!(normalize_remote("https://one.example/repo@v2.git"), "https://one.example/repo@v2.git");
         assert_ne!(
             normalize_remote("https://one.example/repo@v2.git"),
             normalize_remote("https://two.example/other@v2.git")
@@ -1787,10 +1864,10 @@ mod tests {
         // Any syntactically valid URI scheme is recognised, not just the four
         // common ones: an `ftp://` (or uppercase-scheme) remote with
         // credentials must not leak `user:pass@` into the key (Copilot
-        // finding, src/memory.rs).
-        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "host/repo.git");
-        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "example.com/a/b.git");
-        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "github.com/org/repo.git");
+        // finding, src/memory.rs). The scheme is lowercased on the key.
+        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "ftp://host/repo.git");
+        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "https://example.com/a/b.git");
+        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "git+ssh://github.com/org/repo.git");
         // Query/fragment stripping applies only to remotes with a recognised
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct

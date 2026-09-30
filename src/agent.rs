@@ -2220,12 +2220,20 @@ impl Agent {
         // it neither bumps last_used nor prunes/rewrites the store.
         let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
         let result = memory::run(store, &call.name, &call.arguments, session, read_only);
-        // Any successful writable memory op can change the folded system-prompt
-        // index — a save adds an entry, a matching search bumps `last_used` (and
-        // may prune), a forget deletes one — so drop the cached index; the next
+        // Any non-plan memory op can change the folded system-prompt index — a
+        // save adds an entry, a matching search bumps `last_used` (and may
+        // prune), a forget deletes one — so drop the cached index; the next
         // prompt rebuild re-reads the store. A plan-mode/read-only search never
         // mutates, so it need not invalidate.
-        if result.is_ok() && !read_only {
+        //
+        // Invalidate on *every* non-plan op, not only on `Ok`: a failed mutating
+        // operation can already have changed disk state — `read_scope_file(..,
+        // true)` may prune a scope before a later error, and a two-scope search
+        // may write the first scope before the second write fails — so the
+        // cached prompt could otherwise retain expired entries or a stale MRU
+        // ordering. Invalidating on an error with no mutation is harmless
+        // (Copilot finding, src/agent.rs).
+        if !read_only {
             self.memory_index_cache = None;
         }
         // A successful forget deletes an entry the folded system-prompt index
