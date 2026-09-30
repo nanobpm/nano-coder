@@ -485,6 +485,18 @@ impl Renderer {
     /// Emit command / informational output (e.g. slash-command replies). In
     /// frame mode it is captured as a transcript item so direct writes can't
     /// corrupt the owned frame; otherwise it prints inline as before.
+    /// Output of a command run while a turn is streaming. The frame renderer
+    /// adds it to the transcript as usual; the legacy renderer prints it as a
+    /// note, which waits for a half-streamed line to end rather than landing
+    /// in the middle of it (`print_block` there is a bare `println!`).
+    pub fn turn_block(&self, text: &str) {
+        if self.frame.is_some() {
+            self.print_block(text);
+        } else {
+            self.note(text);
+        }
+    }
+
     pub fn print_block(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
