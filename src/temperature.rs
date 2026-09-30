@@ -185,10 +185,17 @@ pub fn resolve(global: Temperature, kind: ProviderKind, provider: &ProviderConfi
     let mut warning = None;
     if kind == ProviderKind::Anthropic
         && let Temperature::Value(v) = effective
-        && v > 1.0
     {
-        warning = Some(format!("temperature {v} is above Anthropic's maximum of 1; sending 1"));
-        effective = Temperature::Value(1.0);
+        // Anthropic's range is 0..=1, and its body builder clamps out-of-range
+        // values silently. Resolve and report both bounds here so `/context`
+        // and ACP show the value actually sent, with a warning.
+        if v > 1.0 {
+            warning = Some(format!("temperature {v} is above Anthropic's maximum of 1; sending 1"));
+            effective = Temperature::Value(1.0);
+        } else if v < 0.0 {
+            warning = Some(format!("temperature {v} is below Anthropic's minimum of 0; sending 0"));
+            effective = Temperature::Value(0.0);
+        }
     }
     Resolved { effective, source, fixed: None, warning }
 }
@@ -269,6 +276,12 @@ mod tests {
         let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &p, "claude");
         assert_eq!(r.value(), Some(1.0));
         assert!(r.warning.unwrap().contains("Anthropic's maximum"));
+        // Negative values are clamped to 0 with a warning, matching the body
+        // builder, rather than being reported as sent.
+        let p = provider("temperature = -0.5\n");
+        let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &p, "claude");
+        assert_eq!(r.value(), Some(0.0));
+        assert!(r.warning.unwrap().contains("Anthropic's minimum"));
         let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &ProviderConfig::default(), "claude");
         assert_eq!((r.value(), r.warning), (Some(0.7), None));
     }

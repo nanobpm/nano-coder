@@ -67,6 +67,12 @@ pub struct Message {
     /// message, in milliseconds. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Assistant messages: the effective sampling temperature sent for the
+    /// request that produced this message and where it came from, e.g.
+    /// `0.3 (set for this model)` or `model default (global setting)`. Recorded
+    /// so runs can be compared. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<String>,
 }
 
 impl Message {
@@ -84,6 +90,7 @@ impl Message {
             thinking: String::new(),
             usage: None,
             duration_ms: None,
+            temperature: None,
         }
     }
 

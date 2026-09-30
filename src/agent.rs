@@ -1351,6 +1351,10 @@ impl Agent {
             // Reset per attempt, so the recorded duration is the request that
             // produced the response, not earlier overflowed attempts.
             let mut request_started;
+            // Resolve once per turn: the model/provider/config that decide the
+            // temperature do not change across overflow retries, and the
+            // trajectory records the same effective value that is sent.
+            let resolved_temperature = self.temperature();
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Rebuilt every retry iteration, not just once before the loop:
@@ -1362,7 +1366,7 @@ impl Agent {
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
-                    temperature: self.temperature().value(),
+                    temperature: resolved_temperature.value(),
                     max_tokens: Some(self.request_max_tokens()),
                 };
                 let control = self.control.clone();
@@ -1499,6 +1503,7 @@ impl Agent {
                 thinking: response.thinking.clone(),
                 usage: response.usage.clone(),
                 duration_ms: Some(duration_ms),
+                temperature: Some(resolved_temperature.describe()),
                 ..message
             };
 
@@ -2168,7 +2173,7 @@ mod tests {
     /// `message` without its timestamp (or other timing), for comparing with a
     /// constructed one.
     fn unstamped(message: &Message) -> Message {
-        Message { timestamp: None, log_line: None, duration_ms: None, ..message.clone() }
+        Message { timestamp: None, log_line: None, duration_ms: None, temperature: None, ..message.clone() }
     }
 
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
