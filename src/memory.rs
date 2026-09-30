@@ -216,6 +216,13 @@ impl Store {
                 text.chars().count()
             );
         }
+        // The text is folded into the next session's system prompt and echoed in
+        // the save confirmation on one line. Reject control chars/newlines so the
+        // whole persisted fact stays visible for review and cannot smuggle a
+        // standalone system-prompt instruction past the transcript.
+        if text.chars().any(char::is_control) {
+            bail!("memory text must be a single line (no line breaks or control characters)");
+        }
         if let Some(reason) = looks_like_secret(text) {
             bail!(
                 "refusing to save: this looks like a secret ({reason}). Memory is human-readable and shared across \
@@ -237,7 +244,10 @@ impl Store {
         };
         let now = crate::session::now();
         let entry = Entry {
-            id: format!("mem-{:08x}", fastrand::u32(..)),
+            // 128 random bits: memory IDs form a persistent cross-scope
+            // namespace, so a wide ID keeps collisions (which would make an
+            // entry impossible to address via `forget`) vanishingly unlikely.
+            id: format!("mem-{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)),
             text: text.to_string(),
             created: now,
             last_used: now,
@@ -500,10 +510,10 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_
             let scope = Scope::parse(arg_str(args, "scope").ok_or_else(|| anyhow!("scope is required"))?)?;
             let text = arg_str(args, "text").ok_or_else(|| anyhow!("text is required"))?;
             let entry = store.save(scope, text, arg_str(args, "evidence"), session)?;
-            // Show the evidence too so the whole persisted entry (not just the
-            // text) is reviewable in the transcript — save rejects control
-            // characters, so it is safe to echo on one line.
-            let mut msg = format!("remembered ({}, {}): {}", scope.as_str(), entry.id, one_line(&entry.text));
+            // Show the whole persisted entry (text + evidence) so it is fully
+            // reviewable in the transcript — save rejects control characters, so
+            // both are single-line and safe to echo in full.
+            let mut msg = format!("remembered ({}, {}): {}", scope.as_str(), entry.id, entry.text);
             if let Some(evidence) = &entry.evidence {
                 msg.push_str(&format!(" (check: {evidence})"));
             }
@@ -645,11 +655,29 @@ fn normalize_remote(url: &str) -> String {
     // Only the SCP separator is remapped below — preserving the port keeps
     // `ssh://host:2222/a/b` distinct from `https://host/2222/a/b`.
     let scp = !scheme;
-    // `git@host:owner/repo` → `host:owner/repo` (still SCP-style).
-    let s = s.strip_prefix("git@").unwrap_or(s);
-    // Drop any remaining `user:pass@` credentials.
-    let s = s.rsplit_once('@').map_or(s, |(_, rest)| rest);
-    let s: String = if scp { s.replacen(':', "/", 1) } else { s.to_string() };
+    // Strip `user:pass@` credentials from the *authority* only, never from the
+    // path. A legal `@` in the path (e.g. `example.com/repo@v2.git`) must be
+    // preserved, or unrelated repositories that differ only after an `@` would
+    // collapse onto one project key and share a memory file.
+    let s: String = if scp {
+        // SCP-style `[user@]host:owner/repo`: the authority is before the `:`.
+        match s.split_once(':') {
+            Some((authority, path)) => {
+                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                format!("{host}/{path}")
+            }
+            None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
+        }
+    } else {
+        // Scheme URL `[user:pass@]host[:port]/path`: authority is before the `/`.
+        match s.split_once('/') {
+            Some((authority, path)) => {
+                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                format!("{host}/{path}")
+            }
+            None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
+        }
+    };
     let trimmed = s.trim_end_matches('/');
     trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string()
 }
@@ -750,15 +778,32 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
 /// Whether an assignment's value is an obvious placeholder rather than a real
 /// secret, so a template line like `token=<your-token>` is not rejected.
 fn is_placeholder(value: &str) -> bool {
+    // Angle-bracket templates like `<your-token>` or `<TOKEN>` are placeholders.
+    if value.contains('<') && value.contains('>') {
+        return true;
+    }
     let trimmed = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     if trimmed.is_empty() {
         return true;
     }
     let lower = trimmed.to_ascii_lowercase();
-    matches!(
+    if matches!(
         lower.as_str(),
         "none" | "null" | "nil" | "todo" | "tbd" | "changeme" | "change_me" | "redacted" | "placeholder" | "example"
     ) || trimmed.chars().all(|c| matches!(c, 'x' | 'X' | '*' | '•'))
+    {
+        return true;
+    }
+    // Hyphen/underscore-separated templates like `your-token` or `example_key`:
+    // a placeholder when every segment is a known filler word (the documented
+    // `token=<your-token>` example must not be a false positive).
+    const FILLER: &[&str] = &[
+        "your", "my", "our", "some", "the", "a", "an", "example", "sample", "placeholder", "dummy", "fake",
+        "token", "secret", "key", "keys", "password", "passwd", "apikey", "api", "access", "private", "client",
+        "value", "val", "here", "goes", "change", "changeme", "me", "redacted", "todo", "tbd", "foo", "bar",
+    ];
+    let segments: Vec<&str> = lower.split(['-', '_']).filter(|s| !s.is_empty()).collect();
+    segments.len() > 1 && segments.iter().all(|s| FILLER.contains(s))
 }
 
 #[cfg(test)]
@@ -815,6 +860,10 @@ mod tests {
         assert!(store.save(Scope::User, "PASSWORD=hunter2", None, None).is_err());
         // An obvious placeholder value is not a real secret.
         assert!(store.save(Scope::User, "example config: token=xxxxxxxx", None, None).is_ok());
+        // The documented hyphenated/angle-bracket example must not be a false
+        // positive (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "example: token=<your-token>", None, None).is_ok());
+        assert!(store.save(Scope::User, "template: api_key=your-api-key", None, None).is_ok());
         // A pointer to where a secret lives is fine.
         assert!(store.save(Scope::User, "the API key lives in ~/.config/app/creds", None, None).is_ok());
         // A credential-free URL is fine (no `user:pass@`).
@@ -992,6 +1041,14 @@ mod tests {
         // (Copilot finding, src/memory.rs).
         assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "github.com:2222/a/b");
         assert_ne!(normalize_remote("ssh://host:2222/org/repo"), normalize_remote("https://host/2222/org/repo"));
+        // A legal `@` in the repository PATH is preserved: credential stripping
+        // applies only to the authority, so repos differing only after an `@`
+        // don't collapse onto one key (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote("https://one.example/repo@v2.git"), "one.example/repo@v2");
+        assert_ne!(
+            normalize_remote("https://one.example/repo@v2.git"),
+            normalize_remote("https://two.example/other@v2.git")
+        );
         // A readable head is kept, but a disambiguating hash is always appended.
         assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);

@@ -1042,11 +1042,12 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         );
     }
     let mut out = vec![format!(
-        "{} memor{} (memory is {}; edit the files under {}, or /memory forget <id>):",
+        "{} memor{} (memory is {}; edit the files under {}{}):",
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" },
         agent.config().memory.as_str(),
-        agent.config().memory_dir().display()
+        agent.config().memory_dir().display(),
+        if agent.config().memory.writable() { ", or /memory forget <id>" } else { "" }
     )];
     for (scope, entry) in &entries {
         let mut line = format!(
