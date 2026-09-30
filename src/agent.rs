@@ -605,6 +605,19 @@ impl Agent {
         ContextCap::Total
     }
 
+    /// The combined prompt + output window to enforce alongside a prompt-only
+    /// cap: the window the endpoint advertised (`total_tokens`), further
+    /// tightened by any window learned from a context-overflow error. A learned
+    /// window is a total-request cap, so when it sits below the advertised
+    /// combined window it becomes the effective combined limit even while it
+    /// stays above the prompt-only `tokens` cap (which keeps `context_cap()`
+    /// `Prompt`). Without this, `request_max_tokens()` would size output against
+    /// the larger advertised window and overflow again on the sole retry.
+    fn combined_window(&self) -> Option<usize> {
+        let advertised = self.detected_window.as_ref().and_then(|d| d.total_tokens)?;
+        Some(self.learned_window.map_or(advertised, |learned| advertised.min(learned)))
+    }
+
     /// The context window and where it came from, for `/context`.
     pub fn context_window_with_source(&self) -> (usize, String) {
         let (user, default_provider) = self.config.effective_providers();
@@ -1710,7 +1723,7 @@ impl Agent {
         // window — `request_max_tokens()` would then shrink `max_tokens` below
         // the target instead of compacting. Compact against the combined window
         // too, so the reservation is carved out of whichever limit is tighter.
-        let limit = match self.detected_window.as_ref().and_then(|d| d.total_tokens) {
+        let limit = match self.combined_window() {
             Some(combined) if self.context_cap() == ContextCap::Prompt => {
                 let combined_reserved =
                     (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
@@ -1739,8 +1752,9 @@ impl Agent {
         let (tokens, _) = self.estimate_context_tokens();
         if self.context_cap() == ContextCap::Prompt {
             // The prompt cap does not consume output tokens; only the combined
-            // window (when the endpoint advertised one) limits prompt + output.
-            let Some(combined) = self.detected_window.as_ref().and_then(|d| d.total_tokens) else {
+            // window (when the endpoint advertised one, tightened by any learned
+            // overflow limit) limits prompt + output.
+            let Some(combined) = self.combined_window() else {
                 return configured as i64;
             };
             let room = combined.saturating_sub(tokens + output_margin(combined));
@@ -2731,6 +2745,42 @@ mod tests {
         assert_eq!(seen.len(), 2, "summary, then the real call: {seen:?}");
         assert!(seen[0].1, "the first request is the compaction summary: {seen:?}");
         assert!(agent.context_stats().lock().unwrap().compactions >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_learned_window_tightens_the_effective_combined_window() {
+        // Copilot advertises `max_prompt_tokens = 100K` (prompt-only) and a
+        // larger `max_context_window_tokens = 128K` (prompt + output). A context
+        // overflow then teaches a real 110K total cap — above the prompt-only
+        // cap (so `context_cap()` stays `Prompt`) but below the advertised 128K
+        // combined window. That learned total must become the effective combined
+        // limit: `max_tokens` is capped to the room left in 110K, not 128K, so
+        // the request does not overflow the learned window again.
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_window = 100_000;
+        let advertised = 128_000;
+        let learned = 110_000;
+        let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
+        agent.config_mut().context_window = None;
+        agent.detected_window = Some(DetectedWindow {
+            tokens: prompt_window,
+            source: "Copilot /models max_prompt_tokens".into(),
+            cap: ContextCap::Prompt,
+            total_tokens: Some(advertised),
+        });
+        agent.learned_window = Some(learned);
+        agent.new_session().unwrap();
+        // A ~96K-token prompt: under the prompt-only cap (no compaction) but
+        // within the reserve of the learned 110K combined window. Against the
+        // advertised 128K it would leave ample room and send `max_tokens`
+        // unchanged; against the learned 110K it is capped.
+        agent.run_turn(Some("in-1"), &"w".repeat(384_000)).await.unwrap();
+        let (tokens, _) = agent.estimate_context_tokens();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "no compaction: {seen:?}");
+        let (Some(max_tokens), false) = seen[0] else { panic!("{seen:?}") };
+        assert!(max_tokens < 16_384, "capped to the learned combined window's room: {max_tokens}");
+        assert!(tokens + max_tokens as usize <= learned, "{tokens} + {max_tokens} > {learned}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
