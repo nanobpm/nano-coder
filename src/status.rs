@@ -451,9 +451,10 @@ fn render(stats: &ContextStats, cols: usize) -> String {
             priority: 1,
         });
     }
+    let label = if stats.smart_compact { "smart-compact" } else { "auto-compact" };
     let compact = match threshold {
-        Some(t) => format!(" auto-compact {t:.0}%"),
-        None => " auto-compact off".to_string(),
+        Some(t) => format!(" {label} {t:.0}%"),
+        None => format!(" {label} off"),
     };
     let compacted = if stats.compactions > 0 { format!(" ({}×)", stats.compactions) } else { String::new() };
     segments.push(Segment { text: format!("{compact}{compacted} "), color: None, priority: 1 });
@@ -561,6 +562,7 @@ mod tests {
             history_searches: 0,
             history_reads: 0,
             auto_compact: Some(0.8),
+            smart_compact: false,
             activity: Activity::Tool("bash".into()),
             plan: Some((2, 5)),
             cwd: "/tmp/project".into(),
@@ -584,6 +586,17 @@ mod tests {
         ] {
             assert!(line.contains(part), "{part} missing from {line:?}");
         }
+    }
+
+    #[test]
+    fn names_smart_compaction() {
+        let mut stats = stats();
+        stats.smart_compact = true;
+        let line = visible(&render(&stats, 140));
+        assert!(line.contains("smart-compact 80% (1×)"), "{line:?}");
+        assert!(!line.contains("auto-compact"), "{line:?}");
+        stats.auto_compact = None;
+        assert!(visible(&render(&stats, 140)).contains("smart-compact off"));
     }
 
     #[test]
