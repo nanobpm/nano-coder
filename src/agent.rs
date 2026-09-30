@@ -13,7 +13,9 @@ use crate::goal::{self, Outcome};
 use crate::history;
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
-use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
+use crate::llm::{
+    ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall,
+};
 use crate::output;
 use crate::permissions::Policy;
 use crate::plan::{self, Plan};
@@ -577,6 +579,19 @@ impl Agent {
     /// endpoint reports, or one known for the model name.
     pub fn context_window(&self) -> usize {
         self.context_window_with_source().0
+    }
+
+    /// Whether the context window caps the whole request (prompt + output) or
+    /// only the prompt. Only an endpoint-reported window can be prompt-only
+    /// (GitHub Copilot's `max_prompt_tokens`); config, model-name, and learned
+    /// windows all describe the total prompt + output budget.
+    fn context_cap(&self) -> ContextCap {
+        if self.configured_window().is_none()
+            && let Some(detected) = &self.detected_window
+        {
+            return detected.cap;
+        }
+        ContextCap::Total
     }
 
     /// The context window and where it came from, for `/context`.
@@ -1665,9 +1680,17 @@ impl Agent {
         let window = self.context_window();
         // Endpoints such as vLLM and Splash reject a request whose prompt plus
         // `max_tokens` exceeds the window, so the output reservation counts
-        // against the window too. `request_max_tokens` shrinks the reservation
-        // down to MIN_OUTPUT_RESERVE; compact before even that would not fit.
-        let reserved = (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window);
+        // against the window too — unless the window caps the prompt alone
+        // (GitHub Copilot's `max_prompt_tokens`), where output tokens do not
+        // consume it and reserving them would compact early. `request_max_tokens`
+        // shrinks the reservation down to MIN_OUTPUT_RESERVE; compact before even
+        // that would not fit.
+        let reserved = match self.context_cap() {
+            ContextCap::Total => {
+                (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
+            }
+            ContextCap::Prompt => 0,
+        };
         let limit = (window as f64 * threshold).min(window.saturating_sub(reserved) as f64);
         tokens as f64 > limit && tokens > self.compact_floor + window / 10
     }
@@ -1680,8 +1703,15 @@ impl Agent {
     /// unavailable (`auto_compact` disabled) or suppressed by the `compact_floor`
     /// guard, capping to the real room keeps `prompt + max_tokens` inside the
     /// window instead of overflowing it. Always at least 1 so the request is valid.
+    ///
+    /// A prompt-only window (GitHub Copilot's `max_prompt_tokens`) caps the prompt
+    /// alone, so output room is not carved out of it: the configured `max_tokens`
+    /// goes through unchanged.
     fn request_max_tokens(&self) -> i64 {
         let configured = self.config.max_tokens.max(1) as usize;
+        if self.context_cap() == ContextCap::Prompt {
+            return configured as i64;
+        }
         let (tokens, _) = self.estimate_context_tokens();
         let window = self.context_window();
         let room = window.saturating_sub(tokens + output_margin(window));
@@ -2547,6 +2577,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn prompt_only_window_does_not_shrink_max_tokens() {
+        // A prompt-only window (GitHub Copilot's `max_prompt_tokens`) caps the
+        // prompt alone, so the output reservation is not carved out of it: even
+        // with the prompt near the window, `max_tokens` goes through unchanged
+        // and no compaction is triggered by output room.
+        let dir = tempfile::tempdir().unwrap();
+        let window = 24_000;
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
+        agent.config_mut().context_window = None;
+        agent.detected_window = Some(DetectedWindow {
+            tokens: window,
+            source: "Copilot /models max_prompt_tokens".into(),
+            cap: ContextCap::Prompt,
+        });
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "no compaction against a prompt-only cap: {seen:?}");
+        assert_eq!(seen[1], (Some(16_384), false), "max_tokens unchanged: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn max_tokens_shrinks_so_prompt_and_output_fit_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let window = 24_000;
@@ -2792,7 +2844,7 @@ mod tests {
                 unreachable!()
             }
             async fn detect_context_window(&self) -> Option<DetectedWindow> {
-                Some(DetectedWindow { tokens: 65_536, source: "test".into() })
+                Some(DetectedWindow::total(65_536, "test"))
             }
             fn model_name(&self) -> &str {
                 "claude-test"

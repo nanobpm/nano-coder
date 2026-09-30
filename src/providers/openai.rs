@@ -431,14 +431,14 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
             .pointer("/default_generation_settings/n_ctx")
             .or_else(|| props.get("n_ctx"))
             .and_then(as_tokens)
-            .map(|tokens| DetectedWindow { tokens, source: "llama.cpp /props n_ctx".into() });
+            .map(|tokens| DetectedWindow::total(tokens, "llama.cpp /props n_ctx"));
     }
     if owner == "organization_owner" || provider.name == "lmstudio" {
         let listed = probe(transport, reqwest::Method::GET, &format!("{root}/api/v0/models"), None).await?;
         return model_entry(&listed, model)
             .and_then(|m| m.get("loaded_context_length"))
             .and_then(as_tokens)
-            .map(|tokens| DetectedWindow { tokens, source: "LM Studio loaded_context_length".into() });
+            .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length"));
     }
     if is_ollama {
         return ollama_window(transport, root, model).await;
@@ -459,7 +459,7 @@ async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Op
             .flatten()
             .find(|m| ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same)));
         if let Some(tokens) = loaded.and_then(|m| m.get("context_length")).and_then(as_tokens) {
-            return Some(DetectedWindow { tokens, source: "Ollama /api/ps context_length".into() });
+            return Some(DetectedWindow::total(tokens, "Ollama /api/ps context_length"));
         }
     }
     let show =
@@ -468,7 +468,7 @@ async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Op
     parameters
         .lines()
         .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse::<usize>().ok().filter(|&n| n > 0))
-        .map(|tokens| DetectedWindow { tokens, source: "Ollama num_ctx".into() })
+        .map(|tokens| DetectedWindow::total(tokens, "Ollama num_ctx"))
 }
 
 async fn probe(transport: &HttpTransport, method: reqwest::Method, url: &str, body: Option<Value>) -> Option<Value> {
@@ -516,6 +516,7 @@ fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
         Some(DetectedWindow {
             tokens,
             source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")),
+            cap: crate::llm::ContextCap::Total,
         })
     })
 }
@@ -1013,7 +1014,7 @@ mod tests {
     }
 
     fn window(tokens: usize, source: &str) -> Option<DetectedWindow> {
-        Some(DetectedWindow { tokens, source: source.into() })
+        Some(DetectedWindow::total(tokens, source))
     }
 
     #[tokio::test]

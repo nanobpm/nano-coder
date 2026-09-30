@@ -347,6 +347,32 @@ pub struct DetectedWindow {
     pub tokens: usize,
     /// Where it came from, e.g. `/v1/models max_model_len`.
     pub source: String,
+    /// Whether `tokens` caps the whole request (prompt + output) or the prompt
+    /// alone. Total unless the endpoint says otherwise.
+    pub cap: ContextCap,
+}
+
+impl DetectedWindow {
+    /// A window that caps the whole request, prompt + output.
+    pub fn total(tokens: usize, source: impl Into<String>) -> Self {
+        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total }
+    }
+}
+
+/// Whether a context window caps the whole request or only the prompt.
+///
+/// Most endpoints reject a request whose prompt *plus* `max_tokens` exceeds the
+/// window, so the output reservation counts against it (`Total`). GitHub Copilot
+/// instead enforces a prompt-only budget (`max_prompt_tokens`) that sits below
+/// the full window: output tokens do not consume it, so subtracting the output
+/// reservation would compact and cap completions earlier than the real limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextCap {
+    /// `tokens` is the combined prompt + output budget; reserve output room in it.
+    #[default]
+    Total,
+    /// `tokens` caps the prompt alone; output tokens do not consume it.
+    Prompt,
 }
 
 /// Splits `<think>...</think>` sections out of streamed content (servers that

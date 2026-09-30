@@ -23,7 +23,7 @@ use super::openai;
 use super::openai_responses;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
-use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
+use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -511,7 +511,10 @@ impl LLMClient for GithubCopilotClient {
             // Copilot enforces the prompt budget, which is below the full window.
             ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
                 let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
-                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
+                // `max_prompt_tokens` caps the prompt alone: output tokens do not
+                // consume it. `max_context_window_tokens` is the full window.
+                let cap = if *field == "max_prompt_tokens" { ContextCap::Prompt } else { ContextCap::Total };
+                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}"), cap })
             })
         })
         .await
@@ -883,6 +886,7 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 111);
         assert_eq!(window.source, "Copilot /models max_prompt_tokens");
+        assert_eq!(window.cap, ContextCap::Prompt, "the prompt budget caps the prompt alone");
 
         // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
         let window = detect_window(json!({
@@ -894,6 +898,7 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 222);
         assert_eq!(window.source, "Copilot /models max_context_window_tokens");
+        assert_eq!(window.cap, ContextCap::Total, "the full window caps prompt + output");
 
         // Neither field present: no detection rather than a bogus default.
         assert!(
