@@ -1745,8 +1745,16 @@ impl Agent {
             max_tokens: Some(context::SUMMARY_MAX_TOKENS.min(self.config.max_tokens as i64)),
         };
         let control = self.control.clone();
+        // Stream the summary even though its text is used only once complete.
+        // A summary prompt is new text that no prefix cache holds. A local
+        // model can take minutes to read it before sending its first token.
+        // A non-streaming request sends no bytes in that time, so a proxy or
+        // tunnel with an idle timeout drops it, and every retry starts over.
+        // A stream carries the server's keepalives (and falls back to one
+        // whole response for providers configured with `stream = false`).
+        let discard = |_: StreamEvent<'_>| {};
         let result = tokio::select! {
-            result = self.client.chat(&request) => result,
+            result = self.client.chat_stream(&request, &discard) => result,
             () = control.cancelled() => return Ok(None),
         };
         let (summary, fallback) = match result {
@@ -2479,6 +2487,56 @@ mod tests {
         assert!(restored.pending_input.is_none());
         assert_eq!(restored.completed["in-1"], "done");
         assert_eq!(restored.conversation.last().map(unstamped), Some(Message::assistant("done")));
+    }
+
+    /// Answers turns through `chat`, but only answers a summary through
+    /// `chat_stream`: a non-streaming summary request gets an idle-timeout
+    /// error, as through a tunnel that drops connections sending no bytes.
+    struct StreamOnlySummary {
+        streamed: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for StreamOnlySummary {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            if request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT) {
+                anyhow::bail!("error sending request: idle connection dropped")
+            }
+            Ok(text("done"))
+        }
+        async fn chat_stream(
+            &self,
+            request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            *self.streamed.lock().unwrap() += 1;
+            assert!(request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT));
+            sink(StreamEvent::Text("SUMMARY: "));
+            sink(StreamEvent::Text("streamed"));
+            Ok(text("SUMMARY: streamed"))
+        }
+        fn model_name(&self) -> &str {
+            "stream-only-summary"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_streams_the_summary_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let streamed = Arc::new(Mutex::new(0));
+        let client = StreamOnlySummary { streamed: streamed.clone() };
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Config::default() };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "summary must not fall back to dropping messages");
+        assert_eq!(*streamed.lock().unwrap(), 1);
+        assert!(agent.conversation()[1].content.ends_with("SUMMARY: streamed"));
     }
 
     /// Replays scripted results, including errors.
