@@ -1036,10 +1036,20 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         Err(e) => return format!("Could not read memory: {e}"),
     };
     if entries.is_empty() {
-        return format!(
-            "No memories yet. The model saves them with memory_save; files live under {}.",
-            agent.config().memory_dir().display()
-        );
+        // Branch on writability: in read-only mode (including headless/ACP runs)
+        // the `memory_save` tool is unavailable, so pointing the user at it
+        // would describe an action the model cannot take.
+        return if agent.config().memory.writable() {
+            format!(
+                "No memories yet. The model saves them with memory_save; files live under {}.",
+                agent.config().memory_dir().display()
+            )
+        } else {
+            format!(
+                "No memories yet. Memory is read-only here, so the model cannot save them; files live under {}.",
+                agent.config().memory_dir().display()
+            )
+        };
     }
     let mut out = vec![format!(
         "{} memor{} (memory is {}; edit the files under {}{}):",
