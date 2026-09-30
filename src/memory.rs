@@ -1132,10 +1132,36 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // *location-only* guidance such as "the password is stored in …" or "the API
     // key is in vault" — those point to where a secret lives rather than stating
     // it, and must not be blocked.
-    let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*\s+(?:is|was|are|be)\s+["']?(\S+)"#;
+    //
+    // Capture the *rest of the phrase* (`.+`), not just the first token: a
+    // leading article or possessive (`the token is the abc123`, `password is my
+    // hunter2`) is filler in front of the value, not the value itself. Skip those
+    // lead-in words and evaluate the first *real* token, or the whole match is
+    // dropped after one filler word and the secret is persisted (Copilot
+    // finding, src/memory.rs).
+    // The subject may be written with a space as well as `_`/`-` (`API key`,
+    // `client secret`): natural prose rarely uses the identifier form, so allow
+    // a single space in the two-word labels or a copular sentence like "API key
+    // is your real-key" slips past (Copilot finding, src/memory.rs).
+    let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*\s+(?:is|was|are|be)\s+["']?(.+)"#;
     if let Ok(re) = RegexBuilder::new(copular).build() {
         for caps in re.captures_iter(text) {
-            let value = caps[1].trim_matches(|c: char| ['"', '\''].contains(&c));
+            // Skip leading filler (articles / possessives) to reach the value.
+            let mut value = "";
+            for word in caps[1].split_whitespace() {
+                let w = word.trim_matches(|c: char| ['"', '\''].contains(&c));
+                if matches!(
+                    w.to_ascii_lowercase().as_str(),
+                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
+                ) {
+                    continue;
+                }
+                value = w;
+                break;
+            }
+            if value.is_empty() {
+                continue;
+            }
             // Exempt location-only guidance: a value that is itself a
             // location/preposition word ("stored", "in", "at", "kept", "lives",
             // "set", "saved", …) means the sentence says *where* the secret is,
@@ -1164,12 +1190,6 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
                     | "within"
                     | "on"
                     | "via"
-                    | "the"
-                    | "a"
-                    | "an"
-                    | "your"
-                    | "my"
-                    | "our"
             ) {
                 continue;
             }
@@ -1382,6 +1402,12 @@ mod tests {
         assert!(store.save(Scope::User, "database password is hunter2", None, None).is_err());
         assert!(store.save(Scope::User, "the token was abc123def456", None, None).is_err());
         assert!(store.save(Scope::User, "my api_key is s3cr3tvalue", None, None).is_err());
+        // A leading article/possessive is filler in front of the value, not the
+        // value itself: skipping the match after that first token would persist
+        // the real secret that follows (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "the token is the abc123def456", None, None).is_err());
+        assert!(store.save(Scope::User, "password is my hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "API key is your real-key", None, None).is_err());
         // Location-only guidance points to *where* a secret lives rather than
         // stating it, and must not be blocked (Copilot finding, src/memory.rs).
         assert!(store.save(Scope::User, "the password is stored in ~/.config/app/creds", None, None).is_ok());
