@@ -505,16 +505,15 @@ impl Renderer {
     /// export that lives only in scrollback would be erased the moment the
     /// frame is restored. Keeping it as an item re-emits it inside the frame
     /// on every redraw — including resizes, which clear scrollback too. The
-    /// lock is dropped across the print so the write can't interleave with a
-    /// render.
+    /// frame lock is held across the direct write and the following render so
+    /// a concurrent editor/resize/event render can't interleave its escape
+    /// sequences with the raw bytes (`println!` takes no terminal lock, so the
+    /// frame mutex is the only thing serializing them).
     pub fn print_raw(&self, text: &str) {
         if let Some(frame) = &self.frame {
-            {
-                let mut fs = frame.lock().unwrap();
-                self.frame_finish_stream(&mut fs);
-            }
-            println!("{text}");
             let mut fs = frame.lock().unwrap();
+            self.frame_finish_stream(&mut fs);
+            println!("{text}");
             fs.items.push(stamped(Item::Raw(text.to_string())));
             fs.out.invalidate();
             self.frame_render(&mut fs);

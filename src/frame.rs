@@ -611,9 +611,9 @@ impl<W: Write> FrameRenderer<W> {
             // the entire transcript, so anything already in scrollback is a copy
             // of what is about to be written; keeping it would leave a duplicate
             // (stale) frame behind the fresh one.
-            self.full_redraw(frame, height)?;
+            self.full_redraw(frame, width, height)?;
         } else {
-            self.differential(frame, height)?;
+            self.differential(frame, width, height)?;
         }
         self.prev = frame.to_vec();
         self.width = width;
@@ -622,7 +622,7 @@ impl<W: Write> FrameRenderer<W> {
         Ok(())
     }
 
-    fn full_redraw(&mut self, frame: &[String], height: usize) -> std::io::Result<()> {
+    fn full_redraw(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
         // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
         // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
@@ -635,8 +635,12 @@ impl<W: Write> FrameRenderer<W> {
         buf.push_str("\x1b[H\x1b[2J\x1b[3J");
         // Bottom-anchor: when the frame is shorter than the screen, leave blank
         // rows at the top so the bar lands on the last row; when it is taller,
-        // write from the top and let the surplus scroll into scrollback.
-        let start_row = if frame.len() < height { height - frame.len() + 1 } else { 1 };
+        // write from the top and let the surplus scroll into scrollback. Count
+        // PHYSICAL rows, not logical lines: a raw export line wider than the
+        // terminal wraps natively onto extra rows, and only the physical total
+        // places the first line on the right row.
+        let physical = physical_rows(frame, width);
+        let start_row = if physical < height { height - physical + 1 } else { 1 };
         buf.push_str(&format!("\x1b[{start_row};1H"));
         for (i, line) in frame.iter().enumerate() {
             if i > 0 {
@@ -649,21 +653,37 @@ impl<W: Write> FrameRenderer<W> {
         self.out.flush()
     }
 
-    fn differential(&mut self, frame: &[String], height: usize) -> std::io::Result<()> {
+    fn differential(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let Some(diff) = first_diff(&self.prev, frame) else {
             return Ok(());
         };
         let plen = self.prev.len();
-        // The first on-screen line index of the previous frame; anything before
-        // it has scrolled into scrollback and can't be rewritten in place.
+        // Row addressing must count PHYSICAL rows: a raw export line wider than
+        // the terminal wraps natively onto extra rows, so a logical line index
+        // is not a screen row. Compare physical totals to decide the fallback
+        // and to locate the first on-screen row.
+        let prev_physical = physical_rows(&self.prev, width);
+        let new_physical = physical_rows(frame, width);
+        // The first on-screen logical line index of the previous frame;
+        // anything before it has scrolled into scrollback and can't be
+        // rewritten in place.
         let prev_top = plen.saturating_sub(height);
-        if plen != frame.len() || diff < prev_top {
-            // Line count changed, or the change is already in scrollback: fall
-            // back to a full redraw. It clears scrollback so re-emitting the
-            // whole transcript can't stack a duplicate copy behind the frame.
-            return self.full_redraw(frame, height);
+        if prev_physical != new_physical || diff < prev_top {
+            // Physical row count changed, or the change is already in
+            // scrollback: fall back to a full redraw. It clears scrollback so
+            // re-emitting the whole transcript can't stack a duplicate copy
+            // behind the frame.
+            return self.full_redraw(frame, width, height);
         }
-        let row = if plen <= height { (height - plen) + diff + 1 } else { diff - prev_top + 1 };
+        // The screen row of the changed line is its cumulative physical offset
+        // within the frame, anchored against the bottom (the status bar is the
+        // last physical row).
+        let before: usize = frame[..diff].iter().map(|l| line_physical_rows(l, width)).sum();
+        let row = if new_physical <= height {
+            (height - new_physical) + before + 1
+        } else {
+            before - (new_physical - height) + 1
+        };
         let mut buf = String::from(SYNC_START);
         buf.push_str(&format!("\x1b[{row};1H"));
         for (i, line) in frame[diff..].iter().enumerate() {
@@ -677,6 +697,27 @@ impl<W: Write> FrameRenderer<W> {
         self.out.write_all(buf.as_bytes())?;
         self.out.flush()
     }
+}
+
+/// The number of physical terminal rows a single composed line occupies once
+/// written: a line wider than `width` wraps natively onto `ceil(w/width)` rows
+/// (an empty line still takes one). ANSI escape sequences are ignored, so this
+/// measures what the terminal actually advances, not the byte length.
+fn line_physical_rows(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let w = visible_width(line);
+    if w == 0 {
+        return 1;
+    }
+    w.div_ceil(width)
+}
+
+/// The total physical terminal rows a composed frame occupies: the sum over
+/// every line of its wrapped height. Cursor addressing must use this count —
+/// logical line indices undercount whenever a raw export line wraps past the
+/// terminal width.
+fn physical_rows(frame: &[String], width: usize) -> usize {
+    frame.iter().map(|l| line_physical_rows(l, width)).sum()
 }
 
 // --- Resize debounce -------------------------------------------------------
@@ -1177,5 +1218,64 @@ mod emulator {
         assert_eq!(second.last().unwrap(), "MODEL  ctx 10%");
         assert_eq!(second.iter().filter(|r| r.contains("ctx 10%")).count(), 1);
         assert!(second[second.len() - 2].contains("my next question"));
+    }
+
+    /// A frame whose transcript holds a raw export line far wider than the
+    /// terminal: the line wraps natively onto extra rows, and the renderer must
+    /// still land the editor and the status bar on the correct rows.
+    fn wide_raw_frame(width: usize, marker: &str) -> Vec<String> {
+        let long = "x".repeat(width * 3);
+        let transcript = transcript_lines(
+            &[
+                StampedItem { stamp: String::new(), item: Item::Raw(format!("{{\"k\":\"{long}\"}}")) },
+                StampedItem {
+                    stamp: String::new(),
+                    item: Item::Message { role: Role::Assistant, text: format!("answer {marker}") },
+                },
+            ],
+            width,
+        );
+        let editor = editor_lines("› ", "next", 4, width);
+        compose(&transcript, &editor, "BAR")
+    }
+
+    #[test]
+    fn a_wrapping_raw_line_keeps_the_bar_on_the_last_row() {
+        let mut emu = Emu::new(24, 40);
+        emu.render(&wide_raw_frame(40, "a"));
+        let screen = emu.screen();
+        // The raw line wrapped onto several rows, but the bar is still the
+        // single last row and the editor sits directly above it.
+        assert_eq!(screen.last().unwrap(), "BAR", "bar pushed off the last row: {screen:?}");
+        assert_eq!(screen.iter().filter(|r| r.contains("BAR")).count(), 1, "duplicate bars: {screen:?}");
+        assert!(screen[screen.len() - 2].contains("next"), "editor not above the bar: {screen:?}");
+    }
+
+    #[test]
+    fn a_differential_render_after_a_wrapping_raw_line_addresses_real_rows() {
+        let mut emu = Emu::new(24, 40);
+        emu.render(&wide_raw_frame(40, "a"));
+        // Change only the trailing assistant text: a differential render must
+        // rewrite that row in place, not the row a naive logical index picks.
+        emu.render(&wide_raw_frame(40, "b"));
+        let screen = emu.screen();
+        assert_eq!(screen.last().unwrap(), "BAR");
+        assert_eq!(screen.iter().filter(|r| r.contains("BAR")).count(), 1, "bar duplicated: {screen:?}");
+        assert!(screen.iter().any(|r| r.contains("answer b")), "update lost: {screen:?}");
+        assert!(!screen.iter().any(|r| r.contains("answer a")), "stale row left behind: {screen:?}");
+    }
+
+    #[test]
+    fn physical_row_helpers_count_native_wraps() {
+        // Empty and exactly-full lines take one row; wider lines wrap.
+        assert_eq!(line_physical_rows("", 10), 1);
+        assert_eq!(line_physical_rows("1234567890", 10), 1);
+        assert_eq!(line_physical_rows("12345678901", 10), 2);
+        assert_eq!(line_physical_rows(&"x".repeat(25), 10), 3);
+        // ANSI styling adds no width.
+        assert_eq!(line_physical_rows("\x1b[2m12345\x1b[0m", 10), 1);
+        // The frame total is the per-line sum.
+        let frame = vec!["abc".to_string(), "x".repeat(21), String::new()];
+        assert_eq!(physical_rows(&frame, 10), 1 + 3 + 1);
     }
 }
