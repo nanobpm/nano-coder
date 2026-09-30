@@ -685,7 +685,16 @@ pub fn project_key(cwd: &Path) -> Option<String> {
             {
                 let root = root.trim();
                 if !root.is_empty() {
-                    let resolved = Path::new(root).join(url);
+                    // `Path::join` does not collapse `.`/`..`, so resolving
+                    // `../origin.git` against `/work/a` and `/work/b` would
+                    // yield the distinct raw strings `/work/a/../origin.git`
+                    // and `/work/b/../origin.git` even though both point to
+                    // the same `/work/origin.git` — fragmenting project memory
+                    // across repositories that share one origin (Copilot
+                    // finding, src/memory.rs). Collapse the components
+                    // lexically (no filesystem access: the target need not
+                    // exist) before deriving the key.
+                    let resolved = normalize_path(&Path::new(root).join(url));
                     return Some(normalize_remote(&resolved.to_string_lossy()));
                 }
             }
@@ -693,6 +702,32 @@ pub fn project_key(cwd: &Path) -> Option<String> {
         }
     }
     git_output(cwd, &["rev-parse", "--show-toplevel"]).map(|root| root.trim().to_string()).filter(|r| !r.is_empty())
+}
+
+/// Collapse `.` and `..` components lexically, without touching the filesystem
+/// (the target need not exist). The root/prefix is preserved; a `..` that would
+/// climb above the root (or a leading `..` in a relative path) is kept verbatim
+/// so the result stays a valid, equivalent path. Used to give repositories that
+/// resolve the same relative origin a single stable project key.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop the last normal component; otherwise keep the `..` (it is
+                // either leading in a relative path or climbs above the root).
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::Prefix(_) => out.push(component.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Whether a remote string is a relative local path (e.g. `./repo.git` or
@@ -1467,6 +1502,48 @@ mod tests {
         // The resolved absolute path is what feeds the key, not the raw
         // relative string.
         assert!(!key_a.starts_with(".."), "relative origin must be resolved, got: {key_a}");
+    }
+
+    #[test]
+    fn shared_relative_origin_normalizes_to_one_key() {
+        // Two repositories at the same depth that both use `../origin.git` point
+        // at the *same* origin (`<root>/origin.git`). The resolved path must be
+        // normalised (`..` collapsed) so both derive one shared project key
+        // rather than fragmenting on the unresolved `a/../` vs `b/../` raw
+        // strings (Copilot finding, src/memory.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("a");
+        let repo_b = dir.path().join("b");
+        for repo in [&repo_a, &repo_b] {
+            std::fs::create_dir_all(repo).unwrap();
+            let init = std::process::Command::new("git").arg("-C").arg(repo).args(["init", "-q"]).output().unwrap();
+            assert!(init.status.success());
+            let add = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["remote", "add", "origin", "../origin.git"])
+                .output()
+                .unwrap();
+            assert!(add.status.success());
+        }
+        let key_a = project_key(&repo_a).expect("repo a has a project key");
+        let key_b = project_key(&repo_b).expect("repo b has a project key");
+        assert_eq!(key_a, key_b, "repos sharing one relative origin must share a key, got {key_a} vs {key_b}");
+        // The collapsed path names the shared origin, not a per-repo `a/../` fragment.
+        assert!(!key_a.contains(".."), "key must not retain an uncollapsed `..`, got: {key_a}");
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_components_lexically() {
+        // `..` pops the last normal component; the root is preserved.
+        assert_eq!(normalize_path(Path::new("/work/a/../origin.git")), PathBuf::from("/work/origin.git"));
+        // `.` is dropped; `..` pops the immediately-preceding normal component (`b`).
+        assert_eq!(normalize_path(Path::new("/work/a/./b/../c")), PathBuf::from("/work/a/c"));
+        // A leading/escaping `..` is kept verbatim (cannot pop the root).
+        assert_eq!(normalize_path(Path::new("/../origin.git")), PathBuf::from("/../origin.git"));
+        assert_eq!(normalize_path(Path::new("../rel/repo.git")), PathBuf::from("../rel/repo.git"));
+        // A path with nothing to collapse is returned unchanged.
+        assert_eq!(normalize_path(Path::new("/srv/repo.git")), PathBuf::from("/srv/repo.git"));
     }
 
     #[test]

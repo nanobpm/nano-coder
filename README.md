@@ -839,7 +839,8 @@ Storage mirrors the session log: append-oriented JSONL, one entry per line, unde
 `<memory_dir>/user.jsonl` and `<memory_dir>/projects/<key>.jsonl` (default `<data>/memory`,
 next to `sessions/`). Each entry has an id, the text, created and last-used dates, the source
 session, and optional evidence (a file path or command). Search is a case-insensitive regex
-over the text, as in `history_search` - no embeddings or vector store.
+over the text and the optional evidence, as in `history_search` - no embeddings or vector
+store.
 
 **Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
 `memory_search(pattern, scope?)`, `memory_forget(id)`.

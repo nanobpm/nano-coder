@@ -1004,12 +1004,24 @@ async fn run_compaction(
     }
 }
 
+/// Parse the id from `/memory forget <id>` args, requiring a token boundary
+/// after `forget`: the next character must be whitespace (or end of args).
+/// Without it, `/memory forgetmem-…` would strip the `forget` prefix and treat
+/// `mem-…` as an id, deleting an entry instead of reporting an unknown command
+/// (Copilot finding, src/main.rs). Returns `None` when `args` is not a
+/// `forget` request at all, so the caller falls through to the
+/// unknown-argument branch.
+fn parse_forget_id(args: &str) -> Option<&str> {
+    let rest = args.strip_prefix("forget")?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) { Some(rest.trim()) } else { None }
+}
+
 /// `/memory` (list) and `/memory forget <id>`.
 fn memory_command(agent: &mut Agent, args: &str) -> String {
     if agent.memory().is_none() {
         return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
     }
-    if let Some(id) = args.strip_prefix("forget").map(str::trim) {
+    if let Some(id) = parse_forget_id(args) {
         if id.is_empty() {
             return "Usage: /memory forget <id>".to_string();
         }
@@ -2038,5 +2050,23 @@ mod tests {
         // Blank input is a no-op on both paths.
         assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
+    }
+
+    #[test]
+    fn forget_id_requires_a_token_boundary() {
+        // A well-formed `forget` request yields the trimmed id.
+        assert_eq!(parse_forget_id("forget mem-abc"), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget  mem-abc  "), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget\tmem-abc"), Some("mem-abc"));
+        // `forget` alone is a forget request with an empty id (usage error).
+        assert_eq!(parse_forget_id("forget"), Some(""));
+        // No token boundary: `forgetmem-…` is NOT a forget request, so the
+        // caller reports an unknown argument instead of deleting `mem-…`
+        // (Copilot finding, src/main.rs).
+        assert_eq!(parse_forget_id("forgetmem-abc"), None);
+        assert_eq!(parse_forget_id("forgetful"), None);
+        // Unrelated args are not forget requests either.
+        assert_eq!(parse_forget_id(""), None);
+        assert_eq!(parse_forget_id("list"), None);
     }
 }
