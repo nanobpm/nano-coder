@@ -309,8 +309,13 @@ impl Store {
         let mut hits: Vec<(Scope, Entry)> = Vec::new();
         let mut total = 0;
         // Loaded scope files retained for the deferred `last_used` bump (only
-        // populated on a mutating search).
-        let mut loaded: Vec<(Scope, std::path::PathBuf, ScopeFile)> = Vec::new();
+        // populated on a mutating search). Each entry keeps its `FileLock`
+        // guard alive so the scope stays locked from the load all the way
+        // through the deferred write below — dropping it at the end of the
+        // `for scope` iteration would let a concurrent `save`/`forget`
+        // complete in between and have its changes silently overwritten by
+        // the stale snapshot held here.
+        let mut loaded: Vec<(Scope, std::path::PathBuf, ScopeFile, Option<FileLock>)> = Vec::new();
         for scope in scopes {
             // A missing project scope (outside a repo) is not an error here.
             let path = match self.path(scope) {
@@ -320,8 +325,10 @@ impl Store {
             };
             // A mutating search bumps last_used, so hold the scope lock across
             // the load-modify-write to serialize with other processes; a
-            // read-only search neither locks nor prunes nor writes.
-            let _lock = if read_only { None } else { Some(FileLock::acquire(&path)?) };
+            // read-only search neither locks nor prunes nor writes. The guard
+            // is moved into `loaded` (not dropped here) so it stays held until
+            // the deferred write below completes.
+            let lock = if read_only { None } else { Some(FileLock::acquire(&path)?) };
             // A missing project scope (outside a repo) was already skipped by
             // `self.path` above, and a missing *file* reads as an empty store,
             // so a failure here is a real permission/I/O/pruning error — even
@@ -344,10 +351,11 @@ impl Store {
                     hits.push((scope, entry.clone()));
                 }
             }
-            // Keep the loaded entries so the `last_used` bump can be applied to
-            // exactly the returned hits once the global MRU ranking is known.
+            // Keep the loaded entries (and their lock guard) so the `last_used`
+            // bump can be applied to exactly the returned hits once the global
+            // MRU ranking is known.
             if !read_only {
-                loaded.push((scope, path, file));
+                loaded.push((scope, path, file, lock));
             }
         }
         if hits.is_empty() {
@@ -365,7 +373,7 @@ impl Store {
             for (scope, entry) in hits.iter().take(limit) {
                 per_scope.entry(*scope).or_default().insert(entry.id.clone());
             }
-            for (scope, path, mut file) in loaded {
+            for (scope, path, mut file, lock) in loaded {
                 let mut bumped = false;
                 if let Some(ids) = per_scope.get(&scope) {
                     for entry in &mut file.entries {
@@ -378,6 +386,11 @@ impl Store {
                 if bumped {
                     write_all(&path, &file.entries, &file.unknown)?;
                 }
+                // Keep the scope locked until after its write completes: the
+                // guard is dropped (releasing the lock) only here, at the end
+                // of the iteration, so no concurrent `save`/`forget` can
+                // interleave between the load and this write.
+                drop(lock);
             }
         }
         let mut lines: Vec<String> = Vec::new();
@@ -873,8 +886,11 @@ fn dos_drive_prefix(s: &str) -> bool {
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
-/// A git remote URL reduced to a stable `host/path` label, dropping the scheme,
-/// any credentials and a trailing `.git`.
+/// A git remote URL reduced to a stable `host/path` label, dropping the scheme
+/// and any credentials. A trailing `.git` is deliberately *preserved*: it is
+/// part of the repository identity, and stripping it is non-injective —
+/// `host/org/repo` and `host/org/repo.git` can be two distinct repositories
+/// that would otherwise collapse onto one project key and share a memory file.
 fn normalize_remote(url: &str) -> String {
     let s = url.trim();
     // Recognise any syntactically valid URI scheme (`scheme://…`), not just a
