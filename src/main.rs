@@ -682,8 +682,16 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// clipboard/title writes) through the interactive picker. Dropping C0/C1
 /// control characters — including ESC (0x1B), which begins every such sequence —
 /// neutralises them while leaving ordinary printable text intact.
+///
+/// The Unicode line/paragraph separators U+2028/U+2029 are dropped too: they are
+/// not `char::is_control`, but terminals and this crate's own memory guards
+/// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
+/// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
+/// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars()
+        .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
+        .collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -2028,6 +2036,17 @@ mod tests {
         assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
         assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
         assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_unicode_line_separators() {
+        // U+2028/U+2029 are not `char::is_control`, but a terminal folds them as
+        // line breaks, so a hand-edited `/memory` id/text/evidence value could
+        // otherwise render a forged extra row (Copilot finding, src/main.rs).
+        assert_eq!(sanitize_terminal_text("mem-evil\u{2028}forged row"), "mem-evilforged row");
+        assert_eq!(sanitize_terminal_text("head\u{2029}forged row"), "headforged row");
+        // Ordinary printable text (including non-ASCII) is left intact.
+        assert_eq!(sanitize_terminal_text("café — label"), "café — label");
     }
 
     #[test]
