@@ -769,13 +769,35 @@ impl FileLock {
 
         #[cfg(not(unix))]
         {
-            // Portable fallback: lock-file creation as the mutex. A crash can
-            // leave the file behind; it is cleared by removing the stale
-            // `*.jsonl.lock` file.
+            // Portable fallback: lock-file creation as the mutex. A crash while
+            // holding the lock would otherwise leave the `create_new` file
+            // behind, so every later save/search/forget sees `AlreadyExists`,
+            // times out, and the scope is disabled until a user manually deletes
+            // the file (Copilot finding, src/memory.rs). Recover such a *stale*
+            // lock by age: a live holder only ever keeps the lock for a
+            // sub-second read-modify-write (far below the acquire budget), so a
+            // lock file whose mtime is older than `STALE_AFTER` is almost
+            // certainly orphaned by a crash. Reclaim it with an atomic rename so
+            // two racing waiters cannot both steal the same file — only the one
+            // whose rename wins removes it and retries.
+            const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
             loop {
                 match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
                     Ok(_) => return Ok(FileLock { path: lock }),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // Reclaim a lock left behind by a crashed holder.
+                        if let Ok(meta) = std::fs::metadata(&lock)
+                            && let Ok(modified) = meta.modified()
+                            && modified.elapsed().map(|age| age >= STALE_AFTER).unwrap_or(false)
+                        {
+                            let steal = PathBuf::from(format!("{}.stale.{}", lock.display(), std::process::id()));
+                            if std::fs::rename(&lock, &steal).is_ok() {
+                                let _ = std::fs::remove_file(&steal);
+                            }
+                            // Loop back and retry create_new immediately (a
+                            // racing waiter's rename simply failed harmlessly).
+                            continue;
+                        }
                         if std::time::Instant::now() >= deadline {
                             bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
                         }
@@ -957,10 +979,44 @@ fn sanitize_uri_query(query: &str) -> String {
         .filter(|param| !param.is_empty())
         .filter(|param| {
             let key = param.split('=').next().unwrap_or("");
-            !is_credential_query_key(key)
+            // Classify the *percent-decoded* key. A server decodes the query
+            // before reading it, so `access_%74oken` is really `access_token`
+            // and must be treated as a credential even though its raw spelling
+            // (`access74oken` after separator-stripping) hides the `token`
+            // needle and would otherwise let the secret leak into the key,
+            // prompt label and filename (Copilot finding, src/memory.rs). Only
+            // classification uses the decoded form; the surviving non-credential
+            // params below are emitted with their original spelling, so a param
+            // that merely *selects* the repository keeps its exact identity.
+            !is_credential_query_key(&percent_decode_lossy(key))
         })
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-decode a URI component for credential *classification only* (never
+/// for the identity key, which keeps the original spelling). Invalid or
+/// truncated `%`-escapes are passed through verbatim — a best-effort, lenient
+/// decode mirroring how servers degrade — and the decoded bytes are read as
+/// UTF-8 lossily since query keys are ASCII in practice.
+fn percent_decode_lossy(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a query-parameter name denotes a credential whose value must not be
@@ -1344,11 +1400,25 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
                     continue;
                 }
                 let lower = w.to_ascii_lowercase();
-                // Filler: articles, possessives and the value connective `as`
-                // (`stored as hunter2`) are lead-in words, not the value itself.
+                // Value-introducing connectives (`stored as hunter2`,
+                // `password = swordfish`) announce that the *next* token is the
+                // value itself, not a location — so they cancel any location
+                // mode a preceding verb set. Without this, `database password is
+                // stored as swordfish` is accepted: `stored` sets `in_location`,
+                // `as` was mere filler, and an all-alphabetic secret escapes the
+                // digit-requiring `is_secret_shaped` location check. Clearing
+                // `in_location` makes the following token a direct value, so a
+                // plaintext password after `stored as`/`= ` is still rejected
+                // (Copilot finding, src/memory.rs).
+                if matches!(lower.as_str(), "as" | "=" | "equals" | "equal") {
+                    in_location = false;
+                    continue;
+                }
+                // Filler: articles and possessives are lead-in words, not the
+                // value itself.
                 if matches!(
                     lower.as_str(),
-                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its" | "as"
+                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
                 ) {
                     continue;
                 }
@@ -1664,6 +1734,14 @@ mod tests {
         assert!(store.save(Scope::User, "database password is stored as hunter2", None, None).is_err());
         assert!(store.save(Scope::User, "the token is in abc123", None, None).is_err());
         assert!(store.save(Scope::User, "api key is kept as s3cr3tvalue", None, None).is_err());
+        // A `stored as <value>` connective introduces the *value*, so an
+        // all-alphabetic plaintext secret (no digit) is still rejected even
+        // though it would pass the digit-requiring location heuristic — while a
+        // genuine `stored in <place>` location stays allowed (Copilot finding,
+        // src/memory.rs).
+        assert!(store.save(Scope::User, "database password is stored as swordfish", None, None).is_err());
+        assert!(store.save(Scope::User, "the secret is saved as mypassword", None, None).is_err());
+        assert!(store.save(Scope::User, "the password is stored in the vault", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
@@ -2079,6 +2157,13 @@ mod tests {
         // credential-valued parameter is dropped so it never leaks into the key.
         assert_eq!(
             normalize_remote("https://github.com/nanobpm/nano-coder.git?access_token=secret"),
+            "https://github.com/nanobpm/nano-coder.git"
+        );
+        // A percent-encoded credential key is decoded before classification, so
+        // `access_%74oken` (→ `access_token` on the server) is still dropped and
+        // never leaks its value into the key (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://github.com/nanobpm/nano-coder.git?access_%74oken=secret"),
             "https://github.com/nanobpm/nano-coder.git"
         );
         // …but a query that *selects* the repository is non-secret identity and
