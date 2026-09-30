@@ -1007,6 +1007,13 @@ enum Esc {
     /// An unmodified Enter reported as an escape sequence (kitty keyboard
     /// protocol `CSI 13 u`): submit the line, like a bare CR would.
     Submit,
+    /// Esc reported as an escape sequence (kitty keyboard protocol
+    /// `CSI 27 u`): handled like a lone Esc byte.
+    Escape,
+    /// Ctrl+letter reported as an escape sequence (kitty `CSI 99;5u`,
+    /// modifyOtherKeys `CSI 27;5;99~`): the control byte legacy mode would
+    /// have sent (here 0x03, Ctrl-C), to be handled as if it had been typed.
+    Control(u8),
     /// Something else (function keys, releases, motion, mouse events, unknown
     /// sequences).
     Ignored,
@@ -1229,6 +1236,11 @@ impl LineReader {
                                         view.insert("\n");
                                     }
                                     Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
+                                    Esc::Escape if menu => shared.lock().unwrap().hide_menu(),
+                                    Esc::Escape => send(Key::Escape),
+                                    // Re-read as the byte legacy mode sends,
+                                    // so every control key keeps one handler.
+                                    Esc::Control(byte) => self.pending.push_front(byte),
                                     Esc::Ignored => {}
                                 }
                             }
@@ -1325,27 +1337,65 @@ fn parse_escape(seq: &[u8]) -> Esc {
                 _ => Esc::Ignored,
             }
         }
-        // modifyOtherKeys / kitty: CSI 27 ; modifier ; 13 ~ is Enter with a
-        // modifier. Ctrl (5) and Cmd/Super (9) insert a newline.
+        // modifyOtherKeys: CSI 27 ; modifier ; key ~ is a key with a modifier
+        // (e.g. Ctrl-Enter `27;5;13~`).
         (b'~', params) if params.starts_with("27;") => {
-            let mut parts = params.split(';');
-            let (_, modifier, key) = (parts.next(), parts.next(), parts.next());
-            match (modifier.and_then(|m| m.parse::<u16>().ok()), key) {
-                (Some(5 | 9), Some("13")) => Esc::Newline,
-                _ => Esc::Ignored,
+            let mut parts = params.split(';').skip(1);
+            let modifier = parts.next().and_then(|m| m.parse().ok()).unwrap_or(1);
+            match parts.next().and_then(|k| k.parse().ok()) {
+                Some(key) => modified_key(key, modifier),
+                None => Esc::Ignored,
             }
         }
-        // kitty keyboard protocol: CSI 13 ; modifier u.
+        // kitty keyboard protocol: CSI key[:alternates] ; modifier[:event] u.
+        // With "disambiguate escape codes" on, Esc and Ctrl/Alt+key arrive
+        // this way instead of as the legacy bytes.
         (b'u', params) => {
             let mut parts = params.split(';');
-            match (parts.next().and_then(|k| k.parse::<u16>().ok()), parts.next().and_then(|m| m.parse::<u16>().ok())) {
-                (Some(13), Some(m)) if m & 0b100 != 0 || m & 0b1000 != 0 => Esc::Newline,
-                // Unmodified Enter (modifier absent or the bare `1`): legacy
-                // mode would deliver a CR, so submit rather than ignore it.
-                (Some(13), None | Some(1)) => Esc::Submit,
-                _ => Esc::Ignored,
+            let key = parts.next().and_then(|k| k.split(':').next()?.parse().ok());
+            let mut modifier = parts.next().unwrap_or("1").split(':');
+            let bits = modifier.next().and_then(|m| m.parse().ok()).unwrap_or(1);
+            // Event type 3 is a key release (only reported when asked for).
+            if modifier.next() == Some("3") {
+                return Esc::Ignored;
+            }
+            match key {
+                Some(key) => modified_key(key, bits),
+                None => Esc::Ignored,
             }
         }
+        _ => Esc::Ignored,
+    }
+}
+
+/// A key reported with its code and xterm modifier parameter (1 + shift=1,
+/// alt=2, ctrl=4, super=8), as the legacy terminal input it stands for.
+fn modified_key(key: u32, modifier: u16) -> Esc {
+    const SHIFT: u16 = 1;
+    const ALT: u16 = 2;
+    const CTRL: u16 = 4;
+    const SUPER: u16 = 8;
+    // Kitty reports Caps Lock (64) and Num Lock (128) as always-present state
+    // bits, not held modifiers; mask them off so they don't defeat the exact
+    // modifier comparisons below.
+    const CAPS_LOCK: u16 = 64;
+    const NUM_LOCK: u16 = 128;
+    let bits = modifier.saturating_sub(1) & !(CAPS_LOCK | NUM_LOCK);
+    match key {
+        // Ctrl- or Cmd-Enter: newline (queue during a turn). Unmodified Enter
+        // submits, as the CR legacy mode sends would.
+        13 if bits & (CTRL | SUPER) != 0 => Esc::Newline,
+        13 if bits == 0 => Esc::Submit,
+        27 if bits & !SHIFT == 0 => Esc::Escape,
+        // Ctrl+letter (Shift ignored, as legacy terminals do): its control
+        // byte, e.g. Ctrl-C → 0x03. Accept both ASCII letter cases: Shift is
+        // ignored, but modifyOtherKeys reports the shifted character code, so
+        // Ctrl+Shift+W arrives as uppercase `W` (`CSI 27;6;87~`). `key & 0x1f`
+        // yields the same control byte for either case.
+        0x41..=0x5a | 0x61..=0x7a if bits & !SHIFT == CTRL => Esc::Control((key & 0x1f) as u8),
+        // Alt-b / Alt-f: readline word jumps.
+        0x62 if bits == ALT => Esc::WordLeft,
+        0x66 if bits == ALT => Esc::WordRight,
         _ => Esc::Ignored,
     }
 }
@@ -2012,6 +2062,76 @@ mod tests {
     }
 
     #[test]
+    fn parses_kitty_and_modify_other_keys_control_keys() {
+        // kitty "disambiguate escape codes" reports Esc and Ctrl/Alt+key as CSI u.
+        assert!(matches!(parse_escape(b"\x1b[27u"), Esc::Escape), "Esc");
+        assert!(matches!(parse_escape(b"\x1b[27;1u"), Esc::Escape), "Esc, explicit no modifier");
+        assert!(matches!(parse_escape(b"\x1b[99;5u"), Esc::Control(0x03)), "Ctrl-C");
+        assert!(matches!(parse_escape(b"\x1b[99;6u"), Esc::Control(0x03)), "Ctrl-Shift-C");
+        assert!(matches!(parse_escape(b"\x1b[111;5u"), Esc::Control(0x0f)), "Ctrl-O");
+        assert!(matches!(parse_escape(b"\x1b[97;5u"), Esc::Control(0x01)), "Ctrl-A");
+        assert!(matches!(parse_escape(b"\x1b[100;5u"), Esc::Control(0x04)), "Ctrl-D");
+        assert!(matches!(parse_escape(b"\x1b[99;5:1u"), Esc::Control(0x03)), "press event");
+        assert!(matches!(parse_escape(b"\x1b[99;5:3u"), Esc::Ignored), "release is ignored");
+        assert!(matches!(parse_escape(b"\x1b[99:67;5u"), Esc::Control(0x03)), "alternate key codes");
+        assert!(matches!(parse_escape(b"\x1b[98;3u"), Esc::WordLeft), "Alt-b");
+        assert!(matches!(parse_escape(b"\x1b[102;3u"), Esc::WordRight), "Alt-f");
+        assert!(matches!(parse_escape(b"\x1b[99;7u"), Esc::Ignored), "Ctrl-Alt-C is not Ctrl-C");
+        assert!(matches!(parse_escape(b"\x1b[99;9u"), Esc::Ignored), "Cmd-C is the terminal's copy");
+        // modifyOtherKeys: CSI 27 ; modifier ; key ~
+        assert!(matches!(parse_escape(b"\x1b[27;5;99~"), Esc::Control(0x03)), "modifyOtherKeys Ctrl-C");
+        // modifyOtherKeys reports the shifted (uppercase) code for Ctrl+Shift+letter.
+        assert!(matches!(parse_escape(b"\x1b[27;6;87~"), Esc::Control(0x17)), "modifyOtherKeys Ctrl+Shift+W");
+        assert!(matches!(parse_escape(b"\x1b[87;6u"), Esc::Control(0x17)), "kitty Ctrl+Shift+W");
+    }
+
+    /// Keys `read_line` sends while reading `bytes`, then its result.
+    fn keys_sent(view: &SharedView, bytes: &[u8]) -> Vec<String> {
+        let sent = Mutex::new(Vec::new());
+        let mut reader = LineReader::default();
+        reader.pending.extend(bytes.iter());
+        let key = reader.read_line(view, &|key| sent.lock().unwrap().push(key_name(&key)));
+        let mut sent = sent.into_inner().unwrap();
+        sent.push(format!("-> {}", key_name(&key)));
+        sent
+    }
+
+    fn key_name(key: &Key) -> String {
+        match key {
+            Key::Line(line) => format!("line {line:?}"),
+            Key::Queue(line) => format!("queue {line:?}"),
+            Key::Eof => "eof".into(),
+            Key::Interrupt => "interrupt".into(),
+            Key::ToggleThinking => "toggle-thinking".into(),
+            Key::Escape => "escape".into(),
+            Key::CycleMode => "cycle-mode".into(),
+        }
+    }
+
+    #[test]
+    fn kitty_encoded_control_keys_act_like_legacy_bytes() {
+        let context = Arc::new(Mutex::new(EditContext::default()));
+        let frame = EditView::shared(None, context.clone());
+        frame.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+        let legacy = EditView::shared(None, context);
+        for view in [&frame, &legacy] {
+            view.lock().unwrap().mode = EditMode::Turn;
+            // Ctrl-C clears the line and interrupts; Esc and Ctrl-O are sent.
+            assert_eq!(
+                keys_sent(view, b"abc\x1b[99;5u\x1b[27u\x1b[111;5uok\r"),
+                ["interrupt", "escape", "toggle-thinking", "-> line \"ok\\n\""]
+            );
+            // Ctrl-D on an empty line is end of input, as the legacy byte is.
+            assert_eq!(keys_sent(view, b"\x1b[100;5u"), ["-> eof"]);
+            // Ctrl-A / Ctrl-U / Ctrl-W edit the line.
+            assert_eq!(keys_sent(view, b"one two\x1b[119;5u\x1b[97;5uX\r"), ["-> line \"Xone \\n\""]);
+        }
+        // At the prompt with the command menu open, Esc closes the menu first.
+        frame.lock().unwrap().mode = EditMode::Prompt;
+        assert_eq!(keys_sent(&frame, b"/he\x1b[27u\x1b[27u\x1b[117;5u\r"), ["escape", "-> line \"\\n\""]);
+    }
+
+    #[test]
     fn parses_ctrl_and_cmd_enter_as_a_newline() {
         // modifyOtherKeys: ESC [ 27 ; modifier ; 13 ~
         assert!(matches!(parse_escape(b"\x1b[27;5;13~"), Esc::Newline), "Ctrl-Enter");
@@ -2023,6 +2143,26 @@ mod tests {
         // Unmodified kitty Enter submits rather than being ignored.
         assert!(matches!(parse_escape(b"\x1b[13u"), Esc::Submit), "kitty Enter (no modifier) submits");
         assert!(matches!(parse_escape(b"\x1b[13;1u"), Esc::Submit), "kitty Enter (modifier 1) submits");
+    }
+
+    #[test]
+    fn kitty_lock_state_bits_are_ignored() {
+        // Kitty adds Caps Lock (64) and Num Lock (128) as always-present state
+        // bits in the modifier field; they must not defeat the modifier
+        // comparisons. modifier = 1 + bits, so Caps Lock alone is 65, Num Lock
+        // alone is 129, and both together are 193.
+        assert!(matches!(parse_escape(b"\x1b[27;65u"), Esc::Escape), "Esc with Caps Lock");
+        assert!(matches!(parse_escape(b"\x1b[27;129u"), Esc::Escape), "Esc with Num Lock");
+        assert!(matches!(parse_escape(b"\x1b[13;65u"), Esc::Submit), "Enter with Caps Lock submits");
+        assert!(matches!(parse_escape(b"\x1b[13;193u"), Esc::Submit), "Enter with both locks submits");
+        // Ctrl-C is modifier 5 (1 + ctrl=4); with Caps Lock it is 69, with both
+        // locks 197. Held Ctrl must still be honoured.
+        assert!(matches!(parse_escape(b"\x1b[99;69u"), Esc::Control(0x03)), "Ctrl-C with Caps Lock");
+        assert!(matches!(parse_escape(b"\x1b[99;197u"), Esc::Control(0x03)), "Ctrl-C with both locks");
+        // Ctrl-Enter is modifier 5; with Caps Lock 69 it stays a newline.
+        assert!(matches!(parse_escape(b"\x1b[13;69u"), Esc::Newline), "Ctrl-Enter with Caps Lock");
+        // Alt-b is modifier 3 (1 + alt=2); with Num Lock it is 131.
+        assert!(matches!(parse_escape(b"\x1b[98;131u"), Esc::WordLeft), "Alt-b with Num Lock");
     }
 
     #[test]
