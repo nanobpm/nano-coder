@@ -1527,7 +1527,15 @@ async fn main() -> Result<()> {
             println!("{}\n", banner.join("\n"));
         }
         let recents_path = recents::default_path();
-        let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
+        let recents: recents::SharedRecents = {
+            let mut loaded = recents::load(&recents_path);
+            // Migrate a legacy file recorded before entries were canonicalized,
+            // so a raw default-provider spec (`meta-llama/llama-4`) is not
+            // hidden by the picker's provider filter on the first `/model`.
+            let (user, default_provider) = agent.config().effective_providers();
+            loaded.canonicalize(&providers::effective_providers(&user), &default_provider);
+            Arc::new(Mutex::new(loaded))
+        };
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),

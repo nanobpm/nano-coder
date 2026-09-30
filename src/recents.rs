@@ -21,6 +21,15 @@ pub const MAX_RECENTS: usize = 8;
 /// while a default-provider model keeps a configured prefix.
 pub fn canonical(spec: &str, all: &BTreeMap<String, ProviderConfig>, default_provider: &str) -> String {
     let (provider, model) = providers::parse_model_spec(spec, all, default_provider);
+    // A provider-only spec (`work`) is resolved to that provider's configured
+    // default model (`work/foo`) while the provider metadata is still
+    // available. Storing the slash form lets a later removal of `work` be told
+    // apart from a bare model literally named `work`: the `work/` prefix stops
+    // resolving so the entry is skipped, instead of being offered as a model on
+    // the default provider. A provider with no default model stays bare.
+    let model = model
+        .map(str::to_string)
+        .or_else(|| all.get(provider).and_then(|p| p.default_model.clone()).filter(|m| !m.is_empty()));
     match model {
         Some(model) => format!("{provider}/{model}"),
         None => provider.to_string(),
@@ -50,6 +59,23 @@ impl Recents {
         }
         self.models.retain(|m| m != spec);
         self.models.insert(0, spec.to_string());
+        self.models.truncate(MAX_RECENTS);
+    }
+
+    /// Migrate every stored entry to canonical `provider/model` form (see
+    /// [`canonical`]). A `recent-models.json` written by a released version
+    /// recorded the raw model spec, so a default-provider entry like
+    /// `meta-llama/llama-4` would be mistaken for a `meta-llama` provider and
+    /// hidden by the picker's filter after upgrade. Rewriting the loaded list
+    /// once — de-duplicating any entries that now collapse to the same spec,
+    /// most-recent-first — preserves the existing MRU this feature reuses.
+    pub fn canonicalize(&mut self, all: &BTreeMap<String, ProviderConfig>, default_provider: &str) {
+        let mut seen = std::collections::HashSet::new();
+        self.models = std::mem::take(&mut self.models)
+            .into_iter()
+            .map(|spec| canonical(&spec, all, default_provider))
+            .filter(|spec| !spec.is_empty() && seen.insert(spec.clone()))
+            .collect();
         self.models.truncate(MAX_RECENTS);
     }
 }
@@ -92,6 +118,42 @@ mod tests {
         assert_eq!(canonical("openai/gpt-4o", &all, "openai"), "openai/gpt-4o");
         // A bare provider name stays as-is (it means "the provider's default model").
         assert_eq!(canonical("ollama", &all, "openai"), "ollama");
+    }
+
+    #[test]
+    fn canonical_expands_a_provider_only_spec_to_its_default_model() {
+        let mut all: BTreeMap<String, ProviderConfig> = BTreeMap::new();
+        all.insert("openai".to_string(), ProviderConfig::default());
+        all.insert(
+            "work".to_string(),
+            ProviderConfig { default_model: Some("foo".to_string()), ..ProviderConfig::default() },
+        );
+        // A provider with a default model is expanded, so a later removal of
+        // `work` is skipped by the filter instead of switching to a `work` model.
+        assert_eq!(canonical("work", &all, "openai"), "work/foo");
+        // A provider without a default model stays bare.
+        assert_eq!(canonical("openai", &all, "work"), "openai");
+    }
+
+    #[test]
+    fn canonicalize_migrates_a_legacy_raw_list() {
+        let all: BTreeMap<String, ProviderConfig> =
+            ["openai", "together"].iter().map(|n| (n.to_string(), ProviderConfig::default())).collect();
+        let mut recents = Recents { models: vec!["meta-llama/llama-4".to_string(), "gpt-4o".to_string()] };
+        recents.canonicalize(&all, "together");
+        // The default-provider slash spec gains its real prefix (so it is no
+        // longer hidden); the bare model gains its default provider.
+        assert_eq!(recents.models(), &["together/meta-llama/llama-4", "together/gpt-4o"]);
+    }
+
+    #[test]
+    fn canonicalize_dedupes_collapsed_entries_keeping_order() {
+        let all: BTreeMap<String, ProviderConfig> =
+            ["openai"].iter().map(|n| (n.to_string(), ProviderConfig::default())).collect();
+        // `gpt-4o` and `openai/gpt-4o` both canonicalize to `openai/gpt-4o`.
+        let mut recents = Recents { models: vec!["gpt-4o".to_string(), "openai/gpt-4o".to_string()] };
+        recents.canonicalize(&all, "openai");
+        assert_eq!(recents.models(), &["openai/gpt-4o"]);
     }
 
     #[test]
