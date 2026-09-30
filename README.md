@@ -356,7 +356,8 @@ Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model pro
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
 Before opening a PR, run `cargo fmt` (style in `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings`
-and `cargo test`; CI checks all three.
+and `cargo test`; CI checks all three. To keep `git blame` past the one-time reformat, run
+`git config blame.ignoreRevsFile .git-blame-ignore-revs` once.
 
 ## Configuration
 
