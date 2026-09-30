@@ -943,6 +943,47 @@ fn strip_uri_password(scheme: Option<&str>, authority: &str) -> String {
     }
 }
 
+/// Redact credential-valued parameters from a URI query while keeping the rest,
+/// so a query that *selects* the repository (`?repo=one`) stays part of the
+/// identity key but a secret (`?access_token=…`) never leaks into the key,
+/// prompt label or on-disk filename — and a rotating token no longer rotates the
+/// key (Copilot finding, src/memory.rs). Credential parameters are dropped
+/// entirely (both key and value): their presence is authentication, not
+/// repository identity, and two URLs differing only in a rotated token denote
+/// the same repository.
+fn sanitize_uri_query(query: &str) -> String {
+    query
+        .split('&')
+        .filter(|param| !param.is_empty())
+        .filter(|param| {
+            let key = param.split('=').next().unwrap_or("");
+            !is_credential_query_key(key)
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Whether a query-parameter name denotes a credential whose value must not be
+/// kept in the identity key. Matching is case-insensitive and ignores `-`/`_`/
+/// `.` separators (`access-token`, `access_token`, `ACCESSTOKEN` all match).
+fn is_credential_query_key(key: &str) -> bool {
+    let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    const NEEDLES: [&str; 11] = [
+        "token",
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "apikey",
+        "accesskey",
+        "auth",
+        "credential",
+        "signature",
+        "oauth",
+    ];
+    NEEDLES.iter().any(|needle| k.contains(needle)) || matches!(k.as_str(), "key" | "sig" | "pat" | "sso")
+}
+
 /// A git remote URL reduced to a stable identity key. A trailing `.git` is
 /// deliberately *preserved*: it is part of the repository identity, and
 /// stripping it is non-injective — `host/org/repo` and `host/org/repo.git` can
@@ -1001,18 +1042,39 @@ fn normalize_remote(url: &str) -> String {
             let authority = &s[..colon];
             !authority.contains(['/', '?', '#']) && !authority.chars().any(char::is_whitespace)
         });
-    // Query strings and fragments can carry a credential
-    // (`repo.git?access_token=…`) that would otherwise leak into the project
-    // label, system prompt and on-disk filename, and would rotate the key on
-    // token refresh — but that is only query/fragment *syntax* on a URI remote.
-    // An SCP-style path has no query/fragment component: everything after
-    // `host:` is the repository path, so `?`/`#` there are ordinary filename
-    // characters. Stripping them would merge distinct origins such as
-    // `git@host:repos/app#blue.git` and `git@host:repos/app#red.git` onto one
-    // project-memory file and disclose one repository's memories in the other.
-    // Strip only on a URI remote; SCP and local paths keep `?`/`#` verbatim
-    // (Copilot finding, src/memory.rs).
-    let s: &str = if uri { s.split(['?', '#']).next().unwrap_or(s) } else { s };
+    // A URI query string can carry a credential (`repo.git?access_token=…`)
+    // that would otherwise leak into the project label, system prompt and
+    // on-disk filename, and would rotate the key on token refresh. But the
+    // query can *also* select the repository (`/git?repo=one` vs `?repo=two`),
+    // so dropping it wholesale would collapse distinct remotes onto one
+    // project-memory scope and disclose one repository's memories in the other.
+    // Instead, redact only the credential-valued parameters and keep the rest,
+    // preserving non-secret query identity (Copilot finding, src/memory.rs). The
+    // fragment carries no repository identity for a git remote, so it is dropped
+    // (matching git, which ignores it). An SCP-style path has no query/fragment
+    // component: everything after `host:` is the repository path, so `?`/`#`
+    // there are ordinary filename characters — stripping them would merge
+    // distinct origins such as `git@host:repos/app#blue.git` and
+    // `git@host:repos/app#red.git`. Act only on a URI remote; SCP and local
+    // paths keep `?`/`#` verbatim (Copilot finding, src/memory.rs).
+    let owned_query;
+    let s: &str = if uri {
+        let no_fragment = s.split('#').next().unwrap_or(s);
+        match no_fragment.split_once('?') {
+            Some((base, query)) => {
+                let sanitized = sanitize_uri_query(query);
+                owned_query = if sanitized.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}?{sanitized}")
+                };
+                &owned_query
+            }
+            None => no_fragment,
+        }
+    } else {
+        s
+    };
     // Strip `user:pass@` credentials from the *authority* only, never from the
     // path. A legal `@` in the path (e.g. `example.com/repo@v2.git`) must be
     // preserved, or unrelated repositories that differ only after an `@` would
@@ -1266,60 +1328,105 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // is your real-key" slips past (Copilot finding, src/memory.rs).
     let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*\s+(?:is|was|are|be)\s+["']?(.+)"#;
     if let Ok(re) = RegexBuilder::new(copular).build() {
-        for caps in re.captures_iter(text) {
-            // Skip leading filler (articles / possessives) to reach the value.
-            let mut value = "";
+        'caps: for caps in re.captures_iter(text) {
+            // Walk *all* the tokens after the copula to find the first
+            // substantive one (the candidate value), skipping filler and
+            // location words along the way. Judging only the first token would
+            // let a location preamble swallow the real secret behind it —
+            // `password is stored as hunter2` leads with the location verb
+            // `stored` (and the value connective `as`), yet still states the
+            // secret `hunter2`; `token is in abc123` leads with the preposition
+            // `in`, yet `abc123` is the value (Copilot finding, src/memory.rs).
+            let mut in_location = false;
             for word in caps[1].split_whitespace() {
-                let w = word.trim_matches(|c: char| ['"', '\''].contains(&c));
+                let w = word.trim_matches(|c: char| ['"', '\'', ',', '.', ';', ':'].contains(&c));
+                if w.is_empty() {
+                    continue;
+                }
+                let lower = w.to_ascii_lowercase();
+                // Filler: articles, possessives and the value connective `as`
+                // (`stored as hunter2`) are lead-in words, not the value itself.
                 if matches!(
-                    w.to_ascii_lowercase().as_str(),
-                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
+                    lower.as_str(),
+                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its" | "as"
                 ) {
                     continue;
                 }
-                value = w;
-                break;
-            }
-            if value.is_empty() {
-                continue;
-            }
-            // Exempt location-only guidance: a value that is itself a
-            // location/preposition word ("stored", "in", "at", "kept", "lives",
-            // "set", "saved", …) means the sentence says *where* the secret is,
-            // not the secret itself.
-            let lower = value.to_ascii_lowercase();
-            if matches!(
-                lower.as_str(),
-                "stored"
-                    | "in"
-                    | "at"
-                    | "kept"
-                    | "lives"
-                    | "set"
-                    | "saved"
-                    | "located"
-                    | "found"
-                    | "defined"
-                    | "configured"
-                    | "managed"
-                    | "read"
-                    | "loaded"
-                    | "fetched"
-                    | "from"
-                    | "under"
-                    | "inside"
-                    | "within"
-                    | "on"
-                    | "via"
-            ) {
-                continue;
-            }
-            if !is_placeholder(value) {
-                return Some("credential statement");
+                // Location/preposition words ("stored", "in", "at", …) put the
+                // sentence into *where-it-lives* mode: the noun that follows is
+                // a location, not the secret — unless it is itself credential-
+                // shaped (see below), which catches `token is in abc123`.
+                if matches!(
+                    lower.as_str(),
+                    "stored"
+                        | "in"
+                        | "at"
+                        | "kept"
+                        | "lives"
+                        | "set"
+                        | "saved"
+                        | "located"
+                        | "found"
+                        | "defined"
+                        | "configured"
+                        | "managed"
+                        | "read"
+                        | "loaded"
+                        | "fetched"
+                        | "from"
+                        | "under"
+                        | "inside"
+                        | "within"
+                        | "into"
+                        | "to"
+                        | "on"
+                        | "via"
+                ) {
+                    in_location = true;
+                    continue;
+                }
+                // First substantive token: the candidate value. A direct
+                // statement (`password is hunter2`, `api key is real-key`) flags
+                // any non-placeholder. Inside a location clause (`stored in X`)
+                // the token is presumed a location name and only flagged when it
+                // is credential-shaped (contains a digit and is long enough), so
+                // benign destinations like `vault`, `~/.config/app/creds` or
+                // `1password` are not blocked while an explicit secret such as
+                // `abc123` still is.
+                let flagged = if is_placeholder(w) {
+                    false
+                } else if in_location {
+                    is_secret_shaped(w) && !is_secret_store_noun(&lower)
+                } else {
+                    true
+                };
+                if flagged {
+                    return Some("credential statement");
+                }
+                continue 'caps;
             }
         }
     }
     None
+}
+
+/// Whether a token inside a *location clause* (`… is stored in X`) looks like an
+/// explicit secret value rather than a destination name. A real inline secret
+/// such as `abc123` or `hunter2` mixes letters and digits and is reasonably
+/// long, whereas benign destinations (`vault`, `~/.config/app/creds`, `s3`,
+/// `env`) are plain words, paths, or short identifiers. This is a heuristic —
+/// the filter is best-effort — so it keeps a low false-positive rate on
+/// location names while still catching the common alphanumeric-secret shape.
+fn is_secret_shaped(value: &str) -> bool {
+    let v = value.trim_matches(|c: char| ['"', '\'', ',', '.', ';', ':'].contains(&c));
+    v.len() >= 6 && v.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Common secret-store / location names that happen to be credential-shaped
+/// (they contain a digit and are long enough for [`is_secret_shaped`]), so they
+/// must stay exempt as destinations rather than being read as inline secrets.
+fn is_secret_store_noun(lower: &str) -> bool {
+    matches!(lower, "1password" | "onepassword" | "route53" | "keepassxc")
 }
 
 /// Whether an assignment's value is an obvious placeholder rather than a real
@@ -1550,6 +1657,13 @@ mod tests {
         assert!(store.save(Scope::User, "the password is stored in ~/.config/app/creds", None, None).is_ok());
         assert!(store.save(Scope::User, "the API key is in vault", None, None).is_ok());
         assert!(store.save(Scope::User, "the token is set in the environment", None, None).is_ok());
+        assert!(store.save(Scope::User, "the password is stored in 1password", None, None).is_ok());
+        // …but a location preamble must not swallow an inline secret behind it:
+        // judging only the first token after the copula let `stored as hunter2`
+        // and `in abc123` slip through (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "database password is stored as hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "the token is in abc123", None, None).is_err());
+        assert!(store.save(Scope::User, "api key is kept as s3cr3tvalue", None, None).is_err());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
@@ -1961,12 +2075,34 @@ mod tests {
         // distinct keys (Copilot finding, src/memory.rs).
         assert_ne!(normalize_remote("https://github.com/org/repo.git"), normalize_remote("https://github.com/org/repo"));
         assert_ne!(normalize_remote("git@host:org/repo.git"), normalize_remote("git@host:org/repo"));
-        // Query strings / fragments (which can carry credentials like
-        // `?access_token=…`) are stripped so they never leak into the key.
+        // A URI query can carry a credential (`?access_token=…`); the
+        // credential-valued parameter is dropped so it never leaks into the key.
         assert_eq!(
             normalize_remote("https://github.com/nanobpm/nano-coder.git?access_token=secret"),
             "https://github.com/nanobpm/nano-coder.git"
         );
+        // …but a query that *selects* the repository is non-secret identity and
+        // is preserved, so distinct query-disambiguated remotes keep distinct
+        // project scopes (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one"),
+            "https://host.example/git?repo=one"
+        );
+        assert_ne!(
+            normalize_remote("https://host.example/git?repo=one"),
+            normalize_remote("https://host.example/git?repo=two")
+        );
+        // A rotating token no longer rotates the key, and a mix of secret and
+        // identity params keeps only the identity one.
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&access_token=a1"),
+            normalize_remote("https://host.example/git?repo=one&access_token=b2")
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&token=xyz"),
+            "https://host.example/git?repo=one"
+        );
+        // The fragment carries no git repository identity and is dropped.
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");
         // A scheme URL's port is preserved, so it cannot collide with an
         // SCP-style path or a URL carrying that number as a path segment

@@ -974,9 +974,17 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
-        // ACP sets the session cwd before this runs; rekey memory so the project
-        // scope (and the index folded into the prompt below) matches it.
-        self.rekey_memory();
+        // ACP sets the session cwd before this runs, so the memory store (keyed
+        // to the launch directory at build time) must be rekeyed to the new
+        // project scope, and that rekeyed index folded into the prompt below.
+        // Build it into a *temporary* rather than committing to `self.memory`
+        // now: in ACP `cwd` has already changed, so a `SessionLog::create` /
+        // initial-append failure below must not leave the live store rekeyed to
+        // the new repository while the old conversation/session are still
+        // active. The staged store is committed with the rest of the live state
+        // only after staging succeeds (failure-atomic staging; Copilot finding,
+        // src/agent.rs).
+        let staged_memory = self.memory.is_some().then(|| Self::build_memory(&self.config));
         // Discover instructions/skills into temporaries so a staging failure
         // below leaves self.instructions/self.skills (and the live system
         // prompt they render) untouched, rather than pairing the old
@@ -984,21 +992,25 @@ impl Agent {
         let (instructions, skills) = self.discover_project_instructions();
         // Render the prompt with the fresh session's default (Normal) mode's
         // writability — a previous Plan mode would otherwise suppress the memory
-        // save guidance. Do *not* reset `control` here: the live session must
-        // stay untouched until staging below succeeds, so a `SessionLog::create`
-        // / initial-append failure cannot leave the current session switched out
-        // of Plan/Auto mode while `new_session` returns an error (failure-
-        // atomic staging; Copilot finding, src/agent.rs).
+        // save guidance — and against the *staged* memory store, so the folded
+        // index reflects the new scope without committing it. Do *not* reset
+        // `control` or `self.memory` here: the live session must stay untouched
+        // until staging below succeeds, so a `SessionLog::create` /
+        // initial-append failure cannot leave the current session switched out
+        // of Plan/Auto mode, or paired with the new repository's memory scope,
+        // while `new_session` returns an error (failure-atomic staging; Copilot
+        // finding, src/agent.rs).
         let default_mode = crate::mode::AgentMode::default();
         let writable = self.config.memory.writable() && default_mode != crate::mode::AgentMode::Plan;
+        let staged_store = staged_memory.as_ref().and_then(|m| m.as_ref());
         let system = Message {
             timestamp: Some(session::now()),
-            ..Message::system(&self.system_prompt_for(&instructions, &skills, writable))
+            ..Message::system(&self.system_prompt_with(&instructions, &skills, writable, staged_store))
         };
         // Stage the new log before mutating any live state so a disk/permission
         // failure leaves the current session (conversation, id, log,
-        // instructions, skills, mode) intact instead of detaching the agent
-        // from it.
+        // instructions, skills, mode, memory scope) intact instead of detaching
+        // the agent from it.
         let session = if self.config.persist_sessions {
             let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
             log.append(&Record::Message(system.clone()))?;
@@ -1007,8 +1019,12 @@ impl Agent {
             None
         };
         // Staging succeeded — now commit all live state, including the mode
-        // reset deferred from above.
+        // reset and the memory rekey deferred from above.
         self.control.set_mode(default_mode);
+        if let Some(memory) = staged_memory {
+            self.memory = memory;
+            self.memory_index_cache = None;
+        }
         self.instructions = instructions;
         self.skills = skills;
         self.conversation = vec![system];
@@ -1208,10 +1224,23 @@ impl Agent {
     /// `control` (e.g. a fresh session's default mode before that mode is
     /// applied). `system_prompt_from` is this with the live writability.
     fn system_prompt_for(&self, instructions: &Option<ProjectInstructions>, skills: &Skills, writable: bool) -> String {
+        self.system_prompt_with(instructions, skills, writable, self.memory.as_ref())
+    }
+
+    /// Like [`Agent::system_prompt_for`] but with an explicit memory store, so a
+    /// caller can fold in a *staged* store that has not yet been committed to
+    /// `self.memory` (e.g. `new_session` renders with the rekeyed store before
+    /// committing it, so a later staging failure cannot leave the store paired
+    /// with the old session — failure-atomic staging).
+    fn system_prompt_with(
+        &self,
+        instructions: &Option<ProjectInstructions>,
+        skills: &Skills,
+        writable: bool,
+        memory: Option<&memory::Store>,
+    ) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        let memory = self
-            .memory
-            .as_ref()
+        let memory = memory
             .filter(|_| self.config.memory.enabled())
             .map(|store| store.index(writable))
             .unwrap_or_default();
