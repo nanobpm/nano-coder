@@ -498,14 +498,15 @@ impl Renderer {
     /// Emit machine-readable output verbatim (e.g. `/trajectory --json`). The
     /// frame transcript wraps `Item::Output` to the terminal width and prefixes
     /// a timestamp, which hard-breaks long JSON string values and puts text
-    /// before the opening `{`, so export modes must bypass it. In frame mode
-    /// the raw text is written at whatever cursor the last render left and can
-    /// scroll or overwrite rows the renderer still believes it owns, so the
-    /// frame is restored immediately afterwards: `invalidate` makes that
-    /// render a full redraw (clearing screen and scrollback), which re-anchors
-    /// the frame at the bottom of the terminal with the export preserved in
-    /// the scrollback above it. The lock is dropped across the print so the
-    /// write can't interleave with a render.
+    /// before the opening `{`, so export modes bypass it. In frame mode the
+    /// raw text is printed once into scrollback and then kept in the
+    /// transcript as an `Item::Raw`, which renders byte-exact: the restore
+    /// render's forced full redraw clears the screen AND scrollback, so an
+    /// export that lives only in scrollback would be erased the moment the
+    /// frame is restored. Keeping it as an item re-emits it inside the frame
+    /// on every redraw — including resizes, which clear scrollback too. The
+    /// lock is dropped across the print so the write can't interleave with a
+    /// render.
     pub fn print_raw(&self, text: &str) {
         if let Some(frame) = &self.frame {
             {
@@ -514,6 +515,7 @@ impl Renderer {
             }
             println!("{text}");
             let mut fs = frame.lock().unwrap();
+            fs.items.push(stamped(Item::Raw(text.to_string())));
             fs.out.invalidate();
             self.frame_render(&mut fs);
             return;
@@ -1152,6 +1154,19 @@ mod tests {
             .filter(|i| matches!(&i.item, Item::Message { role: Role::User, text, .. } if text == "resumed prompt"))
             .count();
         assert_eq!(user, 1);
+    }
+
+    #[test]
+    fn raw_export_is_kept_in_the_frame_transcript() {
+        let r = Renderer::frame_for_test();
+        // A raw export (`/trajectory --json`) is printed to scrollback AND kept
+        // as a transcript item: the restore render's full redraw clears the
+        // screen and scrollback, so an export that lived only in scrollback
+        // would be erased the moment the frame is restored.
+        r.print_raw("{\"session_id\":\"s\"}");
+        let raw =
+            r.frame_items().iter().filter(|i| matches!(&i.item, Item::Raw(t) if t.contains("session_id"))).count();
+        assert_eq!(raw, 1, "the export must survive the frame restore: {:?}", r.frame_items());
     }
 
     #[test]

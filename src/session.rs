@@ -186,7 +186,13 @@ impl SessionLog {
             // Drop a torn trailing record so later appends stay line-aligned.
             file.set_len(committed as u64)?;
         }
-        let lines = bytes[..committed].split(|&b| b == b'\n').filter(|l| !l.is_empty()).count() as u64;
+        // Count PHYSICAL lines, not just nonempty records: `append` writes at
+        // the next physical line, and `decode`/`read_records_at` number
+        // messages by physical line, so a blank line in the log must advance
+        // the counter too — otherwise a reopened session appends at the right
+        // physical line but returns a `#N` that collides with an existing
+        // message and diverges from `history_read`.
+        let lines = bytes[..committed].iter().filter(|&&b| b == b'\n').count() as u64;
         Ok((Self { path, file, lines }, restored))
     }
 
@@ -578,6 +584,18 @@ mod tests {
         let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
         assert_eq!(lines, vec![Some(2), Some(4)], "the assistant message stays on physical line 4");
 
+        // Reopening and appending writes on physical line 5 AND returns #5: the
+        // blank line must advance the append counter too, or the new message's
+        // `#N` collides with the existing assistant (#4) and diverges from
+        // `history_read`.
+        let (mut log, _) = SessionLog::open(dir.path(), "s7").unwrap();
+        let line = log.append(&Record::Message(Message::user("again"))).unwrap();
+        assert_eq!(line, 5, "the append lands on physical line 5, past the blank line 3");
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
+        assert_eq!(lines, vec![Some(2), Some(4), Some(5)]);
+
         // The offline trajectory reader agrees, so `/trajectory` cites the same
         // `#N` as `history_read`.
         let records = read_records(dir.path(), "s7").unwrap();
@@ -588,7 +606,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ids, vec![Some(2), Some(4)]);
+        assert_eq!(ids, vec![Some(2), Some(4), Some(5)]);
     }
 
     #[test]

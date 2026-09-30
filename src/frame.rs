@@ -109,6 +109,13 @@ pub enum Item {
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
     Output(String),
+    /// Verbatim machine-readable output (e.g. `/trajectory --json`), rendered
+    /// byte-exact — no wrapping, sanitizing or width-fitting, which would
+    /// corrupt JSON/Markdown. A raw export is printed once to scrollback and
+    /// then kept here so the frame's restore redraw re-emits it instead of
+    /// erasing it (a full redraw clears the screen and scrollback, so anything
+    /// not in the frame is lost).
+    Raw(String),
 }
 
 /// A transcript item paired with the timestamp prefix captured when it was
@@ -129,6 +136,14 @@ pub struct StampedItem {
 /// timestamps off the stamp is empty, so this collapses to plain `render_item`.
 pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
     let width = width.max(1);
+    // Raw machine-readable output renders byte-exact: no stamp, no wrapping,
+    // no width-fitting — any of those would corrupt JSON/Markdown. Lines wider
+    // than the terminal wrap natively (the same bytes a plain `println!` would
+    // produce), and `sanitize` inside `fit` would strip legitimate escape
+    // sequences from the export, so this arm must bypass them both.
+    if let Item::Raw(text) = &si.item {
+        return text.split('\n').map(str::to_string).collect();
+    }
     let stamp_w = visible_width(&si.stamp);
     let inner = width.saturating_sub(stamp_w).max(1);
     let pad = " ".repeat(stamp_w);
@@ -177,6 +192,10 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
         Item::Plan(plan) => plan_lines(plan, width),
         Item::Note(text) => wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect(),
         Item::Output(text) => wrap_block(text, width),
+        // Normally rendered by the dedicated arm in `render_stamped` (which
+        // also skips the timestamp); this keeps a direct `render_item` call
+        // byte-exact too.
+        Item::Raw(text) => text.split('\n').map(str::to_string).collect(),
     }
 }
 
@@ -905,6 +924,19 @@ mod tests {
         // A grown frame differs at the first extra line.
         let c = vec!["one".into(), "two".into(), "three".into(), "four".into()];
         assert_eq!(first_diff(&a, &c), Some(3));
+    }
+
+    #[test]
+    fn raw_items_render_byte_exact() {
+        // A raw export must survive the frame verbatim: no timestamp prefix,
+        // no wrapping, no width-fitting, no sanitizing — any of those would
+        // corrupt JSON/Markdown.
+        let json = "{\n  \"session_id\": \"s\",\n  \"long\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}";
+        let items = vec![StampedItem { stamp: format!("{DIM}12:34:56{RESET} "), item: Item::Raw(json.to_string()) }];
+        let lines = transcript_lines(&items, 20);
+        assert_eq!(lines, json.split('\n').collect::<Vec<_>>(), "raw lines must be byte-exact");
+        // `render_item` direct agrees (no stamp path).
+        assert_eq!(render_item(&Item::Raw(json.to_string()), 20), lines);
     }
 
     #[test]

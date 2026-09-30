@@ -192,11 +192,15 @@ impl Turn {
         // The one row that is NOT a request is the final-answer row the agent
         // itself appends after `report_outcome` (`Message::assistant(&response)`
         // in agent.rs): it is the turn's LAST assistant row, carries no
-        // usage/duration, and its text is the persisted `TurnEnd.response`
-        // verbatim. Logs written before per-request metrics existed have no
-        // usage/duration on ANY row; there every assistant/think row is a real
-        // request, so only that specifically identifiable synthetic row is
-        // excluded — otherwise a completed legacy turn would summarize as
+        // usage/duration, its text is the persisted `TurnEnd.response`
+        // verbatim, AND the turn has a recorded outcome — `report_outcome`
+        // always records one, so without it the matching last row is an
+        // ordinary final response (`TurnEnd.response` is the turn's real
+        // response for every completed turn, outcome or not). Logs written
+        // before per-request metrics existed have no usage/duration on ANY
+        // row; there every assistant/think row is a real request, so only
+        // that specifically identifiable synthetic row is excluded —
+        // otherwise a completed legacy turn would summarize as
         // `(no activity)`.
         let any_metrics = self.rows.iter().any(|r| {
             matches!(r.kind, RowKind::Assistant | RowKind::Think) && (r.usage.is_some() || r.duration_ms.is_some())
@@ -213,6 +217,7 @@ impl Turn {
                 RowKind::Assistant => {
                     let synthetic_answer = Some(i) == last_assistant
                         && self.response.is_some()
+                        && self.outcome.is_some()
                         && r.usage.is_none()
                         && r.duration_ms.is_none()
                         && self.response.as_deref() == Some(r.text.as_str());
@@ -845,6 +850,33 @@ mod tests {
                 input_id: "i".into(),
                 response: "done".into(),
                 outcome: Some(Outcome { status: crate::goal::Status::Completed, summary: "done".into() }),
+                history_calls: 0,
+                recorded_at: now(),
+            },
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let turn = &traj.turns[0];
+        assert!(turn.summary().contains("1 call"), "{}", turn.summary());
+        assert!(!turn.summary().contains("no activity"), "{}", turn.summary());
+    }
+
+    #[test]
+    fn outcome_free_turn_counts_its_real_final_response() {
+        // Every completed turn copies its real assistant response into
+        // `TurnEnd.response`, outcome or not — so the response-text match alone
+        // must NOT mark the last assistant row synthetic. A legacy (metrics-free)
+        // one-call turn with no recorded outcome is one real request, not
+        // `(no activity)`.
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            // The one real request: no usage, no duration_ms (legacy log).
+            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::TurnEnd {
+                input_id: "i".into(),
+                response: "done".into(),
+                outcome: None,
                 history_calls: 0,
                 recorded_at: now(),
             },
