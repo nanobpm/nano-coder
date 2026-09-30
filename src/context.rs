@@ -90,6 +90,10 @@ pub struct ContextStats {
     pub history_reads: u32,
     /// Auto-compaction threshold as a fraction of the window (None = off).
     pub auto_compact: Option<f64>,
+    /// Compactions will be smart (session log plus history tools): the
+    /// configured mode is smart and the session is persisted, without which
+    /// smart falls back to standard.
+    pub smart_compact: bool,
     pub activity: Activity,
     /// Plan progress as (done, total), when there is a plan.
     pub plan: Option<(usize, usize)>,

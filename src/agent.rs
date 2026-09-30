@@ -624,6 +624,7 @@ impl Agent {
             stats.window = self.context_window();
             stats.messages = self.conversation.len();
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
+            stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();

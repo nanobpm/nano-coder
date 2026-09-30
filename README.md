@@ -604,7 +604,7 @@ scrollback and reflows history itself on a resize, with the status line pinned t
 In an interactive terminal the bottom row shows the provider/model, context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
-count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
+count (labelled `smart-compact` when compactions are smart, else `auto-compact`), the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
 AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. In the legacy
 renderer it uses a terminal scroll region (DECSTBM); the default frame renderer instead composes
