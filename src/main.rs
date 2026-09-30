@@ -450,6 +450,12 @@ impl Terminal {
         // the frame's first full redraw clears the scrollback those notes
         // were headed for.
         let pending = if switching_to_frame { self.renderer.drain_pending() } else { Vec::new() };
+        // Whether a frame is ACTIVE right now (before the switch). Off a tty
+        // `set_mode(Frame)` leaves `is_frame()` false, so this — not the
+        // configured mode — tells whether the post-switch replay/cleanup is
+        // needed: with no frame ever active, legacy scrollback was never
+        // cleared and replaying would print the whole conversation again.
+        let frame_was_active = self.renderer.is_frame();
         self.renderer.set_mode(mode);
         let on = self.renderer.is_frame();
         // Rebuild the frame hook to match: frame routes every edit through the
@@ -463,6 +469,21 @@ impl Terminal {
             h
         });
         self.view.lock().unwrap().set_frame_mode(on, hook);
+        // Leaving an active frame: re-own the screen for legacy BEFORE the
+        // editor/status redraw below. The frame's last redraw is still
+        // visible (dropping it emits nothing), so this clears the screen and
+        // scrollback — the replay and the migrated frame-only items reprint
+        // everything — then re-pins the scroll region the frame's redraws
+        // reset, leaving the cursor on the last scrollable row. Doing it
+        // before `view.resize()` (not after) means there is no fresh prompt
+        // for the clear to wipe, and the replay can't start writing on the
+        // reserved status row.
+        if !on
+            && frame_was_active
+            && let Some(status) = &self.status
+        {
+            status.repin_scroll_region();
+        }
         // Re-anchor the scroll region (legacy) / let the frame re-own the
         // screen (frame), and recompute the prompt at the current size.
         if let Some(status) = &self.status {
@@ -476,12 +497,6 @@ impl Terminal {
             self.view.lock().unwrap().reset_drawing();
         }
         self.view.lock().unwrap().resize();
-        // The frame's full redraw (when switching *to* frame) resets the scroll
-        // region to the whole screen; switching *to* legacy must re-pin it to
-        // the status line's rows or the bottom bar would scroll off.
-        if !on && let Some(status) = &self.status {
-            status.repin_scroll_region();
-        }
         if on {
             // A fresh frame starts empty, so the transcript must be rebuilt
             // into it (its first full redraw clears scrollback and re-owns the
@@ -492,13 +507,17 @@ impl Terminal {
             self.renderer.push_items(pending);
             let renderer = self.renderer.clone();
             self.renderer.frame_batch(|| agent.replay_history_with(|event| renderer.replay_event(event)));
-        } else {
+        } else if frame_was_active {
             // Legacy scrollback was cleared by the frame's redraws: reprint
             // the conversation so older turns stay accessible. The tap prints
             // only the user turns (the sink's legacy `Renderer::event` renders
-            // everything else and ignores replayed user messages); `set_mode`
-            // has already drained the frame-only items (banner, `/help`,
-            // notes) into legacy scrollback.
+            // everything else and ignores replayed user messages). First flush
+            // the frame-only items `set_mode` migrated (banner, `/help`,
+            // notes): a fresh session has no history events to trigger
+            // `out()`'s deferred flush and the next prompt is drawn by
+            // `EditView`, so without this they would stay invisible until the
+            // first turn's output.
+            self.renderer.flush_pending();
             let renderer = self.renderer.clone();
             agent.replay_history_with(|event| renderer.replay_event(event));
         }

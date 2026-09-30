@@ -106,6 +106,13 @@ pub enum Item {
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
     Note(String),
+    /// The `report_outcome` status marker (`✔ completed` etc.). Distinct from
+    /// [`Item::Note`] because it is derived from a CONVERSATION event (the
+    /// tool call), not renderer-only output: on a frame → legacy switch the
+    /// history replay re-emits that event and the legacy renderer prints the
+    /// marker again, so this item must NOT be drained into legacy scrollback
+    /// (unlike renderer-only notes, which the replay cannot reproduce).
+    OutcomeMark(String),
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
     Output(String),
@@ -190,7 +197,9 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
         }
         Item::ToolResult { ok, output, verbose } => tool_result_lines(*ok, output, *verbose, width),
         Item::Plan(plan) => plan_lines(plan, width),
-        Item::Note(text) => wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect(),
+        Item::Note(text) | Item::OutcomeMark(text) => {
+            wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect()
+        }
         Item::Output(text) => wrap_block(text, width),
         // Normally rendered by the dedicated arm in `render_stamped` (which
         // also skips the timestamp); this keeps a direct `render_item` call

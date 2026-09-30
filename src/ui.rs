@@ -290,7 +290,14 @@ impl Renderer {
     /// already cleared the old scrollback, so dropping the frame would lose
     /// it. Conversation items (messages, tool calls/results, the plan) are
     /// NOT drained: the caller's history replay reprints those, and draining
-    /// them too would repeat every turn.
+    /// them too would repeat every turn. For the same reason the
+    /// conversation-derived `report_outcome` status markers
+    /// (`Item::OutcomeMark`) are dropped, not drained: the replay re-emits
+    /// the tool call and the legacy renderer prints the marker again.
+    /// `Item::Raw` holds verbatim machine-readable output (`/trajectory
+    /// --json`); it is printed byte-exact straight away, never routed through
+    /// the deferred-note queue (which would trim trailing newlines and add
+    /// DIM styling, corrupting the export).
     pub fn set_mode(&self, mode: crate::frame::RendererMode) {
         let on = mode == crate::frame::RendererMode::Frame && self.tty;
         let mut frame = self.frame.lock().unwrap();
@@ -303,7 +310,10 @@ impl Renderer {
             for si in fs.items {
                 match si.item {
                     Item::Note(text) => state.deferred.push(text),
-                    Item::Output(text) | Item::Raw(text) => state.deferred.push(text.trim_end().to_string()),
+                    // Conversation-derived: the history replay reprints it.
+                    Item::OutcomeMark(_) => {}
+                    Item::Output(text) => state.deferred.push(text.trim_end().to_string()),
+                    Item::Raw(text) => self.restore_raw(&mut state, &text),
                     Item::Message { .. } | Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Plan(_) => {}
                     Item::Thinking { chars, seconds } => {
                         state.deferred.push(format!("∴ Thought for {seconds:.1}s · {chars} chars"))
@@ -311,6 +321,36 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Print migrated frame-only output (notes deferred behind a streamed
+    /// line, the collapsed thinking summary) now, rather than waiting for the
+    /// next renderer write to flush the queue. Used when switching frame →
+    /// legacy: a fresh session has no history events to trigger `out()`'s
+    /// flush, and the next prompt is drawn by `EditView` (not the renderer),
+    /// so without this the migrated banner / `/help` output would stay
+    /// invisible until the first turn's output. Goes through `out()` (via
+    /// `newline`), so a partial streamed line is ended first and the notes
+    /// are not re-flushed by that `out()` call — `state.deferred` is already
+    /// empty when it runs.
+    pub fn flush_pending(&self) {
+        let mut state = self.state.lock().unwrap();
+        if self.frame.lock().unwrap().is_some() || state.deferred.is_empty() {
+            return;
+        }
+        self.newline(&mut state);
+        for note in std::mem::take(&mut state.deferred) {
+            self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
+        }
+    }
+
+    /// Print a raw machine-readable export (`/trajectory --json`) preserved
+    /// across a frame → legacy switch: byte-exact, with no trimming, styling
+    /// or added newline — anything else would corrupt the export for the
+    /// pipeline reading it.
+    fn restore_raw(&self, state: &mut State, text: &str) {
+        self.newline(state);
+        self.out(state, text);
     }
 
     /// Update the editor row (called by the line editor's frame hook) and
@@ -479,7 +519,11 @@ impl Renderer {
             {
                 self.frame_finish_stream(fs);
                 // Derive the status from the parsed outcome so an invalid
-                // `report_outcome` is not rendered as a success.
+                // `report_outcome` is not rendered as a success. The marker is
+                // conversation-derived (the replay re-emits the tool call), so
+                // it is an `OutcomeMark`, not a renderer-only `Note` — that
+                // keeps it out of the frame → legacy drain, where it would be
+                // printed a second time.
                 let mark = match crate::goal::Status::from_args(&call.arguments) {
                     Some(crate::goal::Status::Blocked) => "■ blocked".to_string(),
                     Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
@@ -491,7 +535,7 @@ impl Renderer {
                         if raw.is_empty() { "• unknown".to_string() } else { format!("• {raw}") }
                     }
                 };
-                fs.items.push(stamped(Item::Note(mark)));
+                fs.items.push(stamped(Item::OutcomeMark(mark)));
             }
             AgentEvent::ToolResult { call, ok: true, .. }
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
@@ -1258,6 +1302,67 @@ mod tests {
         assert!(
             !notes.iter().any(|n| n.contains("hi") || n.contains("hello")),
             "conversation items are replayed, not drained: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn leaving_frame_mode_drops_the_conversation_derived_outcome_marker() {
+        // The `report_outcome` status marker is derived from a conversation
+        // event: the legacy history replay re-emits the tool call and
+        // `Renderer::event` prints the marker again, so draining the frame's
+        // copy into legacy scrollback would show each outcome twice.
+        let r = Renderer::frame_for_test();
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: crate::goal::TOOL_NAME.into(),
+            arguments: json!({"status": "completed", "summary": "done"}),
+            ..Default::default()
+        };
+        r.event(&AgentEvent::ToolCall { call: &call });
+        assert!(
+            r.frame_items().iter().any(|i| matches!(&i.item, Item::OutcomeMark(t) if t.contains("completed"))),
+            "frame shows the marker"
+        );
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        let notes = r.deferred_notes();
+        assert!(
+            !notes.iter().any(|n| n.contains("completed")),
+            "the marker is replayed from the conversation, not drained: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn flush_pending_prints_migrated_notes_and_empties_the_queue() {
+        // After a frame → legacy switch the migrated banner / `/help` output
+        // must be printed during the transition: a fresh session has no
+        // history events to trigger `out()`'s deferred flush, and the next
+        // prompt is drawn by `EditView`, so the queue would otherwise stay
+        // invisible until the first turn's output.
+        let r = Renderer::frame_for_test();
+        r.print_block("nano-coder v0.0.0");
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        assert!(!r.deferred_notes().is_empty(), "migrated into the deferred queue");
+        r.flush_pending();
+        assert!(r.deferred_notes().is_empty(), "flushed during the transition");
+        // Idempotent: a second flush (or the next `out()`) reprints nothing.
+        r.flush_pending();
+        assert!(r.deferred_notes().is_empty());
+    }
+
+    #[test]
+    fn leaving_frame_mode_keeps_raw_exports_out_of_the_note_queue() {
+        // `Item::Raw` holds verbatim machine-readable output (`/trajectory
+        // --json`); routing it through the deferred-note queue would trim its
+        // trailing newline and add DIM styling when flushed, so the export
+        // would no longer be byte-exact. It is printed verbatim on the spot
+        // instead (captured by the test harness's stdout).
+        let r = Renderer::frame_for_test();
+        r.print_raw("{\"session_id\":\"abc\"}\n");
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        let notes = r.deferred_notes();
+        assert!(
+            !notes.iter().any(|n| n.contains("session_id")),
+            "raw output is restored byte-exact, never deferred as a note: {notes:?}"
         );
     }
 
