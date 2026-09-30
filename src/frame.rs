@@ -108,10 +108,11 @@ pub enum Item {
     Note(String),
     /// The `report_outcome` status marker (`✔ completed` etc.). Distinct from
     /// [`Item::Note`] because it is derived from a CONVERSATION event (the
-    /// tool call), not renderer-only output: on a frame → legacy switch the
-    /// history replay re-emits that event and the legacy renderer prints the
-    /// marker again, so this item must NOT be drained into legacy scrollback
-    /// (unlike renderer-only notes, which the replay cannot reproduce).
+    /// tool call), not renderer-only output. It is part of the captured
+    /// transcript all the same: on a frame → legacy switch `set_mode` copies
+    /// the WHOLE `items` list and `replay_transcript` reprints it directly
+    /// (the caller does not re-derive history from the conversation on that
+    /// path), so this marker is restored in place, exactly once.
     OutcomeMark(String),
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.

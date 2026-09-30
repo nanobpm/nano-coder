@@ -696,14 +696,15 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
         // the running session uses the new endpoint / key / model at once.
         match agent.refresh_client().await {
             Ok(()) => println!("Rebuilt the session's client for {name}."),
-            // In frame mode the dialog's own redraw (`frame_resize` on exit)
-            // wipes a plain `println!`, so a rebuild FAILURE — the one notice
-            // the user must not miss, since the saved settings no longer match
-            // the live client — is also returned for `main` to re-show through
-            // the renderer after the redraw.
+            // A rebuild FAILURE — the one notice the user must not miss, since
+            // the saved settings no longer match the live client — is returned
+            // for `main` to re-show through the renderer after the dialog's
+            // exit redraw. It is NOT printed here: in frame mode a plain
+            // `println!` is wiped by `frame_resize`, and in legacy mode (where
+            // `frame_resize` is a no-op) printing here too would show the same
+            // warning twice — once inline and once via the retained notice.
             Err(e) => {
                 let notice = format!("Provider {name} saved, but could not rebuild the client: {e:#}");
-                println!("{notice}");
                 return Ok(Some(ProviderEdit { name, rebuild_notice: Some(notice) }));
             }
         }

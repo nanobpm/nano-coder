@@ -293,26 +293,28 @@ impl Renderer {
     /// in-flight stream state are preserved across the switch, and the
     /// caller is expected to re-render (a resize / replay) afterwards.
     ///
-    /// Switching OFF drains the frame transcript into legacy scrollback
-    /// first: frame-only output (the startup banner, `/help` or `/tools`
-    /// text, renderer notes) lives only in `FrameState.items` — not in the
-    /// `Agent` conversation the caller replays — and frame redraws have
-    /// already cleared the old scrollback, so dropping the frame would lose
-    /// it. Conversation items (messages, tool calls/results, the plan) are
-    /// NOT drained: the caller's history replay reprints those, and draining
-    /// them too would repeat every turn. For the same reason the
-    /// conversation-derived `report_outcome` status markers
-    /// (`Item::OutcomeMark`) are dropped, not drained: the replay re-emits
-    /// the tool call and the legacy renderer prints the marker again.
-    /// `Item::Raw` holds verbatim machine-readable output (`/trajectory
-    /// --json`); it is queued for the post-clear flush (printed byte-exact,
-    /// never routed through the deferred-note queue, which would trim trailing
-    /// newlines and add DIM styling, corrupting the export). Printing it here
-    /// would lose it: the caller's `repin_scroll_region` clears the screen and
-    /// scrollback AFTER this returns, so the raw bytes are deferred until that
-    /// clear has run. Likewise the frame's `Item::Plan` snapshots are queued:
-    /// the history replay emits only the CURRENT plan (once, at the end), so
-    /// dropping them would lose the earlier checklist states the frame showed.
+    /// Switching OFF captures the WHOLE frame transcript (`fs.items`, in
+    /// on-screen order) so `replay_transcript` can reprint it once legacy owns
+    /// the screen again. The frame holds the visible history exactly as shown
+    /// — frame-only output (the startup banner, `/help` or `/tools` text,
+    /// renderer notes) lives ONLY in `FrameState.items`, and frame redraws have
+    /// already cleared the old scrollback, so dropping the frame would lose it.
+    /// Conversation items (messages, tool calls/results, the plan) and the
+    /// conversation-derived `report_outcome` markers (`Item::OutcomeMark`) are
+    /// captured and replayed too: the caller does NOT re-derive the visible
+    /// history from `Agent::conversation` on this path, so nothing is printed
+    /// twice and nothing is dropped. Replaying the captured transcript — rather
+    /// than the conversation — is what keeps the switch lossless: it restores
+    /// the real pre-compaction turns (compaction only appends a note; it never
+    /// rewrites `fs.items`) where the compacted conversation would print the
+    /// synthetic summary as a user turn and lose the compacted-away turns, and
+    /// the current plan prints exactly once (it is simply the last
+    /// `Item::Plan`). `Item::Raw` holds verbatim machine-readable output
+    /// (`/trajectory --json`); it is replayed byte-exact (never routed through
+    /// the deferred-note queue, which would trim trailing newlines and add DIM
+    /// styling, corrupting the export). Nothing prints here: the caller clears
+    /// the screen+scrollback AFTER `set_mode` returns, so `replay_transcript`
+    /// does the printing.
     pub fn set_mode(&self, mode: crate::frame::RendererMode) {
         let on = mode == crate::frame::RendererMode::Frame && self.tty;
         let mut frame = self.frame.lock().unwrap();
@@ -433,13 +435,14 @@ impl Renderer {
             }
             // Byte-exact, unstyled, untrimmed, UNSANITIZED: the export must
             // survive intact for whatever pipeline reads it. `print_raw`
-            // originally emitted it with `println!`, so restore the trailing
-            // newline too — otherwise the next prompt attaches to a JSON export
-            // that has none.
+            // originally emitted it with `println!`, which ALWAYS appends one
+            // newline after the text — so write that suffix newline
+            // unconditionally (`newline()` would skip it when the raw text
+            // already ends in `\n`, dropping the blank line `println!` added).
             Item::Raw(text) => {
                 self.newline(state);
                 self.out(state, text);
-                self.newline(state);
+                self.out(state, "\n");
             }
         }
     }

@@ -816,13 +816,22 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// control characters — including ESC (0x1B), which begins every such sequence —
 /// neutralises them while leaving ordinary printable text intact.
 ///
+/// Line feeds (`\n`) are kept: a line feed is not an escape-initiating or
+/// cursor-moving control, and dropping it would corrupt multi-line text.
+/// Callers that render a single line (option labels, the prompt) hand
+/// single-line strings to begin with; the transcript replay in particular
+/// relies on `\n` surviving so a multi-line message replays as the same lines
+/// the frame showed, not one concatenated line.
+///
 /// The Unicode line/paragraph separators U+2028/U+2029 are dropped too: they are
 /// not `char::is_control`, but terminals and this crate's own memory guards
 /// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    s.chars()
+        .filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}')
+        .collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -1442,12 +1451,14 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 terminal.renderer_switched(agent);
             }
             // Re-show any notice the dialog retained (e.g. a client-rebuild
-            // failure) THROUGH the renderer, now that the redraw has run: the
-            // dialog's own `println!` of it was wiped by `frame_resize`, and
-            // `print_block` captures it into the frame transcript (or prints
-            // inline in legacy) so the warning survives. `run` returns the
-            // notices on EVERY exit — even a cancel/error at a later prompt —
-            // so a rebuild failure already recorded is never dropped.
+            // failure) THROUGH the renderer, now that the redraw has run. The
+            // dialog does NOT print these itself (a plain `println!` would be
+            // wiped by `frame_resize` in frame mode, and would double-print in
+            // legacy); `print_block` captures the notice into the frame
+            // transcript (or prints inline in legacy) so it is shown exactly
+            // once. `run` returns the notices on EVERY exit — even a
+            // cancel/error at a later prompt — so a rebuild failure already
+            // recorded is never dropped.
             for notice in &notices {
                 terminal.renderer.print_block(notice);
             }
@@ -2487,6 +2498,15 @@ mod tests {
         // is loaded before serving ACP requests); only a bare picker `--resume`
         // is rejected there (in `main`, not parse_args).
         assert!(parse_args_from(argv(&["--acp", "--resume", "sess-1"])).is_ok());
+    }
+
+    #[test]
+    fn sanitize_terminal_text_preserves_line_feeds() {
+        // Multi-line model/tool text must keep its line breaks: the transcript
+        // replay re-prints it as the lines the frame showed, so stripping `\n`
+        // would concatenate the lines. Other controls are still dropped.
+        assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
+        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
     }
 
     #[test]
