@@ -700,16 +700,47 @@ impl<W: Write> FrameRenderer<W> {
 }
 
 /// The number of physical terminal rows a single composed line occupies once
-/// written: a line wider than `width` wraps natively onto `ceil(w/width)` rows
-/// (an empty line still takes one). ANSI escape sequences are ignored, so this
-/// measures what the terminal actually advances, not the byte length.
+/// written: a line wider than `width` wraps natively onto extra rows (an empty
+/// line still takes one). ANSI escape sequences are ignored, so this measures
+/// what the terminal actually advances, not the byte length.
+///
+/// Terminal wrapping is sequence-sensitive, not just `ceil(width / width)`: a
+/// wide (2-cell) glyph cannot start in the last column, so it moves wholly to
+/// the next row and leaves that cell blank. Count cells incrementally and start
+/// a new row whenever the next glyph would cross the column boundary, as
+/// [`wrap_ansi`] does — `ceil(total_width / width)` undercounts CJK/emoji lines.
 fn line_physical_rows(line: &str, width: usize) -> usize {
     let width = width.max(1);
-    let w = visible_width(line);
-    if w == 0 {
-        return 1;
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip a CSI escape sequence (`\x1b[...<final>`); it advances no cell.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let w = cell_width(c);
+        if w == 0 {
+            continue;
+        }
+        // A wide glyph that would cross the boundary starts a new row — but not
+        // on an empty row (a glyph wider than `width` still occupies one row
+        // rather than wrapping forever).
+        if col + w > width && col > 0 {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
     }
-    w.div_ceil(width)
+    rows
 }
 
 /// The total physical terminal rows a composed frame occupies: the sum over
@@ -1277,5 +1308,23 @@ mod emulator {
         // The frame total is the per-line sum.
         let frame = vec!["abc".to_string(), "x".repeat(21), String::new()];
         assert_eq!(physical_rows(&frame, 10), 1 + 3 + 1);
+    }
+
+    #[test]
+    fn line_physical_rows_counts_wide_glyphs_that_cannot_start_in_the_last_column() {
+        // Cell widths 1,2,2,2,2,2,1,2,2,2,2 (2 ASCII + 9 CJK = 20 cells) at
+        // width 10: the naive `ceil(20/10)` is 2, but a 2-cell glyph cannot
+        // start in the last column, so the terminal actually uses 3 rows.
+        // `visible_width` still sums to 20 — only the incremental count sees
+        // the boundary.
+        let line = "1\u{4e16}\u{4e16}\u{4e16}\u{4e16}\u{4e16}2\u{4e16}\u{4e16}\u{4e16}\u{4e16}";
+        assert_eq!(visible_width(line), 20);
+        assert_eq!(visible_width(line).div_ceil(10), 2);
+        assert_eq!(line_physical_rows(line, 10), 3);
+        // ANSI styling around the wide glyphs still advances no cell.
+        let styled = format!("\x1b[2m{line}\x1b[0m");
+        assert_eq!(line_physical_rows(&styled, 10), 3);
+        // A glyph wider than the column still occupies exactly one row.
+        assert_eq!(line_physical_rows("\u{4e16}", 1), 1);
     }
 }
