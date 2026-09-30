@@ -247,20 +247,6 @@ pub fn context_window(
     (provider.and_then(|p| p.context_window), model)
 }
 
-/// The provider name, merged provider entry and model name a spec resolves to
-/// (the model is the provider's `default_model` when the spec names none).
-pub fn entry_for(
-    spec: &str,
-    user: &HashMap<String, ProviderConfig>,
-    default_provider: &str,
-) -> Option<(String, ProviderConfig, String)> {
-    let providers = effective_providers(user);
-    let (name, model) = parse_model_spec(spec, &providers, default_provider);
-    let provider = providers.get(name)?.clone();
-    let model = model.map(str::to_string).or_else(|| provider.default_model.clone()).unwrap_or_default();
-    Some((name.to_string(), provider, model))
-}
-
 /// Fully-resolved provider settings used by a client.
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {

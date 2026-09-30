@@ -652,10 +652,13 @@ fn diff_from(preset: &ProviderConfig, existing: &ProviderConfig, updated: &Provi
 fn edit_temperature(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
     use crate::temperature::{MAX, Temperature};
     let current = agent.temperature();
-    let (user, default_provider) = agent.config().effective_providers();
-    let Some((provider, _, model)) = providers::entry_for(&agent.config().model, &user, &default_provider) else {
-        return Ok(());
-    };
+    // Target the live client's provider/model, not `config.model`: after a
+    // provider's `default_model` is edited and the user declines to switch,
+    // the two diverge, and the menu (via `agent.temperature()`) reports the
+    // live model — so the edit must write to that same model, not the newly
+    // configured default.
+    let provider = agent.provider_name().to_string();
+    let model = agent.model_name().to_string();
     if let Some(reason) = &current.fixed {
         println!("{provider}/{model} always uses the model default: {reason}.");
         return Ok(());
@@ -792,7 +795,10 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         doc["model"] = toml_edit::value(config.model.as_str());
     }
     if changes.temperature {
-        doc["temperature"] = temperature_item(config.temperature);
+        // Reuse the decoration-preserving helper so editing the global
+        // temperature keeps an attached comment (`temperature = 0.2 # tuned`),
+        // matching the provider/model path.
+        set_nested(&mut doc, &[], "temperature", Some(config.temperature));
     }
     for name in &changes.provider_temperatures {
         let value = config.providers.get(name).and_then(|p| p.temperature);
@@ -952,7 +958,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "temperature = 0.2\n\n[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
+            "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
         )
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -971,7 +977,7 @@ mod tests {
         save(&config, &changes, &path).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("temperature = \"default\""), "{text}");
+        assert!(text.contains("temperature = \"default\" # global tune"), "global comment kept: {text}");
         // Replacing an existing value keeps its attached comment.
         assert!(
             text.contains("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider"),
