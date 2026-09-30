@@ -89,11 +89,16 @@ pub async fn run(
     config_path: &Path,
     recents: &recents::SharedRecents,
     recents_path: &Path,
-) -> Result<Vec<String>> {
+) -> Vec<String> {
     let mut changes = Changes::default();
     // Notices (e.g. a client-rebuild failure) that must survive the dialog's
     // exit redraw: the caller re-shows them through the renderer after
     // `frame_resize`, since a plain `println!` here is wiped in frame mode.
+    // They are returned on EVERY exit — including a cancel/error at a later
+    // prompt — so a rebuild failure already recorded is never dropped (the
+    // dialog's own `println!` of it is gone by then, and the session keeps the
+    // old client). Every `?` below is a dialoguer prompt: on cancel/error it
+    // maps to `None`, which the loop treats as Done and returns `notices`.
     let mut notices: Vec<String> = Vec::new();
     loop {
         let config = agent.config();
@@ -120,26 +125,34 @@ pub async fn run(
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
-        let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
+        let Some(selection) = Select::new().with_prompt("Select setting").items(&items).default(0).interact().ok()
+        else {
+            return notices;
+        };
         match selection {
             0 => {
                 let snapshot = recents.lock().unwrap().models().to_vec();
-                if let Some(spec) = pick_model_interactive(agent, &snapshot).await? {
+                if let Some(spec) = pick_model_interactive(agent, &snapshot).await.ok().flatten() {
                     switch_model(agent, &spec, &mut changes, recents, recents_path).await;
                 }
             }
             1 => {
-                if let Some(edit) = edit_provider(agent).await? {
+                if let Some(edit) = edit_provider(agent).await.ok().flatten() {
                     if let Some(notice) = edit.rebuild_notice {
                         notices.push(notice);
                     }
                     let name = edit.name;
                     changes.providers.insert(name.clone());
-                    if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
+                    let pick_now = Confirm::new()
+                        .with_prompt(format!("Pick a model from {name} now?"))
+                        .default(true)
+                        .interact()
+                        .unwrap_or(false);
+                    if pick_now {
                         let (user, default_provider) = agent.config().effective_providers();
                         let all = providers::effective_providers(&user);
-                        if let Step::Done(spec) =
-                            pick_model_from_provider(&name, &all, &user, &default_provider).await?
+                        if let Ok(Step::Done(spec)) =
+                            pick_model_from_provider(&name, &all, &user, &default_provider).await
                         {
                             switch_model(agent, &spec, &mut changes, recents, recents_path).await;
                         }
@@ -148,53 +161,68 @@ pub async fn run(
             }
             2 => edit_temperature(agent, &mut changes)?,
             3 => {
-                let value: i32 =
-                    Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
-                agent.config_mut().max_tokens = value;
-                changes.max_tokens = true;
+                if let Ok(value) = Input::<i32>::new()
+                    .with_prompt("Max tokens")
+                    .default(agent.config().max_tokens)
+                    .interact_text()
+                {
+                    agent.config_mut().max_tokens = value;
+                    changes.max_tokens = true;
+                }
             }
             4 => {
-                let value: usize = Input::new()
+                if let Ok(value) = Input::<usize>::new()
                     .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
-                    .interact_text()?;
-                agent.config_mut().max_iterations = value;
-                changes.max_iterations = true;
+                    .interact_text()
+                {
+                    agent.config_mut().max_iterations = value;
+                    changes.max_iterations = true;
+                }
             }
             5 => {
-                let value: String = Input::new()
+                if let Ok(value) = Input::<String>::new()
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
-                    .interact_text()?;
-                agent.set_system_prompt(&value)?;
-                changes.system_prompt = true;
+                    .interact_text()
+                    && agent.set_system_prompt(&value).is_ok()
+                {
+                    changes.system_prompt = true;
+                }
             }
             6 => {
-                edit_context(agent)?;
-                changes.compaction = true;
+                if edit_context(agent).is_ok() {
+                    changes.compaction = true;
+                }
             }
             7 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
-                let choice = Select::new().with_prompt("Verbosity").items(&labels).default(current).interact()?;
-                agent.config_mut().verbosity = levels[choice];
-                crate::ui::set_verbosity(levels[choice]);
-                changes.verbosity = true;
+                if let Ok(choice) =
+                    Select::new().with_prompt("Verbosity").items(&labels).default(current).interact()
+                {
+                    agent.config_mut().verbosity = levels[choice];
+                    crate::ui::set_verbosity(levels[choice]);
+                    changes.verbosity = true;
+                }
             }
             8 => {
                 let modes = crate::frame::RendererMode::ALL;
                 let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
                 let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                let choice = Select::new().with_prompt("Renderer").items(&labels).default(current).interact()?;
-                let previous = agent.config().renderer;
-                agent.config_mut().renderer = modes[choice];
-                changes.renderer = true;
-                if modes[choice] != previous {
-                    // The switch is applied live by `main` (which detects the
-                    // changed `renderer` after the dialog returns and flips the
-                    // frame renderer, the line editor, and the scroll region).
-                    println!("Renderer set to {} — taking effect now.", modes[choice]);
+                if let Ok(choice) =
+                    Select::new().with_prompt("Renderer").items(&labels).default(current).interact()
+                {
+                    let previous = agent.config().renderer;
+                    agent.config_mut().renderer = modes[choice];
+                    changes.renderer = true;
+                    if modes[choice] != previous {
+                        // The switch is applied live by `main` (which detects the
+                        // changed `renderer` after the dialog returns and flips the
+                        // frame renderer, the line editor, and the scroll region).
+                        println!("Renderer set to {} — taking effect now.", modes[choice]);
+                    }
                 }
             }
             9 => save_and_report(agent.config(), &mut changes, config_path),
@@ -203,11 +231,12 @@ pub async fn run(
                     && Confirm::new()
                         .with_prompt(format!("Save changes to {}?", config_path.display()))
                         .default(true)
-                        .interact()?
+                        .interact()
+                        .unwrap_or(false)
                 {
                     save_and_report(agent.config(), &mut changes, config_path);
                 }
-                return Ok(notices);
+                return notices;
             }
         }
     }
@@ -645,10 +674,16 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     // provider, so the old client names that default — yet adding `work` makes
     // the SAME spec resolve to `work`. Rebuild when either side names the
     // edited provider, or the next request would keep using the old endpoint.
+    // Resolve against the SAME table `Agent::client_for` builds from —
+    // `Config::effective_providers()` merges the legacy top-level credentials
+    // and flips a `mock` default to `openai` — not the raw provider table, or
+    // a bare model resolves to a different provider than the client uses and
+    // the guard rebuilds the wrong one.
     let resolves_to_edited = {
         let config = agent.config();
-        let providers = providers::effective_providers(&config.providers);
-        providers::parse_model_spec(&config.model, &providers, &config.default_provider).0 == name
+        let (providers, default_provider) = config.effective_providers();
+        let providers: std::collections::BTreeMap<_, _> = providers.into_iter().collect();
+        providers::parse_model_spec(&config.model, &providers, &default_provider).0 == name
     };
     if agent.provider_name() == name || resolves_to_edited {
         // The edited provider serves the current model: rebuild the client so
@@ -1051,6 +1086,27 @@ mod tests {
         let resolves_to_edited = providers::parse_model_spec(spec, &after, "anthropic").0 == edited;
         assert!(!old_guard_would_skip, "the old guard misses the resolution change");
         assert!(resolves_to_edited, "the resolution check catches it");
+    }
+
+    #[test]
+    fn edited_provider_resolution_uses_the_effective_provider_table() {
+        // Advisory: the rebuild guard must resolve the model against the SAME
+        // table `Agent::client_for` builds from — `Config::effective_providers()`
+        // — not the raw `[providers]` table. With legacy top-level credentials
+        // and `default_provider = "mock"`, the effective default flips to
+        // `openai`, so a bare model actually uses `openai`: editing `mock` must
+        // NOT trigger a rebuild (the raw table would wrongly say it does).
+        let config = crate::config::Config {
+            api_key: Some("sk-test".to_string()), // legacy top-level credential
+            ..crate::config::Config::default()    // default_provider = "mock"
+        };
+        let (providers, default) = config.effective_providers();
+        assert_eq!(default, "openai", "legacy credentials flip a mock default to openai");
+        let providers: std::collections::BTreeMap<_, _> = providers.into_iter().collect();
+        // A bare model resolves to the EFFECTIVE default (openai), not mock.
+        assert_eq!(providers::parse_model_spec(&config.model, &providers, &default).0, "openai");
+        // So editing `mock` does not resolve to the edited provider — no rebuild.
+        assert_ne!(providers::parse_model_spec(&config.model, &providers, &default).0, "mock");
     }
 
     #[test]

@@ -499,7 +499,19 @@ impl Terminal {
             // resize redraw would climb into the status row / frame content.
             self.view.lock().unwrap().reset_drawing();
         }
-        self.view.lock().unwrap().resize();
+        // Leaving an ACTIVE frame, skip the editor's resize redraw: it would
+        // reprint the inline prompt NOW, before `replay_transcript` below
+        // restores the history — the renderer still counts itself at a line
+        // start, so the first restored item lands after that prompt and the
+        // next loop print draws a second one. `reset_drawing` above already
+        // re-anchored the editor to the single prompt row, so replaying first
+        // and letting the next loop print the prompt keeps it where it
+        // belongs. Every other path (entering frame mode, or legacy with no
+        // frame ever active) still needs the redraw to recompute the prompt at
+        // the current size.
+        if on || !frame_was_active {
+            self.view.lock().unwrap().resize();
+        }
         if on {
             // A fresh frame starts empty, so the transcript must be rebuilt
             // into it (its first full redraw clears scrollback and re-owns the
@@ -1418,7 +1430,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // switch must still be applied here — returning early would leave
             // the renderer and editor in the old mode with no diff left to
             // retrigger the switch on the next visit.
-            let result = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
+            let notices = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
@@ -1433,19 +1445,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // failure) THROUGH the renderer, now that the redraw has run: the
             // dialog's own `println!` of it was wiped by `frame_resize`, and
             // `print_block` captures it into the frame transcript (or prints
-            // inline in legacy) so the warning survives. Done before `result?`
-            // so a later dialog error still leaves the notice visible.
-            if let Ok(notices) = &result {
-                for notice in notices {
-                    terminal.renderer.print_block(notice);
-                }
+            // inline in legacy) so the warning survives. `run` returns the
+            // notices on EVERY exit — even a cancel/error at a later prompt —
+            // so a rebuild failure already recorded is never dropped.
+            for notice in &notices {
+                terminal.renderer.print_block(notice);
             }
             // Each model switch made in the dialog was recorded into the recents
             // MRU as it happened, so here just refresh the config the line
             // editor's argument suggestions read (providers or the model may
             // have changed).
             terminal.sync_context(agent);
-            result?;
             Ok(true)
         }
         "/tools" => {

@@ -321,22 +321,124 @@ impl Renderer {
                 *frame = Some(Self::fresh_frame());
             }
         } else if let Some(fs) = frame.take() {
-            let mut state = self.state.lock().unwrap();
-            for si in fs.items {
-                match si.item {
-                    Item::Note(text) => state.deferred.push(text),
-                    // Conversation-derived: the history replay reprints it.
-                    Item::OutcomeMark(_) => {}
-                    Item::Output(text) => state.deferred.push(text.trim_end().to_string()),
-                    Item::Raw(text) => state.raw.push(text),
-                    // Historical plan snapshots: the replay reprints only the
-                    // current plan, so queue these for `replay_plan_snapshots`.
-                    Item::Plan(plan) => state.plans.push(plan),
-                    Item::Message { .. } | Item::ToolCall { .. } | Item::ToolResult { .. } => {}
-                    Item::Thinking { chars, seconds } => {
-                        state.deferred.push(format!("∴ Thought for {seconds:.1}s · {chars} chars"))
-                    }
+            // Capture the WHOLE transcript in on-screen order. The frame holds
+            // the visible history exactly as shown — including the real
+            // pre-compaction turns (compaction only appends a note; it never
+            // rewrites `fs.items`) — so replaying it restores what the user
+            // saw, in order, where re-deriving from `Agent::conversation`
+            // would print the synthetic summary as a user turn and lose the
+            // compacted-away turns. Nothing prints here: the caller clears the
+            // screen+scrollback AFTER `set_mode` returns, so `replay_transcript`
+            // does the printing.
+            self.state.lock().unwrap().transcript = fs.items;
+        }
+    }
+
+    /// Reprint the dropped frame's transcript, in original on-screen order,
+    /// now that legacy owns the screen again. The caller runs this AFTER the
+    /// post-switch screen+scrollback clear (`repin_scroll_region` /
+    /// `clear_display`), so everything printed here survives the transition.
+    ///
+    /// Replaying the captured transcript — rather than re-deriving the visible
+    /// history from `Agent::conversation` — is what keeps a frame → legacy
+    /// switch lossless:
+    /// * ORDER: frame-only items (`/help`, banner, notes), turns and plan
+    ///   updates are reprinted where they were shown, not grouped ahead of or
+    ///   behind the conversation (the old `flush_pending` /
+    ///   `replay_plan_snapshots` split reordered them).
+    /// * COMPACTION: the frame kept the real pre-compaction turns, so they are
+    ///   restored instead of the synthetic summary the compacted conversation
+    ///   would print as a user turn — and the summary is never exposed.
+    /// * The CURRENT plan is simply the last `Item::Plan` in the transcript,
+    ///   so it prints exactly once with no special-casing.
+    ///
+    /// No-op in frame mode or when nothing was captured. Goes through `out()`
+    /// so a partial streamed line is ended first.
+    pub fn replay_transcript(&self) {
+        let mut state = self.state.lock().unwrap();
+        if self.frame.lock().unwrap().is_some() || state.transcript.is_empty() {
+            return;
+        }
+        if verbosity() == Verbosity::Quiet {
+            state.transcript.clear();
+            return;
+        }
+        let items = std::mem::take(&mut state.transcript);
+        for si in &items {
+            self.replay_item(&mut state, si);
+        }
+    }
+
+    /// Print one captured transcript item through the legacy path, mirroring
+    /// what [`Self::event`] emits for the equivalent live event so the
+    /// transition looks seamless. `si.stamp` is reused (not a fresh `stamp()`)
+    /// so each line keeps the timestamp it was originally shown with.
+    ///
+    /// The frame layout strips cursor/erase escapes from model/tool text before
+    /// displaying it, so the captured fields are still RAW — replaying them
+    /// straight into legacy `out()` would emit those controls now (a tool
+    /// result holding `\x1b[2J` is safe in the frame yet clears the terminal
+    /// here). Run every model/tool-controlled field through
+    /// [`crate::sanitize_terminal_text`] first — the same filter live output
+    /// applies — leaving the intentional styling (colours, bold) and the
+    /// byte-exact `Raw` export untouched.
+    fn replay_item(&self, state: &mut State, si: &crate::frame::StampedItem) {
+        use crate::frame::Item;
+        let stamp = &si.stamp;
+        match &si.item {
+            Item::Message { role, text } => {
+                let text = crate::sanitize_terminal_text(text);
+                let text = text.trim_end();
+                if text.trim().is_empty() {
+                    return;
                 }
+                self.newline(state);
+                match role {
+                    crate::frame::Role::User => self.out(state, &format!("{stamp}> {text}\n")),
+                    crate::frame::Role::Assistant => self.out(state, &stamp_block_with(stamp, &format!("{text}\n"))),
+                }
+            }
+            Item::Thinking { chars, seconds } => {
+                self.newline(state);
+                self.out(state, &format!("{stamp}{DIM}∴ Thought for {seconds:.1}s · {chars} chars{RESET}\n"));
+            }
+            Item::ToolCall { name, summary } => {
+                self.newline(state);
+                let name = crate::sanitize_terminal_text(name);
+                let summary = crate::sanitize_terminal_text(summary);
+                self.out(state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}\n"));
+            }
+            Item::ToolResult { ok, output, .. } => {
+                self.newline(state);
+                let output = crate::sanitize_terminal_text(output);
+                let text = stamp_block_with(stamp, &self.tool_result(*ok, &output));
+                self.out(state, &text);
+            }
+            Item::Plan(plan) => {
+                self.newline(state);
+                let width = self.width().saturating_sub(4 + visible_width(stamp));
+                let text = plan_checklist(plan, width);
+                self.out(state, &stamp_block_with(stamp, &text));
+            }
+            Item::Note(text) | Item::OutcomeMark(text) => {
+                self.newline(state);
+                let text = crate::sanitize_terminal_text(text);
+                self.out(state, &format!("{stamp}{DIM}{}{RESET}\n", text.trim_end()));
+            }
+            Item::Output(text) => {
+                self.newline(state);
+                let text = crate::sanitize_terminal_text(text);
+                self.out(state, &format!("{}\n", text.trim_end()));
+            }
+            // Byte-exact, unstyled, untrimmed, UNSANITIZED: the export must
+            // survive intact for whatever pipeline reads it. `print_raw`
+            // originally emitted it with `println!`, so restore the trailing
+            // newline too — otherwise the next prompt attaches to a JSON export
+            // that has none.
+            Item::Raw(text) => {
+                self.newline(state);
+                self.out(state, text);
+                self.newline(state);
             }
         }
     }
