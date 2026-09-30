@@ -282,6 +282,15 @@ impl Renderer {
     /// dropped in place; off a tty it is always off. The transcript and
     /// in-flight stream state are preserved across the switch, and the
     /// caller is expected to re-render (a resize / replay) afterwards.
+    ///
+    /// Switching OFF drains the frame transcript into legacy scrollback
+    /// first: frame-only output (the startup banner, `/help` or `/tools`
+    /// text, renderer notes) lives only in `FrameState.items` — not in the
+    /// `Agent` conversation the caller replays — and frame redraws have
+    /// already cleared the old scrollback, so dropping the frame would lose
+    /// it. Conversation items (messages, tool calls/results, the plan) are
+    /// NOT drained: the caller's history replay reprints those, and draining
+    /// them too would repeat every turn.
     pub fn set_mode(&self, mode: crate::frame::RendererMode) {
         let on = mode == crate::frame::RendererMode::Frame && self.tty;
         let mut frame = self.frame.lock().unwrap();
@@ -289,8 +298,18 @@ impl Renderer {
             if frame.is_none() {
                 *frame = Some(Self::fresh_frame());
             }
-        } else {
-            *frame = None;
+        } else if let Some(fs) = frame.take() {
+            let mut state = self.state.lock().unwrap();
+            for si in fs.items {
+                match si.item {
+                    Item::Note(text) => state.deferred.push(text),
+                    Item::Output(text) | Item::Raw(text) => state.deferred.push(text.trim_end().to_string()),
+                    Item::Message { .. } | Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Plan(_) => {}
+                    Item::Thinking { chars, seconds } => {
+                        state.deferred.push(format!("∴ Thought for {seconds:.1}s · {chars} chars"))
+                    }
+                }
+            }
         }
     }
 
@@ -533,13 +552,15 @@ impl Renderer {
         }
     }
 
-    /// Render one replayed history event in LEGACY mode (used when leaving
-    /// frame mode, whose full redraws cleared the legacy scrollback, to put
-    /// the conversation back). Unlike `event()`, which treats replayed
-    /// `UserMessage`s as steer notes and skips `ToolResult`s unless verbose,
-    /// this prints user turns as messages and every tool result, mirroring
-    /// what the live legacy session had on screen. No-op in frame mode: the
-    /// frame transcript already holds the conversation.
+    /// Print one replayed USER turn in LEGACY mode (used when leaving frame
+    /// mode, whose full redraws cleared the legacy scrollback, to put the
+    /// conversation back). Only `UserMessage` is handled: the replay also
+    /// emits every event to the installed sink (`Renderer::event`), which
+    /// already renders assistant replies, tool calls/results and the plan in
+    /// legacy mode — printing them here too would show each twice. The sink
+    /// ignores `UserMessage` (a live one is a mid-turn steer note, not a
+    /// transcript line), so user turns are printed here instead. No-op in
+    /// frame mode: the frame transcript already holds the conversation.
     pub fn replay_event(&self, event: &AgentEvent) {
         if self.frame.lock().unwrap().is_some() {
             return;
@@ -547,42 +568,12 @@ impl Renderer {
         if verbosity() == Verbosity::Quiet {
             return;
         }
-        let mut state = self.state.lock().unwrap();
-        match event {
-            AgentEvent::UserMessage { text } => {
-                if !text.trim().is_empty() {
-                    self.newline(&mut state);
-                    self.out(&mut state, &format!("{}> {}\n", stamp(), text));
-                }
+        if let AgentEvent::UserMessage { text } = event {
+            let mut state = self.state.lock().unwrap();
+            if !text.trim().is_empty() {
+                self.newline(&mut state);
+                self.out(&mut state, &format!("{}> {}\n", stamp(), text));
             }
-            AgentEvent::AssistantMessage { text, .. } => {
-                self.finish_thinking(&mut state);
-                if !text.trim().is_empty() {
-                    self.newline(&mut state);
-                    let stamp = stamp();
-                    self.out_aligned(&mut state, text, stamp.chars().count());
-                    self.out(&mut state, "\n");
-                }
-            }
-            AgentEvent::Thinking { text } => {
-                if !state.streamed_thinking {
-                    self.thinking_delta(&mut state, text);
-                    self.finish_thinking(&mut state);
-                }
-                state.streamed_thinking = false;
-            }
-            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. } | AgentEvent::Plan { .. } => {
-                // Matches the live legacy rendering exactly (verbosity-aware
-                // tool lines, the plan checklist).
-                drop(state);
-                self.event(event);
-            }
-            // Replay never emits deltas (only whole messages), and `Context` /
-            // `Compacted` carry no transcript text.
-            AgentEvent::TextDelta { .. }
-            | AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::Context
-            | AgentEvent::Compacted => {}
         }
     }
 
@@ -761,6 +752,13 @@ impl Renderer {
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
             self.frame_render(fs);
+            // `begin_turn` sets the legacy `in_turn` flag even in frame mode;
+            // clear it here too, or switching back to legacy leaves Ctrl-O at
+            // the prompt behaving as though a turn is still active.
+            let mut state = self.state.lock().unwrap();
+            state.in_turn = false;
+            state.streamed_text = false;
+            state.streamed_thinking = false;
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -1228,6 +1226,51 @@ mod tests {
         fn frame_batching(&self) -> bool {
             self.frame.lock().unwrap().as_ref().unwrap().batch
         }
+
+        #[cfg(test)]
+        fn deferred_notes(&self) -> Vec<String> {
+            self.state.lock().unwrap().deferred.clone()
+        }
+
+        #[cfg(test)]
+        fn in_turn(&self) -> bool {
+            self.state.lock().unwrap().in_turn
+        }
+    }
+
+    #[test]
+    fn leaving_frame_mode_drains_frame_only_items_into_legacy_notes() {
+        // Frame-only output (the startup banner, `/help` text, notes) lives
+        // only in `FrameState.items` — not in the conversation the caller
+        // replays — and frame redraws cleared the old scrollback, so dropping
+        // the frame must move it into legacy scrollback (as deferred notes).
+        // Conversation items are left to the history replay, not repeated.
+        let r = Renderer::frame_for_test();
+        r.print_block("nano-coder v0.0.0\nType /help for commands");
+        r.note("a renderer note");
+        r.event(&AgentEvent::UserMessage { text: "hi" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "hello" });
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        assert!(r.frame.lock().unwrap().is_none(), "frame dropped");
+        let notes = r.deferred_notes();
+        assert!(notes.iter().any(|n| n.contains("nano-coder v0.0.0")), "banner preserved: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("a renderer note")), "note preserved: {notes:?}");
+        assert!(
+            !notes.iter().any(|n| n.contains("hi") || n.contains("hello")),
+            "conversation items are replayed, not drained: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn frame_mode_end_turn_clears_the_legacy_turn_flag() {
+        // `begin_turn` sets `in_turn` even in frame mode; if the frame branch
+        // of `end_turn` did not clear it, switching back to legacy would leave
+        // Ctrl-O at the prompt behaving as though a turn were still active.
+        let r = Renderer::frame_for_test();
+        r.begin_turn();
+        assert!(r.in_turn());
+        r.end_turn();
+        assert!(!r.in_turn(), "frame-mode end_turn must clear the legacy flag");
     }
 
     #[test]

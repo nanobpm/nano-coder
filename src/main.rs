@@ -50,7 +50,6 @@ mod ui;
 use agent::Agent;
 use config::ConfigManager;
 use hooks::HookEvent;
-use llm::Role;
 use tools::ToolDefinition;
 
 fn register_builtin_tools(agent: &mut Agent) {
@@ -436,19 +435,21 @@ impl Terminal {
             return;
         }
         self.renderer_before = mode;
-        // Leaving frame mode: the frame's full redraws cleared the legacy
-        // scrollback, so the legacy transcript is gone — capture the
-        // conversation now and reprint it below, once legacy owns the screen
-        // again. The interactive prompt's current line is the conversation's
-        // last user message but was never printed as a transcript line (the
-        // editor owns it), so it is skipped in the replay rather than
-        // duplicated.
         let switching_to_frame = mode == crate::frame::RendererMode::Frame;
-        let pending_user = if switching_to_frame {
-            None
-        } else {
-            agent.last_message().filter(|m| m.role == Role::User).map(|m| m.content.clone())
-        };
+        // Leaving frame mode: the frame's full redraws cleared the legacy
+        // scrollback, so the legacy transcript is gone — the conversation is
+        // replayed below, once legacy owns the screen again. The interactive
+        // prompt's current line is NOT in the conversation (it is recorded
+        // only when submitted), so replaying every user message cannot
+        // duplicate the line being edited.
+        //
+        // Entering frame mode: legacy output that exists only in renderer
+        // state (deferred notes, the collapsed thinking summary) must move
+        // into the frame transcript BEFORE the frame is activated — once it
+        // is, `drain_pending` (a legacy-state accessor) returns empty, and
+        // the frame's first full redraw clears the scrollback those notes
+        // were headed for.
+        let pending = if switching_to_frame { self.renderer.drain_pending() } else { Vec::new() };
         self.renderer.set_mode(mode);
         let on = self.renderer.is_frame();
         // Rebuild the frame hook to match: frame routes every edit through the
@@ -484,22 +485,22 @@ impl Terminal {
         if on {
             // A fresh frame starts empty, so the transcript must be rebuilt
             // into it (its first full redraw clears scrollback and re-owns the
-            // screen). Move legacy output that exists only in renderer state
-            // (deferred notes, the collapsed thinking summary) into the frame
-            // first so the clear cannot erase it, then replay the conversation
-            // as one batch: rendering per event would redo the whole
-            // transcript layout each time (O(events²) on a long session).
-            let pending = self.renderer.drain_pending();
+            // screen). Seed the drained legacy output first so it lands ahead
+            // of the conversation, then replay the conversation as one batch:
+            // rendering per event would redo the whole transcript layout each
+            // time (O(events²) on a long session).
             self.renderer.push_items(pending);
             let renderer = self.renderer.clone();
-            self.renderer.frame_batch(|| agent.replay_history_with(None, |event| renderer.replay_event(event)));
+            self.renderer.frame_batch(|| agent.replay_history_with(|event| renderer.replay_event(event)));
         } else {
             // Legacy scrollback was cleared by the frame's redraws: reprint
             // the conversation so older turns stay accessible. The tap prints
-            // (frame mode is already off); the emitted events reach only the
-            // detached frame sink, which ignores them.
+            // only the user turns (the sink's legacy `Renderer::event` renders
+            // everything else and ignores replayed user messages); `set_mode`
+            // has already drained the frame-only items (banner, `/help`,
+            // notes) into legacy scrollback.
             let renderer = self.renderer.clone();
-            agent.replay_history_with(pending_user.as_deref(), |event| renderer.replay_event(event));
+            agent.replay_history_with(|event| renderer.replay_event(event));
         }
     }
 

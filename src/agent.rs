@@ -1017,21 +1017,18 @@ impl Agent {
     }
 
     /// Re-emit the conversation like `replay_history`, additionally passing
-    /// each event to `tap` as it is emitted. Used when leaving frame mode:
-    /// the frame's full redraws cleared the legacy scrollback, so the legacy
-    /// renderer reprints the conversation from the tap while the (now
-    /// detached) frame sink ignores the events. `skip_user` names a user
-    /// message whose replay is skipped: the interactive prompt's current line
-    /// was recorded into the conversation without ever being printed as a
-    /// transcript line (the editor owns it), so reprinting it would duplicate
-    /// the text the user is still editing.
-    pub fn replay_history_with(&mut self, skip_user: Option<&str>, tap: impl Fn(&AgentEvent)) {
+    /// each event to `tap` as it is emitted. Used on a live renderer switch:
+    /// the tap reprints the conversation into the newly active renderer while
+    /// the emitted events reach the installed sink. Every user message is
+    /// replayed — the interactive prompt's current line is not part of the
+    /// conversation (it is recorded only when submitted), so nothing here can
+    /// duplicate the line being edited.
+    pub fn replay_history_with(&mut self, tap: impl Fn(&AgentEvent)) {
         if self.event_sink.is_none() {
             return;
         }
         let conversation = self.conversation.clone();
         let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
-        let mut skipped = false;
         macro_rules! replay {
             ($event:expr) => {{
                 let event = $event;
@@ -1043,11 +1040,7 @@ impl Agent {
             match message.role {
                 Role::System => {}
                 Role::User => {
-                    let skip = !skipped && skip_user.is_some_and(|s| s == message.content);
-                    skipped |= skip;
-                    if !skip {
-                        replay!(AgentEvent::UserMessage { text: &message.content });
-                    }
+                    replay!(AgentEvent::UserMessage { text: &message.content });
                 }
                 Role::Assistant => {
                     if !message.content.trim().is_empty() {
@@ -2495,12 +2488,6 @@ impl Agent {
     pub fn conversation(&self) -> &[Message] {
         &self.conversation
     }
-
-    /// The most recent conversation message, if any. Used by a renderer
-    /// switch to recognise the interactive prompt's in-flight user line.
-    pub fn last_message(&self) -> Option<&Message> {
-        self.conversation.last()
-    }
 }
 
 /// Keep only characters that are safe in a file name.
@@ -2543,6 +2530,27 @@ mod tests {
         agent.set_model("mock/other-model").await.unwrap();
         assert_eq!(agent.config().model, "mock/other-model");
         assert_eq!(agent.model_name(), "other-model");
+    }
+
+    #[test]
+    fn replay_history_with_replays_every_user_message() {
+        // A renderer switch replays the conversation into the newly active
+        // renderer. The interactive prompt's in-flight line is not part of
+        // the conversation (it is recorded only when submitted), so no user
+        // message is skipped — including a trailing one with no assistant
+        // reply yet, and repeated texts.
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("gpt-4o-mini")), Config::default());
+        agent.set_event_sink(Box::new(|_, _| {}));
+        agent.conversation.push(Message::user("same"));
+        agent.conversation.push(Message::assistant("first answer"));
+        agent.conversation.push(Message::user("same"));
+        let tapped: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        agent.replay_history_with(|event| {
+            if let AgentEvent::UserMessage { text } = event {
+                tapped.borrow_mut().push(text.to_string());
+            }
+        });
+        assert_eq!(*tapped.borrow(), vec!["same".to_string(), "same".to_string()]);
     }
 
     #[test]
