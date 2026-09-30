@@ -583,7 +583,8 @@ fn sanitize_terminal(text: &str) -> String {
 
 /// Show `text` in the user's pager (`$PAGER`, default `less`), run through
 /// `sh -c` like git does. Returns `false` when no pager could be started (the
-/// caller prints the text instead). The pager reads the text on stdin and the
+/// caller prints the text instead), including when the shell could not find
+/// or run it (exit status 127 / 126). The pager reads the text on stdin and the
 /// keyboard from the terminal; it owns the screen until it exits.
 pub fn page(text: &str) -> bool {
     use std::io::Write;
@@ -601,13 +602,31 @@ pub fn page(text: &str) -> bool {
         // A pager quit before reading everything closes the pipe: not an error.
         let _ = stdin.write_all(text.as_bytes());
     }
-    child.wait().is_ok()
+    child.wait().is_ok_and(|status| pager_ran(status.code()))
 }
 
-/// Whether `text` is worth paging on a terminal of `rows` rows: it would not
-/// fit on one screen.
-pub fn needs_pager(text: &str, rows: usize) -> bool {
-    text.lines().count() + 2 > rows
+/// Whether a pager that exited with `code` actually ran. `sh -c` exits 127
+/// when the command is not found and 126 when it cannot be executed; any other
+/// status (including a non-zero one, or death by a signal) means the pager
+/// started and showed the text, so printing it again would only duplicate it.
+fn pager_ran(code: Option<i32>) -> bool {
+    !matches!(code, Some(126 | 127))
+}
+
+/// Whether `text` is worth paging on a `rows` x `cols` terminal: once long
+/// lines wrap (counted in display cells), it would not fit on one screen with
+/// room for the prompt.
+pub fn needs_pager(text: &str, rows: usize, cols: usize) -> bool {
+    let cols = cols.max(1);
+    let limit = rows.saturating_sub(2);
+    let mut used = 0usize;
+    for line in text.lines() {
+        used += UnicodeWidthStr::width(line).div_ceil(cols).max(1);
+        if used > limit {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -668,6 +687,30 @@ mod tests {
         let traj = Trajectory::from_records(&records());
         assert!(traj.turns[0].rows.iter().all(|r| r.id.is_none()));
         assert!(!traj.to_plain().contains(" #"), "{}", traj.to_plain());
+    }
+
+    #[test]
+    fn needs_pager_counts_wrapped_rows() {
+        // Ten 300-column lines are 3 lines short of a 24-row screen by count,
+        // but 40 rows once wrapped at 80 columns.
+        let long = vec!["x".repeat(300); 10].join("\n");
+        assert!(needs_pager(&long, 24, 80));
+        assert!(!needs_pager(&long, 24, 400));
+        // Wide characters take two cells each.
+        let wide = vec!["界".repeat(100); 10].join("\n");
+        assert!(needs_pager(&wide, 24, 80));
+        // Short text and empty lines fit.
+        assert!(!needs_pager("a\n\nb", 24, 80));
+        assert!(needs_pager(&"a\n".repeat(23), 24, 80));
+    }
+
+    #[test]
+    fn a_pager_that_could_not_start_falls_back() {
+        assert!(!pager_ran(Some(127)), "command not found");
+        assert!(!pager_ran(Some(126)), "not executable");
+        assert!(pager_ran(Some(0)));
+        assert!(pager_ran(Some(1)), "ran, then failed: the text was shown");
+        assert!(pager_ran(None), "killed by a signal after starting");
     }
 
     #[test]

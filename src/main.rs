@@ -913,7 +913,8 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
 fn trajectory_pageable(traj: &trajectory::Trajectory) -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
-        && status::terminal_size().is_some_and(|(rows, _)| trajectory::needs_pager(&traj.to_plain(), rows as usize))
+        && status::terminal_size()
+            .is_some_and(|(rows, cols)| trajectory::needs_pager(&traj.to_plain(), rows as usize, cols as usize))
 }
 
 /// Emit a transient diagnostic: through the frame transcript in frame mode (a
