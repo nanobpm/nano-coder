@@ -835,10 +835,13 @@ Two scopes:
 - `project` - keyed by the git remote (fallback: the git root path); this repo's quirks and
   setup. Unavailable outside a git repository.
 
-Storage mirrors the session log: append-oriented JSONL, one entry per line, under
-`<memory_dir>/user.jsonl` and `<memory_dir>/projects/<key>.jsonl` (default `<data>/memory`,
-next to `sessions/`). Each entry has an id, the text, created and last-used dates, the source
-session, and optional evidence (a file path or command). Search is a case-insensitive regex
+Storage mirrors the session log's format but not its write pattern: each scope is a JSONL
+file, one entry per line, under `<memory_dir>/user.jsonl` and `<memory_dir>/projects/<key>.jsonl`
+(default `<data>/memory`, next to `sessions/`). Every save, matching search, expiry prune, and
+forget **atomically rewrites** the complete scope (write a sibling temp file, then rename) rather
+than appending, so do not infer session-log-style append behaviour or append-write performance.
+Each entry has an id, the text, created and last-used dates, the source session, and optional
+evidence (a file path or command). Search is a case-insensitive regex
 over the text and the optional evidence, as in `history_search` - no embeddings or vector
 store.
 

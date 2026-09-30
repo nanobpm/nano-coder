@@ -597,16 +597,27 @@ fn write_all(path: &Path, entries: &[Entry], unknown: &[String]) -> Result<()> {
         body.push('\n');
     }
     let tmp = path.with_extension(format!("jsonl.tmp.{}.{:08x}", std::process::id(), fastrand::u32(..)));
-    std::fs::write(&tmp, body)?;
-    // Preserve the target's permissions across the atomic rewrite: the temp file
+    // Create the (empty) temp file first, then copy the target's permissions
+    // onto it, and only then write the body. Writing first (the previous order)
+    // briefly placed the full contents in an umask-created `0644`/`0664` sibling
+    // that another local user could read or monitor before the restrictive
+    // permissions were applied (Copilot finding, src/memory.rs). The temp file
     // is created with the process umask, so a rename would otherwise silently
     // widen a user-protected `0600` memory file to `0644`/`0664`, exposing it to
     // other local users. Copy the existing target's permissions onto the temp
     // file first (as `src/files.rs` does); a missing target (first save) keeps
     // the umask default. Clean up the temp file if the chmod itself fails.
+    let mut file = std::fs::File::create(&tmp)?;
     if let Ok(meta) = std::fs::metadata(path)
         && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
     {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    // Write the body only after the restrictive permissions are in place, and
+    // remove the temp file if the write itself fails so a partial body is never
+    // left behind in a readable sibling.
+    if let Err(e) = std::io::Write::write_all(&mut file, body.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
@@ -808,12 +819,16 @@ fn normalize_remote(url: &str) -> String {
     // collapse onto one project key and share a memory file.
     let s: String = if scp {
         // SCP-style `[user@]host:owner/repo`: the authority is before the `:`.
+        // Unlike a URI authority, SCP syntax carries no password — only an
+        // optional login username — so there is no credential to strip. The
+        // username is part of the repository *identity*: a relative path is
+        // resolved under that user's home, so `alice@host:repo.git` and
+        // `bob@host:repo.git` may name different repositories. Keep the
+        // username so these scopes cannot collide on one project-memory file
+        // (Copilot finding, src/memory.rs).
         match s.split_once(':') {
-            Some((authority, path)) => {
-                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-                format!("{host}/{path}")
-            }
-            None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
+            Some((authority, path)) => format!("{authority}/{path}"),
+            None => s.to_string(),
         }
     } else if uri {
         // URI `[user:pass@]host[:port]/path`: the authority is before the `/`.
@@ -966,6 +981,60 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
             }
         }
     }
+    // Natural-language copular forms: `database password is hunter2`, `the token
+    // was abc123`. These carry no `:`/`=`, so the assignment rule above misses
+    // them and the obvious secret is persisted in plaintext even though memory
+    // text is normally prose (Copilot finding, src/memory.rs). Detect a
+    // secret-labelled subject followed by a copula and a value, while exempting
+    // *location-only* guidance such as "the password is stored in …" or "the API
+    // key is in vault" — those point to where a secret lives rather than stating
+    // it, and must not be blocked.
+    let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*\s+(?:is|was|are|be)\s+["']?(\S+)"#;
+    if let Ok(re) = RegexBuilder::new(copular).build() {
+        for caps in re.captures_iter(text) {
+            let value = caps[1].trim_matches(|c: char| ['"', '\''].contains(&c));
+            // Exempt location-only guidance: a value that is itself a
+            // location/preposition word ("stored", "in", "at", "kept", "lives",
+            // "set", "saved", …) means the sentence says *where* the secret is,
+            // not the secret itself.
+            let lower = value.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "stored"
+                    | "in"
+                    | "at"
+                    | "kept"
+                    | "lives"
+                    | "set"
+                    | "saved"
+                    | "located"
+                    | "found"
+                    | "defined"
+                    | "configured"
+                    | "managed"
+                    | "read"
+                    | "loaded"
+                    | "fetched"
+                    | "from"
+                    | "under"
+                    | "inside"
+                    | "within"
+                    | "on"
+                    | "via"
+                    | "the"
+                    | "a"
+                    | "an"
+                    | "your"
+                    | "my"
+                    | "our"
+            ) {
+                continue;
+            }
+            if !is_placeholder(value) {
+                return Some("credential statement");
+            }
+        }
+    }
     None
 }
 
@@ -1028,7 +1097,7 @@ fn is_placeholder_filler(value: &str) -> bool {
     if matches!(
         lower.as_str(),
         "none" | "null" | "nil" | "todo" | "tbd" | "changeme" | "change_me" | "redacted" | "placeholder" | "example"
-    ) || trimmed.chars().all(|c| matches!(c, 'x' | 'X' | '*' | '•'))
+    ) || value.trim().chars().all(|c| matches!(c, 'x' | 'X' | '*' | '•'))
     {
         return true;
     }
@@ -1135,6 +1204,11 @@ mod tests {
         // src/memory.rs).
         assert!(store.save(Scope::User, "config: PASSWORD=!@#$%^&*()", None, None).is_err());
         assert!(store.save(Scope::User, "config: token=---", None, None).is_err());
+        // Punctuation around an all-`x` value is not a mask: the mask check must
+        // run on the original whitespace-trimmed value, so `xxxx!` is a real
+        // secret, not a placeholder (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "config: PASSWORD=xxxx!", None, None).is_err());
+        assert!(store.save(Scope::User, "config: PASSWORD=xxxx.", None, None).is_err());
         // The supported mask redactions and an empty value remain placeholders.
         assert!(store.save(Scope::User, "config: password=********", None, None).is_ok());
         assert!(store.save(Scope::User, "config: password=xxxxxxxx", None, None).is_ok());
@@ -1155,6 +1229,17 @@ mod tests {
         // Short prose uses of the words are not credentials.
         assert!(store.save(Scope::User, "use Bearer token auth", None, None).is_ok());
         assert!(store.save(Scope::User, "Basic auth header", None, None).is_ok());
+        // A natural-language copular form states a secret in plaintext even
+        // though it has no `:`/`=` for the assignment rule to catch (Copilot
+        // finding, src/memory.rs).
+        assert!(store.save(Scope::User, "database password is hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "the token was abc123def456", None, None).is_err());
+        assert!(store.save(Scope::User, "my api_key is s3cr3tvalue", None, None).is_err());
+        // Location-only guidance points to *where* a secret lives rather than
+        // stating it, and must not be blocked (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "the password is stored in ~/.config/app/creds", None, None).is_ok());
+        assert!(store.save(Scope::User, "the API key is in vault", None, None).is_ok());
+        assert!(store.save(Scope::User, "the token is set in the environment", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
@@ -1423,7 +1508,13 @@ mod tests {
 
     #[test]
     fn normalizes_remotes_to_a_stable_key() {
-        assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
+        // SCP-style `[user@]host:path` keeps the username: SCP syntax carries no
+        // password, and the username is part of the repository identity (a
+        // relative path resolves under that user's home), so stripping it would
+        // let `alice@host:repo.git` and `bob@host:repo.git` collide on one key
+        // (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "git@github.com/nanobpm/nano-coder");
+        assert_ne!(normalize_remote("alice@host.example:repo.git"), normalize_remote("bob@host.example:repo.git"));
         assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
         assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "example.com/a/b");
         // Query strings / fragments (which can carry credentials like
