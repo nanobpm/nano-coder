@@ -185,9 +185,15 @@ pub async fn run(
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
                     .interact_text()
-                    && agent.set_system_prompt(&value).is_ok()
                 {
-                    changes.system_prompt = true;
+                    // `set_system_prompt` is atomic (it rolls its config change
+                    // back on failure), so on error the prompt is unchanged;
+                    // retain a notice since the dialog's own `println!` is wiped
+                    // by the exit redraw in frame mode.
+                    match agent.set_system_prompt(&value) {
+                        Ok(()) => changes.system_prompt = true,
+                        Err(e) => notices.push(format!("Could not update the system prompt: {e:#}")),
+                    }
                 }
             }
             6 => {

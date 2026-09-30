@@ -1365,8 +1365,16 @@ impl Agent {
 
     /// Set the system prompt and reset conversation
     pub fn set_system_prompt(&mut self, prompt: &str) -> Result<()> {
-        self.config.system_prompt = prompt.to_string();
-        self.replace_conversation(vec![Message::system(&self.system_prompt())])
+        let previous = std::mem::replace(&mut self.config.system_prompt, prompt.to_string());
+        let result = self.replace_conversation(vec![Message::system(&self.system_prompt())]);
+        // Keep config and conversation consistent: `replace_conversation` can
+        // fail while appending the durable replace record, which leaves the
+        // active conversation untouched. Roll the config prompt back so the two
+        // never drift out of sync on a failed update.
+        if result.is_err() {
+            self.config.system_prompt = previous;
+        }
+        result
     }
 
     /// The configured system prompt plus any project instructions and the

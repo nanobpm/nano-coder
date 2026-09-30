@@ -359,10 +359,11 @@ impl Renderer {
         if self.frame.lock().unwrap().is_some() || state.transcript.is_empty() {
             return;
         }
-        if verbosity() == Verbosity::Quiet {
-            state.transcript.clear();
-            return;
-        }
+        // Replay even in quiet mode. Leaving the frame clears the screen AND
+        // scrollback, and in quiet mode the frame only ever recorded what it
+        // displayed — final assistant replies and `print_raw` exports (both
+        // printed regardless of verbosity). Dropping the transcript here would
+        // erase those already-visible lines; replaying restores exactly them.
         let items = std::mem::take(&mut state.transcript);
         for si in &items {
             self.replay_item(&mut state, si);
@@ -1338,7 +1339,11 @@ fn plan_checklist(plan: &Plan, width: usize) -> String {
             out.push_str(&format!("  {DIM}… +{} more{RESET}\n", visible.len() - shown));
             break;
         }
-        let title = fit(&item.title, width);
+        // A plan title is model-controlled (`plan_add` / `plan_update`), so it
+        // may embed cursor/erase escapes. This legacy `fit` does NOT sanitize
+        // (unlike the frame's), so strip them before formatting to keep e.g.
+        // `\x1b[2J` from clearing the terminal on replay or live legacy output.
+        let title = fit(&crate::sanitize_terminal_text(&item.title), width);
         let line = match item.status {
             Status::Done => format!("{GREEN}✔{RESET} {DIM}{title}{RESET}"),
             Status::InProgress => format!("{BOLD}◼ {title}{RESET}"),
@@ -1749,5 +1754,27 @@ mod tests {
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");
+    }
+
+    #[test]
+    fn plan_checklist_sanitizes_model_controlled_titles() {
+        // A plan title comes from a model's `plan_add` / `plan_update`, so the
+        // legacy checklist (used on frame→legacy replay and live legacy output)
+        // must strip cursor/erase escapes before printing — otherwise a title
+        // like `\x1b[2J` would clear the terminal.
+        let plan = Plan {
+            goal: String::new(),
+            items: vec![PlanItem {
+                id: 1,
+                title: "\x1b[2Jwipe\x1b[H".to_string(),
+                status: Status::Pending,
+                notes: Vec::new(),
+                after: Vec::new(),
+            }],
+        };
+        let rendered = plan_checklist(&plan, 80);
+        assert!(!rendered.contains("\x1b[2J"), "erase escape leaked: {rendered:?}");
+        assert!(!rendered.contains("\x1b[H"), "cursor escape leaked: {rendered:?}");
+        assert!(rendered.contains("wipe"), "title text dropped: {rendered:?}");
     }
 }
