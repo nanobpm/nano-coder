@@ -39,8 +39,7 @@ pub fn looks_failed(tool: &str, ok: bool, result: &str) -> bool {
 
 /// Line prefixes `bash::run` uses to report a command that ran but failed (see
 /// `src/bash.rs`): a non-zero exit, a timeout, or termination by a signal.
-const BASH_FAILURE_MARKERS: [&str; 3] =
-    ["Exit code: ", "Error: command timed out ", "Terminated by signal "];
+const BASH_FAILURE_MARKERS: [&str; 3] = ["Exit code: ", "Error: command timed out ", "Terminated by signal "];
 
 /// Whether `marker` begins `text` or begins any line within it.
 fn line_starts_with(text: &str, marker: &str) -> bool {
@@ -58,8 +57,7 @@ fn line_starts_with(text: &str, marker: &str) -> bool {
 pub fn consumes_hint(message: &Message) -> bool {
     match message.role {
         Role::Tool => {
-            message.content.contains(FAILED_TOOL_HINT)
-                || message.name.as_deref().is_some_and(is_history_tool)
+            message.content.contains(FAILED_TOOL_HINT) || message.name.as_deref().is_some_and(is_history_tool)
         }
         Role::Assistant => message.tool_calls.iter().any(|call| is_history_tool(&call.name)),
         _ => false,
@@ -172,12 +170,9 @@ fn id_arg(args: &Value, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| anyhow!("{key} must be a positive integer")),
-        Some(Value::String(s)) => s
-            .trim()
-            .trim_start_matches('#')
-            .parse()
-            .map(Some)
-            .map_err(|_| anyhow!("{key} must be a positive integer")),
+        Some(Value::String(s)) => {
+            s.trim().trim_start_matches('#').parse().map(Some).map_err(|_| anyhow!("{key} must be a positive integer"))
+        }
         Some(_) => bail!("{key} must be a positive integer"),
     }
 }
@@ -186,7 +181,10 @@ fn snippet(text: &str, start: usize, end: usize) -> String {
     let lead = SNIPPET_CHARS / 3;
     let from = text[..start].char_indices().rev().nth(lead - 1).map_or(0, |(i, _)| i);
     let room = SNIPPET_CHARS.saturating_sub(text[from..start].chars().count());
-    let to = text[end..].char_indices().nth(room.saturating_sub(text[start..end].chars().count())).map_or(text.len(), |(i, _)| end + i);
+    let to = text[end..]
+        .char_indices()
+        .nth(room.saturating_sub(text[start..end].chars().count()))
+        .map_or(text.len(), |(i, _)| end + i);
     let mut out = text[from..to].split_whitespace().collect::<Vec<_>>().join(" ");
     if from > 0 {
         out.insert(0, '…');
@@ -211,7 +209,10 @@ fn preceding_tool_outputs(messages: &[(u64, Message)], index: usize) -> Option<S
 
 /// `history_search`: matching messages, newest first.
 pub fn search(path: &Path, args: &Value) -> Result<String> {
-    let pattern = args.get("pattern").and_then(Value::as_str).filter(|p| !p.is_empty())
+    let pattern = args
+        .get("pattern")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow!("pattern must be a non-empty string"))?;
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(true)
@@ -232,7 +233,8 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
     let messages = load(path)?;
     let ordered: Box<dyn Iterator<Item = &(u64, Message)>> =
         if oldest_first { Box::new(messages.iter()) } else { Box::new(messages.iter().rev()) };
-    let position: std::collections::HashMap<u64, usize> = messages.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+    let position: std::collections::HashMap<u64, usize> =
+        messages.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
     let mut hits = Vec::new();
     let mut total = 0;
     let mut omitted = (u64::MAX, 0u64);
@@ -373,7 +375,13 @@ mod tests {
         let mut log = SessionLog::create(dir, "h").unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
         log.append(&Record::Message(Message::user("fix the flaky test in auth.rs"))).unwrap();
-        let call = crate::llm::ToolCall { id: "c1".into(), name: "bash".into(), arguments: json!({"command": "cargo test auth"}), item_id: None, malformed_arguments: None };
+        let call = crate::llm::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "cargo test auth"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
         log.append(&Record::Message(Message::assistant_with_tools("", vec![call]))).unwrap();
         let long = format!("{}error[E0308]: mismatched types at auth.rs:42{}", "a ".repeat(400), " b".repeat(400));
         log.append(&Record::Message(Message::tool_error("c1", "bash", &long))).unwrap();
@@ -423,7 +431,10 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() == 2 && lines[0].starts_with("#3 user") && lines[1].starts_with("[role=user hid"), "{out}");
         let out = search(&path, &json!({"pattern": "auth", "limit": 1})).unwrap();
-        assert!(out.contains("[2 more older matching messages not shown (#3–#4)") && out.contains("order=oldest"), "{out}");
+        assert!(
+            out.contains("[2 more older matching messages not shown (#3–#4)") && out.contains("order=oldest"),
+            "{out}"
+        );
         let out = search(&path, &json!({"pattern": "auth", "order": "oldest", "limit": 1})).unwrap();
         assert!(out.starts_with("#3 user") && out.contains("2 more newer") && out.contains("order=newest"), "{out}");
         assert!(search(&path, &json!({"pattern": "auth", "order": "sideways"})).is_err());
@@ -440,7 +451,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = crate::session::SessionLog::create(dir.path(), "s").unwrap();
         let noise = "x ".repeat(300);
-        let text = format!("Compiling lease {noise} Compiling lease {noise} error[E0599]: no method named `renew` in lease {noise}");
+        let text = format!(
+            "Compiling lease {noise} Compiling lease {noise} error[E0599]: no method named `renew` in lease {noise}"
+        );
         log.append(&Record::Message(Message::tool_result("t1", "bash", &text))).unwrap();
         let out = search(log.path(), &json!({"pattern": "lease"})).unwrap();
         assert!(out.contains("[3 matches]") && out.contains("no method named `renew`"), "{out}");
@@ -514,7 +527,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "t").unwrap();
         let mut thinker = Message::assistant("");
-        thinker.thinking_blocks = vec![json!({"type": "thinking", "thinking": "weigh the options", "signature": "sig"})];
+        thinker.thinking_blocks =
+            vec![json!({"type": "thinking", "thinking": "weigh the options", "signature": "sig"})];
         log.append(&Record::Message(thinker)).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] weigh the options"), "{out}");
@@ -542,7 +556,13 @@ mod tests {
         assert!(!consumes_hint(&Message::user(FAILED_TOOL_HINT)));
         assert!(!consumes_hint(&Message::assistant(FAILED_TOOL_HINT)));
         // A history-tool call (assistant) and its result (tool) both consume it.
-        let call = crate::llm::ToolCall { id: "h".into(), name: SEARCH_TOOL.into(), arguments: json!({}), item_id: None, malformed_arguments: None };
+        let call = crate::llm::ToolCall {
+            id: "h".into(),
+            name: SEARCH_TOOL.into(),
+            arguments: json!({}),
+            item_id: None,
+            malformed_arguments: None,
+        };
         assert!(consumes_hint(&Message::assistant_with_tools("", vec![call])));
         assert!(consumes_hint(&Message::tool_result("h", READ_TOOL, "results")));
         // An assistant that only names a history tool in its text does not.

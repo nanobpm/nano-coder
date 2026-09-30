@@ -1,7 +1,7 @@
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use anyhow::{Result, Context};
 
 use crate::providers::ProviderConfig;
 
@@ -110,11 +110,8 @@ impl Config {
             if default_provider == "mock" {
                 default_provider = "openai".to_string();
             }
-            let legacy = ProviderConfig {
-                api_key: self.api_key.clone(),
-                base_url: self.base_url.clone(),
-                ..Default::default()
-            };
+            let legacy =
+                ProviderConfig { api_key: self.api_key.clone(), base_url: self.base_url.clone(), ..Default::default() };
             let entry = providers.remove(&default_provider).unwrap_or_default();
             // Explicit [providers.*] settings win over the legacy fields.
             providers.insert(default_provider.clone(), legacy.merged_with(&entry));
@@ -176,17 +173,15 @@ impl ConfigManager {
     }
 
     pub fn load_from_file(path: &Path) -> Result<Config> {
-        let content = fs::read_to_string(path).with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config = toml::from_str(&content).with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        let content =
+            fs::read_to_string(path).with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let config: Config =
+            toml::from_str(&content).with_context(|| format!("Failed to parse config file: {}", path.display()))?;
         Ok(config)
     }
 
     pub fn from_path(config_path: PathBuf) -> Result<Self> {
-        let config = if config_path.exists() {
-            Self::load_from_file(&config_path)?
-        } else {
-            Config::default()
-        };
+        let config = if config_path.exists() { Self::load_from_file(&config_path)? } else { Config::default() };
         Ok(Self { config_path, config })
     }
 
@@ -215,7 +210,8 @@ mod tests {
 
     #[test]
     fn parses_partial_config_with_providers() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             model = "work/gpt-oss-120b"
 
             [providers.work]
@@ -226,7 +222,9 @@ mod tests {
 
             [providers.anthropic]
             max_retries = 2
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(config.max_tokens, 4096);
         assert_eq!(config.providers["work"].headers["X-Team"], "nwf");
         let (providers, default) = config.effective_providers();
@@ -241,10 +239,13 @@ mod tests {
 
     #[test]
     fn legacy_base_url_targets_an_openai_compatible_default() {
-        let config: Config = toml::from_str(r#"
+        let config: Config = toml::from_str(
+            r#"
             model = "llama3"
             base_url = "http://localhost:8080/v1"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let (providers, default) = config.effective_providers();
         let resolved = crate::providers::resolve(&config.model, &providers, &default).unwrap();
         assert_eq!(resolved.name, "openai");

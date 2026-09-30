@@ -8,19 +8,19 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::config::{CompactionMode, Config};
-use crate::history;
 use crate::context::{self, Activity, SharedStats};
+use crate::goal::{self, Outcome};
+use crate::history;
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
 use crate::instructions::ProjectInstructions;
-use crate::skills::{self, Skills};
-use crate::goal::{self, Outcome};
+use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::output;
 use crate::permissions::Policy;
 use crate::plan::{self, Plan};
-use crate::reminders::{self, Reminders};
-use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall};
 use crate::providers;
+use crate::reminders::{self, Reminders};
 use crate::session::{self, PendingInput, Record, SessionLog};
+use crate::skills::{self, Skills};
 use crate::tools::ToolRegistry;
 
 const INTERRUPTED_TOOL_RESULT: &str =
@@ -296,23 +296,42 @@ impl TurnControl {
 pub enum AgentEvent<'a> {
     /// Emitted when replaying history and for steer/queued messages absorbed
     /// mid-turn.
-    UserMessage { text: &'a str },
-    AssistantMessage { message_id: &'a str, text: &'a str },
+    UserMessage {
+        text: &'a str,
+    },
+    AssistantMessage {
+        message_id: &'a str,
+        text: &'a str,
+    },
     /// Streamed piece of the assistant's answer (only when streaming).
-    TextDelta { text: &'a str },
+    TextDelta {
+        text: &'a str,
+    },
     /// Streamed piece of the model's reasoning (only when streaming).
-    ThinkingDelta { text: &'a str },
+    ThinkingDelta {
+        text: &'a str,
+    },
     /// The model's complete reasoning for one response, emitted before the
     /// response's `AssistantMessage`.
-    Thinking { text: &'a str },
-    ToolCall { call: &'a ToolCall },
-    ToolResult { call: &'a ToolCall, ok: bool, output: &'a str },
+    Thinking {
+        text: &'a str,
+    },
+    ToolCall {
+        call: &'a ToolCall,
+    },
+    ToolResult {
+        call: &'a ToolCall,
+        ok: bool,
+        output: &'a str,
+    },
     /// Context statistics or activity changed (see `Agent::context_stats`).
     Context,
     /// The conversation was compacted.
     Compacted,
     /// The task plan changed (or is being replayed).
-    Plan { plan: &'a Plan },
+    Plan {
+        plan: &'a Plan,
+    },
 }
 
 /// Result of a compaction.
@@ -583,7 +602,11 @@ impl Agent {
         let tools: usize = self
             .tool_definitions()
             .iter()
-            .map(|d| context::text_tokens(&d.name) + context::text_tokens(&d.description) + context::text_tokens(&d.parameters.to_string()))
+            .map(|d| {
+                context::text_tokens(&d.name)
+                    + context::text_tokens(&d.description)
+                    + context::text_tokens(&d.parameters.to_string())
+            })
             .sum();
         (context::messages_tokens(&self.conversation) + tools, false)
     }
@@ -591,9 +614,7 @@ impl Agent {
     /// Recompute the shared statistics and notify the event sink.
     pub fn refresh_stats(&self) {
         let (tokens, calibrated) = self.estimate_context_tokens();
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
         {
             let mut stats = self.stats.lock().unwrap();
             stats.provider = self.client.provider_name().to_string();
@@ -791,8 +812,10 @@ impl Agent {
         // prompt they render) untouched, rather than pairing the old
         // conversation with newly discovered instructions.
         let (instructions, skills) = self.discover_project_instructions();
-        let system =
-            Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt_from(&instructions, &skills)) };
+        let system = Message {
+            timestamp: Some(session::now()),
+            ..Message::system(&self.system_prompt_from(&instructions, &skills))
+        };
         // Stage the new log before mutating any live state so a disk/permission
         // failure leaves the current session (conversation, id, log,
         // instructions, skills) intact instead of detaching the agent from it.
@@ -885,17 +908,12 @@ impl Agent {
     /// Give every tool call without a result a synthetic error result, so the
     /// conversation is valid for providers that require paired results.
     fn repair_dangling_tool_calls(&mut self) -> Result<()> {
-        let Some(index) = self
-            .conversation
-            .iter()
-            .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+        let Some(index) = self.conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
         else {
             return Ok(());
         };
-        let answered: HashSet<&str> = self.conversation[index + 1..]
-            .iter()
-            .filter_map(|m| m.tool_call_id.as_deref())
-            .collect();
+        let answered: HashSet<&str> =
+            self.conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
         let missing: Vec<Message> = self.conversation[index]
             .tool_calls
             .iter()
@@ -1109,18 +1127,16 @@ impl Agent {
             outcome,
         };
         if let Some(id) = input_id
-            && let Some(response) = self.completed_inputs.get(id) {
-                eprintln!("[agent] input {id:?} already processed; returning recorded response");
-                return Ok(end_turn((response.clone(), self.completed_outcomes.get(id).cloned())));
-            }
+            && let Some(response) = self.completed_inputs.get(id)
+        {
+            eprintln!("[agent] input {id:?} already processed; returning recorded response");
+            return Ok(end_turn((response.clone(), self.completed_outcomes.get(id).cloned())));
+        }
         self.control.start_turn();
         self.reminders.start_turn();
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
-        let resuming = self
-            .pending_input
-            .clone()
-            .filter(|pending| input_id == Some(pending.id.as_str()));
+        let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
         let input_id = match input_id {
             Some(id) => id.to_string(),
             None => {
@@ -1180,8 +1196,8 @@ impl Agent {
         }
 
         // Trigger after_context_load hook
-        let ctx = HookContext::new(HookEvent::AfterContextLoad)
-            .with_data("message_count", json!(self.conversation.len()));
+        let ctx =
+            HookContext::new(HookEvent::AfterContextLoad).with_data("message_count", json!(self.conversation.len()));
         self.hooks.trigger(&ctx);
 
         // A cap of 0 is unbounded.
@@ -1206,7 +1222,8 @@ impl Agent {
             if iteration > budget {
                 // Cap reached. Only normal mode in an interactive session asks
                 // to continue; anything else (auto, ACP/headless) stops.
-                let can_prompt = self.control.mode() == crate::mode::AgentMode::Normal && self.questions.is_interactive();
+                let can_prompt =
+                    self.control.mode() == crate::mode::AgentMode::Normal && self.questions.is_interactive();
                 if can_prompt {
                     match self.questions.cap().wait().await {
                         crate::question::CapDecision::Continue => {
@@ -1325,11 +1342,8 @@ impl Agent {
                 };
                 let streaming = self.streaming && event_sink.is_some();
                 request_started = Instant::now();
-                let mut call = if streaming {
-                    self.client.chat_stream(&request, &on_stream)
-                } else {
-                    self.client.chat(&request)
-                };
+                let mut call =
+                    if streaming { self.client.chat_stream(&request, &on_stream) } else { self.client.chat(&request) };
                 // While streaming, refresh the displayed rate on a timer even
                 // when no new deltas arrive. The rate is cumulative
                 // (estimated_tokens / elapsed), so a pause or a hung endpoint
@@ -1367,9 +1381,8 @@ impl Agent {
                         // per-delta rate still reports a `usage / elapsed`
                         // average.
                         let tokens = response.usage.as_ref().and_then(|u| u64::try_from(u.completion_tokens).ok());
-                        if let Some(rate) = meter_live
-                            .then(|| rate_meter.lock().unwrap().finish(tokens, Instant::now()))
-                            .flatten()
+                        if let Some(rate) =
+                            meter_live.then(|| rate_meter.lock().unwrap().finish(tokens, Instant::now())).flatten()
                         {
                             stats.lock().unwrap().tokens_per_sec = Some(rate);
                             if let Some(sink) = event_sink {
@@ -1388,11 +1401,11 @@ impl Agent {
                         // compact once before retrying.
                         overflow_retried = true;
                         let estimate = self.estimate_context_tokens().0;
-                        self.learned_window = Some(
-                            context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000),
-                        );
+                        self.learned_window =
+                            Some(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
-                        let compacted = self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
+                        let compacted =
+                            self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
                         if compacted.is_none() || self.control.is_cancelled() {
                             if self.control.is_cancelled() {
                                 break None;
@@ -1473,7 +1486,9 @@ impl Agent {
                     // don't let a handler misreport it as a missing field —
                     // hand the model a clear, actionable error so it retries.
                     Err(anyhow::anyhow!(error))
-                } else if self.control.mode() == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&tool_call.name) {
+                } else if self.control.mode() == crate::mode::AgentMode::Plan
+                    && !crate::mode::plan_allows(&tool_call.name)
+                {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
@@ -1517,14 +1532,16 @@ impl Agent {
                 if ok
                     && matches!(tool_call.name.as_str(), "read_file" | "write_file" | "edit_file")
                     && let Some(path) = tool_call.arguments.get("path").and_then(Value::as_str)
-                    && let Some(nested) = self.instructions.as_mut().and_then(|i| i.nested_for(std::path::Path::new(path)))
+                    && let Some(nested) =
+                        self.instructions.as_mut().and_then(|i| i.nested_for(std::path::Path::new(path)))
                 {
                     result_text.push_str(&nested);
                 }
                 // bash, read_file and load_skill bound their own output (and bash keeps the whole).
                 if !matches!(tool_call.name.as_str(), "bash" | "read_file" | history::READ_TOOL) && !is_skill_tool {
                     let name = format!("tool-{}-{}.txt", sanitize(&tool_call.id), sanitize(&tool_call.name));
-                    result_text = output::bound_and_spill(&result_text, self.tool_output_limit, &self.spill_dir(), &name);
+                    result_text =
+                        output::bound_and_spill(&result_text, self.tool_output_limit, &self.spill_dir(), &name);
                 }
                 if self.config.reminders && !is_plan_tool && !is_outcome_tool {
                     for note in self.reminders.after_tool_call(&self.plan) {
@@ -1615,7 +1632,11 @@ impl Agent {
     /// in-flight turn's user message) verbatim. `instructions` steer what the
     /// summary focuses on; `mode` overrides `compaction_mode` for this call.
     /// Returns `None` when there is nothing to compact.
-    pub async fn compact(&mut self, mode: Option<CompactionMode>, instructions: Option<&str>) -> Result<Option<CompactReport>> {
+    pub async fn compact(
+        &mut self,
+        mode: Option<CompactionMode>,
+        instructions: Option<&str>,
+    ) -> Result<Option<CompactReport>> {
         self.control.start_turn();
         let mode = mode.unwrap_or(self.config.compaction_mode);
         let report = self.compact_logged(CompactTrigger::Manual, mode, instructions).await;
@@ -1729,13 +1750,21 @@ impl Agent {
             Ok(response) if !response.content.trim().is_empty() => {
                 self.record_usage(&response, false);
                 let summary = if smart {
-                    format!("{}\n{}\n\n{}", context::SMART_SUMMARY_PREFIX, response.content.trim(), context::smart_summary_note(range))
+                    format!(
+                        "{}\n{}\n\n{}",
+                        context::SMART_SUMMARY_PREFIX,
+                        response.content.trim(),
+                        context::smart_summary_note(range)
+                    )
                 } else {
                     format!("{}\n{}", context::SUMMARY_PREFIX, response.content.trim())
                 };
                 (summary, None)
             }
-            Ok(_) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some("empty summary".to_string())),
+            Ok(_) => (
+                self.dropped_note(summarized.len(), smart.then_some(range).flatten()),
+                Some("empty summary".to_string()),
+            ),
             Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
 
@@ -1800,9 +1829,12 @@ impl Agent {
     /// Stand-in for a failed summary. Given the dropped log range (smart
     /// mode), it is a smart summary too, so the history tools stay offered.
     fn dropped_note(&self, count: usize, range: Option<(u64, u64)>) -> String {
-        let note = format!("[{count} earlier messages were removed to fit the context window; no summary is available]");
+        let note =
+            format!("[{count} earlier messages were removed to fit the context window; no summary is available]");
         match range {
-            Some(range) => format!("{}\n{note}\n\n{}", context::SMART_SUMMARY_PREFIX, context::smart_summary_note(Some(range))),
+            Some(range) => {
+                format!("{}\n{note}\n\n{}", context::SMART_SUMMARY_PREFIX, context::smart_summary_note(Some(range)))
+            }
             None => note,
         }
     }
@@ -1889,9 +1921,7 @@ mod tests {
         // A real 4-byte (~1 token) delta one second later starts the clock now,
         // so the first published rate reflects only actual output.
         assert_eq!(meter.record(4, t0 + Duration::from_secs(1)), None);
-        let rate = meter
-            .record(4, t0 + Duration::from_millis(1_500))
-            .expect("rate after real output");
+        let rate = meter.record(4, t0 + Duration::from_millis(1_500)).expect("rate after real output");
         // 8 bytes ≈ 2 tokens over 0.5s ≈ 4 tok/s (not diluted by the empty delta).
         assert!((rate - 4.0).abs() < 0.01, "got {rate}");
     }
@@ -2018,7 +2048,13 @@ mod tests {
 
     fn tool_call(id: &str) -> LLMResponse {
         LLMResponse {
-            tool_calls: vec![ToolCall { id: id.into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "echo".into(),
+                arguments: json!({"text": "pong"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         }
     }
@@ -2030,7 +2066,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn logs_thinking_usage_and_duration_with_assistant_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let usage = |n| Some(crate::llm::TokenUsage { prompt_tokens: n, completion_tokens: 1, total_tokens: n + 1, aic: None });
+        let usage =
+            |n| Some(crate::llm::TokenUsage { prompt_tokens: n, completion_tokens: 1, total_tokens: n + 1, aic: None });
         let responses = vec![
             LLMResponse { thinking: "call the tool".into(), usage: usage(10), ..tool_call("c1") },
             LLMResponse { thinking: "now answer".into(), usage: usage(20), ..text("done") },
@@ -2046,7 +2083,9 @@ mod tests {
         assert_eq!((assistants[1].thinking.as_str(), assistants[1].usage.clone()), ("now answer", usage(20)));
         assert!(assistants.iter().all(|m| m.duration_ms.is_some()));
         // Only assistant messages carry trajectory data.
-        assert!(logged.iter().filter(|m| m.role != Role::Assistant).all(|m| m.duration_ms.is_none() && m.usage.is_none()));
+        assert!(
+            logged.iter().filter(|m| m.role != Role::Assistant).all(|m| m.duration_ms.is_none() && m.usage.is_none())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2107,12 +2146,17 @@ mod tests {
         let id = "sess-crash";
         let mut log = SessionLog::create(dir.path(), id).unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
-        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() })
-            .unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
         log.append(&Record::Message(Message::user("run it"))).unwrap();
         log.append(&Record::Message(Message::assistant_with_tools(
             "",
-            vec![ToolCall { id: "c9".into(), name: "echo".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
+            vec![ToolCall {
+                id: "c9".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
         )))
         .unwrap();
         drop(log);
@@ -2129,8 +2173,7 @@ mod tests {
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
         let mut log = SessionLog::create(dir, id).unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
-        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() })
-            .unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
         for record in records {
             log.append(&record).unwrap();
         }
@@ -2153,10 +2196,7 @@ mod tests {
         crashed_session(
             dir.path(),
             "lost-end",
-            vec![
-                Record::Message(Message::user("run it")),
-                Record::Message(Message::assistant("already answered")),
-            ],
+            vec![Record::Message(Message::user("run it")), Record::Message(Message::assistant("already answered"))],
         );
         let (mut agent, seen) = agent(vec![], dir.path());
         agent.load_session("lost-end").unwrap();
@@ -2229,8 +2269,16 @@ mod tests {
         assert_eq!(agent.send_message("what did the tool say?").await.unwrap(), "it said pong");
         let last = seen.lock().unwrap().last().unwrap().clone();
         let results: Vec<&Message> = last.iter().filter(|m| m.role == Role::Tool).collect();
-        assert!(results[0].content.starts_with("#6 tool echo") && results[0].content.contains(": pong"), "{}", results[0].content);
-        assert!(results[1].content.starts_with("#6 tool echo") && results[1].content.ends_with("\npong"), "{}", results[1].content);
+        assert!(
+            results[0].content.starts_with("#6 tool echo") && results[0].content.contains(": pong"),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            results[1].content.starts_with("#6 tool echo") && results[1].content.ends_with("\npong"),
+            "{}",
+            results[1].content
+        );
         {
             let stats = agent.context_stats();
             let stats = stats.lock().unwrap();
@@ -2240,7 +2288,12 @@ mod tests {
         drop(agent);
         let log = std::fs::read_to_string(dir.path().join(format!("{id}.jsonl"))).unwrap();
         let records: Vec<Record> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert!(records.iter().any(|r| matches!(r, Record::Replace { summarized: Some((4, 6)), mode: Some(CompactionMode::Smart), .. })));
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                Record::Replace { summarized: Some((4, 6)), mode: Some(CompactionMode::Smart), .. }
+            ))
+        );
         assert!(matches!(records.last(), Some(Record::TurnEnd { history_calls: 2, .. })));
         // Kept messages keep their IDs across resume.
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
@@ -2273,7 +2326,10 @@ mod tests {
         agent.send_message("what was the error?").await.unwrap();
         let tool_results = |seen: &Seen| -> Vec<String> {
             let last = seen.lock().unwrap().last().unwrap().clone();
-            last.iter().filter(|m| m.role == Role::Tool && m.name.as_deref() == Some("broken")).map(|m| m.content.clone()).collect()
+            last.iter()
+                .filter(|m| m.role == Role::Tool && m.name.as_deref() == Some("broken"))
+                .map(|m| m.content.clone())
+                .collect()
         };
         let results = tool_results(&seen);
         assert_eq!(results.len(), 2);
@@ -2286,8 +2342,10 @@ mod tests {
 
         // Standard compaction never hints (no history tools).
         let dir = tempfile::tempdir().unwrap();
-        let (mut agent, seen) =
-            self::agent(vec![tool_call("c1"), text("done"), text("SUMMARY"), call("b1", "broken", json!({})), text("x")], dir.path());
+        let (mut agent, seen) = self::agent(
+            vec![tool_call("c1"), text("done"), text("SUMMARY"), call("b1", "broken", json!({})), text("x")],
+            dir.path(),
+        );
         agent.tools().register(
             ToolDefinition::new("broken", "fails", json!({"type": "object"})),
             Box::new(|_| Err(anyhow::anyhow!("boom"))),
@@ -2384,7 +2442,13 @@ mod tests {
     async fn auto_compaction_mid_turn_keeps_the_turn_going() {
         let dir = tempfile::tempdir().unwrap();
         let big = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "big".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
@@ -2438,7 +2502,9 @@ mod tests {
     async fn context_overflow_compacts_and_retries_once() {
         let dir = tempfile::tempdir().unwrap();
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let overflow = "HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens.".to_string();
+        let overflow =
+            "HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens."
+                .to_string();
         let client = Fallible {
             results: Mutex::new(vec![Ok(tool_call("c1")), Err(overflow), Ok(text("SUMMARY")), Ok(text("done"))]),
             seen: seen.clone(),
@@ -2502,12 +2568,19 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tools_seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let overflow = "HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens.".to_string();
+        let overflow =
+            "HTTP 400: This model's maximum context length is 4000 tokens. However, you requested 5000 tokens."
+                .to_string();
         let client = ToolSpy {
             // 0: initial call -> tool call; 1: next request overflows (still
             // pre-compaction tools); 2: the summary request (no tools); 3: the
             // retry after the smart compaction (must now offer history tools).
-            results: Mutex::new(vec![Ok(tool_call("c1")), Err(overflow), Ok(text("SUMMARY: pinged")), Ok(text("done"))]),
+            results: Mutex::new(vec![
+                Ok(tool_call("c1")),
+                Err(overflow),
+                Ok(text("SUMMARY: pinged")),
+                Ok(text("done")),
+            ]),
             tools_seen: tools_seen.clone(),
         };
         let config = Config {
@@ -2577,7 +2650,12 @@ mod tests {
         assert!(!calibrated && raw > 0);
         let response = LLMResponse {
             content: "hi".into(),
-            usage: Some(crate::llm::TokenUsage { prompt_tokens: 1_000, completion_tokens: 50, total_tokens: 1_050, aic: None }),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 50,
+                total_tokens: 1_050,
+                aic: None,
+            }),
             ..Default::default()
         };
         agent.record_usage(&response, true);
@@ -2669,11 +2747,23 @@ mod tests {
         std::fs::write(repo.join("pkg/AGENTS.md"), "Never edit generated files.").unwrap();
         let file = repo.join("pkg/lib.rs");
         let read = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r1".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: "r1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": file}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         };
         let again = LLMResponse {
-            tool_calls: vec![ToolCall { id: "r2".into(), name: "read_file".into(), arguments: json!({"path": file}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: "r2".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": file}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         };
         let (mut agent, seen) = agent(vec![read, again, text("done")], dir.path());
@@ -2696,7 +2786,16 @@ mod tests {
     }
 
     fn call(id: &str, name: &str, arguments: Value) -> LLMResponse {
-        LLMResponse { tool_calls: vec![ToolCall { id: id.into(), name: name.into(), arguments, item_id: None, malformed_arguments: None }], ..Default::default() }
+        LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2710,7 +2809,8 @@ mod tests {
             "---\nname: release\ndescription: Cut a release.\n---\nBump the version, then tag it.\n",
         )
         .unwrap();
-        let (mut agent, seen) = agent(vec![call("s1", "load_skill", json!({"name": "release"})), text("done")], dir.path());
+        let (mut agent, seen) =
+            agent(vec![call("s1", "load_skill", json!({"name": "release"})), text("done")], dir.path());
         agent.new_session().unwrap();
         assert!(!agent.tool_definitions().iter().any(|d| d.name == "load_skill"), "no skills, no tool");
         agent.skills = Skills::discover_in(&repo, &agent.config.skills, &skills::Locations::default());
@@ -2719,8 +2819,12 @@ mod tests {
         agent.send_message("ship it").await.unwrap();
 
         let last = seen.lock().unwrap().last().unwrap().clone();
-        assert!(last[0].content.contains("- `release`: Cut a release.") && !last[0].content.contains("Bump the version"));
-        assert!(last[3].content.contains("Skill: release") && last[3].content.contains("Bump the version, then tag it."));
+        assert!(
+            last[0].content.contains("- `release`: Cut a release.") && !last[0].content.contains("Bump the version")
+        );
+        assert!(
+            last[3].content.contains("Skill: release") && last[3].content.contains("Bump the version, then tag it.")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2745,7 +2849,8 @@ mod tests {
         assert_eq!(agent.plan().progress(), (1, 2));
         assert_eq!(agent.context_stats().lock().unwrap().plan, Some((1, 2)));
 
-        let plans: Vec<Value> = events.lock().unwrap().iter().filter(|u| u["sessionUpdate"] == "plan").cloned().collect();
+        let plans: Vec<Value> =
+            events.lock().unwrap().iter().filter(|u| u["sessionUpdate"] == "plan").cloned().collect();
         assert_eq!(plans.len(), 2, "one per change; failed and read-only calls send none");
         assert_eq!(plans[1]["entries"][0], json!({"content": "Find it", "priority": "medium", "status": "completed"}));
         assert_eq!(plans[1]["_meta"]["plan"]["items"][0]["notes"][0], "it is in parser.rs:40");
@@ -2782,7 +2887,13 @@ mod tests {
     }
 
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: goal::TOOL_NAME.into(), arguments: json!({"status": status, "summary": summary}), item_id: None, malformed_arguments: None }
+        ToolCall {
+            id: id.into(),
+            name: goal::TOOL_NAME.into(),
+            arguments: json!({"status": status, "summary": summary}),
+            item_id: None,
+            malformed_arguments: None,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2791,7 +2902,13 @@ mod tests {
         let batch = LLMResponse {
             tool_calls: vec![
                 report("o1", "completed", "Opened PR #5"),
-                ToolCall { id: "c1".into(), name: "echo".into(), arguments: json!({"text": "pong"}), item_id: None, malformed_arguments: None },
+                ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"text": "pong"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
             ],
             ..Default::default()
         };
@@ -2803,7 +2920,11 @@ mod tests {
         assert_eq!(outcome.response, "Opened PR #5");
         assert_eq!(outcome.outcome, Some(Outcome { status: goal::Status::Completed, summary: "Opened PR #5".into() }));
         let tail = &first.conversation()[first.conversation_length() - 3..];
-        assert_eq!(unstamped(&tail[1]), Message::tool_result("c1", "echo", "pong"), "later calls in the batch still run");
+        assert_eq!(
+            unstamped(&tail[1]),
+            Message::tool_result("c1", "echo", "pong"),
+            "later calls in the batch still run"
+        );
         assert_eq!(unstamped(&tail[2]), Message::assistant("Opened PR #5"));
         drop(first);
 
@@ -2849,7 +2970,11 @@ mod tests {
         let results: Vec<&Message> = last.iter().filter(|m| m.name.as_deref() == Some("echo")).collect();
         assert!(results[..results.len() - 1].iter().all(|m| m.content == "pong"));
         let reminded = &results.last().unwrap().content;
-        assert!(reminded.starts_with("pong\n\n<system-reminder>\n") && reminded.contains("#1 \"Find it\" is still in progress"), "{reminded}");
+        assert!(
+            reminded.starts_with("pong\n\n<system-reminder>\n")
+                && reminded.contains("#1 \"Find it\" is still in progress"),
+            "{reminded}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2907,7 +3032,13 @@ mod tests {
     async fn failed_tool_reports_failed_status_and_replay_covers_history() {
         let dir = tempfile::tempdir().unwrap();
         let broken = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "broken".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "broken".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![broken, text("sorry")], dir.path());
@@ -3022,7 +3153,8 @@ mod tests {
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "adjusted");
         let second = seen.lock().unwrap()[1].clone();
-        let tail: Vec<(Role, &str)> = second.iter().rev().take(2).map(|m| (m.role.clone(), m.content.as_str())).collect();
+        let tail: Vec<(Role, &str)> =
+            second.iter().rev().take(2).map(|m| (m.role.clone(), m.content.as_str())).collect();
         assert_eq!(tail, [(Role::User, "use the other file"), (Role::Tool, "pong")]);
         let absorbed = agent.control().take_absorbed();
         assert_eq!(absorbed.len(), 1);
@@ -3089,13 +3221,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_during_model_call_stops_the_turn() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut agent, _) = interfering(vec![], dir.path(), |_, control| {
-            let control = control.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                control.cancel();
-            });
-        }, Some(1));
+        let (mut agent, _) = interfering(
+            vec![],
+            dir.path(),
+            |_, control| {
+                let control = control.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    control.cancel();
+                });
+            },
+            Some(1),
+        );
         let id = agent.new_session().unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), agent.run_turn(Some("in-1"), "hang"))
             .await
@@ -3118,14 +3255,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let calls = LLMResponse {
             tool_calls: vec![
-                ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "sleep 30"}), item_id: None, malformed_arguments: None },
-                ToolCall { id: "e1".into(), name: "echo".into(), arguments: json!({"text": "never"}), item_id: None, malformed_arguments: None },
+                ToolCall {
+                    id: "b1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "sleep 30"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "e1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"text": "never"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
             ],
             ..Default::default()
         };
         let (mut agent, seen) = interfering(vec![calls], dir.path(), |_, _| {}, None);
         let bash_config = crate::bash::BashConfig { cancel: Some(agent.control().cancel_flag()), ..Default::default() };
-        agent.tools().register(crate::bash::definition(), Box::new(move |args| Ok(json!(crate::bash::run(&bash_config, &args)))));
+        agent.tools().register(
+            crate::bash::definition(),
+            Box::new(move |args| Ok(json!(crate::bash::run(&bash_config, &args)))),
+        );
         agent.new_session().unwrap();
         let control = agent.control();
         tokio::spawn(async move {
@@ -3147,12 +3299,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn steer_on_last_iteration_keeps_the_final_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut agent, _) = interfering(
-            vec![text("done")],
-            dir.path(),
-            |_, control| control.steer("late", None),
-            None,
-        );
+        let (mut agent, _) =
+            interfering(vec![text("done")], dir.path(), |_, control| control.steer("late", None), None);
         agent.config.max_iterations = 1;
         agent.new_session().unwrap();
         let outcome = agent.run_turn(None, "go").await.unwrap();
@@ -3166,7 +3314,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The model tries to call `bash` (mutating), then answers with text.
         let calls = LLMResponse {
-            tool_calls: vec![ToolCall { id: "b1".into(), name: "bash".into(), arguments: json!({"command": "rm -rf /"}), item_id: None, malformed_arguments: None }],
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "rm -rf /"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
             ..Default::default()
         };
         let (mut agent, _) = agent(vec![calls, text("cannot do that in plan mode")], dir.path());
@@ -3213,7 +3367,8 @@ mod tests {
     async fn auto_mode_disables_the_turn_cap() {
         let dir = tempfile::tempdir().unwrap();
         // More tool calls than the cap; auto mode should run them all.
-        let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
+        let (mut agent, seen) =
+            agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
         agent.config.max_iterations = 2;
         agent.new_session().unwrap();
         agent.set_mode(crate::mode::AgentMode::Auto);
@@ -3227,7 +3382,8 @@ mod tests {
     async fn zero_turn_cap_is_unbounded() {
         let dir = tempfile::tempdir().unwrap();
         // More tool calls than any finite cap; a cap of 0 should run them all.
-        let (mut agent, seen) = agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
+        let (mut agent, seen) =
+            agent(vec![tool_call("e1"), tool_call("e2"), tool_call("e3"), text("done")], dir.path());
         agent.config.max_iterations = 0;
         agent.new_session().unwrap();
         let outcome = agent.run_turn(None, "go").await.unwrap();

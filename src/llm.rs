@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tools::ToolDefinition;
 
@@ -100,10 +100,7 @@ impl Message {
     }
 
     pub fn assistant_with_tools(content: &str, tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            tool_calls,
-            ..Self::new(Role::Assistant, content)
-        }
+        Self { tool_calls, ..Self::new(Role::Assistant, content) }
     }
 
     pub fn tool_result(tool_call_id: &str, name: &str, content: &str) -> Self {
@@ -277,10 +274,7 @@ impl ToolCall {
 /// cause-neutral advice.
 fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
-        matches!(
-            reason.to_ascii_lowercase().as_str(),
-            "length" | "max_tokens" | "max_output_tokens"
-        )
+        matches!(reason.to_ascii_lowercase().as_str(), "length" | "max_tokens" | "max_output_tokens")
     })
 }
 
@@ -381,7 +375,11 @@ impl ThinkSplitter {
             // Hold back a suffix that could be the start of the tag.
             let keep = (1..tag.len())
                 .rev()
-                .find(|&n| self.pending.len() >= n && self.pending.is_char_boundary(self.pending.len() - n) && tag.starts_with(&self.pending[self.pending.len() - n..]))
+                .find(|&n| {
+                    self.pending.len() >= n
+                        && self.pending.is_char_boundary(self.pending.len() - n)
+                        && tag.starts_with(&self.pending[self.pending.len() - n..])
+                })
                 .unwrap_or(0);
             let split = self.pending.len() - keep;
             if split > 0 {
@@ -406,7 +404,8 @@ impl ThinkSplitter {
         }
         let (mut content, mut thinking) = (String::new(), String::new());
         let mut splitter = Self::default();
-        let mut emit = |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
+        let mut emit =
+            |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
         splitter.push(text, &mut emit);
         splitter.finish(&mut emit);
         (content.trim_start().to_string(), thinking.trim().to_string())
@@ -440,7 +439,8 @@ mod tests {
     fn splits_think_tags_across_chunks() {
         let mut splitter = ThinkSplitter::default();
         let (mut content, mut thinking) = (String::new(), String::new());
-        let mut emit = |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
+        let mut emit =
+            |think: bool, piece: &str| if think { thinking.push_str(piece) } else { content.push_str(piece) };
         for chunk in ["<th", "ink>plan ", "it</thi", "nk>Answer <b>", "</b> done"] {
             splitter.push(chunk, &mut emit);
         }
@@ -488,7 +488,13 @@ mod tests {
         assert!(error.contains(r#"{"path":"/tmp/x"#), "shows the raw text: {error}");
 
         // A well-formed call reports no error.
-        let ok = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: json!({"path": "/tmp/x"}), item_id: None, malformed_arguments: None };
+        let ok = ToolCall {
+            id: "c2".into(),
+            name: "write_file".into(),
+            arguments: json!({"path": "/tmp/x"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
         assert!(ok.invalid_arguments().is_none());
         assert!(ok.raw_arguments_error(None).is_none());
     }

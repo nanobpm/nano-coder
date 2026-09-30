@@ -102,9 +102,23 @@ impl ProviderConfig {
             ($($field:ident),*) => { $( if other.$field.is_some() { self.$field = other.$field.clone(); } )* };
         }
         take!(
-            kind, base_url, api_key, api_key_env, api_key_command, default_model, extra_body, drop_params,
-            max_tokens_param, context_window, stream, timeout_secs, max_retries, retry_initial_backoff_ms,
-            retry_max_backoff_ms, retryable_statuses, replay_reasoning
+            kind,
+            base_url,
+            api_key,
+            api_key_env,
+            api_key_command,
+            default_model,
+            extra_body,
+            drop_params,
+            max_tokens_param,
+            context_window,
+            stream,
+            timeout_secs,
+            max_retries,
+            retry_initial_backoff_ms,
+            retry_max_backoff_ms,
+            retryable_statuses,
+            replay_reasoning
         );
         self.headers.extend(other.headers.clone());
         self
@@ -127,7 +141,10 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add("anthropic", ProviderConfig::preset(Anthropic, "https://api.anthropic.com/v1", Some("ANTHROPIC_API_KEY")));
     add("openrouter", ProviderConfig::preset(Openai, "https://openrouter.ai/api/v1", Some("OPENROUTER_API_KEY")));
-    add("fireworks", ProviderConfig::preset(Openai, "https://api.fireworks.ai/inference/v1", Some("FIREWORKS_API_KEY")));
+    add(
+        "fireworks",
+        ProviderConfig::preset(Openai, "https://api.fireworks.ai/inference/v1", Some("FIREWORKS_API_KEY")),
+    );
     add("groq", ProviderConfig::preset(Openai, "https://api.groq.com/openai/v1", Some("GROQ_API_KEY")));
     add("together", ProviderConfig::preset(Openai, "https://api.together.xyz/v1", Some("TOGETHER_API_KEY")));
     add("deepseek", ProviderConfig::preset(Openai, "https://api.deepseek.com/v1", Some("DEEPSEEK_API_KEY")));
@@ -145,7 +162,11 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     add("mistral", ProviderConfig::preset(Openai, "https://api.mistral.ai/v1", Some("MISTRAL_API_KEY")));
     add(
         "gemini",
-        ProviderConfig::preset(Openai, "https://generativelanguage.googleapis.com/v1beta/openai", Some("GEMINI_API_KEY")),
+        ProviderConfig::preset(
+            Openai,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            Some("GEMINI_API_KEY"),
+        ),
     );
     add(
         "github-copilot",
@@ -158,18 +179,15 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add(
         "qwen",
-        ProviderConfig::preset(Openai, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", Some("DASHSCOPE_API_KEY")),
+        ProviderConfig::preset(
+            Openai,
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            Some("DASHSCOPE_API_KEY"),
+        ),
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
     add("llamacpp", ProviderConfig::preset(Openai, "http://localhost:8080/v1", None));
-    add(
-        "mock",
-        ProviderConfig {
-            kind: Some(Mock),
-            default_model: Some("mock".into()),
-            ..Default::default()
-        },
-    );
+    add("mock", ProviderConfig { kind: Some(Mock), default_model: Some("mock".into()), ..Default::default() });
     presets
 }
 
@@ -210,10 +228,8 @@ pub fn context_window(
     let providers = effective_providers(user);
     let (name, model) = parse_model_spec(spec, &providers, default_provider);
     let provider = providers.get(name);
-    let model = model
-        .map(str::to_string)
-        .or_else(|| provider.and_then(|p| p.default_model.clone()))
-        .unwrap_or_default();
+    let model =
+        model.map(str::to_string).or_else(|| provider.and_then(|p| p.default_model.clone())).unwrap_or_default();
     (provider.and_then(|p| p.context_window), model)
 }
 
@@ -238,11 +254,7 @@ pub struct ResolvedProvider {
     pub replay_reasoning: bool,
 }
 
-pub fn resolve(
-    spec: &str,
-    user: &HashMap<String, ProviderConfig>,
-    default_provider: &str,
-) -> Result<ResolvedProvider> {
+pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provider: &str) -> Result<ResolvedProvider> {
     let providers = effective_providers(user);
     let (name, model) = parse_model_spec(spec, &providers, default_provider);
     let config = providers.get(name).ok_or_else(|| {
@@ -251,9 +263,7 @@ pub fn resolve(
             providers.keys().cloned().collect::<Vec<_>>().join(", ")
         )
     })?;
-    let kind = config
-        .kind
-        .ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
+    let kind = config.kind.ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
     let model = model
         .map(str::to_string)
         .or_else(|| config.default_model.clone())
@@ -277,20 +287,18 @@ pub fn resolve(
         (None, None) => None,
     };
     let extra_body = match &config.extra_body {
-        Some(table) => serde_json::to_value(table)
-            .context("provider extra_body")?
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+        Some(table) => {
+            serde_json::to_value(table).context("provider extra_body")?.as_object().cloned().unwrap_or_default()
+        }
         None => Default::default(),
     };
     let defaults = RetryPolicy::default();
     // Copilot reasoning models (Responses-routed GPT‑5+/Grok/…) require their
     // reasoning items replayed across tool calls, so replay defaults on for
     // them; a user config value still overrides this.
-    let replay_reasoning = config.replay_reasoning.unwrap_or_else(|| {
-        kind == ProviderKind::GithubCopilot && github_copilot::is_reasoning_model(&model)
-    });
+    let replay_reasoning = config
+        .replay_reasoning
+        .unwrap_or_else(|| kind == ProviderKind::GithubCopilot && github_copilot::is_reasoning_model(&model));
     Ok(ResolvedProvider {
         name: name.to_string(),
         kind,
@@ -310,10 +318,7 @@ pub fn resolve(
                 .retry_initial_backoff_ms
                 .map(Duration::from_millis)
                 .unwrap_or(defaults.initial_backoff),
-            max_backoff: config
-                .retry_max_backoff_ms
-                .map(Duration::from_millis)
-                .unwrap_or(defaults.max_backoff),
+            max_backoff: config.retry_max_backoff_ms.map(Duration::from_millis).unwrap_or(defaults.max_backoff),
         },
         retryable_statuses: config
             .retryable_statuses
@@ -464,71 +469,65 @@ impl HttpTransport {
             let outcome = auth(request).send().await;
             let (err, retry_after): (anyhow::Error, Option<String>) = 'failed: {
                 match outcome {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string);
-                    let text = match response.text().await {
-                        Ok(text) => text,
-                        // The body was cut off (reset, timeout): transient like a send error.
-                        Err(e) => {
-                            let e = anyhow!(e).context(format!("reading HTTP {status} response body"));
-                            if attempt >= policy.max_retries {
-                                return Err(self.wrap(e));
-                            }
-                            break 'failed (e, retry_after);
-                        }
-                    };
-                    if (200..300).contains(&status) {
-                        match serde_json::from_str::<Value>(&text) {
-                            Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
-                                let api = ApiError::from_body(status, &text);
-                                if attempt >= policy.max_retries
-                                    || !retry::retryable(&api, &self.provider.retryable_statuses)
-                                {
-                                    return Err(self.wrap(api.into()));
-                                }
-                                (api.into(), retry_after)
-                            }
-                            Ok(value) => return Ok(value),
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let text = match response.text().await {
+                            Ok(text) => text,
+                            // The body was cut off (reset, timeout): transient like a send error.
                             Err(e) => {
-                                return Err(self.wrap(anyhow!(
-                                    "invalid JSON response ({e}): {}",
-                                    text.chars().take(500).collect::<String>()
-                                )));
+                                let e = anyhow!(e).context(format!("reading HTTP {status} response body"));
+                                if attempt >= policy.max_retries {
+                                    return Err(self.wrap(e));
+                                }
+                                break 'failed (e, retry_after);
                             }
+                        };
+                        if (200..300).contains(&status) {
+                            match serde_json::from_str::<Value>(&text) {
+                                Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
+                                    let api = ApiError::from_body(status, &text);
+                                    if attempt >= policy.max_retries
+                                        || !retry::retryable(&api, &self.provider.retryable_statuses)
+                                    {
+                                        return Err(self.wrap(api.into()));
+                                    }
+                                    (api.into(), retry_after)
+                                }
+                                Ok(value) => return Ok(value),
+                                Err(e) => {
+                                    return Err(self.wrap(anyhow!(
+                                        "invalid JSON response ({e}): {}",
+                                        text.chars().take(500).collect::<String>()
+                                    )));
+                                }
+                            }
+                        } else {
+                            let api = ApiError::from_body(status, &text);
+                            if attempt >= policy.max_retries
+                                || !retry::retryable(&api, &self.provider.retryable_statuses)
+                            {
+                                return Err(self.wrap(api.into()));
+                            }
+                            (api.into(), retry_after)
                         }
-                    } else {
-                        let api = ApiError::from_body(status, &text);
-                        if attempt >= policy.max_retries
-                            || !retry::retryable(&api, &self.provider.retryable_statuses)
-                        {
-                            return Err(self.wrap(api.into()));
+                    }
+                    Err(e) => {
+                        // Connection resets, timeouts, DNS: transient by assumption.
+                        if attempt >= policy.max_retries || e.is_builder() {
+                            return Err(self.wrap(anyhow!(e)));
                         }
-                        (api.into(), retry_after)
+                        (anyhow!(e), None)
                     }
-                }
-                Err(e) => {
-                    // Connection resets, timeouts, DNS: transient by assumption.
-                    if attempt >= policy.max_retries || e.is_builder() {
-                        return Err(self.wrap(anyhow!(e)));
-                    }
-                    (anyhow!(e), None)
-                }
                 }
             };
             let api = err.downcast_ref::<ApiError>();
-            let delay = retry::retry_delay(
-                policy,
-                attempt,
-                api,
-                retry_after.as_deref(),
-                chrono::Utc::now(),
-                fastrand::f64(),
-            );
+            let delay =
+                retry::retry_delay(policy, attempt, api, retry_after.as_deref(), chrono::Utc::now(), fastrand::f64());
             eprintln!(
                 "[provider {}] attempt {} failed: {err}; retrying in {:.1}s",
                 self.provider.name,
@@ -744,9 +743,7 @@ pub(crate) mod test_server {
     }
 
     /// Serve each `(status, extra_headers, body)` in turn; returns base URL and captured requests.
-    pub async fn serve(
-        responses: Vec<(u16, &'static str, String)>,
-    ) -> (String, Arc<Mutex<Vec<Captured>>>) {
+    pub async fn serve(responses: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<Captured>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));

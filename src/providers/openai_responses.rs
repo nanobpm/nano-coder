@@ -13,11 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use super::{HttpTransport, StreamAction};
 use super::github_copilot::is_reasoning_model;
-use crate::llm::{
-    ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
-};
+use super::{HttpTransport, StreamAction};
+use crate::llm::{ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole};
 
 /// Responses API request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
@@ -119,19 +117,13 @@ fn parts_text(content: &Value) -> String {
 
 /// Reasoning text carried by a `reasoning` output item (`summary`/`content`).
 fn reasoning_text(item: &Value) -> String {
-    ["summary", "content"]
-        .iter()
-        .filter_map(|key| item.get(*key))
-        .map(parts_text)
-        .collect()
+    ["summary", "content"].iter().filter_map(|key| item.get(*key)).map(parts_text).collect()
 }
 
 /// The raw `reasoning` items among `thinking_blocks`, preserved verbatim so
 /// they can be replayed to the Responses API before their function call.
 fn reasoning_items(blocks: &[Value]) -> impl Iterator<Item = &Value> {
-    blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("reasoning"))
+    blocks.iter().filter(|block| block.get("type").and_then(Value::as_str) == Some("reasoning"))
 }
 
 /// Parse a complete (non-streamed) Responses payload.
@@ -142,19 +134,15 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
         let error = value.get("error").cloned().unwrap_or_else(|| value.clone());
         return Err(anyhow!("response failed: {error}"));
     }
-    let output = value
-        .get("output")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("response has no output: {value}"))?;
+    let output =
+        value.get("output").and_then(Value::as_array).ok_or_else(|| anyhow!("response has no output: {value}"))?;
     let mut content = String::new();
     let mut thinking = String::new();
     let mut thinking_blocks = Vec::new();
     let mut tool_calls = Vec::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
-            Some("message") => {
-                content.push_str(&parts_text(item.get("content").unwrap_or(&Value::Null)))
-            }
+            Some("message") => content.push_str(&parts_text(item.get("content").unwrap_or(&Value::Null))),
             Some("reasoning") => {
                 thinking.push_str(&reasoning_text(item));
                 if replay {
@@ -168,11 +156,7 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
                 let raw = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
                 let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                 tool_calls.push(ToolCall::from_raw_arguments(id, name, raw, item_id));
@@ -205,10 +189,8 @@ pub(crate) fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse>
 fn response_stop_reason(response: &Value) -> Option<String> {
     let status = response.get("status").and_then(Value::as_str)?;
     if status == "incomplete" {
-        let reason = response
-            .get("incomplete_details")
-            .and_then(|details| details.get("reason"))
-            .and_then(Value::as_str);
+        let reason =
+            response.get("incomplete_details").and_then(|details| details.get("reason")).and_then(Value::as_str);
         return Some(reason.unwrap_or(status).to_string());
     }
     Some(status.to_string())
@@ -219,16 +201,8 @@ fn parse_usage(usage: Option<&Value>) -> Option<TokenUsage> {
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
     let prompt = field("input_tokens");
     let completion = field("output_tokens");
-    let total = usage
-        .get("total_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(prompt + completion);
-    Some(TokenUsage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: total,
-        aic: None,
-    })
+    let total = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(prompt + completion);
+    Some(TokenUsage { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total, aic: None })
 }
 
 /// A function call being streamed, keyed by its `output_index`.
@@ -254,36 +228,20 @@ struct StreamAccumulator {
 
 impl StreamAccumulator {
     fn new(replay: bool) -> Self {
-        Self {
-            replay,
-            ..Self::default()
-        }
+        Self { replay, ..Self::default() }
     }
 
     fn call(&mut self, index: u64) -> &mut PartialCall {
         if !self.calls.iter().any(|(i, _)| *i == index) {
             self.calls.push((index, PartialCall::default()));
         }
-        self.calls
-            .iter_mut()
-            .find(|(i, _)| *i == index)
-            .map(|(_, c)| c)
-            .unwrap()
+        self.calls.iter_mut().find(|(i, _)| *i == index).map(|(_, c)| c).unwrap()
     }
 
     fn push(&mut self, data: &str, sink: StreamSink<'_>) -> Result<()> {
-        let event: Value = serde_json::from_str(data)
-            .map_err(|e| anyhow!("invalid stream event ({e}): {data}"))?;
-        let str_of = |v: &Value, key: &str| {
-            v.get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        let index = event
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let event: Value = serde_json::from_str(data).map_err(|e| anyhow!("invalid stream event ({e}): {data}"))?;
+        let str_of = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+        let index = event.get("output_index").and_then(Value::as_u64).unwrap_or(0);
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_text.delta") => {
                 let piece = str_of(&event, "delta");
@@ -305,10 +263,7 @@ impl StreamAccumulator {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    call.item_id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    call.item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                     call.name = str_of(&item, "name");
                 }
             }
@@ -436,14 +391,25 @@ mod tests {
     fn trajectory_data_is_never_sent() {
         let body = |assistant: Message| {
             let messages = [Message::user("q"), assistant];
-            build_body(&transport(), &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None })
+            build_body(
+                &transport(),
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
+            )
         };
-        assert_eq!(body(Message {
+        assert_eq!(
+            body(Message {
                 thinking: "private reasoning".into(),
-                usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+                usage: Some(crate::llm::TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    aic: Some(0.5)
+                }),
                 duration_ms: Some(1234),
                 ..Message::assistant("answer")
-            }), body(Message::assistant("answer")));
+            }),
+            body(Message::assistant("answer"))
+        );
     }
 
     fn copilot_transport(model: &str) -> HttpTransport {
@@ -453,13 +419,7 @@ mod tests {
 
     fn replay_transport() -> HttpTransport {
         let mut user: HashMap<String, ProviderConfig> = HashMap::new();
-        user.insert(
-            "openai".into(),
-            ProviderConfig {
-                replay_reasoning: Some(true),
-                ..Default::default()
-            },
-        );
+        user.insert("openai".into(), ProviderConfig { replay_reasoning: Some(true), ..Default::default() });
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
     }
 
@@ -480,19 +440,10 @@ mod tests {
             ),
             Message::tool_result("call_1", "get_time", "noon"),
         ];
-        let tools = [ToolDefinition::new(
-            "get_time",
-            "time",
-            json!({"type": "object"}),
-        )];
+        let tools = [ToolDefinition::new("get_time", "time", json!({"type": "object"}))];
         let body = build_body(
             &transport(),
-            &ChatRequest {
-                messages: &messages,
-                tools: &tools,
-                temperature: Some(0.5),
-                max_tokens: Some(64),
-            },
+            &ChatRequest { messages: &messages, tools: &tools, temperature: Some(0.5), max_tokens: Some(64) },
         );
         assert_eq!(body["instructions"], "be brief");
         assert_eq!(body["max_output_tokens"], 64);
@@ -500,10 +451,7 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "get_time");
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0], json!({ "role": "user", "content": "time?" }));
-        assert_eq!(
-            input[1],
-            json!({ "role": "assistant", "content": "checking" })
-        );
+        assert_eq!(input[1], json!({ "role": "assistant", "content": "checking" }));
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[2]["arguments"], r#"{"tz":"utc"}"#);
@@ -662,12 +610,7 @@ mod tests {
         ];
         let body = build_body(
             &replay_transport(),
-            &ChatRequest {
-                messages: &messages,
-                tools: &[],
-                temperature: None,
-                max_tokens: None,
-            },
+            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
         );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], json!(false));
@@ -686,10 +629,7 @@ mod tests {
         });
         let error = parse_response(&value, false).unwrap_err().to_string();
         assert!(error.contains("failed"), "unexpected error: {error}");
-        assert!(
-            error.contains("content policy"),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains("content policy"), "unexpected error: {error}");
     }
 
     #[test]
@@ -700,22 +640,14 @@ mod tests {
             "type": "response.failed",
             "response": { "status": "failed", "error": { "message": "boom" } }
         });
-        let error = accumulator
-            .push(&event.to_string(), sink)
-            .unwrap_err()
-            .to_string();
+        let error = accumulator.push(&event.to_string(), sink).unwrap_err().to_string();
         assert!(error.contains("boom"), "unexpected error: {error}");
     }
 
     #[test]
     fn omits_temperature_for_reasoning_models_only() {
         let messages = vec![Message::user("hi")];
-        let request = |t| ChatRequest {
-            messages: &messages,
-            tools: &[],
-            temperature: Some(t),
-            max_tokens: None,
-        };
+        let request = |t| ChatRequest { messages: &messages, tools: &[], temperature: Some(t), max_tokens: None };
         // gpt-6-astra is a reasoning model: temperature is dropped so the
         // Responses endpoint does not reject the request before generating.
         let body = build_body(&copilot_transport("gpt-6-astra"), &request(0.7));

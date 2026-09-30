@@ -85,9 +85,8 @@ mod tests {
         plan.apply("plan_add", &json!({"items": ["read", "fix"]})).unwrap();
         plan.apply("plan_update", &json!({"id": 1, "status": "in_progress"})).unwrap();
         let mut reminders = Reminders::default();
-        let fired: Vec<usize> = (1..=PLAN_STALE_AFTER * 2)
-            .filter(|_| !reminders.after_tool_call(&plan).is_empty())
-            .collect();
+        let fired: Vec<usize> =
+            (1..=PLAN_STALE_AFTER * 2).filter(|_| !reminders.after_tool_call(&plan).is_empty()).collect();
         assert_eq!(fired, [PLAN_STALE_AFTER, PLAN_STALE_AFTER * 2]);
 
         reminders.plan_changed();

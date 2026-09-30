@@ -636,11 +636,7 @@ mod tests {
     use super::*;
 
     fn words(source: &str) -> Vec<Vec<String>> {
-        parse(source)
-            .unwrap()
-            .into_iter()
-            .map(|s| s.words.into_iter().map(|w| w.text).collect())
-            .collect()
+        parse(source).unwrap().into_iter().map(|s| s.words.into_iter().map(|w| w.text).collect()).collect()
     }
 
     #[test]

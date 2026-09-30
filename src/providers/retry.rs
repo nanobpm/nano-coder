@@ -12,9 +12,8 @@ use regex::Regex;
 
 pub const DEFAULT_RETRYABLE_STATUSES: &[u16] = &[408, 409, 425, 429, 500, 502, 503, 504, 529];
 
-static RETRY_AFTER_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\btry again in\s*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)\b").unwrap()
-});
+static RETRY_AFTER_MESSAGE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\btry again in\s*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)\b").unwrap());
 
 /// A normalized provider error.
 #[derive(Debug, Clone, Default)]
@@ -50,24 +49,17 @@ impl ApiError {
         let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
         let error = parsed.as_ref().and_then(|v| v.get("error"));
         let field = |name: &str| {
-            error
-                .and_then(|e| e.get(name))
-                .and_then(|v| match v {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                })
+            error.and_then(|e| e.get(name)).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
         };
         let message = match error {
             Some(serde_json::Value::String(s)) => s.clone(),
             _ => field("message").unwrap_or_else(|| body.chars().take(2000).collect()),
         };
-        Self {
-            status,
-            code: field("code"),
-            kind: field("type"),
-            message,
-        }
+        Self { status, code: field("code"), kind: field("type"), message }
     }
 
     fn is_overloaded(&self) -> bool {
@@ -100,17 +92,19 @@ pub fn retryable(err: &ApiError, retryable_statuses: &[u16]) -> bool {
                 | "bio_policy"
                 | "invalid_api_key"
                 | "invalid_token"
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
+    }
     if let Some(kind) = err.kind.as_deref()
         && matches!(
             kind,
             "authentication_error" | "permission_error" | "insufficient_quota" | "invalid_request_error"
                 if err.status != 429
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
+    }
     if !(200..300).contains(&err.status) {
         return retryable_statuses.contains(&err.status);
     }
@@ -127,11 +121,7 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self {
-            max_retries: 5,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(30),
-        }
+        Self { max_retries: 5, initial_backoff: Duration::from_secs(1), max_backoff: Duration::from_secs(30) }
     }
 }
 
@@ -154,13 +144,12 @@ pub fn retry_delay(
     now: chrono::DateTime<chrono::Utc>,
     jitter: f64,
 ) -> Duration {
-    let mut hint = retry_after_header
-        .map(|value| parse_retry_after_header(value, now))
-        .unwrap_or_default();
+    let mut hint = retry_after_header.map(|value| parse_retry_after_header(value, now)).unwrap_or_default();
     if let Some(err) = err
-        && err.is_rate_limited() {
-            hint = hint.max(parse_retry_after_message(&err.message));
-        }
+        && err.is_rate_limited()
+    {
+        hint = hint.max(parse_retry_after_message(&err.message));
+    }
     if !hint.is_zero() {
         return hint.min(policy.max_backoff);
     }
@@ -180,9 +169,11 @@ pub fn parse_retry_after_header(value: &str, now: chrono::DateTime<chrono::Utc>)
         return Duration::from_secs(seconds);
     }
     if let Ok(seconds) = value.parse::<f64>()
-        && seconds.is_finite() && seconds > 0.0 {
-            return Duration::from_secs_f64(seconds);
-        }
+        && seconds.is_finite()
+        && seconds > 0.0
+    {
+        return Duration::from_secs_f64(seconds);
+    }
     if let Ok(deadline) = chrono::DateTime::parse_from_rfc2822(value) {
         return (deadline.with_timezone(&chrono::Utc) - now).to_std().unwrap_or_default();
     }
@@ -240,10 +231,8 @@ mod tests {
         assert_eq!(openai.code.as_deref(), Some("rate_limit_exceeded"));
         assert!(openai.message.starts_with("Rate limit"));
 
-        let anthropic = ApiError::from_body(
-            529,
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
-        );
+        let anthropic =
+            ApiError::from_body(529, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#);
         assert_eq!(anthropic.kind.as_deref(), Some("overloaded_error"));
 
         let plain = ApiError::from_body(502, "bad gateway");
@@ -254,10 +243,7 @@ mod tests {
     fn honours_retry_after_hints() {
         let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
         assert_eq!(parse_retry_after_header("7", now), Duration::from_secs(7));
-        assert_eq!(
-            parse_retry_after_header("Thu, 01 Jan 2026 00:00:03 GMT", now),
-            Duration::from_secs(3)
-        );
+        assert_eq!(parse_retry_after_header("Thu, 01 Jan 2026 00:00:03 GMT", now), Duration::from_secs(3));
         assert_eq!(parse_retry_after_message("try again in 250ms"), Duration::from_millis(250));
         assert_eq!(parse_retry_after_message("Please try again in 2 seconds"), Duration::from_secs(2));
 
@@ -276,9 +262,6 @@ mod tests {
         assert_eq!(retry_delay(&policy, 10, None, None, now, 0.0), Duration::from_secs(30));
         assert_eq!(retry_delay(&policy, 0, None, None, now, 1.0), Duration::from_millis(800));
         let overloaded = err(503, Some("server_is_overloaded"), None, "");
-        assert_eq!(
-            retry_delay(&policy, 0, Some(&overloaded), None, now, 0.0),
-            Duration::from_secs(10)
-        );
+        assert_eq!(retry_delay(&policy, 0, Some(&overloaded), None, now, 0.0), Duration::from_secs(10));
     }
 }

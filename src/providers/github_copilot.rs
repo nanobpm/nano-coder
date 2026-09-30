@@ -18,11 +18,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::anthropic;
 use super::openai;
 use super::openai_responses;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
-use super::anthropic;
 use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
@@ -261,11 +261,8 @@ pub async fn login() -> Result<PathBuf> {
             .json()
             .await?;
         if let Some(token) = poll.get("access_token").and_then(Value::as_str) {
-            let credentials = StoredCredentials {
-                oauth_token: token.to_string(),
-                domain: domain.clone(),
-                created_at: Utc::now(),
-            };
+            let credentials =
+                StoredCredentials { oauth_token: token.to_string(), domain: domain.clone(), created_at: Utc::now() };
             // Prove the account actually has Copilot before reporting success.
             let session = exchange(&http, &endpoints, token).await?;
             let path = save_credentials(&credentials)?;
@@ -277,10 +274,9 @@ pub async fn login() -> Result<PathBuf> {
             Some("slow_down") => {
                 interval = poll.get("interval").and_then(Value::as_u64).unwrap_or(interval + 5);
             }
-            Some(other) => bail!(
-                "login failed: {other}: {}",
-                poll.get("error_description").and_then(Value::as_str).unwrap_or("")
-            ),
+            Some(other) => {
+                bail!("login failed: {other}: {}", poll.get("error_description").and_then(Value::as_str).unwrap_or(""))
+            }
             None => bail!("unexpected token response: {poll}"),
         }
     }
@@ -324,26 +320,18 @@ pub async fn exchange(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Copilot token response has no token"))?
         .to_string();
-    let expires_at = value
-        .get("expires_at")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| Utc::now().timestamp() + 1500);
+    let expires_at = value.get("expires_at").and_then(Value::as_i64).unwrap_or_else(|| Utc::now().timestamp() + 1500);
     let base_url = value
         .pointer("/endpoints/api")
         .and_then(Value::as_str)
         .map(|u| u.trim_end_matches('/').to_string())
         .or_else(|| base_url_from_token(&token))
         .unwrap_or_else(|| DEFAULT_API_BASE.into());
-    Ok(SessionToken {
-        token,
-        base_url,
-        refresh_at: expires_at - REFRESH_MARGIN_SECS,
-    })
+    Ok(SessionToken { token, base_url, refresh_at: expires_at - REFRESH_MARGIN_SECS })
 }
 
 fn is_unauthorized(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.downcast_ref::<ApiError>().is_some_and(|api| api.status == 401))
+    err.chain().any(|cause| cause.downcast_ref::<ApiError>().is_some_and(|api| api.status == 401))
 }
 
 pub struct GithubCopilotClient {
@@ -389,12 +377,7 @@ impl GithubCopilotClient {
     }
 
     pub fn with_endpoints(provider: ResolvedProvider, oauth: String, endpoints: Endpoints) -> Result<Self> {
-        Ok(Self {
-            transport: HttpTransport::new(provider)?,
-            oauth,
-            endpoints,
-            session: tokio::sync::Mutex::new(None),
-        })
+        Ok(Self { transport: HttpTransport::new(provider)?, oauth, endpoints, session: tokio::sync::Mutex::new(None) })
     }
 
     async fn session_token(&self, force: bool) -> Result<SessionToken> {
@@ -456,10 +439,9 @@ impl LLMClient for GithubCopilotClient {
                         CopilotApi::Completions => {
                             openai::parse_response(&value, self.transport.provider().replay_reasoning)
                         }
-                        CopilotApi::Responses => openai_responses::parse_response(
-                            &value,
-                            self.transport.provider().replay_reasoning,
-                        ),
+                        CopilotApi::Responses => {
+                            openai_responses::parse_response(&value, self.transport.provider().replay_reasoning)
+                        }
                         CopilotApi::Messages => anthropic::parse_response(&value),
                     };
                 }
@@ -504,7 +486,9 @@ impl LLMClient for GithubCopilotClient {
             };
             let result = match api {
                 CopilotApi::Completions => openai::stream_chat(&self.transport, &url, body.clone(), auth, sink).await,
-                CopilotApi::Responses => openai_responses::stream(&self.transport, &url, body.clone(), auth, sink).await,
+                CopilotApi::Responses => {
+                    openai_responses::stream(&self.transport, &url, body.clone(), auth, sink).await
+                }
                 CopilotApi::Messages => anthropic::stream(&self.transport, &url, body.clone(), auth, sink).await,
             };
             match result {
@@ -522,7 +506,8 @@ impl LLMClient for GithubCopilotClient {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
             let model = &self.transport.provider().model;
-            let entry = models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+            let entry =
+                models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
             // Copilot enforces the prompt budget, which is below the full window.
             ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
                 let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
@@ -601,7 +586,8 @@ mod tests {
 
     // `gpt-5-mini` routes to the Responses endpoint, so its non-streamed reply is an
     // `output` list, not Chat Completions `choices`.
-    const CHAT_OK: &str = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"status":"completed"}"#;
+    const CHAT_OK: &str =
+        r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"status":"completed"}"#;
 
     #[test]
     fn catalogs_model_endpoints() {
@@ -774,7 +760,8 @@ mod tests {
             json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 2 } }),
             json!({ "type": "message_stop" }),
         ];
-        let sse: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+        let sse: String =
+            events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
         let (api, api_log) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", sse)]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
@@ -810,11 +797,7 @@ mod tests {
     #[tokio::test]
     async fn exchanges_token_and_sends_editor_headers() {
         // The token response's `endpoints.api` points at a second server.
-        let (api, api_log) = test_server::serve(vec![
-            (200, "", CHAT_OK.into()),
-            (200, "", CHAT_OK.into()),
-        ])
-        .await;
+        let (api, api_log) = test_server::serve(vec![(200, "", CHAT_OK.into()), (200, "", CHAT_OK.into())]).await;
         let (auth, auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
 
@@ -823,7 +806,16 @@ mod tests {
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
-            Message::assistant_with_tools("", vec![ToolCall { id: "c".into(), name: "t".into(), arguments: json!({}), item_id: None, malformed_arguments: None }]),
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "c".into(),
+                    name: "t".into(),
+                    arguments: json!({}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
+            ),
             Message::tool_result("c", "t", "ok"),
         ];
         let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };
@@ -850,11 +842,9 @@ mod tests {
             (200, "", CHAT_OK.into()),
         ])
         .await;
-        let (auth, auth_log) = test_server::serve(vec![
-            (200, "", token_body(&api, "sess-1")),
-            (200, "", token_body(&api, "sess-2")),
-        ])
-        .await;
+        let (auth, auth_log) =
+            test_server::serve(vec![(200, "", token_body(&api, "sess-1")), (200, "", token_body(&api, "sess-2"))])
+                .await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
         let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };

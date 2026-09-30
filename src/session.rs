@@ -127,11 +127,7 @@ pub fn default_dir() -> PathBuf {
 }
 
 pub fn new_session_id() -> String {
-    format!(
-        "sess-{}-{:08x}",
-        Utc::now().format("%Y%m%dT%H%M%S"),
-        fastrand::u32(..)
-    )
+    format!("sess-{}-{:08x}", Utc::now().format("%Y%m%dT%H%M%S"), fastrand::u32(..))
 }
 
 /// Session IDs name files, so restrict them to a safe alphabet.
@@ -166,11 +162,7 @@ impl SessionLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("create session log {}", path.display()))?;
-        file.write_all(&encode(&Record::Session {
-            version: FORMAT_VERSION,
-            id: id.to_string(),
-            created_at: now(),
-        })?)?;
+        file.write_all(&encode(&Record::Session { version: FORMAT_VERSION, id: id.to_string(), created_at: now() })?)?;
         file.sync_data()?;
         Ok(Self { path, file, lines: 1 })
     }
@@ -184,7 +176,8 @@ impl SessionLog {
             .rposition(|&b| b == b'\n')
             .map(|i| i + 1)
             .ok_or_else(|| anyhow!("session log {} has no committed records", path.display()))?;
-        let restored = decode(&bytes[..committed], id).with_context(|| format!("load session log {}", path.display()))?;
+        let restored =
+            decode(&bytes[..committed], id).with_context(|| format!("load session log {}", path.display()))?;
         let file = OpenOptions::new()
             .append(true)
             .open(&path)
@@ -265,8 +258,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     // a later `replace` from a legacy log can recover the IDs of retained messages.
     let mut originals: Vec<Message> = Vec::new();
     for (index, line) in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
-        let record: Record =
-            serde_json::from_slice(line).with_context(|| format!("decode record {}", index + 1))?;
+        let record: Record = serde_json::from_slice(line).with_context(|| format!("decode record {}", index + 1))?;
         match record {
             Record::Session { version, id, .. } => {
                 if index != 0 {
@@ -327,10 +319,14 @@ mod tests {
 
     #[test]
     fn reads_utc_records_and_unstamped_messages_from_older_logs() {
-        let input: Record = serde_json::from_str(r#"{"type":"input","data":{"id":"i","text":"hi","recorded_at":"2026-01-01T00:00:00Z"}}"#).unwrap();
+        let input: Record = serde_json::from_str(
+            r#"{"type":"input","data":{"id":"i","text":"hi","recorded_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
         let Record::Input { recorded_at, .. } = input else { panic!() };
         assert_eq!(recorded_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
-        let message: Record = serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi"}}"#).unwrap();
+        let message: Record =
+            serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi"}}"#).unwrap();
         assert_eq!(message, Record::Message(Message::user("hi")));
         // New records carry the local offset.
         let now = serde_json::to_string(&now()).unwrap();
@@ -342,7 +338,13 @@ mod tests {
     }
 
     fn turn_end(id: &str) -> Record {
-        Record::TurnEnd { input_id: id.into(), response: "hello".into(), outcome: None, history_calls: 0, recorded_at: now() }
+        Record::TurnEnd {
+            input_id: id.into(),
+            response: "hello".into(),
+            outcome: None,
+            history_calls: 0,
+            recorded_at: now(),
+        }
     }
 
     #[test]
@@ -361,10 +363,7 @@ mod tests {
         let (_, restored) = SessionLog::open(dir.path(), "s1").unwrap();
         assert_eq!(restored.conversation.len(), 4);
         assert_eq!(restored.completed.get("in-1").map(String::as_str), Some("hello"));
-        assert_eq!(
-            restored.pending_input,
-            Some(PendingInput { id: "in-2".into(), text: "hi".into(), position: 3 })
-        );
+        assert_eq!(restored.pending_input, Some(PendingInput { id: "in-2".into(), text: "hi".into(), position: 3 }));
         assert!(SessionLog::create(dir.path(), "s1").is_err(), "create must not clobber");
     }
 
@@ -373,8 +372,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s2").unwrap();
         log.append(&Record::Message(Message::user("a"))).unwrap();
-        log.append(&Record::Replace { messages: vec![Message::system("new")], pending_position: None, summarized: None, mode: None, model: None, recorded_at: now() })
-            .unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("new")],
+            pending_position: None,
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s2").unwrap();
         assert_eq!(restored.conversation, vec![Message::system("new")]);
@@ -392,7 +398,12 @@ mod tests {
         log.append(&Record::Message(Message::assistant("reply"))).unwrap(); // #4
         // Retained messages carry no `log_line`, as a legacy compaction would write.
         log.append(&Record::Replace {
-            messages: vec![Message::system("sys"), Message::user("first"), Message::assistant("reply"), Message::assistant("summary")],
+            messages: vec![
+                Message::system("sys"),
+                Message::user("first"),
+                Message::assistant("reply"),
+                Message::assistant("summary"),
+            ],
             pending_position: None,
             summarized: None,
             mode: None,
@@ -415,8 +426,15 @@ mod tests {
         log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
         log.append(&Record::Message(Message::user("go"))).unwrap();
         let messages = vec![Message::system("sys"), Message::user("summary"), Message::user("go")];
-        log.append(&Record::Replace { messages: messages.clone(), pending_position: Some(2), summarized: None, mode: None, model: None, recorded_at: now() })
-            .unwrap();
+        log.append(&Record::Replace {
+            messages: messages.clone(),
+            pending_position: Some(2),
+            summarized: None,
+            mode: None,
+            model: None,
+            recorded_at: now(),
+        })
+        .unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();
         // The retained "go" folds in original record #3, so its ID is backfilled.
@@ -508,8 +526,10 @@ mod tests {
         // must recover the ID of the original with matching thinking blocks.
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s8").unwrap();
-        let think_a = Message { thinking_blocks: vec![serde_json::json!({"thinking": "a"})], ..Message::assistant("reply") };
-        let think_b = Message { thinking_blocks: vec![serde_json::json!({"thinking": "b"})], ..Message::assistant("reply") };
+        let think_a =
+            Message { thinking_blocks: vec![serde_json::json!({"thinking": "a"})], ..Message::assistant("reply") };
+        let think_b =
+            Message { thinking_blocks: vec![serde_json::json!({"thinking": "b"})], ..Message::assistant("reply") };
         log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
         log.append(&Record::Message(think_a.clone())).unwrap(); // #3
         log.append(&Record::Message(think_b.clone())).unwrap(); // #4

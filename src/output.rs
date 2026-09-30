@@ -41,11 +41,7 @@ fn reserve_and_write(dir: &std::path::Path, name: &str, text: &str) -> Option<st
         None => (name, String::new()),
     };
     for attempt in 1..=10_000u32 {
-        let candidate = if attempt == 1 {
-            dir.join(name)
-        } else {
-            dir.join(format!("{stem}-{attempt}{ext}"))
-        };
+        let candidate = if attempt == 1 { dir.join(name) } else { dir.join(format!("{stem}-{attempt}{ext}")) };
         match std::fs::File::create_new(&candidate) {
             Ok(mut file) => return file.write_all(text.as_bytes()).ok().map(|()| candidate),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -106,9 +102,7 @@ pub fn parse_max_output_length(value: Option<&serde_json::Value>) -> Result<usiz
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(DEFAULT_MAX_OUTPUT_LENGTH);
     };
-    let limit = value
-        .as_i64()
-        .ok_or_else(|| "max_output_length must be a positive integer".to_string())?;
+    let limit = value.as_i64().ok_or_else(|| "max_output_length must be a positive integer".to_string())?;
     if limit <= 0 {
         return Err("max_output_length must be a positive integer".into());
     }

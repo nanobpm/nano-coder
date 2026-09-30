@@ -34,10 +34,7 @@ pub struct HookContext {
 
 impl HookContext {
     pub fn new(event: HookEvent) -> Self {
-        Self {
-            event,
-            data: HashMap::new(),
-        }
+        Self { event, data: HashMap::new() }
     }
 
     pub fn with_data(mut self, key: &str, value: serde_json::Value) -> Self {
@@ -75,5 +72,4 @@ impl HookRegistry {
             }
         }
     }
-
 }

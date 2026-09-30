@@ -31,7 +31,15 @@ struct Changes {
 
 impl Changes {
     fn any(&self) -> bool {
-        self.model || self.temperature || self.max_tokens || self.max_iterations || self.system_prompt || self.compaction || self.verbosity || self.renderer || !self.providers.is_empty()
+        self.model
+            || self.temperature
+            || self.max_tokens
+            || self.max_iterations
+            || self.system_prompt
+            || self.compaction
+            || self.verbosity
+            || self.renderer
+            || !self.providers.is_empty()
     }
 }
 
@@ -79,7 +87,11 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             format!(
                 "Context          {} window, auto-compact {}, {} compaction",
                 crate::context::format_tokens(agent.context_window()),
-                if config.auto_compact { format!("at {:.0}%", config.auto_compact_threshold * 100.0) } else { "off".into() },
+                if config.auto_compact {
+                    format!("at {:.0}%", config.auto_compact_threshold * 100.0)
+                } else {
+                    "off".into()
+                },
                 config.compaction_mode.as_str()
             ),
             format!("Verbosity        {} ({})", config.verbosity, config.verbosity.describe()),
@@ -100,7 +112,9 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                     if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
                         let (user, default_provider) = agent.config().effective_providers();
                         let all = providers::effective_providers(&user);
-                        if let Step::Done(spec) = pick_model_from_provider(&name, &all, &user, &default_provider).await? {
+                        if let Step::Done(spec) =
+                            pick_model_from_provider(&name, &all, &user, &default_provider).await?
+                        {
                             switch_model(agent, &spec, &mut changes).await;
                         }
                     }
@@ -115,7 +129,8 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
                 changes.temperature = true;
             }
             3 => {
-                let value: i32 = Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
+                let value: i32 =
+                    Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
                 agent.config_mut().max_tokens = value;
                 changes.max_tokens = true;
             }
@@ -150,19 +165,9 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
             }
             8 => {
                 let modes = crate::frame::RendererMode::ALL;
-                let labels: Vec<String> = modes
-                    .iter()
-                    .map(|m| format!("{m:<7} {}", m.describe()))
-                    .collect();
-                let current = modes
-                    .iter()
-                    .position(|m| *m == agent.config().renderer)
-                    .unwrap_or(0);
-                let choice = Select::new()
-                    .with_prompt("Renderer")
-                    .items(&labels)
-                    .default(current)
-                    .interact()?;
+                let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
+                let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
+                let choice = Select::new().with_prompt("Renderer").items(&labels).default(current).interact()?;
                 let previous = agent.config().renderer;
                 agent.config_mut().renderer = modes[choice];
                 changes.renderer = true;
@@ -215,7 +220,10 @@ fn save_and_report(config: &Config, changes: &mut Changes, path: &Path) {
 
 fn edit_context(agent: &mut Agent) -> Result<()> {
     let config = agent.config().clone();
-    let auto = Confirm::new().with_prompt("Auto-compact when the context fills up?").default(config.auto_compact).interact()?;
+    let auto = Confirm::new()
+        .with_prompt("Auto-compact when the context fills up?")
+        .default(config.auto_compact)
+        .interact()?;
     let threshold = if auto {
         let percent: f64 = Input::new()
             .with_prompt("Compact at this % of the context window")
@@ -226,7 +234,10 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
     } else {
         config.auto_compact_threshold
     };
-    let modes = ["standard: summary only", "smart (experimental): summary cites the session log; history tools recover originals"];
+    let modes = [
+        "standard: summary only",
+        "smart (experimental): summary cites the session log; history tools recover originals",
+    ];
     let current = usize::from(config.compaction_mode == crate::config::CompactionMode::Smart);
     let mode = match Select::new().with_prompt("Compaction mode").items(&modes).default(current).interact()? {
         1 => crate::config::CompactionMode::Smart,
@@ -249,11 +260,7 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
 /// of its models. Esc at the model list goes back to the provider list; Esc
 /// there leaves the model unchanged. Returns the chosen `provider/model` spec.
 pub async fn pick_model_interactive(agent: &Agent) -> Result<Option<String>> {
-    println!(
-        "Current model: {} (provider {})",
-        agent.model_name(),
-        agent.provider_name()
-    );
+    println!("Current model: {} (provider {})", agent.model_name(), agent.provider_name());
     let (user, default_provider) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut provider = None;
@@ -302,11 +309,8 @@ fn model_spec(provider: &str, model: &str) -> Step {
 /// pre-selected. Esc (or the Cancel row) returns `None`.
 fn pick_provider(agent: &Agent, all: &std::collections::BTreeMap<String, ProviderConfig>) -> Result<Option<String>> {
     let names: Vec<&String> = all.keys().collect();
-    let labels: Vec<String> = all
-        .iter()
-        .map(|(name, p)| format!("{name:<14} {}", key_status(p)))
-        .chain(["Cancel".to_string()])
-        .collect();
+    let labels: Vec<String> =
+        all.iter().map(|(name, p)| format!("{name:<14} {}", key_status(p))).chain(["Cancel".to_string()]).collect();
     let current = agent.provider_name();
     let default = names.iter().position(|n| n.as_str() == current).unwrap_or(0);
     let choice = Select::new()
@@ -420,7 +424,9 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     let kind_default = kinds.iter().position(|k| Some(*k) == current.kind).unwrap_or(0);
     let kind = kinds[Select::new().with_prompt("API kind").items(&kind_labels).default(kind_default).interact()?];
 
-    let mut base_url = Input::<String>::new().with_prompt("Base URL (e.g. http://merlin.local:8000/v1)").allow_empty(kind == ProviderKind::GithubCopilot);
+    let mut base_url = Input::<String>::new()
+        .with_prompt("Base URL (e.g. http://merlin.local:8000/v1)")
+        .allow_empty(kind == ProviderKind::GithubCopilot);
     if let Some(url) = &current.base_url {
         base_url = base_url.default(url.clone());
     } else if kind == ProviderKind::GithubCopilot
@@ -439,13 +445,20 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         "No key",
         "Keep current",
     ];
-    let source_default = if current.api_key_env.is_some() || current.api_key_command.is_some() || current.api_key.is_some() { 4 } else { 0 };
-    let mut updated = ProviderConfig {
-        kind: Some(kind),
-        base_url: Some(base_url).filter(|u| !u.is_empty()),
-        ..current.clone()
-    };
-    match Select::new().with_prompt(format!("API key ({})", key_status(&current))).items(&sources).default(source_default).interact()? {
+    let source_default =
+        if current.api_key_env.is_some() || current.api_key_command.is_some() || current.api_key.is_some() {
+            4
+        } else {
+            0
+        };
+    let mut updated =
+        ProviderConfig { kind: Some(kind), base_url: Some(base_url).filter(|u| !u.is_empty()), ..current.clone() };
+    match Select::new()
+        .with_prompt(format!("API key ({})", key_status(&current)))
+        .items(&sources)
+        .default(source_default)
+        .interact()?
+    {
         0 => {
             let mut input = Input::<String>::new().with_prompt("Variable name");
             let suggested = current
@@ -493,7 +506,11 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     let entry = diff_from(&preset, &existing, &updated);
     let config = agent.config_mut();
     config.providers.insert(name.clone(), entry);
-    println!("Provider {name}: {} {}", format!("{kind:?}").to_lowercase(), updated.base_url.as_deref().unwrap_or("(from session token)"));
+    println!(
+        "Provider {name}: {} {}",
+        format!("{kind:?}").to_lowercase(),
+        updated.base_url.as_deref().unwrap_or("(from session token)")
+    );
     Ok(Some(name))
 }
 

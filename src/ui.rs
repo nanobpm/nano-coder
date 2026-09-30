@@ -125,7 +125,11 @@ pub fn visible_width(text: &str) -> usize {
 /// Local time (`HH:MM:SS`) in dim text plus a space, to start a message
 /// line; empty when timestamps are off.
 pub fn stamp() -> String {
-    if TIMESTAMPS.load(Ordering::Relaxed) { format!("{DIM}{}{RESET} ", chrono::Local::now().format("%H:%M:%S")) } else { String::new() }
+    if TIMESTAMPS.load(Ordering::Relaxed) {
+        format!("{DIM}{}{RESET} ", chrono::Local::now().format("%H:%M:%S"))
+    } else {
+        String::new()
+    }
 }
 
 /// Pair a frame transcript item with the current timestamp, so every item
@@ -380,25 +384,21 @@ impl Renderer {
                 }
                 match fs.stream {
                     Some(i) => {
-                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) = fs.items.get_mut(i) {
+                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) =
+                            fs.items.get_mut(i)
+                        {
                             existing.push_str(text);
                         }
                     }
                     None => {
-                        fs.items.push(stamped(Item::Message {
-                            role: Role::Assistant,
-                            text: (*text).to_string(),
-                        }));
+                        fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
                         fs.stream = Some(fs.items.len() - 1);
                     }
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 if fs.stream.is_none() && !text.is_empty() {
-                    fs.items.push(stamped(Item::Message {
-                        role: Role::Assistant,
-                        text: (*text).to_string(),
-                    }));
+                    fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
                 }
                 self.frame_finish_stream(fs);
             }
@@ -434,16 +434,9 @@ impl Renderer {
                     Some(crate::goal::Status::Completed) => "✔ completed".to_string(),
                     None => {
                         let raw = crate::sanitize_terminal_text(
-                            call.arguments
-                                .get("status")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default(),
+                            call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default(),
                         );
-                        if raw.is_empty() {
-                            "• unknown".to_string()
-                        } else {
-                            format!("• {raw}")
-                        }
+                        if raw.is_empty() { "• unknown".to_string() } else { format!("• {raw}") }
                     }
                 };
                 fs.items.push(stamped(Item::Note(mark)));
@@ -452,10 +445,7 @@ impl Renderer {
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(stamped(Item::ToolCall {
-                    name: call.name.clone(),
-                    summary: tool_summary_text(call),
-                }));
+                fs.items.push(stamped(Item::ToolCall { name: call.name.clone(), summary: tool_summary_text(call) }));
             }
             AgentEvent::ToolResult { ok, output, .. } => {
                 fs.items.push(stamped(Item::ToolResult {
@@ -676,10 +666,7 @@ impl Renderer {
     pub fn event(&self, event: &AgentEvent) {
         if let Some(frame) = &self.frame {
             if verbosity() == Verbosity::Quiet
-                && !matches!(
-                    event,
-                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context
-                )
+                && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
             {
                 return;
             }
@@ -744,11 +731,17 @@ impl Renderer {
             AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
             AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
                 self.newline(&mut state);
-                let text = stamp_block(&format!("{RED}●{RESET} {BOLD}{}{RESET}\n{}", call.name, self.tool_result(false, output)));
+                let text = stamp_block(&format!(
+                    "{RED}●{RESET} {BOLD}{}{RESET}\n{}",
+                    call.name,
+                    self.tool_result(false, output)
+                ));
                 self.out(&mut state, &text);
             }
             // The outcome's summary follows as the answer; show just its status.
-            AgentEvent::ToolCall { call } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {
+            AgentEvent::ToolCall { call }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose =>
+            {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
                 state.streamed_thinking = false;
@@ -778,7 +771,8 @@ impl Renderer {
                 };
                 self.out(&mut state, &format!("{}{mark}\n", stamp()));
             }
-            AgentEvent::ToolResult { call, ok: true, .. } if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
+            AgentEvent::ToolResult { call, ok: true, .. }
+                if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::Plan { plan } => {
                 self.finish_thinking(&mut state);
                 self.newline(&mut state);
@@ -840,7 +834,8 @@ impl Renderer {
             if expanded {
                 self.out(state, &format!("{stamp}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n"));
             }
-            state.thinking = Some(ThinkBlock { text: String::new(), started: Instant::now(), stamp, expanded, last_draw: None });
+            state.thinking =
+                Some(ThinkBlock { text: String::new(), started: Instant::now(), stamp, expanded, last_draw: None });
         }
         let print = {
             let block = state.thinking.as_mut().unwrap();
@@ -1125,7 +1120,11 @@ mod tests {
         // Replaying a resumed session (and mid-turn steer messages) surface as
         // `UserMessage` events; they must land in the transcript.
         r.event(&AgentEvent::UserMessage { text: "resumed prompt" });
-        let user = r.frame_items().iter().filter(|i| matches!(&i.item, Item::Message { role: Role::User, text, .. } if text == "resumed prompt")).count();
+        let user = r
+            .frame_items()
+            .iter()
+            .filter(|i| matches!(&i.item, Item::Message { role: Role::User, text, .. } if text == "resumed prompt"))
+            .count();
         assert_eq!(user, 1);
     }
 
@@ -1147,9 +1146,21 @@ mod tests {
 
     #[test]
     fn summarizes_tool_calls() {
-        let call = ToolCall { id: "1".into(), name: "bash".into(), arguments: json!({"command": "ls\n  -la"}), item_id: None, malformed_arguments: None };
+        let call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls\n  -la"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
         assert!(tool_summary(&call, 40).contains("ls -la"));
-        let call = ToolCall { id: "1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None };
+        let call = ToolCall {
+            id: "1".into(),
+            name: "get_time".into(),
+            arguments: json!({}),
+            item_id: None,
+            malformed_arguments: None,
+        };
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");

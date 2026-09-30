@@ -30,7 +30,8 @@ Be concise but do not drop facts the agent would otherwise have to rediscover. D
 Output only the summary.";
 
 /// Starts a smart-compaction summary; its presence enables the history tools.
-pub const SMART_SUMMARY_PREFIX: &str = "[Summary of the earlier conversation, written when the context was compacted (smart compaction)]";
+pub const SMART_SUMMARY_PREFIX: &str =
+    "[Summary of the earlier conversation, written when the context was compacted (smart compaction)]";
 
 /// Added to the summarizer prompt in smart mode.
 pub const SMART_SUMMARY_INSTRUCTIONS: &str = "\n\nEach message in the transcript is labelled [#N], its ID in the session log. \
@@ -126,19 +127,12 @@ pub fn text_tokens(text: &str) -> usize {
 
 /// `12 tok/s`-style output-rate label.
 pub fn format_rate(tokens_per_sec: f64) -> String {
-    if tokens_per_sec >= 10.0 {
-        format!("{tokens_per_sec:.0} tok/s")
-    } else {
-        format!("{tokens_per_sec:.1} tok/s")
-    }
+    if tokens_per_sec >= 10.0 { format!("{tokens_per_sec:.0} tok/s") } else { format!("{tokens_per_sec:.1} tok/s") }
 }
 
 pub fn message_tokens(message: &Message) -> usize {
-    let calls: usize = message
-        .tool_calls
-        .iter()
-        .map(|c| text_tokens(&c.name) + text_tokens(&c.arguments.to_string()) + 4)
-        .sum();
+    let calls: usize =
+        message.tool_calls.iter().map(|c| text_tokens(&c.name) + text_tokens(&c.arguments.to_string()) + 4).sum();
     text_tokens(&message.content) + calls + 4
 }
 
@@ -198,9 +192,7 @@ pub fn limit_from_error(error: &str) -> Option<usize> {
         r"(?i)context window (?:of|is) (\d+)",
         r"(?i)limit of (\d+) tokens",
     ];
-    patterns.iter().find_map(|p| {
-        Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok()
-    })
+    patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
 
 fn clip(text: &str, max_chars: usize) -> String {
@@ -252,8 +244,10 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
         };
         let block = match (ids, message.log_line) {
             (true, Some(line)) => format!("[#{line}] {block}"),
-            (true, None) if message.role == Role::User
-                && (message.content.starts_with(SUMMARY_PREFIX) || message.content.starts_with(SMART_SUMMARY_PREFIX)) =>
+            (true, None)
+                if message.role == Role::User
+                    && (message.content.starts_with(SUMMARY_PREFIX)
+                        || message.content.starts_with(SMART_SUMMARY_PREFIX)) =>
             {
                 format!("[earlier summary] {block}")
             }
@@ -293,7 +287,8 @@ mod tests {
 
     #[test]
     fn transcript_keeps_the_newest_messages() {
-        let messages: Vec<Message> = (0..50).map(|i| Message::user(&format!("message {i} {}", "x".repeat(100)))).collect();
+        let messages: Vec<Message> =
+            (0..50).map(|i| Message::user(&format!("message {i} {}", "x".repeat(100)))).collect();
         let text = render_transcript(&messages, 1_000, false);
         assert!(text.starts_with("…[earlier messages omitted]…"));
         assert!(text.contains("message 49"));

@@ -192,7 +192,8 @@ impl StatusLine {
     /// Reserve the bottom row, when stdin and stdout are a terminal and
     /// `AGENTIC_NO_STATUS` is unset.
     pub fn install(stats: SharedStats) -> Option<Arc<Self>> {
-        if !io::stdout().is_terminal() || !io::stdin().is_terminal() || std::env::var_os("AGENTIC_NO_STATUS").is_some() {
+        if !io::stdout().is_terminal() || !io::stdin().is_terminal() || std::env::var_os("AGENTIC_NO_STATUS").is_some()
+        {
             return None;
         }
         let (rows, cols) = terminal_size().filter(|(rows, _)| *rows >= 5)?;
@@ -211,11 +212,7 @@ impl StatusLine {
     /// need `EditView::status` to be `Some` without installing a real one.
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Self {
-            stats: SharedStats::default(),
-            size: Mutex::new(Some((24, 80))),
-            input: Mutex::new(None),
-        }
+        Self { stats: SharedStats::default(), size: Mutex::new(Some((24, 80))), input: Mutex::new(None) }
     }
 
     /// The status bar as a plain string at `cols` columns (stats only, no
@@ -371,11 +368,8 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     let cursor = cursor.min(flat.chars().count());
     let room = cols.saturating_sub(prefix.chars().count() + hint.chars().count() + extra + 1);
     // Keep the cursor visible: show the window of text around it.
-    let start = if flat.chars().count() > room {
-        cursor.saturating_sub(room / 2).min(flat.chars().count() - room)
-    } else {
-        0
-    };
+    let start =
+        if flat.chars().count() > room { cursor.saturating_sub(room / 2).min(flat.chars().count() - room) } else { 0 };
     let shown: String = flat.chars().skip(start).take(room).collect();
     let cursor_col = cursor - start;
     let before: String = shown.chars().take(cursor_col).collect();
@@ -384,9 +378,7 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     let cursor_glyph = if under.is_empty() { "█".to_string() } else { format!("\x1b[7m{under}\x1b[27m") };
     let used = prefix.chars().count() + shown.chars().count() + 1;
     let pad = cols.saturating_sub(used + hint.chars().count() + extra);
-    let indicator = indicator
-        .map(|i| format!("\x1b[38;5;222m · {i}\x1b[38;5;244m"))
-        .unwrap_or_default();
+    let indicator = indicator.map(|i| format!("\x1b[38;5;222m · {i}\x1b[38;5;244m")).unwrap_or_default();
     format!(
         "{BG}\x1b[1;38;5;117m{prefix}\x1b[0;48;5;236;38;5;255m{before}{cursor_glyph}{after}{}\x1b[38;5;244m{hint}{indicator}{RESET}",
         " ".repeat(pad)
@@ -405,17 +397,18 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     let filled = ((percent / 10.0).round() as usize).min(10);
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
     let approx = if stats.calibrated { "" } else { "~" };
-    let model = if stats.model.is_empty() { stats.provider.clone() } else { format!("{}/{}", stats.provider, stats.model) };
+    let model =
+        if stats.model.is_empty() { stats.provider.clone() } else { format!("{}/{}", stats.provider, stats.model) };
 
     let mut segments = vec![
         Segment { text: format!(" {model} "), color: Some("\x1b[1;38;5;255m"), priority: 9 },
+        Segment { text: format!(" {} ", stats.cwd), color: None, priority: 6 },
         Segment {
-            text: format!(" {} ", stats.cwd),
-            color: None,
-            priority: 6,
-        },
-        Segment {
-            text: format!(" ctx {approx}{}/{} {percent:.0}% ", format_tokens(stats.tokens), format_tokens(stats.window)),
+            text: format!(
+                " ctx {approx}{}/{} {percent:.0}% ",
+                format_tokens(stats.tokens),
+                format_tokens(stats.window)
+            ),
             color: None,
             priority: 8,
         },
@@ -580,7 +573,15 @@ mod tests {
     fn renders_all_segments_when_wide() {
         let line = visible(&render(&stats(), 140));
         assert_eq!(line.chars().count(), 140);
-        for part in ["work/llama-b", "ctx 96.5k/128k 75%", "42 msgs", "↑310k ↓12.4k", "auto-compact 80% (1×)", "▶ bash", "plan 2/5"] {
+        for part in [
+            "work/llama-b",
+            "ctx 96.5k/128k 75%",
+            "42 msgs",
+            "↑310k ↓12.4k",
+            "auto-compact 80% (1×)",
+            "▶ bash",
+            "plan 2/5",
+        ] {
             assert!(line.contains(part), "{part} missing from {line:?}");
         }
     }
@@ -630,8 +631,11 @@ mod tests {
         assert!(!line.contains('\n'), "newline leaked: {line:?}");
         assert!(!line.contains('\r'), "carriage return leaked: {line:?}");
         assert!(!line.contains('\t'), "tab leaked: {line:?}");
-        assert!(!line.contains('\x1b') || visible(&line).chars().all(|c| !c.is_control()),
-            "control leaked into visible text: {:?}", visible(&line));
+        assert!(
+            !line.contains('\x1b') || visible(&line).chars().all(|c| !c.is_control()),
+            "control leaked into visible text: {:?}",
+            visible(&line)
+        );
         // The surrounding real path characters survive.
         assert!(visible(&line).contains("abcd") || visible(&line).contains("/tmp/a"), "{line:?}");
     }

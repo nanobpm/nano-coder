@@ -384,9 +384,7 @@ impl EditView {
             // has no completion, while keeping Tab a no-op for a bare ambiguous
             // command (`/s`) and for the known first-argument menus (`/model`,
             // `/mode`, `/verbosity`).
-            None if self.line.contains(char::is_whitespace)
-                && !crate::commands::has_argument_menu(&self.line) =>
-            {
+            None if self.line.contains(char::is_whitespace) && !crate::commands::has_argument_menu(&self.line) => {
                 self.insert(" ");
             }
             None => {}
@@ -445,11 +443,7 @@ impl EditView {
     fn prompt_start(&self, cols: usize) -> (usize, usize) {
         let cols = cols.max(1);
         let w = self.prompt_width;
-        if w > 0 && w.is_multiple_of(cols) {
-            (w / cols - 1, cols)
-        } else {
-            (w / cols, w % cols)
-        }
+        if w > 0 && w.is_multiple_of(cols) { (w / cols - 1, cols) } else { (w / cols, w % cols) }
     }
 
     /// The cursor's row and column, counted from the prompt's row. The column
@@ -646,11 +640,7 @@ impl EditView {
         // up is unconditional, so a stale (too-tall) span lands the cursor above
         // the prompt and reprints over the transcript. Reset it to the actual
         // post-resize span first.
-        self.drawn_rows = if self.status.is_some() {
-            self.drawn_cursor_row + 1
-        } else {
-            self.content_rows(cols)
-        };
+        self.drawn_rows = if self.status.is_some() { self.drawn_cursor_row + 1 } else { self.content_rows(cols) };
         // Reprint the input FIRST, while the menu is still released: `redraw`
         // clears only the content rows and places the real cursor on the edit
         // character at the new width, recording that row in `drawn_cursor_row`.
@@ -689,12 +679,8 @@ impl EditView {
     fn erase_word(&mut self) {
         let before: String = self.line.chars().take(self.cursor).collect();
         let trimmed = before.trim_end();
-        let word_start = trimmed
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
+        let word_start =
+            trimmed.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
         let start = before[..word_start].chars().count();
         let from = self.byte_of(start);
         let to = self.byte_of(self.cursor);
@@ -848,9 +834,7 @@ impl EditView {
 /// single-row input this matches the historical reserve (`rows - 1`, or
 /// `rows - 2` with a status line).
 fn menu_max_rows(rows: usize, content: usize, has_status: bool) -> usize {
-    rows.saturating_sub(content)
-        .saturating_sub(has_status as usize)
-        .min(16)
+    rows.saturating_sub(content).saturating_sub(has_status as usize).min(16)
 }
 
 /// Terminal output that shows `lines` below the cursor's row (which holds
@@ -1534,14 +1518,14 @@ mod tests {
         assert_eq!(rows, 2);
         // Reserve descent+menu rows, then descend two rows to the end row before
         // drawing each menu row, restoring the edit cursor at the end.
-        assert_eq!(
-            seq,
-            "\x1bD\x1bD\x1bD\x1bD\x1b[4A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
-        );
+        assert_eq!(seq, "\x1bD\x1bD\x1bD\x1bD\x1b[4A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
         // Reusing already-reserved rows needs no scroll, but the reservation
         // descent still runs (a no-op) and it still descends to the end row.
         let (seq, rows) = menu_sequence(2, &lines[..1], false, 2);
-        assert_eq!((seq.as_str(), rows), ("\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2));
+        assert_eq!(
+            (seq.as_str(), rows),
+            ("\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[2B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2K\x1b8", 2)
+        );
     }
 
     #[test]
@@ -1558,10 +1542,7 @@ mod tests {
         let lines = vec!["a".to_string(), "b".to_string()];
         let (seq, rows) = menu_sequence(2, &lines, false, 1);
         assert_eq!(rows, 2);
-        assert_eq!(
-            seq,
-            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
-        );
+        assert_eq!(seq, "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
     }
 
     #[test]
@@ -1592,10 +1573,7 @@ mod tests {
         let (seq, rows) = menu_sequence(capped, &lines, true, 1);
         assert_eq!(rows, 2);
         assert_eq!(seq.matches("\x1b[2K").count(), 2);
-        assert_eq!(
-            seq,
-            "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8"
-        );
+        assert_eq!(seq, "\x1bD\x1bD\x1bD\x1b[3A\x1b7\x1b[1B\x1b[1B\r\x1b[2Ka\x1b[1B\r\x1b[2Kb\x1b8");
     }
 
     #[test]
@@ -1679,11 +1657,7 @@ mod tests {
         v.draw_menu();
         let content = v.content_rows(80);
         assert!(v.menu_rows > 0, "a bare `/` opens the command menu");
-        assert_eq!(
-            v.drawn_rows,
-            content + v.menu_rows,
-            "drawn_rows must keep the freshly drawn menu, not erase it"
-        );
+        assert_eq!(v.drawn_rows, content + v.menu_rows, "drawn_rows must keep the freshly drawn menu, not erase it");
     }
 
     #[test]
@@ -1699,10 +1673,7 @@ mod tests {
         v.cursor = v.line.chars().count();
         let _ = v.redraw_sequence(4, "");
         assert_eq!(v.drawn_rows, 3, "three content rows at 4 cols");
-        assert_eq!(
-            v.drawn_cursor_row, 2,
-            "cursor rests on the last wrapped row, recomputed — not reset to 0"
-        );
+        assert_eq!(v.drawn_cursor_row, 2, "cursor rests on the last wrapped row, recomputed — not reset to 0");
     }
 
     #[test]
@@ -1722,11 +1693,7 @@ mod tests {
         // As left by the last redraw at the old wide width: cursor on row 0.
         v.drawn_cursor_row = 0;
         v.drawn_rows = 1;
-        assert_eq!(
-            v.cursor_position(40).0,
-            0,
-            "at 40 cols the cursor sits on the prompt row",
-        );
+        assert_eq!(v.cursor_position(40).0, 0, "at 40 cols the cursor sits on the prompt row",);
         // The recompute `resize` performs before `redraw` at the new width.
         let new_cols = 4;
         v.drawn_cursor_row = v.cursor_position(new_cols).0;
@@ -2464,8 +2431,13 @@ mod tests {
     #[test]
     fn narrowing_the_command_menu_does_not_stack_prompts() {
         for (with_status, rows, start, typed) in [
-            (false, 30, 0, "/co"), (true, 30, 0, "/co"), (true, 10, 0, "/co"), (true, 10, 0, "/zzz"),
-            (true, 30, 10, "/co"), (true, 10, 3, "/mo"), (false, 10, 3, "/mo"),
+            (false, 30, 0, "/co"),
+            (true, 30, 0, "/co"),
+            (true, 10, 0, "/co"),
+            (true, 10, 0, "/zzz"),
+            (true, 30, 10, "/co"),
+            (true, 10, 3, "/mo"),
+            (false, 10, 3, "/mo"),
         ] {
             let cols = 80;
             let mut term = Vt::new(rows, cols, with_status);
@@ -2480,7 +2452,12 @@ mod tests {
             v.drawn_rows = 1;
             for c in typed.chars() {
                 press(&mut v, &mut term, c, rows, cols);
-                assert_eq!(term.prompts(), 1, "status={with_status} rows={rows} start={start} {typed} after {c:?}: {:#?}", term.dump());
+                assert_eq!(
+                    term.prompts(),
+                    1,
+                    "status={with_status} rows={rows} start={start} {typed} after {c:?}: {:#?}",
+                    term.dump()
+                );
             }
         }
     }
@@ -2513,9 +2490,8 @@ mod tests {
             }));
         }
         view.lock().unwrap().mode = EditMode::Prompt;
-        let last = |line: &str| {
-            seen.lock().unwrap().iter().rev().find(|(l, _)| l == line).map(|(_, m)| m.clone()).unwrap()
-        };
+        let last =
+            |line: &str| seen.lock().unwrap().iter().rev().find(|(l, _)| l == line).map(|(_, m)| m.clone()).unwrap();
         let plain = |rows: Vec<String>| -> Vec<String> {
             let re = regex::Regex::new("\x1b\\[[0-9;]*m").unwrap();
             rows.iter().map(|r| re.replace_all(r, "").into_owned()).collect()

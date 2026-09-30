@@ -250,7 +250,8 @@ pub fn result_text(questions: &[Question], answer: &QuestionAnswer) -> String {
                 .iter()
                 .enumerate()
                 .map(|(i, q)| {
-                    let answer = answers.get(i).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "Unanswered".into());
+                    let answer =
+                        answers.get(i).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "Unanswered".into());
                     format!(
                         "\"{}\"=\"{}\"",
                         crate::sanitize_terminal_text(&q.question),
@@ -325,7 +326,8 @@ mod tests {
             "non-custom question without options rejected"
         );
         assert!(
-            parse(&json!({ "questions": [ { "question": "Pick", "custom": false, "options": [ {"label": "A"} ] } ] })).is_ok(),
+            parse(&json!({ "questions": [ { "question": "Pick", "custom": false, "options": [ {"label": "A"} ] } ] }))
+                .is_ok(),
             "non-custom question with an option accepted"
         );
     }
@@ -334,12 +336,14 @@ mod tests {
     fn ask_blocks_until_resolved() {
         let broker = QuestionBroker::new();
         let worker = broker.clone();
-        let handle = std::thread::spawn(move || worker.ask_blocking(vec![Question {
-            question: "Proceed?".into(),
-            header: String::new(),
-            options: vec![],
-            custom: true,
-        }]));
+        let handle = std::thread::spawn(move || {
+            worker.ask_blocking(vec![Question {
+                question: "Proceed?".into(),
+                header: String::new(),
+                options: vec![],
+                custom: true,
+            }])
+        });
         // Wait for the request to register, then answer it from this side.
         let request = loop {
             if let Some(request) = broker.pending() {
@@ -365,12 +369,8 @@ mod tests {
 
     #[test]
     fn result_text_strips_control_sequences_from_model_and_user_text() {
-        let questions = vec![Question {
-            question: "pick\x1b[2Jone".into(),
-            header: String::new(),
-            options: vec![],
-            custom: true,
-        }];
+        let questions =
+            vec![Question { question: "pick\x1b[2Jone".into(), header: String::new(), options: vec![], custom: true }];
         let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["ans\x07wer".into()]));
         assert!(answered.contains("\"pick[2Jone\"=\"answer\""), "{answered}");
         assert!(!answered.contains('\x1b'), "escape leaked: {answered:?}");

@@ -1,6 +1,6 @@
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use anyhow::Result;
 
 /// Tool handler function type
 pub type ToolHandler = Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value> + Send + Sync>;
@@ -15,11 +15,7 @@ pub struct ToolDefinition {
 
 impl ToolDefinition {
     pub fn new(name: &str, description: &str, parameters: serde_json::Value) -> Self {
-        Self {
-            name: name.to_string(),
-            description: description.to_string(),
-            parameters,
-        }
+        Self { name: name.to_string(), description: description.to_string(), parameters }
     }
 }
 

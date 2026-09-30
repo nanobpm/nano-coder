@@ -113,7 +113,8 @@ pub struct Locations {
 impl Locations {
     pub fn from_env() -> Self {
         let home = dirs::home_dir();
-        let spm_home = std::env::var_os("SPM_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".spm")));
+        let spm_home =
+            std::env::var_os("SPM_HOME").map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".spm")));
         Self {
             spm_store: spm_home.map(|h| h.join("store")),
             cache: dirs::cache_dir().map(|c| c.join(crate::config::APP_NAME).join("skills")),
@@ -196,14 +197,18 @@ impl Skills {
             }
             return;
         }
-        let lock: Lockfile = match std::fs::read_to_string(&lock_path).map_err(anyhow::Error::from).and_then(|t| Ok(serde_json::from_str(&t)?)) {
+        let lock: Lockfile = match std::fs::read_to_string(&lock_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| Ok(serde_json::from_str(&t)?))
+        {
             Ok(lock) => lock,
             Err(e) => {
                 self.warnings.push(format!("{LOCK_FILE}: {e}"));
                 return;
             }
         };
-        let entries = lock.skills.iter().map(|(n, l)| (n, l, false)).chain(lock.plugins.iter().map(|(n, l)| (n, l, true)));
+        let entries =
+            lock.skills.iter().map(|(n, l)| (n, l, false)).chain(lock.plugins.iter().map(|(n, l)| (n, l, true)));
         for (name, locked, is_plugin) in entries {
             let kind = if is_plugin { "plugin" } else { "skill" };
             match self.load_locked(name, locked, is_plugin, config, locations, seen) {
@@ -225,12 +230,15 @@ impl Skills {
         locked.validate(name)?;
         let checkout = checkout_for(locked, config, locations)?;
         let checkout = checkout.canonicalize()?;
-        let content = within(&checkout, &checkout.join(locked.path.as_deref().unwrap_or(".")))
-            .with_context(|| format!("path `{}` is missing or outside the checkout", locked.path.as_deref().unwrap_or(".")))?;
+        let content = within(&checkout, &checkout.join(locked.path.as_deref().unwrap_or("."))).with_context(|| {
+            format!("path `{}` is missing or outside the checkout", locked.path.as_deref().unwrap_or("."))
+        })?;
         let source = Source::Lock { git: locked.git.clone(), commit: locked.commit.clone() };
         if !is_plugin {
-            within(&checkout, &content.join(SKILL_FILE)).with_context(|| format!("no {SKILL_FILE} inside the checkout at the locked path"))?;
-            let skill = read_skill(&content, Some(name), source).with_context(|| format!("no {SKILL_FILE} in the locked path"))?;
+            within(&checkout, &content.join(SKILL_FILE))
+                .with_context(|| format!("no {SKILL_FILE} inside the checkout at the locked path"))?;
+            let skill = read_skill(&content, Some(name), source)
+                .with_context(|| format!("no {SKILL_FILE} in the locked path"))?;
             self.push(skill, seen);
             return Ok(());
         }
@@ -314,8 +322,9 @@ impl Skills {
         // Re-check containment at read time: discovery canonicalized `skill.dir`,
         // but the `SKILL.md` beneath it could since have been swapped for a symlink
         // escaping the directory, so resolve it with `within` before reading.
-        let skill_file = within(&skill.dir, &skill.dir.join(SKILL_FILE))
-            .with_context(|| format!("{} is not a regular file inside the skill directory", skill.dir.join(SKILL_FILE).display()))?;
+        let skill_file = within(&skill.dir, &skill.dir.join(SKILL_FILE)).with_context(|| {
+            format!("{} is not a regular file inside the skill directory", skill.dir.join(SKILL_FILE).display())
+        })?;
         let text = std::fs::read(&skill_file).with_context(|| format!("reading {}", skill_file.display()))?;
         let text = String::from_utf8_lossy(&text);
         let (_, body) = front_matter(&text);
@@ -455,7 +464,9 @@ fn front_matter(text: &str) -> (Vec<(String, String)>, &str) {
             fields.push((key, String::new()));
             continue;
         }
-        let unquoted = if value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\''))) {
+        let unquoted = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\'')))
+        {
             &value[1..value.len() - 1]
         } else {
             value
@@ -478,7 +489,8 @@ fn cap(text: &str, max: usize) -> String {
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
-        let out = format!("{}\n\n[... truncated: {end} of {total} bytes shown; read the rest with read_file]", &text[..end]);
+        let out =
+            format!("{}\n\n[... truncated: {end} of {total} bytes shown; read the rest with read_file]", &text[..end]);
         if out.len() <= max || end == 0 {
             return out;
         }
@@ -610,7 +622,11 @@ fn head_is(dir: &Path, commit: &str) -> bool {
 /// cache's, fetching into the cache when allowed.
 fn checkout_for(locked: &Locked, config: &SkillsConfig, locations: &Locations) -> Result<PathBuf> {
     let candidates = [&locations.spm_store, &locations.cache];
-    if let Some(dir) = candidates.iter().filter_map(|base| base.as_ref().map(|b| b.join(&locked.store))).find(|d| head_is(d, &locked.commit)) {
+    if let Some(dir) = candidates
+        .iter()
+        .filter_map(|base| base.as_ref().map(|b| b.join(&locked.store)))
+        .find(|d| head_is(d, &locked.commit))
+    {
         return Ok(dir);
     }
     if !config.fetch {
@@ -648,11 +664,8 @@ fn git_host(url: &str) -> Option<String> {
     if url.starts_with("file://") {
         return Some("file".to_string());
     }
-    let authority = if let Some((_, rest)) = url.split_once("://") {
-        rest.split('/').next()?
-    } else {
-        url.split_once(':')?.0
-    };
+    let authority =
+        if let Some((_, rest)) = url.split_once("://") { rest.split('/').next()? } else { url.split_once(':')?.0 };
     let host = authority.rsplit('@').next()?;
     let host = host.split(':').next()?;
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
@@ -736,7 +749,11 @@ mod tests {
     }
 
     fn locations(base: &Path) -> Locations {
-        Locations { home: Some(base.join("home")), spm_store: Some(base.join("spm/store")), cache: Some(base.join("cache")) }
+        Locations {
+            home: Some(base.join("home")),
+            spm_store: Some(base.join("spm/store")),
+            cache: Some(base.join("cache")),
+        }
     }
 
     fn config() -> SkillsConfig {
@@ -753,7 +770,9 @@ mod tests {
 
     #[test]
     fn parses_front_matter_blocks_and_quotes() {
-        let (fields, body) = front_matter("---\nname: \"pdf\"\ndescription: >\n  Fill PDF forms\n  and merge files.\nlicense: MIT\n---\nBody\n");
+        let (fields, body) = front_matter(
+            "---\nname: \"pdf\"\ndescription: >\n  Fill PDF forms\n  and merge files.\nlicense: MIT\n---\nBody\n",
+        );
         assert_eq!(fields[0], ("name".into(), "pdf".into()));
         assert_eq!(fields[1], ("description".into(), "Fill PDF forms and merge files.".into()));
         assert_eq!(fields[2], ("license".into(), "MIT".into()));
@@ -784,14 +803,22 @@ mod tests {
         assert!(skills.warnings.is_empty());
 
         let index = skills.render_index();
-        assert!(index.contains("# Skills") && index.contains("- `review`: Review a PR.") && !index.contains("shadowed"));
+        assert!(
+            index.contains("# Skills") && index.contains("- `review`: Review a PR.") && !index.contains("shadowed")
+        );
 
         let loaded = skills.load(&json!({ "name": "review" })).unwrap();
         assert!(loaded.contains("Do the review thing.") && !loaded.contains("description:"));
         let expected_script = skills.skills[0].dir.join("scripts/check.sh");
         assert!(loaded.contains(&format!("- {}", expected_script.display())), "{loaded}");
         assert!(expected_script.is_absolute(), "listed skill file paths must be absolute");
-        assert!(skills.load(&json!({ "name": "nope" })).unwrap_err().to_string().contains("available: review, deploy, notes"));
+        assert!(
+            skills
+                .load(&json!({ "name": "nope" }))
+                .unwrap_err()
+                .to_string()
+                .contains("available: review, deploy, notes")
+        );
     }
 
     #[test]
@@ -817,7 +844,10 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let entry = |path: &str| json!({ "git": url, "reference": "branch:main", "commit": sha, "path": path, "store": store_key(&url, &sha) });
-        write(&repo.join("ai.lock"), &json!({ "skills": { "lint": entry("skills/lint") }, "plugins": { "p": entry("plugin") } }).to_string());
+        write(
+            &repo.join("ai.lock"),
+            &json!({ "skills": { "lint": entry("skills/lint") }, "plugins": { "p": entry("plugin") } }).to_string(),
+        );
 
         let skills = Skills::discover_in(&repo, &config(), &locations(dir.path()));
         assert!(skills.warnings.is_empty(), "{:?}", skills.warnings);
@@ -842,13 +872,15 @@ mod tests {
         write(&store.join("fmt/SKILL.md"), &skill_md("fmt", "Format files."));
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let good = json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "fmt", "store": store_key(url, &sha) });
+        let good =
+            json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "fmt", "store": store_key(url, &sha) });
         let escape = json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "../../etc", "store": store_key(url, &sha) });
         let forged = json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "fmt", "store": "other@x" });
         write(&dir.path().join("secret/SKILL.md"), "---\nname: secret\ndescription: TOP SECRET\n---\n");
         std::fs::create_dir_all(store.join("leak")).unwrap();
         std::os::unix::fs::symlink(dir.path().join("secret/SKILL.md"), store.join("leak/SKILL.md")).unwrap();
-        let leak = json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "leak", "store": store_key(url, &sha) });
+        let leak =
+            json!({ "git": url, "reference": "tag:v1", "commit": sha, "path": "leak", "store": store_key(url, &sha) });
         let short = json!({ "git": url, "reference": "tag:v1", "commit": "abc", "store": "x" });
         let other_host = json!({ "git": "https://evil.example/x.git", "reference": "tag:v1", "commit": "b".repeat(40), "store": store_key("https://evil.example/x.git", &"b".repeat(40)) });
         write(

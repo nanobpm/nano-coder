@@ -15,19 +15,11 @@ pub struct MockLLMClient {
 
 impl MockLLMClient {
     pub fn new(model: &str) -> Self {
-        Self {
-            model: model.to_string(),
-            call_count: AtomicI64::new(0),
-        }
+        Self { model: model.to_string(), call_count: AtomicI64::new(0) }
     }
 
     fn usage(completion_tokens: i64) -> Option<TokenUsage> {
-        Some(TokenUsage {
-            prompt_tokens: 50,
-            completion_tokens,
-            total_tokens: 50 + completion_tokens,
-            aic: None,
-        })
+        Some(TokenUsage { prompt_tokens: 50, completion_tokens, total_tokens: 50 + completion_tokens, aic: None })
     }
 
     fn pick_tool(content: &str) -> Option<(&'static str, serde_json::Value)> {
@@ -38,13 +30,16 @@ impl MockLLMClient {
         // Match as standalone words so ordinary prompts like "finish the task"
         // (which merely *contain* "ask") don't trip the picker unexpectedly.
         if has_word(&content, "question") || has_word(&content, "ask") {
-            return Some(("question", json!({
-                "questions": [{
-                    "question": "Which way should I go?",
-                    "header": "Direction",
-                    "options": [{ "label": "Left" }, { "label": "Right" }]
-                }]
-            })));
+            return Some((
+                "question",
+                json!({
+                    "questions": [{
+                        "question": "Which way should I go?",
+                        "header": "Direction",
+                        "options": [{ "label": "Left" }, { "label": "Right" }]
+                    }]
+                }),
+            ));
         }
         if content.contains("time") || content.contains("clock") {
             return Some(("get_time", json!({})));
@@ -72,9 +67,7 @@ impl MockLLMClient {
 /// non-alphanumeric characters), so substrings like "ask" inside "task" don't
 /// match. Both arguments are expected to already be lowercase.
 fn has_word(haystack: &str, needle: &str) -> bool {
-    haystack
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| word == needle)
+    haystack.split(|c: char| !c.is_alphanumeric()).any(|word| word == needle)
 }
 
 /// Mock reasoning, produced when the user's latest message mentions "think".

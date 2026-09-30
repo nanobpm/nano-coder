@@ -116,9 +116,7 @@ pub fn parse(args: &str) -> Result<QueueOp, String> {
         "remove" | "rm" | "delete" => {
             let mut ids = Vec::new();
             for word in rest.split_whitespace() {
-                let id = word
-                    .parse::<usize>()
-                    .map_err(|_| format!("{word:?} is not a queue id — {USAGE}"))?;
+                let id = word.parse::<usize>().map_err(|_| format!("{word:?} is not a queue id — {USAGE}"))?;
                 ids.push(id);
             }
             if ids.is_empty() {
@@ -127,13 +125,8 @@ pub fn parse(args: &str) -> Result<QueueOp, String> {
             Ok(QueueOp::Remove(ids))
         }
         "edit" => {
-            let (id, text) = rest
-                .split_once(char::is_whitespace)
-                .ok_or_else(|| USAGE.to_string())?;
-            let id = id
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| format!("{id:?} is not a queue id — {USAGE}"))?;
+            let (id, text) = rest.split_once(char::is_whitespace).ok_or_else(|| USAGE.to_string())?;
+            let id = id.trim().parse::<usize>().map_err(|_| format!("{id:?} is not a queue id — {USAGE}"))?;
             let text = text.trim();
             if text.is_empty() {
                 return Err(USAGE.to_string());
@@ -183,7 +176,8 @@ pub fn apply(queue: &mut MessageQueue, op: &QueueOp) -> String {
 /// One line per waiting message, oldest first.
 pub fn describe(queue: &MessageQueue) -> String {
     if queue.is_empty() {
-        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.".to_string();
+        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers."
+            .to_string();
     }
     let mut out = format!("Queued ({}):", queue.len());
     for entry in queue.list() {
@@ -300,7 +294,10 @@ mod tests {
         assert!(missing.contains("No queued message with id 7"), "{missing}");
 
         assert!(apply(&mut queue, &QueueOp::Clear).contains("Cleared 2"));
-        assert_eq!(apply(&mut queue, &QueueOp::List), "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.");
+        assert_eq!(
+            apply(&mut queue, &QueueOp::List),
+            "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers."
+        );
     }
 
     #[test]

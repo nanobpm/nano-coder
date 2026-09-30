@@ -85,10 +85,9 @@ struct Arguments {
 }
 
 fn validate(config: &BashConfig, args: &Value) -> Result<Arguments, String> {
-    let object = args
-        .as_object()
-        .ok_or_else(|| format!("bash arguments must be a JSON object, got {args}"))?;
-    let limit = output::parse_max_output_length(object.get("max_output_length")).map_err(|e| format!("bash argument: {e}"))?;
+    let object = args.as_object().ok_or_else(|| format!("bash arguments must be a JSON object, got {args}"))?;
+    let limit =
+        output::parse_max_output_length(object.get("max_output_length")).map_err(|e| format!("bash argument: {e}"))?;
     let command = match object.get("command") {
         None => return Err(r#"bash argument "command" must be set"#.into()),
         Some(Value::String(command)) => command.clone(),
@@ -111,7 +110,9 @@ fn validate(config: &BashConfig, args: &Value) -> Result<Arguments, String> {
 pub fn run(config: &BashConfig, args: &Value) -> String {
     let arguments = match validate(config, args) {
         Ok(arguments) => arguments,
-        Err(message) => return format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0),
+        Err(message) => {
+            return format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0);
+        }
     };
     match execute(config, &arguments) {
         Ok(text) => text,
@@ -124,8 +125,7 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
         Some(shared) => shared.read().unwrap().clone(),
         None => config.output_dir.clone(),
     };
-    fs::create_dir_all(&output_dir)
-        .map_err(|e| format!("create output directory {}: {e}", output_dir.display()))?;
+    fs::create_dir_all(&output_dir).map_err(|e| format!("create output directory {}: {e}", output_dir.display()))?;
     // Reserve a per-call output basename without overwriting spills from an
     // earlier run of a resumed session. Their paths are still referenced by
     // logged tool results, so reusing bash-1 again after a restart (when the
@@ -224,10 +224,7 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     if was_cancelled {
         parts.push("Error: the turn was cancelled; the command was killed".into());
     } else if timed_out {
-        parts.push(format!(
-            "Error: command timed out after {}s and was killed",
-            arguments.timeout.as_secs()
-        ));
+        parts.push(format!("Error: command timed out after {}s and was killed", arguments.timeout.as_secs()));
     } else if let Some(code) = status.code() {
         if code != 0 {
             parts.push(format!("Exit code: {code}"));
@@ -314,11 +311,7 @@ mod tests {
         let result = run(&config, &json!({"command": "seq 1 100000", "max_output_length": 20}));
         assert!(result.starts_with("1\n2\n3\n4\n5\n"), "{result}");
         assert!(result.ends_with("...99\n100000\n"), "{result}");
-        let path = result
-            .split("complete output in ")
-            .nth(1)
-            .and_then(|rest| rest.split("...").next())
-            .unwrap();
+        let path = result.split("complete output in ").nth(1).and_then(|rest| rest.split("...").next()).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 100000);
         // Untruncated stderr capture is cleaned up.
         assert!(!Path::new(&path.replace(".stdout", ".stderr")).exists());

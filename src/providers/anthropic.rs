@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{HttpTransport, ResolvedProvider, StreamAction};
-use crate::llm::{ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole};
+use crate::llm::{
+    ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
+};
 
 const API_VERSION: &str = "2023-06-01";
 /// The Messages API requires `max_tokens`.
@@ -18,9 +20,7 @@ pub struct AnthropicClient {
 
 impl AnthropicClient {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
-        Ok(Self {
-            transport: HttpTransport::new(provider)?,
-        })
+        Ok(Self { transport: HttpTransport::new(provider)? })
     }
 
     pub fn build_body(&self, request: &ChatRequest<'_>) -> Value {
@@ -30,39 +30,39 @@ impl AnthropicClient {
 
 /// Messages API request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
-        let provider = transport.provider();
-        let system: Vec<&str> = request
-            .messages
+    let provider = transport.provider();
+    let system: Vec<&str> = request
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System && !m.content.is_empty())
+        .map(|m| m.content.as_str())
+        .collect();
+    let mut body = json!({
+        "model": provider.model,
+        "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "messages": encode_messages(request.messages),
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system.join("\n\n"));
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = request
+            .tools
             .iter()
-            .filter(|m| m.role == Role::System && !m.content.is_empty())
-            .map(|m| m.content.as_str())
-            .collect();
-        let mut body = json!({
-            "model": provider.model,
-            "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            "messages": encode_messages(request.messages),
-        });
-        if !system.is_empty() {
-            body["system"] = json!(system.join("\n\n"));
-        }
-        if !request.tools.is_empty() {
-            body["tools"] = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    })
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters,
                 })
-                .collect();
-        }
-        if let Some(temperature) = request.temperature {
-            // Anthropic's range is 0..=1.
-            body["temperature"] = json!(temperature.clamp(0.0, 1.0));
-        }
-        transport.finish_body(body)
+            })
+            .collect();
+    }
+    if let Some(temperature) = request.temperature {
+        // Anthropic's range is 0..=1.
+        body["temperature"] = json!(temperature.clamp(0.0, 1.0));
+    }
+    transport.finish_body(body)
 }
 
 /// Encode messages as content blocks, merging consecutive same-role turns
@@ -124,17 +124,12 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
             _ => encoded.push((role.to_string(), blocks)),
         }
     }
-    encoded
-        .into_iter()
-        .map(|(role, content)| json!({"role": role, "content": content}))
-        .collect()
+    encoded.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect()
 }
 
 pub fn parse_response(value: &Value) -> Result<LLMResponse> {
-    let blocks = value
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("response has no content: {value}"))?;
+    let blocks =
+        value.get("content").and_then(Value::as_array).ok_or_else(|| anyhow!("response has no content: {value}"))?;
     let mut content = String::new();
     let mut thinking = String::new();
     let mut thinking_blocks = Vec::new();
@@ -174,7 +169,8 @@ pub fn parse_response(value: &Value) -> Result<LLMResponse> {
 /// Usage with `prompt` already known (from `message_start`) added in.
 fn parse_usage(usage: &Value, prompt: i64) -> TokenUsage {
     let field = |name: &str| usage.get(name).and_then(Value::as_i64).unwrap_or(0);
-    let prompt = prompt + field("input_tokens") + field("cache_read_input_tokens") + field("cache_creation_input_tokens");
+    let prompt =
+        prompt + field("input_tokens") + field("cache_read_input_tokens") + field("cache_creation_input_tokens");
     let completion = field("output_tokens");
     TokenUsage { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion, aic: None }
 }
@@ -217,8 +213,12 @@ impl StreamAccumulator {
                 let block = event.get("content_block").cloned().unwrap_or(Value::Null);
                 let block = match block.get("type").and_then(Value::as_str) {
                     Some("text") => Block::Text(str_of(&block, "text")),
-                    Some("thinking") => Block::Thinking { thinking: str_of(&block, "thinking"), signature: str_of(&block, "signature") },
-                    Some("tool_use") => Block::ToolUse { id: str_of(&block, "id"), name: str_of(&block, "name"), json: String::new() },
+                    Some("thinking") => {
+                        Block::Thinking { thinking: str_of(&block, "thinking"), signature: str_of(&block, "signature") }
+                    }
+                    Some("tool_use") => {
+                        Block::ToolUse { id: str_of(&block, "id"), name: str_of(&block, "name"), json: String::new() }
+                    }
                     _ => Block::Opaque(block),
                 };
                 self.blocks.push((index, block));
@@ -235,8 +235,12 @@ impl StreamAccumulator {
                         thinking.push_str(piece("thinking"));
                         sink(StreamEvent::Thinking(piece("thinking")));
                     }
-                    (Some(Block::Thinking { signature, .. }), Some("signature_delta")) => signature.push_str(piece("signature")),
-                    (Some(Block::ToolUse { json, .. }), Some("input_json_delta")) => json.push_str(piece("partial_json")),
+                    (Some(Block::Thinking { signature, .. }), Some("signature_delta")) => {
+                        signature.push_str(piece("signature"))
+                    }
+                    (Some(Block::ToolUse { json, .. }), Some("input_json_delta")) => {
+                        json.push_str(piece("partial_json"))
+                    }
                     _ => {}
                 }
             }
@@ -269,7 +273,9 @@ impl StreamAccumulator {
                 Block::Text(text) => response.content.push_str(&text),
                 Block::Thinking { thinking, signature } => {
                     response.thinking.push_str(&thinking);
-                    response.thinking_blocks.push(json!({"type": "thinking", "thinking": thinking, "signature": signature}));
+                    response
+                        .thinking_blocks
+                        .push(json!({"type": "thinking", "thinking": thinking, "signature": signature}));
                 }
                 Block::Opaque(block) => {
                     if block.get("type").and_then(Value::as_str) == Some("redacted_thinking") {
@@ -352,13 +358,19 @@ impl LLMClient for AnthropicClient {
         }
         let api_key = provider.api_key.clone();
         let url = format!("{}/messages", provider.base_url);
-        stream(&self.transport, &url, self.build_body(request), |builder| {
-            let builder = builder.header("anthropic-version", API_VERSION);
-            match &api_key {
-                Some(key) => builder.header("x-api-key", key),
-                None => builder,
-            }
-        }, sink)
+        stream(
+            &self.transport,
+            &url,
+            self.build_body(request),
+            |builder| {
+                let builder = builder.header("anthropic-version", API_VERSION);
+                match &api_key {
+                    Some(key) => builder.header("x-api-key", key),
+                    None => builder,
+                }
+            },
+            sink,
+        )
         .await
     }
 
@@ -382,7 +394,12 @@ mod tests {
     fn trajectory_data_is_never_sent() {
         let logged = Message {
             thinking: "private reasoning".into(),
-            usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                aic: Some(0.5),
+            }),
             duration_ms: Some(1234),
             ..Message::assistant("answer")
         };
@@ -412,7 +429,13 @@ mod tests {
             Message::assistant_with_tools(
                 "checking",
                 vec![
-                    ToolCall { id: "t1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None },
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "get_time".into(),
+                        arguments: json!({}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
                     // Malformed arguments arrive as dedicated metadata.
                     ToolCall::from_raw_arguments("t2".into(), "bash".into(), "{bad", None),
                 ],
@@ -454,7 +477,11 @@ mod tests {
         })
         .to_string();
         let (url, captured) = test_server::serve(vec![
-            (529, "retry-after: 0.01\r\n", r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.into()),
+            (
+                529,
+                "retry-after: 0.01\r\n",
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#.into(),
+            ),
             (200, "", ok),
         ])
         .await;
@@ -513,7 +540,8 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}),
             json!({"type":"message_stop"}),
         ];
-        let body: String = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
+        let body: String =
+            events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
         let (url, captured) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", body)]).await;
         let messages = [Message::user("hello")];
         let seen = std::sync::Mutex::new(String::new());
@@ -523,14 +551,20 @@ mod tests {
             }
         };
         let response = client(&url)
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &sink,
+            )
             .await
             .unwrap();
         assert_eq!(*seen.lock().unwrap(), "Plan.");
         assert_eq!(response.content, "Running");
         assert_eq!(response.thinking, "Plan.");
         assert_eq!(response.tool_calls[0].arguments, json!({"command": "ls"}));
-        assert_eq!(response.usage, Some(TokenUsage { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29, aic: None }));
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29, aic: None })
+        );
         assert_eq!(captured.lock().unwrap()[0].body["stream"], true);
 
         let assistant = Message {
@@ -565,10 +599,7 @@ mod tests {
         assert_eq!(response.stop_reason.as_deref(), Some("max_tokens"));
         let call = &response.tool_calls[0];
         // The truncated text is preserved verbatim as malformed metadata...
-        assert_eq!(
-            call.invalid_arguments(),
-            Some("{\"path\":\"/tmp/big.txt\",\"content\":\"...")
-        );
+        assert_eq!(call.invalid_arguments(), Some("{\"path\":\"/tmp/big.txt\",\"content\":\"..."));
         // ...and `arguments` holds no fabricated field for a handler to
         // misreport as present-but-empty.
         assert_eq!(call.arguments, json!({}));
@@ -595,10 +626,8 @@ mod tests {
         // the first attempt is not duplicated onto the second.
         let start = json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
         let empty = json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}});
-        let mut truncated: String = [&start, &empty]
-            .iter()
-            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
-            .collect();
+        let mut truncated: String =
+            [&start, &empty].iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
         // A second event begins but is cut off before it completes.
         truncated.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"wor");
         let good_events = [
@@ -608,10 +637,8 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
             json!({"type":"message_stop"}),
         ];
-        let good: String = good_events
-            .iter()
-            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
-            .collect();
+        let good: String =
+            good_events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect();
         let (url, captured) = test_server::serve(vec![
             (200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated),
             (200, "content-type: text/event-stream\r\n", good),
@@ -627,7 +654,10 @@ mod tests {
             }
         };
         let response = client(&url)
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &sink,
+            )
             .await
             .unwrap();
         // An empty delta must not suppress the retry.
