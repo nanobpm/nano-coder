@@ -1075,8 +1075,11 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
         // Credentials embedded in a URL authority: `scheme://user:pass@host`.
         // The assignment rule only fires on variable *names* like `password`/
         // `token`, so `DATABASE_URL=postgres://admin:s3cr3t@db/app` slips past
-        // every other pattern; catch the `user:pass@` shape directly.
-        (r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:]+:[^\s/@]+@", "credential in URL authority"),
+        // every other pattern; catch the `user:pass@` shape directly. The
+        // username may be *empty* (`redis://:s3cr3t@host/0` — a common Redis
+        // form), so allow zero chars before the authority colon, or that
+        // plaintext password is accepted despite the rejection guarantee.
+        (r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:]*:[^\s/@]+@", "credential in URL authority"),
     ];
     for (pattern, reason) in patterns {
         if RegexBuilder::new(pattern).build().is_ok_and(|re| re.is_match(text)) {
@@ -1298,6 +1301,10 @@ mod tests {
             // A password embedded in a URL authority (`user:pass@host`), which
             // no variable-name rule catches (Copilot finding, src/memory.rs).
             "DATABASE_URL=postgres://admin:s3cr3tPassw0rd@db.example/app",
+            // The username may be empty (`:pass@host`) — a common Redis form —
+            // and the password must still be rejected (Copilot finding,
+            // src/memory.rs).
+            "REDIS_URL=redis://:s3cr3tPassw0rd@cache.example/0",
         ] {
             assert!(store.save(Scope::User, secret, None, None).is_err(), "should reject: {secret}");
         }
