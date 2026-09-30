@@ -784,7 +784,15 @@ impl EditView {
         self.line = line.to_string();
         self.cursor = line.chars().count();
         self.menu_hidden = false;
-        self.draw_edit();
+        // Like `mutated`: the legacy path needs both renders (`draw_edit`
+        // reprints the input row, `draw_menu` draws the menu below it), but the
+        // frame path composes input + menu in a single hook call. A leading
+        // `draw_edit` here would recompose and re-emit the whole transcript an
+        // extra time per history recall, so route frame mode through
+        // `draw_menu` alone for a single O(history) render.
+        if self.on_edit.is_none() {
+            self.draw_edit();
+        }
         self.draw_menu();
     }
 
@@ -1477,6 +1485,27 @@ mod tests {
         view.insert("h");
         assert_eq!(*calls.lock().unwrap(), 1, "post-Esc mutation renders once");
         assert!(view.menu_visible(), "the mutation reopened the menu");
+    }
+
+    #[test]
+    fn frame_history_recall_invokes_the_draw_hook_once() {
+        // History recall (Up/Down -> `set_line`) must recompose the frame
+        // exactly once. Like a text mutation, the hook clones the whole
+        // transcript, so the old `draw_edit()` + `draw_menu()` pair performed
+        // two O(history) renders per recall. Frame mode now routes through the
+        // single hook invocation in `draw_menu`.
+        let calls = Arc::new(Mutex::new(0usize));
+        let mut view = view("");
+        view.mode = EditMode::Prompt;
+        view.menu_enabled = true;
+        let counter = calls.clone();
+        view.on_edit = Some(Arc::new(move |_: &str, _: usize, _: usize, _: &[String]| {
+            *counter.lock().unwrap() += 1;
+        }));
+
+        *calls.lock().unwrap() = 0;
+        view.set_line("/model gpt");
+        assert_eq!(*calls.lock().unwrap(), 1, "history recall renders the frame once");
     }
 
     #[test]
