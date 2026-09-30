@@ -53,6 +53,14 @@ line shows how many are waiting. Edit the queue at any time
 drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites one, and
 `/queue clear` empties the queue. A queued message is never injected while the agent is
 asking for input (the `question` tool's picker owns the terminal until you answer).
+Slash commands work mid-turn too, where it is safe:
+- **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
+  `/context`, `/trajectory`, and `/mode` or `/verbosity` without an argument) show the current state.
+  `/plan` shows the plan as the agent updates it.
+- **From the agent's next step:** `/mode NAME` and `/verbosity LEVEL`.
+- **After the turn:** commands that change the conversation or take over the keyboard
+  (`/compact`, `/restart`, `/settings`, `/model`, `/exit`) wait for the turn to finish.
+
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts

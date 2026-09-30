@@ -205,6 +205,9 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// The plan as last published by the agent (every `AgentEvent::Plan`),
+    /// so `/plan` can show it while a turn holds the agent.
+    plan: Mutex<crate::plan::Plan>,
 }
 
 /// Steering and cancellation for the running turn. Cheap to clone and safe to
@@ -223,6 +226,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                plan: Mutex::new(crate::plan::Plan::default()),
             }),
         }
     }
@@ -271,6 +275,15 @@ impl TurnControl {
         let mut mode = self.inner.mode.lock().unwrap();
         *mode = mode.next();
         *mode
+    }
+
+    /// The plan as the agent last published it.
+    pub fn plan(&self) -> crate::plan::Plan {
+        self.inner.plan.lock().unwrap().clone()
+    }
+
+    pub fn publish_plan(&self, plan: &crate::plan::Plan) {
+        *self.inner.plan.lock().unwrap() = plan.clone();
     }
 
     /// Flag for synchronous tools (e.g. bash) to poll.
@@ -721,6 +734,9 @@ impl Agent {
     }
 
     fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::Plan { plan } = &event {
+            self.control.publish_plan(plan);
+        }
         if let Some(sink) = &self.event_sink {
             sink(self.session_id.as_deref(), &event);
         }
@@ -2849,6 +2865,8 @@ mod tests {
         assert!(last[7].is_error && last[7].content.contains("items are 1, 2"), "{}", last[7].content);
         assert_eq!(agent.plan().progress(), (1, 2));
         assert_eq!(agent.context_stats().lock().unwrap().plan, Some((1, 2)));
+        // Published on the control handle too, for `/plan` typed mid-turn.
+        assert_eq!(&agent.control().plan(), agent.plan());
 
         let plans: Vec<Value> =
             events.lock().unwrap().iter().filter(|u| u["sessionUpdate"] == "plan").cloned().collect();
