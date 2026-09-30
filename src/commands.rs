@@ -144,7 +144,9 @@ fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
 
     let current = config.model.trim();
     if !current.is_empty() {
-        push(current.to_string(), "current".to_string());
+        // Canonicalize to match how recents are stored, so the current model
+        // and its recents entry dedupe into one row.
+        push(crate::recents::canonical(current, &all, &default_provider), "current".to_string());
     }
     for spec in recents {
         push(spec.to_string(), "recent".to_string());

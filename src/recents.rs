@@ -3,10 +3,29 @@
 //! list, so the models actually switched to lately are the first completions
 //! offered. Best-effort: a corrupt or unreadable file just starts empty.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::providers::{self, ProviderConfig};
+
 pub const MAX_RECENTS: usize = 8;
+
+/// Canonicalize `spec` to `provider/model` (or a bare `provider`) with the
+/// same rules the rest of the app parses model specs by, so a slash-containing
+/// default-provider model ID (`meta-llama/llama-4` on `together`) is stored
+/// with its real provider prefix (`together/meta-llama/llama-4`) instead of
+/// being mistaken for a `meta-llama` provider. Recording the canonical spec is
+/// what lets a later provider removal be told apart from a model ID that merely
+/// contains a slash: a genuinely removed provider's prefix no longer resolves,
+/// while a default-provider model keeps a configured prefix.
+pub fn canonical(spec: &str, all: &BTreeMap<String, ProviderConfig>, default_provider: &str) -> String {
+    let (provider, model) = providers::parse_model_spec(spec, all, default_provider);
+    match model {
+        Some(model) => format!("{provider}/{model}"),
+        None => provider.to_string(),
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -60,6 +79,20 @@ pub fn save(path: &Path, recents: &Recents) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_prefixes_the_real_provider() {
+        let all: BTreeMap<String, ProviderConfig> =
+            ["openai", "together", "ollama"].iter().map(|n| (n.to_string(), ProviderConfig::default())).collect();
+        // A slash-containing bare model on the default provider keeps that
+        // provider, rather than being read as a `meta-llama` provider.
+        assert_eq!(canonical("meta-llama/llama-4", &all, "together"), "together/meta-llama/llama-4");
+        // A bare model gains its default provider; an explicit spec is unchanged.
+        assert_eq!(canonical("gpt-4o", &all, "openai"), "openai/gpt-4o");
+        assert_eq!(canonical("openai/gpt-4o", &all, "openai"), "openai/gpt-4o");
+        // A bare provider name stays as-is (it means "the provider's default model").
+        assert_eq!(canonical("ollama", &all, "openai"), "ollama");
+    }
 
     #[test]
     fn record_moves_to_front_without_duplicates_and_caps() {

@@ -12,6 +12,7 @@ use dialoguer::{Confirm, Input, Select};
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::providers::{self, ProviderConfig, ProviderKind};
+use crate::recents;
 
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -72,9 +73,17 @@ fn turn_cap_label(max_iterations: usize) -> String {
     }
 }
 
-/// The settings dialog. `recents` is the most-recently-used model list, for
-/// the model picker.
-pub async fn run(agent: &mut Agent, config_path: &Path, recents: &[String]) -> Result<()> {
+/// The settings dialog. `recents` is the shared most-recently-used model MRU:
+/// the model picker reads a fresh snapshot each time it opens, and every switch
+/// made here is recorded into it immediately (and persisted to `recents_path`),
+/// so multiple switches in one visit all land and reopening the picker sees the
+/// latest.
+pub async fn run(
+    agent: &mut Agent,
+    config_path: &Path,
+    recents: &recents::SharedRecents,
+    recents_path: &Path,
+) -> Result<()> {
     let mut changes = Changes::default();
     loop {
         let config = agent.config();
@@ -104,8 +113,9 @@ pub async fn run(agent: &mut Agent, config_path: &Path, recents: &[String]) -> R
         let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
         match selection {
             0 => {
-                if let Some(spec) = pick_model_interactive(agent, recents).await? {
-                    switch_model(agent, &spec, &mut changes).await;
+                let snapshot = recents.lock().unwrap().models().to_vec();
+                if let Some(spec) = pick_model_interactive(agent, &snapshot).await? {
+                    switch_model(agent, &spec, &mut changes, recents, recents_path).await;
                 }
             }
             1 => {
@@ -117,7 +127,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path, recents: &[String]) -> R
                         if let Step::Done(spec) =
                             pick_model_from_provider(&name, &all, &user, &default_provider).await?
                         {
-                            switch_model(agent, &spec, &mut changes).await;
+                            switch_model(agent, &spec, &mut changes, recents, recents_path).await;
                         }
                     }
                 }
@@ -200,14 +210,38 @@ pub async fn run(agent: &mut Agent, config_path: &Path, recents: &[String]) -> R
     }
 }
 
-async fn switch_model(agent: &mut Agent, spec: &str, changes: &mut Changes) {
+async fn switch_model(
+    agent: &mut Agent,
+    spec: &str,
+    changes: &mut Changes,
+    recents: &recents::SharedRecents,
+    recents_path: &Path,
+) {
+    let previous = agent.config().model.clone();
     match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
+            record_switch(agent, &previous, recents, recents_path);
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
         }
         Err(e) => println!("Could not switch model: {e:#}"),
     }
+}
+
+/// Record a switch from `previous` to the agent's now-current model into the
+/// recents MRU and persist it. Both specs are canonicalized so a slash-bearing
+/// default-provider model keeps its real provider. Recording immediately (not
+/// deriving one `before -> final` transition when the dialog closes) means
+/// every switch made in a single visit lands, in order.
+fn record_switch(agent: &Agent, previous: &str, recents: &recents::SharedRecents, recents_path: &Path) {
+    let (user, default_provider) = agent.config().effective_providers();
+    let all = providers::effective_providers(&user);
+    let previous = recents::canonical(previous, &all, &default_provider);
+    let current = recents::canonical(&agent.config().model, &all, &default_provider);
+    let mut guard = recents.lock().unwrap();
+    guard.record(&previous);
+    guard.record(&current);
+    recents::save(recents_path, &guard);
 }
 
 fn save_and_report(config: &Config, changes: &mut Changes, path: &Path) {
@@ -315,8 +349,10 @@ fn model_spec(provider: &str, model: &str) -> Step {
 
 /// The recently used specs to offer, most recent first: at most
 /// [`RECENT_MODELS_SHOWN`], skipping any whose provider is no longer
-/// configured (a spec without a `provider/` prefix uses the default provider,
-/// so it is always kept).
+/// configured. Recents are stored canonicalized (see [`recents::canonical`]),
+/// so a slash-bearing default-provider model carries its real provider prefix
+/// and is kept, while a genuinely removed provider's prefix no longer matches
+/// and is skipped.
 fn recent_models(recents: &[String], all: &std::collections::BTreeMap<String, ProviderConfig>) -> Vec<String> {
     recents
         .iter()
@@ -373,7 +409,9 @@ fn pick_provider(
     all: &std::collections::BTreeMap<String, ProviderConfig>,
     recent: &[String],
 ) -> Result<Option<ProviderChoice>> {
-    let (mut rows, default) = provider_rows(recent, &agent.config().model, agent.provider_name(), all);
+    let (_, default_provider) = agent.config().effective_providers();
+    let current_spec = recents::canonical(&agent.config().model, all, &default_provider);
+    let (mut rows, default) = provider_rows(recent, &current_spec, agent.provider_name(), all);
     let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
     let prompt = if recent.is_empty() {
         "Provider (↑/↓ to scroll, Enter to select, Esc to keep the current model)"

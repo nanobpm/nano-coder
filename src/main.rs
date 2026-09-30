@@ -373,10 +373,13 @@ impl Terminal {
     /// it is recorded too, just behind the new one: the model a session
     /// started with is offered as well, and `/model` then Enter switches back.
     fn model_switched(&mut self, agent: &Agent, previous: &str) {
-        let spec = agent.config().model.clone();
+        let (user, default_provider) = agent.config().effective_providers();
+        let all = providers::effective_providers(&user);
+        let previous = recents::canonical(previous, &all, &default_provider);
+        let spec = recents::canonical(&agent.config().model, &all, &default_provider);
         {
             let mut recents = self.recents.lock().unwrap();
-            recents.record(previous);
+            recents.record(&previous);
             recents.record(&spec);
             recents::save(&self.recents_path, &recents);
         }
@@ -1067,22 +1070,16 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
-            let before = agent.config().model.clone();
-            let recent = terminal.recent_models();
-            settings::run(agent, &terminal.config_path, &recent).await?;
+            settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await?;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
-            // Providers or the model may have changed. A model switched through
-            // the settings dialog must land in the recents MRU just like one
-            // switched with `/model`; a provider-only edit just refreshes the
-            // config the line editor's argument suggestions read.
-            if agent.config().model != before {
-                terminal.model_switched(agent, &before);
-            } else {
-                terminal.sync_context(agent);
-            }
+            // Each model switch made in the dialog was recorded into the recents
+            // MRU as it happened, so here just refresh the config the line
+            // editor's argument suggestions read (providers or the model may
+            // have changed).
+            terminal.sync_context(agent);
             Ok(true)
         }
         "/tools" => {

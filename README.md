@@ -310,7 +310,8 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/verbosity [quiet|normal|verbose|debug]` - Show or set how much is printed (see below)
 - `/context` - Show context usage, window, session token totals, AI Credits (GitHub Copilot), auto-compaction state and the loaded instruction files
 - `/settings` - Interactive settings menu:
-  - **Model**: pick a provider, then a model from its live model list (or type an ID)
+  - **Model**: starts with the last four models you used, then pick a provider and a
+    model from its live model list (or type an ID)
   - **Add or edit a provider**: name, API kind (OpenAI-compatible, Anthropic, Copilot),
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
