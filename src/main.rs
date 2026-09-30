@@ -1437,23 +1437,30 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Interactive CLI mode
-        println!("nano-coder v{}", env!("CARGO_PKG_VERSION"));
-        println!("Model: {} (provider: {})", agent.model_name(), agent.provider_name());
+        // Interactive CLI mode: build the startup banner. In frame mode the
+        // renderer owns the screen and its first full redraw clears the
+        // scrollback, so `println!`-ing the banner here would wipe it before it
+        // is ever seen. Collect the lines now and emit them once the renderer
+        // exists (below): seeded into the owned transcript in frame mode, or
+        // printed inline as before in legacy mode.
+        let mut banner = vec![
+            format!("nano-coder v{}", env!("CARGO_PKG_VERSION")),
+            format!("Model: {} (provider: {})", agent.model_name(), agent.provider_name()),
+        ];
         if let Some(id) = agent.session_id() {
-            println!("Session: {id} (resume with --resume {id})");
+            banner.push(format!("Session: {id} (resume with --resume {id})"));
         }
         for file in agent.project_instruction_files() {
-            println!("Instructions: {file}");
+            banner.push(format!("Instructions: {file}"));
         }
         let skills = agent.skills();
         if !skills.is_empty() {
-            println!("Skills: {}", skills.names().join(", "));
+            banner.push(format!("Skills: {}", skills.names().join(", ")));
         }
         for warning in &skills.warnings {
-            println!("Skills warning: {warning}");
+            banner.push(format!("Skills warning: {warning}"));
         }
-        println!("Type /help for commands\n");
+        banner.push("Type /help for commands".to_string());
 
         // Main loop
         let status = status::StatusLine::install(agent.context_stats());
@@ -1470,6 +1477,15 @@ async fn main() -> Result<()> {
         agent.set_streaming(true);
         agent.refresh_stats();
         let frame_mode = renderer.is_frame();
+        // Emit the startup banner now the renderer exists. In frame mode seed it
+        // into the owned transcript via `print_block` so the first full redraw
+        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // inline, with the trailing blank line the banner has always had.
+        if frame_mode {
+            renderer.print_block(&banner.join("\n"));
+        } else {
+            println!("{}\n", banner.join("\n"));
+        }
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
         let view = {
@@ -1480,7 +1496,9 @@ async fn main() -> Result<()> {
             // The app-owned frame renderer draws the editor row itself; route
             // every edit through it instead of the inline/scroll-region path.
             let renderer = renderer.clone();
-            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize| renderer.set_editor(line, cursor, queued)));
+            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
+                renderer.set_editor(line, cursor, queued, menu)
+            }));
         }
         if let Ok(mut resized) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -1517,10 +1535,18 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    // `frame_resize()` re-renders every row (editor included)
-                    // at the new size in one pass; calling `view.resize()` here
-                    // too would fire the edit hook and emit a second redraw.
-                    renderer.frame_resize();
+                    // Regenerate the editor's command-menu rows at the new size
+                    // and redraw in a single pass. `view.resize()` re-runs
+                    // `frame_menu` through the edit hook so `FrameState.menu` is
+                    // sized to the new terminal, then renders; because the frame
+                    // renderer's `render` detects the changed width/height it
+                    // already performs one full invalidated redraw of every row
+                    // (clearing scrollback). Calling `frame_resize()` afterwards
+                    // would invalidate that just-rendered frame and re-emit the
+                    // entire transcript a second time — a redundant O(history)
+                    // redraw on every resize — so the hook-driven redraw is the
+                    // sole one here.
+                    view.lock().unwrap().resize();
                 }
             });
         }
@@ -1553,8 +1579,8 @@ async fn main() -> Result<()> {
                         // The frame renderer owns the screen: refresh the editor
                         // row (and thus the whole frame) instead of writing an
                         // inline prompt.
-                        let (line, cursor) = view.snapshot();
-                        terminal.renderer.set_editor(&line, cursor, 0);
+                        // `prompt_redrawn` re-renders the editor (and its
+                        // command menu) through the edit hook.
                         view.prompt_redrawn();
                         return;
                     }

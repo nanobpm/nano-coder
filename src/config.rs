@@ -42,8 +42,8 @@ pub struct Config {
     pub compaction_mode: CompactionMode,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
-    /// Which interactive renderer to use: `legacy` (scroll region) or `frame`
-    /// (app-owned, re-renders on a width change).
+    /// Which interactive renderer to use: `frame` (the default; app-owned,
+    /// re-renders on a width change) or `legacy` (scroll region).
     pub renderer: crate::frame::RendererMode,
     /// Start each message in the interactive CLI with the local time.
     pub timestamps: bool,
@@ -253,10 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_the_legacy_renderer_and_parses_frame() {
+    fn defaults_to_the_frame_renderer_and_parses_legacy() {
         let default: Config = toml::from_str("model = \"work/x\"").unwrap();
-        assert_eq!(default.renderer, crate::frame::RendererMode::Legacy);
-        let framed: Config = toml::from_str("model = \"work/x\"\nrenderer = \"frame\"").unwrap();
-        assert_eq!(framed.renderer, crate::frame::RendererMode::Frame);
+        assert_eq!(default.renderer, crate::frame::RendererMode::Frame);
+        let legacy: Config = toml::from_str("model = \"work/x\"\nrenderer = \"legacy\"").unwrap();
+        assert_eq!(legacy.renderer, crate::frame::RendererMode::Legacy);
     }
 }

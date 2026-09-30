@@ -374,7 +374,7 @@ auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
-renderer = "legacy"                     # legacy | frame (app-owned redraw on resize, experimental)
+renderer = "frame"                      # frame (default: app-owned redraw on resize) | legacy
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
 project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
@@ -582,16 +582,16 @@ Every message (your prompt, answers, tool calls and results, thinking, notes) st
 the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
 shows when the message was sent. Turn this off with `timestamps = false`.
 
-**Renderer (experimental).** By default (`renderer = "legacy"`) the terminal owns the
-scrollback and reflows history itself on a resize, with the status line pinned to the bottom
-via a scroll region. Setting `renderer = "frame"` (or picking it in `/settings`) switches to
-an **app-owned frame renderer**: nano-coder composes the whole screen — transcript, input
+**Renderer.** By default (`renderer = "frame"`) nano-coder uses an **app-owned frame
+renderer**: it composes the whole screen — transcript, input
 editor, then the status bar as the last line — into one frame and diff-renders it through a
 single writer, wrapped in synchronized-output markers so a half-drawn frame is never visible.
 On a width change it re-renders the entire frame (clearing the screen and scrollback) instead
 of relying on the terminal's native reflow, and resizes are debounced (~40ms) so a drag
-settles on one clean redraw. It never captures the mouse. This is opt-in for now; `legacy`
-remains the default.
+settles on one clean redraw. The `/` command menu is drawn under the input editor as part of
+the frame. It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
+`/settings`) switches back to the scroll-region renderer, where the terminal owns the
+scrollback and reflows history itself on a resize, with the status line pinned to the bottom.
 
 ## Status Line and Compaction
 
@@ -600,8 +600,9 @@ In an interactive terminal the bottom row shows the provider/model, context usag
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. It uses a terminal
-scroll region, follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. In the legacy
+renderer it uses a terminal scroll region (DECSTBM); the default frame renderer instead composes
+the bar as the frame's final row. Either way it follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.
 
