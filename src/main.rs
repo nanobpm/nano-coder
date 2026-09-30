@@ -820,11 +820,14 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// neutralises them while leaving ordinary printable text intact.
 ///
 /// Line feeds (`\n`) are kept: a line feed is not an escape-initiating or
-/// cursor-moving control, and dropping it would corrupt multi-line text.
-/// Callers that render a single line (option labels, the prompt) hand
-/// single-line strings to begin with; the transcript replay in particular
-/// relies on `\n` surviving so a multi-line message replays as the same lines
-/// the frame showed, not one concatenated line.
+/// cursor-moving control, and dropping it would corrupt multi-line text. The
+/// transcript replay in particular relies on `\n` surviving so a multi-line
+/// message replays as the same lines the frame showed, not one concatenated
+/// line. Callers that render a genuinely single-line field (a picker prompt,
+/// option label or description, a checklist title) must instead use
+/// [`sanitize_terminal_line`], which also drops `\n`: an embedded line feed
+/// there is not multi-line content to preserve but injected layout that would
+/// add an extra, unprefixed row or shift an interactive selector's cursor.
 ///
 /// The Unicode line/paragraph separators U+2028/U+2029 are dropped too: they are
 /// not `char::is_control`, but terminals and this crate's own memory guards
@@ -837,17 +840,30 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
         .collect()
 }
 
+/// Like [`sanitize_terminal_text`], but for single-line fields: drops every
+/// control character, `\n` included, as well as the Unicode line/paragraph
+/// separators U+2028/U+2029 that a terminal folds into an extra row. Use it for
+/// model-controlled text rendered on one row — picker prompts, option
+/// labels/descriptions and plan titles — where a line feed is not multi-line
+/// content to keep but injected layout that would spill an unprefixed extra row
+/// or move an interactive selector's cursor.
+pub(crate) fn sanitize_terminal_line(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
+        .collect()
+}
+
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
     use dialoguer::{Input, Select};
     let mut labels: Vec<String> = q
         .options
         .iter()
         .map(|o| {
-            let label = sanitize_terminal_text(&o.label);
+            let label = sanitize_terminal_line(&o.label);
             if o.description.is_empty() {
                 label
             } else {
-                format!("{} — {}", label, sanitize_terminal_text(&o.description))
+                format!("{} — {}", label, sanitize_terminal_line(&o.description))
             }
         })
         .collect();
@@ -858,7 +874,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
         None
     };
     let choice =
-        Select::new().with_prompt(sanitize_terminal_text(&q.question)).items(&labels).default(0).interact_opt()?;
+        Select::new().with_prompt(sanitize_terminal_line(&q.question)).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -2510,6 +2526,17 @@ mod tests {
         // would concatenate the lines. Other controls are still dropped.
         assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
         assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
+    }
+
+    #[test]
+    fn sanitize_terminal_line_drops_line_feeds() {
+        // Single-line fields (picker prompts/labels, plan titles) must drop
+        // `\n` too: an embedded line feed there is injected layout that would
+        // spill an unprefixed extra row or move a selector's cursor, not
+        // multi-line content to keep. Other controls are dropped as well.
+        assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
+        assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
     }
 
     #[test]

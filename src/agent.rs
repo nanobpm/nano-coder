@@ -691,9 +691,11 @@ impl Agent {
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
-    /// Atomic: when the new spec cannot build a client (an unknown provider,
-    /// a missing key, …) the previous model spec is restored so the config
-    /// keeps naming the client the session is actually still using.
+    /// Atomic: when the new spec cannot build a client (a missing credential,
+    /// a failing `api_key_command`, …) the previous model spec is restored so
+    /// the config keeps naming the client the session is actually still using.
+    /// (An unknown provider prefix is not such a failure — `parse_model_spec`
+    /// falls back to the default provider — so it does not trigger this path.)
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         let previous = std::mem::replace(&mut self.config.model, spec.to_string());
         if let Err(e) = self.refresh_client().await {

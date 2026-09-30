@@ -649,11 +649,12 @@ impl Renderer {
             {
                 self.frame_finish_stream(fs);
                 // Derive the status from the parsed outcome so an invalid
-                // `report_outcome` is not rendered as a success. The marker is
-                // conversation-derived (the replay re-emits the tool call), so
-                // it is an `OutcomeMark`, not a renderer-only `Note` — that
-                // keeps it out of the frame → legacy drain, where it would be
-                // printed a second time.
+                // `report_outcome` is not rendered as a success. Record it as
+                // an `OutcomeMark` rather than a renderer-only `Note` to mark
+                // it conversation-derived (it comes from the tool call). Both
+                // are captured in `fs.items` and, on a frame → legacy switch,
+                // replayed directly and in place exactly once, so the choice is
+                // semantic — the marker is neither dropped nor reprinted.
                 let mark = match crate::goal::Status::from_args(&call.arguments) {
                     Some(crate::goal::Status::Blocked) => "■ blocked".to_string(),
                     Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
@@ -1321,7 +1322,10 @@ fn plan_checklist(plan: &Plan, width: usize) -> String {
         // may embed cursor/erase escapes. This legacy `fit` does NOT sanitize
         // (unlike the frame's), so strip them before formatting to keep e.g.
         // `\x1b[2J` from clearing the terminal on replay or live legacy output.
-        let title = fit(&crate::sanitize_terminal_text(&item.title), width);
+        // Use the single-line sanitizer: a title is one checklist row, so an
+        // embedded `\n` must be dropped too (the frame's `fit` also strips it),
+        // else it would spill an unprefixed extra terminal row here.
+        let title = fit(&crate::sanitize_terminal_line(&item.title), width);
         let line = match item.status {
             Status::Done => format!("{GREEN}✔{RESET} {DIM}{title}{RESET}"),
             Status::InProgress => format!("{BOLD}◼ {title}{RESET}"),
