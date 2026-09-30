@@ -1703,6 +1703,21 @@ impl Agent {
             ContextCap::Prompt => 0,
         };
         let limit = (window as f64 * threshold).min(window.saturating_sub(reserved) as f64);
+        // A prompt-only cap does not consume output tokens, but the endpoint's
+        // larger combined window still bounds prompt + output. When the gap
+        // between the two is under the reserve, a prompt can sit below the
+        // prompt threshold while leaving too little output room in the combined
+        // window — `request_max_tokens()` would then shrink `max_tokens` below
+        // the target instead of compacting. Compact against the combined window
+        // too, so the reservation is carved out of whichever limit is tighter.
+        let limit = match self.detected_window.as_ref().and_then(|d| d.total_tokens) {
+            Some(combined) if self.context_cap() == ContextCap::Prompt => {
+                let combined_reserved =
+                    (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
+                limit.min(combined.saturating_sub(combined_reserved) as f64)
+            }
+            _ => limit,
+        };
         tokens as f64 > limit && tokens > self.compact_floor + window / 10
     }
 
@@ -2679,6 +2694,43 @@ mod tests {
         let (Some(max_tokens), false) = seen[0] else { panic!("{seen:?}") };
         assert!(max_tokens < 16_384, "capped to the combined window's room: {max_tokens}");
         assert!(tokens + max_tokens as usize <= combined, "{tokens} + {max_tokens} > {combined}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompt_only_window_compacts_against_the_combined_window() {
+        // Copilot advertises `max_prompt_tokens = 100K` (prompt-only) and
+        // `max_context_window_tokens = 102K` (prompt + output): a gap under the
+        // reserve. A ~97.7K-token prompt is below the 0.99 prompt threshold
+        // (99K) yet leaves under MIN_OUTPUT_RESERVE of output room in the
+        // combined window. The output reservation must count against the
+        // combined window so compaction triggers here — otherwise
+        // `request_max_tokens()` would shrink `max_tokens` below the target
+        // instead of compacting as promised.
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_window = 100_000;
+        let combined = 102_000;
+        let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
+        agent.config_mut().context_window = None;
+        agent.detected_window = Some(DetectedWindow {
+            tokens: prompt_window,
+            source: "Copilot /models max_prompt_tokens".into(),
+            cap: ContextCap::Prompt,
+            total_tokens: Some(combined),
+        });
+        agent.new_session().unwrap();
+        // Compactable history: a large earlier exchange. The running prompt is
+        // ~97.7K tokens — over the combined window's reserve limit
+        // (102K - 4096 - 102K/50 ~= 95.9K) but under the prompt-only 0.99
+        // threshold (99K) — so only the combined-window reservation can trigger
+        // compaction here.
+        agent.push(Message::user("q")).unwrap();
+        agent.push(Message::assistant(&"a".repeat(388_000))).unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.response, "done");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "summary, then the real call: {seen:?}");
+        assert!(seen[0].1, "the first request is the compaction summary: {seen:?}");
+        assert!(agent.context_stats().lock().unwrap().compactions >= 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
