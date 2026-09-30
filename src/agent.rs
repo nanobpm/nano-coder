@@ -1051,6 +1051,15 @@ impl Agent {
         // Rekey memory to the session cwd (ACP applies it before this runs), so
         // memory_search hits the requested repository's project scope.
         self.rekey_memory();
+        // A loaded session starts in the default mode, not whatever mode the
+        // previous session left selected. Reset it *before* rendering the
+        // system prompt below: `system_prompt()` derives memory writability
+        // from the live mode, so rendering while still in Plan would bake
+        // read-only memory guidance into a session that is actually writable
+        // (Normal) until the next prompt refresh (Copilot finding,
+        // src/agent.rs). Mirrors `new_session`, which renders for the default
+        // mode's writability.
+        self.control.set_mode(crate::mode::AgentMode::default());
         let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
         match self.conversation.first_mut() {
             Some(first) if first.role == Role::System => *first = system,
@@ -1082,9 +1091,8 @@ impl Agent {
             stats.history_reads = 0;
         }
         self.repair_dangling_tool_calls()?;
-        // A loaded session starts in the default mode, not whatever mode the
-        // previous session left selected.
-        self.control.set_mode(crate::mode::AgentMode::default());
+        // The mode was already reset to the default before the system prompt
+        // was rendered above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(())
     }
@@ -2658,6 +2666,27 @@ mod tests {
         let normal_content = agent.conversation.first().unwrap().content.clone();
         assert!(normal_content.contains(memory::SAVE_TOOL), "normal mode restores save guidance");
         assert!(!normal_content.contains("PLAN MODE"), "plan note removed");
+    }
+
+    #[test]
+    fn load_session_renders_prompt_with_default_mode_writability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+        let id = agent.new_session().unwrap();
+
+        // Load while still in Plan mode: the resumed session is Normal
+        // (writable), so its stored system prompt must advertise memory_save —
+        // not Plan's read-only guidance (Copilot finding, src/agent.rs).
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.load_session(&id).unwrap();
+        assert_eq!(agent.mode(), crate::mode::AgentMode::Normal, "load_session resets the mode");
+        let loaded = agent.conversation.first().unwrap().content.clone();
+        assert!(
+            loaded.contains(memory::SAVE_TOOL),
+            "loaded session is writable, so its prompt offers save guidance: {loaded}"
+        );
+        assert!(!loaded.contains("PLAN MODE"), "loaded session carries no plan note: {loaded}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
