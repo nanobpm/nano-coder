@@ -1155,7 +1155,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/model" => {
-            let before = agent.config().model.clone();
+            // Capture the model actually in use (resolved by the live
+            // client) before switching, so a provider-default edit made in the
+            // same session cannot rewrite which model we record leaving.
+            let before = format!("{}/{}", agent.provider_name(), agent.model_name());
             let recent = terminal.recent_models();
             let picked = settings::pick_model_interactive(agent, &recent).await;
             // The picker (dialoguer) wrote directly over the owned frame; force
@@ -1181,7 +1184,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
-            let before = agent.config().model.clone();
+            // Capture the model actually in use (resolved by the live
+            // client) before switching, so a provider-default edit made in the
+            // same session cannot rewrite which model we record leaving.
+            let before = format!("{}/{}", agent.provider_name(), agent.model_name());
             agent.set_model(cmd["/model ".len()..].trim()).await?;
             terminal.model_switched(agent, &before);
             terminal.renderer.print_block(&format!(
@@ -1531,9 +1537,14 @@ async fn main() -> Result<()> {
             let mut loaded = recents::load(&recents_path);
             // Migrate a legacy file recorded before entries were canonicalized,
             // so a raw default-provider spec (`meta-llama/llama-4`) is not
-            // hidden by the picker's provider filter on the first `/model`.
+            // hidden by the picker's provider filter on the first `/model`. The
+            // migration is gated on a persisted format marker and runs once; on
+            // success we save the upgraded file so later loads skip it (and so a
+            // removed provider's canonical entry is never reinterpreted).
             let (user, default_provider) = agent.config().effective_providers();
-            loaded.canonicalize(&providers::effective_providers(&user), &default_provider);
+            if loaded.canonicalize(&providers::effective_providers(&user), &default_provider) {
+                recents::save(&recents_path, &loaded);
+            }
             Arc::new(Mutex::new(loaded))
         };
         let view = {

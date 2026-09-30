@@ -217,7 +217,7 @@ async fn switch_model(
     recents: &recents::SharedRecents,
     recents_path: &Path,
 ) {
-    let previous = agent.config().model.clone();
+    let previous = format!("{}/{}", agent.provider_name(), agent.model_name());
     match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
@@ -229,15 +229,21 @@ async fn switch_model(
 }
 
 /// Record a switch from `previous` to the agent's now-current model into the
-/// recents MRU and persist it. Both specs are canonicalized so a slash-bearing
-/// default-provider model keeps its real provider. Recording immediately (not
-/// deriving one `before -> final` transition when the dialog closes) means
-/// every switch made in a single visit lands, in order.
+/// recents MRU and persist it. `previous` is the model that was actually in use
+/// (the live client's resolved `provider/model`) captured before the switch, so
+/// a `/settings` edit to a provider's default in the same visit cannot rewrite
+/// which model is recorded as left. Both specs are canonicalized so a
+/// slash-bearing default-provider model keeps its real provider. Recording
+/// immediately (not deriving one `before -> final` transition when the dialog
+/// closes) means every switch made in a single visit lands, in order.
 fn record_switch(agent: &Agent, previous: &str, recents: &recents::SharedRecents, recents_path: &Path) {
     let (user, default_provider) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let previous = recents::canonical(previous, &all, &default_provider);
-    let current = recents::canonical(&agent.config().model, &all, &default_provider);
+    // The now-current model, read from the live client rather than re-resolving
+    // the raw config spec against a possibly just-edited provider table.
+    let current =
+        recents::canonical(&format!("{}/{}", agent.provider_name(), agent.model_name()), &all, &default_provider);
     let mut guard = recents.lock().unwrap();
     guard.record(&previous);
     guard.record(&current);
@@ -410,7 +416,12 @@ fn pick_provider(
     recent: &[String],
 ) -> Result<Option<ProviderChoice>> {
     let (_, default_provider) = agent.config().effective_providers();
-    let current_spec = recents::canonical(&agent.config().model, all, &default_provider);
+    // Highlight the model actually in use (the live client's resolved spec),
+    // not `config.model` re-resolved against a table a `/settings` visit may
+    // have just edited — otherwise a freshly edited provider default would be
+    // marked current while the live client is still on its old model.
+    let current_spec =
+        recents::canonical(&format!("{}/{}", agent.provider_name(), agent.model_name()), all, &default_provider);
     let (mut rows, default) = provider_rows(recent, &current_spec, agent.provider_name(), all);
     let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
     let prompt = if recent.is_empty() {
