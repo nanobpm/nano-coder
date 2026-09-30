@@ -943,10 +943,15 @@ fn normalize_remote(url: &str) -> String {
     // Query strings and fragments can carry a credential
     // (`repo.git?access_token=…`) that would otherwise leak into the project
     // label, system prompt and on-disk filename, and would rotate the key on
-    // token refresh — but they are only query/fragment syntax on a URI or SCP
-    // remote. On a local path they are filename characters, so strip them only
-    // when a host/authority was actually recognised.
-    let s: &str = if uri || scp { s.split(['?', '#']).next().unwrap_or(s) } else { s };
+    // token refresh — but that is only query/fragment *syntax* on a URI remote.
+    // An SCP-style path has no query/fragment component: everything after
+    // `host:` is the repository path, so `?`/`#` there are ordinary filename
+    // characters. Stripping them would merge distinct origins such as
+    // `git@host:repos/app#blue.git` and `git@host:repos/app#red.git` onto one
+    // project-memory file and disclose one repository's memories in the other.
+    // Strip only on a URI remote; SCP and local paths keep `?`/`#` verbatim
+    // (Copilot finding, src/memory.rs).
+    let s: &str = if uri { s.split(['?', '#']).next().unwrap_or(s) } else { s };
     // Strip `user:pass@` credentials from the *authority* only, never from the
     // path. A legal `@` in the path (e.g. `example.com/repo@v2.git`) must be
     // preserved, or unrelated repositories that differ only after an `@` would
@@ -1122,16 +1127,19 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
         }
     }
     // Opaque `Authorization: Bearer <token>` / `Basic <token>` header values.
-    // A long opaque token after the scheme keyword is a credential even when it
-    // matches no known-token pattern and no secret-labelled variable name.
-    // `$TOKEN`/`<token>` placeholders are exempted by `is_placeholder`.
-    let auth_header = r"(?i)\b(?:bearer|basic)\s+(\S+)";
+    // Require the literal `Authorization:` header prefix so prose that merely
+    // mentions the scheme words — "use Bearer token auth", "Basic auth header" —
+    // is not flagged. Once that prefix is present the value is an explicit
+    // credential, so reject *every* non-placeholder value regardless of length:
+    // a length threshold lets a short but valid secret through (`Authorization:
+    // Basic dTpw` decodes to `u:p`), which must not be persisted (Copilot
+    // finding, src/memory.rs). `$TOKEN`/`<token>`/`xxxxxxxx` placeholders are
+    // still exempted by `is_placeholder`.
+    let auth_header = r"(?i)\bauthorization\s*:\s*(?:bearer|basic)\s+(\S+)";
     if let Ok(re) = RegexBuilder::new(auth_header).build() {
         for caps in re.captures_iter(text) {
             let value = &caps[1];
-            // Only flag values long enough to be a real token — short words
-            // like `Bearer token` or `Basic auth` are prose, not credentials.
-            if value.len() >= 16 && !is_placeholder(value) {
+            if !is_placeholder(value) {
                 return Some("authorization header value");
             }
         }
@@ -1439,6 +1447,14 @@ mod tests {
                 .is_err()
         );
         assert!(store.save(Scope::User, "header: Authorization: Basic dXNlcjpwYXNzd29yZA==", None, None).is_err());
+        // A short but valid credential is still a secret: the `Authorization:`
+        // prefix makes the value explicit, so length must not gate detection —
+        // `Basic dTpw` decodes to `u:p` (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "Authorization: Basic dTpw", None, None).is_err());
+        assert!(store.save(Scope::User, "Authorization: Bearer abc", None, None).is_err());
+        // The `Authorization:` prefix is required: prose that merely mentions
+        // the scheme words is not a credential (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "set the header to Bearer abcdef1234567890", None, None).is_ok());
         // Placeholder auth values are not real secrets.
         assert!(store.save(Scope::User, "header: Authorization: Bearer $TOKEN", None, None).is_ok());
         assert!(store.save(Scope::User, "header: Authorization: Bearer <your-token>", None, None).is_ok());
@@ -1875,6 +1891,17 @@ mod tests {
         assert_eq!(normalize_remote("/srv/repo#blue.git"), "/srv/repo#blue.git");
         assert_ne!(normalize_remote("/srv/repo#blue.git"), normalize_remote("/srv/repo#red.git"));
         assert_eq!(normalize_remote("/srv/repo.git?x=1"), "/srv/repo.git?x=1");
+        // SCP-style remotes have no query/fragment syntax: everything after
+        // `host:` is the repository path, so `?`/`#` there are ordinary
+        // filename characters and must be kept verbatim. Stripping them would
+        // merge distinct origins onto one project-memory file (Copilot finding,
+        // src/memory.rs).
+        assert_eq!(normalize_remote("git@host:repos/app#blue.git"), "git@host/repos/app#blue.git");
+        assert_ne!(
+            normalize_remote("git@host:repos/app#blue.git"),
+            normalize_remote("git@host:repos/app#red.git")
+        );
+        assert_eq!(normalize_remote("git@host:repos/app.git?x=1"), "git@host/repos/app.git?x=1");
         // On a local path `.git` is an ordinary filename suffix and is
         // preserved, so `/srv/project.git` and `/srv/project` keep distinct
         // keys instead of sharing one memory file (Copilot finding,

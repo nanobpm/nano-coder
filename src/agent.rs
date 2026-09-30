@@ -2219,6 +2219,16 @@ impl Agent {
         // Plan mode must not mutate: route search through the read-only path so
         // it neither bumps last_used nor prunes/rewrites the store.
         let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
+        // A mode switch can land after the outer dispatch gate but before this
+        // handler runs (the control is switchable while a turn holds `&mut
+        // Agent`). `memory::run` only honours `read_only` for search — save and
+        // forget mutate unconditionally — so re-check the mode here and refuse a
+        // mutating op that arrived while the agent is in Plan mode, or it would
+        // write to the store despite the read-only guarantee (Copilot finding,
+        // src/agent.rs).
+        if read_only && call.name != memory::SEARCH_TOOL {
+            return Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", call.name));
+        }
         let result = memory::run(store, &call.name, &call.arguments, session, read_only);
         // Any non-plan memory op can change the folded system-prompt index — a
         // save adds an entry, a matching search bumps `last_used` (and may
@@ -2696,6 +2706,41 @@ mod tests {
         agent.new_session().unwrap();
         agent.send_message("try to save").await.unwrap();
         assert!(agent.memory().unwrap().all().unwrap().is_empty(), "read-only did not persist the save");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mode_blocks_a_memory_mutation_that_reached_the_handler() {
+        // A mode switch can land after the outer dispatch gate but before the
+        // memory handler runs (the control is switchable while a turn holds
+        // `&mut Agent`). `memory::run` only honours `read_only` for search, so
+        // the handler must re-check the mode itself and refuse a save/forget
+        // that arrived while the agent is in Plan mode (Copilot finding,
+        // src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.new_session().unwrap();
+        // Switch to Plan mode *after* dispatch would have occurred, then call
+        // the handler directly — the in-flight save must be refused.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let save = ToolCall {
+            id: "m1".into(),
+            name: memory::SAVE_TOOL.into(),
+            arguments: json!({"scope": "user", "text": "should not persist"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        let err = agent.run_memory_tool(&save).unwrap_err();
+        assert!(err.to_string().contains("plan mode"), "save refused in plan mode: {err}");
+        assert!(agent.memory().unwrap().all().unwrap().is_empty(), "plan mode did not persist the save");
+        // A read-only search is still allowed in Plan mode.
+        let search = ToolCall {
+            id: "m2".into(),
+            name: memory::SEARCH_TOOL.into(),
+            arguments: json!({"pattern": "anything"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_memory_tool(&search).is_ok(), "plan mode still allows a read-only search");
     }
 
     #[tokio::test(flavor = "multi_thread")]
