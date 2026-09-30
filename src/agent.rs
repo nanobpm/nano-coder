@@ -1141,8 +1141,12 @@ impl Agent {
     /// committing them to `self`.
     fn system_prompt_from(&self, instructions: &Option<ProjectInstructions>, skills: &Skills) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        let memory =
-            self.memory.as_ref().filter(|_| self.config.memory.enabled()).map(memory::Store::index).unwrap_or_default();
+        let memory = self
+            .memory
+            .as_ref()
+            .filter(|_| self.config.memory.enabled())
+            .map(|store| store.index(self.config.memory.writable()))
+            .unwrap_or_default();
         format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
     }
 
@@ -2523,7 +2527,7 @@ mod tests {
         let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, vec![save, text("ok")], dir.path());
         agent.new_session().unwrap();
         agent.send_message("try to save").await.unwrap();
-        assert!(agent.memory().unwrap().all().is_empty(), "read-only did not persist the save");
+        assert!(agent.memory().unwrap().all().unwrap().is_empty(), "read-only did not persist the save");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1021,7 +1021,10 @@ fn memory_command(agent: &Agent, args: &str) -> String {
     if !args.is_empty() {
         return format!("Unknown /memory argument {args:?}; use /memory or /memory forget <id>.");
     }
-    let entries = store.all();
+    let entries = match store.all() {
+        Ok(entries) => entries,
+        Err(e) => return format!("Could not read memory: {e}"),
+    };
     if entries.is_empty() {
         return format!(
             "No memories yet. The model saves them with memory_save; files live under {}.",
