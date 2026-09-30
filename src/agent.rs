@@ -550,10 +550,13 @@ impl Agent {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
         let entry = providers.get(self.provider_name()).cloned();
-        // A provider whose entry vanished from the config this session keeps
-        // only its kind's rules; a kindless entry (or a test double reporting
-        // no kind) resolves with no provider rules at all.
-        let kind = entry.as_ref().and_then(|p| p.kind).or_else(|| self.client.kind());
+        // Prefer the live client's API kind: a `/settings` edit can change the
+        // active provider's `kind` while the user declines the model switch, so
+        // the client still speaks the old API even though the config now names a
+        // new one. The client's kind is what actually governs the request, so
+        // use it for temperature rules; fall back to the config kind only for a
+        // kindless test double (a client reporting no kind).
+        let kind = self.client.kind().or_else(|| entry.as_ref().and_then(|p| p.kind));
         let provider = entry.unwrap_or_default();
         crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
     }
