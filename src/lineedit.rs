@@ -908,6 +908,9 @@ pub enum Key {
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
     CycleMode,
+    /// Enter on an unknown `/command`: the line stays in the editor, unsent;
+    /// this is why (see `commands::rejection`).
+    Rejected(String),
 }
 
 /// How long to wait after Esc for the rest of an escape sequence. Terminals
@@ -1144,6 +1147,11 @@ impl LineReader {
                     if byte == b'\r' && self.pending.front() == Some(&b'\n') {
                         self.pending.pop_front();
                     }
+                    if let Some(note) = crate::commands::rejection(&view.line) {
+                        drop(view);
+                        send(Key::Rejected(note));
+                        continue;
+                    }
                     return Key::Line(view.take() + "\n");
                 }
                 0x01 => view.move_home(),
@@ -1231,11 +1239,25 @@ impl LineReader {
                                     Esc::Newline => {
                                         let mut view = shared.lock().unwrap();
                                         if view.mode == EditMode::Turn {
+                                            if let Some(note) = crate::commands::rejection(&view.line) {
+                                                drop(view);
+                                                send(Key::Rejected(note));
+                                                continue;
+                                            }
                                             return Key::Queue(view.take() + "\n");
                                         }
                                         view.insert("\n");
                                     }
-                                    Esc::Submit => return Key::Line(shared.lock().unwrap().take() + "\n"),
+                                    Esc::Submit => {
+                                        let mut view = shared.lock().unwrap();
+                                        match crate::commands::rejection(&view.line) {
+                                            Some(note) => {
+                                                drop(view);
+                                                send(Key::Rejected(note));
+                                            }
+                                            None => return Key::Line(view.take() + "\n"),
+                                        }
+                                    }
                                     Esc::Escape if menu => shared.lock().unwrap().hide_menu(),
                                     Esc::Escape => send(Key::Escape),
                                     // Re-read as the byte legacy mode sends,
@@ -2105,6 +2127,7 @@ mod tests {
             Key::ToggleThinking => "toggle-thinking".into(),
             Key::Escape => "escape".into(),
             Key::CycleMode => "cycle-mode".into(),
+            Key::Rejected(note) => format!("rejected {note:?}"),
         }
     }
 
@@ -2296,6 +2319,42 @@ mod tests {
         let mut reader = LineReader::default();
         reader.pending.extend(bytes.iter());
         reader.read_line(&view, &|_| {})
+    }
+
+    #[test]
+    fn enter_on_an_unknown_command_keeps_the_line_unsent() {
+        // Enter on `/exin` is refused (with a reason), the text stays in the
+        // editor, and the fixed line is what gets submitted.
+        for (mode, submit) in [
+            (EditMode::Prompt, &b"\r"[..]),
+            (EditMode::Turn, b"\r"),
+            (EditMode::Turn, b"\x1b[13;5u"),
+            (EditMode::Prompt, b"\x1b[13;1u"),
+        ] {
+            let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+            view.lock().unwrap().mode = mode;
+            let mut reader = LineReader::default();
+            // Type `/exin`, submit (refused), fix to `/exit`, submit.
+            let bytes = [&b"/exin"[..], submit, b"\x7ft", submit].concat();
+            reader.pending.extend(bytes.iter());
+            let notes = Mutex::new(Vec::new());
+            let key = reader.read_line(&view, &|key| {
+                if let Key::Rejected(note) = key {
+                    notes.lock().unwrap().push(note);
+                }
+            });
+            let notes = notes.into_inner().unwrap();
+            assert_eq!(notes.len(), 1, "{mode:?} {submit:?}: {notes:?}");
+            assert!(notes[0].contains("Did you mean /exit?"), "{notes:?}");
+            assert!(
+                matches!(&key, Key::Line(l) | Key::Queue(l) if l == "/exit\n"),
+                "{mode:?} {submit:?}: only the fixed line is submitted"
+            );
+        }
+        // `//` sends a line starting with `/`; known commands and prose pass.
+        assert!(matches!(read_key(EditMode::Prompt, b"//usr/lib is big\r"), Key::Line(l) if l == "//usr/lib is big\n"));
+        assert!(matches!(read_key(EditMode::Prompt, b"/help\r"), Key::Line(l) if l == "/help\n"));
+        assert!(matches!(read_key(EditMode::Turn, b"hi /exin\r"), Key::Line(l) if l == "hi /exin\n"));
     }
 
     #[test]
@@ -2611,7 +2670,7 @@ mod tests {
         view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
         view.lock().unwrap().mode = EditMode::Prompt;
         let mut reader = LineReader::default();
-        reader.pending.extend(b"/he\r".iter());
+        reader.pending.extend(b"/help\r".iter());
         let _ = reader.read_line(&view, &|_| {});
         let v = view.lock().unwrap();
         assert!(!v.menu_enabled, "inline menu must stay off with an edit hook");
@@ -2637,7 +2696,7 @@ mod tests {
             rows.iter().map(|r| re.replace_all(r, "").into_owned()).collect()
         };
         let mut reader = LineReader::default();
-        reader.pending.extend(b"/he\r".iter());
+        reader.pending.extend(b"/help\r".iter());
         let _ = reader.read_line(&view, &|_| {});
         let slash = plain(last("/"));
         assert!(slash.len() > 1, "a bare `/` lists commands: {slash:?}");

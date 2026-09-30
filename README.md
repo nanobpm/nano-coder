@@ -296,6 +296,11 @@ model where it may write.
 
 ## Commands
 
+A line starting with `/` is never sent to the model. Enter on an unknown command (`/exin`)
+keeps it in the input with a hint (`Unknown command /exin. Did you mean /exit?`) so you
+can fix it. To send a message that starts with `/`, such as a path, type `//`:
+`//usr/lib is 4 GB, why?` sends `/usr/lib is 4 GB, why?`.
+
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
 list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
