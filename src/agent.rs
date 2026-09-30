@@ -16,6 +16,7 @@ use crate::instructions::ProjectInstructions;
 use crate::llm::{
     ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall,
 };
+use crate::memory;
 use crate::output;
 use crate::permissions::Policy;
 use crate::plan::{self, Plan};
@@ -462,6 +463,9 @@ pub struct Agent {
     /// was only in the conversation). Cleared once shown or once the agent
     /// uses a history tool.
     history_hint_pending: bool,
+    /// Cross-session memory store, present when `config.memory` is not `off`
+    /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
+    memory: Option<memory::Store>,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -471,6 +475,7 @@ impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
         let policy = Policy::new(&config.permissions, &config.sandbox);
+        let memory = Self::build_memory(&config);
         Self {
             policy,
             client,
@@ -503,6 +508,35 @@ impl Agent {
             turn_history_calls: 0,
             history_available: false,
             history_hint_pending: false,
+            memory,
+        }
+    }
+
+    /// Build the memory store from config: `None` when memory is off, else a
+    /// store rooted at the configured directory and keyed to the current git
+    /// repository (project scope is unavailable outside a repo).
+    fn build_memory(config: &Config) -> Option<memory::Store> {
+        if !config.memory.enabled() {
+            return None;
+        }
+        let project = std::env::current_dir().ok().and_then(|cwd| memory::project_key(&cwd));
+        Some(memory::Store::new(config.memory_dir(), project, config.memory_expiry_days))
+    }
+
+    /// Whether the memory tools are offered at all.
+    fn memory_enabled(&self) -> bool {
+        self.config.memory.enabled() && self.memory.is_some()
+    }
+
+    pub fn memory(&self) -> Option<&memory::Store> {
+        self.memory.as_ref()
+    }
+
+    /// Downgrade full memory to read-only (headless/ACP default: no human vets
+    /// a save live). A no-op if memory is already read-only or off.
+    pub fn restrict_memory_to_read_only(&mut self) {
+        if self.config.memory == crate::config::MemoryMode::On {
+            self.config.memory = crate::config::MemoryMode::ReadOnly;
         }
     }
 
@@ -1089,7 +1123,9 @@ impl Agent {
     /// committing them to `self`.
     fn system_prompt_from(&self, instructions: &Option<ProjectInstructions>, skills: &Skills) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        format!("{}{extra}{}", self.config.system_prompt, skills.render_index())
+        let memory =
+            self.memory.as_ref().filter(|_| self.config.memory.enabled()).map(memory::Store::index).unwrap_or_default();
+        format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
     }
 
     /// Discover instruction files and skills for the current working directory,
@@ -1177,6 +1213,9 @@ impl Agent {
         }
         if self.history_tools_enabled() {
             tools.extend(history::definitions());
+        }
+        if self.memory_enabled() {
+            tools.extend(memory::definitions(self.config.memory.writable()));
         }
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
@@ -1573,6 +1612,7 @@ impl Agent {
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
+                let is_memory_tool = memory::is_memory_tool(&tool_call.name) && self.memory_enabled();
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -1595,6 +1635,8 @@ impl Agent {
                     self.skills.load(&tool_call.arguments).map(Value::String)
                 } else if is_history_tool {
                     self.run_history_tool(tool_call).map(Value::String)
+                } else if is_memory_tool {
+                    self.run_memory_tool(tool_call).map(Value::String)
                 } else if is_outcome_tool {
                     Outcome::from_args(&tool_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
@@ -2053,6 +2095,17 @@ impl Agent {
         }
     }
 
+    fn run_memory_tool(&mut self, call: &ToolCall) -> Result<String> {
+        let store = self.memory.as_ref().ok_or_else(|| anyhow::anyhow!("memory is disabled"))?;
+        // Read-only memory offers only search; refuse a save/forget that
+        // arrived anyway (e.g. an in-flight call from before a mode change).
+        if !self.config.memory.writable() && call.name != memory::SEARCH_TOOL {
+            return Err(anyhow::anyhow!("{} is disabled: memory is read-only here", call.name));
+        }
+        let session = self.session_id.as_deref();
+        memory::run(store, &call.name, &call.arguments, session)
+    }
+
     /// Get conversation length
     #[cfg(test)]
     pub fn conversation_length(&self) -> usize {
@@ -2368,6 +2421,88 @@ mod tests {
         // … and the temperature lookup resolves against `demo`, not `mock`.
         let resolved = agent.temperature();
         assert_eq!((resolved.value(), resolved.source), (Some(0.2), crate::temperature::Source::Provider));
+    }
+
+    fn memory_agent(mode: crate::config::MemoryMode, responses: Vec<LLMResponse>, dir: &std::path::Path) -> Agent {
+        let client = Scripted { responses: Mutex::new(responses), seen: Arc::new(Mutex::new(Vec::new())) };
+        let config = Config {
+            session_dir: Some(dir.join("sessions")),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory: mode,
+            memory_dir: Some(dir.join("memory")),
+            ..Config::default()
+        };
+        Agent::new(Box::new(client), config)
+    }
+
+    #[test]
+    fn memory_tools_track_the_configured_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = |a: &Agent| a.tool_definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+
+        let on = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        let on_names = names(&on);
+        for tool in [memory::SAVE_TOOL, memory::SEARCH_TOOL, memory::FORGET_TOOL] {
+            assert!(on_names.contains(&tool.to_string()), "on offers {tool}");
+        }
+
+        let read_only = memory_agent(crate::config::MemoryMode::ReadOnly, vec![], dir.path());
+        let ro_names = names(&read_only);
+        assert!(ro_names.contains(&memory::SEARCH_TOOL.to_string()));
+        assert!(!ro_names.contains(&memory::SAVE_TOOL.to_string()), "read-only hides save");
+
+        let off = memory_agent(crate::config::MemoryMode::Off, vec![], dir.path());
+        assert!(!names(&off).iter().any(|n| memory::is_memory_tool(n)), "off offers no memory tools");
+        assert!(off.memory().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_save_persists_and_surfaces_in_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "m1".into(),
+                name: memory::SAVE_TOOL.into(),
+                arguments: json!({"scope": "user", "text": "python comes from uv"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![save, text("done")], dir.path());
+        agent.new_session().unwrap();
+        assert_eq!(agent.send_message("remember that").await.unwrap(), "done");
+        // The save is confirmed to the model (and so shown in the transcript).
+        let path = agent.session_path().unwrap().to_path_buf();
+        let logged: Vec<Message> = history::load(&path).unwrap().into_iter().map(|(_, m)| m).collect();
+        assert!(
+            logged.iter().any(|m| m.role == Role::Tool && m.content.contains("remembered (user")),
+            "transcript records the save"
+        );
+        // A fresh session on the same store surfaces the fact in its prompt.
+        let mut next = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        next.new_session().unwrap();
+        assert!(next.system_prompt().contains("python comes from uv"), "index carries into the next session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_memory_refuses_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "m1".into(),
+                name: memory::SAVE_TOOL.into(),
+                arguments: json!({"scope": "user", "text": "should not persist"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, vec![save, text("ok")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("try to save").await.unwrap();
+        assert!(agent.memory().unwrap().all().is_empty(), "read-only did not persist the save");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -66,6 +66,47 @@ pub struct Config {
     pub permissions: crate::permissions::PermissionsConfig,
     /// OS sandbox for shell commands (off by default).
     pub sandbox: crate::sandbox::SandboxConfig,
+    /// Cross-session memory: whether the model may save/search facts that
+    /// outlive a session (see `memory.rs`).
+    pub memory: MemoryMode,
+    /// Memory store directory (default: platform data dir/nano-coder/memory).
+    pub memory_dir: Option<PathBuf>,
+    /// Days a memory survives without being used before it expires; `0` never
+    /// expires.
+    pub memory_expiry_days: u64,
+}
+
+/// Whether cross-session memory is available, and whether the model may write
+/// to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMode {
+    /// No memory tools and no index in the prompt.
+    Off,
+    /// The index and `memory_search` only — no saving or forgetting (the
+    /// default for headless/ACP runs, where no human vets a save live).
+    ReadOnly,
+    /// Full memory: save, search and forget.
+    #[default]
+    On,
+}
+
+impl MemoryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::ReadOnly => "read_only",
+            Self::On => "on",
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        self != Self::Off
+    }
+
+    pub fn writable(self) -> bool {
+        self == Self::On
+    }
 }
 
 impl Default for Config {
@@ -98,6 +139,9 @@ impl Default for Config {
             skills: crate::skills::SkillsConfig::default(),
             permissions: crate::permissions::PermissionsConfig::default(),
             sandbox: crate::sandbox::SandboxConfig::default(),
+            memory: MemoryMode::default(),
+            memory_dir: None,
+            memory_expiry_days: crate::memory::DEFAULT_EXPIRY_DAYS,
         }
     }
 }
@@ -123,6 +167,10 @@ impl Config {
 
     pub fn session_dir(&self) -> PathBuf {
         self.session_dir.clone().unwrap_or_else(crate::session::default_dir)
+    }
+
+    pub fn memory_dir(&self) -> PathBuf {
+        self.memory_dir.clone().unwrap_or_else(crate::memory::default_dir)
     }
 }
 

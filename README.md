@@ -165,6 +165,7 @@ src/
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
 ├── queue.rs     # The interactive message queue and the /queue editor
 ├── goal.rs      # report_outcome tool (completed / blocked / needs_input)
+├── memory.rs    # Cross-session memory: memory_save / memory_search / memory_forget
 ├── mode.rs      # Agent mode (normal / plan / auto) and the plan-mode tool gate
 ├── question.rs  # question tool and the mid-turn question / turn-cap rendezvous
 ├── commands.rs  # Slash-command table for /help and the as-you-type menu
@@ -218,6 +219,9 @@ The harness exposes 6 lifecycle hook events:
   away message. Headless (ACP) sessions get an error instead.
 - `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
   when skills were found (see [Skills](#skills)).
+- `memory_save`, `memory_search`, `memory_forget` - Cross-session memory: facts the model saves
+  in one session and finds in later ones (see [Memory](#memory)). Offered when `memory` is on;
+  read-only runs (headless/ACP) offer `memory_search` only.
 
 Any other tool's result longer than 40,000 characters is cut the same way as bash output,
 with the whole result saved under the temp directory (`nano-coder-<pid>/tool-<id>-<name>.txt`)
@@ -326,6 +330,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
+- `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
@@ -388,6 +393,9 @@ project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instruct
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
+memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
+# memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
+memory_expiry_days = 90                 # expire memories unused this long (0 = never)
 
 [skills]                                # see Skills
 enabled = true
@@ -812,6 +820,47 @@ tool out.
 `needs_input` is the structural "waiting on the user" signal: an orchestrator (or auto mode)
 can tell it apart from a clean `completed` without guessing from the text. For a richer,
 multi-choice question that does not end the turn, the model uses the `question` tool instead.
+
+## Memory
+
+Cross-session memory lets the model save a fact in one session and find it in later ones, so
+a project's quirks and the machine's setup are not rediscovered every time ("tests run with
+`cargo test`, not `make test`"; "Python comes from `uv`"). A memory is a **hint to verify, not
+a rule**: entries are dated, framed in the prompt as possibly out of date, shown in the
+transcript when saved, undoable with `/memory`, and never grant any permission.
+
+Two scopes:
+
+- `user` - the machine and your habits (toolchains, auth, preferences).
+- `project` - keyed by the git remote (fallback: the git root path); this repo's quirks and
+  setup. Unavailable outside a git repository.
+
+Storage mirrors the session log: append-oriented JSONL, one entry per line, under
+`<memory_dir>/user.jsonl` and `<memory_dir>/projects/<key>.jsonl` (default `<data>/memory`,
+next to `sessions/`). Each entry has an id, the text, created and last-used dates, the source
+session, and optional evidence (a file path or command). Search is a case-insensitive regex
+over the text, as in `history_search` - no embeddings or vector store.
+
+**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
+`memory_search(pattern, scope?)`, `memory_forget(id)`.
+
+**Prompt.** A capped, dated index (most-recently-used first, ~3 KB) is appended to the system
+prompt at session start, framed as "notes from earlier sessions; may be out of date; verify
+before relying on them". The rest is reachable with `memory_search`.
+
+**Control and hygiene.**
+
+- Each save is confirmed to the model (`remembered (scope, id): ...`), so it shows in the
+  transcript. `/memory` lists every entry with its id; `/memory forget <id>` deletes one; the
+  files are human-readable and can be edited directly.
+- Obvious secrets (keys, tokens, passwords, `.env`-style assignments, private-key blocks) are
+  rejected on save - store where to find them instead.
+- Using an entry (a `memory_search` match) bumps its last-used date; entries unused for
+  `memory_expiry_days` (default 90; `0` disables) expire on the next load.
+- Memories never touch the permission rules.
+
+Set `memory = "on"` (full), `"read_only"` (index and `memory_search` only), or `"off"`.
+Headless/ACP runs downgrade `on` to `read_only` by default, since no human vets a save live.
 
 ## Sessions
 

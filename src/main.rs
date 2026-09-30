@@ -24,6 +24,7 @@ mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod memory;
 mod mode;
 mod output;
 mod permissions;
@@ -1003,6 +1004,53 @@ async fn run_compaction(
     }
 }
 
+/// `/memory` (list) and `/memory forget <id>`.
+fn memory_command(agent: &Agent, args: &str) -> String {
+    let Some(store) = agent.memory() else {
+        return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
+    };
+    if let Some(id) = args.strip_prefix("forget").map(str::trim) {
+        if id.is_empty() {
+            return "Usage: /memory forget <id>".to_string();
+        }
+        return match store.forget(id) {
+            Ok(msg) => msg,
+            Err(e) => format!("{e}"),
+        };
+    }
+    if !args.is_empty() {
+        return format!("Unknown /memory argument {args:?}; use /memory or /memory forget <id>.");
+    }
+    let entries = store.all();
+    if entries.is_empty() {
+        return format!(
+            "No memories yet. The model saves them with memory_save; files live under {}.",
+            agent.config().memory_dir().display()
+        );
+    }
+    let mut out = vec![format!(
+        "{} memor{} (memory is {}; edit the files under {}, or /memory forget <id>):",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        agent.config().memory.as_str(),
+        agent.config().memory_dir().display()
+    )];
+    for (scope, entry) in &entries {
+        let mut line = format!(
+            "  {} [{}] ({}) {}",
+            scope.as_str(),
+            entry.id,
+            entry.created.format("%Y-%m-%d"),
+            entry.text.lines().next().unwrap_or("").trim()
+        );
+        if let Some(evidence) = &entry.evidence {
+            line.push_str(&format!(" (check: {evidence})"));
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     match cmd {
         "/exit" | "/quit" => Ok(false),
@@ -1139,6 +1187,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 terminal.renderer.print_block(agent.plan().render(true, usize::MAX).trim_end());
             }
+            Ok(true)
+        }
+        _ if cmd == "/memory" || cmd.starts_with("/memory ") => {
+            terminal.renderer.print_block(&memory_command(agent, cmd.strip_prefix("/memory").unwrap_or("").trim()));
             Ok(true)
         }
         _ if let Some(op) = queue_command(cmd) => {
@@ -1548,7 +1600,10 @@ async fn main() -> Result<()> {
     register_hooks(&mut agent);
 
     if args.acp {
-        // ACP headless mode; sessions start with session/new or session/load
+        // ACP headless mode; sessions start with session/new or session/load.
+        // No human vets a memory save live here, so full memory is downgraded
+        // to read-only (the model can still consult earlier notes).
+        agent.restrict_memory_to_read_only();
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
