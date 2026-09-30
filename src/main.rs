@@ -1429,6 +1429,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if agent.config().renderer != renderer_before {
                 terminal.renderer_switched(agent);
             }
+            // Re-show any notice the dialog retained (e.g. a client-rebuild
+            // failure) THROUGH the renderer, now that the redraw has run: the
+            // dialog's own `println!` of it was wiped by `frame_resize`, and
+            // `print_block` captures it into the frame transcript (or prints
+            // inline in legacy) so the warning survives. Done before `result?`
+            // so a later dialog error still leaves the notice visible.
+            if let Ok(notices) = &result {
+                for notice in notices {
+                    terminal.renderer.print_block(notice);
+                }
+            }
             // Each model switch made in the dialog was recorded into the recents
             // MRU as it happened, so here just refresh the config the line
             // editor's argument suggestions read (providers or the model may

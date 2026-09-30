@@ -89,8 +89,12 @@ pub async fn run(
     config_path: &Path,
     recents: &recents::SharedRecents,
     recents_path: &Path,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let mut changes = Changes::default();
+    // Notices (e.g. a client-rebuild failure) that must survive the dialog's
+    // exit redraw: the caller re-shows them through the renderer after
+    // `frame_resize`, since a plain `println!` here is wiped in frame mode.
+    let mut notices: Vec<String> = Vec::new();
     loop {
         let config = agent.config();
         println!("\nSettings ({}):", config_path.display());
@@ -125,7 +129,11 @@ pub async fn run(
                 }
             }
             1 => {
-                if let Some(name) = edit_provider(agent).await? {
+                if let Some(edit) = edit_provider(agent).await? {
+                    if let Some(notice) = edit.rebuild_notice {
+                        notices.push(notice);
+                    }
+                    let name = edit.name;
                     changes.providers.insert(name.clone());
                     if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
                         let (user, default_provider) = agent.config().effective_providers();
@@ -199,7 +207,7 @@ pub async fn run(
                 {
                     save_and_report(agent.config(), &mut changes, config_path);
                 }
-                return Ok(());
+                return Ok(notices);
             }
         }
     }
@@ -492,11 +500,20 @@ async fn pick_model_from_provider(
     Ok(model_spec(name, &model))
 }
 
+/// The result of adding/editing a provider: its name, plus a rebuild-failure
+/// notice to re-show through the renderer after the dialog's exit redraw (a
+/// plain `println!` is wiped by `frame_resize` in frame mode, and this warning
+/// — saved settings that no longer match the live client — must not be lost).
+struct ProviderEdit {
+    name: String,
+    rebuild_notice: Option<String>,
+}
+
 /// Add a provider or edit an existing one. Returns its name. When the edited
 /// provider is the one serving the current model, the live client is rebuilt
 /// so the running session immediately uses the new endpoint / key / model —
 /// the conversation is kept.
-async fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
+async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     let (user, _) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut labels: Vec<String> = vec!["New provider".into()];
@@ -621,15 +638,36 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         format!("{kind:?}").to_lowercase(),
         updated.base_url.as_deref().unwrap_or("(from session token)")
     );
-    if agent.provider_name() == name {
+    // Rebuild the live client when the edit touches the provider the session
+    // is actually using. That is broader than `provider_name() == name` (the
+    // provider the CURRENT client was built from): if the model spec is
+    // `work/foo` while `work` does not exist, the spec resolves to the default
+    // provider, so the old client names that default — yet adding `work` makes
+    // the SAME spec resolve to `work`. Rebuild when either side names the
+    // edited provider, or the next request would keep using the old endpoint.
+    let resolves_to_edited = {
+        let config = agent.config();
+        let providers = providers::effective_providers(&config.providers);
+        providers::parse_model_spec(&config.model, &providers, &config.default_provider).0 == name
+    };
+    if agent.provider_name() == name || resolves_to_edited {
         // The edited provider serves the current model: rebuild the client so
         // the running session uses the new endpoint / key / model at once.
         match agent.refresh_client().await {
             Ok(()) => println!("Rebuilt the session's client for {name}."),
-            Err(e) => println!("Provider saved, but could not rebuild the client: {e:#}"),
+            // In frame mode the dialog's own redraw (`frame_resize` on exit)
+            // wipes a plain `println!`, so a rebuild FAILURE — the one notice
+            // the user must not miss, since the saved settings no longer match
+            // the live client — is also returned for `main` to re-show through
+            // the renderer after the redraw.
+            Err(e) => {
+                let notice = format!("Provider {name} saved, but could not rebuild the client: {e:#}");
+                println!("{notice}");
+                return Ok(Some(ProviderEdit { name, rebuild_notice: Some(notice) }));
+            }
         }
     }
-    Ok(Some(name))
+    Ok(Some(ProviderEdit { name, rebuild_notice: None }))
 }
 
 /// The user entry to store for an edited provider: the existing entry with
@@ -989,6 +1027,30 @@ mod tests {
     fn turn_cap_label_marks_zero_as_unbounded() {
         assert_eq!(turn_cap_label(0), "unbounded");
         assert_eq!(turn_cap_label(50), "50 LLM calls per input (normal mode asks before stopping)");
+    }
+
+    #[test]
+    fn edited_provider_resolution_detects_a_spec_that_newly_resolves_to_it() {
+        // Advisory: the rebuild guard `provider_name() == name` checks the
+        // provider the CURRENT client was built from. With `config.model =
+        // "work/foo"` while `work` is absent, that spec resolves to the
+        // DEFAULT provider — so the old guard skips the rebuild even though
+        // adding `work` makes the SAME spec resolve to `work`. The fix keys the
+        // rebuild off the post-edit resolution too; this pins that resolution.
+        let spec = "work/foo";
+        // Before `work` exists: the spec falls back to the default provider.
+        let before = providers(&["anthropic", "openai"]);
+        assert_eq!(providers::parse_model_spec(spec, &before, "anthropic").0, "anthropic");
+        // After `work` is added: the same spec now resolves to `work`.
+        let after = providers(&["anthropic", "openai", "work"]);
+        assert_eq!(providers::parse_model_spec(spec, &after, "anthropic").0, "work");
+        // So a rebuild is required when the edited provider is `work`, even
+        // though the running client's `provider_name()` is still "anthropic".
+        let edited = "work";
+        let old_guard_would_skip = "anthropic" == edited; // provider_name() == name
+        let resolves_to_edited = providers::parse_model_spec(spec, &after, "anthropic").0 == edited;
+        assert!(!old_guard_would_skip, "the old guard misses the resolution change");
+        assert!(resolves_to_edited, "the resolution check catches it");
     }
 
     #[test]
