@@ -825,14 +825,20 @@ impl Agent {
     /// a read-only note (and leaving plan mode removes it). Advisory only —
     /// the tool gating is the real guarantee. Needs `&mut`, so callers apply it
     /// between turns.
+    ///
+    /// Rebuilds the full system prompt (not just the note) so the memory index
+    /// guidance reflects the current mode: `memory_writable()` is false in plan
+    /// mode, so the index must not advertise `memory_save` while planning.
     fn apply_mode_to_system_prompt(&mut self) {
-        let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
-        // Strip any existing note, then add it back only in plan mode.
-        let base = first.content.replace(crate::mode::PLAN_PROMPT_NOTE, "");
-        first.content = match self.control.mode() {
+        // Compute the prompt before borrowing the conversation mutably, so the
+        // immutable borrow of `self` (for `system_prompt`) does not conflict.
+        let base = self.system_prompt();
+        let content = match self.control.mode() {
             crate::mode::AgentMode::Plan => format!("{base}{}", crate::mode::PLAN_PROMPT_NOTE),
             _ => base,
         };
+        let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
+        first.content = content;
     }
 
     /// Rebuild the system message so the folded memory index reflects the
@@ -843,12 +849,8 @@ impl Agent {
         if self.memory.is_none() {
             return;
         }
-        let prompt = self.system_prompt();
-        if let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) {
-            first.content = prompt;
-        }
-        // `system_prompt()` renders without the plan-mode note; re-apply it so a
-        // refresh mid plan-mode does not silently drop the note.
+        // `apply_mode_to_system_prompt` rebuilds the full system prompt
+        // (including the memory index) and applies the plan-mode note.
         self.apply_mode_to_system_prompt();
     }
 
@@ -958,6 +960,10 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
+        // Reset the mode *before* rendering the system prompt so the memory
+        // index guidance reflects the fresh session's default (Normal) mode —
+        // otherwise a previous Plan mode would suppress the save guidance.
+        self.control.set_mode(crate::mode::AgentMode::default());
         // ACP sets the session cwd before this runs; rekey memory so the project
         // scope (and the index folded into the prompt below) matches it.
         self.rekey_memory();
@@ -1008,9 +1014,8 @@ impl Agent {
             stats.history_searches = 0;
             stats.history_reads = 0;
         }
-        // Each session starts in the default mode; a plan/auto selection does
-        // not leak across `/restart` or a later session load.
-        self.control.set_mode(crate::mode::AgentMode::default());
+        // Mode was already reset to the default before the system prompt was
+        // rendered above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(id)
     }
@@ -2537,6 +2542,35 @@ mod tests {
 
         agent.set_mode(crate::mode::AgentMode::Normal);
         assert!(agent.system_prompt().contains(memory::SAVE_TOOL), "leaving plan mode restores save guidance");
+    }
+
+    #[test]
+    fn stored_system_message_reflects_mode_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+        agent.new_session().unwrap();
+
+        // In Normal mode the stored system message advertises memory_save.
+        assert!(
+            agent.conversation.first().unwrap().content.contains(memory::SAVE_TOOL),
+            "normal mode stored prompt offers save"
+        );
+
+        // Entering plan mode must rebuild the stored prompt so it no longer
+        // advertises the unavailable save tool (Copilot finding, src/agent.rs).
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.apply_mode_to_system_prompt();
+        let plan_content = agent.conversation.first().unwrap().content.clone();
+        assert!(!plan_content.contains(memory::SAVE_TOOL), "plan mode stored prompt drops save guidance");
+        assert!(plan_content.contains("PLAN MODE"), "plan note present");
+
+        // Leaving plan mode restores the save guidance.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        agent.apply_mode_to_system_prompt();
+        let normal_content = agent.conversation.first().unwrap().content.clone();
+        assert!(normal_content.contains(memory::SAVE_TOOL), "normal mode restores save guidance");
+        assert!(!normal_content.contains("PLAN MODE"), "plan note removed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
