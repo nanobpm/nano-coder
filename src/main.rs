@@ -1013,6 +1013,9 @@ fn memory_command(agent: &Agent, args: &str) -> String {
         if id.is_empty() {
             return "Usage: /memory forget <id>".to_string();
         }
+        if !agent.config().memory.writable() {
+            return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
+        }
         return match store.forget(id) {
             Ok(msg) => msg,
             Err(e) => format!("{e}"),

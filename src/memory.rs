@@ -610,9 +610,11 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 /// any credentials and a trailing `.git`.
 fn normalize_remote(url: &str) -> String {
     let mut s = url.trim();
+    let mut scheme = false;
     for prefix in ["https://", "http://", "ssh://", "git://"] {
         if let Some(rest) = s.strip_prefix(prefix) {
             s = rest;
+            scheme = true;
             break;
         }
     }
@@ -622,12 +624,18 @@ fn normalize_remote(url: &str) -> String {
     // filename, and would rotate the key on token refresh; a stray `@`/`:`
     // inside them would also confuse the credential/host splitting below.
     let s = s.split(['?', '#']).next().unwrap_or(s);
-    // `git@host:owner/repo` → `host/owner/repo`.
+    // An SCP-style remote (`git@host:owner/repo` or a bare `host:owner/repo`)
+    // uses `:` as the host/path separator; a scheme URL uses it for a port.
+    // Only the SCP separator is remapped below — preserving the port keeps
+    // `ssh://host:2222/a/b` distinct from `https://host/2222/a/b`.
+    let scp = !scheme;
+    // `git@host:owner/repo` → `host:owner/repo` (still SCP-style).
     let s = s.strip_prefix("git@").unwrap_or(s);
     // Drop any remaining `user:pass@` credentials.
     let s = s.rsplit_once('@').map_or(s, |(_, rest)| rest);
-    let s = s.replacen(':', "/", 1);
-    s.trim_end_matches('/').strip_suffix(".git").unwrap_or(s.trim_end_matches('/')).to_string()
+    let s: String = if scp { s.replacen(':', "/", 1) } else { s.to_string() };
+    let trimmed = s.trim_end_matches('/');
+    trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string()
 }
 
 /// A filesystem-safe file stem for a project key. Distinct keys always map to
@@ -703,18 +711,38 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
         // `token`, so `DATABASE_URL=postgres://admin:s3cr3t@db/app` slips past
         // every other pattern; catch the `user:pass@` shape directly.
         (r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:]+:[^\s/@]+@", "credential in URL authority"),
-        // `SOMETHING_TOKEN=<value>` / `password: <value>` style assignments.
-        (
-            r"(?i)\b\w*(secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*\s*[:=]\s*[^\s]{8,}",
-            "credential assignment",
-        ),
     ];
     for (pattern, reason) in patterns {
         if RegexBuilder::new(pattern).build().is_ok_and(|re| re.is_match(text)) {
             return Some(reason);
         }
     }
+    // `SOMETHING_TOKEN=<value>` / `password: <value>` style assignments. Any
+    // non-empty value counts — a short one (`API_KEY=secret`, `PASSWORD=hunter2`)
+    // is still a credential, so the value length must not gate detection — except
+    // for obvious placeholders (`token=<your-token>`, `password: xxxxxxxx`).
+    let assignment = r"(?i)\b\w*(?:secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*\s*[:=]\s*(\S+)";
+    if let Ok(re) = RegexBuilder::new(assignment).build()
+        && let Some(caps) = re.captures(text)
+        && !is_placeholder(&caps[1])
+    {
+        return Some("credential assignment");
+    }
     None
+}
+
+/// Whether an assignment's value is an obvious placeholder rather than a real
+/// secret, so a template line like `token=<your-token>` is not rejected.
+fn is_placeholder(value: &str) -> bool {
+    let trimmed = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "none" | "null" | "nil" | "todo" | "tbd" | "changeme" | "change_me" | "redacted" | "placeholder" | "example"
+    ) || trimmed.chars().all(|c| matches!(c, 'x' | 'X' | '*' | '•'))
 }
 
 #[cfg(test)]
@@ -765,6 +793,12 @@ mod tests {
         ] {
             assert!(store.save(Scope::User, secret, None, None).is_err(), "should reject: {secret}");
         }
+        // A short secret-labelled assignment is still a secret: value length
+        // must not gate detection (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "API_KEY=secret", None, None).is_err());
+        assert!(store.save(Scope::User, "PASSWORD=hunter2", None, None).is_err());
+        // An obvious placeholder value is not a real secret.
+        assert!(store.save(Scope::User, "example config: token=xxxxxxxx", None, None).is_ok());
         // A pointer to where a secret lives is fine.
         assert!(store.save(Scope::User, "the API key lives in ~/.config/app/creds", None, None).is_ok());
         // A credential-free URL is fine (no `user:pass@`).
@@ -923,6 +957,11 @@ mod tests {
             "github.com/nanobpm/nano-coder"
         );
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "github.com/a/b");
+        // A scheme URL's port is preserved, so it cannot collide with an
+        // SCP-style path or a URL carrying that number as a path segment
+        // (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "github.com:2222/a/b");
+        assert_ne!(normalize_remote("ssh://host:2222/org/repo"), normalize_remote("https://host/2222/org/repo"));
         // A readable head is kept, but a disambiguating hash is always appended.
         assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);
