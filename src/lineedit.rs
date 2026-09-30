@@ -1388,8 +1388,11 @@ fn modified_key(key: u32, modifier: u16) -> Esc {
         13 if bits == 0 => Esc::Submit,
         27 if bits & !SHIFT == 0 => Esc::Escape,
         // Ctrl+letter (Shift ignored, as legacy terminals do): its control
-        // byte, e.g. Ctrl-C → 0x03.
-        0x61..=0x7a if bits & !SHIFT == CTRL => Esc::Control((key & 0x1f) as u8),
+        // byte, e.g. Ctrl-C → 0x03. Accept both ASCII letter cases: Shift is
+        // ignored, but modifyOtherKeys reports the shifted character code, so
+        // Ctrl+Shift+W arrives as uppercase `W` (`CSI 27;6;87~`). `key & 0x1f`
+        // yields the same control byte for either case.
+        0x41..=0x5a | 0x61..=0x7a if bits & !SHIFT == CTRL => Esc::Control((key & 0x1f) as u8),
         // Alt-b / Alt-f: readline word jumps.
         0x62 if bits == ALT => Esc::WordLeft,
         0x66 if bits == ALT => Esc::WordRight,
@@ -2077,6 +2080,9 @@ mod tests {
         assert!(matches!(parse_escape(b"\x1b[99;9u"), Esc::Ignored), "Cmd-C is the terminal's copy");
         // modifyOtherKeys: CSI 27 ; modifier ; key ~
         assert!(matches!(parse_escape(b"\x1b[27;5;99~"), Esc::Control(0x03)), "modifyOtherKeys Ctrl-C");
+        // modifyOtherKeys reports the shifted (uppercase) code for Ctrl+Shift+letter.
+        assert!(matches!(parse_escape(b"\x1b[27;6;87~"), Esc::Control(0x17)), "modifyOtherKeys Ctrl+Shift+W");
+        assert!(matches!(parse_escape(b"\x1b[87;6u"), Esc::Control(0x17)), "kitty Ctrl+Shift+W");
     }
 
     /// Keys `read_line` sends while reading `bytes`, then its result.
