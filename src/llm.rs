@@ -350,12 +350,19 @@ pub struct DetectedWindow {
     /// Whether `tokens` caps the whole request (prompt + output) or the prompt
     /// alone. Total unless the endpoint says otherwise.
     pub cap: ContextCap,
+    /// The combined prompt + output window, when the endpoint reports it
+    /// alongside a prompt-only `tokens` cap (GitHub Copilot advertises both
+    /// `max_prompt_tokens` and the larger `max_context_window_tokens`). A
+    /// prompt-only `cap` leaves `max_tokens` unchanged, which can still push
+    /// prompt + output past this window, so it is enforced as a second limit.
+    /// `None` for a `Total` cap, where `tokens` already is the combined window.
+    pub total_tokens: Option<usize>,
 }
 
 impl DetectedWindow {
     /// A window that caps the whole request, prompt + output.
     pub fn total(tokens: usize, source: impl Into<String>) -> Self {
-        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total }
+        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total, total_tokens: None }
     }
 }
 

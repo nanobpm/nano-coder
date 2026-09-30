@@ -517,6 +517,7 @@ fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
             tokens,
             source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")),
             cap: crate::llm::ContextCap::Total,
+            total_tokens: None,
         })
     })
 }
