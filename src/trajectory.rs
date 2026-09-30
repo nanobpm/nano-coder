@@ -167,8 +167,9 @@ impl Turn {
         let call_rows = self.rows.iter().filter(|r| matches!(r.kind, RowKind::ToolCall { .. })).count();
         // Collect the call IDs once so orphan detection stays O(rows): for every
         // tool result we then test membership in O(1) rather than rescanning
-        // every row, which made `summary()` quadratic (and it is recomputed on
-        // each pager keypress via `flatten`).
+        // every row, which would make `summary()` quadratic. `summary()` runs
+        // once per turn while building the single pre-rendered string handed to
+        // `$PAGER`, so keeping it linear matters for large sessions.
         let call_ids: HashSet<&str> = self
             .rows
             .iter()
@@ -333,7 +334,7 @@ impl Trajectory {
     }
 
     /// Render the whole ledger as plain text (the `/trajectory` fallback when
-    /// no terminal is attached). Unlike the interactive pager's collapsed rows,
+    /// no terminal is attached). Where the interactive view collapses rows,
     /// this emits each row's full sanitized text so a piped
     /// `nano-coder --trajectory <id>` loses no prompt, reasoning, tool
     /// argument/result or answer content.
