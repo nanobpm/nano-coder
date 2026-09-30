@@ -125,7 +125,7 @@ pub async fn run(
                 }
             }
             1 => {
-                if let Some(name) = edit_provider(agent)? {
+                if let Some(name) = edit_provider(agent).await? {
                     changes.providers.insert(name.clone());
                     if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
                         let (user, default_provider) = agent.config().effective_providers();
@@ -183,14 +183,10 @@ pub async fn run(
                 agent.config_mut().renderer = modes[choice];
                 changes.renderer = true;
                 if modes[choice] != previous {
-                    // The live renderer and the `frame_mode` branch in `main`
-                    // are fixed at startup, so a renderer switch only takes
-                    // effect on the next launch.
-                    println!(
-                        "Renderer set to {}. Restart nano-coder for it to take effect \
-                         (the active renderer is fixed for this session).",
-                        modes[choice]
-                    );
+                    // The switch is applied live by `main` (which detects the
+                    // changed `renderer` after the dialog returns and flips the
+                    // frame renderer, the line editor, and the scroll region).
+                    println!("Renderer set to {} — taking effect now.", modes[choice]);
                 }
             }
             9 => save_and_report(agent.config(), &mut changes, config_path),
@@ -496,8 +492,11 @@ async fn pick_model_from_provider(
     Ok(model_spec(name, &model))
 }
 
-/// Add a provider or edit an existing one. Returns its name.
-fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
+/// Add a provider or edit an existing one. Returns its name. When the edited
+/// provider is the one serving the current model, the live client is rebuilt
+/// so the running session immediately uses the new endpoint / key / model —
+/// the conversation is kept.
+async fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
     let (user, _) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut labels: Vec<String> = vec!["New provider".into()];
@@ -622,6 +621,14 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         format!("{kind:?}").to_lowercase(),
         updated.base_url.as_deref().unwrap_or("(from session token)")
     );
+    if agent.provider_name() == name {
+        // The edited provider serves the current model: rebuild the client so
+        // the running session uses the new endpoint / key / model at once.
+        match agent.refresh_client().await {
+            Ok(()) => println!("Rebuilt the session's client for {name}."),
+            Err(e) => println!("Provider saved, but could not rebuild the client: {e:#}"),
+        }
+    }
     Ok(Some(name))
 }
 

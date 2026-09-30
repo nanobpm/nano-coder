@@ -149,6 +149,16 @@ impl EditView {
         self.menu_enabled = false;
     }
 
+    /// Match the editor's drawing path to the renderer: `true` routes every
+    /// change through the frame hook (and disables the inline command menu,
+    /// which the frame draws instead); `false` restores the inline editor and
+    /// its menu. Used when a live `renderer` switch in `/settings` flips the
+    /// app-owned frame renderer on or off.
+    pub fn set_frame_mode(&mut self, on: bool, hook: Option<EditHook>) {
+        self.on_edit = on.then(|| hook.expect("a hook is required when enabling frame mode"));
+        self.menu_enabled = !on;
+    }
+
     /// Redraw the editor: through the frame hook when set, else inline / on the
     /// status line as before.
     fn draw_edit(&mut self) {

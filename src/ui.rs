@@ -187,8 +187,12 @@ pub struct Renderer {
     /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
     /// terminal. When set, all output is composed into one frame (transcript,
     /// editor, status as the last line) and diff-rendered by a single writer,
-    /// instead of streaming into the terminal's scrollback.
-    frame: Option<Mutex<FrameState>>,
+    /// instead of streaming into the terminal's scrollback. Wrapped in a
+    /// `Mutex<Option<..>>` (rather than `Option<Mutex<..>>`) so the frame can
+    /// be enabled or dropped at runtime — a live `renderer` switch in
+    /// `/settings` — behind the shared `Arc<Renderer>`; the `Mutex` supplies
+    /// the interior mutability, so the field itself stays shared-borrowed.
+    frame: Mutex<Option<FrameState>>,
 }
 
 /// The mutable state behind the app-owned frame renderer.
@@ -231,22 +235,27 @@ struct FrameState {
 }
 
 impl Renderer {
+    /// A fresh frame transcript state: an empty transcript, a new prompt stamp,
+    /// and a frame renderer bound to stdout.
+    fn fresh_frame() -> FrameState {
+        FrameState {
+            out: FrameRenderer::new(io::stdout()),
+            items: Vec::new(),
+            editor: (String::new(), 0),
+            queued: 0,
+            menu: Vec::new(),
+            stream: None,
+            think: None,
+            think_streamed: false,
+            prompt_stamp: stamp(),
+            transient: None,
+        }
+    }
+
     pub fn new(status: Option<Arc<StatusLine>>, mode: crate::frame::RendererMode) -> Arc<Self> {
         let tty = io::stdout().is_terminal();
-        let frame = (mode == crate::frame::RendererMode::Frame && tty).then(|| {
-            Mutex::new(FrameState {
-                out: FrameRenderer::new(io::stdout()),
-                items: Vec::new(),
-                editor: (String::new(), 0),
-                queued: 0,
-                menu: Vec::new(),
-                stream: None,
-                think: None,
-                think_streamed: false,
-                prompt_stamp: stamp(),
-                transient: None,
-            })
-        });
+        let frame =
+            Mutex::new(if mode == crate::frame::RendererMode::Frame && tty { Some(Self::fresh_frame()) } else { None });
         Arc::new(Self {
             state: Mutex::new(State { at_line_start: true, ..Default::default() }),
             status,
@@ -258,7 +267,24 @@ impl Renderer {
 
     /// Whether the app-owned frame renderer is active.
     pub fn is_frame(&self) -> bool {
-        self.frame.is_some()
+        self.frame.lock().unwrap().is_some()
+    }
+
+    /// Turn the app-owned frame renderer on or off at runtime (a live
+    /// `renderer` switch in `/settings`). On a tty the frame is created or
+    /// dropped in place; off a tty it is always off. The transcript and
+    /// in-flight stream state are preserved across the switch, and the
+    /// caller is expected to re-render (a resize / replay) afterwards.
+    pub fn set_mode(&self, mode: crate::frame::RendererMode) {
+        let on = mode == crate::frame::RendererMode::Frame && self.tty;
+        let mut frame = self.frame.lock().unwrap();
+        if on {
+            if frame.is_none() {
+                *frame = Some(Self::fresh_frame());
+            }
+        } else {
+            *frame = None;
+        }
     }
 
     /// Update the editor row (called by the line editor's frame hook) and
@@ -266,22 +292,22 @@ impl Renderer {
     /// the current turn, shown as an indicator under the editor; `menu` is the
     /// command type-ahead, drawn under the editor.
     pub fn set_editor(&self, line: &str, cursor: usize, queued: usize, menu: &[String]) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.editor = (line.to_string(), cursor);
             fs.queued = queued;
             fs.menu = menu.to_vec();
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
         }
     }
 
     /// Re-render after a resize (or after a foreground picker clobbered the
     /// screen): force a full redraw at the current size.
     pub fn frame_resize(&self) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.out.invalidate();
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
         }
     }
 
@@ -475,10 +501,10 @@ impl Renderer {
 
     /// Record a submitted user message in the transcript (frame mode).
     pub fn frame_user_message(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Message { role: Role::User, text: text.to_string() }));
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
         }
     }
 
@@ -486,10 +512,10 @@ impl Renderer {
     /// frame mode it is captured as a transcript item so direct writes can't
     /// corrupt the owned frame; otherwise it prints inline as before.
     pub fn print_block(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Output(text.to_string())));
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         println!("{text}");
@@ -510,13 +536,13 @@ impl Renderer {
     /// sequences with the raw bytes (`println!` takes no terminal lock, so the
     /// frame mutex is the only thing serializing them).
     pub fn print_raw(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
-            self.frame_finish_stream(&mut fs);
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            self.frame_finish_stream(fs);
             println!("{text}");
             fs.items.push(stamped(Item::Raw(text.to_string())));
             fs.out.invalidate();
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         println!("{text}");
@@ -529,13 +555,13 @@ impl Renderer {
     /// Wipe the screen and scrollback for a fresh session, re-pinning the
     /// status line's scroll region, and reset the renderer's line state.
     pub fn clear_screen(&self) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.items.clear();
             fs.stream = None;
             fs.think = None;
             fs.out.invalidate();
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         match &self.status {
@@ -604,16 +630,16 @@ impl Renderer {
     }
 
     pub fn end_turn(&self) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
-            self.frame_finish_stream(&mut fs);
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            self.frame_finish_stream(fs);
             // A fresh prompt starts now the turn is done: restamp it (matching
             // the legacy editor, which restamps on submission) so the next
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -630,10 +656,10 @@ impl Renderer {
     /// Print a short note on its own line (e.g. a queued steer). If an
     /// answer is streaming mid-line, the note waits for the line to end.
     pub fn note(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Note(text.to_string())));
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -646,10 +672,10 @@ impl Renderer {
 
     /// Print a note on its own line straight away.
     pub fn urgent_note(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Note(text.to_string())));
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -659,11 +685,11 @@ impl Renderer {
     /// Clear any transient status-bar hint (frame mode only; a no-op in legacy
     /// mode, where transients are ordinary printed lines).
     pub fn clear_transient(&self) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
-            if fs.transient.take().is_some() {
-                self.frame_render(&mut fs);
-            }
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut()
+            && fs.transient.take().is_some()
+        {
+            self.frame_render(fs);
         }
     }
 
@@ -674,10 +700,10 @@ impl Renderer {
     /// legacy mode it prints inline like `note`. Use for cursor-relevant
     /// feedback such as "(Ctrl-C again to exit)".
     pub fn transient_note(&self, text: &str) {
-        if let Some(frame) = &self.frame {
-            let mut fs = frame.lock().unwrap();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
             fs.transient = Some(text.to_string());
-            self.frame_render(&mut fs);
+            self.frame_render(fs);
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -691,14 +717,14 @@ impl Renderer {
     }
 
     pub fn event(&self, event: &AgentEvent) {
-        if let Some(frame) = &self.frame {
+        let mut guard = self.frame.lock().unwrap();
+        if let Some(fs) = guard.as_mut() {
             if verbosity() == Verbosity::Quiet
                 && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
             {
                 return;
             }
-            let mut fs = frame.lock().unwrap();
-            self.frame_event(&mut fs, event);
+            self.frame_event(fs, event);
             return;
         }
         if matches!(event, AgentEvent::Context | AgentEvent::Compacted)
@@ -920,7 +946,7 @@ impl Renderer {
     /// Ctrl-O: toggle between collapsed and expanded thinking. Returns true
     /// when it printed something at the prompt (the prompt must be redrawn).
     pub fn toggle_thinking(&self) -> bool {
-        if self.frame.is_some() {
+        if self.frame.lock().unwrap().is_some() {
             // Reasoning is already shown collapsed in the transcript; there is
             // no in-place expand/collapse in frame mode yet.
             return false;
@@ -1063,29 +1089,18 @@ mod tests {
                 status: None,
                 tty: true,
                 expanded: AtomicBool::new(false),
-                frame: Some(Mutex::new(FrameState {
-                    out: FrameRenderer::new(io::stdout()),
-                    items: Vec::new(),
-                    editor: (String::new(), 0),
-                    queued: 0,
-                    menu: Vec::new(),
-                    stream: None,
-                    think: None,
-                    think_streamed: false,
-                    prompt_stamp: stamp(),
-                    transient: None,
-                })),
+                frame: Mutex::new(Some(Self::fresh_frame())),
             })
         }
 
         #[cfg(test)]
         fn frame_items(&self) -> Vec<StampedItem> {
-            self.frame.as_ref().unwrap().lock().unwrap().items.clone()
+            self.frame.lock().unwrap().as_ref().unwrap().items.clone()
         }
 
         #[cfg(test)]
         fn frame_transient(&self) -> Option<String> {
-            self.frame.as_ref().unwrap().lock().unwrap().transient.clone()
+            self.frame.lock().unwrap().as_ref().unwrap().transient.clone()
         }
     }
 

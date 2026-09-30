@@ -282,6 +282,17 @@ impl StatusLine {
         self.anchor();
     }
 
+    /// Re-pin the scroll region to the status line's rows. The frame renderer's
+    /// full redraw resets the region to the whole screen (`\x1b[r`); after a
+    /// live switch back to legacy the region must be re-pinned or the status
+    /// bar (pinned to the bottom row) would scroll off. `draw()` alone does not
+    /// re-pin it, because it only does so when the terminal *size* changed —
+    /// and a renderer switch does not change the size.
+    pub fn repin_scroll_region(&self) {
+        let Some((rows, _)) = terminal_size() else { return };
+        with_term_lock(|| emit(&resize_sequence(rows)));
+    }
+
     /// Close any gap between the cursor and the status line by scrolling the
     /// conversation down into it. Asks the terminal for the cursor row, which
     /// only works while the line reader is in key mode (it forwards the reply;

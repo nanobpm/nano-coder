@@ -692,8 +692,18 @@ impl Agent {
 
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
-        self.client = Self::client_for(&self.config, spec)?;
         self.config.model = spec.to_string();
+        self.refresh_client().await
+    }
+
+    /// Rebuild the LLM client for the current model, resetting the state that
+    /// is tied to a client: the context calibration, the window learned from
+    /// overflow errors, the window detected from the endpoint, and the
+    /// post-compaction floor. Used after a provider edit (which can change the
+    /// endpoint, key, or model the current spec resolves to) and on model
+    /// switches.
+    pub async fn refresh_client(&mut self) -> Result<()> {
+        self.client = Self::client_for(&self.config, &self.config.model)?;
         self.calibration = None;
         self.learned_window = None;
         self.detected_window = None;

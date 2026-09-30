@@ -267,6 +267,12 @@ struct Terminal {
     recents: recents::SharedRecents,
     recents_path: std::path::PathBuf,
     renderer: std::sync::Arc<ui::Renderer>,
+    /// The renderer mode active when the session started; a live `renderer`
+    /// switch in `/settings` is detected against it.
+    renderer_before: crate::frame::RendererMode,
+    /// The status line, kept so a live renderer switch can re-anchor the
+    /// scroll region (legacy) or let the frame clear it (frame).
+    status: Option<std::sync::Arc<status::StatusLine>>,
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -309,6 +315,8 @@ impl Terminal {
         renderer: std::sync::Arc<ui::Renderer>,
         recents: recents::SharedRecents,
         recents_path: std::path::PathBuf,
+        status: Option<std::sync::Arc<status::StatusLine>>,
+        renderer_before: crate::frame::RendererMode,
     ) -> Self {
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
@@ -375,6 +383,8 @@ impl Terminal {
             recents,
             recents_path,
             renderer,
+            renderer_before,
+            status,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -411,6 +421,53 @@ impl Terminal {
     fn sync_context(&mut self, agent: &Agent) {
         let context = self.view.lock().unwrap().context_handle();
         context.lock().unwrap().config = agent.config().clone();
+    }
+
+    /// Apply a live `renderer` switch from `/settings`: flip the app-owned
+    /// frame renderer, match the line editor's drawing path (frame hook vs
+    /// inline), re-anchor the status line / scroll region, and replay the
+    /// transcript into the now-active renderer. No-op when the mode is
+    /// unchanged. The transcript state is preserved across the flip, so the
+    /// conversation is simply re-emitted into whichever renderer is active.
+    fn renderer_switched(&mut self, agent: &mut Agent) {
+        let mode = agent.config().renderer;
+        if mode == self.renderer_before {
+            return;
+        }
+        self.renderer_before = mode;
+        self.renderer.set_mode(mode);
+        let on = self.renderer.is_frame();
+        // Rebuild the frame hook to match: frame routes every edit through the
+        // single frame writer; legacy draws inline with its own command menu.
+        let renderer = self.renderer.clone();
+        let hook: Option<lineedit::EditHook> = on.then(|| {
+            let h: lineedit::EditHook =
+                std::sync::Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
+                    renderer.set_editor(line, cursor, queued, menu)
+                });
+            h
+        });
+        self.view.lock().unwrap().set_frame_mode(on, hook);
+        // Re-anchor the scroll region (legacy) / let the frame re-own the
+        // screen (frame), and recompute the prompt at the current size.
+        if let Some(status) = &self.status {
+            status.resize();
+        }
+        self.view.lock().unwrap().resize();
+        // The frame's full redraw (when switching *to* frame) resets the scroll
+        // region to the whole screen; switching *to* legacy must re-pin it to
+        // the status line's rows or the bottom bar would scroll off.
+        if !on && let Some(status) = &self.status {
+            status.repin_scroll_region();
+        }
+        // Re-emit the conversation into the frame transcript only when switching
+        // *to* frame: a fresh frame starts empty, so the transcript must be
+        // rebuilt into it (a full redraw clears scrollback and re-owns the
+        // screen). Switching *to* legacy must NOT replay — the legacy transcript
+        // already lives in scrollback, and replaying would duplicate it.
+        if on {
+            agent.replay_history();
+        }
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
@@ -1292,11 +1349,18 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
+            let renderer_before = agent.config().renderer;
             settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await?;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
+            // A renderer switch in the settings dialog takes effect live: flip
+            // the frame renderer, the line editor's drawing path, and the
+            // scroll region, and replay the transcript into the new renderer.
+            if agent.config().renderer != renderer_before {
+                terminal.renderer_switched(agent);
+            }
             // Each model switch made in the dialog was recorded into the recents
             // MRU as it happened, so here just refresh the config the line
             // editor's argument suggestions read (providers or the model may
@@ -2027,7 +2091,15 @@ async fn main() -> Result<()> {
         if frame_mode && args.resume.is_some() {
             agent.replay_history();
         }
-        let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
+        let mut terminal = Terminal::start(
+            config_path,
+            view,
+            renderer,
+            recents,
+            recents_path,
+            status.clone(),
+            agent.config().renderer,
+        );
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved
         // key or a queued/empty line cannot silently disarm it (see
@@ -2036,14 +2108,14 @@ async fn main() -> Result<()> {
         let mut separate = false;
         while running {
             if let Some(status) = &status
-                && !frame_mode
+                && !terminal.renderer.is_frame()
             {
                 status.draw();
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
-                    if frame_mode {
+                    if terminal.renderer.is_frame() {
                         // The frame renderer owns the screen: refresh the editor
                         // row (and thus the whole frame) instead of writing an
                         // inline prompt.
@@ -2098,7 +2170,7 @@ async fn main() -> Result<()> {
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        if frame_mode {
+                        if terminal.renderer.is_frame() {
                             terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
                         } else {
                             println!("\nMode: {mode} ({})", mode.describe());
@@ -2127,7 +2199,7 @@ async fn main() -> Result<()> {
             if input.trim().is_empty() {
                 continue;
             }
-            if frame_mode && !input.starts_with('/') {
+            if terminal.renderer.is_frame() && !input.starts_with('/') {
                 terminal.renderer.frame_user_message(&input);
             }
 
@@ -2136,7 +2208,7 @@ async fn main() -> Result<()> {
                     running = continue_running;
                 }
                 Err(e) => {
-                    if frame_mode {
+                    if terminal.renderer.is_frame() {
                         terminal.renderer.note(&format!("Error: {:#}", e));
                     } else {
                         eprintln!("Error: {:#}", e);
