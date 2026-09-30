@@ -1,0 +1,4 @@
+# Keep the codebase's dense style: wide lines, and short structs, calls and
+# match arms on one line. Checked in CI with `cargo fmt --check`.
+max_width = 120
+use_small_heuristics = "Max"
