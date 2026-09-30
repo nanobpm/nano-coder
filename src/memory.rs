@@ -598,6 +598,18 @@ fn write_all(path: &Path, entries: &[Entry], unknown: &[String]) -> Result<()> {
     }
     let tmp = path.with_extension(format!("jsonl.tmp.{}.{:08x}", std::process::id(), fastrand::u32(..)));
     std::fs::write(&tmp, body)?;
+    // Preserve the target's permissions across the atomic rewrite: the temp file
+    // is created with the process umask, so a rename would otherwise silently
+    // widen a user-protected `0600` memory file to `0644`/`0664`, exposing it to
+    // other local users. Copy the existing target's permissions onto the temp
+    // file first (as `src/files.rs` does); a missing target (first save) keeps
+    // the umask default. Clean up the temp file if the chmod itself fails.
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
@@ -782,7 +794,12 @@ fn normalize_remote(url: &str) -> String {
         s.to_string()
     };
     let trimmed = s.trim_end_matches('/');
-    trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string()
+    // Strip a trailing `.git` only for URI/SCP remotes. On a local path `.git`
+    // is an ordinary filename suffix, and stripping it makes the key
+    // non-injective: `/srv/project.git` and `/srv/project` would collapse onto
+    // one project key and share a JSONL memory file, exposing project-scoped
+    // memories to each other even though they can be distinct repositories.
+    if uri || scp { trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string() } else { trimmed.to_string() }
 }
 
 /// A filesystem-safe file stem for a project key. Distinct keys always map to
@@ -1215,6 +1232,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn write_all_preserves_target_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        let path = store.path(Scope::User).unwrap();
+        // Create the target with restrictive `0600` permissions, as a user
+        // protecting their memory file would. A rewrite must not silently widen
+        // it to the process umask (`0644`/`0664`), which would expose the
+        // contents to other local users (Copilot finding, src/memory.rs).
+        let entry = store.save(Scope::User, "permission fact", None, None).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_all(&path, std::slice::from_ref(&entry), &[]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rewrite widened memory file permissions: {mode:#o}");
+    }
+
+    #[test]
     fn index_is_dated_framed_and_capped() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -1387,13 +1422,19 @@ mod tests {
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct
         // keys (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("/srv/repo#blue.git"), "/srv/repo#blue");
+        assert_eq!(normalize_remote("/srv/repo#blue.git"), "/srv/repo#blue.git");
         assert_ne!(normalize_remote("/srv/repo#blue.git"), normalize_remote("/srv/repo#red.git"));
         assert_eq!(normalize_remote("/srv/repo.git?x=1"), "/srv/repo.git?x=1");
-        assert_eq!(normalize_remote("./rel/repo.git"), "./rel/repo");
-        assert_eq!(normalize_remote("../rel/repo.git"), "../rel/repo");
+        // A trailing `.git` is stripped only for URI/SCP remotes; on a local
+        // path it is an ordinary filename suffix and is preserved so that
+        // `/srv/project.git` and `/srv/project` keep distinct keys instead of
+        // sharing one memory file (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote("./rel/repo.git"), "./rel/repo.git");
+        assert_eq!(normalize_remote("../rel/repo.git"), "../rel/repo.git");
+        assert_eq!(normalize_remote("/srv/project.git"), "/srv/project.git");
+        assert_ne!(normalize_remote("/srv/project.git"), normalize_remote("/srv/project"));
         // A local path that happens to contain an `@` is not an authority.
-        assert_eq!(normalize_remote("/srv/repo@home.git"), "/srv/repo@home");
+        assert_eq!(normalize_remote("/srv/repo@home.git"), "/srv/repo@home.git");
         // A readable head is kept, but a disambiguating hash is always appended.
         assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);
