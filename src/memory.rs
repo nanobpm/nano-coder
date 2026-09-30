@@ -12,10 +12,12 @@
 //! - `project`: keyed by the git remote (fallback: the git root path); repo
 //!   quirks and setup.
 //!
-//! Storage mirrors the session log: append-oriented JSONL, one [`Entry`] per
-//! line, in `<data>/memory/user.jsonl` and `<data>/memory/projects/<key>.jsonl`.
-//! Search is a regex over the text, as in `history_search`; there is no
-//! embedding or vector store.
+//! Storage is JSONL — one [`Entry`] per line, in `<data>/memory/user.jsonl` and
+//! `<data>/memory/projects/<key>.jsonl` — but, unlike the append-only session
+//! log, every mutation (save, matching search, expiry prune, forget) rewrites
+//! the whole scope file atomically rather than appending, so it has none of a
+//! log's append-write performance characteristics. Search is a regex over the
+//! text, as in `history_search`; there is no embedding or vector store.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -830,6 +832,16 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// Whether `s` begins with a Windows drive prefix (`C:` — an ASCII letter then
+/// a colon), as in `C:\repo.git`, `C:/repo` or the drive-relative `C:repo`.
+/// Such a path has a colon before any `/`, so it otherwise trips the SCP
+/// `host:path` heuristic; git resolves the same ambiguity in favour of the
+/// drive letter.
+fn dos_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 /// A git remote URL reduced to a stable `host/path` label, dropping the scheme,
 /// any credentials and a trailing `.git`.
 fn normalize_remote(url: &str) -> String {
@@ -856,7 +868,13 @@ fn normalize_remote(url: &str) -> String {
     // path and must be kept verbatim: `?`/`#`/`@` are ordinary filename
     // characters there, and stripping them would merge unrelated repositories
     // (e.g. `/srv/repo#blue.git` and `/srv/repo#red.git`) onto one project key.
+    // A Windows drive prefix (`C:\repo.git`, `C:/repo`, `C:repo`) also has a
+    // colon before any `/`, so exclude it first — otherwise it is read as
+    // `host:path`, its `.git` is stripped, and distinct local repos like
+    // `C:\repo.git` and `C:\repo` collapse onto one project key (git itself
+    // resolves this ambiguity in favour of the drive letter).
     let scp = !uri
+        && !dos_drive_prefix(s)
         && s.find(':').is_some_and(|colon| {
             let authority = &s[..colon];
             !authority.contains(['/', '?', '#']) && !authority.chars().any(char::is_whitespace)
@@ -1679,6 +1697,14 @@ mod tests {
         assert_eq!(normalize_remote("../rel/repo.git"), "../rel/repo.git");
         assert_eq!(normalize_remote("/srv/project.git"), "/srv/project.git");
         assert_ne!(normalize_remote("/srv/project.git"), normalize_remote("/srv/project"));
+        // A Windows drive path (`C:\repo.git`) has a colon before any `/`, so
+        // it must not be read as SCP `host:path`: its `.git` is kept and
+        // `C:\repo.git`/`C:\repo` stay distinct keys instead of sharing one
+        // memory file (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote(r"C:\repo.git"), r"C:\repo.git");
+        assert_ne!(normalize_remote(r"C:\repo.git"), normalize_remote(r"C:\repo"));
+        assert_eq!(normalize_remote("C:/repo.git"), "C:/repo.git");
+        assert_eq!(normalize_remote("c:repo.git"), "c:repo.git");
         // A local path that happens to contain an `@` is not an authority.
         assert_eq!(normalize_remote("/srv/repo@home.git"), "/srv/repo@home.git");
         // A readable head is kept, but a disambiguating hash is always appended.

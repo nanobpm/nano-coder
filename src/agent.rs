@@ -466,6 +466,15 @@ pub struct Agent {
     /// Cross-session memory store, present when `config.memory` is not `off`
     /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
     memory: Option<memory::Store>,
+    /// Cached rendered memory index, tagged with the `writable` flag it was
+    /// built for. `apply_mode_to_system_prompt` runs at turn start and before
+    /// every LLM request, and building the index synchronously reads and parses
+    /// both scope files, so without this cache each model iteration would add
+    /// filesystem work proportional to the whole store. Invalidated whenever the
+    /// store is mutated (save/search/forget) so a change still surfaces
+    /// promptly; a `writable` flip (plan-mode toggle) rebuilds once to vary the
+    /// save guidance.
+    memory_index_cache: Option<(bool, String)>,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -509,6 +518,7 @@ impl Agent {
             history_available: false,
             history_hint_pending: false,
             memory,
+            memory_index_cache: None,
         }
     }
 
@@ -532,6 +542,7 @@ impl Agent {
     fn rekey_memory(&mut self) {
         if self.memory.is_some() {
             self.memory = Self::build_memory(&self.config);
+            self.memory_index_cache = None;
         }
     }
 
@@ -832,7 +843,7 @@ impl Agent {
     fn apply_mode_to_system_prompt(&mut self) {
         // Compute the prompt before borrowing the conversation mutably, so the
         // immutable borrow of `self` (for `system_prompt`) does not conflict.
-        let base = self.system_prompt();
+        let base = self.system_prompt_cached();
         let content = match self.control.mode() {
             crate::mode::AgentMode::Plan => format!("{base}{}", crate::mode::PLAN_PROMPT_NOTE),
             _ => base,
@@ -849,6 +860,9 @@ impl Agent {
         if self.memory.is_none() {
             return;
         }
+        // Drop the cached index so the rebuild re-reads the store rather than
+        // reusing a snapshot taken before the change.
+        self.memory_index_cache = None;
         // `apply_mode_to_system_prompt` rebuilds the full system prompt
         // (including the memory index) and applies the plan-mode note.
         self.apply_mode_to_system_prompt();
@@ -1178,6 +1192,37 @@ impl Agent {
             .map(|store| store.index(self.memory_writable()))
             .unwrap_or_default();
         format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
+    }
+
+    /// Like [`Agent::system_prompt`] but serves the memory index from the
+    /// per-session cache. `apply_mode_to_system_prompt` runs before every model
+    /// request, and rendering the index reads and parses both scope files, so
+    /// recomputing it each iteration would add filesystem work proportional to
+    /// the whole store to every turn. Instructions and skills are already
+    /// in-memory, so only the memory index is cached.
+    fn system_prompt_cached(&mut self) -> String {
+        let memory = self.cached_memory_index();
+        let extra = self.instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
+        format!("{}{extra}{}{memory}", self.config.system_prompt, self.skills.render_index())
+    }
+
+    /// The rendered memory index, cached for the current `writable` state. The
+    /// cache is invalidated on any store mutation (see `refresh_memory_index`
+    /// and the memory-tool dispatch); a `writable` flip rebuilds once so the
+    /// save guidance matches the mode.
+    fn cached_memory_index(&mut self) -> String {
+        if self.memory.is_none() || !self.config.memory.enabled() {
+            return String::new();
+        }
+        let writable = self.memory_writable();
+        if let Some((cached_writable, index)) = &self.memory_index_cache
+            && *cached_writable == writable
+        {
+            return index.clone();
+        }
+        let index = self.memory.as_ref().map(|store| store.index(writable)).unwrap_or_default();
+        self.memory_index_cache = Some((writable, index.clone()));
+        index
     }
 
     /// Discover instruction files and skills for the current working directory,
@@ -2159,6 +2204,14 @@ impl Agent {
         // it neither bumps last_used nor prunes/rewrites the store.
         let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
         let result = memory::run(store, &call.name, &call.arguments, session, read_only);
+        // Any successful writable memory op can change the folded system-prompt
+        // index — a save adds an entry, a matching search bumps `last_used` (and
+        // may prune), a forget deletes one — so drop the cached index; the next
+        // prompt rebuild re-reads the store. A plan-mode/read-only search never
+        // mutates, so it need not invalidate.
+        if result.is_ok() && !read_only {
+            self.memory_index_cache = None;
+        }
         // A successful forget deletes an entry the folded system-prompt index
         // still shows; rebuild it so the removed fact leaves the active prompt
         // at once rather than resurfacing on the next turn.
