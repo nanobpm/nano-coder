@@ -614,7 +614,9 @@ impl Agent {
     /// Recompute the shared statistics and notify the event sink.
     pub fn refresh_stats(&self) {
         let (tokens, calibrated) = self.estimate_context_tokens();
-        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string());
+        let cwd = std::env::current_dir()
+            .map(|p| crate::status::tilde_path(&p, dirs::home_dir().as_deref()))
+            .unwrap_or_else(|_| ".".to_string());
         {
             let mut stats = self.stats.lock().unwrap();
             stats.provider = self.client.provider_name().to_string();
