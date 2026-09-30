@@ -40,6 +40,7 @@ mod shell;
 mod skills;
 mod status;
 mod tools;
+mod trajectory;
 mod ui;
 
 use agent::Agent;
@@ -907,6 +908,15 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
     }
 }
 
+/// Whether `/trajectory` / `--trajectory` should open a pager: both ends are
+/// a terminal and the ledger doesn't fit on one screen.
+fn trajectory_pageable(traj: &trajectory::Trajectory) -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && status::terminal_size()
+            .is_some_and(|(rows, cols)| trajectory::needs_pager(&traj.to_plain(), rows as usize, cols as usize))
+}
+
 /// Emit a transient diagnostic: through the frame transcript in frame mode (a
 /// direct write would corrupt the owned frame), else to stderr as before.
 fn diag(renderer: &ui::Renderer, text: &str) {
@@ -1219,6 +1229,48 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
+            let arg = cmd["/trajectory".len()..].trim();
+            let Some(path) = agent.session_path() else {
+                terminal.renderer.print_block("Session persistence is disabled: no trajectory to show");
+                return Ok(true);
+            };
+            let records = match session::read_records_at(path, None) {
+                Ok(records) => records,
+                Err(e) => {
+                    terminal.renderer.print_block(&format!("Could not read the session log: {e:#}"));
+                    return Ok(true);
+                }
+            };
+            let traj = trajectory::Trajectory::from_records(&records);
+            match arg {
+                // Export modes bypass the transcript renderer (`print_raw`, not
+                // `print_block`): the frame would wrap long lines and prefix a
+                // timestamp, making the JSON unparseable and mangling Markdown.
+                "--json" => terminal.renderer.print_raw(&traj.to_json()),
+                "--markdown" | "--md" => terminal.renderer.print_raw(&traj.to_markdown()),
+                "" if !terminal.outstanding && terminal.renderer.is_frame() && trajectory_pageable(&traj) => {
+                    // The pager owns the screen until it exits; force a full
+                    // redraw so the frame renderer's next differential render
+                    // isn't diffed against what the pager left (as /settings
+                    // does). Typed during a turn, a stdin read is still pending
+                    // and would race the pager for keys, so print instead; the
+                    // legacy renderer's status line pins a scroll region a
+                    // full-screen pager would disturb, so it prints too.
+                    let text = traj.to_plain();
+                    let paged = trajectory::page(&text);
+                    terminal.renderer.frame_resize();
+                    if !paged {
+                        terminal.renderer.print_block(&text);
+                    }
+                }
+                "" => terminal.renderer.print_block(&traj.to_plain()),
+                other => terminal
+                    .renderer
+                    .print_block(&format!("Unknown option {other:?}; use /trajectory [--json|--markdown]")),
+            }
+            Ok(true)
+        }
         "/restart" => {
             // Start a brand-new session in place: new ID, context reset to
             // just the system prompt, empty plan, counters zeroed. The
@@ -1317,6 +1369,9 @@ struct Args {
     sandbox: Option<sandbox::SandboxMode>,
     allow: Vec<String>,
     deny: Vec<String>,
+    trajectory: Option<String>,
+    json: bool,
+    markdown: bool,
 }
 
 fn print_version() {
@@ -1327,6 +1382,7 @@ fn print_help() {
     println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
     println!("                  [--verbosity quiet|normal|verbose|debug]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot");
     println!("       nano-coder --list-models PROVIDER[/model]");
     println!("       nano-coder --version");
@@ -1359,6 +1415,9 @@ fn parse_args() -> Result<Args> {
         sandbox: None,
         allow: Vec::new(),
         deny: Vec::new(),
+        trajectory: None,
+        json: false,
+        markdown: false,
     };
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -1370,6 +1429,9 @@ fn parse_args() -> Result<Args> {
             "--model" => args.model = Some(value("--model")?),
             "--resume" => args.resume = Some(value("--resume")?),
             "--config" => args.config = Some(value("--config")?.into()),
+            "--trajectory" => args.trajectory = Some(value("--trajectory")?),
+            "--json" => args.json = true,
+            "--markdown" | "--md" => args.markdown = true,
             "--verbosity" | "-v" => {
                 args.verbosity = Some(value("--verbosity")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
             }
@@ -1386,6 +1448,16 @@ fn parse_args() -> Result<Args> {
             }
             other => anyhow::bail!("unknown argument {other:?} (see --help)"),
         }
+    }
+    // The `--json` / `--markdown` output selectors are only honoured in
+    // trajectory mode; without `--trajectory` they would silently start the
+    // normal agent, and specifying both would silently pick one. Reject those
+    // invalid combinations rather than run an unintended mode.
+    if args.json && args.markdown {
+        anyhow::bail!("--json and --markdown are mutually exclusive");
+    }
+    if (args.json || args.markdown) && args.trajectory.is_none() {
+        anyhow::bail!("--json/--markdown require --trajectory <id>");
     }
     Ok(args)
 }
@@ -1411,6 +1483,21 @@ async fn main() -> Result<()> {
     };
     let config_path = config_mgr.config_path().to_path_buf();
     let mut config = config_mgr.get().clone();
+    if let Some(id) = &args.trajectory {
+        let records = session::read_records(&config.session_dir(), id)?;
+        let traj = trajectory::Trajectory::from_records(&records);
+        if args.json {
+            println!("{}", traj.to_json());
+        } else if args.markdown {
+            println!("{}", traj.to_markdown());
+        } else {
+            let text = traj.to_plain();
+            if !(trajectory_pageable(&traj) && trajectory::page(&text)) {
+                println!("{text}");
+            }
+        }
+        return Ok(());
+    }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();
         let client = providers::build_lister(spec, &user, &default_provider)?;

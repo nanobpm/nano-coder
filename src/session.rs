@@ -186,7 +186,13 @@ impl SessionLog {
             // Drop a torn trailing record so later appends stay line-aligned.
             file.set_len(committed as u64)?;
         }
-        let lines = bytes[..committed].split(|&b| b == b'\n').filter(|l| !l.is_empty()).count() as u64;
+        // Count PHYSICAL lines, not just nonempty records: `append` writes at
+        // the next physical line, and `decode`/`read_records_at` number
+        // messages by physical line, so a blank line in the log must advance
+        // the counter too — otherwise a reopened session appends at the right
+        // physical line but returns a `#N` that collides with an existing
+        // message and diverges from `history_read`.
+        let lines = bytes[..committed].iter().filter(|&&b| b == b'\n').count() as u64;
         Ok((Self { path, file, lines }, restored))
     }
 
@@ -205,6 +211,89 @@ impl SessionLog {
         self.lines += 1;
         Ok(self.lines)
     }
+}
+
+/// Every committed record from a session log, in order, for offline tools
+/// like the trajectory view. Unlike [`SessionLog::open`], this does not fold
+/// records into a [`Restored`] snapshot: it returns them verbatim so a reader
+/// can reconstruct the turn-by-turn ledger (inputs, per-message
+/// thinking/usage/timing, tool results, compactions). A torn trailing line
+/// from a crash is discarded, exactly as on resume.
+pub fn read_records(dir: &Path, id: &str) -> Result<Vec<Record>> {
+    validate_id(id)?;
+    read_records_at(&path_for(dir, id), Some(id))
+}
+
+/// [`read_records`] for a known log path (the live session's own file).
+/// `expected_id`, when given, is checked against the session header's `id` so a
+/// renamed or misplaced log is rejected rather than read as the wrong session;
+/// pass `None` for the live session's own file, whose path is authoritative.
+pub fn read_records_at(path: &Path, expected_id: Option<&str>) -> Result<Vec<Record>> {
+    let bytes = fs::read(path).with_context(|| format!("read session log {}", path.display()))?;
+    // Require at least one committed (newline-terminated) record; a log with none
+    // is empty or torn, and treating it as an empty trajectory would be
+    // misleading.
+    let committed = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .ok_or_else(|| anyhow!("session log {} has no committed records", path.display()))?;
+    let mut records = Vec::new();
+    // Record ordinals count only decodable records (the session header is
+    // record 1), but a message's `log_line` is its PHYSICAL line number:
+    // `history_read`/`history_search` enumerate physical lines and skip empty
+    // ones, so a blank line in the log must not shift every later `#N`.
+    let mut index = 0usize;
+    for (line_no, line) in bytes[..committed].split(|&b| b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let record: Record = serde_json::from_slice(line)
+            .with_context(|| format!("decode record {} of {}", index + 1, path.display()))?;
+        // Enforce the same invariants `SessionLog::open` does: the first record
+        // must be a session header of a supported format version.
+        match &record {
+            Record::Session { version, id, .. } => {
+                if index != 0 {
+                    bail!("session record must be first (found at record {})", index + 1);
+                }
+                if *version != FORMAT_VERSION {
+                    bail!("unsupported session format version {version} (this build supports {FORMAT_VERSION})");
+                }
+                // Match `SessionLog::open`: a log whose header id differs from the
+                // requested id was renamed or misplaced, so refuse to read it as
+                // the requested session.
+                if let Some(expected) = expected_id
+                    && id != expected
+                {
+                    bail!("session log header id {id:?} does not match {expected:?}");
+                }
+            }
+            _ if index == 0 => bail!("session log {} does not start with a session header", path.display()),
+            _ => {}
+        }
+        // Number messages by log line, as `SessionLog::open` does, so the
+        // trajectory cites the same `#N` IDs as `history_read` and smart
+        // summaries. Assign the physical line unconditionally: a direct message
+        // record's ID IS its physical line (`history_read` enumerates lines and
+        // knows nothing of a serialized field), so a syntactically valid log
+        // carrying a stale `log_line` on a direct record must not export a
+        // different `#N` than `history_read` shows. Embedded IDs are meaningful
+        // only on messages nested inside `replace` records.
+        let mut record = record;
+        if let Record::Message(message) = &mut record {
+            message.log_line = Some(line_no as u64 + 1);
+        }
+        records.push(record);
+        index += 1;
+    }
+    // A log made up solely of newline bytes passes the `rposition` check but
+    // filters down to zero records, so the session-header invariant above is
+    // never enforced. Reject it rather than return a misleading empty ledger.
+    if records.is_empty() {
+        bail!("session log {} has no decodable records", path.display());
+    }
+    Ok(records)
 }
 
 /// Compare two messages by their durable content, ignoring only the transient
@@ -257,7 +346,15 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     // Every direct message record seen so far, with its assigned `log_line`, so
     // a later `replace` from a legacy log can recover the IDs of retained messages.
     let mut originals: Vec<Message> = Vec::new();
-    for (index, line) in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()).enumerate() {
+    // Record ordinals count only decodable records (the session header is
+    // record 1), but a message's `log_line` is its PHYSICAL line number:
+    // `history_read`/`history_search` enumerate physical lines and skip empty
+    // ones, so a blank line in the log must not shift every later `#N`.
+    let mut index = 0usize;
+    for (line_no, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
         let record: Record = serde_json::from_slice(line).with_context(|| format!("decode record {}", index + 1))?;
         match record {
             Record::Session { version, id, .. } => {
@@ -276,7 +373,12 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
             }
             Record::Message(mut message) => {
-                message.log_line.get_or_insert(index as u64 + 1);
+                // A direct record's ID is its physical line (`history_read`
+                // enumerates lines), so assign it unconditionally: a stale
+                // serialized `log_line` must not override the line the history
+                // tools would cite. Embedded IDs are meaningful only on
+                // messages nested inside `replace` records.
+                message.log_line = Some(line_no as u64 + 1);
                 if crate::history::consumes_hint(&message) {
                     restored.history_hint_consumed = true;
                 }
@@ -309,6 +411,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
         }
+        index += 1;
     }
     Ok(restored)
 }
@@ -316,6 +419,34 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_log_line_on_a_direct_record_is_renumbered_to_its_physical_line() {
+        // A direct message record's `#N` IS its physical line: `history_read`
+        // enumerates lines and knows nothing of a serialized field, so both
+        // readers must assign the physical line unconditionally rather than
+        // trust an embedded `log_line`. (Live logs never carry one on direct
+        // records — it is written only inside `replace` records — but a
+        // syntactically valid log can.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let stale: Record =
+            serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi","log_line":99}}"#).unwrap();
+        assert_eq!(stale, Record::Message(Message { log_line: Some(99), ..Message::user("hi") }));
+        let mut log = String::new();
+        for record in
+            [Record::Session { version: FORMAT_VERSION, id: "s".into(), created_at: now() }, input("i"), stale]
+        {
+            log.push_str(&serde_json::to_string(&record).unwrap());
+            log.push('\n');
+        }
+        std::fs::write(&path, log).unwrap();
+        let records = read_records_at(&path, Some("s")).unwrap();
+        let Record::Message(message) = &records[2] else { panic!("a message record") };
+        assert_eq!(message.log_line, Some(3), "the physical line wins over the serialized field");
+        let (_, restored) = SessionLog::open(dir.path(), "s").unwrap();
+        assert_eq!(restored.conversation[0].log_line, Some(3));
+    }
 
     #[test]
     fn reads_utc_records_and_unstamped_messages_from_older_logs() {
@@ -473,6 +604,50 @@ mod tests {
     }
 
     #[test]
+    fn blank_lines_do_not_shift_message_ids() {
+        // `history_read`/`history_search` number messages by PHYSICAL log line
+        // (enumerating every line, skipping empties). A blank line in the log
+        // must not shift the `#N` of every message after it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s7.jsonl");
+        let header =
+            serde_json::to_string(&Record::Session { version: FORMAT_VERSION, id: "s7".into(), created_at: now() })
+                .unwrap();
+        let user = serde_json::to_string(&Record::Message(Message::user("hi"))).unwrap();
+        let answer = serde_json::to_string(&Record::Message(Message::assistant("hello"))).unwrap();
+        // Physical lines: 1 header, 2 user, 3 BLANK, 4 assistant.
+        std::fs::write(&path, format!("{header}\n{user}\n\n{answer}\n")).unwrap();
+
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
+        assert_eq!(lines, vec![Some(2), Some(4)], "the assistant message stays on physical line 4");
+
+        // Reopening and appending writes on physical line 5 AND returns #5: the
+        // blank line must advance the append counter too, or the new message's
+        // `#N` collides with the existing assistant (#4) and diverges from
+        // `history_read`.
+        let (mut log, _) = SessionLog::open(dir.path(), "s7").unwrap();
+        let line = log.append(&Record::Message(Message::user("again"))).unwrap();
+        assert_eq!(line, 5, "the append lands on physical line 5, past the blank line 3");
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        let lines: Vec<Option<u64>> = restored.conversation.iter().map(|m| m.log_line).collect();
+        assert_eq!(lines, vec![Some(2), Some(4), Some(5)]);
+
+        // The offline trajectory reader agrees, so `/trajectory` cites the same
+        // `#N` as `history_read`.
+        let records = read_records(dir.path(), "s7").unwrap();
+        let ids: Vec<Option<u64>> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Message(m) => Some(m.log_line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![Some(2), Some(4), Some(5)]);
+    }
+
+    #[test]
     fn standard_replace_does_not_offer_history_tools() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s7").unwrap();
@@ -590,5 +765,25 @@ mod tests {
             serde_json::to_string(&record).unwrap(),
             r#"{"type":"message","data":{"role":"tool","content":"ok","tool_call_id":"c1","name":"bash"}}"#
         );
+    }
+
+    #[test]
+    fn read_records_rejects_a_header_id_that_differs_from_the_requested_id() {
+        // A log written for session "real" but read back as "renamed" (a renamed
+        // or misplaced file) must be rejected, matching SessionLog::open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_for(dir.path(), "renamed");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"data\":{\"version\":1,\"id\":\"real\",\"created_at\":\"2026-01-01T00:00:00Z\"}}\n",
+        )
+        .unwrap();
+        let err = read_records(dir.path(), "renamed").err().unwrap();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+        // The live-session path (no expected id) accepts the same file: its own
+        // path is authoritative, so no id check applies.
+        assert!(read_records_at(&path, None).is_ok());
+        // And an explicit matching id accepts it too.
+        assert!(read_records_at(&path, Some("real")).is_ok());
     }
 }

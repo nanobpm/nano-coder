@@ -109,6 +109,13 @@ pub enum Item {
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
     Output(String),
+    /// Verbatim machine-readable output (e.g. `/trajectory --json`), rendered
+    /// byte-exact — no wrapping, sanitizing or width-fitting, which would
+    /// corrupt JSON/Markdown. A raw export is printed once to scrollback and
+    /// then kept here so the frame's restore redraw re-emits it instead of
+    /// erasing it (a full redraw clears the screen and scrollback, so anything
+    /// not in the frame is lost).
+    Raw(String),
 }
 
 /// A transcript item paired with the timestamp prefix captured when it was
@@ -129,6 +136,14 @@ pub struct StampedItem {
 /// timestamps off the stamp is empty, so this collapses to plain `render_item`.
 pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
     let width = width.max(1);
+    // Raw machine-readable output renders byte-exact: no stamp, no wrapping,
+    // no width-fitting — any of those would corrupt JSON/Markdown. Lines wider
+    // than the terminal wrap natively (the same bytes a plain `println!` would
+    // produce), and `sanitize` inside `fit` would strip legitimate escape
+    // sequences from the export, so this arm must bypass them both.
+    if let Item::Raw(text) = &si.item {
+        return text.split('\n').map(str::to_string).collect();
+    }
     let stamp_w = visible_width(&si.stamp);
     let inner = width.saturating_sub(stamp_w).max(1);
     let pad = " ".repeat(stamp_w);
@@ -177,6 +192,10 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
         Item::Plan(plan) => plan_lines(plan, width),
         Item::Note(text) => wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect(),
         Item::Output(text) => wrap_block(text, width),
+        // Normally rendered by the dedicated arm in `render_stamped` (which
+        // also skips the timestamp); this keeps a direct `render_item` call
+        // byte-exact too.
+        Item::Raw(text) => text.split('\n').map(str::to_string).collect(),
     }
 }
 
@@ -592,9 +611,9 @@ impl<W: Write> FrameRenderer<W> {
             // the entire transcript, so anything already in scrollback is a copy
             // of what is about to be written; keeping it would leave a duplicate
             // (stale) frame behind the fresh one.
-            self.full_redraw(frame, height)?;
+            self.full_redraw(frame, width, height)?;
         } else {
-            self.differential(frame, height)?;
+            self.differential(frame, width, height)?;
         }
         self.prev = frame.to_vec();
         self.width = width;
@@ -603,7 +622,7 @@ impl<W: Write> FrameRenderer<W> {
         Ok(())
     }
 
-    fn full_redraw(&mut self, frame: &[String], height: usize) -> std::io::Result<()> {
+    fn full_redraw(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
         // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
         // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
@@ -616,8 +635,12 @@ impl<W: Write> FrameRenderer<W> {
         buf.push_str("\x1b[H\x1b[2J\x1b[3J");
         // Bottom-anchor: when the frame is shorter than the screen, leave blank
         // rows at the top so the bar lands on the last row; when it is taller,
-        // write from the top and let the surplus scroll into scrollback.
-        let start_row = if frame.len() < height { height - frame.len() + 1 } else { 1 };
+        // write from the top and let the surplus scroll into scrollback. Count
+        // PHYSICAL rows, not logical lines: a raw export line wider than the
+        // terminal wraps natively onto extra rows, and only the physical total
+        // places the first line on the right row.
+        let physical = physical_rows(frame, width);
+        let start_row = if physical < height { height - physical + 1 } else { 1 };
         buf.push_str(&format!("\x1b[{start_row};1H"));
         for (i, line) in frame.iter().enumerate() {
             if i > 0 {
@@ -630,21 +653,37 @@ impl<W: Write> FrameRenderer<W> {
         self.out.flush()
     }
 
-    fn differential(&mut self, frame: &[String], height: usize) -> std::io::Result<()> {
+    fn differential(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let Some(diff) = first_diff(&self.prev, frame) else {
             return Ok(());
         };
         let plen = self.prev.len();
-        // The first on-screen line index of the previous frame; anything before
-        // it has scrolled into scrollback and can't be rewritten in place.
+        // Row addressing must count PHYSICAL rows: a raw export line wider than
+        // the terminal wraps natively onto extra rows, so a logical line index
+        // is not a screen row. Compare physical totals to decide the fallback
+        // and to locate the first on-screen row.
+        let prev_physical = physical_rows(&self.prev, width);
+        let new_physical = physical_rows(frame, width);
+        // The first on-screen logical line index of the previous frame;
+        // anything before it has scrolled into scrollback and can't be
+        // rewritten in place.
         let prev_top = plen.saturating_sub(height);
-        if plen != frame.len() || diff < prev_top {
-            // Line count changed, or the change is already in scrollback: fall
-            // back to a full redraw. It clears scrollback so re-emitting the
-            // whole transcript can't stack a duplicate copy behind the frame.
-            return self.full_redraw(frame, height);
+        if prev_physical != new_physical || diff < prev_top {
+            // Physical row count changed, or the change is already in
+            // scrollback: fall back to a full redraw. It clears scrollback so
+            // re-emitting the whole transcript can't stack a duplicate copy
+            // behind the frame.
+            return self.full_redraw(frame, width, height);
         }
-        let row = if plen <= height { (height - plen) + diff + 1 } else { diff - prev_top + 1 };
+        // The screen row of the changed line is its cumulative physical offset
+        // within the frame, anchored against the bottom (the status bar is the
+        // last physical row).
+        let before: usize = frame[..diff].iter().map(|l| line_physical_rows(l, width)).sum();
+        let row = if new_physical <= height {
+            (height - new_physical) + before + 1
+        } else {
+            before - (new_physical - height) + 1
+        };
         let mut buf = String::from(SYNC_START);
         buf.push_str(&format!("\x1b[{row};1H"));
         for (i, line) in frame[diff..].iter().enumerate() {
@@ -658,6 +697,58 @@ impl<W: Write> FrameRenderer<W> {
         self.out.write_all(buf.as_bytes())?;
         self.out.flush()
     }
+}
+
+/// The number of physical terminal rows a single composed line occupies once
+/// written: a line wider than `width` wraps natively onto extra rows (an empty
+/// line still takes one). ANSI escape sequences are ignored, so this measures
+/// what the terminal actually advances, not the byte length.
+///
+/// Terminal wrapping is sequence-sensitive, not just `ceil(width / width)`: a
+/// wide (2-cell) glyph cannot start in the last column, so it moves wholly to
+/// the next row and leaves that cell blank. Count cells incrementally and start
+/// a new row whenever the next glyph would cross the column boundary, as
+/// [`wrap_ansi`] does — `ceil(total_width / width)` undercounts CJK/emoji lines.
+fn line_physical_rows(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip a CSI escape sequence (`\x1b[...<final>`); it advances no cell.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let w = cell_width(c);
+        if w == 0 {
+            continue;
+        }
+        // A wide glyph that would cross the boundary starts a new row — but not
+        // on an empty row (a glyph wider than `width` still occupies one row
+        // rather than wrapping forever).
+        if col + w > width && col > 0 {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    rows
+}
+
+/// The total physical terminal rows a composed frame occupies: the sum over
+/// every line of its wrapped height. Cursor addressing must use this count —
+/// logical line indices undercount whenever a raw export line wraps past the
+/// terminal width.
+fn physical_rows(frame: &[String], width: usize) -> usize {
+    frame.iter().map(|l| line_physical_rows(l, width)).sum()
 }
 
 // --- Resize debounce -------------------------------------------------------
@@ -908,6 +999,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_items_render_byte_exact() {
+        // A raw export must survive the frame verbatim: no timestamp prefix,
+        // no wrapping, no width-fitting, no sanitizing — any of those would
+        // corrupt JSON/Markdown.
+        let json = "{\n  \"session_id\": \"s\",\n  \"long\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n}";
+        let items = vec![StampedItem { stamp: format!("{DIM}12:34:56{RESET} "), item: Item::Raw(json.to_string()) }];
+        let lines = transcript_lines(&items, 20);
+        assert_eq!(lines, json.split('\n').collect::<Vec<_>>(), "raw lines must be byte-exact");
+        // `render_item` direct agrees (no stamp path).
+        assert_eq!(render_item(&Item::Raw(json.to_string()), 20), lines);
+    }
+
+    #[test]
     fn renders_items_within_the_width() {
         let items = vec![
             StampedItem {
@@ -1145,5 +1249,82 @@ mod emulator {
         assert_eq!(second.last().unwrap(), "MODEL  ctx 10%");
         assert_eq!(second.iter().filter(|r| r.contains("ctx 10%")).count(), 1);
         assert!(second[second.len() - 2].contains("my next question"));
+    }
+
+    /// A frame whose transcript holds a raw export line far wider than the
+    /// terminal: the line wraps natively onto extra rows, and the renderer must
+    /// still land the editor and the status bar on the correct rows.
+    fn wide_raw_frame(width: usize, marker: &str) -> Vec<String> {
+        let long = "x".repeat(width * 3);
+        let transcript = transcript_lines(
+            &[
+                StampedItem { stamp: String::new(), item: Item::Raw(format!("{{\"k\":\"{long}\"}}")) },
+                StampedItem {
+                    stamp: String::new(),
+                    item: Item::Message { role: Role::Assistant, text: format!("answer {marker}") },
+                },
+            ],
+            width,
+        );
+        let editor = editor_lines("› ", "next", 4, width);
+        compose(&transcript, &editor, "BAR")
+    }
+
+    #[test]
+    fn a_wrapping_raw_line_keeps_the_bar_on_the_last_row() {
+        let mut emu = Emu::new(24, 40);
+        emu.render(&wide_raw_frame(40, "a"));
+        let screen = emu.screen();
+        // The raw line wrapped onto several rows, but the bar is still the
+        // single last row and the editor sits directly above it.
+        assert_eq!(screen.last().unwrap(), "BAR", "bar pushed off the last row: {screen:?}");
+        assert_eq!(screen.iter().filter(|r| r.contains("BAR")).count(), 1, "duplicate bars: {screen:?}");
+        assert!(screen[screen.len() - 2].contains("next"), "editor not above the bar: {screen:?}");
+    }
+
+    #[test]
+    fn a_differential_render_after_a_wrapping_raw_line_addresses_real_rows() {
+        let mut emu = Emu::new(24, 40);
+        emu.render(&wide_raw_frame(40, "a"));
+        // Change only the trailing assistant text: a differential render must
+        // rewrite that row in place, not the row a naive logical index picks.
+        emu.render(&wide_raw_frame(40, "b"));
+        let screen = emu.screen();
+        assert_eq!(screen.last().unwrap(), "BAR");
+        assert_eq!(screen.iter().filter(|r| r.contains("BAR")).count(), 1, "bar duplicated: {screen:?}");
+        assert!(screen.iter().any(|r| r.contains("answer b")), "update lost: {screen:?}");
+        assert!(!screen.iter().any(|r| r.contains("answer a")), "stale row left behind: {screen:?}");
+    }
+
+    #[test]
+    fn physical_row_helpers_count_native_wraps() {
+        // Empty and exactly-full lines take one row; wider lines wrap.
+        assert_eq!(line_physical_rows("", 10), 1);
+        assert_eq!(line_physical_rows("1234567890", 10), 1);
+        assert_eq!(line_physical_rows("12345678901", 10), 2);
+        assert_eq!(line_physical_rows(&"x".repeat(25), 10), 3);
+        // ANSI styling adds no width.
+        assert_eq!(line_physical_rows("\x1b[2m12345\x1b[0m", 10), 1);
+        // The frame total is the per-line sum.
+        let frame = vec!["abc".to_string(), "x".repeat(21), String::new()];
+        assert_eq!(physical_rows(&frame, 10), 1 + 3 + 1);
+    }
+
+    #[test]
+    fn line_physical_rows_counts_wide_glyphs_that_cannot_start_in_the_last_column() {
+        // Cell widths 1,2,2,2,2,2,1,2,2,2,2 (2 ASCII + 9 CJK = 20 cells) at
+        // width 10: the naive `ceil(20/10)` is 2, but a 2-cell glyph cannot
+        // start in the last column, so the terminal actually uses 3 rows.
+        // `visible_width` still sums to 20 — only the incremental count sees
+        // the boundary.
+        let line = "1\u{4e16}\u{4e16}\u{4e16}\u{4e16}\u{4e16}2\u{4e16}\u{4e16}\u{4e16}\u{4e16}";
+        assert_eq!(visible_width(line), 20);
+        assert_eq!(visible_width(line).div_ceil(10), 2);
+        assert_eq!(line_physical_rows(line, 10), 3);
+        // ANSI styling around the wide glyphs still advances no cell.
+        let styled = format!("\x1b[2m{line}\x1b[0m");
+        assert_eq!(line_physical_rows(&styled, 10), 3);
+        // A glyph wider than the column still occupies exactly one row.
+        assert_eq!(line_physical_rows("\u{4e16}", 1), 1);
     }
 }

@@ -40,6 +40,11 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
+    Command {
+        name: "/trajectory",
+        args: "[--json|--markdown]",
+        description: "Show this session's turn-by-turn trajectory in your pager (or export it)",
+    },
     Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },
     Command { name: "/exit", args: "", description: "Exit the agent" },
     Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
