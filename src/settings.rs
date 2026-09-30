@@ -760,7 +760,18 @@ fn set_nested(
     }
     match value {
         Some(t) => {
-            table.insert(key, temperature_item(t));
+            let mut item = temperature_item(t);
+            // `TableLike::insert` replaces the whole item, including its
+            // decoration, so editing an existing temperature would drop an
+            // attached comment (`temperature = 0.3 # tuned for this model`).
+            // Carry the old value's prefix/suffix over to keep it.
+            if let Some(toml_edit::Item::Value(old)) = table.get(key)
+                && let toml_edit::Item::Value(new) = &mut item
+            {
+                new.decor_mut().set_prefix(old.decor().prefix().cloned().unwrap_or_default());
+                new.decor_mut().set_suffix(old.decor().suffix().cloned().unwrap_or_default());
+            }
+            table.insert(key, item);
         }
         None => {
             table.remove(key);
@@ -941,7 +952,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "temperature = 0.2\n\n[providers.groq] # fast\nmax_retries = 2\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
+            "temperature = 0.2\n\n[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
         )
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -961,7 +972,11 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("temperature = \"default\""), "{text}");
-        assert!(text.contains("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4"), "{text}");
+        // Replacing an existing value keeps its attached comment.
+        assert!(
+            text.contains("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider"),
+            "{text}"
+        );
         assert!(text.contains("[providers.anthropic.models.claude]\ntemperature = 0.3"), "{text}");
         assert!(!text.contains("[providers]\n") && !text.contains("[providers.anthropic]\n"), "implicit: {text}");
         assert!(!text.contains("0.5"), "{text}");

@@ -1877,7 +1877,11 @@ impl Agent {
         let request = ChatRequest {
             messages: &summary_messages,
             tools: &[],
-            temperature: None,
+            // Compaction goes through the same resolution as a chat turn, so a
+            // legacy `extra_body` temperature override still applies (the
+            // transport no longer re-inserts it) and fixed-temperature models
+            // still send none.
+            temperature: self.temperature().value(),
             max_tokens: Some(context::SUMMARY_MAX_TOKENS.min(self.config.max_tokens as i64)),
         };
         let control = self.control.clone();
