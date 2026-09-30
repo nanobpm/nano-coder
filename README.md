@@ -601,7 +601,9 @@ scrollback and reflows history itself on a resize, with the status line pinned t
 
 ## Status Line and Compaction
 
-In an interactive terminal the bottom row shows the provider/model, context usage
+In an interactive terminal the bottom row shows the provider/model, the working directory
+(home shown as `~`; on a narrow terminal the middle directories collapse to `…`, as in
+`~/…/src/providers`, before other items are dropped), context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count, the active mode when it is `plan` or `auto` (the default `normal` is not shown, to

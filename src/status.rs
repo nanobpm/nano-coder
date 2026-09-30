@@ -385,6 +385,75 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     )
 }
 
+/// Index of the cwd in the status segments (after the model).
+const CWD_SEGMENT: usize = 1;
+/// The narrowest the cwd is elided to before whole segments are dropped.
+const CWD_MIN_CELLS: usize = 16;
+
+/// `path` for display, with the home directory shown as `~`. Only whole
+/// leading components match: `/home/joshua` is not a prefix of
+/// `/home/joshua2`.
+pub fn tilde_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let home = home.filter(|h| h.components().count() > 1);
+    // The working directory is reported with symlinks resolved (on macOS
+    // `/tmp` is `/private/tmp`), so also try the resolved home directory.
+    let resolved = home.and_then(|h| h.canonicalize().ok());
+    let rest = home
+        .and_then(|h| path.strip_prefix(h).ok())
+        .or_else(|| resolved.as_deref().and_then(|h| path.strip_prefix(h).ok()));
+    match rest {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Shorten `path` to at most `budget` terminal cells by replacing middle
+/// directories with `…`: keep the first component (`~`, or the first
+/// directory under `/`) and as many trailing components as fit, e.g.
+/// `~/workspace/nano/src/providers` -> `~/…/src/providers`. When even the
+/// first and last components don't fit, keep the end of the last one
+/// (`…providers`), since that is the directory the user is in.
+fn elide_path(path: &str, budget: usize) -> String {
+    if cell_width(path) <= budget {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    // `/a/b/c` splits to ["", "a", "b", "c"]: keep "/a" as the head.
+    let head_len = if parts.first() == Some(&"") { 2 } else { 1 };
+    if parts.len() > head_len + 1 {
+        let head = parts[..head_len].join("/");
+        // Take trailing components while they fit, always leaving at least
+        // one middle component to elide (or nothing would be gained).
+        let mut keep = 0;
+        while head_len + keep + 1 < parts.len() {
+            let tail = parts[parts.len() - keep - 1..].join("/");
+            if cell_width(&format!("{head}/…/{tail}")) > budget {
+                break;
+            }
+            keep += 1;
+        }
+        if keep > 0 {
+            return format!("{head}/…/{}", parts[parts.len() - keep..].join("/"));
+        }
+    }
+    // Keep the end of the path, with `…` in front, within the budget.
+    if budget == 0 {
+        return String::new();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1; // the leading `…`
+    for c in path.chars().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        kept.push(c);
+        used += w;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
 fn render(stats: &ContextStats, cols: usize) -> String {
     let percent = stats.percent();
     let threshold = stats.auto_compact.map(|t| t * 100.0);
@@ -477,6 +546,14 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     let width = |segments: &[Segment]| -> usize {
         segments.iter().map(|s| cell_width(&s.text)).sum::<usize>() + segments.len().saturating_sub(1)
     };
+    // Too wide: first shorten the cwd by eliding its middle directories, down
+    // to CWD_MIN_CELLS, before any other segment is dropped.
+    let overflow = width(&segments).saturating_sub(cols);
+    if overflow > 0 {
+        let cwd_width = cell_width(&stats.cwd);
+        let budget = cwd_width.saturating_sub(overflow).max(CWD_MIN_CELLS.min(cwd_width));
+        segments[CWD_SEGMENT].text = format!(" {} ", elide_path(&stats.cwd, budget));
+    }
     while width(&segments) > cols && segments.len() > 1 {
         let lowest = segments.iter().enumerate().min_by_key(|(_, s)| s.priority).map(|(i, _)| i).unwrap();
         segments.remove(lowest);
@@ -638,6 +715,67 @@ mod tests {
         );
         // The surrounding real path characters survive.
         assert!(visible(&line).contains("abcd") || visible(&line).contains("/tmp/a"), "{line:?}");
+    }
+
+    #[test]
+    fn home_is_shown_as_tilde() {
+        use std::path::Path;
+        let home = Some(Path::new("/Users/joshua"));
+        assert_eq!(tilde_path(Path::new("/Users/joshua"), home), "~");
+        assert_eq!(tilde_path(Path::new("/Users/joshua/workspace/nano"), home), "~/workspace/nano");
+        // Whole components only, and paths outside home are unchanged.
+        assert_eq!(tilde_path(Path::new("/Users/joshua2/x"), home), "/Users/joshua2/x");
+        assert_eq!(tilde_path(Path::new("/tmp/project"), home), "/tmp/project");
+        assert_eq!(tilde_path(Path::new("/tmp"), None), "/tmp");
+        // A home of `/` would turn every path into `~/…`: leave it alone.
+        assert_eq!(tilde_path(Path::new("/tmp"), Some(Path::new("/"))), "/tmp");
+        // A home reached through a symlink matches the resolved working dir.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real-home");
+        std::fs::create_dir_all(real.join("proj")).unwrap();
+        let link = dir.path().join("link-home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(tilde_path(&real.join("proj"), Some(&link)), "~/proj");
+    }
+
+    #[test]
+    fn elide_path_drops_middle_directories_first() {
+        let path = "~/workspace/rusty-harness/src/providers";
+        assert_eq!(elide_path(path, 100), path, "fits: unchanged");
+        assert_eq!(elide_path(path, 31), "~/…/rusty-harness/src/providers");
+        assert_eq!(elide_path(path, 30), "~/…/src/providers");
+        assert_eq!(elide_path(path, 20), "~/…/src/providers");
+        assert_eq!(elide_path(path, 15), "~/…/providers");
+        // Too narrow for head and last component: keep the end of the path.
+        assert_eq!(elide_path(path, 8), "…oviders");
+        assert_eq!(elide_path(path, 1), "…");
+        assert_eq!(elide_path(path, 0), "");
+        // Absolute paths keep their first directory.
+        assert_eq!(elide_path("/var/lib/docker/volumes/data", 22), "/var/…/volumes/data");
+        // Nothing in the middle to elide.
+        assert_eq!(elide_path("/verylongdirectory/name", 10), "…tory/name");
+        // Budgeted by terminal cells: CJK glyphs are two cells wide.
+        let wide = elide_path("/项目/工作目录/深层/路径", 12);
+        assert!(cell_width(&wide) <= 12, "{wide:?}");
+        assert!(wide.ends_with("路径"), "{wide:?}");
+    }
+
+    #[test]
+    fn a_long_cwd_is_elided_before_other_segments_are_dropped() {
+        let long = ContextStats { cwd: "~/workspace/clients/acme/monorepo/services/billing/api".into(), ..stats() };
+        let full = visible(&render(&long, 400));
+        assert!(full.contains(&long.cwd), "wide: shown whole {full:?}");
+        // Narrow enough that the whole cwd would push segments off, but wide
+        // enough for all of them once the cwd is elided.
+        let wide_enough = cell_width(visible(&render(&stats(), 400)).trim_end()) + 20;
+        let line = visible(&render(&long, wide_enough));
+        assert!(line.contains("~/…/"), "{line:?}");
+        assert!(line.ends_with("api ") || line.contains("/api "), "the current directory stays: {line:?}");
+        for part in ["work/llama-b", "ctx 96.5k/128k 75%", "42 msgs", "auto-compact 80% (1×)", "▶ bash", "plan 2/5"]
+        {
+            assert!(line.contains(part), "{part} dropped instead of eliding the cwd: {line:?}");
+        }
+        assert!(cell_width(&line) <= wide_enough);
     }
 
     #[test]
