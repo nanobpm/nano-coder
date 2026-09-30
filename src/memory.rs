@@ -259,6 +259,26 @@ impl Store {
             Some(e) if looks_like_secret(e).is_some() => bail!("refusing to save: the evidence looks like a secret"),
             other => other.map(str::to_string),
         };
+        // `text` and `evidence` are filtered independently above, but the prompt
+        // later renders them together, so a single credential split across the
+        // boundary bypasses both checks: `text = "API_KEY"` + `evidence =
+        // "=secret"` reassembles into `API_KEY=secret`, and `text = "database
+        // password is"` + `evidence = "hunter2"` into `password is hunter2`
+        // (Copilot finding, src/memory.rs). Re-run the filter over the combined
+        // string in both join forms — directly concatenated (no separator, for
+        // the `KEY`+`=value` split) and space-joined (for the `password is` +
+        // `hunter2` split) — so neither boundary split is persisted.
+        if let Some(evidence) = &evidence {
+            let concatenated = format!("{text}{evidence}");
+            let space_joined = format!("{text} {evidence}");
+            if looks_like_secret(&concatenated).is_some() || looks_like_secret(&space_joined).is_some() {
+                bail!(
+                    "refusing to save: the text and evidence together look like a secret. Memory is \
+                     human-readable and shared across sessions; never store keys, tokens or passwords, \
+                     even split across fields. Save where to find it instead."
+                );
+            }
+        }
         let now = crate::session::now();
         let entry = Entry {
             // 128 random bits: memory IDs form a persistent cross-scope
@@ -1480,6 +1500,37 @@ mod tests {
         assert!(store.save(Scope::User, "the API key is in vault", None, None).is_ok());
         assert!(store.save(Scope::User, "the token is set in the environment", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
+    }
+
+    #[test]
+    fn rejects_a_credential_split_across_text_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // `text` and `evidence` are filtered independently, but the prompt
+        // renders them together, so a credential split across the boundary must
+        // still be rejected (Copilot finding, src/memory.rs). Neither half alone
+        // trips the filter; only the recombined string does.
+        //
+        // Directly concatenated (`KEY` + `=value`): the assignment rule fires on
+        // the reassembled `API_KEY=secret`.
+        assert!(store.save(Scope::User, "API_KEY", Some("=secret"), None).is_err());
+        assert!(store.save(Scope::User, "the password", Some("=hunter2"), None).is_err());
+        // Space-joined (`... is` + `value`): the copular rule fires on the
+        // reassembled `database password is hunter2`.
+        assert!(store.save(Scope::User, "database password is", Some("hunter2"), None).is_err());
+        assert!(store.save(Scope::User, "the token is", Some("abc123def456"), None).is_err());
+        // A known token shape split across the boundary (space-joined).
+        assert!(
+            store
+                .save(Scope::User, "the token is", Some("ghp_0123456789abcdef0123456789abcdefABCD"), None)
+                .is_err()
+        );
+        // Each half is individually benign and the recombined string is too:
+        // ordinary fact + verifying path/command must still save.
+        assert!(store.save(Scope::User, "the project uses Rust", Some("Cargo.toml"), None).is_ok());
+        assert!(store.save(Scope::User, "run the tests with", Some("cargo test"), None).is_ok());
+        // A placeholder split across the boundary stays a placeholder.
+        assert!(store.save(Scope::User, "config: token", Some("=<your-token>"), None).is_ok());
     }
 
     #[test]
