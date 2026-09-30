@@ -69,7 +69,14 @@ impl Scope {
 }
 
 /// One saved fact.
+///
+/// `deny_unknown_fields` is deliberate: without it Serde would silently accept
+/// (and then drop on the next rewrite) any extra field a newer nano-coder
+/// wrote, defeating the preservation guarantee. Rejecting unknown fields routes
+/// such a future record to `ScopeFile::unknown`, where the entire raw line is
+/// preserved verbatim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     pub id: String,
     pub text: String,
@@ -609,6 +616,12 @@ fn normalize_remote(url: &str) -> String {
             break;
         }
     }
+    // Drop any query string or fragment before touching credentials or the
+    // path. They can carry a credential (`repo.git?access_token=…`) that would
+    // otherwise leak into the project label, system prompt and on-disk
+    // filename, and would rotate the key on token refresh; a stray `@`/`:`
+    // inside them would also confuse the credential/host splitting below.
+    let s = s.split(['?', '#']).next().unwrap_or(s);
     // `git@host:owner/repo` → `host/owner/repo`.
     let s = s.strip_prefix("git@").unwrap_or(s);
     // Drop any remaining `user:pass@` credentials.
@@ -850,6 +863,31 @@ mod tests {
     }
 
     #[test]
+    fn preserves_complete_entry_with_extra_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        let keep = store.save(Scope::User, "a real fact", None, None).unwrap();
+        // A future nano-coder writes a record with *every* current field plus a
+        // new one. `deny_unknown_fields` must reject it on parse so the raw line
+        // is preserved verbatim rather than silently losing `future_field` on
+        // the next rewrite.
+        let path = store.path(Scope::User).unwrap();
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        let now = crate::session::now().to_rfc3339();
+        raw.push_str(&format!(
+            "{{\"id\":\"fut1\",\"text\":\"future fact\",\"created\":\"{now}\",\"last_used\":\"{now}\",\"future_field\":42}}\n"
+        ));
+        std::fs::write(&path, &raw).unwrap();
+        store.save(Scope::User, "another fact", None, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("future_field"), "complete-entry-plus-extra-field preserved: {after}");
+        // The future record is NOT surfaced as a parsed entry (it stays raw).
+        let ids: Vec<_> = store.all().unwrap().into_iter().map(|(_, e)| e.id).collect();
+        assert!(ids.contains(&keep.id), "existing entry kept: {ids:?}");
+        assert!(!ids.contains(&"fut1".to_string()), "unparsed future record not surfaced: {ids:?}");
+    }
+
+    #[test]
     fn absurd_expiry_days_errors_instead_of_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().join("memory"), None, u64::MAX);
@@ -878,6 +916,13 @@ mod tests {
         assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
         assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
         assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "example.com/a/b");
+        // Query strings / fragments (which can carry credentials like
+        // `?access_token=…`) are stripped so they never leak into the key.
+        assert_eq!(
+            normalize_remote("https://github.com/nanobpm/nano-coder.git?access_token=secret"),
+            "github.com/nanobpm/nano-coder"
+        );
+        assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "github.com/a/b");
         // A readable head is kept, but a disambiguating hash is always appended.
         assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);
