@@ -397,7 +397,10 @@ pub fn tilde_path(path: &std::path::Path, home: Option<&std::path::Path>) -> Str
     let home = home.filter(|h| h.components().count() > 1);
     // The working directory is reported with symlinks resolved (on macOS
     // `/tmp` is `/private/tmp`), so also try the resolved home directory.
-    let resolved = home.and_then(|h| h.canonicalize().ok());
+    // Apply the same root guard after canonicalization: a symlinked home that
+    // resolves to `/` would otherwise strip the `/` prefix from every
+    // absolute path and display it as `~/…`.
+    let resolved = home.and_then(|h| h.canonicalize().ok()).filter(|h| h.components().count() > 1);
     let rest = home
         .and_then(|h| path.strip_prefix(h).ok())
         .or_else(|| resolved.as_deref().and_then(|h| path.strip_prefix(h).ok()));
@@ -736,6 +739,12 @@ mod tests {
         let link = dir.path().join("link-home");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(tilde_path(&real.join("proj"), Some(&link)), "~/proj");
+        // A symlinked home that resolves to `/` is still a root home: leave
+        // absolute paths alone rather than stripping the resolved `/` prefix.
+        let root_link = dir.path().join("root-home");
+        std::os::unix::fs::symlink("/", &root_link).unwrap();
+        assert_eq!(tilde_path(Path::new("/tmp"), Some(&root_link)), "/tmp");
+        assert_eq!(tilde_path(Path::new("/any/where"), Some(&root_link)), "/any/where");
     }
 
     #[test]
