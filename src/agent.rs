@@ -543,11 +543,19 @@ impl Agent {
 
     /// The temperature the current model is sent, and where it comes from.
     pub fn temperature(&self) -> crate::temperature::Resolved {
-        let (user, default_provider) = self.config.effective_providers();
-        let (_, provider, model) = providers::entry_for(&self.config.model, &user, &default_provider)
-            .unwrap_or_else(|| (String::new(), Default::default(), self.config.model.clone()));
-        let kind = provider.kind.unwrap_or(providers::ProviderKind::Mock);
-        crate::temperature::resolve(self.config.temperature, kind, &provider, &model)
+        // Resolve against the live client, not `config.model`: a `/settings`
+        // edit to the active provider (e.g. its `default_model`, kept when
+        // "Pick a model … now?" is declined) mutates the config without
+        // rebuilding the client, and requests still go to the client's model.
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let entry = providers.get(self.provider_name()).cloned();
+        // A provider whose entry vanished from the config this session keeps
+        // only its kind's rules; a kindless entry (or a test double reporting
+        // no kind) resolves with no provider rules at all.
+        let kind = entry.as_ref().and_then(|p| p.kind).or_else(|| self.client.kind());
+        let provider = entry.unwrap_or_default();
+        crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
@@ -2212,6 +2220,46 @@ mod tests {
 
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn temperature_resolves_against_the_live_client() {
+        // `Scripted` reports provider "test" and model "scripted", whatever
+        // `config.model` says — so resolution must follow the client.
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        assert_eq!(agent.temperature().source, crate::temperature::Source::Global);
+
+        // A temperature set for the client's provider/model is what it is sent …
+        let mut config = agent.config().clone();
+        config.providers.insert(
+            "test".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Openai),
+                temperature: Some(crate::temperature::Temperature::Value(0.4)),
+                ..Default::default()
+            },
+        );
+        let agent = Agent::new(
+            Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
+            config,
+        );
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.4), crate::temperature::Source::Provider));
+
+        // … even when `config.model` drifts from the live client, as a
+        // `/settings` edit to the provider's `default_model` leaves it: the
+        // config now points at a fixed-temperature reasoning model, but the
+        // client still speaks for "scripted", which takes a temperature.
+        let mut config = agent.config().clone();
+        config.model = "github-copilot/gpt-5".into();
+        let agent = Agent::new(
+            Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
+            config,
+        );
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.4), crate::temperature::Source::Provider));
+        assert_eq!(resolved.fixed, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

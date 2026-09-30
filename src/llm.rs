@@ -346,6 +346,11 @@ pub trait LLMClient: Send + Sync {
     }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    /// The provider API kind this client speaks. `None` for test doubles that
+    /// imitate no real provider API.
+    fn kind(&self) -> Option<crate::providers::ProviderKind> {
+        None
+    }
 }
 
 /// A context window reported by the provider's endpoint.

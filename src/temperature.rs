@@ -140,11 +140,13 @@ impl Resolved {
 }
 
 /// Why `model` on this provider accepts no temperature, if it doesn't.
-pub fn fixed_reason(kind: ProviderKind, provider: &ProviderConfig, model: &str) -> Option<String> {
+/// `kind` is `None` when the client's API is unknown (e.g. a test double), in
+/// which case no kind-specific rule applies.
+pub fn fixed_reason(kind: Option<ProviderKind>, provider: &ProviderConfig, model: &str) -> Option<String> {
     if provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == "temperature")) {
         return Some("the provider drops temperature (drop_params)".to_string());
     }
-    if kind == ProviderKind::GithubCopilot && crate::providers::github_copilot::is_reasoning_model(model) {
+    if kind == Some(ProviderKind::GithubCopilot) && crate::providers::github_copilot::is_reasoning_model(model) {
         return Some(format!("{model} is a reasoning model and rejects a custom temperature"));
     }
     None
@@ -152,7 +154,7 @@ pub fn fixed_reason(kind: ProviderKind, provider: &ProviderConfig, model: &str) 
 
 /// The temperature for `model` on `provider` (the merged provider entry):
 /// the model's setting, else the provider's, else `global`.
-pub fn resolve(global: Temperature, kind: ProviderKind, provider: &ProviderConfig, model: &str) -> Resolved {
+pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &ProviderConfig, model: &str) -> Resolved {
     let (chosen, mut source) = if let Some(t) = provider.models.get(model).and_then(|m| m.temperature) {
         (t, Source::Model)
     } else if let Some(t) = provider.temperature {
@@ -183,12 +185,16 @@ pub fn resolve(global: Temperature, kind: ProviderKind, provider: &ProviderConfi
     }
 
     let mut warning = None;
-    if kind == ProviderKind::Anthropic
-        && let Temperature::Value(v) = effective
-    {
-        // Anthropic's range is 0..=1, and its body builder clamps out-of-range
-        // values silently. Resolve and report both bounds here so `/context`
-        // and ACP show the value actually sent, with a warning.
+    // Anthropic's Messages API takes 0..=1, and `anthropic::build_body` clamps
+    // out-of-range values silently. That builder is used for Anthropic
+    // providers and for Copilot's Claude 4.x/5.x models (routed to
+    // `/v1/messages`), so resolve and report both bounds for exactly those
+    // requests — `/context`, ACP and trajectory then show the value actually
+    // sent, with a warning.
+    let anthropic_messages = kind == Some(ProviderKind::Anthropic)
+        || (kind == Some(ProviderKind::GithubCopilot)
+            && crate::providers::github_copilot::uses_anthropic_messages(model));
+    if anthropic_messages && let Temperature::Value(v) = effective {
         if v > 1.0 {
             warning = Some(format!("temperature {v} is above Anthropic's maximum of 1; sending 1"));
             effective = Temperature::Value(1.0);
@@ -232,18 +238,18 @@ mod tests {
     fn most_specific_setting_wins() {
         let global = Temperature::Value(0.7);
         let p = provider("temperature = 0.4\n[models.\"big\"]\ntemperature = \"default\"\n");
-        let r = resolve(global, ProviderKind::Openai, &p, "big");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "big");
         assert_eq!((r.effective, r.source, r.value()), (Temperature::Default, Source::Model, None));
-        let r = resolve(global, ProviderKind::Openai, &p, "small");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "small");
         assert_eq!((r.value(), r.source), (Some(0.4), Source::Provider));
-        let r = resolve(global, ProviderKind::Openai, &ProviderConfig::default(), "small");
+        let r = resolve(global, Some(ProviderKind::Openai), &ProviderConfig::default(), "small");
         assert_eq!((r.value(), r.source), (Some(0.7), Source::Global));
         assert_eq!(r.describe(), "0.7 (global setting)");
         assert_eq!(r.warning, None);
 
         // extra_body is merged into the request last, so it is what is sent.
         let p = provider("temperature = 0.4\nextra_body = { temperature = 0.1 }\n");
-        let r = resolve(global, ProviderKind::Openai, &p, "m");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "m");
         assert_eq!((r.value(), r.source), (Some(0.1), Source::ExtraBody));
     }
 
@@ -251,39 +257,71 @@ mod tests {
     fn models_without_temperature_only_use_the_default() {
         let global = Temperature::Value(0.7);
         // The global setting isn't meant for this model: no warning.
-        let r = resolve(global, ProviderKind::GithubCopilot, &ProviderConfig::default(), "gpt-5");
+        let r = resolve(global, Some(ProviderKind::GithubCopilot), &ProviderConfig::default(), "gpt-5");
         assert_eq!((r.value(), r.source), (None, Source::Required));
         assert!(r.fixed.as_deref().unwrap().contains("reasoning model"));
         assert_eq!(r.warning, None);
         // A non-reasoning Copilot model takes a temperature.
-        let r = resolve(global, ProviderKind::GithubCopilot, &ProviderConfig::default(), "gpt-4.1");
+        let r = resolve(global, Some(ProviderKind::GithubCopilot), &ProviderConfig::default(), "gpt-4.1");
         assert_eq!(r.value(), Some(0.7));
 
         // A number set for the model is ignored, with a warning.
         let p = provider("drop_params = [\"temperature\"]\n[models.\"k3\"]\ntemperature = 0.3\n");
-        let r = resolve(global, ProviderKind::Openai, &p, "k3");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
         assert_eq!(r.value(), None);
         let warning = r.warning.unwrap();
         assert!(warning.contains("0.3") && warning.contains("drop_params"), "{warning}");
         // "default" set for it is what it gets anyway: no warning.
         let p = provider("drop_params = [\"temperature\"]\ntemperature = \"default\"\n");
-        assert_eq!(resolve(global, ProviderKind::Openai, &p, "k3").warning, None);
+        assert_eq!(resolve(global, Some(ProviderKind::Openai), &p, "k3").warning, None);
     }
 
     #[test]
     fn anthropic_range_is_checked() {
         let p = provider("temperature = 1.5\n");
-        let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &p, "claude");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &p, "claude");
         assert_eq!(r.value(), Some(1.0));
         assert!(r.warning.unwrap().contains("Anthropic's maximum"));
         // Negative values are clamped to 0 with a warning, matching the body
         // builder, rather than being reported as sent.
         let p = provider("temperature = -0.5\n");
-        let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &p, "claude");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &p, "claude");
         assert_eq!(r.value(), Some(0.0));
         assert!(r.warning.unwrap().contains("Anthropic's minimum"));
-        let r = resolve(Temperature::Value(0.7), ProviderKind::Anthropic, &ProviderConfig::default(), "claude");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &ProviderConfig::default(), "claude");
         assert_eq!((r.value(), r.warning), (Some(0.7), None));
+    }
+
+    #[test]
+    fn copilot_claude_uses_the_anthropic_range() {
+        // Claude 4.x/5.x on GitHub Copilot is served through the Anthropic
+        // Messages endpoint, whose body builder clamps to 0..=1 — resolve the
+        // same way so the reported value is the one sent.
+        let p = provider("temperature = 1.5\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::GithubCopilot), &p, "claude-sonnet-4.5");
+        assert_eq!(r.value(), Some(1.0));
+        assert!(r.warning.unwrap().contains("Anthropic's maximum"));
+        let p = provider("temperature = -0.5\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::GithubCopilot), &p, "claude-opus-5");
+        assert_eq!(r.value(), Some(0.0));
+        assert!(r.warning.unwrap().contains("Anthropic's minimum"));
+        // In-range values pass through untouched …
+        let r = resolve(
+            Temperature::Value(0.7),
+            Some(ProviderKind::GithubCopilot),
+            &ProviderConfig::default(),
+            "claude-haiku-4.5",
+        );
+        assert_eq!((r.value(), r.warning), (Some(0.7), None));
+        // … and non-Messages Copilot models keep the wider OpenAI range.
+        let p = provider("temperature = 1.5\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::GithubCopilot), &p, "gpt-4.1");
+        assert_eq!((r.value(), r.warning), (Some(1.5), None));
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::GithubCopilot), &p, "claude-sonnet-3.5");
+        assert_eq!((r.value(), r.warning), (Some(1.5), None));
+        // An unknown kind (a test double) applies no provider rules.
+        let r = resolve(Temperature::Value(0.7), None, &p, "claude-sonnet-4.5");
+        assert_eq!((r.value(), r.warning), (Some(1.5), None));
     }
 
     #[test]

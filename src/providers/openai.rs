@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HttpTransport, ResolvedProvider, StreamAction};
+use super::{HttpTransport, ProviderKind, ResolvedProvider, StreamAction};
 use crate::llm::{
     ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter,
     TokenUsage, ToolCall, report_whole,
@@ -399,6 +399,10 @@ impl LLMClient for OpenAiClient {
 
     fn provider_name(&self) -> &str {
         &self.transport.provider().name
+    }
+
+    fn kind(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Openai)
     }
 }
 
