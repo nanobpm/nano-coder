@@ -624,7 +624,7 @@ pub(crate) fn format_duration(ms: u64) -> String {
     }
 }
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Strip terminal control sequences (ESC/OSC/CSI and C0/C1 controls) from
 /// untrusted persisted text and expand tabs to 8-column stops. A prompt or tool
@@ -706,12 +706,38 @@ pub fn needs_pager(text: &str, rows: usize, cols: usize) -> bool {
     let limit = rows.saturating_sub(2);
     let mut used = 0usize;
     for line in text.lines() {
-        used += UnicodeWidthStr::width(line).div_ceil(cols).max(1);
+        used += wrapped_rows(line, cols);
         if used > limit {
             return true;
         }
     }
     false
+}
+
+/// How many terminal rows `line` occupies once wrapped at `cols` columns.
+/// Terminal wrapping is sequence-sensitive, not just `ceil(width / cols)`: a
+/// wide (2-cell) glyph cannot start in the last column, so it moves to the next
+/// row and leaves that cell blank. Count cells incrementally and start a new
+/// row whenever the next glyph would cross the column boundary, as
+/// `frame::wrap_ansi` does.
+fn wrapped_rows(line: &str, cols: usize) -> usize {
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for c in line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        // A wide glyph that would cross the boundary starts a new row — but
+        // not when the row is empty (a glyph wider than `cols` still occupies
+        // its own row rather than wrapping forever).
+        if col + w > cols && col > 0 {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -794,6 +820,25 @@ mod tests {
         // Short text and empty lines fit.
         assert!(!needs_pager("a\n\nb", 24, 80));
         assert!(needs_pager(&"a\n".repeat(23), 24, 80));
+    }
+
+    #[test]
+    fn needs_pager_counts_wide_glyphs_that_cannot_start_in_the_last_column() {
+        // Terminal wrapping is sequence-sensitive: a wide (2-cell) glyph cannot
+        // start in the last column, so it moves to the next row and leaves that
+        // cell blank. At width 10 the cell sequence 1,2,2,2,2,2,1,2,2,2,2 wraps
+        // to 3 rows, not ceil(19/10) = 2.
+        let line = "a界界界界界a界界界界";
+        assert_eq!(wrapped_rows(line, 10), 3);
+        assert_eq!(UnicodeWidthStr::width(line).div_ceil(10), 2);
+        // A run of wide glyphs at an odd width pads the last cell each row:
+        // width 5 fits two 2-cell glyphs per row (4 cells + 1 blank), so eight
+        // glyphs take 4 rows, not ceil(16/5) = 4... verify the boundary rule.
+        assert_eq!(wrapped_rows("界界界界界界界界", 5), 4);
+        // An exact fit stays on one row.
+        assert_eq!(wrapped_rows("界界", 4), 1);
+        // A wide glyph alone in a too-narrow column still occupies its row.
+        assert_eq!(wrapped_rows("界", 1), 1);
     }
 
     #[test]
