@@ -1,11 +1,11 @@
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -36,7 +36,11 @@ fn input_id(params: &Value) -> Option<&str> {
 pub enum Action {
     Respond(Value),
     /// Run a model turn for a `session/prompt`.
-    Turn { id: Option<Value>, input_id: Option<String>, text: String },
+    Turn {
+        id: Option<Value>,
+        input_id: Option<String>,
+        text: String,
+    },
     Nothing,
 }
 
@@ -69,11 +73,7 @@ fn classify_during_turn(msg: &Value, active: Option<&str>) -> DuringTurn {
             let text = prompt_text(&params);
             let trimmed = text.trim();
             // Slash commands operate on the agent itself, so they wait for the turn.
-            if trimmed.is_empty() || trimmed.starts_with('/') {
-                DuringTurn::Defer
-            } else {
-                DuringTurn::Steer(text)
-            }
+            if trimmed.is_empty() || trimmed.starts_with('/') { DuringTurn::Defer } else { DuringTurn::Steer(text) }
         }
         _ => DuringTurn::Defer,
     }
@@ -129,7 +129,10 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
             "entries": plan.acp_entries(),
             "_meta": { "plan": plan },
         }),
-        AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. } | AgentEvent::Context | AgentEvent::Compacted => {
+        AgentEvent::TextDelta { .. }
+        | AgentEvent::ThinkingDelta { .. }
+        | AgentEvent::Context
+        | AgentEvent::Compacted => {
             return None;
         }
     })
@@ -156,7 +159,8 @@ fn new_session(agent: &mut Agent, params: &Value) -> anyhow::Result<String> {
 /// Make `params.cwd` the working directory for tools (one session per process).
 /// `_meta` for session/new and session/load: loaded instruction files and skills.
 fn session_meta(agent: &Agent) -> Value {
-    let mut meta = json!({ "projectInstructions": agent.project_instruction_files(), "skills": agent.skills().names() });
+    let mut meta =
+        json!({ "projectInstructions": agent.project_instruction_files(), "skills": agent.skills().names() });
     if !agent.skills().warnings.is_empty() {
         meta["skillWarnings"] = json!(agent.skills().warnings);
     }
@@ -377,8 +381,7 @@ fn write_line(msg: &Value) {
 /// values such as `{}`, `null`, or `42` are rejected so that non-ACP input is
 /// not mistaken for a valid ACP session.
 fn is_jsonrpc_request(msg: &Value) -> bool {
-    msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
-        && msg.get("method").and_then(Value::as_str).is_some()
+    msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0") && msg.get("method").and_then(Value::as_str).is_some()
 }
 
 /// Run the ACP protocol loop. Stdin is read concurrently with turns so that
@@ -427,7 +430,9 @@ pub async fn run_acp(agent: &mut Agent) -> Result<bool> {
                     // speaking ACP at all; say so plainly instead of only
                     // surfacing a serde byte position.
                     if first_line {
-                        eprintln!("input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): {e}");
+                        eprintln!(
+                            "input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): {e}"
+                        );
                     } else {
                         eprintln!("ACP parse error: {e}");
                     }
@@ -584,7 +589,8 @@ mod tests {
         // session/set_mode, steer b.
         let mut deferred: VecDeque<Value> = VecDeque::from([json!({"method": "early"})]);
         let mut marks = Vec::new();
-        deferred.push_back(json!({"method": "session/prompt", "params": {"prompt": [{"type": "text", "text": "/plan"}]}}));
+        deferred
+            .push_back(json!({"method": "session/prompt", "params": {"prompt": [{"type": "text", "text": "/plan"}]}}));
         marks.push(deferred.len());
         deferred.push_back(json!({"method": "session/set_mode"}));
         marks.push(deferred.len());

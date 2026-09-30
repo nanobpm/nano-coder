@@ -101,11 +101,7 @@ pub enum Item {
     ToolCall { name: String, summary: String },
     /// A tool result: its first line plus a "+N lines" count (or a preview
     /// when `verbose`).
-    ToolResult {
-        ok: bool,
-        output: String,
-        verbose: bool,
-    },
+    ToolResult { ok: bool, output: String, verbose: bool },
     /// The current plan checklist.
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
@@ -140,11 +136,7 @@ pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let row = if i == 0 {
-                format!("{}{line}", si.stamp)
-            } else {
-                format!("{pad}{line}")
-            };
+            let row = if i == 0 { format!("{}{line}", si.stamp) } else { format!("{pad}{line}") };
             fit(&row, width)
         })
         .collect()
@@ -166,50 +158,31 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
             let body = wrap_block(text, inner);
             body.into_iter()
                 .enumerate()
-                .map(|(i, line)| {
-                    if i == 0 && !prefix.is_empty() {
-                        format!("{DIM}{prefix}{RESET}{line}")
-                    } else {
-                        line
-                    }
-                })
+                .map(
+                    |(i, line)| {
+                        if i == 0 && !prefix.is_empty() { format!("{DIM}{prefix}{RESET}{line}") } else { line }
+                    },
+                )
                 .collect()
         }
         Item::Thinking { chars, seconds } => {
-            vec![fit(
-                &format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"),
-                width,
-            )]
+            vec![fit(&format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"), width)]
         }
         Item::ToolCall { name, summary } => {
             let used = name.chars().count() + 4;
             let summary = fit(summary, width.saturating_sub(used));
-            vec![fit(
-                &format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"),
-                width,
-            )]
+            vec![fit(&format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"), width)]
         }
-        Item::ToolResult {
-            ok,
-            output,
-            verbose,
-        } => tool_result_lines(*ok, output, *verbose, width),
+        Item::ToolResult { ok, output, verbose } => tool_result_lines(*ok, output, *verbose, width),
         Item::Plan(plan) => plan_lines(plan, width),
-        Item::Note(text) => wrap_block(text, width)
-            .into_iter()
-            .map(|line| format!("{DIM}{line}{RESET}"))
-            .collect(),
+        Item::Note(text) => wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect(),
         Item::Output(text) => wrap_block(text, width),
     }
 }
 
 fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec<String> {
     let lines: Vec<&str> = output.trim_end().lines().collect();
-    let (mark, color) = if ok {
-        ("⎿", DIM)
-    } else {
-        ("⎿ error:", RED)
-    };
+    let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
     // The prefix is two leading spaces, the marker, and one space; reserve its
     // real width so the longer `⎿ error:` marker can't overflow `width` and
     // wrap onto extra rows. Both result formats below use the same `body`.
@@ -224,25 +197,12 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
             out.push(fit(&format!("  {color}{lead} {}{RESET}", fit(line, body)), width));
         }
         if lines.len() > PREVIEW_LINES {
-            out.push(fit(
-                &format!("  {DIM}  … +{} lines{RESET}", lines.len() - PREVIEW_LINES),
-                width,
-            ));
+            out.push(fit(&format!("  {DIM}  … +{} lines{RESET}", lines.len() - PREVIEW_LINES), width));
         }
         return out;
     }
-    let more = if lines.len() > 1 {
-        format!(" (+{} lines)", lines.len() - 1)
-    } else {
-        String::new()
-    };
-    vec![fit(
-        &format!(
-            "  {color}{mark} {}{more}{RESET}",
-            fit(lines[0], body.saturating_sub(more.len()))
-        ),
-        width,
-    )]
+    let more = if lines.len() > 1 { format!(" (+{} lines)", lines.len() - 1) } else { String::new() };
+    vec![fit(&format!("  {color}{mark} {}{more}{RESET}", fit(lines[0], body.saturating_sub(more.len()))), width)]
 }
 
 /// Plans longer than this show finished items as one summary line.
@@ -251,23 +211,14 @@ const PLAN_LINES: usize = 12;
 fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
     let body = width.saturating_sub(4).max(1);
     let (done, total) = plan.progress();
-    let mut out = vec![fit(
-        &format!("{GREEN}●{RESET} {BOLD}Plan{RESET} {DIM}{done}/{total} done{RESET}"),
-        width,
-    )];
-    let live: Vec<&crate::plan::PlanItem> = plan
-        .items
-        .iter()
-        .filter(|i| i.status != Status::Dropped)
-        .collect();
+    let mut out = vec![fit(&format!("{GREEN}●{RESET} {BOLD}Plan{RESET} {DIM}{done}/{total} done{RESET}"), width)];
+    let live: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|i| i.status != Status::Dropped).collect();
     let collapse = live.len() > PLAN_LINES && done > 0;
     if collapse {
         out.push(fit(&format!("  {GREEN}✔{RESET} {DIM}{done} done{RESET}"), width));
     }
-    let visible: Vec<&&crate::plan::PlanItem> = live
-        .iter()
-        .filter(|i| !(collapse && i.status == Status::Done))
-        .collect();
+    let visible: Vec<&&crate::plan::PlanItem> =
+        live.iter().filter(|i| !(collapse && i.status == Status::Done)).collect();
     for (shown, item) in visible.iter().enumerate() {
         if shown == PLAN_LINES {
             out.push(fit(&format!("  {DIM}… +{} more{RESET}", visible.len() - shown), width));
@@ -287,10 +238,7 @@ fn plan_lines(plan: &Plan, width: usize) -> Vec<String> {
 
 /// Every transcript item's lines, in order, at `width`.
 pub fn transcript_lines(items: &[StampedItem], width: usize) -> Vec<String> {
-    items
-        .iter()
-        .flat_map(|item| render_stamped(item, width))
-        .collect()
+    items.iter().flat_map(|item| render_stamped(item, width)).collect()
 }
 
 /// The input editor as wrapped lines with a reverse-video cursor marker at
@@ -318,11 +266,7 @@ pub fn editor_lines(prompt: &str, text: &str, cursor: usize, width: usize) -> Ve
     let inner = width.saturating_sub(visible_width(prompt)).max(1);
     let mut lines: Vec<String> = Vec::new();
     for (i, logical) in marked.split('\n').enumerate() {
-        let wrapped = if i == 0 {
-            wrap_ansi(logical, inner)
-        } else {
-            wrap_ansi(logical, width)
-        };
+        let wrapped = if i == 0 { wrap_ansi(logical, inner) } else { wrap_ansi(logical, width) };
         for line in wrapped {
             lines.push(line);
         }
@@ -357,12 +301,7 @@ pub fn compose(transcript: &[String], editor: &[String], status: &str) -> Vec<St
 /// the legacy status line's `⏸N queued · /queue to edit` hint. Returns `None`
 /// when nothing is queued.
 pub fn queue_indicator(queued: usize, width: usize) -> Option<String> {
-    (queued > 0).then(|| {
-        fit(
-            &format!("{DIM}⏸{queued} queued · /queue to edit{RESET}"),
-            width.max(1),
-        )
-    })
+    (queued > 0).then(|| fit(&format!("{DIM}⏸{queued} queued · /queue to edit{RESET}"), width.max(1)))
 }
 
 /// A transient hint rendered in place of the status bar (e.g. "(Ctrl-C again
@@ -398,11 +337,7 @@ const CURSOR_MARK: char = '\u{0}';
 /// reserving a cell for it here keeps a full editor row from spilling past the
 /// frame width and pushing the status bar down.
 fn cell_width(c: char) -> usize {
-    if c == CURSOR_MARK {
-        1
-    } else {
-        UnicodeWidthChar::width(c).unwrap_or(0)
-    }
+    if c == CURSOR_MARK { 1 } else { UnicodeWidthChar::width(c).unwrap_or(0) }
 }
 
 /// Visible width in terminal cells, ignoring ANSI escape sequences. CJK
@@ -474,9 +409,7 @@ fn fit(text: &str, width: usize) -> String {
 /// Wrap plain (uncoloured) text to `width`, splitting on whitespace and hard
 /// breaking words longer than the width. Existing newlines start new lines.
 fn wrap_block(text: &str, width: usize) -> Vec<String> {
-    text.split('\n')
-        .flat_map(|line| wrap_ansi(line, width))
-        .collect()
+    text.split('\n').flat_map(|line| wrap_ansi(line, width)).collect()
 }
 
 /// Prepare a logical line for width-accurate, layout-safe composition: expand
@@ -639,13 +572,7 @@ pub struct FrameRenderer<W: Write> {
 
 impl<W: Write> FrameRenderer<W> {
     pub fn new(out: W) -> Self {
-        Self {
-            out,
-            prev: Vec::new(),
-            width: 0,
-            height: 0,
-            started: false,
-        }
+        Self { out, prev: Vec::new(), width: 0, height: 0, started: false }
     }
 
     /// Force the next [`render`](Self::render) to be a full redraw — used after
@@ -690,11 +617,7 @@ impl<W: Write> FrameRenderer<W> {
         // Bottom-anchor: when the frame is shorter than the screen, leave blank
         // rows at the top so the bar lands on the last row; when it is taller,
         // write from the top and let the surplus scroll into scrollback.
-        let start_row = if frame.len() < height {
-            height - frame.len() + 1
-        } else {
-            1
-        };
+        let start_row = if frame.len() < height { height - frame.len() + 1 } else { 1 };
         buf.push_str(&format!("\x1b[{start_row};1H"));
         for (i, line) in frame.iter().enumerate() {
             if i > 0 {
@@ -721,11 +644,7 @@ impl<W: Write> FrameRenderer<W> {
             // whole transcript can't stack a duplicate copy behind the frame.
             return self.full_redraw(frame, height);
         }
-        let row = if plen <= height {
-            (height - plen) + diff + 1
-        } else {
-            diff - prev_top + 1
-        };
+        let row = if plen <= height { (height - plen) + diff + 1 } else { diff - prev_top + 1 };
         let mut buf = String::from(SYNC_START);
         buf.push_str(&format!("\x1b[{row};1H"));
         for (i, line) in frame[diff..].iter().enumerate() {
@@ -763,8 +682,7 @@ impl Debouncer {
 
     /// Whether enough quiet time has passed since the last resize to render.
     pub fn ready(&self, now: Instant) -> bool {
-        self.last
-            .is_none_or(|last| now.duration_since(last) >= self.quiet)
+        self.last.is_none_or(|last| now.duration_since(last) >= self.quiet)
     }
 
     /// Consume the pending resize once rendered.
@@ -814,10 +732,7 @@ mod tests {
 
     #[test]
     fn wraps_words_at_the_width() {
-        assert_eq!(
-            wrap_ansi("the quick brown fox", 9),
-            vec!["the quick", "brown fox"]
-        );
+        assert_eq!(wrap_ansi("the quick brown fox", 9), vec!["the quick", "brown fox"]);
         // A word longer than the width is hard-broken.
         assert_eq!(wrap_ansi("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         // Every wrapped line stays within the width.
@@ -924,10 +839,7 @@ mod tests {
         let lines = render_stamped(&item, 30);
         assert!(strip(&lines[0]).starts_with("12:34:56 › "), "{:?}", lines[0]);
         // With timestamps off (empty stamp) the first row keeps the bare marker.
-        let bare = StampedItem {
-            stamp: String::new(),
-            item: Item::Message { role: Role::User, text: "hi".into() },
-        };
+        let bare = StampedItem { stamp: String::new(), item: Item::Message { role: Role::User, text: "hi".into() } };
         assert_eq!(strip(&render_stamped(&bare, 30)[0]), "› hi");
     }
 
@@ -970,10 +882,7 @@ mod tests {
     fn wrapping_preserves_ansi_but_not_its_width() {
         let coloured = format!("{GREEN}hello world again{RESET}");
         let lines = wrap_ansi(&coloured, 11);
-        assert_eq!(
-            lines.iter().map(|l| strip(l)).collect::<Vec<_>>(),
-            vec!["hello world", "again"]
-        );
+        assert_eq!(lines.iter().map(|l| strip(l)).collect::<Vec<_>>(), vec!["hello world", "again"]);
         // The colour codes survived even though they cost no columns.
         assert!(lines[0].contains(GREEN));
     }
@@ -984,11 +893,7 @@ mod tests {
         let editor = vec!["› hi".to_string()];
         let frame = compose(&transcript, &editor, "STATUS");
         assert_eq!(frame, vec!["a", "b", "› hi", "STATUS"]);
-        assert_eq!(
-            frame.last().unwrap(),
-            "STATUS",
-            "the bar must be the last line"
-        );
+        assert_eq!(frame.last().unwrap(), "STATUS", "the bar must be the last line");
     }
 
     #[test]
@@ -1021,11 +926,7 @@ mod tests {
             },
             StampedItem {
                 stamp: format!("{DIM}12:34:56{RESET} "),
-                item: Item::ToolResult {
-                    ok: true,
-                    output: "line1\nline2\nline3".into(),
-                    verbose: false,
-                },
+                item: Item::ToolResult { ok: true, output: "line1\nline2\nline3".into(), verbose: false },
             },
             StampedItem {
                 stamp: String::new(),
@@ -1033,21 +934,10 @@ mod tests {
             },
         ];
         for line in transcript_lines(&items, 20) {
-            assert!(
-                visible_width(&line) <= 20,
-                "{line:?} ({} cols)",
-                visible_width(&line)
-            );
+            assert!(visible_width(&line) <= 20, "{line:?} ({} cols)", visible_width(&line));
         }
         // The single-line tool result summarises the extra lines.
-        let result = render_item(
-            &Item::ToolResult {
-                ok: true,
-                output: "a\nb\nc".into(),
-                verbose: false,
-            },
-            40,
-        );
+        let result = render_item(&Item::ToolResult { ok: true, output: "a\nb\nc".into(), verbose: false }, 40);
         assert_eq!(result.len(), 1);
         assert!(strip(&result[0]).contains("(+2 lines)"));
     }
@@ -1160,20 +1050,14 @@ mod emulator {
 
         /// Render a frame and feed the produced bytes to the emulator.
         fn render(&mut self, frame: &[String]) {
-            self.renderer
-                .render(frame, self.cols as usize, self.rows as usize)
-                .unwrap();
+            self.renderer.render(frame, self.cols as usize, self.rows as usize).unwrap();
             let bytes: Vec<u8> = self.buf.0.borrow_mut().drain(..).collect();
             self.parser.process(&bytes);
         }
 
         /// The visible screen, one trimmed string per row.
         fn screen(&self) -> Vec<String> {
-            self.parser
-                .screen()
-                .rows(0, self.cols)
-                .map(|row| row.trim_end().to_string())
-                .collect()
+            self.parser.screen().rows(0, self.cols).map(|row| row.trim_end().to_string()).collect()
         }
     }
 
@@ -1203,17 +1087,10 @@ mod emulator {
         let mut emu = Emu::new(24, 80);
         emu.render(&sample_frame(80));
         let screen = emu.screen();
-        assert_eq!(
-            screen.last().unwrap(),
-            "MODEL  ctx 10%",
-            "bar on the last row"
-        );
+        assert_eq!(screen.last().unwrap(), "MODEL  ctx 10%", "bar on the last row");
         // The editor row sits directly above the bar.
         let editor_row = &screen[screen.len() - 2];
-        assert!(
-            editor_row.contains("my next question"),
-            "editor above the bar: {editor_row:?}"
-        );
+        assert!(editor_row.contains("my next question"), "editor above the bar: {editor_row:?}");
         // Exactly one bar on screen.
         let bars = screen.iter().filter(|r| r.contains("ctx 10%")).count();
         assert_eq!(bars, 1, "no duplicate bars: {screen:?}");
@@ -1224,11 +1101,7 @@ mod emulator {
         let mut emu = Emu::new(24, 80);
         emu.render(&sample_frame(80));
         // The long answer fits few rows when wide.
-        let wide_answer_rows = emu
-            .screen()
-            .iter()
-            .filter(|r| r.contains("fairly long answer"))
-            .count();
+        let wide_answer_rows = emu.screen().iter().filter(|r| r.contains("fairly long answer")).count();
 
         // Shrink: the terminal (and renderer) both go narrow.
         emu.resize(24, 30);
@@ -1243,10 +1116,8 @@ mod emulator {
         }
         // History reflowed: the long answer occupies more rows at the smaller
         // width than it did when wide.
-        let narrow_answer_rows = narrow
-            .iter()
-            .filter(|r| r.contains("fairly") || r.contains("answer") || r.contains("wrap"))
-            .count();
+        let narrow_answer_rows =
+            narrow.iter().filter(|r| r.contains("fairly") || r.contains("answer") || r.contains("wrap")).count();
         assert!(
             narrow_answer_rows > wide_answer_rows,
             "history did not reflow ({wide_answer_rows} -> {narrow_answer_rows})"

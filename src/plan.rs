@@ -174,7 +174,12 @@ impl Plan {
                 id,
                 title: clip(title, MAX_TITLE_CHARS),
                 status: Status::Pending,
-                notes: note.map(str::trim).filter(|n| !n.is_empty()).map(|n| clip(n, MAX_NOTE_CHARS)).into_iter().collect(),
+                notes: note
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(|n| clip(n, MAX_NOTE_CHARS))
+                    .into_iter()
+                    .collect(),
                 after,
             });
             added.push(id);
@@ -237,7 +242,8 @@ impl Plan {
         if self.is_empty() {
             return "The plan is empty.".to_string();
         }
-        let modes: &[(bool, bool)] = if notes { &[(true, true), (true, false), (false, false)] } else { &[(false, false)] };
+        let modes: &[(bool, bool)] =
+            if notes { &[(true, true), (true, false), (false, false)] } else { &[(false, false)] };
         let mut text = String::new();
         for &(open_notes, closed_notes) in modes {
             text = self.render_with(open_notes, closed_notes);
@@ -267,7 +273,11 @@ impl Plan {
                     out.push_str(&format!("      - {}\n", note.replace('\n', "\n        ")));
                 }
             } else if !item.notes.is_empty() {
-                out.push_str(&format!("      ({} note{})\n", item.notes.len(), if item.notes.len() == 1 { "" } else { "s" }));
+                out.push_str(&format!(
+                    "      ({} note{})\n",
+                    item.notes.len(),
+                    if item.notes.len() == 1 { "" } else { "s" }
+                ));
             }
         }
         let next = self.next();
@@ -324,18 +334,25 @@ impl Plan {
     /// as sent in `_meta.plan` of `plan` updates) or bare ACP entries.
     pub fn from_value(value: &Value) -> Result<Self> {
         if value.get("items").is_some() {
-            let plan: Plan = serde_json::from_value(value.clone()).context("plan must be {goal, items: [{id, title, status}]}")?;
+            let plan: Plan =
+                serde_json::from_value(value.clone()).context("plan must be {goal, items: [{id, title, status}]}")?;
             plan.validate()?;
             return Ok(plan);
         }
-        let entries = value.get("entries").unwrap_or(value).as_array().ok_or_else(|| anyhow::anyhow!("plan must be {{goal, items}} or a list of ACP plan entries"))?;
+        let entries = value
+            .get("entries")
+            .unwrap_or(value)
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("plan must be {{goal, items}} or a list of ACP plan entries"))?;
         let mut plan = Plan::default();
         for (index, entry) in entries.iter().enumerate() {
-            let title = entry.get("content").or_else(|| entry.get("title")).and_then(Value::as_str).unwrap_or_default().trim();
+            let title =
+                entry.get("content").or_else(|| entry.get("title")).and_then(Value::as_str).unwrap_or_default().trim();
             if title.is_empty() {
                 continue;
             }
-            let status = entry.get("status").and_then(Value::as_str).map(Status::parse).transpose()?.unwrap_or(Status::Pending);
+            let status =
+                entry.get("status").and_then(Value::as_str).map(Status::parse).transpose()?.unwrap_or(Status::Pending);
             plan.items.push(PlanItem {
                 id: index as u32 + 1,
                 title: clip(title, MAX_TITLE_CHARS),
@@ -363,7 +380,9 @@ impl Plan {
                 bail!("plan item id {} is used twice", item.id);
             }
         }
-        if let Some((item, dep)) = self.items.iter().find_map(|i| i.after.iter().find(|d| !seen.contains(d)).map(|d| (i.id, d))) {
+        if let Some((item, dep)) =
+            self.items.iter().find_map(|i| i.after.iter().find(|d| !seen.contains(d)).map(|d| (i.id, d)))
+        {
             bail!("plan item {item} is after unknown item {dep}");
         }
         Ok(())
@@ -373,9 +392,8 @@ impl Plan {
 /// Models sometimes send a nested list as a JSON string; decode it.
 fn decoded(value: &Value) -> Result<Value> {
     match value {
-        Value::String(text) if text.trim_start().starts_with(['[', '{']) => {
-            serde_json::from_str(text).map_err(|e| anyhow::anyhow!("could not parse {text:?} as JSON: {e}; pass a list, not a string"))
-        }
+        Value::String(text) if text.trim_start().starts_with(['[', '{']) => serde_json::from_str(text)
+            .map_err(|e| anyhow::anyhow!("could not parse {text:?} as JSON: {e}; pass a list, not a string")),
         other => Ok(other.clone()),
     }
 }
@@ -484,7 +502,10 @@ mod tests {
     fn adds_updates_and_tracks_what_is_next() {
         let mut plan = Plan::default();
         let out = plan
-            .apply("plan_add", &json!({"goal": "Ship it", "items": ["Read code", {"title": "Write fix", "after": [1]}, "Open PR"]}))
+            .apply(
+                "plan_add",
+                &json!({"goal": "Ship it", "items": ["Read code", {"title": "Write fix", "after": [1]}, "Open PR"]}),
+            )
             .unwrap();
         assert!(out.changed);
         assert!(out.text.starts_with("Set the goal, added items 1-3.\n"), "{}", out.text);
@@ -509,8 +530,16 @@ mod tests {
         let mut plan = Plan::default();
         plan.apply("plan_add", &json!({"items": ["a"]})).unwrap();
         let before = plan.clone();
-        assert!(plan.apply("plan_update", &json!({"id": 9, "status": "done"})).unwrap_err().to_string().contains("items are 1"));
-        assert!(plan.apply("plan_update", &json!({"updates": [{"id": 1, "status": "done"}, {"id": 1, "status": "nope"}]})).is_err());
+        assert!(
+            plan.apply("plan_update", &json!({"id": 9, "status": "done"}))
+                .unwrap_err()
+                .to_string()
+                .contains("items are 1")
+        );
+        assert!(
+            plan.apply("plan_update", &json!({"updates": [{"id": 1, "status": "done"}, {"id": 1, "status": "nope"}]}))
+                .is_err()
+        );
         assert!(plan.apply("plan_add", &json!({"items": [{"title": "b", "after": [5]}]})).is_err());
         assert!(plan.apply("plan_add", &json!({})).is_err());
         assert!(plan.apply("plan_add", &json!({"items": "[\"unclosed"})).is_err());

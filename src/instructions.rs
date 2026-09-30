@@ -62,7 +62,8 @@ impl ProjectInstructions {
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let root = git_root(&cwd).unwrap_or_else(|| cwd.clone());
         let mut this = Self { root, names: names.to_vec(), ..Default::default() };
-        let mut dirs: Vec<PathBuf> = cwd.ancestors().take_while(|d| d.starts_with(&this.root)).map(Path::to_path_buf).collect();
+        let mut dirs: Vec<PathBuf> =
+            cwd.ancestors().take_while(|d| d.starts_with(&this.root)).map(Path::to_path_buf).collect();
         dirs.reverse();
         for dir in dirs {
             if let Some(file) = this.search(&dir) {
@@ -101,7 +102,10 @@ impl ProjectInstructions {
         for file in &self.loaded {
             let section = format!("\n\n## {}\n\n{}", self.display(&file.path), file.text);
             if section.len() > budget {
-                out.push_str(&format!("\n\n## {}\n\n[omitted: instruction size limit reached; read it with read_file]", self.display(&file.path)));
+                out.push_str(&format!(
+                    "\n\n## {}\n\n[omitted: instruction size limit reached; read it with read_file]",
+                    self.display(&file.path)
+                ));
                 continue;
             }
             budget -= section.len();
@@ -116,7 +120,8 @@ impl ProjectInstructions {
         let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().ok()?.join(path) };
         let absolute = canonicalize_existing(&absolute);
         let dir = if absolute.is_dir() { absolute.as_path() } else { absolute.parent()? };
-        let mut dirs: Vec<PathBuf> = dir.ancestors().take_while(|d| d.starts_with(&self.root)).map(Path::to_path_buf).collect();
+        let mut dirs: Vec<PathBuf> =
+            dir.ancestors().take_while(|d| d.starts_with(&self.root)).map(Path::to_path_buf).collect();
         if dirs.is_empty() {
             return None;
         }
@@ -213,4 +218,3 @@ mod tests {
         assert!(instructions.loaded[0].text.contains("[... truncated"));
     }
 }
-

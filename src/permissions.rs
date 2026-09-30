@@ -182,10 +182,7 @@ impl Policy {
     pub fn new(config: &PermissionsConfig, sandbox: &SandboxConfig) -> Self {
         let mut errors = Vec::new();
         let mut parse = |rules: &[String]| {
-            rules
-                .iter()
-                .filter_map(|r| Rule::parse(r).map_err(|e| errors.push(e)).ok())
-                .collect::<Vec<_>>()
+            rules.iter().filter_map(|r| Rule::parse(r).map_err(|e| errors.push(e)).ok()).collect::<Vec<_>>()
         };
         let allow = parse(&config.allow);
         let deny = parse(&config.deny);
@@ -305,8 +302,7 @@ impl Policy {
                 // so the builtin guard still runs on it. Only a truly empty command
                 // (no words and no redirects) is treated as automatically approved.
                 let text = command_text(cmd);
-                (cmd.words.is_empty() && cmd.redirects.is_empty())
-                    || allow.iter().any(|r| r.matches(&text))
+                (cmd.words.is_empty() && cmd.redirects.is_empty()) || allow.iter().any(|r| r.matches(&text))
             })
         {
             return Ok(());
@@ -432,7 +428,8 @@ fn device_write(target: &str, cwd: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn basename(text: &str) -> &str {    text.rsplit('/').next().unwrap_or(text)
+fn basename(text: &str) -> &str {
+    text.rsplit('/').next().unwrap_or(text)
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -606,11 +603,48 @@ const TIMEOUT_LONG_WITH_VALUE: &[&str] = &["--kill-after", "--signal"];
 /// `docker`/`podman` `exec`/`run`; otherwise their value is mistaken for the
 /// container/image and the nested command is not reached.
 const DOCKER_LONG_WITH_VALUE: &[&str] = &[
-    "--env", "--user", "--workdir", "--volume", "--publish", "--name", "--network", "--net", "--hostname",
-    "--entrypoint", "--env-file", "--label", "--label-file", "--mount", "--add-host", "--device", "--dns", "--expose",
-    "--link", "--log-driver", "--restart", "--memory", "--cpus", "--platform", "--detach-keys", "--volumes-from",
-    "--tmpfs", "--ulimit", "--sysctl", "--cap-add", "--cap-drop", "--security-opt", "--pid", "--ipc", "--uts",
-    "--group-add", "--health-cmd", "--stop-signal", "--stop-timeout", "--pull", "--attach", "--cidfile",
+    "--env",
+    "--user",
+    "--workdir",
+    "--volume",
+    "--publish",
+    "--name",
+    "--network",
+    "--net",
+    "--hostname",
+    "--entrypoint",
+    "--env-file",
+    "--label",
+    "--label-file",
+    "--mount",
+    "--add-host",
+    "--device",
+    "--dns",
+    "--expose",
+    "--link",
+    "--log-driver",
+    "--restart",
+    "--memory",
+    "--cpus",
+    "--platform",
+    "--detach-keys",
+    "--volumes-from",
+    "--tmpfs",
+    "--ulimit",
+    "--sysctl",
+    "--cap-add",
+    "--cap-drop",
+    "--security-opt",
+    "--pid",
+    "--ipc",
+    "--uts",
+    "--group-add",
+    "--health-cmd",
+    "--stop-signal",
+    "--stop-timeout",
+    "--pull",
+    "--attach",
+    "--cidfile",
 ];
 
 /// Index of the command `docker`/`podman exec CONTAINER CMD...` or
@@ -725,9 +759,7 @@ fn skip_options(words: &[Word], mut i: usize, with_value: &str, long_with_value:
             // bundle; otherwise the rest of the same word is its value. Fail toward
             // consuming the next word so a wrapped command can't hide behind it.
             let opts = &text[1..];
-            opts.chars()
-                .position(|c| with_value.contains(c))
-                .is_some_and(|pos| pos + 1 == opts.chars().count())
+            opts.chars().position(|c| with_value.contains(c)).is_some_and(|pos| pos + 1 == opts.chars().count())
         };
         i += if consume_next { 2 } else { 1 };
     }
@@ -841,7 +873,9 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
                 }
                 return parse_inner(&script_text(rest)?, depth, out);
             }
-            "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "fish" => return expand_shell(simple, i, depth, out),
+            "bash" | "sh" | "zsh" | "dash" | "ksh" | "ash" | "mksh" | "fish" => {
+                return expand_shell(simple, i, depth, out);
+            }
             "docker" | "podman" => {
                 // `docker exec c sh -c '...'` / `docker run img sh -c '...'` run a
                 // nested command (and often a nested shell); unwrap to it so its
@@ -1078,7 +1112,10 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
     let mut out: HashMap<String, Option<String>> = HashMap::new();
     for cmd in commands {
         let mut words = cmd.words.iter().peekable();
-        if words.peek().is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly")) {
+        if words
+            .peek()
+            .is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
+        {
             words.next();
         }
         for word in words {
@@ -1106,8 +1143,26 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
 const SAFE_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"];
 
 const DB_CLIENTS: &[&str] = &[
-    "psql", "pgcli", "mysql", "mariadb", "mycli", "sqlite3", "litecli", "duckdb", "sqlcmd", "mongosh", "mongo",
-    "redis-cli", "valkey-cli", "cqlsh", "clickhouse-client", "clickhouse", "cockroach", "snowsql", "usql", "bq",
+    "psql",
+    "pgcli",
+    "mysql",
+    "mariadb",
+    "mycli",
+    "sqlite3",
+    "litecli",
+    "duckdb",
+    "sqlcmd",
+    "mongosh",
+    "mongo",
+    "redis-cli",
+    "valkey-cli",
+    "cqlsh",
+    "clickhouse-client",
+    "clickhouse",
+    "cockroach",
+    "snowsql",
+    "usql",
+    "bq",
 ];
 
 const INTERPRETERS: &[&str] = &["python", "python3", "node", "ruby", "perl", "php", "deno", "bun"];
@@ -1123,8 +1178,26 @@ static FORK_BOMB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\s*\(\s*\)\s*
 
 /// Directories whose contents are the operating system.
 const SYSTEM_DIRS: &[&str] = &[
-    "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec", "/usr/share", "/etc", "/private/etc",
-    "/System", "/boot", "/lib", "/lib32", "/lib64", "/proc", "/sys", "/dev", "/var/lib", "/private/var/lib", "/private/var/db",
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/share",
+    "/etc",
+    "/private/etc",
+    "/System",
+    "/boot",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/var/lib",
+    "/private/var/lib",
+    "/private/var/db",
 ];
 
 /// The `var` roots themselves are catastrophic to delete wholesale (`rm -rf
@@ -1258,9 +1331,9 @@ impl Guard<'_> {
         match program {
             "rm" => {
                 let (flags, targets) = split_flags(args);
-                let recursive = flags.iter().any(|f| {
-                    *f == "--recursive" || (!f.starts_with("--") && (f.contains('r') || f.contains('R')))
-                });
+                let recursive = flags
+                    .iter()
+                    .any(|f| *f == "--recursive" || (!f.starts_with("--") && (f.contains('r') || f.contains('R'))));
                 if flags.contains(&"--no-preserve-root") {
                     return Err("`rm --no-preserve-root` can delete the whole filesystem".into());
                 }
@@ -1349,10 +1422,8 @@ impl Guard<'_> {
                 // `find` runs; drop those. If that leaves no start paths, `find`
                 // falls back to the implicit `.` and deletes the working tree, so
                 // guard it exactly like `find -delete`.
-                let mut starts: Vec<Word> = starts
-                    .into_iter()
-                    .filter(|w| !matches!(self.resolve(w), Ok(None)))
-                    .collect();
+                let mut starts: Vec<Word> =
+                    starts.into_iter().filter(|w| !matches!(self.resolve(w), Ok(None))).collect();
                 if starts.is_empty() {
                     starts.push(implicit.clone());
                 }
@@ -1366,7 +1437,10 @@ impl Guard<'_> {
                         if let Ok(Some((path, _))) = self.resolve(start)
                             && let Some(what) = self.catastrophic_root(&path)
                         {
-                            return Err(format!("`find -delete` under {what} ({}) can remove protected files", path.display()));
+                            return Err(format!(
+                                "`find -delete` under {what} ({}) can remove protected files",
+                                path.display()
+                            ));
                         }
                     }
                     // Recursion from an in-workspace start still reaches a nested
@@ -1420,8 +1494,15 @@ impl Guard<'_> {
                     t.starts_with("erase")
                         || matches!(
                             t.as_str(),
-                            "zerodisk" | "randomdisk" | "secureerase" | "partitiondisk" | "reformat" | "deletevolume"
-                                | "deletecontainer" | "splitpartition" | "mergepartitions"
+                            "zerodisk"
+                                | "randomdisk"
+                                | "secureerase"
+                                | "partitiondisk"
+                                | "reformat"
+                                | "deletevolume"
+                                | "deletecontainer"
+                                | "splitpartition"
+                                | "mergepartitions"
                         )
                 });
                 if destructive {
@@ -1454,10 +1535,13 @@ impl Guard<'_> {
                 let words: Vec<&str> = std::iter::once(program).chain(args.iter().map(|a| a.text.as_str())).collect();
                 let contains = |w: &str| words.contains(&w);
                 let prisma = contains("prisma")
-                    && (words.windows(2).any(|w| w == ["migrate", "reset"]) || contains("--force-reset") || contains("--accept-data-loss"));
+                    && (words.windows(2).any(|w| w == ["migrate", "reset"])
+                        || contains("--force-reset")
+                        || contains("--accept-data-loss"));
                 let rails = matches!(program, "rails" | "rake" | "bundle" | "npm" | "pnpm" | "yarn" | "bun")
                     && (contains("db:drop") || contains("db:reset") || contains("db:purge"));
-                let django = words.iter().any(|w| basename(w) == "manage.py") && (contains("flush") || contains("reset_db"));
+                let django =
+                    words.iter().any(|w| basename(w) == "manage.py") && (contains("flush") || contains("reset_db"));
                 if prisma || rails || django {
                     return Err("it drops or resets a database".into());
                 }
@@ -1477,8 +1561,7 @@ impl Guard<'_> {
         if target.contains('`') {
             return Err("it redirects to a target computed at run time".into());
         }
-        let (target, known) =
-            if target.contains('$') { self.substitute(target) } else { (target.to_string(), true) };
+        let (target, known) = if target.contains('$') { self.substitute(target) } else { (target.to_string(), true) };
         if !known {
             return Err("it redirects to a target computed at run time".into());
         }
@@ -1492,7 +1575,11 @@ impl Guard<'_> {
         } else {
             match self.base.borrow().clone() {
                 Some(base) => base,
-                None => return Err("it redirects relative to a directory nano-coder can't determine; use an absolute path".into()),
+                None => {
+                    return Err(
+                        "it redirects relative to a directory nano-coder can't determine; use an absolute path".into(),
+                    );
+                }
             }
         };
         device_write(&target, &base)
@@ -1543,7 +1630,10 @@ impl Guard<'_> {
                 return Some("your home directory".into());
             }
             if p.parent() == Some(home) {
-                return Some(format!("a top-level folder of your home directory (~/{})", p.file_name()?.to_string_lossy()));
+                return Some(format!(
+                    "a top-level folder of your home directory (~/{})",
+                    p.file_name()?.to_string_lossy()
+                ));
             }
         }
         // Inside the workspace is fine even when the workspace lives
@@ -1676,43 +1766,51 @@ impl Guard<'_> {
     fn substitute(&self, text: &str) -> (String, bool) {
         let known = std::cell::Cell::new(true);
         static VAR: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[?\-=+][^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$\([^)]*\)|\$\(\.\.\.\)").unwrap()
+            Regex::new(
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:?[?\-=+][^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)|\$\([^)]*\)|\$\(\.\.\.\)",
+            )
+            .unwrap()
         });
-        let text = VAR.replace_all(text, |caps: &regex::Captures| {
-            let name = caps.get(1).or(caps.get(3)).map(|m| m.as_str());
-            let Some(name) = name else {
-                known.set(false);
-                return String::new();
-            };
-            let value = match (name, self.assigned.get(name)) {
-                (_, Some(Some(literal))) => Some(literal.clone()),
-                // Assigned at run time (`DIR=$(mktemp -d)`): unknown, but not empty.
-                (_, Some(None)) => {
+        let text = VAR
+            .replace_all(text, |caps: &regex::Captures| {
+                let name = caps.get(1).or(caps.get(3)).map(|m| m.as_str());
+                let Some(name) = name else {
                     known.set(false);
-                    Some(format!("__{name}__"))
+                    return String::new();
+                };
+                let value = match (name, self.assigned.get(name)) {
+                    (_, Some(Some(literal))) => Some(literal.clone()),
+                    // Assigned at run time (`DIR=$(mktemp -d)`): unknown, but not empty.
+                    (_, Some(None)) => {
+                        known.set(false);
+                        Some(format!("__{name}__"))
+                    }
+                    ("PWD", None) => self.base.borrow().as_ref().map(|b| b.display().to_string()),
+                    ("HOME", None) => self.home.as_ref().map(|h| h.display().to_string()),
+                    _ => std::env::var(name).ok(),
                 }
-                ("PWD", None) => self.base.borrow().as_ref().map(|b| b.display().to_string()),
-                ("HOME", None) => self.home.as_ref().map(|h| h.display().to_string()),
-                _ => std::env::var(name).ok(),
-            }
-            .filter(|v| !v.is_empty());
-            if value.is_none() {
-                known.set(false);
-            }
-            let modifier = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            match (value, modifier) {
-                // `${X:+word}` / `${X+word}`: expands to `word` when X is set,
-                // otherwise to nothing. `DIR=/; rm -rf "${DIR:+/}"` really runs
-                // `rm -rf /`, so substitute the operand when the value is present.
-                (Some(_), m) if m.trim_start_matches(':').starts_with('+') => m.trim_start_matches(':')[1..].to_string(),
-                (Some(v), _) => v,
-                // `${X:?}` aborts when X is unset: the path is not empty.
-                (None, m) if m.trim_start_matches(':').starts_with('?') => format!("__{name}__"),
-                (None, m) if m.trim_start_matches(':').starts_with(['-', '=']) => m.trim_start_matches(':')[1..].to_string(),
-                _ => String::new(),
-            }
-        })
-        .into_owned();
+                .filter(|v| !v.is_empty());
+                if value.is_none() {
+                    known.set(false);
+                }
+                let modifier = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                match (value, modifier) {
+                    // `${X:+word}` / `${X+word}`: expands to `word` when X is set,
+                    // otherwise to nothing. `DIR=/; rm -rf "${DIR:+/}"` really runs
+                    // `rm -rf /`, so substitute the operand when the value is present.
+                    (Some(_), m) if m.trim_start_matches(':').starts_with('+') => {
+                        m.trim_start_matches(':')[1..].to_string()
+                    }
+                    (Some(v), _) => v,
+                    // `${X:?}` aborts when X is unset: the path is not empty.
+                    (None, m) if m.trim_start_matches(':').starts_with('?') => format!("__{name}__"),
+                    (None, m) if m.trim_start_matches(':').starts_with(['-', '=']) => {
+                        m.trim_start_matches(':')[1..].to_string()
+                    }
+                    _ => String::new(),
+                }
+            })
+            .into_owned();
         (text, known.get())
     }
 
@@ -2308,8 +2406,10 @@ mod tests {
 
         // #5 Interpreter command strings attached to their short option carry the
         // script (`python3 -c"..."`, `ruby -e'...'`), so `scan_sql` must see them.
-        assert!(blocked("python3 -c\"import sqlite3; sqlite3.connect('a.db').execute('DROP TABLE t')\"")
-            .contains("destructive database"));
+        assert!(
+            blocked("python3 -c\"import sqlite3; sqlite3.connect('a.db').execute('DROP TABLE t')\"")
+                .contains("destructive database")
+        );
         assert!(blocked("ruby -e'system(\"psql -c \\\"DROP TABLE t\\\"\")'").contains("destructive database"));
 
         // #7 An unquoted start operand that expands to nothing (`find $UNSET -delete`)
@@ -2491,8 +2591,7 @@ mod tests {
         let p = Policy::default();
         let find_blocked = p.check_in("bash", &json!({ "command": "find -L etc -name passwd -delete" }), &dir).is_err();
         let mv_blocked = p.check_in("bash", &json!({ "command": "mv passwd etc" }), &dir).is_err();
-        let find_default_ok =
-            p.check_in("bash", &json!({ "command": "find etc -name passwd -delete" }), &dir).is_ok();
+        let find_default_ok = p.check_in("bash", &json!({ "command": "find etc -name passwd -delete" }), &dir).is_ok();
         std::fs::remove_dir_all(&dir).ok();
         assert!(find_blocked, "find -L should follow the symlink into /etc");
         assert!(mv_blocked, "mv into a symlink-to-/etc should be blocked");
@@ -2582,7 +2681,10 @@ mod tests {
         assert!(p.check_in("read_file", &json!({"path": "~/.ssh/id_ed25519"}), cwd).is_err());
         assert!(p.check_in("web_fetch", &json!({"url": "x"}), cwd).is_err());
         assert!(p.check_in("echo", &json!({"text": "x"}), cwd).is_ok());
-        let bad = Policy::new(&PermissionsConfig { deny: vec!["Bash(rm".into()], ..Default::default() }, &SandboxConfig::default());
+        let bad = Policy::new(
+            &PermissionsConfig { deny: vec!["Bash(rm".into()], ..Default::default() },
+            &SandboxConfig::default(),
+        );
         assert_eq!(bad.errors.len(), 1);
     }
 

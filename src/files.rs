@@ -27,9 +27,7 @@ const MAX_READ_BYTES: usize = 100_000;
 static SEEN: LazyLock<Mutex<HashMap<PathBuf, u64>>> = LazyLock::new(Default::default);
 
 fn seen_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
-        .or_else(|_| std::path::absolute(path))
-        .unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path).or_else(|_| std::path::absolute(path)).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn digest(bytes: &[u8]) -> u64 {
@@ -46,10 +44,7 @@ fn remember(path: &Path, bytes: &[u8]) {
 fn check_fresh(path: &Path, current: &[u8]) -> Result<()> {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&seen_key(path)).copied();
     match seen {
-        None => bail!(
-            "{} has not been read yet; read it with read_file before changing it",
-            path.display()
-        ),
+        None => bail!("{} has not been read yet; read it with read_file before changing it", path.display()),
         Some(hash) if hash != digest(current) => bail!(
             "{} has changed since it was last read (by a command, a tool or the user); read it again before changing it",
             path.display()
@@ -66,9 +61,9 @@ fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     match args.get(name) {
         None => bail!("missing required argument {name:?}"),
         Some(Value::Null) => bail!("argument {name:?} is null; provide a string value"),
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| anyhow!("argument {name:?} must be a string, got {}", type_name(value))),
+        Some(value) => {
+            value.as_str().ok_or_else(|| anyhow!("argument {name:?} must be a string, got {}", type_name(value)))
+        }
     }
 }
 
@@ -134,10 +129,7 @@ pub fn read_file(args: &Value) -> Result<String> {
     }
     let last = (offset - 1 + limit).min(total);
     if last < total {
-        out.push_str(&format!(
-            "[showing lines {offset}-{last} of {total}; use offset={} to continue]\n",
-            last + 1
-        ));
+        out.push_str(&format!("[showing lines {offset}-{last} of {total}; use offset={} to continue]\n", last + 1));
     }
     Ok(output::bound_output(&out, MAX_READ_BYTES).0)
 }
@@ -167,8 +159,7 @@ fn write_atomically(path: &Path, content: &str, expect: Expect<'_>) -> Result<()
     // Write through symlinks: renaming onto the link would replace it with a file.
     let resolved;
     let path = if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
-        resolved = std::fs::canonicalize(path)
-            .with_context(|| format!("resolve symlink {}", path.display()))?;
+        resolved = std::fs::canonicalize(path).with_context(|| format!("resolve symlink {}", path.display()))?;
         resolved.as_path()
     } else {
         path
@@ -194,8 +185,7 @@ fn write_atomically(path: &Path, content: &str, expect: Expect<'_>) -> Result<()
         }
         match expect {
             Expect::Bytes(expected) => {
-                let current =
-                    std::fs::read(path).with_context(|| format!("re-read {}", path.display()))?;
+                let current = std::fs::read(path).with_context(|| format!("re-read {}", path.display()))?;
                 check_fresh(path, &current)?;
                 // `check_fresh` compares against what the model last saw, which can be
                 // stale if the file changed after the caller's own read; also require the
@@ -248,11 +238,7 @@ struct Located {
 /// Convert `s` to the file's line endings: `read_file` shows lines without
 /// `\r`, so the model writes `\n` even for CRLF files.
 fn to_file_endings(text: &str, s: &str) -> String {
-    if text.contains("\r\n") && !s.contains('\r') {
-        s.replace('\n', "\r\n")
-    } else {
-        s.to_string()
-    }
+    if text.contains("\r\n") && !s.contains('\r') { s.replace('\n', "\r\n") } else { s.to_string() }
 }
 
 /// The line ending to use for a replacement over `text[start..end]`. The
@@ -280,11 +266,7 @@ fn ending_for(text: &str, start: usize, end: usize) -> &'static str {
 /// `read_file` shows lines without `\r`, so the model writes `\n` even for CRLF
 /// files.
 fn to_endings_at(text: &str, start: usize, end: usize, s: &str) -> String {
-    if ending_for(text, start, end) == "\r\n" && !s.contains('\r') {
-        s.replace('\n', "\r\n")
-    } else {
-        s.to_string()
-    }
+    if ending_for(text, start, end) == "\r\n" && !s.contains('\r') { s.replace('\n', "\r\n") } else { s.to_string() }
 }
 
 /// `read_file` prefixes each line with a right-aligned number and a tab. If
@@ -347,9 +329,8 @@ fn strip_line_numbers(old: &str, new: &str) -> Result<Option<(String, String, u6
              without the leading line-number field."
         );
     }
-    let strip_old = |s: &str| {
-        s.split('\n').map(|l| prefix_num(l).map_or(l, |(_, rest)| rest)).collect::<Vec<_>>().join("\n")
-    };
+    let strip_old =
+        |s: &str| s.split('\n').map(|l| prefix_num(l).map_or(l, |(_, rest)| rest)).collect::<Vec<_>>().join("\n");
     Ok(Some((strip_old(old), new.to_string(), lo)))
 }
 
@@ -463,10 +444,7 @@ fn match_lines(text: &str, old: &str, new: &str, trim_start: bool) -> Result<Opt
     let i = match hits.as_slice() {
         [] => return Ok(None),
         [i] => *i,
-        _ => bail!(
-            "old_string matches {} places ({how}); add surrounding context to make it unique",
-            hits.len()
-        ),
+        _ => bail!("old_string matches {} places ({how}); add surrounding context to make it unique", hits.len()),
     };
     let start = spans[i].0;
     let end = if ends_nl { spans[i + k - 1].2 } else { spans[i + k - 1].1 };
@@ -531,7 +509,8 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
         // form would see one match and edit just the LF block even though
         // `read_file` shows two identical blocks.
         let normalized = to_file_endings(text, o);
-        let candidates: Vec<&str> = if normalized != *o { vec![o.as_str(), normalized.as_str()] } else { vec![o.as_str()] };
+        let candidates: Vec<&str> =
+            if normalized != *o { vec![o.as_str(), normalized.as_str()] } else { vec![o.as_str()] };
         // For a stripped candidate, keep only matches that actually start on
         // the line its (consecutive) numbers name AND begin at that physical
         // line's boundary — a match landing mid-line (e.g. `foo` inside line 2's
@@ -586,9 +565,9 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
             // `replace_all` only ever applies to the exact, literal attempt:
             // a relaxed (stripped) match must be unique per the PR contract.
             _ if replace_all && how.is_none() => Ok(Some(Located { ranges, news, how: *how })),
-            count => bail!(
-                "old_string occurs {count} times; add surrounding context to make it unique or set replace_all"
-            ),
+            count => {
+                bail!("old_string occurs {count} times; add surrounding context to make it unique or set replace_all")
+            }
         }
     };
 
@@ -643,7 +622,10 @@ fn locate(text: &str, old: &str, new: &str, replace_all: bool) -> Result<Located
             return Ok(found);
         }
     }
-    bail!("old_string not found; read the file and copy the text exactly{}", near_miss(text, &attempts.last().unwrap().0))
+    bail!(
+        "old_string not found; read the file and copy the text exactly{}",
+        near_miss(text, &attempts.last().unwrap().0)
+    )
 }
 
 /// Lines `lo..=hi` (0-based) of `text`, numbered as `read_file` shows them.
@@ -740,14 +722,9 @@ fn near_miss(text: &str, old: &str) -> String {
         String::new()
     };
     let trimmed: Vec<&str> = want.iter().map(|l| l.trim()).collect();
-    let line_score = |i: usize| {
-        (0..k).filter(|&j| !trimmed[j].is_empty() && lines[i + j].trim() == trimmed[j]).count()
-    };
-    let (best, i) = windows
-        .clone()
-        .map(|i| (line_score(i), i))
-        .max_by_key(|&(s, i)| (s, std::cmp::Reverse(i)))
-        .unwrap();
+    let line_score = |i: usize| (0..k).filter(|&j| !trimmed[j].is_empty() && lines[i + j].trim() == trimmed[j]).count();
+    let (best, i) =
+        windows.clone().map(|i| (line_score(i), i)).max_by_key(|&(s, i)| (s, std::cmp::Reverse(i))).unwrap();
     if best > 0 {
         let of = want.iter().filter(|l| !l.trim().is_empty()).count();
         return format!(
@@ -783,10 +760,8 @@ fn near_miss(text: &str, old: &str) -> String {
             for c in lines[i + j].trim().chars() {
                 *scratch.entry(c).or_insert(0) += 1;
             }
-            score += want_counts[j]
-                .iter()
-                .map(|(c, &wc)| wc.min(scratch.get(c).copied().unwrap_or(0)))
-                .sum::<i32>() as usize;
+            score += want_counts[j].iter().map(|(c, &wc)| wc.min(scratch.get(c).copied().unwrap_or(0))).sum::<i32>()
+                as usize;
         }
         // Strictly-greater keeps the earliest (smallest-i) window among ties,
         // matching the line-score pass's `(s, Reverse(i))` preference.
@@ -798,7 +773,12 @@ fn near_miss(text: &str, old: &str) -> String {
     if sbest == 0 {
         return String::new();
     }
-    format!(". Closest lines {}-{} (no lines match exactly){scope}:\n{}", si + 1, si + k, numbered(&lines, si, si + k - 1))
+    format!(
+        ". Closest lines {}-{} (no lines match exactly){scope}:\n{}",
+        si + 1,
+        si + k,
+        numbered(&lines, si, si + k - 1)
+    )
 }
 
 pub fn write_file(args: &Value) -> Result<String> {
@@ -815,18 +795,9 @@ pub fn write_file(args: &Value) -> Result<String> {
     } else {
         None
     };
-    write_atomically(
-        &path,
-        content,
-        current.as_deref().map_or(Expect::Absent, Expect::Bytes),
-    )?;
+    write_atomically(&path, content, current.as_deref().map_or(Expect::Absent, Expect::Bytes))?;
     remember(&path, content.as_bytes());
-    Ok(format!(
-        "{} {} ({} bytes)",
-        if existed { "Overwrote" } else { "Created" },
-        path.display(),
-        content.len()
-    ))
+    Ok(format!("{} {} ({} bytes)", if existed { "Overwrote" } else { "Created" }, path.display(), content.len()))
 }
 
 pub fn edit_file(args: &Value) -> Result<String> {
@@ -1049,7 +1020,8 @@ mod tests {
         assert!(out.contains("ignoring indentation"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "def f():\n    x = 3\n    if x:\n        return x\n");
         // read_file's line-number prefixes copied into old_string.
-        let out = edit_file(&json!({ "path": p, "old_string": "     2\t    x = 3", "new_string": "    x = 4" })).unwrap();
+        let out =
+            edit_file(&json!({ "path": p, "old_string": "     2\t    x = 3", "new_string": "    x = 4" })).unwrap();
         assert!(out.contains("line numbers"), "{out}");
         assert!(std::fs::read_to_string(&p).unwrap().contains("    x = 4\n"));
     }
@@ -1268,7 +1240,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Many distant matches would each render a region; the global cap bounds
         // total output and notes the omitted regions instead of flooding.
-        let body: String = (1..=200).map(|n| if n % 10 == 0 { "mark\n".into() } else { format!("line {n}\n") }).collect();
+        let body: String =
+            (1..=200).map(|n| if n % 10 == 0 { "mark\n".into() } else { format!("line {n}\n") }).collect();
         let p = read_fixture(&dir, "big.txt", &body);
         let out =
             edit_file(&json!({ "path": p, "old_string": "mark", "new_string": "DONE", "replace_all": true })).unwrap();
@@ -1296,8 +1269,7 @@ mod tests {
         // old copies that numbered line, but new is a genuine six-digit TSV row
         // that must be written verbatim, not stripped to `abc`.
         let p = read_fixture(&dir, "n.tsv", "abc\ndef\n");
-        let out =
-            edit_file(&json!({ "path": p, "old_string": "     1\tabc", "new_string": "123456\tabc" })).unwrap();
+        let out = edit_file(&json!({ "path": p, "old_string": "     1\tabc", "new_string": "123456\tabc" })).unwrap();
         assert!(out.contains("line numbers"), "{out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "123456\tabc\ndef\n");
     }
@@ -1415,9 +1387,7 @@ mod tests {
         // by changing the file after read_file but before the edit's re-check.)
         let p = read_fixture(&dir, "race.txt", "one\ntwo\n");
         std::fs::write(&p, "one\nCHANGED\n").unwrap();
-        let err = edit_file(&json!({ "path": p, "old_string": "two", "new_string": "2" }))
-            .unwrap_err()
-            .to_string();
+        let err = edit_file(&json!({ "path": p, "old_string": "two", "new_string": "2" })).unwrap_err().to_string();
         assert!(err.contains("changed"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "one\nCHANGED\n");
     }
@@ -1446,9 +1416,7 @@ mod tests {
         // — once per representation — and must not be treated as unique (which
         // would edit only the LF block).
         let p = read_fixture(&dir, "both.txt", "a\nb\na\r\nb\r\n");
-        let err = edit_file(&json!({ "path": p, "old_string": "a\nb", "new_string": "x\ny" }))
-            .unwrap_err()
-            .to_string();
+        let err = edit_file(&json!({ "path": p, "old_string": "a\nb", "new_string": "x\ny" })).unwrap_err().to_string();
         assert!(err.contains("occurs 2 times"), "{err}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\na\r\nb\r\n");
     }
@@ -1488,7 +1456,8 @@ mod tests {
         // `replace_all` slicing `text[4..3]`); the edit must be rejected as
         // ambiguous instead.
         let p = read_fixture(&dir, "cross.txt", "a\r\na\na");
-        let err = edit_file(&json!({ "path": p, "old_string": "a\na", "new_string": "X", "replace_all": true })).unwrap_err();
+        let err =
+            edit_file(&json!({ "path": p, "old_string": "a\na", "new_string": "X", "replace_all": true })).unwrap_err();
         assert!(err.to_string().contains("ambiguously"), "unexpected error: {err}");
         // The file is left untouched.
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\r\na\na");
@@ -1547,9 +1516,7 @@ mod tests {
         // The bytes the write was planned against differ from what is on disk, so
         // the pre-rename validation fails — and the temp file it wrote must be
         // cleaned up rather than left behind under its predictable name.
-        let err = write_atomically(&path, "new\n", Expect::Bytes(b"planned-against\n"))
-            .unwrap_err()
-            .to_string();
+        let err = write_atomically(&path, "new\n", Expect::Bytes(b"planned-against\n")).unwrap_err().to_string();
         assert!(err.contains("changed while"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "on disk\n");
         assert!(!temp_file_present(dir.path(), "t.txt"), "temp file leaked");
@@ -1576,9 +1543,7 @@ mod tests {
         // A following line must not trigger `max + 1` overflow (which panics in
         // debug builds); it should simply be treated as non-consecutive.
         assert!(
-            strip_line_numbers("18446744073709551615\tfoo\n18446744073709551615\tbar\n", "baz\n")
-                .unwrap()
-                .is_none()
+            strip_line_numbers("18446744073709551615\tfoo\n18446744073709551615\tbar\n", "baz\n").unwrap().is_none()
         );
     }
 

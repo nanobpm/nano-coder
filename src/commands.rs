@@ -16,15 +16,27 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command { name: "/help", args: "", description: "Show this help" },
-    Command { name: "/compact", args: "[--smart|--standard] [focus]", description: "Summarize older messages to free context (optional mode and focus)" },
+    Command {
+        name: "/compact",
+        args: "[--smart|--standard] [focus]",
+        description: "Summarize older messages to free context (optional mode and focus)",
+    },
     Command { name: "/context", args: "", description: "Show context-window use and token totals" },
     Command { name: "/settings", args: "", description: "View/edit settings" },
     Command { name: "/verbosity", args: "[quiet|normal|verbose|debug]", description: "Show or set output detail" },
     Command { name: "/plan", args: "", description: "Show the agent's task plan with notes" },
-    Command { name: "/queue", args: "[list|add text|remove N...|edit N text|clear]", description: "Show or edit the queued messages" },
+    Command {
+        name: "/queue",
+        args: "[list|add text|remove N...|edit N text|clear]",
+        description: "Show or edit the queued messages",
+    },
     Command { name: "/tools", args: "", description: "List available tools" },
     Command { name: "/skills", args: "", description: "List skills the agent can load" },
-    Command { name: "/model", args: "[provider/model]", description: "Show the model and pick a new one (or switch directly)" },
+    Command {
+        name: "/model",
+        args: "[provider/model]",
+        description: "Show the model and pick a new one (or switch directly)",
+    },
     Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
@@ -156,7 +168,11 @@ fn model_suggestions(config: &Config, recents: &[String]) -> Vec<Suggestion> {
 
 /// Annotation for a `provider/default-model` row.
 fn default_note(name: &str, provider: &ProviderConfig, default_provider: &str) -> String {
-    if name == default_provider { "default provider".to_string() } else { provider_note(name, provider, default_provider) }
+    if name == default_provider {
+        "default provider".to_string()
+    } else {
+        provider_note(name, provider, default_provider)
+    }
 }
 
 /// Annotation for a bare provider row: its kind, and the default model Tab
@@ -197,9 +213,7 @@ pub fn complete_line(config: &Config, recents: &[String], line: &str) -> Option<
                 // No common progress: when the typed text is itself a
                 // candidate (e.g. the provider `ollama`), descend to the
                 // top-ranked spec under it (a recent or its default model).
-                found.iter()
-                    .find(|s| s.value.starts_with(&format!("{prefix}/")))
-                    .map(|s| s.value.clone())
+                found.iter().find(|s| s.value.starts_with(&format!("{prefix}/"))).map(|s| s.value.clone())
             }
         }
     };
@@ -314,7 +328,10 @@ mod tests {
         assert_eq!(menu("/", 200, 50).len(), COMMANDS.len());
         let rows: Vec<String> = menu("/co", 200, 50).iter().map(|r| plain(r)).collect();
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].trim_start().starts_with("/compact [--smart|--standard] [focus]") && rows[1].trim_start().starts_with("/context"));
+        assert!(
+            rows[0].trim_start().starts_with("/compact [--smart|--standard] [focus]")
+                && rows[1].trim_start().starts_with("/context")
+        );
         assert!(plain(&menu("/zz", 200, 50)[0]).contains("no matching command"));
         assert!(menu("/model gpt", 200, 50).is_empty(), "arguments hide the command menu");
         assert!(menu("hello /", 200, 50).is_empty());
@@ -350,14 +367,16 @@ mod tests {
 
     #[test]
     fn model_suggestions_hoist_current_recent_and_defaults() {
-        let config = config(r#"
+        let config = config(
+            r#"
             model = "openai/gpt-4o"
             default_provider = "openai"
             [providers.work]
             kind = "openai"
             base_url = "http://merlin.local:8000/v1"
             default_model = "gpt-oss-120b"
-        "#);
+        "#,
+        );
         let recents = vec!["ollama/qwen3:8b".to_string(), "anthropic/claude-sonnet-4-5".to_string()];
         let found = model_suggestions(&config, &recents);
         let values: Vec<&str> = found.iter().map(|s| s.value.as_str()).collect();
@@ -384,7 +403,10 @@ mod tests {
         assert_eq!(values, ["ollama/qwen3:8b", "ollama"], "recent first, then the bare provider");
         assert!(suggestions(&config, &recents, "/model zz").is_empty());
         assert!(suggestions(&config, &recents, "/model a b").is_empty(), "only the first argument completes");
-        assert!(suggestions(&config, &recents, "/compact anything").is_empty(), "free-text arguments are not suggested");
+        assert!(
+            suggestions(&config, &recents, "/compact anything").is_empty(),
+            "free-text arguments are not suggested"
+        );
         assert!(suggestions(&config, &recents, "hello world").is_empty());
     }
 
@@ -401,13 +423,15 @@ mod tests {
 
     #[test]
     fn complete_line_handles_arguments() {
-        let config = config(r#"
+        let config = config(
+            r#"
             model = "openai/gpt-4o"
             [providers.work]
             kind = "openai"
             base_url = "http://merlin.local:8000/v1"
             default_model = "gpt-oss-120b"
-        "#);
+        "#,
+        );
         let recents = vec!["ollama/qwen3:8b".to_string()];
         // Several matches extend to the common prefix first...
         assert_eq!(complete_line(&config, &recents, "/model ol").as_deref(), Some("/model ollama"));
@@ -440,10 +464,6 @@ mod tests {
         let none = suggestion_menu(&[], "/model zz", 200, 50);
         assert!(plain(&none[0]).contains("no match"));
     }
-
-
-
-
 
     #[test]
     fn help_lists_every_command() {

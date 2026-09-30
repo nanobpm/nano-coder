@@ -26,10 +26,7 @@ fn short_flag_prints_version_and_exits_zero() {
 fn preceding_value_option_does_not_swallow_version() {
     // A value-taking option must not consume `--version` as its value; the
     // early-exit flag wins and the process still prints the version.
-    let out = bin()
-        .args(["--model", "--version"])
-        .output()
-        .expect("run --model --version");
+    let out = bin().args(["--model", "--version"]).output().expect("run --model --version");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected());
 }

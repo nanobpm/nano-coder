@@ -100,9 +100,7 @@ impl Outcome {
     /// turn's messages), for finishing a turn interrupted after the call.
     pub fn reported_in(messages: &[Message]) -> Option<Self> {
         let succeeded = |id: &str| {
-            messages
-                .iter()
-                .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id) && !m.is_error)
+            messages.iter().any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id) && !m.is_error)
         };
         messages
             .iter()

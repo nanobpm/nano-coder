@@ -142,8 +142,10 @@ impl SandboxConfig {
             // the worktree's metadata and shared refs. Accept them when git ties the
             // worktree back to `cwd`: the per-worktree git dir carries a `gitdir`
             // back-pointer resolving into `cwd`.
-            let is_worktree_of_cwd =
-                dirs.iter().filter_map(|d| d.canonicalize().ok()).any(|real| worktree_backpointer_within(&real, &cwd_real));
+            let is_worktree_of_cwd = dirs
+                .iter()
+                .filter_map(|d| d.canonicalize().ok())
+                .any(|real| worktree_backpointer_within(&real, &cwd_real));
             for dir in dirs {
                 // `git rev-parse` output is influenced by a `.git` *file* in the
                 // workspace: a poisoned worktree pointer can name a git directory
@@ -269,12 +271,8 @@ impl SandboxConfig {
     /// A short description for messages to the model.
     pub fn describe(&self, cwd: &Path) -> String {
         let roots = self.writable_roots(cwd);
-        let shown: Vec<String> = roots
-            .iter()
-            .filter(|r| !r.starts_with("/dev"))
-            .take(6)
-            .map(|r| r.display().to_string())
-            .collect();
+        let shown: Vec<String> =
+            roots.iter().filter(|r| !r.starts_with("/dev")).take(6).map(|r| r.display().to_string()).collect();
         let more = roots.iter().filter(|r| !r.starts_with("/dev")).count().saturating_sub(shown.len());
         format!(
             "commands run in a {} sandbox: they can write only to {}{}{}",
@@ -312,10 +310,7 @@ fn worktree_backpointer_within(git_dir: &Path, cwd_real: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(git_dir.join("gitdir")) else {
         return false;
     };
-    Path::new(content.trim())
-        .parent()
-        .and_then(|root| root.canonicalize().ok())
-        .is_some_and(|root| root == cwd_real)
+    Path::new(content.trim()).parent().and_then(|root| root.canonicalize().ok()).is_some_and(|root| root == cwd_real)
 }
 
 /// A command prepared to run inside the sandbox. Keep it alive until spawned.
@@ -355,7 +350,9 @@ mod platform {
             "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*{allowed})\n"
         );
         if !config.network {
-            profile.push_str("(deny network-outbound (remote ip))\n(allow network-outbound (remote ip \"localhost:*\"))\n");
+            profile.push_str(
+                "(deny network-outbound (remote ip))\n(allow network-outbound (remote ip \"localhost:*\"))\n",
+            );
         }
         profile
     }
@@ -411,7 +408,9 @@ mod platform {
 
     fn abi() -> i64 {
         // SAFETY: querying the ABI version takes no pointers.
-        unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, CREATE_RULESET_VERSION) }
+        unsafe {
+            libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, CREATE_RULESET_VERSION)
+        }
     }
 
     /// Build a ruleset in the parent, so the child only needs two syscalls
@@ -419,7 +418,9 @@ mod platform {
     fn ruleset(config: &SandboxConfig, roots: &[PathBuf]) -> Result<OwnedFd, String> {
         let abi = abi();
         if abi < 1 {
-            return Err("sandbox unavailable: this kernel does not support Landlock (Linux 5.13+ with Landlock enabled)".into());
+            return Err(
+                "sandbox unavailable: this kernel does not support Landlock (Linux 5.13+ with Landlock enabled)".into(),
+            );
         }
         // Without `REFER` (Landlock ABI 2, Linux 5.19+) cross-directory rename/link
         // operations are not confined, and without `TRUNCATE` (Landlock ABI 3, Linux
@@ -429,7 +430,16 @@ mod platform {
         if abi < 3 {
             return Err("sandbox unavailable: enforcing the write boundary needs Landlock ABI 3 (Linux 6.2+); on older kernels cross-directory renames and file truncation cannot be confined".into());
         }
-        let mut fs = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR | MAKE_DIR | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_BLOCK | MAKE_SYM;
+        let mut fs = WRITE_FILE
+            | REMOVE_DIR
+            | REMOVE_FILE
+            | MAKE_CHAR
+            | MAKE_DIR
+            | MAKE_REG
+            | MAKE_SOCK
+            | MAKE_FIFO
+            | MAKE_BLOCK
+            | MAKE_SYM;
         if abi >= 2 {
             fs |= REFER;
         }
@@ -453,7 +463,10 @@ mod platform {
         } else if abi >= 4 {
             BIND_TCP | CONNECT_TCP
         } else {
-            return Err("sandbox unavailable: blocking the network needs Landlock ABI 4 (Linux 6.7+); set network = true".into());
+            return Err(
+                "sandbox unavailable: blocking the network needs Landlock ABI 4 (Linux 6.7+); set network = true"
+                    .into(),
+            );
         };
         let attr = RulesetAttr { handled_access_fs: fs, handled_access_net: net };
         let size = if abi >= 4 { std::mem::size_of::<RulesetAttr>() } else { std::mem::size_of::<u64>() };
@@ -487,10 +500,20 @@ mod platform {
             let rule = PathBeneathAttr { allowed_access: access, parent_fd: parent.as_raw_fd() };
             // SAFETY: rule outlives the call; both descriptors are open.
             let status = unsafe {
-                libc::syscall(libc::SYS_landlock_add_rule, ruleset.as_raw_fd(), RULE_PATH_BENEATH, &rule as *const PathBeneathAttr, 0u32)
+                libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset.as_raw_fd(),
+                    RULE_PATH_BENEATH,
+                    &rule as *const PathBeneathAttr,
+                    0u32,
+                )
             };
             if status < 0 {
-                return Err(format!("sandbox: landlock_add_rule {}: {}", root.display(), std::io::Error::last_os_error()));
+                return Err(format!(
+                    "sandbox: landlock_add_rule {}: {}",
+                    root.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
         }
         Ok(ruleset)
@@ -634,7 +657,10 @@ mod tests {
     fn read_only_mode_blocks_workspace_writes() {
         let workspace = outside_dir();
         let config = SandboxConfig { mode: SandboxMode::ReadOnly, ..Default::default() };
-        let Some((_, text)) = run(&config, workspace.path(), "echo hi > inside.txt; ls >/dev/null && echo listed") else { return };
+        let Some((_, text)) = run(&config, workspace.path(), "echo hi > inside.txt; ls >/dev/null && echo listed")
+        else {
+            return;
+        };
         assert!(text.contains("listed"), "{text}");
         assert!(!workspace.path().join("inside.txt").exists(), "{text}");
         assert!(!config.allows_write(Path::new("inside.txt"), workspace.path()));
@@ -649,7 +675,11 @@ mod tests {
             writable: vec![extra.path().display().to_string()],
             ..Default::default()
         };
-        let Some((ok, text)) = run(&config, workspace.path(), &format!("echo hi > \"{}/f.txt\"", extra.path().display())) else { return };
+        let Some((ok, text)) =
+            run(&config, workspace.path(), &format!("echo hi > \"{}/f.txt\"", extra.path().display()))
+        else {
+            return;
+        };
         assert!(ok, "{text}");
         assert!(extra.path().join("f.txt").exists());
     }
@@ -681,8 +711,14 @@ mod tests {
             assert!(ws_roots.iter().any(|r| r == &fd_real), "workspace mode dropped /dev/fd: {ws_roots:?}");
         }
         // …but never the host-shared `/dev/shm` / `/dev/pts` trees, in any mode.
-        assert!(!ws_roots.iter().any(|r| r == Path::new("/dev/shm")), "workspace mode granted shared /dev/shm: {ws_roots:?}");
-        assert!(!ws_roots.iter().any(|r| r == Path::new("/dev/pts")), "workspace mode granted shared /dev/pts: {ws_roots:?}");
+        assert!(
+            !ws_roots.iter().any(|r| r == Path::new("/dev/shm")),
+            "workspace mode granted shared /dev/shm: {ws_roots:?}"
+        );
+        assert!(
+            !ws_roots.iter().any(|r| r == Path::new("/dev/pts")),
+            "workspace mode granted shared /dev/pts: {ws_roots:?}"
+        );
         assert!(!ws.allows_write(Path::new("/dev/shm/x"), workspace.path()));
     }
 

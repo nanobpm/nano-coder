@@ -64,11 +64,7 @@ enum Activity {
 
 impl DemoStats {
     fn percent(&self) -> f64 {
-        if self.window == 0 {
-            0.0
-        } else {
-            (self.tokens as f64 / self.window as f64) * 100.0
-        }
+        if self.window == 0 { 0.0 } else { (self.tokens as f64 / self.window as f64) * 100.0 }
     }
 }
 
@@ -96,27 +92,18 @@ fn format_tokens(n: usize) -> String {
 /// Build the status line as styled ratatui spans. When a steer is being typed
 /// we show that instead, mirroring the production behaviour.
 fn status_line(stats: &DemoStats) -> Line<'static> {
-    let bg = Style::default()
-        .bg(Color::Indexed(236))
-        .fg(Color::Indexed(250));
+    let bg = Style::default().bg(Color::Indexed(236)).fg(Color::Indexed(250));
 
     if let Some(text) = &stats.steer {
-        return Line::from(vec![Span::styled(
-            format!(" › {text}"),
-            bg.fg(Color::Indexed(255)),
-        )])
-        .style(bg);
+        return Line::from(vec![Span::styled(format!(" › {text}"), bg.fg(Color::Indexed(255)))]).style(bg);
     }
 
     let percent = stats.percent();
     let threshold = stats.auto_compact.map(|t| t * 100.0);
     let filled = ((percent / 10.0).round() as usize).min(10);
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
-    let model = if stats.model.is_empty() {
-        stats.provider.clone()
-    } else {
-        format!("{}/{}", stats.provider, stats.model)
-    };
+    let model =
+        if stats.model.is_empty() { stats.provider.clone() } else { format!("{}/{}", stats.provider, stats.model) };
     let compact = match threshold {
         Some(t) => format!(" auto-compact {t:.0}% "),
         None => " auto-compact off ".to_string(),
@@ -128,19 +115,12 @@ fn status_line(stats: &DemoStats) -> Line<'static> {
 
     let sep = Span::styled("│", bg);
     let spans = vec![
-        Span::styled(
-            format!(" {model} "),
-            bg.fg(Color::Indexed(255)).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!(" {model} "), bg.fg(Color::Indexed(255)).add_modifier(Modifier::BOLD)),
         sep.clone(),
         Span::styled(format!(" {} ", stats.cwd), bg),
         sep.clone(),
         Span::styled(
-            format!(
-                " ctx {}/{} {percent:.0}% ",
-                format_tokens(stats.tokens),
-                format_tokens(stats.window)
-            ),
+            format!(" ctx {}/{} {percent:.0}% ", format_tokens(stats.tokens), format_tokens(stats.window)),
             bg,
         ),
         sep.clone(),
@@ -163,12 +143,7 @@ fn main() -> io::Result<()> {
     // `?` error, and (via ratatui's panic-safe backend teardown aside) on the
     // ordinary error paths — before propagating any failure to the caller.
     let backend = CrosstermBackend::new(stdout());
-    let terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(1),
-        },
-    );
+    let terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(1) });
 
     let result = terminal.and_then(|mut terminal| {
         let loop_result = run(&mut terminal);
@@ -214,11 +189,8 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<(
             chunk += 1;
             stats.tokens += 37;
             stats.messages = 1 + chunk / 8;
-            stats.activity = if chunk.is_multiple_of(6) {
-                Activity::Tool("read_file".to_string())
-            } else {
-                Activity::Thinking
-            };
+            stats.activity =
+                if chunk.is_multiple_of(6) { Activity::Tool("read_file".to_string()) } else { Activity::Thinking };
             let line = Line::from(format!(
                 "assistant › streamed token chunk #{chunk} — resize the window; the bar stays pinned and clean"
             ))
@@ -231,8 +203,7 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<(
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(k) => {
-                    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char('c'));
+                    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c'));
                     if ctrl_c {
                         break;
                     }

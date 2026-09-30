@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{HttpTransport, ResolvedProvider, StreamAction};
 use crate::llm::{
-    ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter, TokenUsage, ToolCall,
-    report_whole,
+    ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter,
+    TokenUsage, ToolCall, report_whole,
 };
 
 pub struct OpenAiClient {
@@ -17,9 +17,7 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
-        Ok(Self {
-            transport: HttpTransport::new(provider)?,
-        })
+        Ok(Self { transport: HttpTransport::new(provider)? })
     }
 
     pub fn build_body(&self, request: &ChatRequest<'_>) -> Value {
@@ -29,34 +27,34 @@ impl OpenAiClient {
 
 /// Chat Completions request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
-        let provider = transport.provider();
-        let mut body = json!({
-            "model": provider.model,
-            "messages": request.messages.iter().map(|m| encode_message(m, provider.replay_reasoning)).collect::<Vec<_>>(),
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    })
+    let provider = transport.provider();
+    let mut body = json!({
+        "model": provider.model,
+        "messages": request.messages.iter().map(|m| encode_message(m, provider.replay_reasoning)).collect::<Vec<_>>(),
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
                 })
-                .collect();
-        }
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(max_tokens) = request.max_tokens {
-            body[provider.max_tokens_param.as_str()] = json!(max_tokens);
-        }
-        transport.finish_body(body)
+            })
+            .collect();
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body[provider.max_tokens_param.as_str()] = json!(max_tokens);
+    }
+    transport.finish_body(body)
 }
 
 fn encode_message(message: &Message, replay_reasoning: bool) -> Value {
@@ -96,29 +94,21 @@ fn encode_message(message: &Message, replay_reasoning: bool) -> Value {
 const REASONING_BLOCK: &str = "reasoning_content";
 
 fn reasoning_blocks(replay: bool, reasoning: &str) -> Vec<Value> {
-    if replay && !reasoning.is_empty() {
-        vec![json!({ "type": REASONING_BLOCK, "text": reasoning })]
-    } else {
-        vec![]
-    }
+    if replay && !reasoning.is_empty() { vec![json!({ "type": REASONING_BLOCK, "text": reasoning })] } else { vec![] }
 }
 
 /// Parse a Chat Completions response.
 /// `replay` keeps the reasoning in `thinking_blocks` so it can be sent back.
 pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
-    let choice = value
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .ok_or_else(|| anyhow!("response has no choices: {value}"))?;
+    let choice =
+        value.get("choices").and_then(|c| c.get(0)).ok_or_else(|| anyhow!("response has no choices: {value}"))?;
     let message = choice.get("message").cloned().unwrap_or(Value::Null);
     let content = match message.get("content") {
         Some(Value::String(text)) => text.clone(),
         // Some servers return content parts.
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
+        Some(Value::Array(parts)) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("")
+        }
         _ => String::new(),
     };
     let (content, inline_thinking) = ThinkSplitter::split_all(&content);
@@ -153,11 +143,7 @@ pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
                         .filter(|id| !id.is_empty())
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("call_{index}"));
-                    let name = function
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+                    let name = function.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
                     ToolCall::from_raw_arguments(id, name, &raw, None)
                 })
                 .collect()
@@ -167,10 +153,7 @@ pub fn parse_response(value: &Value, replay: bool) -> Result<LLMResponse> {
         content,
         tool_calls,
         usage: parse_usage(value),
-        stop_reason: choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        stop_reason: choice.get("finish_reason").and_then(Value::as_str).map(str::to_string),
         thinking,
         thinking_blocks,
     })
@@ -201,10 +184,7 @@ fn reasoning_of(value: &Value) -> Option<&str> {
 /// `reasoning` fallback). Replay must echo this verbatim, so a value the
 /// response never supplied under `reasoning_content` must not be sent back.
 fn reasoning_content_of(value: &Value) -> Option<&str> {
-    value
-        .get(REASONING_BLOCK)
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
+    value.get(REASONING_BLOCK).and_then(Value::as_str).filter(|text| !text.is_empty())
 }
 
 /// Accumulates a streamed Chat Completions response.
@@ -373,10 +353,16 @@ impl LLMClient for OpenAiClient {
         }
         let api_key = provider.api_key.clone();
         let url = format!("{}/chat/completions", provider.base_url);
-        stream_chat(&self.transport, &url, self.build_body(request), |builder| match &api_key {
-            Some(key) => builder.bearer_auth(key),
-            None => builder,
-        }, sink)
+        stream_chat(
+            &self.transport,
+            &url,
+            self.build_body(request),
+            |builder| match &api_key {
+                Some(key) => builder.bearer_auth(key),
+                None => builder,
+            },
+            sink,
+        )
         .await
     }
 
@@ -401,10 +387,8 @@ impl LLMClient for OpenAiClient {
         }
         // OpenAI shape `{data:[{id}]}`; GitHub Models returns a bare array.
         let items = value.get("data").unwrap_or(&value).as_array().cloned().unwrap_or_default();
-        let mut models: Vec<String> = items
-            .iter()
-            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-            .collect();
+        let mut models: Vec<String> =
+            items.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string)).collect();
         models.sort();
         Ok(models)
     }
@@ -468,14 +452,18 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
 async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Option<DetectedWindow> {
     let same = |name: &str| name == model || name.strip_suffix(":latest") == Some(model);
     if let Some(ps) = probe(transport, reqwest::Method::GET, &format!("{root}/api/ps"), None).await {
-        let loaded = ps.get("models").and_then(Value::as_array).into_iter().flatten().find(|m| {
-            ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same))
-        });
+        let loaded = ps
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|m| ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same)));
         if let Some(tokens) = loaded.and_then(|m| m.get("context_length")).and_then(as_tokens) {
             return Some(DetectedWindow { tokens, source: "Ollama /api/ps context_length".into() });
         }
     }
-    let show = probe(transport, reqwest::Method::POST, &format!("{root}/api/show"), Some(json!({ "model": model }))).await?;
+    let show =
+        probe(transport, reqwest::Method::POST, &format!("{root}/api/show"), Some(json!({ "model": model }))).await?;
     let parameters = show.get("parameters").and_then(Value::as_str)?;
     parameters
         .lines()
@@ -506,10 +494,11 @@ async fn probe(transport: &HttpTransport, method: reqwest::Method, url: &str, bo
 /// ds4, which accepts aliases) is taken to be serving it.
 fn model_entry<'a>(models: &'a Value, model: &str) -> Option<&'a Value> {
     let items = models.get("data").unwrap_or(models).as_array()?;
-    items
-        .iter()
-        .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
-        .or(if items.len() == 1 { items.first() } else { None })
+    items.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model)).or(if items.len() == 1 {
+        items.first()
+    } else {
+        None
+    })
 }
 
 fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
@@ -524,7 +513,10 @@ fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
     .iter()
     .find_map(|pointer| {
         let tokens = entry.pointer(pointer).and_then(as_tokens)?;
-        Some(DetectedWindow { tokens, source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")) })
+        Some(DetectedWindow {
+            tokens,
+            source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")),
+        })
     })
 }
 
@@ -569,7 +561,12 @@ mod tests {
     fn trajectory_data_is_never_sent() {
         let logged = Message {
             thinking: "private reasoning".into(),
-            usage: Some(crate::llm::TokenUsage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, aic: Some(0.5) }),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                aic: Some(0.5),
+            }),
             duration_ms: Some(1234),
             ..Message::assistant("answer")
         };
@@ -584,7 +581,13 @@ mod tests {
             Message::user("what time is it?"),
             Message::assistant_with_tools(
                 "",
-                vec![ToolCall { id: "c1".into(), name: "get_time".into(), arguments: json!({}), item_id: None, malformed_arguments: None }],
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "get_time".into(),
+                    arguments: json!({}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
             ),
             Message::tool_result("c1", "get_time", "noon"),
         ]
@@ -615,24 +618,25 @@ mod tests {
     fn replay_ignores_generic_reasoning_field() {
         // With replay enabled but only the generic `reasoning` field present,
         // the value is shown as thinking but never stored as a replay block.
-        let response = parse_response(
-            &json!({ "choices": [{"message": {"content": "hi", "reasoning": "generic"}}] }),
-            true,
-        )
-        .unwrap();
+        let response =
+            parse_response(&json!({ "choices": [{"message": {"content": "hi", "reasoning": "generic"}}] }), true)
+                .unwrap();
         assert_eq!(response.thinking, "generic");
         assert!(response.thinking_blocks.is_empty());
     }
 
     #[test]
     fn parses_tool_calls_and_bad_arguments() {
-        let response = parse_response(&json!({
-            "choices": [{"finish_reason": "tool_calls", "message": {"content": null, "tool_calls": [
-                {"id": "a", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}},
-                {"id": "b", "type": "function", "function": {"name": "bash", "arguments": "{oops"}}
-            ]}}],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-        }), false)
+        let response = parse_response(
+            &json!({
+                "choices": [{"finish_reason": "tool_calls", "message": {"content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}},
+                    {"id": "b", "type": "function", "function": {"name": "bash", "arguments": "{oops"}}
+                ]}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            }),
+            false,
+        )
         .unwrap();
         assert_eq!(response.tool_calls[0].arguments["command"], "ls");
         // Bad JSON is preserved as dedicated metadata, not folded into the
@@ -645,18 +649,24 @@ mod tests {
 
     #[test]
     fn parses_copilot_aic_from_response() {
-        let response = parse_response(&json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18},
-            "copilot_usage": {"total_nano_aiu": 11_600_000}
-        }), false)
+        let response = parse_response(
+            &json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18},
+                "copilot_usage": {"total_nano_aiu": 11_600_000}
+            }),
+            false,
+        )
         .unwrap();
         assert_eq!(response.usage.unwrap().aic, Some(0.0116));
         // Non-Copilot responses carry no credits.
-        let plain = parse_response(&json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18}
-        }), false)
+        let plain = parse_response(
+            &json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 10, "total_tokens": 18}
+            }),
+            false,
+        )
         .unwrap();
         assert_eq!(plain.usage.unwrap().aic, None);
     }
@@ -687,11 +697,8 @@ mod tests {
     #[tokio::test]
     async fn retries_truncated_success_bodies() {
         let ok = json!({"choices":[{"message":{"content":"whole"}}]}).to_string();
-        let (url, captured) = test_server::serve(vec![
-            (200, "x-truncate: 1\r\n", r#"{"choices":[{"mess"#.into()),
-            (200, "", ok),
-        ])
-        .await;
+        let (url, captured) =
+            test_server::serve(vec![(200, "x-truncate: 1\r\n", r#"{"choices":[{"mess"#.into()), (200, "", ok)]).await;
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
@@ -795,18 +802,12 @@ mod tests {
         // terminating `[DONE]`. Retrying here would re-request and duplicate the
         // already-emitted output, so the error must surface instead and no second
         // request may be made. This guards the `emitted == true` branch.
-        let mut truncated = format!(
-            "data: {}\n\n",
-            json!({"choices":[{"delta":{"role":"assistant","content":"hello"}}]})
-        );
+        let mut truncated =
+            format!("data: {}\n\n", json!({"choices":[{"delta":{"role":"assistant","content":"hello"}}]}));
         // A second event begins but is severed before it is complete.
         truncated.push_str(r#"data: {"choices":[{"delta":{"content":" wor"#);
-        let (url, captured) = test_server::serve(vec![(
-            200,
-            "content-type: text/event-stream\r\nx-truncate: 1\r\n",
-            truncated,
-        )])
-        .await;
+        let (url, captured) =
+            test_server::serve(vec![(200, "content-type: text/event-stream\r\nx-truncate: 1\r\n", truncated)]).await;
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hi")];
         let seen = std::sync::Mutex::new(Vec::new());
@@ -918,7 +919,16 @@ mod tests {
             .unwrap();
         assert_eq!(response.thinking, "Let me check.more");
         assert_eq!(response.content, "Checking");
-        assert_eq!(response.tool_calls, vec![ToolCall { id: "call_a".into(), name: "bash".into(), arguments: json!({"command": "ls"}), item_id: None, malformed_arguments: None }]);
+        assert_eq!(
+            response.tool_calls,
+            vec![ToolCall {
+                id: "call_a".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+                item_id: None,
+                malformed_arguments: None
+            }]
+        );
         assert_eq!(response.usage.unwrap().total_tokens, 17);
         assert_eq!(response.stop_reason.as_deref(), Some("tool_calls"));
         assert_eq!(*seen.lock().unwrap(), vec!["R:Let me ", "R:check.", "R:more", "T:Checking"]);
@@ -951,10 +961,14 @@ mod tests {
             thinking_blocks: response.thinking_blocks.clone(),
             ..Message::assistant(&response.content)
         };
-        let history = [Message::user("hello"), assistant, Message {
-            thinking_blocks: vec![json!({"type": "thinking", "thinking": "t", "signature": "s"})],
-            ..Message::assistant("done")
-        }];
+        let history = [
+            Message::user("hello"),
+            assistant,
+            Message {
+                thinking_blocks: vec![json!({"type": "thinking", "thinking": "t", "signature": "s"})],
+                ..Message::assistant("done")
+            },
+        ];
         let request = ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None };
         let body = client.build_body(&request);
         assert_eq!(body["messages"][1]["reasoning_content"], "Need ls.");
@@ -966,7 +980,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_falls_back_to_json_and_splits_think_tags() {
-        let ok = json!({"choices":[{"message":{"content":"<think>hmm</think>\nhi"},"finish_reason":"stop"}]}).to_string();
+        let ok =
+            json!({"choices":[{"message":{"content":"<think>hmm</think>\nhi"},"finish_reason":"stop"}]}).to_string();
         let (url, _) = test_server::serve(vec![(200, "", ok)]).await;
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
@@ -977,12 +992,19 @@ mod tests {
         assert_eq!((response.content.as_str(), response.thinking.as_str()), ("hi", "hmm"));
     }
 
-    async fn detect(provider_name: &str, responses: Vec<(u16, &'static str, String)>) -> (Option<DetectedWindow>, Vec<String>) {
+    async fn detect(
+        provider_name: &str,
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (Option<DetectedWindow>, Vec<String>) {
         let (url, captured) = test_server::serve(responses).await;
         let mut user = HashMap::new();
         user.insert(
             provider_name.to_string(),
-            ProviderConfig { kind: Some(ProviderKind::Openai), base_url: Some(format!("{url}/v1")), ..Default::default() },
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
         );
         let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
         let found = OpenAiClient::new(resolved).unwrap().detect_context_window().await;
@@ -1025,7 +1047,8 @@ mod tests {
         // probed when the provider is named `llamacpp`.
         let models = json!({"data": [{"id": "qwen3:8b"}]});
         let props = json!({"default_generation_settings": {"n_ctx": 65536}});
-        let (found, paths) = detect("llamacpp", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        let (found, paths) =
+            detect("llamacpp", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
         assert_eq!(found, window(65536, "llama.cpp /props n_ctx"));
         assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
     }
@@ -1036,7 +1059,8 @@ mod tests {
         // own API even when the `/models` owner is not `organization_owner`.
         let models = json!({"data": [{"id": "qwen3:8b"}]});
         let listed = json!({"data": [{"id": "qwen3:8b", "loaded_context_length": 12288}]});
-        let (found, paths) = detect("lmstudio", vec![(200, "", models.to_string()), (200, "", listed.to_string())]).await;
+        let (found, paths) =
+            detect("lmstudio", vec![(200, "", models.to_string()), (200, "", listed.to_string())]).await;
         assert_eq!(found, window(12288, "LM Studio loaded_context_length"));
         assert_eq!(paths, ["/v1/models", "/api/v0/models"]);
     }

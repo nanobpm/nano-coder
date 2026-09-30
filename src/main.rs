@@ -3,14 +3,14 @@
 use anyhow::Result;
 use chrono::Local;
 use serde_json::json;
-use std::env;
 use std::collections::VecDeque;
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-mod agent;
 mod acp;
+mod agent;
 mod bash;
 mod commands;
 mod config;
@@ -22,20 +22,20 @@ mod history;
 mod hooks;
 mod input_history;
 mod instructions;
-mod plan;
 mod lineedit;
-mod queue;
-mod recents;
 mod llm;
 mod mode;
 mod output;
 mod permissions;
+mod plan;
 mod providers;
 mod question;
+mod queue;
+mod recents;
 mod reminders;
 mod sandbox;
-mod settings;
 mod session;
+mod settings;
 mod shell;
 mod skills;
 mod status;
@@ -49,14 +49,9 @@ use tools::ToolDefinition;
 
 fn register_builtin_tools(agent: &mut Agent) {
     // get_time tool
-    let time_def = ToolDefinition::new(
-        "get_time",
-        "Get the current date and time",
-        json!({ "type": "object", "properties": {} }),
-    );
-    agent.tools().register(time_def, Box::new(|_| {
-        Ok(json!({ "time": Local::now().to_string() }))
-    }));
+    let time_def =
+        ToolDefinition::new("get_time", "Get the current date and time", json!({ "type": "object", "properties": {} }));
+    agent.tools().register(time_def, Box::new(|_| Ok(json!({ "time": Local::now().to_string() }))));
 
     // echo tool
     let echo_def = ToolDefinition::new(
@@ -70,10 +65,13 @@ fn register_builtin_tools(agent: &mut Agent) {
             "required": ["text"]
         }),
     );
-    agent.tools().register(echo_def, Box::new(|args| {
-        let text = args["text"].as_str().unwrap_or("");
-        Ok(json!({ "echo": text }))
-    }));
+    agent.tools().register(
+        echo_def,
+        Box::new(|args| {
+            let text = args["text"].as_str().unwrap_or("");
+            Ok(json!({ "echo": text }))
+        }),
+    );
 
     files::register(agent.tools());
 
@@ -85,9 +83,7 @@ fn register_builtin_tools(agent: &mut Agent) {
         shared_output_dir: Some(agent.spill_dir_handle()),
         ..Default::default()
     };
-    agent.tools().register(bash::definition(), Box::new(move |args| {
-        Ok(json!(bash::run(&bash_config, &args)))
-    }));
+    agent.tools().register(bash::definition(), Box::new(move |args| Ok(json!(bash::run(&bash_config, &args)))));
 
     // question tool: blocks until the turn loop answers (see question.rs).
     // Headless (ACP) sessions have no one to answer, so it errors instead.
@@ -113,37 +109,40 @@ fn register_hooks(agent: &mut Agent) {
         HookEvent::AfterToolCall,
     ] {
         let event_name = event.to_string();
-        agent.hooks().register(event.clone(), Box::new(move |ctx| {
-            if ui::verbosity() < ui::Verbosity::Debug {
-                return;
-            }
-            match ctx.event {
-                HookEvent::BeforeContextLoad => {
-                    let input = ctx.data.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
-                    ui::log(&format!("[hook] {} - user: {}", event_name, input));
+        agent.hooks().register(
+            event.clone(),
+            Box::new(move |ctx| {
+                if ui::verbosity() < ui::Verbosity::Debug {
+                    return;
                 }
-                HookEvent::AfterContextLoad => {
-                    let count = ctx.data.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                    ui::log(&format!("[hook] {} - messages: {}", event_name, count));
+                match ctx.event {
+                    HookEvent::BeforeContextLoad => {
+                        let input = ctx.data.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
+                        ui::log(&format!("[hook] {} - user: {}", event_name, input));
+                    }
+                    HookEvent::AfterContextLoad => {
+                        let count = ctx.data.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                        ui::log(&format!("[hook] {} - messages: {}", event_name, count));
+                    }
+                    HookEvent::BeforeLLMSend => {
+                        let iter = ctx.data.get("iteration").and_then(|v| v.as_i64()).unwrap_or(0);
+                        ui::log(&format!("[hook] {} - iteration: {}", event_name, iter));
+                    }
+                    HookEvent::AfterLLMResponse => {
+                        let has_tools = ctx.data.get("has_tool_calls").and_then(|v| v.as_bool()).unwrap_or(false);
+                        ui::log(&format!("[hook] {} - tool_calls: {}", event_name, has_tools));
+                    }
+                    HookEvent::BeforeToolCall => {
+                        let name = ctx.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                        ui::log(&format!("[hook] {} - tool: {}", event_name, name));
+                    }
+                    HookEvent::AfterToolCall => {
+                        let name = ctx.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                        ui::log(&format!("[hook] {} - tool: {}", event_name, name));
+                    }
                 }
-                HookEvent::BeforeLLMSend => {
-                    let iter = ctx.data.get("iteration").and_then(|v| v.as_i64()).unwrap_or(0);
-                    ui::log(&format!("[hook] {} - iteration: {}", event_name, iter));
-                }
-                HookEvent::AfterLLMResponse => {
-                    let has_tools = ctx.data.get("has_tool_calls").and_then(|v| v.as_bool()).unwrap_or(false);
-                    ui::log(&format!("[hook] {} - tool_calls: {}", event_name, has_tools));
-                }
-                HookEvent::BeforeToolCall => {
-                    let name = ctx.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-                    ui::log(&format!("[hook] {} - tool: {}", event_name, name));
-                }
-                HookEvent::AfterToolCall => {
-                    let name = ctx.data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-                    ui::log(&format!("[hook] {} - tool: {}", event_name, name));
-                }
-            }
-        }));
+            }),
+        );
     }
 }
 
@@ -459,10 +458,8 @@ impl Terminal {
         // or the next `request_line` would queue a second concurrent reader
         // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
         // is emitted the same way and belongs in this set.
-        if !matches!(
-            input,
-            TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode
-        ) {
+        if !matches!(input, TermInput::Interrupt | TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode)
+        {
             self.outstanding = false;
         }
         input
@@ -684,11 +681,8 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     } else {
         None
     };
-    let choice = Select::new()
-        .with_prompt(sanitize_terminal_text(&q.question))
-        .items(&labels)
-        .default(0)
-        .interact_opt()?;
+    let choice =
+        Select::new().with_prompt(sanitize_terminal_text(&q.question)).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -710,10 +704,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
 /// repaint until every picker (orphaned or not) has released the terminal; in
 /// the common case the lock is already free, so the redraw runs at once.
 /// Spawned so the turn loop is never blocked waiting on an away user.
-fn deferred_frame_resize(
-    renderer: &std::sync::Arc<ui::Renderer>,
-    picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-) {
+fn deferred_frame_resize(renderer: &std::sync::Arc<ui::Renderer>, picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>) {
     let renderer = renderer.clone();
     tokio::spawn(async move {
         let _guard = picker_lock.lock_owned().await;
@@ -1013,7 +1004,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             out.push(format!("System prompt: {} tokens", system_tokens));
             let files = agent.project_instruction_files();
             if files.is_empty() {
-                out.push("Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)".to_string());
+                out.push(
+                    "Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)".to_string(),
+                );
             } else {
                 out.push(format!("Instructions: {}", files.join(", ")));
             }
@@ -1024,7 +1017,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if let Some((done, total)) = stats.plan {
                 out.push(format!("Plan:         {done}/{total} done (/plan to show it)"));
             }
-            out.push(format!("Session:      {} input, {} output tokens", stats.session_input_tokens, stats.session_output_tokens));
+            out.push(format!(
+                "Session:      {} input, {} output tokens",
+                stats.session_input_tokens, stats.session_output_tokens
+            ));
             if let Some(aic) = stats.session_aic {
                 out.push(format!("AI Credits:   {aic:.2} used this session"));
             }
@@ -1037,9 +1033,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 )),
                 None => out.push("Auto-compact: off".to_string()),
             }
-            out.push(format!("Compaction:   {} mode (/compact --smart or --standard overrides once)", agent.config().compaction_mode.as_str()));
+            out.push(format!(
+                "Compaction:   {} mode (/compact --smart or --standard overrides once)",
+                agent.config().compaction_mode.as_str()
+            ));
             if stats.history_searches + stats.history_reads > 0 {
-                out.push(format!("History:      {} search(es), {} read(s) this session", stats.history_searches, stats.history_reads));
+                out.push(format!(
+                    "History:      {} search(es), {} read(s) this session",
+                    stats.history_searches, stats.history_reads
+                ));
             }
             out.push(format!("(context window {})", agent.context_window_with_source().1));
             terminal.renderer.print_block(&out.join("\n"));
@@ -1085,7 +1087,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let skills = agent.skills();
             let mut out: Vec<String> = Vec::new();
             if skills.is_empty() {
-                out.push(format!("No skills found (looked in {}, ai.lock and {}).", agent.config().skills.dirs.join(", "), agent.config().skills.user_dirs.join(", ")));
+                out.push(format!(
+                    "No skills found (looked in {}, ai.lock and {}).",
+                    agent.config().skills.dirs.join(", "),
+                    agent.config().skills.user_dirs.join(", ")
+                ));
             }
             for skill in &skills.skills {
                 out.push(format!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display()));
@@ -1123,7 +1129,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // interactive picker would race it for keystrokes.
             terminal.renderer.print_block(&format!(
                 "Model: {} (provider {}, spec {:?})\n(read-only: run /model again at the prompt to switch)",
-                agent.model_name(), agent.provider_name(), agent.config().model
+                agent.model_name(),
+                agent.provider_name(),
+                agent.config().model
             ));
             Ok(true)
         }
@@ -1131,7 +1139,12 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // The picker reads keystrokes from stdin and draws on stderr, so it
             // needs both to be terminals; piped input/output just gets the
             // current model.
-            terminal.renderer.print_block(&format!("Model: {} (provider {}, spec {:?})", agent.model_name(), agent.provider_name(), agent.config().model));
+            terminal.renderer.print_block(&format!(
+                "Model: {} (provider {}, spec {:?})",
+                agent.model_name(),
+                agent.provider_name(),
+                agent.config().model
+            ));
             Ok(true)
         }
         "/model" => {
@@ -1144,16 +1157,28 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent);
-                terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
+                terminal.renderer.print_block(&format!(
+                    "Model set to {} (provider {})",
+                    agent.model_name(),
+                    agent.provider_name()
+                ));
             } else {
-                terminal.renderer.print_block(&format!("Model unchanged: {} (provider {})", agent.model_name(), agent.provider_name()));
+                terminal.renderer.print_block(&format!(
+                    "Model unchanged: {} (provider {})",
+                    agent.model_name(),
+                    agent.provider_name()
+                ));
             }
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
             agent.set_model(cmd["/model ".len()..].trim()).await?;
             terminal.model_switched(agent);
-            terminal.renderer.print_block(&format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name()));
+            terminal.renderer.print_block(&format!(
+                "Model set to {} (provider {})",
+                agent.model_name(),
+                agent.provider_name()
+            ));
             Ok(true)
         }
         "/providers" => {
@@ -1225,7 +1250,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 Ok(level) => {
                     ui::set_verbosity(level);
                     agent.config_mut().verbosity = level;
-                    terminal.renderer.print_block(&format!("Verbosity set to {level} ({}); /settings saves it", level.describe()));
+                    terminal
+                        .renderer
+                        .print_block(&format!("Verbosity set to {level} ({}); /settings saves it", level.describe()));
                 }
                 Err(e) => terminal.renderer.print_block(&e),
             }
@@ -1330,9 +1357,7 @@ fn parse_args() -> Result<Args> {
             "--verbosity" | "-v" => {
                 args.verbosity = Some(value("--verbosity")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
             }
-            "--sandbox" => {
-                args.sandbox = Some(value("--sandbox")?.parse().map_err(|e: String| anyhow::anyhow!(e))?)
-            }
+            "--sandbox" => args.sandbox = Some(value("--sandbox")?.parse().map_err(|e: String| anyhow::anyhow!(e))?),
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
             "-V" | "--version" => {
@@ -1378,7 +1403,8 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(model) = args.model.clone().or_else(|| env::var("AGENTIC_HARNESS_MODEL").ok().filter(|m| !m.is_empty())) {
+    if let Some(model) = args.model.clone().or_else(|| env::var("AGENTIC_HARNESS_MODEL").ok().filter(|m| !m.is_empty()))
+    {
         config.model = model;
     }
 
@@ -1386,7 +1412,11 @@ async fn main() -> Result<()> {
         config.verbosity = level;
     }
     let env_sandbox = env::var("NANO_CODER_SANDBOX").ok().filter(|m| !m.is_empty());
-    if let Some(mode) = env_sandbox.map(|m| m.parse::<sandbox::SandboxMode>()).transpose().map_err(|e| anyhow::anyhow!("NANO_CODER_SANDBOX: {e}"))? {
+    if let Some(mode) = env_sandbox
+        .map(|m| m.parse::<sandbox::SandboxMode>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("NANO_CODER_SANDBOX: {e}"))?
+    {
         config.sandbox.mode = mode;
     }
     if let Some(mode) = args.sandbox {
@@ -1489,20 +1519,23 @@ async fn main() -> Result<()> {
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = Arc::new(Mutex::new(recents::load(&recents_path)));
         let view = {
-            let context = Arc::new(Mutex::new(lineedit::EditContext { config: agent.config().clone(), recents: recents.clone() }));
+            let context = Arc::new(Mutex::new(lineedit::EditContext {
+                config: agent.config().clone(),
+                recents: recents.clone(),
+            }));
             lineedit::EditView::shared(status.clone(), context)
         };
         if frame_mode {
             // The app-owned frame renderer draws the editor row itself; route
             // every edit through it instead of the inline/scroll-region path.
             let renderer = renderer.clone();
-            view.lock().unwrap().set_edit_hook(Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
-                renderer.set_editor(line, cursor, queued, menu)
-            }));
+            view.lock().unwrap().set_edit_hook(Arc::new(
+                move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
+                    renderer.set_editor(line, cursor, queued, menu)
+                },
+            ));
         }
-        if let Ok(mut resized) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-        {
+        if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
             let view = view.clone();
             let status = status.clone();
             let renderer = renderer.clone();

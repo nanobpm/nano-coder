@@ -9,6 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
