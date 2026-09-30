@@ -84,6 +84,13 @@ pub struct ProviderConfig {
     /// for thinking models that require it in multi-turn and tool-call
     /// conversations (e.g. Kimi K3). Default false.
     pub replay_reasoning: Option<bool>,
+    /// Temperature for this provider's models: a number, or `"default"` to
+    /// send none. Overrides the top-level `temperature`.
+    pub temperature: Option<crate::temperature::Temperature>,
+    /// Per-model settings (`[providers.NAME.models."MODEL"]`), which win over
+    /// the provider's.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, crate::temperature::ModelSettings>,
 }
 
 impl ProviderConfig {
@@ -118,9 +125,16 @@ impl ProviderConfig {
             retry_initial_backoff_ms,
             retry_max_backoff_ms,
             retryable_statuses,
-            replay_reasoning
+            replay_reasoning,
+            temperature
         );
         self.headers.extend(other.headers.clone());
+        for (model, settings) in &other.models {
+            let entry = self.models.entry(model.clone()).or_default();
+            if settings.temperature.is_some() {
+                entry.temperature = settings.temperature;
+            }
+        }
         self
     }
 }
@@ -231,6 +245,20 @@ pub fn context_window(
     let model =
         model.map(str::to_string).or_else(|| provider.and_then(|p| p.default_model.clone())).unwrap_or_default();
     (provider.and_then(|p| p.context_window), model)
+}
+
+/// The provider name, merged provider entry and model name a spec resolves to
+/// (the model is the provider's `default_model` when the spec names none).
+pub fn entry_for(
+    spec: &str,
+    user: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+) -> Option<(String, ProviderConfig, String)> {
+    let providers = effective_providers(user);
+    let (name, model) = parse_model_spec(spec, &providers, default_provider);
+    let provider = providers.get(name)?.clone();
+    let model = model.map(str::to_string).or_else(|| provider.default_model.clone()).unwrap_or_default();
+    Some((name.to_string(), provider, model))
 }
 
 /// Fully-resolved provider settings used by a client.

@@ -541,6 +541,15 @@ impl Agent {
         self.client.model_name()
     }
 
+    /// The temperature the current model is sent, and where it comes from.
+    pub fn temperature(&self) -> crate::temperature::Resolved {
+        let (user, default_provider) = self.config.effective_providers();
+        let (_, provider, model) = providers::entry_for(&self.config.model, &user, &default_provider)
+            .unwrap_or_else(|| (String::new(), Default::default(), self.config.model.clone()));
+        let kind = provider.kind.unwrap_or(providers::ProviderKind::Mock);
+        crate::temperature::resolve(self.config.temperature, kind, &provider, &model)
+    }
+
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         self.client = Self::client_for(&self.config, spec)?;
@@ -1353,7 +1362,7 @@ impl Agent {
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
-                    temperature: Some(self.config.temperature),
+                    temperature: self.temperature().value(),
                     max_tokens: Some(self.request_max_tokens()),
                 };
                 let control = self.control.clone();

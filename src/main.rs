@@ -39,6 +39,7 @@ mod settings;
 mod shell;
 mod skills;
 mod status;
+mod temperature;
 mod tools;
 mod trajectory;
 mod ui;
@@ -161,6 +162,16 @@ enum TermInput {
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
     CycleMode,
+}
+
+/// "Model set to …", plus a warning when the new model ignores a temperature
+/// configured for it.
+fn model_set_text(agent: &Agent) -> String {
+    let mut text = format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+    if let Some(warning) = agent.temperature().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    text
 }
 
 /// Esc twice within this window cancels the running turn.
@@ -1013,6 +1024,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let stats = agent.context_stats().lock().unwrap().clone();
             let mut out: Vec<String> = Vec::new();
             out.push(format!("Model:        {}/{}", stats.provider, stats.model));
+            out.push(format!("Temperature:  {}", agent.temperature().describe()));
             out.push(format!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
                 if stats.calibrated { "" } else { "~" },
@@ -1075,7 +1087,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let config = agent.config();
             terminal.renderer.print_block(&format!(
                 "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
-                config.model, config.temperature, config.max_tokens
+                config.model,
+                agent.temperature().describe(),
+                config.max_tokens
             ));
             Ok(true)
         }
@@ -1179,11 +1193,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent, &before);
-                terminal.renderer.print_block(&format!(
-                    "Model set to {} (provider {})",
-                    agent.model_name(),
-                    agent.provider_name()
-                ));
+                terminal.renderer.print_block(&model_set_text(agent));
             } else {
                 terminal.renderer.print_block(&format!(
                     "Model unchanged: {} (provider {})",
@@ -1200,11 +1210,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let before = format!("{}/{}", agent.provider_name(), agent.model_name());
             agent.set_model(cmd["/model ".len()..].trim()).await?;
             terminal.model_switched(agent, &before);
-            terminal.renderer.print_block(&format!(
-                "Model set to {} (provider {})",
-                agent.model_name(),
-                agent.provider_name()
-            ));
+            terminal.renderer.print_block(&model_set_text(agent));
             Ok(true)
         }
         "/providers" => {
@@ -1592,6 +1598,9 @@ async fn main() -> Result<()> {
         }
         for warning in &skills.warnings {
             banner.push(format!("Skills warning: {warning}"));
+        }
+        if let Some(warning) = agent.temperature().warning {
+            banner.push(format!("Warning: {warning}"));
         }
         banner.push("Type /help for commands".to_string());
 

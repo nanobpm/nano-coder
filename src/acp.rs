@@ -316,7 +316,9 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             "model": config.model,
                             "provider": agent.provider_name(),
                             "provider_model": agent.model_name(),
-                            "temperature": config.temperature,
+                            // The value sent to the model (null: its default).
+                            "temperature": agent.temperature().value(),
+                            "temperature_source": agent.temperature().source.label(),
                             "max_tokens": config.max_tokens,
                             "system_prompt": config.system_prompt,
                             "session_id": agent.session_id(),
