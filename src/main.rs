@@ -369,14 +369,23 @@ impl Terminal {
     /// After a successful model switch: hoist the spec in the `/model`
     /// type-ahead (persisted), and refresh the config the line editor's
     /// argument suggestions read.
-    fn model_switched(&mut self, agent: &Agent) {
+    /// `previous` is the spec switched away from. It was in use until now, so
+    /// it is recorded too, just behind the new one: the model a session
+    /// started with is offered as well, and `/model` then Enter switches back.
+    fn model_switched(&mut self, agent: &Agent, previous: &str) {
         let spec = agent.config().model.clone();
         {
             let mut recents = self.recents.lock().unwrap();
+            recents.record(previous);
             recents.record(&spec);
             recents::save(&self.recents_path, &recents);
         }
         self.sync_context(agent);
+    }
+
+    /// The recently used `provider/model` specs, most recent first.
+    fn recent_models(&self) -> Vec<String> {
+        self.recents.lock().unwrap().models().to_vec()
     }
 
     /// Refresh the config the line editor's argument suggestions read, after
@@ -1059,7 +1068,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         "/settings" => {
             let before = agent.config().model.clone();
-            settings::run(agent, &terminal.config_path).await?;
+            let recent = terminal.recent_models();
+            settings::run(agent, &terminal.config_path, &recent).await?;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
@@ -1069,7 +1079,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // switched with `/model`; a provider-only edit just refreshes the
             // config the line editor's argument suggestions read.
             if agent.config().model != before {
-                terminal.model_switched(agent);
+                terminal.model_switched(agent, &before);
             } else {
                 terminal.sync_context(agent);
             }
@@ -1148,7 +1158,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/model" => {
-            let picked = settings::pick_model_interactive(agent).await;
+            let before = agent.config().model.clone();
+            let recent = terminal.recent_models();
+            let picked = settings::pick_model_interactive(agent, &recent).await;
             // The picker (dialoguer) wrote directly over the owned frame; force
             // a full redraw so the next differential render isn't diffed against
             // stale screen coordinates. Do it before propagating any error so
@@ -1156,7 +1168,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             terminal.renderer.frame_resize();
             if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
-                terminal.model_switched(agent);
+                terminal.model_switched(agent, &before);
                 terminal.renderer.print_block(&format!(
                     "Model set to {} (provider {})",
                     agent.model_name(),
@@ -1172,8 +1184,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         _ if cmd.starts_with("/model ") => {
+            let before = agent.config().model.clone();
             agent.set_model(cmd["/model ".len()..].trim()).await?;
-            terminal.model_switched(agent);
+            terminal.model_switched(agent, &before);
             terminal.renderer.print_block(&format!(
                 "Model set to {} (provider {})",
                 agent.model_name(),

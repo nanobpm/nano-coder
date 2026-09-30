@@ -77,6 +77,21 @@ mod tests {
     }
 
     #[test]
+    fn switching_records_the_previous_model_just_behind_the_new_one() {
+        // How `/model` records a switch from `previous` to `spec`.
+        let mut recents = Recents::default();
+        let switch = |recents: &mut Recents, previous: &str, spec: &str| {
+            recents.record(previous);
+            recents.record(spec);
+        };
+        switch(&mut recents, "start/model", "a/one");
+        assert_eq!(recents.models(), ["a/one", "start/model"], "the startup model is offered too");
+        switch(&mut recents, "a/one", "b/two");
+        switch(&mut recents, "b/two", "start/model");
+        assert_eq!(recents.models(), ["start/model", "b/two", "a/one"], "no duplicates; previous is second");
+    }
+
+    #[test]
     fn record_ignores_blank_and_trims() {
         let mut recents = Recents::default();
         recents.record("   ");

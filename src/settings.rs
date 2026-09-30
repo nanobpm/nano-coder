@@ -72,7 +72,9 @@ fn turn_cap_label(max_iterations: usize) -> String {
     }
 }
 
-pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
+/// The settings dialog. `recents` is the most-recently-used model list, for
+/// the model picker.
+pub async fn run(agent: &mut Agent, config_path: &Path, recents: &[String]) -> Result<()> {
     let mut changes = Changes::default();
     loop {
         let config = agent.config();
@@ -102,7 +104,7 @@ pub async fn run(agent: &mut Agent, config_path: &Path) -> Result<()> {
         let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
         match selection {
             0 => {
-                if let Some(spec) = pick_model_interactive(agent).await? {
+                if let Some(spec) = pick_model_interactive(agent, recents).await? {
                     switch_model(agent, &spec, &mut changes).await;
                 }
             }
@@ -256,19 +258,25 @@ fn edit_context(agent: &mut Agent) -> Result<()> {
     Ok(())
 }
 
-/// Interactive `/model`: show the current model, then pick a provider and one
-/// of its models. Esc at the model list goes back to the provider list; Esc
-/// there leaves the model unchanged. Returns the chosen `provider/model` spec.
-pub async fn pick_model_interactive(agent: &Agent) -> Result<Option<String>> {
+/// How many recently used models `/model` lists above the providers.
+pub const RECENT_MODELS_SHOWN: usize = 4;
+
+/// Interactive `/model`: show the current model, then pick a recently used
+/// model or a provider and one of its models. Esc at the model list goes back
+/// to the provider list; Esc there leaves the model unchanged. `recents` is
+/// the most-recently-used `provider/model` list. Returns the chosen spec.
+pub async fn pick_model_interactive(agent: &Agent, recents: &[String]) -> Result<Option<String>> {
     println!("Current model: {} (provider {})", agent.model_name(), agent.provider_name());
     let (user, default_provider) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
+    let recent = recent_models(recents, &all);
     let mut provider = None;
     loop {
         let name = match provider.take() {
             Some(name) => name,
-            None => match pick_provider(agent, &all)? {
-                Some(name) => name,
+            None => match pick_provider(agent, &all, &recent)? {
+                Some(ProviderChoice::Model(spec)) => return Ok(Some(spec)),
+                Some(ProviderChoice::Provider(name)) => name,
                 None => return Ok(None),
             },
         };
@@ -305,23 +313,75 @@ fn model_spec(provider: &str, model: &str) -> Step {
     if model.is_empty() { Step::Back } else { Step::Done(format!("{provider}/{model}")) }
 }
 
-/// Scrollable list of the configured providers, with the current provider
-/// pre-selected. Esc (or the Cancel row) returns `None`.
-fn pick_provider(agent: &Agent, all: &std::collections::BTreeMap<String, ProviderConfig>) -> Result<Option<String>> {
-    let names: Vec<&String> = all.keys().collect();
-    let labels: Vec<String> =
-        all.iter().map(|(name, p)| format!("{name:<14} {}", key_status(p))).chain(["Cancel".to_string()]).collect();
-    let current = agent.provider_name();
-    let default = names.iter().position(|n| n.as_str() == current).unwrap_or(0);
-    let choice = Select::new()
-        .with_prompt("Provider (↑/↓ to scroll, Enter to select, Esc to keep the current model)")
-        .items(&labels)
-        .default(default)
-        .interact_opt()?;
-    match choice.and_then(|i| names.get(i)) {
-        Some(name) => Ok(Some(name.to_string())),
-        None => Ok(None),
-    }
+/// The recently used specs to offer, most recent first: at most
+/// [`RECENT_MODELS_SHOWN`], skipping any whose provider is no longer
+/// configured (a spec without a `provider/` prefix uses the default provider,
+/// so it is always kept).
+fn recent_models(recents: &[String], all: &std::collections::BTreeMap<String, ProviderConfig>) -> Vec<String> {
+    recents
+        .iter()
+        .filter(|spec| spec.split_once('/').is_none_or(|(provider, _)| all.contains_key(provider)))
+        .take(RECENT_MODELS_SHOWN)
+        .cloned()
+        .collect()
+}
+
+/// What the first `/model` list picked: a recent model outright, or a
+/// provider whose models to list next.
+#[derive(Debug, PartialEq)]
+enum ProviderChoice {
+    Model(String),
+    Provider(String),
+}
+
+/// The rows of the first `/model` list: the recent models (the current one
+/// marked), then the providers, then Cancel. Also returns the row to
+/// highlight: the most recent model that isn't the current one, so `/model`
+/// then Enter flips back to the previous model; without one, the current
+/// provider.
+fn provider_rows(
+    recent: &[String],
+    current_spec: &str,
+    current_provider: &str,
+    all: &std::collections::BTreeMap<String, ProviderConfig>,
+) -> (Vec<(String, Option<ProviderChoice>)>, usize) {
+    let mut rows: Vec<(String, Option<ProviderChoice>)> = recent
+        .iter()
+        .map(|spec| {
+            let mark = if spec == current_spec { "  (current)" } else { "" };
+            (format!("↺ {spec}{mark}"), Some(ProviderChoice::Model(spec.clone())))
+        })
+        .collect();
+    let first_provider = rows.len();
+    rows.extend(
+        all.iter()
+            .map(|(name, p)| (format!("{name:<14} {}", key_status(p)), Some(ProviderChoice::Provider(name.clone())))),
+    );
+    rows.push(("Cancel".to_string(), None));
+    let default = recent
+        .iter()
+        .position(|spec| spec != current_spec)
+        .unwrap_or_else(|| first_provider + all.keys().position(|name| name == current_provider).unwrap_or(0));
+    (rows, default)
+}
+
+/// Scrollable list of the recently used models and the configured providers,
+/// with the previous model (or the current provider) pre-selected. Esc (or
+/// the Cancel row) returns `None`.
+fn pick_provider(
+    agent: &Agent,
+    all: &std::collections::BTreeMap<String, ProviderConfig>,
+    recent: &[String],
+) -> Result<Option<ProviderChoice>> {
+    let (mut rows, default) = provider_rows(recent, &agent.config().model, agent.provider_name(), all);
+    let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+    let prompt = if recent.is_empty() {
+        "Provider (↑/↓ to scroll, Enter to select, Esc to keep the current model)"
+    } else {
+        "Recent model or provider (↑/↓ to scroll, Enter to select, Esc to keep the current model)"
+    };
+    let choice = Select::new().with_prompt(prompt).items(&labels).default(default).interact_opt()?;
+    Ok(choice.and_then(|i| rows.get_mut(i)).and_then(|(_, choice)| choice.take()))
 }
 
 /// Scrollable list of the provider's live models, falling back to typing a
@@ -619,6 +679,55 @@ fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn providers(names: &[&str]) -> std::collections::BTreeMap<String, ProviderConfig> {
+        names.iter().map(|n| (n.to_string(), ProviderConfig::default())).collect()
+    }
+
+    fn specs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn recent_models_keep_four_with_a_configured_provider() {
+        let all = providers(&["anthropic", "openai", "work"]);
+        let recents =
+            specs(&["work/llama3", "gone/model", "anthropic/claude", "bare-model", "openai/gpt-5", "openai/o3"]);
+        // `gone` is no longer configured; a bare spec uses the default provider.
+        assert_eq!(
+            recent_models(&recents, &all),
+            specs(&["work/llama3", "anthropic/claude", "bare-model", "openai/gpt-5"])
+        );
+        assert!(recent_models(&[], &all).is_empty());
+    }
+
+    #[test]
+    fn provider_rows_list_recents_first_and_highlight_the_previous_model() {
+        let all = providers(&["anthropic", "openai"]);
+        let recent = specs(&["openai/gpt-5", "anthropic/claude"]);
+        let (rows, default) = provider_rows(&recent, "openai/gpt-5", "openai", &all);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels[0], "↺ openai/gpt-5  (current)");
+        assert_eq!(labels[1], "↺ anthropic/claude");
+        assert!(labels[2].starts_with("anthropic ") && labels[3].starts_with("openai "), "{labels:?}");
+        assert_eq!(labels[4], "Cancel");
+        assert_eq!(rows[1].1, Some(ProviderChoice::Model("anthropic/claude".into())));
+        assert_eq!(rows[3].1, Some(ProviderChoice::Provider("openai".into())));
+        assert_eq!(rows[4].1, None);
+        // Enter on the highlighted row switches back to the previous model.
+        assert_eq!(default, 1);
+
+        // The current model isn't the most recent (e.g. set from the config):
+        // the most recent is highlighted.
+        let (_, default) = provider_rows(&recent, "openai/o3", "openai", &all);
+        assert_eq!(default, 0);
+        // Only the current model is recent: highlight the current provider.
+        let (_, default) = provider_rows(&specs(&["openai/gpt-5"]), "openai/gpt-5", "openai", &all);
+        assert_eq!(default, 1 + 1);
+        // No recents: the plain provider list, as before.
+        let (rows, default) = provider_rows(&[], "openai/gpt-5", "openai", &all);
+        assert_eq!((rows.len(), default), (3, 1));
+    }
 
     #[test]
     fn turn_cap_label_marks_zero_as_unbounded() {
