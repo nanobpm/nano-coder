@@ -1153,6 +1153,14 @@ impl Agent {
         self.system_prompt_from(&self.instructions, &self.skills)
     }
 
+    /// Whether memory saves are actually offered right now: the mode must be
+    /// writable *and* the agent must not be in plan mode, whose read-only tool
+    /// gating drops `memory_save`. The memory index guidance uses this so a
+    /// plan-mode prompt never advertises an unavailable tool.
+    fn memory_writable(&self) -> bool {
+        self.config.memory.writable() && self.control.mode() != crate::mode::AgentMode::Plan
+    }
+
     /// Render the system prompt from a given instruction/skill set, so a new
     /// session can build its prompt from freshly discovered temporaries before
     /// committing them to `self`.
@@ -1162,7 +1170,7 @@ impl Agent {
             .memory
             .as_ref()
             .filter(|_| self.config.memory.enabled())
-            .map(|store| store.index(self.config.memory.writable()))
+            .map(|store| store.index(self.memory_writable()))
             .unwrap_or_default();
         format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
     }
@@ -1254,7 +1262,7 @@ impl Agent {
             tools.extend(history::definitions());
         }
         if self.memory_enabled() {
-            tools.extend(memory::definitions(self.config.memory.writable()));
+            tools.extend(memory::definitions(self.memory_writable()));
         }
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
@@ -2504,6 +2512,31 @@ mod tests {
         let off = memory_agent(crate::config::MemoryMode::Off, vec![], dir.path());
         assert!(!names(&off).iter().any(|n| memory::is_memory_tool(n)), "off offers no memory tools");
         assert!(off.memory().is_none());
+    }
+
+    #[test]
+    fn plan_mode_drops_save_from_tools_and_index_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        // A saved fact gives the index something to render.
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+
+        let normal_prompt = agent.system_prompt();
+        assert!(normal_prompt.contains(memory::SAVE_TOOL), "normal mode offers save guidance: {normal_prompt}");
+        let names = |a: &Agent| a.tool_definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert!(names(&agent).contains(&memory::SAVE_TOOL.to_string()), "normal mode offers the save tool");
+
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let plan_prompt = agent.system_prompt();
+        assert!(
+            !plan_prompt.contains(memory::SAVE_TOOL),
+            "plan mode drops the unavailable save tool from the index guidance: {plan_prompt}"
+        );
+        assert!(plan_prompt.contains(memory::SEARCH_TOOL), "plan mode still offers search: {plan_prompt}");
+        assert!(!names(&agent).contains(&memory::SAVE_TOOL.to_string()), "plan mode hides the save tool");
+
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        assert!(agent.system_prompt().contains(memory::SAVE_TOOL), "leaving plan mode restores save guidance");
     }
 
     #[tokio::test(flavor = "multi_thread")]

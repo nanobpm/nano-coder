@@ -18,10 +18,11 @@
 //! embedding or vector store.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -635,26 +636,41 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 /// A git remote URL reduced to a stable `host/path` label, dropping the scheme,
 /// any credentials and a trailing `.git`.
 fn normalize_remote(url: &str) -> String {
-    let mut s = url.trim();
-    let mut scheme = false;
-    for prefix in ["https://", "http://", "ssh://", "git://"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            s = rest;
-            scheme = true;
-            break;
-        }
-    }
-    // Drop any query string or fragment before touching credentials or the
-    // path. They can carry a credential (`repo.git?access_token=…`) that would
-    // otherwise leak into the project label, system prompt and on-disk
-    // filename, and would rotate the key on token refresh; a stray `@`/`:`
-    // inside them would also confuse the credential/host splitting below.
-    let s = s.split(['?', '#']).next().unwrap_or(s);
-    // An SCP-style remote (`git@host:owner/repo` or a bare `host:owner/repo`)
-    // uses `:` as the host/path separator; a scheme URL uses it for a port.
-    // Only the SCP separator is remapped below — preserving the port keeps
-    // `ssh://host:2222/a/b` distinct from `https://host/2222/a/b`.
-    let scp = !scheme;
+    let s = url.trim();
+    // Recognise any syntactically valid URI scheme (`scheme://…`), not just a
+    // fixed allow-list: an unrecognised scheme such as `ftp://user:pass@host/r`
+    // (or an uppercase `HTTPS://…`) must still get authority-credential
+    // stripping, or the credential leaks into the prompt label and readable
+    // filename.
+    static SCHEME: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://").expect("scheme regex compiles"));
+    let uri = SCHEME.is_match(s);
+    let owned;
+    let s: &str = if uri {
+        owned = SCHEME.replace(s, "").into_owned();
+        &owned
+    } else {
+        s
+    };
+    // A remote without a URI scheme is SCP-style only when it has the
+    // `[user@]host:path` shape — a colon before any `/`, `?` or `#` and no
+    // spaces. Anything else (an absolute path like `/srv/repo.git`, or an
+    // explicitly relative one like `./repo.git` or `../repo.git`) is a local
+    // path and must be kept verbatim: `?`/`#`/`@` are ordinary filename
+    // characters there, and stripping them would merge unrelated repositories
+    // (e.g. `/srv/repo#blue.git` and `/srv/repo#red.git`) onto one project key.
+    let scp = !uri
+        && s.find(':').is_some_and(|colon| {
+            let authority = &s[..colon];
+            !authority.contains(['/', '?', '#']) && !authority.chars().any(char::is_whitespace)
+        });
+    // Query strings and fragments can carry a credential
+    // (`repo.git?access_token=…`) that would otherwise leak into the project
+    // label, system prompt and on-disk filename, and would rotate the key on
+    // token refresh — but they are only query/fragment syntax on a URI or SCP
+    // remote. On a local path they are filename characters, so strip them only
+    // when a host/authority was actually recognised.
+    let s: &str = if uri || scp { s.split(['?', '#']).next().unwrap_or(s) } else { s };
     // Strip `user:pass@` credentials from the *authority* only, never from the
     // path. A legal `@` in the path (e.g. `example.com/repo@v2.git`) must be
     // preserved, or unrelated repositories that differ only after an `@` would
@@ -668,8 +684,8 @@ fn normalize_remote(url: &str) -> String {
             }
             None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
         }
-    } else {
-        // Scheme URL `[user:pass@]host[:port]/path`: authority is before the `/`.
+    } else if uri {
+        // URI `[user:pass@]host[:port]/path`: the authority is before the `/`.
         match s.split_once('/') {
             Some((authority, path)) => {
                 let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
@@ -677,6 +693,9 @@ fn normalize_remote(url: &str) -> String {
             }
             None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
         }
+    } else {
+        // Local path: no authority, so there is nothing to strip.
+        s.to_string()
     };
     let trimmed = s.trim_end_matches('/');
     trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string()
@@ -1049,6 +1068,24 @@ mod tests {
             normalize_remote("https://one.example/repo@v2.git"),
             normalize_remote("https://two.example/other@v2.git")
         );
+        // Any syntactically valid URI scheme is recognised, not just the four
+        // common ones: an `ftp://` (or uppercase-scheme) remote with
+        // credentials must not leak `user:pass@` into the key (Copilot
+        // finding, src/memory.rs).
+        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "host/repo");
+        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "example.com/a/b");
+        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "github.com/org/repo");
+        // Query/fragment stripping applies only to remotes with a recognised
+        // host. On a local-path remote `?`/`#` are ordinary filename
+        // characters, so two paths differing only there must keep distinct
+        // keys (Copilot finding, src/memory.rs).
+        assert_eq!(normalize_remote("/srv/repo#blue.git"), "/srv/repo#blue");
+        assert_ne!(normalize_remote("/srv/repo#blue.git"), normalize_remote("/srv/repo#red.git"));
+        assert_eq!(normalize_remote("/srv/repo.git?x=1"), "/srv/repo.git?x=1");
+        assert_eq!(normalize_remote("./rel/repo.git"), "./rel/repo");
+        assert_eq!(normalize_remote("../rel/repo.git"), "../rel/repo");
+        // A local path that happens to contain an `@` is not an authority.
+        assert_eq!(normalize_remote("/srv/repo@home.git"), "/srv/repo@home");
         // A readable head is kept, but a disambiguating hash is always appended.
         assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);
