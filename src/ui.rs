@@ -232,6 +232,12 @@ struct FrameState {
     /// persists across ordinary status refreshes (which only re-render it) and
     /// is cleared explicitly by `clear_transient`, `begin_turn`, or `end_turn`.
     transient: Option<String>,
+    /// While set, `frame_event` updates the transcript WITHOUT rendering after
+    /// each event: a history replay emits one event per conversation/tool
+    /// entry, and rendering each one redoes the whole transcript layout
+    /// (O(events²) work and a terminal write per event on a long session).
+    /// The caller renders once when the batch is complete.
+    batch: bool,
 }
 
 impl Renderer {
@@ -249,6 +255,7 @@ impl Renderer {
             think_streamed: false,
             prompt_stamp: stamp(),
             transient: None,
+            batch: false,
         }
     }
 
@@ -496,7 +503,107 @@ impl Renderer {
             }
             AgentEvent::Context => {}
         }
-        self.frame_render(fs);
+        // Batched (a history replay): the caller renders once at the end —
+        // rendering here would redo the whole transcript layout per event.
+        if !fs.batch {
+            self.frame_render(fs);
+        }
+    }
+
+    /// Batch a run of frame events (a history replay) into ONE render: set the
+    /// batch flag, run `feed` (which emits the events), then clear the flag and
+    /// render the completed frame a single time. Without this each replayed
+    /// event triggers a full transcript layout, so switching to frame mode (or
+    /// resuming into it) does O(events²) work and one terminal write per event.
+    /// No-op in legacy mode: `feed` then emits nothing frame-bound.
+    pub fn frame_batch(&self, feed: impl FnOnce()) {
+        let mut frame = self.frame.lock().unwrap();
+        let Some(fs) = frame.as_mut() else {
+            drop(frame);
+            feed();
+            return;
+        };
+        fs.batch = true;
+        drop(frame);
+        feed();
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            fs.batch = false;
+            self.frame_render(fs);
+        }
+    }
+
+    /// Render one replayed history event in LEGACY mode (used when leaving
+    /// frame mode, whose full redraws cleared the legacy scrollback, to put
+    /// the conversation back). Unlike `event()`, which treats replayed
+    /// `UserMessage`s as steer notes and skips `ToolResult`s unless verbose,
+    /// this prints user turns as messages and every tool result, mirroring
+    /// what the live legacy session had on screen. No-op in frame mode: the
+    /// frame transcript already holds the conversation.
+    pub fn replay_event(&self, event: &AgentEvent) {
+        if self.frame.lock().unwrap().is_some() {
+            return;
+        }
+        if verbosity() == Verbosity::Quiet {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        match event {
+            AgentEvent::UserMessage { text } => {
+                if !text.trim().is_empty() {
+                    self.newline(&mut state);
+                    self.out(&mut state, &format!("{}> {}\n", stamp(), text));
+                }
+            }
+            AgentEvent::AssistantMessage { text, .. } => {
+                self.finish_thinking(&mut state);
+                if !text.trim().is_empty() {
+                    self.newline(&mut state);
+                    let stamp = stamp();
+                    self.out_aligned(&mut state, text, stamp.chars().count());
+                    self.out(&mut state, "\n");
+                }
+            }
+            AgentEvent::Thinking { text } => {
+                if !state.streamed_thinking {
+                    self.thinking_delta(&mut state, text);
+                    self.finish_thinking(&mut state);
+                }
+                state.streamed_thinking = false;
+            }
+            AgentEvent::ToolCall { .. } | AgentEvent::ToolResult { .. } | AgentEvent::Plan { .. } => {
+                // Matches the live legacy rendering exactly (verbosity-aware
+                // tool lines, the plan checklist).
+                drop(state);
+                self.event(event);
+            }
+            // Replay never emits deltas (only whole messages), and `Context` /
+            // `Compacted` carry no transcript text.
+            AgentEvent::TextDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::Context
+            | AgentEvent::Compacted => {}
+        }
+    }
+
+    /// Hand legacy-mode output that exists only in renderer state (not yet in
+    /// scrollback) to the frame transcript, so the frame's first full redraw —
+    /// which clears scrollback — cannot erase it: notes deferred behind an
+    /// in-progress streamed line, and the collapsed reasoning Ctrl-O would
+    /// reprint. Returns the drained items; the caller pushes them into the
+    /// frame before replaying history so they land ahead of the conversation.
+    /// Empty in frame mode (everything is already in the transcript).
+    pub fn drain_pending(&self) -> Vec<Item> {
+        if self.frame.lock().unwrap().is_some() {
+            return Vec::new();
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut items: Vec<Item> = std::mem::take(&mut state.deferred).into_iter().map(Item::Note).collect();
+        let thinking = std::mem::take(&mut state.last_thinking);
+        if !thinking.trim().is_empty() {
+            items.push(Item::Thinking { chars: thinking.trim().chars().count(), seconds: 0.0 });
+        }
+        items
     }
 
     /// Record a submitted user message in the transcript (frame mode).
@@ -505,6 +612,20 @@ impl Renderer {
         if let Some(fs) = frame.as_mut() {
             fs.items.push(stamped(Item::Message { role: Role::User, text: text.to_string() }));
             self.frame_render(fs);
+        }
+    }
+
+    /// Append drained legacy output (see `drain_pending`) to the frame
+    /// transcript without rendering: called just before a batched history
+    /// replay, whose closing render draws these items too. No-op in legacy
+    /// mode (no frame to hold them).
+    pub fn push_items(&self, items: Vec<Item>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            fs.items.extend(items.into_iter().map(stamped));
         }
     }
 
@@ -1102,6 +1223,37 @@ mod tests {
         fn frame_transient(&self) -> Option<String> {
             self.frame.lock().unwrap().as_ref().unwrap().transient.clone()
         }
+
+        #[cfg(test)]
+        fn frame_batching(&self) -> bool {
+            self.frame.lock().unwrap().as_ref().unwrap().batch
+        }
+    }
+
+    #[test]
+    fn frame_batch_defers_rendering_until_the_batch_ends() {
+        // A history replay emits one event per conversation entry; rendering
+        // each one would redo the whole transcript layout per event. The batch
+        // flag holds renders back while events stream in and the closing
+        // render draws the completed frame once.
+        let r = Renderer::frame_for_test();
+        assert!(!r.frame_batching());
+        r.frame_batch(|| {
+            assert!(r.frame_batching(), "batch flag set while events stream in");
+            r.event(&AgentEvent::UserMessage { text: "one" });
+            r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "two" });
+            r.event(&AgentEvent::UserMessage { text: "three" });
+        });
+        assert!(!r.frame_batching(), "batch flag cleared at the end");
+        let texts: Vec<String> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["one", "two", "three"], "every batched event still landed");
     }
 
     #[test]

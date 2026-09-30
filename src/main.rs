@@ -50,6 +50,7 @@ mod ui;
 use agent::Agent;
 use config::ConfigManager;
 use hooks::HookEvent;
+use llm::Role;
 use tools::ToolDefinition;
 
 fn register_builtin_tools(agent: &mut Agent) {
@@ -435,6 +436,19 @@ impl Terminal {
             return;
         }
         self.renderer_before = mode;
+        // Leaving frame mode: the frame's full redraws cleared the legacy
+        // scrollback, so the legacy transcript is gone — capture the
+        // conversation now and reprint it below, once legacy owns the screen
+        // again. The interactive prompt's current line is the conversation's
+        // last user message but was never printed as a transcript line (the
+        // editor owns it), so it is skipped in the replay rather than
+        // duplicated.
+        let switching_to_frame = mode == crate::frame::RendererMode::Frame;
+        let pending_user = if switching_to_frame {
+            None
+        } else {
+            agent.last_message().filter(|m| m.role == Role::User).map(|m| m.content.clone())
+        };
         self.renderer.set_mode(mode);
         let on = self.renderer.is_frame();
         // Rebuild the frame hook to match: frame routes every edit through the
@@ -453,6 +467,13 @@ impl Terminal {
         if let Some(status) = &self.status {
             status.resize();
         }
+        if !on {
+            // The frame left the cursor on the bottom row and the editor's
+            // drawn state refers to rows the frame owned: reset it to the
+            // single prompt row the next loop print establishes, or the
+            // resize redraw would climb into the status row / frame content.
+            self.view.lock().unwrap().reset_drawing();
+        }
         self.view.lock().unwrap().resize();
         // The frame's full redraw (when switching *to* frame) resets the scroll
         // region to the whole screen; switching *to* legacy must re-pin it to
@@ -460,13 +481,25 @@ impl Terminal {
         if !on && let Some(status) = &self.status {
             status.repin_scroll_region();
         }
-        // Re-emit the conversation into the frame transcript only when switching
-        // *to* frame: a fresh frame starts empty, so the transcript must be
-        // rebuilt into it (a full redraw clears scrollback and re-owns the
-        // screen). Switching *to* legacy must NOT replay — the legacy transcript
-        // already lives in scrollback, and replaying would duplicate it.
         if on {
-            agent.replay_history();
+            // A fresh frame starts empty, so the transcript must be rebuilt
+            // into it (its first full redraw clears scrollback and re-owns the
+            // screen). Move legacy output that exists only in renderer state
+            // (deferred notes, the collapsed thinking summary) into the frame
+            // first so the clear cannot erase it, then replay the conversation
+            // as one batch: rendering per event would redo the whole
+            // transcript layout each time (O(events²) on a long session).
+            let pending = self.renderer.drain_pending();
+            self.renderer.push_items(pending);
+            let renderer = self.renderer.clone();
+            self.renderer.frame_batch(|| agent.replay_history_with(None, |event| renderer.replay_event(event)));
+        } else {
+            // Legacy scrollback was cleared by the frame's redraws: reprint
+            // the conversation so older turns stay accessible. The tap prints
+            // (frame mode is already off); the emitted events reach only the
+            // detached frame sink, which ignores them.
+            let renderer = self.renderer.clone();
+            agent.replay_history_with(pending_user.as_deref(), |event| renderer.replay_event(event));
         }
     }
 
@@ -1350,7 +1383,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         "/settings" => {
             let renderer_before = agent.config().renderer;
-            settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await?;
+            // Capture the dialog result rather than `?`-returning it: when the
+            // user changed `renderer` and a LATER prompt errors or is
+            // cancelled, the config already records the new mode, so the
+            // switch must still be applied here — returning early would leave
+            // the renderer and editor in the old mode with no diff left to
+            // retrigger the switch on the next visit.
+            let result = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
@@ -1366,6 +1405,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // editor's argument suggestions read (providers or the model may
             // have changed).
             terminal.sync_context(agent);
+            result?;
             Ok(true)
         }
         "/tools" => {
@@ -2087,9 +2127,11 @@ async fn main() -> Result<()> {
         // (the sink is installed) to reconstruct the transcript into
         // `FrameState`; `frame_event` populates user, assistant, tool and plan
         // items. Only in frame mode — the legacy renderer would dump the whole
-        // conversation inline, which it has never done on resume.
+        // conversation inline, which it has never done on resume. Batched into
+        // one render: per-event renders would redo the whole transcript layout
+        // for every replayed event.
         if frame_mode && args.resume.is_some() {
-            agent.replay_history();
+            renderer.frame_batch(|| agent.replay_history());
         }
         let mut terminal = Terminal::start(
             config_path,

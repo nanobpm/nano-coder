@@ -691,9 +691,16 @@ impl Agent {
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
+    /// Atomic: when the new spec cannot build a client (an unknown provider,
+    /// a missing key, …) the previous model spec is restored so the config
+    /// keeps naming the client the session is actually still using.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
-        self.config.model = spec.to_string();
-        self.refresh_client().await
+        let previous = std::mem::replace(&mut self.config.model, spec.to_string());
+        if let Err(e) = self.refresh_client().await {
+            self.config.model = previous;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Rebuild the LLM client for the current model, resetting the state that
@@ -1006,6 +1013,64 @@ impl Agent {
         }
         if !self.plan.is_empty() {
             self.emit(AgentEvent::Plan { plan: &self.plan });
+        }
+    }
+
+    /// Re-emit the conversation like `replay_history`, additionally passing
+    /// each event to `tap` as it is emitted. Used when leaving frame mode:
+    /// the frame's full redraws cleared the legacy scrollback, so the legacy
+    /// renderer reprints the conversation from the tap while the (now
+    /// detached) frame sink ignores the events. `skip_user` names a user
+    /// message whose replay is skipped: the interactive prompt's current line
+    /// was recorded into the conversation without ever being printed as a
+    /// transcript line (the editor owns it), so reprinting it would duplicate
+    /// the text the user is still editing.
+    pub fn replay_history_with(&mut self, skip_user: Option<&str>, tap: impl Fn(&AgentEvent)) {
+        if self.event_sink.is_none() {
+            return;
+        }
+        let conversation = self.conversation.clone();
+        let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
+        let mut skipped = false;
+        macro_rules! replay {
+            ($event:expr) => {{
+                let event = $event;
+                tap(&event);
+                self.emit(event);
+            }};
+        }
+        for message in &conversation {
+            match message.role {
+                Role::System => {}
+                Role::User => {
+                    let skip = !skipped && skip_user.is_some_and(|s| s == message.content);
+                    skipped |= skip;
+                    if !skip {
+                        replay!(AgentEvent::UserMessage { text: &message.content });
+                    }
+                }
+                Role::Assistant => {
+                    if !message.content.trim().is_empty() {
+                        self.message_counter += 1;
+                        let message_id = format!("msg-{}-{}", Utc::now().timestamp_millis(), self.message_counter);
+                        replay!(AgentEvent::AssistantMessage { message_id: &message_id, text: &message.content });
+                    }
+                    for call in &message.tool_calls {
+                        calls.insert(call.id.as_str(), call);
+                        replay!(AgentEvent::ToolCall { call });
+                    }
+                }
+                Role::Tool => {
+                    let Some(call) = message.tool_call_id.as_deref().and_then(|id| calls.get(id)) else {
+                        continue;
+                    };
+                    let ok = !message.is_error;
+                    replay!(AgentEvent::ToolResult { call, ok, output: &message.content });
+                }
+            }
+        }
+        if !self.plan.is_empty() {
+            replay!(AgentEvent::Plan { plan: &self.plan });
         }
     }
 
@@ -2430,6 +2495,12 @@ impl Agent {
     pub fn conversation(&self) -> &[Message] {
         &self.conversation
     }
+
+    /// The most recent conversation message, if any. Used by a renderer
+    /// switch to recognise the interactive prompt's in-flight user line.
+    pub fn last_message(&self) -> Option<&Message> {
+        self.conversation.last()
+    }
 }
 
 /// Keep only characters that are safe in a file name.
@@ -2444,6 +2515,35 @@ mod tests {
     use crate::tools::ToolDefinition;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_model_switch_restores_the_previous_spec() {
+        // A `/model` spec that cannot build a client must not leave
+        // `config.model` naming the rejected spec while the session keeps the
+        // old client: the switch is atomic. (An unknown provider is not a
+        // failure — the spec falls back to the default provider — so the
+        // failing build is a provider whose `api_key_command` cannot run.)
+        let mut config = Config::default();
+        config.providers.insert(
+            "broken".to_string(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Openai),
+                base_url: Some("http://localhost:9".to_string()),
+                api_key_command: Some("definitely-not-a-real-command-nano".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("gpt-4o-mini")), config);
+        let before = agent.config().model.clone();
+        let error = agent.set_model("broken/some-model").await.unwrap_err();
+        assert!(format!("{error:#}").contains("definitely-not-a-real-command-nano"), "unexpected error: {error:#}");
+        assert_eq!(agent.config().model, before, "config keeps the spec still in use");
+        assert_eq!(agent.model_name(), "gpt-4o-mini", "the live client is unchanged");
+        // …and a valid spec still switches.
+        agent.set_model("mock/other-model").await.unwrap();
+        assert_eq!(agent.config().model, "mock/other-model");
+        assert_eq!(agent.model_name(), "other-model");
+    }
 
     #[test]
     fn rate_meter_tracks_scripted_stream() {

@@ -159,6 +159,19 @@ impl EditView {
         self.menu_enabled = !on;
     }
 
+    /// Forget where the last inline redraw left the prompt: the frame renderer
+    /// owned the screen and leaves the cursor on the bottom row, so the
+    /// recorded prompt span / cursor offset no longer match anything on
+    /// screen. Reset to "one prompt row, cursor on it" (the state the main
+    /// loop's next prompt print establishes) so the first inline redraw after
+    /// a frame → legacy switch clears and climbs within that row instead of
+    /// walking up into the status line or leftover frame content.
+    pub fn reset_drawing(&mut self) {
+        self.menu_rows = 0;
+        self.drawn_rows = 1;
+        self.drawn_cursor_row = 0;
+    }
+
     /// Redraw the editor: through the frame hook when set, else inline / on the
     /// status line as before.
     fn draw_edit(&mut self) {
@@ -1479,6 +1492,23 @@ mod tests {
         assert_eq!(view.line, "run a\u{a0}");
         view.erase_word();
         assert_eq!(view.line, "run ");
+    }
+
+    #[test]
+    fn reset_drawing_restores_the_single_prompt_row_baseline() {
+        // After the frame renderer owned the screen, the editor's drawn state
+        // refers to rows it no longer controls: a stale span would make the
+        // first inline redraw climb into the status line or leftover frame
+        // content. The reset restores the "one prompt row, cursor on it"
+        // baseline the next prompt print establishes.
+        let mut view = view("/settings");
+        view.menu_rows = 3;
+        view.drawn_rows = 5;
+        view.drawn_cursor_row = 2;
+        view.reset_drawing();
+        assert_eq!(view.menu_rows, 0);
+        assert_eq!(view.drawn_rows, 1);
+        assert_eq!(view.drawn_cursor_row, 0);
     }
 
     #[test]
