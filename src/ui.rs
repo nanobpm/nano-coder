@@ -495,6 +495,16 @@ impl Renderer {
         println!("{text}");
     }
 
+    /// Emit machine-readable output verbatim (e.g. `/trajectory --json`). The
+    /// frame transcript wraps `Item::Output` to the terminal width and prefixes
+    /// a timestamp, which hard-breaks long JSON string values and puts text
+    /// before the opening `{`, so export modes must bypass it; printing raw
+    /// leaves the frame's diff state untouched, and the next differential
+    /// render simply repaints over it.
+    pub fn print_raw(&self, text: &str) {
+        println!("{text}");
+    }
+
     fn width(&self) -> usize {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }

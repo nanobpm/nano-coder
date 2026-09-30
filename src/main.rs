@@ -1244,8 +1244,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             };
             let traj = trajectory::Trajectory::from_records(&records);
             match arg {
-                "--json" => terminal.renderer.print_block(&traj.to_json()),
-                "--markdown" | "--md" => terminal.renderer.print_block(&traj.to_markdown()),
+                // Export modes bypass the transcript renderer (`print_raw`, not
+                // `print_block`): the frame would wrap long lines and prefix a
+                // timestamp, making the JSON unparseable and mangling Markdown.
+                "--json" => terminal.renderer.print_raw(&traj.to_json()),
+                "--markdown" | "--md" => terminal.renderer.print_raw(&traj.to_markdown()),
                 "" if !terminal.outstanding && terminal.renderer.is_frame() && trajectory_pageable(&traj) => {
                     // The pager owns the screen until it exits; force a full
                     // redraw so the frame renderer's next differential render

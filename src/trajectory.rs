@@ -187,8 +187,20 @@ impl Turn {
             .count();
         let tools = call_rows + orphaned_results;
         // One model call per assistant request. A THINK row is the same request's
-        // reasoning, so counting it too would report two calls for one request.
-        let calls = self.rows.iter().filter(|r| matches!(r.kind, RowKind::Assistant)).count();
+        // reasoning, so counting it too would report two calls for one request;
+        // with a separate THINK row the request's usage/duration live on it, so
+        // the request is seen there. The final-answer row the agent itself
+        // appends after `report_outcome` (`Message::assistant(&response)` in
+        // agent.rs) is not a request — it carries no usage/duration and has no
+        // THINK row — so it is excluded; a turn completed by one request would
+        // otherwise summarize as `2 calls`.
+        let calls = self
+            .rows
+            .iter()
+            .filter(|r| {
+                matches!(r.kind, RowKind::Assistant | RowKind::Think) && (r.usage.is_some() || r.duration_ms.is_some())
+            })
+            .count();
         let out: i64 =
             self.rows.iter().filter_map(|r| r.usage.as_ref()).map(|u| u.completion_tokens).filter(|&t| t > 0).sum();
         let duration: u64 = self.rows.iter().filter_map(|r| r.duration_ms).sum();
@@ -735,6 +747,45 @@ mod tests {
         // Two assistant requests (one with reasoning, one final), not three:
         // the THINK row is the same request as its ASSISTANT row.
         assert!(turn.summary().contains("2 calls"), "{}", turn.summary());
+    }
+
+    #[test]
+    fn synthetic_final_answer_is_not_a_model_call() {
+        // A turn the model completed with `report_outcome`: the agent appends
+        // the answer as `Message::assistant(&response)` without another LLM
+        // request, so the row carries no usage/duration and must not count as
+        // a second call.
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message({
+                let mut msg = assistant("", "");
+                msg.tool_calls = vec![ToolCall {
+                    id: "c1".into(),
+                    name: "report_outcome".into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    ..Default::default()
+                }];
+                msg
+            }),
+            Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "report_outcome", "ok") }),
+            // The synthetic final answer: no usage, no duration_ms.
+            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::TurnEnd {
+                input_id: "i".into(),
+                response: "done".into(),
+                outcome: Some(Outcome { status: crate::goal::Status::Completed, summary: "done".into() }),
+                history_calls: 0,
+                recorded_at: now(),
+            },
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let turn = &traj.turns[0];
+        // Both assistant rows are still in the ledger…
+        assert_eq!(turn.rows.iter().filter(|r| matches!(r.kind, RowKind::Assistant)).count(), 2);
+        // …but only the real request is counted as a model call.
+        assert!(turn.summary().contains("1 call"), "{}", turn.summary());
+        assert!(!turn.summary().contains("2 calls"), "{}", turn.summary());
     }
 
     #[test]
