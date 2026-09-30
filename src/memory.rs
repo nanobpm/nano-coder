@@ -906,6 +906,27 @@ fn dos_drive_prefix(s: &str) -> bool {
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
+/// Strip only the *password* from a URI authority (`[user[:pass]@]host[:port]`),
+/// preserving the non-secret username. The username is part of the repository
+/// identity — a relative SSH path is resolved under that user's home, so
+/// `alice@host` and `bob@host` may name different repositories and must not
+/// collapse onto one project key (mirroring the SCP branch). Only the password
+/// (a rotating secret that would leak into the key, label or filename) is
+/// removed; a password-only userinfo (`:pass@host`) collapses to just the host.
+fn strip_uri_password(authority: &str) -> String {
+    match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
+            if user.is_empty() {
+                host.to_string()
+            } else {
+                format!("{user}@{host}")
+            }
+        }
+        None => authority.to_string(),
+    }
+}
+
 /// A git remote URL reduced to a stable identity key. A trailing `.git` is
 /// deliberately *preserved*: it is part of the repository identity, and
 /// stripping it is non-injective — `host/org/repo` and `host/org/repo.git` can
@@ -917,9 +938,13 @@ fn dos_drive_prefix(s: &str) -> bool {
 /// protocol namespaces, so dropping the scheme would make them share one JSONL
 /// file and disclose project-scoped memories to each other (the same
 /// collision-avoidance already applied to `.git`, ports and SCP usernames). The
-/// scheme is therefore kept on the key. Credentials are still stripped from the
-/// authority so a `user:pass@` never leaks into the key, the prompt label or the
-/// on-disk filename.
+/// scheme is therefore kept on the key. Only the *password* is stripped from the
+/// authority so a `user:pass@` secret never leaks into the key, the prompt label
+/// or the on-disk filename — but the non-secret *username* is preserved (exactly
+/// as the SCP branch already does), because a relative SSH path is resolved
+/// under that user's home, so `ssh://alice@host/repo.git` and
+/// `ssh://bob@host/repo.git` may name different repositories and must not
+/// collapse onto one project-memory scope (Copilot finding, src/memory.rs).
 fn normalize_remote(url: &str) -> String {
     let s = url.trim();
     // Recognise any syntactically valid URI scheme (`scheme://…`), not just a
@@ -990,13 +1015,19 @@ fn normalize_remote(url: &str) -> String {
             None => s.to_string(),
         }
     } else if uri {
-        // URI `[user:pass@]host[:port]/path`: the authority is before the `/`.
+        // URI `[user[:pass]@]host[:port]/path`: the authority is before the `/`.
+        // Strip only the *password* from the userinfo, keeping the non-secret
+        // *username* — a relative SSH path is resolved under that user's home,
+        // so `ssh://alice@host/repo.git` and `ssh://bob@host/repo.git` may name
+        // different repositories and must not collapse onto one project key
+        // (exactly as the SCP branch keeps its username). A `user:pass@` (or
+        // password-only `:pass@`) still has its secret removed so it never
+        // leaks into the key, label or filename (Copilot finding, src/memory.rs).
         match s.split_once('/') {
             Some((authority, path)) => {
-                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-                format!("{host}/{path}")
+                format!("{}/{path}", strip_uri_password(authority))
             }
-            None => s.rsplit_once('@').map_or(s, |(_, rest)| rest).to_string(),
+            None => strip_uri_password(s),
         }
     } else {
         // Local path: no authority, so there is nothing to strip.
@@ -1902,7 +1933,7 @@ mod tests {
         // must not collapse onto one project key (Copilot finding,
         // src/memory.rs).
         assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "https://github.com/nanobpm/nano-coder.git");
-        assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "https://example.com/a/b");
+        assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "https://user@example.com/a/b");
         assert_ne!(normalize_remote("https://host/org/repo"), normalize_remote("ssh://host/org/repo"));
         // `.git` and non-`.git` remotes that would previously collide now keep
         // distinct keys (Copilot finding, src/memory.rs).
@@ -1918,7 +1949,7 @@ mod tests {
         // A scheme URL's port is preserved, so it cannot collide with an
         // SCP-style path or a URL carrying that number as a path segment
         // (Copilot finding, src/memory.rs).
-        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "ssh://github.com:2222/a/b.git");
+        assert_eq!(normalize_remote("ssh://git@github.com:2222/a/b.git"), "ssh://git@github.com:2222/a/b.git");
         assert_ne!(normalize_remote("ssh://host:2222/org/repo"), normalize_remote("https://host/2222/org/repo"));
         // A legal `@` in the repository PATH is preserved: credential stripping
         // applies only to the authority, so repos differing only after an `@`
@@ -1930,12 +1961,33 @@ mod tests {
         );
         // Any syntactically valid URI scheme is recognised, not just the four
         // common ones: an `ftp://` (or uppercase-scheme) remote with
-        // credentials must not leak `user:pass@` into the key (Copilot
+        // credentials must not leak the password into the key — but the
+        // non-secret username is kept as an identity discriminator (Copilot
         // finding, src/memory.rs). The scheme is lowercased on the key.
-        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "ftp://host/repo.git");
-        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "https://example.com/a/b.git");
-        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "git+ssh://github.com/org/repo.git");
-        // Query/fragment stripping applies only to remotes with a recognised
+        assert_eq!(normalize_remote("ftp://user:pass@host/repo.git"), "ftp://user@host/repo.git");
+        assert_eq!(normalize_remote("HTTPS://user:pass@example.com/a/b.git"), "https://user@example.com/a/b.git");
+        assert_eq!(normalize_remote("git+ssh://git@github.com/org/repo.git"), "git+ssh://git@github.com/org/repo.git");
+        // A URI's non-secret username is a repository-identity discriminator and
+        // is preserved (mirroring the SCP branch): a relative SSH path resolves
+        // under the login user's home, so distinct users must not collapse onto
+        // one project-memory scope. Only the password is stripped (Copilot
+        // finding, src/memory.rs).
+        assert_eq!(normalize_remote("ssh://alice@host/repo.git"), "ssh://alice@host/repo.git");
+        assert_ne!(
+            normalize_remote("ssh://alice@host/repo.git"),
+            normalize_remote("ssh://bob@host/repo.git")
+        );
+        // The password (a rotating secret) is still removed, keeping only the
+        // username, so two remotes differing only in their password map to one
+        // stable key and no secret leaks into the key/label/filename.
+        assert_eq!(normalize_remote("ssh://alice:secret@host/repo.git"), "ssh://alice@host/repo.git");
+        assert_eq!(
+            normalize_remote("ssh://alice:s3cret@host/repo.git"),
+            normalize_remote("ssh://alice:rotated@host/repo.git")
+        );
+        // A password-only userinfo (`:pass@host`, e.g. a Redis-style secret)
+        // collapses to just the host, since there is no username discriminator.
+        assert_eq!(normalize_remote("ssh://:secret@host/repo.git"), "ssh://host/repo.git");
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct
         // keys (Copilot finding, src/memory.rs).
