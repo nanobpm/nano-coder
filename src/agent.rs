@@ -835,6 +835,23 @@ impl Agent {
         };
     }
 
+    /// Rebuild the system message so the folded memory index reflects the
+    /// current store. Called after a `/memory forget` (or the forget tool) so a
+    /// deleted memory leaves the active system prompt immediately instead of
+    /// lingering until the next session. A no-op when memory is off.
+    pub fn refresh_memory_index(&mut self) {
+        if self.memory.is_none() {
+            return;
+        }
+        let prompt = self.system_prompt();
+        if let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) {
+            first.content = prompt;
+        }
+        // `system_prompt()` renders without the plan-mode note; re-apply it so a
+        // refresh mid plan-mode does not silently drop the note.
+        self.apply_mode_to_system_prompt();
+    }
+
     /// Add queued steering messages to the conversation.
     fn absorb_steers(&mut self) -> Result<()> {
         for steer in self.control.take_pending() {
@@ -2128,7 +2145,14 @@ impl Agent {
         // Plan mode must not mutate: route search through the read-only path so
         // it neither bumps last_used nor prunes/rewrites the store.
         let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
-        memory::run(store, &call.name, &call.arguments, session, read_only)
+        let result = memory::run(store, &call.name, &call.arguments, session, read_only);
+        // A successful forget deletes an entry the folded system-prompt index
+        // still shows; rebuild it so the removed fact leaves the active prompt
+        // at once rather than resurfacing on the next turn.
+        if call.name == memory::FORGET_TOOL && result.is_ok() {
+            self.refresh_memory_index();
+        }
+        result
     }
 
     /// Get conversation length

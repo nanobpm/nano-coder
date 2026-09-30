@@ -1005,10 +1005,10 @@ async fn run_compaction(
 }
 
 /// `/memory` (list) and `/memory forget <id>`.
-fn memory_command(agent: &Agent, args: &str) -> String {
-    let Some(store) = agent.memory() else {
+fn memory_command(agent: &mut Agent, args: &str) -> String {
+    if agent.memory().is_none() {
         return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
-    };
+    }
     if let Some(id) = args.strip_prefix("forget").map(str::trim) {
         if id.is_empty() {
             return "Usage: /memory forget <id>".to_string();
@@ -1016,14 +1016,21 @@ fn memory_command(agent: &Agent, args: &str) -> String {
         if !agent.config().memory.writable() {
             return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
         }
-        return match store.forget(id) {
-            Ok(msg) => msg,
-            Err(e) => format!("{e}"),
+        let (msg, ok) = match agent.memory().unwrap().forget(id) {
+            Ok(msg) => (msg, true),
+            Err(e) => (format!("{e}"), false),
         };
+        // Rebuild the folded system prompt so the deleted memory stops appearing
+        // in the active session's index (it is captured at session start).
+        if ok {
+            agent.refresh_memory_index();
+        }
+        return msg;
     }
     if !args.is_empty() {
         return format!("Unknown /memory argument {args:?}; use /memory or /memory forget <id>.");
     }
+    let store = agent.memory().unwrap();
     let entries = match store.all() {
         Ok(entries) => entries,
         Err(e) => return format!("Could not read memory: {e}"),
