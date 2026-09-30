@@ -52,8 +52,8 @@ Don't bump versions or push `v*` tags by hand: semantic-release owns both.
 ## Branch protection and the release app
 
 The `main` ruleset (Settings → Rules) requires a pull request, allows only squash merges,
-blocks force-pushes and deletion, and requires the `test (ubuntu-24.04)`, `test (macos-14)`
-and `commitlint` checks. The only actor allowed to bypass it is the **release GitHub App**,
+blocks force-pushes and deletion, and requires the `test (ubuntu-24.04)`, `test (macos-14)`,
+`rustfmt` and `commitlint` checks. The only actor allowed to bypass it is the **release GitHub App**,
 which semantic-release uses to push the `chore(release)` commit and tag. The workflow's own
 `GITHUB_TOKEN` can't bypass a repository ruleset, and deploy keys are disabled in the org.
 

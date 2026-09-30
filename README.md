@@ -355,6 +355,9 @@ Flags: `--login github-copilot`, `--list-models PROVIDER`, `--acp`, `--model pro
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
+Before opening a PR, run `cargo fmt` (style in `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings`
+and `cargo test`; CI checks all three.
+
 ## Configuration
 
 Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`) are still used if the new ones don't exist:
