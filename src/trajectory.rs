@@ -186,25 +186,25 @@ impl Turn {
             })
             .count();
         let tools = call_rows + orphaned_results;
-        // One model call per assistant request. A THINK row is the same request's
-        // reasoning, so an assistant row accompanied by one is not counted again
-        // (with a separate THINK row the request's usage/duration live on it).
-        // The one row that is NOT a request is the final-answer row the agent
-        // itself appends after `report_outcome` (`Message::assistant(&response)`
-        // in agent.rs): it is the turn's LAST assistant row, carries no
-        // usage/duration, its text is the persisted `TurnEnd.response`
-        // verbatim, AND the turn has a recorded outcome — `report_outcome`
-        // always records one, so without it the matching last row is an
-        // ordinary final response (`TurnEnd.response` is the turn's real
-        // response for every completed turn, outcome or not). Logs written
-        // before per-request metrics existed have no usage/duration on ANY
-        // row; there every assistant/think row is a real request, so only
+        // One model call per assistant request. A THINK row is the same
+        // request's reasoning, so the ASSISTANT row paired with one is not
+        // counted again — the pairing is positional (a THINK row is always
+        // emitted immediately before its request's ASSISTANT row) and does NOT
+        // depend on usage/duration being present: those fields are optional
+        // for backward compatibility, so a metrics-free thinking message is
+        // still one request, not two. The one row that is NOT a request is the
+        // final-answer row the agent itself appends after `report_outcome`
+        // (`Message::assistant(&response)` in agent.rs): it is the turn's LAST
+        // assistant row, carries no usage/duration, its text is the persisted
+        // `TurnEnd.response` verbatim, AND the turn has a recorded outcome —
+        // `report_outcome` always records one, so without it the matching last
+        // row is an ordinary final response (`TurnEnd.response` is the turn's
+        // real response for every completed turn, outcome or not). Logs
+        // written before per-request metrics existed have no usage/duration on
+        // ANY row; there every assistant/think row is a real request, so only
         // that specifically identifiable synthetic row is excluded —
         // otherwise a completed legacy turn would summarize as
         // `(no activity)`.
-        let any_metrics = self.rows.iter().any(|r| {
-            matches!(r.kind, RowKind::Assistant | RowKind::Think) && (r.usage.is_some() || r.duration_ms.is_some())
-        });
         let last_assistant = self.rows.iter().rposition(|r| matches!(r.kind, RowKind::Assistant));
         let mut seen_think = false;
         let mut calls = 0usize;
@@ -224,11 +224,11 @@ impl Turn {
                     if synthetic_answer {
                         continue;
                     }
-                    // With metrics anywhere, a metrics-free assistant row that
-                    // follows a THINK row is the same request's answer (the
-                    // metrics live on the THINK row) — already counted. In a
-                    // metrics-free (legacy) turn it is a real request.
-                    if any_metrics && r.usage.is_none() && r.duration_ms.is_none() && seen_think {
+                    // The ASSISTANT row paired with a THINK row is the same
+                    // request's answer (any usage/duration live on the THINK
+                    // row) — already counted, metrics or not.
+                    if seen_think {
+                        seen_think = false;
                         continue;
                     }
                     calls += 1;
@@ -364,6 +364,25 @@ impl Trajectory {
                     out.push(sanitize_terminal(&format!("      {text_line}")));
                 }
             }
+            // The persisted turn response lives only on `TurnEnd`; an ordinary
+            // completed turn's final ASSISTANT row already carries the same
+            // text, but a cancelled or max-requests turn has no such row, so
+            // emit the response here or `/trajectory` would omit the
+            // `[turn cancelled]` / stop explanation that JSON/Markdown keep.
+            if let Some(response) = &turn.response {
+                let response = response.trim();
+                if !response.is_empty()
+                    && !matches!(
+                        turn.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Assistant)),
+                        Some(last) if last.text.trim() == response
+                    )
+                {
+                    out.push(sanitize_terminal("  ● RESPONSE"));
+                    for text_line in response.split('\n') {
+                        out.push(sanitize_terminal(&format!("      {text_line}")));
+                    }
+                }
+            }
             out.push(sanitize_terminal(&format!("  ↳ {}", turn.summary())));
         }
         out.join("\n")
@@ -433,8 +452,26 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
             turn.rows.push(row);
         }
         Role::Assistant => {
-            if !message.thinking.is_empty() {
-                let mut row = Row::new(RowKind::Think, message.thinking.clone());
+            // Older Anthropic logs can carry readable reasoning only in
+            // `thinking_blocks` (as `history_read` handles at
+            // src/history.rs:345-359); replay blocks (OpenAI
+            // `reasoning_content`, Responses `reasoning`) have no readable
+            // `thinking`, so only blocks with a string `thinking` member
+            // contribute. The effective thinking decides both the THINK row
+            // and the metric placement below.
+            let thinking = if message.thinking.is_empty() {
+                message
+                    .thinking_blocks
+                    .iter()
+                    .filter_map(|block| block.get("thinking").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<&str>>()
+                    .join("\n\n")
+            } else {
+                message.thinking.clone()
+            };
+            let has_think_row = !thinking.is_empty();
+            if has_think_row {
+                let mut row = Row::new(RowKind::Think, thinking);
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
                 row.timestamp = message.timestamp;
@@ -451,7 +488,7 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
             let mut row = Row::new(RowKind::Assistant, text);
             // When there is a separate think row, the usage/duration belong to
             // it; avoid double-counting the request in the turn summary.
-            if message.thinking.is_empty() {
+            if !has_think_row {
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
             }
@@ -885,6 +922,90 @@ mod tests {
         let turn = &traj.turns[0];
         assert!(turn.summary().contains("1 call"), "{}", turn.summary());
         assert!(!turn.summary().contains("no activity"), "{}", turn.summary());
+    }
+
+    #[test]
+    fn metrics_free_thinking_message_is_one_call_not_two() {
+        // A legacy (metrics-free) assistant message with reasoning produces a
+        // THINK row AND an ASSISTANT row for the SAME request: one call, even
+        // though no usage/duration exists anywhere to pair them by.
+        let mut thinking_request = Message { timestamp: Some(now()), ..Message::assistant("thought through") };
+        thinking_request.thinking = "let me think".into();
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            Record::Message(thinking_request),
+            Record::TurnEnd {
+                input_id: "i".into(),
+                response: "thought through".into(),
+                outcome: None,
+                history_calls: 0,
+                recorded_at: now(),
+            },
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let turn = &traj.turns[0];
+        assert!(turn.rows.iter().any(|r| matches!(r.kind, RowKind::Think)));
+        assert!(turn.summary().contains("1 call"), "{}", turn.summary());
+        assert!(!turn.summary().contains("2 calls"), "{}", turn.summary());
+    }
+
+    #[test]
+    fn thinking_blocks_supply_the_think_row_when_the_plain_field_is_empty() {
+        // Older Anthropic logs carry readable reasoning only in
+        // `thinking_blocks`; `history_read` already replays it, and the
+        // trajectory must not silently drop it. The request metrics sit on the
+        // THINK row, exactly as for a message with the plain `thinking` field.
+        let mut msg = Message {
+            usage: Some(TokenUsage { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, aic: None }),
+            duration_ms: Some(1500),
+            timestamp: Some(now()),
+            ..Message::assistant("the answer")
+        };
+        msg.thinking_blocks = vec![
+            json!({"type": "thinking", "thinking": "reasoning in a block", "signature": "sig"}),
+            json!({"type": "redacted_thinking", "data": "..."}),
+        ];
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(msg),
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let rows = &traj.turns[0].rows;
+        let think = rows.iter().find(|r| matches!(r.kind, RowKind::Think)).expect("a THINK row from the blocks");
+        assert_eq!(think.text, "reasoning in a block");
+        assert_eq!(think.duration_ms, Some(1500), "the request metrics live on the THINK row");
+        let answer = rows.iter().find(|r| matches!(r.kind, RowKind::Assistant)).expect("an ASSISTANT row");
+        assert_eq!(answer.usage, None, "not double-counted on the paired ASSISTANT row");
+        assert!(traj.turns[0].summary().contains("1 call"), "{}", traj.turns[0].summary());
+    }
+
+    #[test]
+    fn plain_render_emits_a_persisted_response_with_no_assistant_row() {
+        // A cancelled turn's final text exists only as `TurnEnd.response`
+        // (src/agent.rs): the plain/pager rendering must still show it, as the
+        // JSON/Markdown exports do.
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            Record::TurnEnd {
+                input_id: "i".into(),
+                response: "[turn cancelled]".into(),
+                outcome: None,
+                history_calls: 0,
+                recorded_at: now(),
+            },
+        ];
+        let plain = Trajectory::from_records(&recs).to_plain();
+        assert!(plain.contains("RESPONSE"), "{plain}");
+        assert!(plain.contains("[turn cancelled]"), "{plain}");
+        // An ordinary completed turn's final ASSISTANT row already carries the
+        // response text, so it is not repeated.
+        let plain = Trajectory::from_records(&records()).to_plain();
+        assert_eq!(plain.matches("feature added").count(), 1, "{plain}");
     }
 
     #[test]

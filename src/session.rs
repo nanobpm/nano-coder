@@ -274,10 +274,15 @@ pub fn read_records_at(path: &Path, expected_id: Option<&str>) -> Result<Vec<Rec
         }
         // Number messages by log line, as `SessionLog::open` does, so the
         // trajectory cites the same `#N` IDs as `history_read` and smart
-        // summaries.
+        // summaries. Assign the physical line unconditionally: a direct message
+        // record's ID IS its physical line (`history_read` enumerates lines and
+        // knows nothing of a serialized field), so a syntactically valid log
+        // carrying a stale `log_line` on a direct record must not export a
+        // different `#N` than `history_read` shows. Embedded IDs are meaningful
+        // only on messages nested inside `replace` records.
         let mut record = record;
         if let Record::Message(message) = &mut record {
-            message.log_line.get_or_insert(line_no as u64 + 1);
+            message.log_line = Some(line_no as u64 + 1);
         }
         records.push(record);
         index += 1;
@@ -368,7 +373,12 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 restored.pending_input = Some(PendingInput { id, text, position: restored.conversation.len() });
             }
             Record::Message(mut message) => {
-                message.log_line.get_or_insert(line_no as u64 + 1);
+                // A direct record's ID is its physical line (`history_read`
+                // enumerates lines), so assign it unconditionally: a stale
+                // serialized `log_line` must not override the line the history
+                // tools would cite. Embedded IDs are meaningful only on
+                // messages nested inside `replace` records.
+                message.log_line = Some(line_no as u64 + 1);
                 if crate::history::consumes_hint(&message) {
                     restored.history_hint_consumed = true;
                 }
@@ -409,6 +419,34 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_log_line_on_a_direct_record_is_renumbered_to_its_physical_line() {
+        // A direct message record's `#N` IS its physical line: `history_read`
+        // enumerates lines and knows nothing of a serialized field, so both
+        // readers must assign the physical line unconditionally rather than
+        // trust an embedded `log_line`. (Live logs never carry one on direct
+        // records — it is written only inside `replace` records — but a
+        // syntactically valid log can.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let stale: Record =
+            serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi","log_line":99}}"#).unwrap();
+        assert_eq!(stale, Record::Message(Message { log_line: Some(99), ..Message::user("hi") }));
+        let mut log = String::new();
+        for record in
+            [Record::Session { version: FORMAT_VERSION, id: "s".into(), created_at: now() }, input("i"), stale]
+        {
+            log.push_str(&serde_json::to_string(&record).unwrap());
+            log.push('\n');
+        }
+        std::fs::write(&path, log).unwrap();
+        let records = read_records_at(&path, Some("s")).unwrap();
+        let Record::Message(message) = &records[2] else { panic!("a message record") };
+        assert_eq!(message.log_line, Some(3), "the physical line wins over the serialized field");
+        let (_, restored) = SessionLog::open(dir.path(), "s").unwrap();
+        assert_eq!(restored.conversation[0].log_line, Some(3));
+    }
 
     #[test]
     fn reads_utc_records_and_unstamped_messages_from_older_logs() {
