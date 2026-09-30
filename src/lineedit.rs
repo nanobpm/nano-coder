@@ -1375,7 +1375,12 @@ fn modified_key(key: u32, modifier: u16) -> Esc {
     const ALT: u16 = 2;
     const CTRL: u16 = 4;
     const SUPER: u16 = 8;
-    let bits = modifier.saturating_sub(1);
+    // Kitty reports Caps Lock (64) and Num Lock (128) as always-present state
+    // bits, not held modifiers; mask them off so they don't defeat the exact
+    // modifier comparisons below.
+    const CAPS_LOCK: u16 = 64;
+    const NUM_LOCK: u16 = 128;
+    let bits = modifier.saturating_sub(1) & !(CAPS_LOCK | NUM_LOCK);
     match key {
         // Ctrl- or Cmd-Enter: newline (queue during a turn). Unmodified Enter
         // submits, as the CR legacy mode sends would.
@@ -2132,6 +2137,26 @@ mod tests {
         // Unmodified kitty Enter submits rather than being ignored.
         assert!(matches!(parse_escape(b"\x1b[13u"), Esc::Submit), "kitty Enter (no modifier) submits");
         assert!(matches!(parse_escape(b"\x1b[13;1u"), Esc::Submit), "kitty Enter (modifier 1) submits");
+    }
+
+    #[test]
+    fn kitty_lock_state_bits_are_ignored() {
+        // Kitty adds Caps Lock (64) and Num Lock (128) as always-present state
+        // bits in the modifier field; they must not defeat the modifier
+        // comparisons. modifier = 1 + bits, so Caps Lock alone is 65, Num Lock
+        // alone is 129, and both together are 193.
+        assert!(matches!(parse_escape(b"\x1b[27;65u"), Esc::Escape), "Esc with Caps Lock");
+        assert!(matches!(parse_escape(b"\x1b[27;129u"), Esc::Escape), "Esc with Num Lock");
+        assert!(matches!(parse_escape(b"\x1b[13;65u"), Esc::Submit), "Enter with Caps Lock submits");
+        assert!(matches!(parse_escape(b"\x1b[13;193u"), Esc::Submit), "Enter with both locks submits");
+        // Ctrl-C is modifier 5 (1 + ctrl=4); with Caps Lock it is 69, with both
+        // locks 197. Held Ctrl must still be honoured.
+        assert!(matches!(parse_escape(b"\x1b[99;69u"), Esc::Control(0x03)), "Ctrl-C with Caps Lock");
+        assert!(matches!(parse_escape(b"\x1b[99;197u"), Esc::Control(0x03)), "Ctrl-C with both locks");
+        // Ctrl-Enter is modifier 5; with Caps Lock 69 it stays a newline.
+        assert!(matches!(parse_escape(b"\x1b[13;69u"), Esc::Newline), "Ctrl-Enter with Caps Lock");
+        // Alt-b is modifier 3 (1 + alt=2); with Num Lock it is 131.
+        assert!(matches!(parse_escape(b"\x1b[98;131u"), Esc::WordLeft), "Alt-b with Num Lock");
     }
 
     #[test]
