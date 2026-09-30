@@ -788,6 +788,21 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
             return Some(reason);
         }
     }
+    // Opaque `Authorization: Bearer <token>` / `Basic <token>` header values.
+    // A long opaque token after the scheme keyword is a credential even when it
+    // matches no known-token pattern and no secret-labelled variable name.
+    // `$TOKEN`/`<token>` placeholders are exempted by `is_placeholder`.
+    let auth_header = r"(?i)\b(?:bearer|basic)\s+(\S+)";
+    if let Ok(re) = RegexBuilder::new(auth_header).build() {
+        for caps in re.captures_iter(text) {
+            let value = &caps[1];
+            // Only flag values long enough to be a real token — short words
+            // like `Bearer token` or `Basic auth` are prose, not credentials.
+            if value.len() >= 16 && !is_placeholder(value) {
+                return Some("authorization header value");
+            }
+        }
+    }
     // `SOMETHING_TOKEN=<value>` / `password: <value>` style assignments. Any
     // non-empty value counts — a short one (`API_KEY=secret`, `PASSWORD=hunter2`)
     // is still a credential, so the value length must not gate detection — except
@@ -810,6 +825,10 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
 fn is_placeholder(value: &str) -> bool {
     // Angle-bracket templates like `<your-token>` or `<TOKEN>` are placeholders.
     if value.contains('<') && value.contains('>') {
+        return true;
+    }
+    // Shell-style variable references like `$TOKEN` or `${TOKEN}` are placeholders.
+    if value.starts_with('$') {
         return true;
     }
     let trimmed = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
@@ -903,6 +922,18 @@ mod tests {
         // src/memory.rs).
         assert!(store.save(Scope::User, "config: token=<your-token> password=hunter2", None, None).is_err());
         assert!(store.save(Scope::User, "config: token=<your-token> password=<your-password>", None, None).is_ok());
+        // Opaque `Authorization: Bearer <token>` / `Basic <token>` header values
+        // are credentials even when they match no known-token pattern and no
+        // secret-labelled variable name (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "header: Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789", None, None).is_err());
+        assert!(store.save(Scope::User, "header: Authorization: Basic dXNlcjpwYXNzd29yZA==", None, None).is_err());
+        // Placeholder auth values are not real secrets.
+        assert!(store.save(Scope::User, "header: Authorization: Bearer $TOKEN", None, None).is_ok());
+        assert!(store.save(Scope::User, "header: Authorization: Bearer <your-token>", None, None).is_ok());
+        assert!(store.save(Scope::User, "header: Authorization: Bearer xxxxxxxx", None, None).is_ok());
+        // Short prose uses of the words are not credentials.
+        assert!(store.save(Scope::User, "use Bearer token auth", None, None).is_ok());
+        assert!(store.save(Scope::User, "Basic auth header", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
