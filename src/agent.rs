@@ -1016,64 +1016,6 @@ impl Agent {
         }
     }
 
-    /// Re-emit the conversation like `replay_history`, additionally passing
-    /// each event to `tap` as it is emitted. Used on a live renderer switch:
-    /// the tap reprints the conversation into the newly active renderer while
-    /// the emitted events reach the installed sink. Every user message is
-    /// replayed — the interactive prompt's current line is not part of the
-    /// conversation (it is recorded only when submitted), so nothing here can
-    /// duplicate the line being edited.
-    pub fn replay_history_with(&mut self, tap: impl Fn(&AgentEvent)) {
-        if self.event_sink.is_none() {
-            return;
-        }
-        let conversation = self.conversation.clone();
-        let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
-        macro_rules! replay {
-            ($event:expr) => {{
-                let event = $event;
-                tap(&event);
-                self.emit(event);
-            }};
-        }
-        for message in &conversation {
-            match message.role {
-                Role::System => {}
-                Role::User => {
-                    replay!(AgentEvent::UserMessage { text: &message.content });
-                }
-                Role::Assistant => {
-                    if !message.content.trim().is_empty() {
-                        self.message_counter += 1;
-                        let message_id = format!("msg-{}-{}", Utc::now().timestamp_millis(), self.message_counter);
-                        replay!(AgentEvent::AssistantMessage { message_id: &message_id, text: &message.content });
-                    }
-                    for call in &message.tool_calls {
-                        calls.insert(call.id.as_str(), call);
-                        replay!(AgentEvent::ToolCall { call });
-                    }
-                }
-                Role::Tool => {
-                    let Some(call) = message.tool_call_id.as_deref().and_then(|id| calls.get(id)) else {
-                        continue;
-                    };
-                    let ok = !message.is_error;
-                    replay!(AgentEvent::ToolResult { call, ok, output: &message.content });
-                }
-            }
-        }
-        if !self.plan.is_empty() {
-            replay!(AgentEvent::Plan { plan: &self.plan });
-        }
-    }
-
-    /// The current plan, when one is set. Used to thread the replayed plan
-    /// into `Renderer::replay_plan_snapshots` so the frame's drained snapshots
-    /// don't reprint it.
-    pub fn current_plan(&self) -> Option<&Plan> {
-        (!self.plan.is_empty()).then_some(&self.plan)
-    }
-
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -2548,24 +2490,25 @@ mod tests {
     }
 
     #[test]
-    fn replay_history_with_replays_every_user_message() {
+    fn replay_history_replays_every_user_message() {
         // A renderer switch replays the conversation into the newly active
-        // renderer. The interactive prompt's in-flight line is not part of
-        // the conversation (it is recorded only when submitted), so no user
-        // message is skipped — including a trailing one with no assistant
-        // reply yet, and repeated texts.
+        // renderer via the installed sink. The interactive prompt's in-flight
+        // line is not part of the conversation (it is recorded only when
+        // submitted), so no user message is skipped — including a trailing one
+        // with no assistant reply yet, and repeated texts.
         let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("gpt-4o-mini")), Config::default());
-        agent.set_event_sink(Box::new(|_, _| {}));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
         agent.conversation.push(Message::user("same"));
         agent.conversation.push(Message::assistant("first answer"));
         agent.conversation.push(Message::user("same"));
-        let tapped: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
-        agent.replay_history_with(|event| {
-            if let AgentEvent::UserMessage { text } = event {
-                tapped.borrow_mut().push(text.to_string());
-            }
-        });
-        assert_eq!(*tapped.borrow(), vec!["same".to_string(), "same".to_string()]);
+        agent.replay_history();
+        assert_eq!(*seen.lock().unwrap(), vec!["same".to_string(), "same".to_string()]);
     }
 
     #[test]

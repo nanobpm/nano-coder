@@ -726,31 +726,6 @@ impl Renderer {
         }
     }
 
-    /// Print one replayed USER turn in LEGACY mode (used when leaving frame
-    /// mode, whose full redraws cleared the legacy scrollback, to put the
-    /// conversation back). Only `UserMessage` is handled: the replay also
-    /// emits every event to the installed sink (`Renderer::event`), which
-    /// already renders assistant replies, tool calls/results and the plan in
-    /// legacy mode — printing them here too would show each twice. The sink
-    /// ignores `UserMessage` (a live one is a mid-turn steer note, not a
-    /// transcript line), so user turns are printed here instead. No-op in
-    /// frame mode: the frame transcript already holds the conversation.
-    pub fn replay_event(&self, event: &AgentEvent) {
-        if self.frame.lock().unwrap().is_some() {
-            return;
-        }
-        if verbosity() == Verbosity::Quiet {
-            return;
-        }
-        if let AgentEvent::UserMessage { text } = event {
-            let mut state = self.state.lock().unwrap();
-            if !text.trim().is_empty() {
-                self.newline(&mut state);
-                self.out(&mut state, &format!("{}> {}\n", stamp(), text));
-            }
-        }
-    }
-
     /// Hand legacy-mode output that exists only in renderer state (not yet in
     /// scrollback) to the frame transcript, so the frame's first full redraw —
     /// which clears scrollback — cannot erase it: notes deferred behind an

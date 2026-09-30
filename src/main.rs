@@ -518,10 +518,13 @@ impl Terminal {
             // screen). Seed the drained legacy output first so it lands ahead
             // of the conversation, then replay the conversation as one batch:
             // rendering per event would redo the whole transcript layout each
-            // time (O(events²) on a long session).
+            // time (O(events²) on a long session). The emitted events reach the
+            // installed sink (`Renderer::event`), which routes them into the
+            // now-active frame — no separate per-event tap is needed (a tap via
+            // `replay_event` would no-op here: it early-returns while the frame
+            // is active).
             self.renderer.push_items(pending);
-            let renderer = self.renderer.clone();
-            self.renderer.frame_batch(|| agent.replay_history_with(|event| renderer.replay_event(event)));
+            self.renderer.frame_batch(|| agent.replay_history());
         } else if frame_was_active {
             // Legacy scrollback was cleared by the frame's redraws: reprint
             // the conversation so older turns stay accessible. The tap prints

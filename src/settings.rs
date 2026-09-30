@@ -138,10 +138,17 @@ pub async fn run(
             }
             1 => {
                 if let Some(edit) = edit_provider(agent).await.ok().flatten() {
+                    let name = edit.name;
+                    // Keep only the LATEST rebuild outcome for this provider:
+                    // a prior failure notice for the same provider is now
+                    // resolved (the rebuild just succeeded) or superseded (it
+                    // failed again, with a fresher message), so drop it before
+                    // recording the new outcome.
+                    let stale = format!("Provider {name} saved, but could not rebuild the client:");
+                    notices.retain(|n| !n.starts_with(&stale));
                     if let Some(notice) = edit.rebuild_notice {
                         notices.push(notice);
                     }
-                    let name = edit.name;
                     changes.providers.insert(name.clone());
                     let pick_now = Confirm::new()
                         .with_prompt(format!("Pick a model from {name} now?"))
@@ -189,10 +196,15 @@ pub async fn run(
                     // `set_system_prompt` is atomic (it rolls its config change
                     // back on failure), so on error the prompt is unchanged;
                     // retain a notice since the dialog's own `println!` is wiped
-                    // by the exit redraw in frame mode.
+                    // by the exit redraw in frame mode. Keep only the LATEST
+                    // outcome: a prior failure notice is resolved by this
+                    // success (or superseded by a fresher failure), so drop it
+                    // first or the exit redraw would re-show a settled failure.
+                    const SYSTEM_PROMPT_NOTICE: &str = "Could not update the system prompt:";
+                    notices.retain(|n| !n.starts_with(SYSTEM_PROMPT_NOTICE));
                     match agent.set_system_prompt(&value) {
                         Ok(()) => changes.system_prompt = true,
-                        Err(e) => notices.push(format!("Could not update the system prompt: {e:#}")),
+                        Err(e) => notices.push(format!("{SYSTEM_PROMPT_NOTICE} {e:#}")),
                     }
                 }
             }
