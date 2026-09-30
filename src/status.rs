@@ -217,6 +217,24 @@ fn repin_sequence(rows: u16) -> String {
     format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{}r\x1b[{};1H", scroll_region_bottom(rows), scroll_region_bottom(rows))
 }
 
+/// Bytes that clear the frame-owned screen and scrollback WITHOUT re-pinning
+/// a scroll region: the frame-to-legacy clear for when no status line is
+/// installed (`AGENTIC_NO_STATUS`, or a terminal shorter than five rows). The
+/// frame's last redraw is still on the display, so this drops the region,
+/// homes the cursor and wipes the screen + scrollback — the caller's legacy
+/// replay reprints the conversation, so anything left visible would scroll
+/// into scrollback as a duplicate. Unlike [`repin_sequence`] there is no
+/// bottom row to reserve, so the cursor is simply left at home.
+fn clear_display_sequence() -> &'static str {
+    "\x1b[r\x1b[H\x1b[2J\x1b[3J"
+}
+
+/// Clear the frame-owned screen and scrollback when no status line is
+/// installed (see [`clear_display_sequence`]).
+pub fn clear_display() {
+    with_term_lock(|| emit(clear_display_sequence()));
+}
+
 impl StatusLine {
     /// Reserve the bottom row, when stdin and stdout are a terminal and
     /// `AGENTIC_NO_STATUS` is unset.
@@ -957,6 +975,18 @@ mod tests {
             let seq = resize_sequence(rows);
             assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
         }
+    }
+
+    #[test]
+    fn clear_display_sequence_clears_without_repinning_a_region() {
+        // The no-status frame → legacy clear: the frame's last redraw is still
+        // on the display, so the screen AND scrollback are wiped (the replay
+        // reprints everything), but with no status line there is no bottom row
+        // to reserve — no region re-pin and no absolute cursor row.
+        let seq = clear_display_sequence();
+        assert!(seq.contains("\x1b[H\x1b[2J\x1b[3J"), "frame copy not cleared: {seq:?}");
+        assert!(!seq.contains("\x1b[1;"), "no region re-pin: {seq:?}");
+        assert!(!seq.contains(";1H"), "no absolute cursor row: {seq:?}");
     }
 
     #[test]

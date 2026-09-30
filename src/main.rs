@@ -477,12 +477,15 @@ impl Terminal {
         // reset, leaving the cursor on the last scrollable row. Doing it
         // before `view.resize()` (not after) means there is no fresh prompt
         // for the clear to wipe, and the replay can't start writing on the
-        // reserved status row.
-        if !on
-            && frame_was_active
-            && let Some(status) = &self.status
-        {
-            status.repin_scroll_region();
+        // reserved status row. When no status line is installed (a TTY with
+        // `AGENTIC_NO_STATUS` or fewer than five rows) there is no region to
+        // re-pin, but the frame's display must STILL be cleared — skipping it
+        // would leave the replay writing over the stale frame copy.
+        if !on && frame_was_active {
+            match &self.status {
+                Some(status) => status.repin_scroll_region(),
+                None => crate::status::clear_display(),
+            }
         }
         // Re-anchor the scroll region (legacy) / let the frame re-own the
         // screen (frame), and recompute the prompt at the current size.
@@ -513,13 +516,19 @@ impl Terminal {
             // only the user turns (the sink's legacy `Renderer::event` renders
             // everything else and ignores replayed user messages). First flush
             // the frame-only items `set_mode` migrated (banner, `/help`,
-            // notes): a fresh session has no history events to trigger
-            // `out()`'s deferred flush and the next prompt is drawn by
+            // notes, raw exports): a fresh session has no history events to
+            // trigger `out()`'s deferred flush and the next prompt is drawn by
             // `EditView`, so without this they would stay invisible until the
-            // first turn's output.
+            // first turn's output. Then reprint the plan snapshots the frame
+            // accumulated: the replay emits only the CURRENT plan (once, at
+            // the end), so without them the earlier checklist states the frame
+            // showed would be lost. `replay_plan_snapshots` skips the last
+            // snapshot when it is the plan the replay just printed.
             self.renderer.flush_pending();
+            let plans = self.renderer.take_pending_plans();
             let renderer = self.renderer.clone();
             agent.replay_history_with(|event| renderer.replay_event(event));
+            self.renderer.replay_plan_snapshots(plans, agent.current_plan());
         }
     }
 

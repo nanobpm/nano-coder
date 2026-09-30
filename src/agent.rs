@@ -1067,6 +1067,13 @@ impl Agent {
         }
     }
 
+    /// The current plan, when one is set. Used to thread the replayed plan
+    /// into `Renderer::replay_plan_snapshots` so the frame's drained snapshots
+    /// don't reprint it.
+    pub fn current_plan(&self) -> Option<&Plan> {
+        (!self.plan.is_empty()).then_some(&self.plan)
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }

@@ -176,6 +176,16 @@ struct State {
     stream_pad: usize,
     /// Notes held back until the streamed line they would interrupt ends.
     deferred: Vec<String>,
+    /// Verbatim machine-readable exports (`/trajectory --json`) drained from a
+    /// dropped frame, held until the post-clear flush so the frame-to-legacy
+    /// screen+scrollback clear cannot erase them. Printed byte-exact (never
+    /// trimmed or DIM-styled like `deferred` notes).
+    raw: Vec<String>,
+    /// Historical plan snapshots drained from a dropped frame, in original
+    /// order. The history replay emits only the CURRENT plan (once, at the
+    /// end), so without these the earlier checklist states the frame showed
+    /// would be lost on a frame → legacy switch.
+    plans: Vec<Plan>,
 }
 
 pub struct Renderer {
@@ -295,9 +305,14 @@ impl Renderer {
     /// (`Item::OutcomeMark`) are dropped, not drained: the replay re-emits
     /// the tool call and the legacy renderer prints the marker again.
     /// `Item::Raw` holds verbatim machine-readable output (`/trajectory
-    /// --json`); it is printed byte-exact straight away, never routed through
-    /// the deferred-note queue (which would trim trailing newlines and add
-    /// DIM styling, corrupting the export).
+    /// --json`); it is queued for the post-clear flush (printed byte-exact,
+    /// never routed through the deferred-note queue, which would trim trailing
+    /// newlines and add DIM styling, corrupting the export). Printing it here
+    /// would lose it: the caller's `repin_scroll_region` clears the screen and
+    /// scrollback AFTER this returns, so the raw bytes are deferred until that
+    /// clear has run. Likewise the frame's `Item::Plan` snapshots are queued:
+    /// the history replay emits only the CURRENT plan (once, at the end), so
+    /// dropping them would lose the earlier checklist states the frame showed.
     pub fn set_mode(&self, mode: crate::frame::RendererMode) {
         let on = mode == crate::frame::RendererMode::Frame && self.tty;
         let mut frame = self.frame.lock().unwrap();
@@ -313,8 +328,11 @@ impl Renderer {
                     // Conversation-derived: the history replay reprints it.
                     Item::OutcomeMark(_) => {}
                     Item::Output(text) => state.deferred.push(text.trim_end().to_string()),
-                    Item::Raw(text) => self.restore_raw(&mut state, &text),
-                    Item::Message { .. } | Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Plan(_) => {}
+                    Item::Raw(text) => state.raw.push(text),
+                    // Historical plan snapshots: the replay reprints only the
+                    // current plan, so queue these for `replay_plan_snapshots`.
+                    Item::Plan(plan) => state.plans.push(plan),
+                    Item::Message { .. } | Item::ToolCall { .. } | Item::ToolResult { .. } => {}
                     Item::Thinking { chars, seconds } => {
                         state.deferred.push(format!("∴ Thought for {seconds:.1}s · {chars} chars"))
                     }
@@ -324,23 +342,29 @@ impl Renderer {
     }
 
     /// Print migrated frame-only output (notes deferred behind a streamed
-    /// line, the collapsed thinking summary) now, rather than waiting for the
-    /// next renderer write to flush the queue. Used when switching frame →
-    /// legacy: a fresh session has no history events to trigger `out()`'s
-    /// flush, and the next prompt is drawn by `EditView` (not the renderer),
-    /// so without this the migrated banner / `/help` output would stay
-    /// invisible until the first turn's output. Goes through `out()` (via
-    /// `newline`), so a partial streamed line is ended first and the notes
-    /// are not re-flushed by that `out()` call — `state.deferred` is already
-    /// empty when it runs.
+    /// line, the collapsed thinking summary, raw exports) now, rather than
+    /// waiting for the next renderer write to flush the queue. Used when
+    /// switching frame → legacy: a fresh session has no history events to
+    /// trigger `out()`'s flush, and the next prompt is drawn by `EditView`
+    /// (not the renderer), so without this the migrated banner / `/help`
+    /// output would stay invisible until the first turn's output. Goes through
+    /// `out()` (via `newline`), so a partial streamed line is ended first and
+    /// the notes are not re-flushed by that `out()` call — `state.deferred` is
+    /// already empty when it runs. Raw exports are printed byte-exact LAST:
+    /// the caller runs this AFTER `repin_scroll_region`'s screen+scrollback
+    /// clear, so the export survives the transition (printing it in
+    /// `set_mode`, before the clear, is what erased it).
     pub fn flush_pending(&self) {
         let mut state = self.state.lock().unwrap();
-        if self.frame.lock().unwrap().is_some() || state.deferred.is_empty() {
+        if self.frame.lock().unwrap().is_some() || (state.deferred.is_empty() && state.raw.is_empty()) {
             return;
         }
         self.newline(&mut state);
         for note in std::mem::take(&mut state.deferred) {
             self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
+        }
+        for raw in std::mem::take(&mut state.raw) {
+            self.restore_raw(&mut state, &raw);
         }
     }
 
@@ -639,6 +663,44 @@ impl Renderer {
             items.push(Item::Thinking { chars: thinking.trim().chars().count(), seconds: 0.0 });
         }
         items
+    }
+
+    /// Take the historical plan snapshots drained from a dropped frame (see
+    /// `set_mode`), leaving the queue empty. The caller threads these to
+    /// [`Self::replay_plan_snapshots`] alongside the history replay.
+    pub fn take_pending_plans(&self) -> Vec<Plan> {
+        std::mem::take(&mut self.state.lock().unwrap().plans)
+    }
+
+    /// Print the plan snapshots a dropped frame accumulated, in original
+    /// order, so the earlier checklist states survive a frame → legacy switch.
+    /// `replay_history_with` emits only the CURRENT plan (once, at the end),
+    /// so the snapshots are everything the frame showed before it. The last
+    /// snapshot is skipped when it equals `current` — that is the plan the
+    /// replay just reprinted, so showing it again would print it twice. No-op
+    /// in frame mode (the frame transcript holds the snapshots already).
+    pub fn replay_plan_snapshots(&self, snapshots: Vec<Plan>, current: Option<&Plan>) {
+        if self.frame.lock().unwrap().is_some() || snapshots.is_empty() {
+            return;
+        }
+        if verbosity() == Verbosity::Quiet {
+            return;
+        }
+        let mut snapshots = snapshots;
+        if let Some(current) = current
+            && snapshots.last() == Some(current)
+        {
+            snapshots.pop();
+        }
+        let mut state = self.state.lock().unwrap();
+        for plan in &snapshots {
+            self.finish_thinking(&mut state);
+            self.newline(&mut state);
+            let stamp = stamp();
+            let width = self.width().saturating_sub(4 + visible_width(&stamp));
+            let text = plan_checklist(plan, width);
+            self.out(&mut state, &stamp_block_with(&stamp, &text));
+        }
     }
 
     /// Record a submitted user message in the transcript (frame mode).
@@ -1277,6 +1339,16 @@ mod tests {
         }
 
         #[cfg(test)]
+        fn raw_pending(&self) -> Vec<String> {
+            self.state.lock().unwrap().raw.clone()
+        }
+
+        #[cfg(test)]
+        fn pending_plans(&self) -> Vec<Plan> {
+            self.state.lock().unwrap().plans.clone()
+        }
+
+        #[cfg(test)]
         fn in_turn(&self) -> bool {
             self.state.lock().unwrap().in_turn
         }
@@ -1350,20 +1422,76 @@ mod tests {
     }
 
     #[test]
-    fn leaving_frame_mode_keeps_raw_exports_out_of_the_note_queue() {
+    fn leaving_frame_mode_defers_raw_exports_until_the_post_clear_flush() {
         // `Item::Raw` holds verbatim machine-readable output (`/trajectory
-        // --json`); routing it through the deferred-note queue would trim its
-        // trailing newline and add DIM styling when flushed, so the export
-        // would no longer be byte-exact. It is printed verbatim on the spot
-        // instead (captured by the test harness's stdout).
+        // --json`). Printing it in `set_mode` would lose it: the caller's
+        // `repin_scroll_region` clears the screen and scrollback AFTER
+        // `set_mode` returns. So the raw bytes are queued (byte-exact, never
+        // trimmed or DIM-styled like a note) and printed by `flush_pending`,
+        // which the caller runs after the clear.
         let r = Renderer::frame_for_test();
         r.print_raw("{\"session_id\":\"abc\"}\n");
         r.set_mode(crate::frame::RendererMode::Legacy);
-        let notes = r.deferred_notes();
-        assert!(
-            !notes.iter().any(|n| n.contains("session_id")),
-            "raw output is restored byte-exact, never deferred as a note: {notes:?}"
-        );
+        assert!(!r.deferred_notes().iter().any(|n| n.contains("session_id")), "raw output is never deferred as a note");
+        assert_eq!(r.raw_pending(), vec!["{\"session_id\":\"abc\"}\n"], "queued byte-exact for the post-clear flush");
+        r.flush_pending();
+        assert!(r.raw_pending().is_empty(), "flushed after the clear");
+    }
+
+    #[test]
+    fn leaving_frame_mode_preserves_plan_snapshots() {
+        // The frame appends an `Item::Plan` per `Plan` event, but the history
+        // replay emits only the CURRENT plan (once, at the end). Draining the
+        // frame must queue the snapshots so `replay_plan_snapshots` can reprint
+        // the earlier checklist states in order.
+        let r = Renderer::frame_for_test();
+        let first = Plan {
+            goal: String::new(),
+            items: vec![
+                PlanItem { id: 1, title: "one".into(), status: Status::InProgress, notes: vec![], after: vec![] },
+                PlanItem { id: 2, title: "two".into(), status: Status::Pending, notes: vec![], after: vec![] },
+            ],
+        };
+        let second = Plan {
+            goal: String::new(),
+            items: vec![
+                PlanItem { id: 1, title: "one".into(), status: Status::Done, notes: vec![], after: vec![] },
+                PlanItem { id: 2, title: "two".into(), status: Status::InProgress, notes: vec![], after: vec![] },
+            ],
+        };
+        r.event(&AgentEvent::Plan { plan: &first });
+        r.event(&AgentEvent::Plan { plan: &second });
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        assert_eq!(r.pending_plans(), vec![first, second], "snapshots drained in original order");
+    }
+
+    #[test]
+    fn replay_plan_snapshots_skips_the_current_plan_the_replay_reprints() {
+        // `replay_history_with` re-emits the current plan once at the end, so
+        // the matching trailing snapshot must be skipped or the final plan
+        // would print twice. Earlier snapshots are all reprinted (and drained).
+        let r = Renderer::frame_for_test();
+        let earlier = Plan {
+            goal: String::new(),
+            items: vec![PlanItem {
+                id: 1,
+                title: "one".into(),
+                status: Status::InProgress,
+                notes: vec![],
+                after: vec![],
+            }],
+        };
+        let current = Plan {
+            goal: String::new(),
+            items: vec![PlanItem { id: 1, title: "one".into(), status: Status::Done, notes: vec![], after: vec![] }],
+        };
+        r.event(&AgentEvent::Plan { plan: &earlier });
+        r.event(&AgentEvent::Plan { plan: &current });
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        let plans = r.take_pending_plans();
+        assert_eq!(plans.len(), 2, "both snapshots drained");
+        r.replay_plan_snapshots(plans, Some(&current));
+        assert!(r.pending_plans().is_empty(), "snapshots consumed by the replay");
     }
 
     #[test]
