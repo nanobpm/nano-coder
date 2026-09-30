@@ -151,9 +151,19 @@ impl Store {
     }
 
     /// Read a scope's entries, pruning expired ones (rewriting the file when it
-    /// changes).
+    /// changes). Callers that mutate (save/search/forget) hold the scope lock
+    /// across this load and the write that follows.
     fn load(&self, scope: Scope) -> Result<Vec<Entry>> {
         self.load_scope(scope, true)
+    }
+
+    /// Read a scope's entries *without* pruning or rewriting, for the unlocked
+    /// readers (`all`/`index`). A pruning load rewrites the file, and these
+    /// readers hold no lock, so letting them prune would let an old snapshot
+    /// overwrite a concurrent locked save. Expired entries are still filtered
+    /// out of the result; they are only removed on disk by a locked writer.
+    fn load_readonly(&self, scope: Scope) -> Result<Vec<Entry>> {
+        self.load_scope(scope, false)
     }
 
     /// Save a fact and record it. Rejects obvious secrets and over-long text.
@@ -238,11 +248,12 @@ impl Store {
             // the load-modify-write to serialize with other processes; a
             // read-only search neither locks nor prunes nor writes.
             let _lock = if read_only { None } else { Some(FileLock::acquire(&path)?) };
-            let mut entries = match self.load_scope(scope, !read_only) {
-                Ok(entries) => entries,
-                Err(_) if scope == Scope::Project => continue,
-                Err(e) => return Err(e),
-            };
+            // A missing project scope (outside a repo) was already skipped by
+            // `self.path` above, and a missing *file* reads as an empty store,
+            // so a failure here is a real permission/I/O/pruning error — even
+            // when the caller explicitly asked for `scope: "project"`. Surface
+            // it rather than report a misleading "no memories match".
+            let mut entries = self.load_scope(scope, !read_only)?;
             let mut bumped = false;
             for entry in &mut entries {
                 let haystack = match &entry.evidence {
@@ -308,7 +319,7 @@ impl Store {
     pub fn all(&self) -> Vec<(Scope, Entry)> {
         let mut all: Vec<(Scope, Entry)> = Vec::new();
         for scope in [Scope::User, Scope::Project] {
-            if let Ok(entries) = self.load(scope) {
+            if let Ok(entries) = self.load_readonly(scope) {
                 all.extend(entries.into_iter().map(|e| (scope, e)));
             }
         }
@@ -323,7 +334,7 @@ impl Store {
     pub fn index(&self) -> String {
         let mut all: Vec<(Scope, Entry)> = Vec::new();
         for scope in [Scope::User, Scope::Project] {
-            if let Ok(entries) = self.load(scope) {
+            if let Ok(entries) = self.load_readonly(scope) {
                 all.extend(entries.into_iter().map(|e| (scope, e)));
             }
         }
@@ -467,8 +478,12 @@ fn write_all(path: &Path, entries: &[Entry]) -> Result<()> {
 /// A best-effort advisory lock on a scope, held for the duration of a
 /// read-modify-write transaction so two nano-coder processes sharing the memory
 /// directory serialize instead of losing each other's entries. Released on
-/// drop. A lock older than the timeout is assumed abandoned (holder crashed)
-/// and broken, so a stale lock cannot wedge memory permanently.
+/// drop. If the lock is still held after the wait budget the acquire fails
+/// rather than breaking it: the timeout measures how long *this* waiter has
+/// waited, not how old the lock is, so a live holder mid-transaction (a large
+/// store, a scheduling pause) must never have its lock deleted out from under
+/// it — that would admit an overlapping writer and let the original holder
+/// delete the replacement's lock on drop.
 struct FileLock(PathBuf);
 
 impl FileLock {
@@ -483,12 +498,14 @@ impl FileLock {
                 Ok(_) => return Ok(FileLock(lock)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if std::time::Instant::now() >= deadline {
-                        // Assume the holder crashed and break the stale lock,
-                        // rather than fail an otherwise-valid save forever.
-                        let _ = std::fs::remove_file(&lock);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        // Still held after the wait budget. It may be a live
+                        // holder or a crashed one; we cannot prove which, so we
+                        // fail instead of deleting a lock that could be live.
+                        // A genuinely abandoned lock is cleared by removing the
+                        // stale `*.jsonl.lock` file.
+                        bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -614,6 +631,11 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
         (r"\bsk-[A-Za-z0-9]+-[A-Za-z0-9-]{20,}", "API secret key"),
         (r"\bAIza[0-9A-Za-z_\-]{35}\b", "Google API key"),
         (r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "JWT"),
+        // Credentials embedded in a URL authority: `scheme://user:pass@host`.
+        // The assignment rule only fires on variable *names* like `password`/
+        // `token`, so `DATABASE_URL=postgres://admin:s3cr3t@db/app` slips past
+        // every other pattern; catch the `user:pass@` shape directly.
+        (r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:]+:[^\s/@]+@", "credential in URL authority"),
         // `SOMETHING_TOKEN=<value>` / `password: <value>` style assignments.
         (
             r"(?i)\b\w*(secret|password|passwd|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)\w*\s*[:=]\s*[^\s]{8,}",
@@ -670,11 +692,16 @@ mod tests {
             // Modern prefixed OpenAI key: the hyphen after `proj` must not stop
             // detection short of 20 chars (Copilot finding, src/memory.rs).
             "key is sk-proj-abcdef1234567890ABCDEFghijklmnop",
+            // A password embedded in a URL authority (`user:pass@host`), which
+            // no variable-name rule catches (Copilot finding, src/memory.rs).
+            "DATABASE_URL=postgres://admin:s3cr3tPassw0rd@db.example/app",
         ] {
             assert!(store.save(Scope::User, secret, None, None).is_err(), "should reject: {secret}");
         }
         // A pointer to where a secret lives is fine.
         assert!(store.save(Scope::User, "the API key lives in ~/.config/app/creds", None, None).is_ok());
+        // A credential-free URL is fine (no `user:pass@`).
+        assert!(store.save(Scope::User, "the repo is at https://github.com/nanobpm/nano-coder", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
@@ -688,8 +715,20 @@ mod tests {
         let mut stale = entry.clone();
         stale.last_used = crate::session::now() - chrono::Duration::days(31);
         write_all(&path, &[stale]).unwrap();
-        assert_eq!(store.all().len(), 0, "stale entry pruned");
-        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty());
+        // A read-only reader (`all`) filters the stale entry out of its result
+        // but does NOT rewrite the file: it holds no lock, so pruning here could
+        // overwrite a concurrent locked save (Copilot finding, src/memory.rs).
+        assert_eq!(store.all().len(), 0, "stale entry filtered from the result");
+        assert!(
+            path.exists() && !std::fs::read_to_string(&path).unwrap().trim().is_empty(),
+            "unlocked reader leaves the file on disk"
+        );
+        // A locked mutating op (search bumps last_used) prunes it from disk.
+        let _ = store.search("nothing matches this", None).unwrap();
+        assert!(
+            !path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty(),
+            "locked writer prunes the stale entry"
+        );
     }
 
     #[test]

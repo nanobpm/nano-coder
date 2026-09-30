@@ -1622,6 +1622,13 @@ async fn main() -> Result<()> {
         // instead of blocking in dialoguer while `Terminal` also reads stdin.
         let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
         agent.questions().set_interactive(interactive);
+        if !interactive {
+            // Piped stdin/stdout is a headless run (a script or agent fleet
+            // drives the CLI): like ACP, no human vets a memory save live, so
+            // downgrade full memory to read-only to uphold the headless
+            // guarantee that the model cannot persist memories unvetted.
+            agent.restrict_memory_to_read_only();
+        }
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
