@@ -28,6 +28,15 @@ const INTERRUPTED_TOOL_RESULT: &str =
 const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this tool call ran.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 
+/// Smallest `max_tokens` a request is lowered to so it fits the context
+/// window. Below this, compacting is better than a reply cut short.
+const MIN_OUTPUT_RESERVE: usize = 4096;
+
+/// Tokens kept free beyond prompt + output: the prompt estimate can undercount.
+fn output_margin(window: usize) -> usize {
+    window / 50
+}
+
 /// Accumulates streamed output to estimate a live output rate (completion
 /// tokens per second), throttled so the status line does not redraw on every
 /// delta. Tokens are estimated from streamed bytes (~4 bytes/token) and
@@ -1295,7 +1304,7 @@ impl Agent {
                     messages: &self.conversation,
                     tools: &tools,
                     temperature: Some(self.config.temperature),
-                    max_tokens: Some(self.config.max_tokens as i64),
+                    max_tokens: Some(self.request_max_tokens()),
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
@@ -1654,7 +1663,24 @@ impl Agent {
         let threshold = self.config.auto_compact_threshold.clamp(0.1, 0.99);
         let (tokens, _) = self.estimate_context_tokens();
         let window = self.context_window();
-        tokens as f64 > window as f64 * threshold && tokens > self.compact_floor + window / 10
+        // Endpoints such as vLLM and Splash reject a request whose prompt plus
+        // `max_tokens` exceeds the window, so the output reservation counts
+        // against the window too. `request_max_tokens` shrinks the reservation
+        // down to MIN_OUTPUT_RESERVE; compact before even that would not fit.
+        let reserved = (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window);
+        let limit = (window as f64 * threshold).min(window.saturating_sub(reserved) as f64);
+        tokens as f64 > limit && tokens > self.compact_floor + window / 10
+    }
+
+    /// `max_tokens` for the next request: the configured value, lowered so the
+    /// estimated prompt plus the reservation fits the context window (with a
+    /// margin for estimation error), but never below MIN_OUTPUT_RESERVE.
+    fn request_max_tokens(&self) -> i64 {
+        let configured = self.config.max_tokens.max(1) as usize;
+        let (tokens, _) = self.estimate_context_tokens();
+        let window = self.context_window();
+        let room = window.saturating_sub(tokens + output_margin(window));
+        configured.min(room.max(MIN_OUTPUT_RESERVE)) as i64
     }
 
     async fn compact_logged(
@@ -2439,6 +2465,118 @@ mod tests {
         // A response without credits leaves the total untouched.
         agent.record_usage(&response(None), false);
         assert_eq!(agent.context_stats().lock().unwrap().session_aic, Some(0.0541));
+    }
+
+    /// Replays scripted responses and records each request's `max_tokens`
+    /// and whether it was a compaction summary.
+    struct Budgeted {
+        responses: Mutex<Vec<LLMResponse>>,
+        seen: BudgetLog,
+    }
+
+    #[async_trait]
+    impl LLMClient for Budgeted {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            let summary = request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT);
+            self.seen.lock().unwrap().push((request.max_tokens, summary));
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+        fn model_name(&self) -> &str {
+            "budgeted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    type BudgetLog = Arc<Mutex<Vec<(Option<i64>, bool)>>>;
+
+    /// An agent with `window` tokens of context, `max_tokens = 16384`, a
+    /// threshold high enough that only the output reservation can trigger
+    /// compaction, and a `big` tool returning `chars` characters.
+    fn budgeted_agent(
+        responses: Vec<LLMResponse>,
+        window: usize,
+        chars: usize,
+        dir: &std::path::Path,
+    ) -> (Agent, BudgetLog) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = Budgeted { responses: Mutex::new(responses), seen: seen.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            context_window: Some(window),
+            auto_compact_threshold: 0.99,
+            max_tokens: 16_384,
+            ..Config::default()
+        };
+        let agent = Agent::new(Box::new(client), config);
+        agent.tools().register(
+            ToolDefinition::new("big", "big", json!({"type": "object"})),
+            Box::new(move |_| Ok(json!("word ".repeat(chars / 5)))),
+        );
+        (agent, seen)
+    }
+
+    fn big_call(id: &str) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_tokens_is_sent_unchanged_when_the_window_has_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], 200_000, 4_000, dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![(Some(16_384), false), (Some(16_384), false)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_tokens_shrinks_so_prompt_and_output_fit_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let window = 24_000;
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let (tokens, _) = agent.estimate_context_tokens();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "no compaction: {seen:?}");
+        let (Some(max_tokens), false) = seen[1] else { panic!("{seen:?}") };
+        assert!((MIN_OUTPUT_RESERVE as i64..16_384).contains(&max_tokens), "lowered: {max_tokens}");
+        // The prompt estimate here includes the final "done", a few tokens.
+        assert!(tokens + max_tokens as usize <= window, "{tokens} + {max_tokens} > {window}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compacts_below_the_threshold_when_output_would_not_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two tool results (each clipped to about 10K tokens) leave less than
+        // MIN_OUTPUT_RESERVE free, though
+        // the prompt is far below the 0.99 threshold.
+        let window = 24_000;
+        let (mut agent, seen) = budgeted_agent(
+            vec![big_call("b1"), big_call("b2"), text("SUMMARY"), text("done")],
+            window,
+            40_000,
+            dir.path(),
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.response, "done");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4, "call, call, summary, call: {seen:?}");
+        assert!(seen[2].1, "the third request is the summary: {seen:?}");
+        assert!(agent.context_stats().lock().unwrap().compactions >= 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
