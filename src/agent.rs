@@ -523,6 +523,18 @@ impl Agent {
         Some(memory::Store::new(config.memory_dir(), project, config.memory_expiry_days))
     }
 
+    /// Rekey the memory store's project scope from the current working
+    /// directory. ACP applies `params.cwd` only *after* the agent is
+    /// constructed, so the store — keyed to the launch directory at build time —
+    /// must be rebuilt once a session's cwd is known, or ACP sessions read the
+    /// wrong repository's project memories. A no-op for the CLI, where the cwd
+    /// never changes.
+    fn rekey_memory(&mut self) {
+        if self.memory.is_some() {
+            self.memory = Self::build_memory(&self.config);
+        }
+    }
+
     /// Whether the memory tools are offered at all.
     fn memory_enabled(&self) -> bool {
         self.config.memory.enabled() && self.memory.is_some()
@@ -929,6 +941,9 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
+        // ACP sets the session cwd before this runs; rekey memory so the project
+        // scope (and the index folded into the prompt below) matches it.
+        self.rekey_memory();
         // Discover instructions/skills into temporaries so a staging failure
         // below leaves self.instructions/self.skills (and the live system
         // prompt they render) untouched, rather than pairing the old
@@ -989,6 +1004,9 @@ impl Agent {
         self.conversation = restored.conversation;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
+        // Rekey memory to the session cwd (ACP applies it before this runs), so
+        // memory_search hits the requested repository's project scope.
+        self.rekey_memory();
         let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
         match self.conversation.first_mut() {
             Some(first) if first.role == Role::System => *first = system,
@@ -2103,7 +2121,10 @@ impl Agent {
             return Err(anyhow::anyhow!("{} is disabled: memory is read-only here", call.name));
         }
         let session = self.session_id.as_deref();
-        memory::run(store, &call.name, &call.arguments, session)
+        // Plan mode must not mutate: route search through the read-only path so
+        // it neither bumps last_used nor prunes/rewrites the store.
+        let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
+        memory::run(store, &call.name, &call.arguments, session, read_only)
     }
 
     /// Get conversation length

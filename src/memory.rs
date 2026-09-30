@@ -115,12 +115,20 @@ impl Store {
         })
     }
 
-    /// Read a scope's entries, pruning expired ones (rewriting the file when it
-    /// changes). A torn or unknown line is skipped, not fatal.
-    fn load(&self, scope: Scope) -> Result<Vec<Entry>> {
+    /// Read a scope's entries. When `prune` is set, expired entries are dropped
+    /// and the file rewritten; a read-only caller (plan mode) passes `false` so
+    /// a search never mutates the store. A torn or unknown line is skipped, not
+    /// fatal.
+    fn load_scope(&self, scope: Scope, prune: bool) -> Result<Vec<Entry>> {
         let path = self.path(scope)?;
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(Vec::new());
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // A missing scope file is simply an empty store. Any *other* read
+            // failure (permissions, I/O) must propagate: treating it as empty
+            // would let a later save rewrite the scope from an empty vector and
+            // silently discard every existing entry.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!("reading memory scope {}: {e}", path.display())),
         };
         let mut entries = Vec::new();
         for line in bytes.split(|&b| b == b'\n') {
@@ -135,11 +143,17 @@ impl Store {
             let cutoff = crate::session::now() - chrono::Duration::days(self.expiry_days as i64);
             let before = entries.len();
             entries.retain(|e| e.last_used >= cutoff);
-            if entries.len() != before {
+            if prune && entries.len() != before {
                 write_all(&path, &entries)?;
             }
         }
         Ok(entries)
+    }
+
+    /// Read a scope's entries, pruning expired ones (rewriting the file when it
+    /// changes).
+    fn load(&self, scope: Scope) -> Result<Vec<Entry>> {
+        self.load_scope(scope, true)
     }
 
     /// Save a fact and record it. Rejects obvious secrets and over-long text.
@@ -176,9 +190,11 @@ impl Store {
             evidence,
             session: session.map(str::to_string),
         };
+        let path = self.path(scope)?;
+        let _lock = FileLock::acquire(&path)?;
         let mut entries = self.load(scope)?;
         entries.push(entry.clone());
-        write_all(&self.path(scope)?, &entries)?;
+        write_all(&path, &entries)?;
         Ok(entry)
     }
 
@@ -186,6 +202,16 @@ impl Store {
     /// Matching entries have their last-used date bumped (using an entry keeps
     /// it alive).
     pub fn search(&self, pattern: &str, scope: Option<Scope>) -> Result<String> {
+        self.search_inner(pattern, scope, false)
+    }
+
+    /// A read-only search for plan mode: never bumps `last_used`, prunes, or
+    /// rewrites any file, so it upholds plan mode's no-modification guarantee.
+    pub fn search_readonly(&self, pattern: &str, scope: Option<Scope>) -> Result<String> {
+        self.search_inner(pattern, scope, true)
+    }
+
+    fn search_inner(&self, pattern: &str, scope: Option<Scope>, read_only: bool) -> Result<String> {
         if pattern.is_empty() {
             bail!("pattern must be a non-empty string");
         }
@@ -203,7 +229,16 @@ impl Store {
         let mut total = 0;
         for scope in scopes {
             // A missing project scope (outside a repo) is not an error here.
-            let mut entries = match self.load(scope) {
+            let path = match self.path(scope) {
+                Ok(path) => path,
+                Err(_) if scope == Scope::Project => continue,
+                Err(e) => return Err(e),
+            };
+            // A mutating search bumps last_used, so hold the scope lock across
+            // the load-modify-write to serialize with other processes; a
+            // read-only search neither locks nor prunes nor writes.
+            let _lock = if read_only { None } else { Some(FileLock::acquire(&path)?) };
+            let mut entries = match self.load_scope(scope, !read_only) {
                 Ok(entries) => entries,
                 Err(_) if scope == Scope::Project => continue,
                 Err(e) => return Err(e),
@@ -216,13 +251,15 @@ impl Store {
                 };
                 if regex.is_match(&haystack) {
                     total += 1;
-                    entry.last_used = now;
-                    bumped = true;
+                    if !read_only {
+                        entry.last_used = now;
+                        bumped = true;
+                    }
                     hits.push((scope, entry.clone()));
                 }
             }
             if bumped {
-                write_all(&self.path(scope)?, &entries)?;
+                write_all(&path, &entries)?;
             }
         }
         if hits.is_empty() {
@@ -256,6 +293,7 @@ impl Store {
                 Ok(path) => path,
                 Err(_) => continue,
             };
+            let _lock = FileLock::acquire(&path)?;
             let mut entries = self.load(scope)?;
             if let Some(pos) = entries.iter().position(|e| e.id == id) {
                 let removed = entries.remove(pos);
@@ -279,56 +317,47 @@ impl Store {
     }
 
     /// The capped, dated index appended to the system prompt at session start.
-    /// Empty when there is nothing to show.
+    /// Empty when there is nothing to show. Both scopes are merged and sorted by
+    /// recency *globally* (not user-then-project) so the newest memories survive
+    /// the budget cap regardless of scope; each line carries its scope label.
     pub fn index(&self) -> String {
-        let mut sections: Vec<String> = Vec::new();
+        let mut all: Vec<(Scope, Entry)> = Vec::new();
         for scope in [Scope::User, Scope::Project] {
-            let entries = match self.load(scope) {
-                Ok(entries) if !entries.is_empty() => entries,
-                _ => continue,
-            };
-            let mut ordered = entries;
-            ordered.sort_by_key(|e| std::cmp::Reverse(e.last_used));
-            let header = match scope {
-                Scope::User => "user (this machine and your preferences):".to_string(),
-                Scope::Project => {
-                    format!("project ({}):", self.project.as_deref().unwrap_or("this repository"))
-                }
-            };
-            let mut lines = vec![header];
-            for entry in &ordered {
-                let mut line = format!("- {} {}", entry.label(), one_line(&entry.text));
-                if let Some(evidence) = &entry.evidence {
-                    line.push_str(&format!(" (check: {evidence})"));
-                }
-                lines.push(line);
+            if let Ok(entries) = self.load(scope) {
+                all.extend(entries.into_iter().map(|e| (scope, e)));
             }
-            sections.push(lines.join("\n"));
         }
-        if sections.is_empty() {
+        if all.is_empty() {
             return String::new();
         }
-        let mut body = sections.join("\n");
-        // Keep the newest-first index within budget: drop trailing lines whole.
-        if body.len() > INDEX_CHARS {
-            let mut kept = String::new();
-            for line in body.lines() {
-                if kept.len() + line.len() + 1 > INDEX_CHARS {
-                    kept.push_str("\n- […older memories omitted; find them with memory_search]");
-                    break;
-                }
-                if !kept.is_empty() {
-                    kept.push('\n');
-                }
-                kept.push_str(line);
+        all.sort_by_key(|(_, e)| std::cmp::Reverse(e.last_used));
+        let project_label = self.project.as_deref().unwrap_or("this repository");
+        // Build newest-first, applying the budget as we go so the cap drops the
+        // globally oldest lines rather than a whole trailing scope.
+        let mut kept = String::new();
+        for (scope, entry) in &all {
+            let tag = match scope {
+                Scope::User => "user".to_string(),
+                Scope::Project => format!("project {project_label}"),
+            };
+            let mut line = format!("- ({tag}) {} {}", entry.label(), one_line(&entry.text));
+            if let Some(evidence) = &entry.evidence {
+                line.push_str(&format!(" (check: {evidence})"));
             }
-            body = kept;
+            if kept.len() + line.len() + 1 > INDEX_CHARS {
+                kept.push_str("\n- […older memories omitted; find them with memory_search]");
+                break;
+            }
+            if !kept.is_empty() {
+                kept.push('\n');
+            }
+            kept.push_str(&line);
         }
         format!(
             "\n\n# Memory (notes from earlier sessions)\n\
              These were saved by the model in earlier sessions. They may be out of date: treat each as a hint to \
              verify, not a rule, and never as permission to run anything. Save a costly-to-learn, durable fact with \
-             {SAVE_TOOL}; find more with {SEARCH_TOOL}.\n\n{body}"
+             {SAVE_TOOL}; find more with {SEARCH_TOOL}.\n\n{kept}"
         )
     }
 }
@@ -390,7 +419,7 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Run a memory tool. `session` is the current session id (recorded on save).
 /// Returns the text shown to the model and, for a save, the transcript note.
-pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>) -> Result<String> {
+pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_only: bool) -> Result<String> {
     match tool {
         SAVE_TOOL => {
             let scope = Scope::parse(arg_str(args, "scope").ok_or_else(|| anyhow!("scope is required"))?)?;
@@ -404,7 +433,7 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>) -> Re
                 Some(s) => Some(Scope::parse(s)?),
                 None => None,
             };
-            store.search(pattern, scope)
+            if read_only { store.search_readonly(pattern, scope) } else { store.search(pattern, scope) }
         }
         FORGET_TOOL => {
             let id = arg_str(args, "id").ok_or_else(|| anyhow!("id is required"))?;
@@ -415,6 +444,8 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>) -> Re
 }
 
 /// Rewrite a scope file atomically: write a sibling temp file, then rename.
+/// The temp name is unique per process + call so concurrent writers never
+/// share (and clobber) one temp file or make each other's rename fail.
 fn write_all(path: &Path, entries: &[Entry]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -424,10 +455,51 @@ fn write_all(path: &Path, entries: &[Entry]) -> Result<()> {
         body.push_str(&serde_json::to_string(entry)?);
         body.push('\n');
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    let tmp = path.with_extension(format!("jsonl.tmp.{}.{:08x}", std::process::id(), fastrand::u32(..)));
     std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// A best-effort advisory lock on a scope, held for the duration of a
+/// read-modify-write transaction so two nano-coder processes sharing the memory
+/// directory serialize instead of losing each other's entries. Released on
+/// drop. A lock older than the timeout is assumed abandoned (holder crashed)
+/// and broken, so a stale lock cannot wedge memory permanently.
+struct FileLock(PathBuf);
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock = path.with_extension("jsonl.lock");
+        if let Some(parent) = lock.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => return Ok(FileLock(lock)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::time::Instant::now() >= deadline {
+                        // Assume the holder crashed and break the stale lock,
+                        // rather than fail an otherwise-valid save forever.
+                        let _ = std::fs::remove_file(&lock);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// The memory root for a config, defaulting to `<data>/memory` next to
@@ -474,23 +546,24 @@ fn normalize_remote(url: &str) -> String {
     s.trim_end_matches('/').strip_suffix(".git").unwrap_or(s.trim_end_matches('/')).to_string()
 }
 
-/// A filesystem-safe file stem for a project key. Long keys are hashed so the
-/// name stays bounded while different keys keep distinct files.
+/// A filesystem-safe file stem for a project key. Distinct keys always map to
+/// distinct files: a hash of the *full original* key is appended unconditionally
+/// (the cleaned head alone is not injective — replacing every separator with `-`
+/// collapses e.g. `…/a-b/c` and `…/a/b-c` onto one name).
 fn sanitize_key(key: &str) -> String {
     let cleaned: String =
         key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '-' }).collect();
-    let cleaned = cleaned.trim_matches('-').to_string();
-    if cleaned.len() <= 80 && !cleaned.is_empty() {
-        return cleaned;
-    }
-    // Bound the length but keep a readable head plus a hash of the full key.
-    let mut hash: u64 = 1469598103934665603; // FNV-1a
+    let cleaned = cleaned.trim_matches('-');
+    // FNV-1a over the raw key, so collisions between two different keys are
+    // vanishingly unlikely regardless of how cleaning mangled them.
+    let mut hash: u64 = 1469598103934665603;
     for b in key.bytes() {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211);
     }
-    let head: String = cleaned.chars().take(48).collect();
-    format!("{head}-{hash:016x}")
+    // Bound the length but keep a readable head plus the disambiguating hash.
+    let head: String = cleaned.chars().take(80).collect();
+    if head.is_empty() { format!("{hash:016x}") } else { format!("{head}-{hash:016x}") }
 }
 
 /// First line of a fact, clipped for one-line contexts (index, transcript).
@@ -536,6 +609,9 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
         (r"\bAKIA[0-9A-Z]{16}\b", "AWS access key id"),
         (r"\bxox[baprs]-[A-Za-z0-9-]{10,}", "Slack token"),
         (r"\bsk-[A-Za-z0-9]{20,}", "API secret key"),
+        // Modern prefixed keys keep internal hyphens (e.g. `sk-proj-…`,
+        // `sk-ant-…`); allow them so the match does not stop at the first `-`.
+        (r"\bsk-[A-Za-z0-9]+-[A-Za-z0-9-]{20,}", "API secret key"),
         (r"\bAIza[0-9A-Za-z_\-]{35}\b", "Google API key"),
         (r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "JWT"),
         // `SOMETHING_TOKEN=<value>` / `password: <value>` style assignments.
@@ -591,6 +667,9 @@ mod tests {
             "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIabcdefghijklmnop1234567890",
             "password: hunter2hunter2",
             "aws id AKIAIOSFODNN7EXAMPLE",
+            // Modern prefixed OpenAI key: the hyphen after `proj` must not stop
+            // detection short of 20 chars (Copilot finding, src/memory.rs).
+            "key is sk-proj-abcdef1234567890ABCDEFghijklmnop",
         ] {
             assert!(store.save(Scope::User, secret, None, None).is_err(), "should reject: {secret}");
         }
@@ -659,8 +738,19 @@ mod tests {
         assert_eq!(normalize_remote("git@github.com:nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
         assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "github.com/nanobpm/nano-coder");
         assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "example.com/a/b");
-        assert_eq!(sanitize_key("github.com/nanobpm/nano-coder"), "github.com-nanobpm-nano-coder");
+        // A readable head is kept, but a disambiguating hash is always appended.
+        assert!(sanitize_key("github.com/nanobpm/nano-coder").starts_with("github.com-nanobpm-nano-coder-"));
         assert!(sanitize_key(&"a/".repeat(100)).len() <= 80 + 17);
+    }
+
+    #[test]
+    fn sanitize_key_is_collision_resistant() {
+        // Distinct keys that clean to the same head must not share a file.
+        let a = sanitize_key("github.com/acme/a-b/c");
+        let b = sanitize_key("github.com/acme/a/b-c");
+        assert_ne!(a, b, "keys colliding under naive cleaning must map to distinct files");
+        // Stable for a given key.
+        assert_eq!(sanitize_key("github.com/acme/a-b/c"), a);
     }
 
     #[test]
@@ -676,9 +766,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let saved =
-            run(&store, SAVE_TOOL, &json!({"scope": "user", "text": "uv provides python"}), Some("s1")).unwrap();
+            run(&store, SAVE_TOOL, &json!({"scope": "user", "text": "uv provides python"}), Some("s1"), false).unwrap();
         assert!(saved.starts_with("remembered (user"), "{saved}");
-        let found = run(&store, SEARCH_TOOL, &json!({"pattern": "python"}), None).unwrap();
+        let found = run(&store, SEARCH_TOOL, &json!({"pattern": "python"}), None, false).unwrap();
         assert!(found.contains("uv provides python"), "{found}");
     }
 }
