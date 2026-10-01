@@ -1,11 +1,14 @@
 //! Choosing a session to resume: `--resume` without an ID, `--resume last`,
 //! and `--list-sessions`.
 
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
+use dialoguer::theme::{ColorfulTheme, Theme};
+use fuzzy_matcher::skim::SkimMatcherV2;
 use unicode_width::UnicodeWidthChar;
 
 use crate::session_index::{self, Summary};
@@ -94,6 +97,40 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
+/// A dialoguer theme that renders each picker row fitted to the terminal
+/// width while fuzzy matching still sees the row's full text. `FuzzySelect`
+/// matches against and renders the same item string, so passing the full
+/// (untruncated) row lets a keyword anywhere in a long prompt find the
+/// session — but dialoguer renders the item verbatim and would let a long row
+/// wrap. This theme truncates only the rendered label, so matching stays
+/// full-text while no drawn row exceeds the terminal.
+struct FitTheme {
+    inner: ColorfulTheme,
+    width: usize,
+}
+
+impl Theme for FitTheme {
+    fn format_fuzzy_select_prompt_item(
+        &self,
+        f: &mut dyn fmt::Write,
+        text: &str,
+        active: bool,
+        highlight_matches: bool,
+        matcher: &SkimMatcherV2,
+        search_term: &str,
+    ) -> fmt::Result {
+        // Render the width-fitted label; `text` stays full for the matcher.
+        self.inner.format_fuzzy_select_prompt_item(
+            f,
+            &truncate(text, self.width),
+            active,
+            highlight_matches,
+            matcher,
+            search_term,
+        )
+    }
+}
+
 /// A picker or list row, fitted to `width` columns: when last used, the
 /// project, the prompt count, then the last prompt — the order the README and
 /// `--list-sessions` document. The whole row (the fixed header included) is
@@ -115,14 +152,21 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let now = crate::session::now();
-    let width = crate::status::terminal_size().map_or(100, |(_, cols)| cols as usize);
+    // The picker renders on stderr (dialoguer) and is gated on stdin/stderr
+    // being terminals, so measure the stderr terminal — stdout may be
+    // redirected, and its width would not reflect where the rows are drawn.
+    let width = crate::status::stderr_terminal_size().map_or(100, |(_, cols)| cols as usize);
     // Use the actual available width (less the picker's own marker and
     // padding) so no row is wider than the terminal, even a narrow one.
     let width = width.saturating_sub(4);
+    let theme = FitTheme { inner: ColorfulTheme::default(), width };
     let mut show_all = in_dir(&sessions, cwd).is_empty();
     loop {
         let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
-        let mut items: Vec<String> = shown.iter().map(|s| row(s, now, width)).collect();
+        // Give the picker the full row text so fuzzy matching can see a
+        // keyword anywhere in a long prompt; the theme truncates only what is
+        // rendered, so a row still never wraps the terminal.
+        let mut items: Vec<String> = shown.iter().map(|s| row(s, now, usize::MAX)).collect();
         let hidden = sessions.len() - shown.len();
         if hidden > 0 {
             items.push(format!("Show all sessions ({hidden} more in other directories)"));
@@ -132,7 +176,7 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
         } else {
             format!("Resume which session in {}? (type to filter, Esc to cancel)", crate::sanitize_terminal_text(cwd))
         };
-        let choice = dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        let choice = dialoguer::FuzzySelect::with_theme(&theme)
             .with_prompt(prompt)
             .items(&items)
             .default(0)

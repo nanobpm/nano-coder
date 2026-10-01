@@ -1002,6 +1002,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "fastrand",
+ "fuzzy-matcher",
  "libc",
  "ratatui",
  "regex",
