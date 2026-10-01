@@ -454,14 +454,10 @@ pub struct Agent {
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
     /// Session-log size when the current turn began; the session-index update
-    /// in `finish_turn` folds just this turn's input into the cached summary
-    /// instead of rescanning the whole log.
+    /// in `finish_turn` folds the input records committed since into the
+    /// cached summary (from the log's tail) instead of rescanning the whole
+    /// log.
     turn_log_offset: Option<u64>,
-    /// Whether the current turn appended a new `Record::Input` (a fresh
-    /// input) rather than redelivering a resumed pending one. Only a fresh
-    /// input's text is folded into the session-index summary; a resumed one
-    /// already lies before `turn_log_offset`, so folding it would double-count.
-    turn_appended_input: bool,
     /// Whether a real smart-compaction summary is in context, gating the
     /// history tools. Tracked explicitly (set by compaction, restored from the
     /// replace record's mode) rather than sniffed from message text, so a user
@@ -525,7 +521,6 @@ impl Agent {
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
             turn_log_offset: None,
-            turn_appended_input: false,
             history_available: false,
             history_hint_pending: false,
             memory,
@@ -1429,16 +1424,11 @@ impl Agent {
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
         // Log size before this turn's records: the session-index update in
-        // `finish_turn` folds just this turn's input into the cached summary
-        // instead of rescanning the whole log.
+        // `finish_turn` folds the input records committed by this turn into
+        // the cached summary (from the log's tail) instead of rescanning the
+        // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
-        // Whether this turn appends a new `Record::Input` (a fresh input) or
-        // redelivers a resumed pending one already in the log. Only the fresh
-        // case may fold the text into the session-index summary: the resumed
-        // input lies before `turn_log_offset`, so a cache covering the log to
-        // there already holds it, and folding it again would double-count it.
-        self.turn_appended_input = resuming.is_none();
         let input_id = match input_id {
             Some(id) => id.to_string(),
             None => {
@@ -1932,12 +1922,11 @@ impl Agent {
             // the picker rebuilds a missing or stale summary from the log.
             let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
             let from = self.turn_log_offset.unwrap_or(0);
-            // Fold the text only when this turn appended the input record; a
-            // resumed pending input already lies before `from`, so a cache
-            // covering the log to `from` holds it and folding would recount it.
-            let input =
-                if self.turn_appended_input { self.pending_input.as_ref().map(|p| p.text.as_str()) } else { None };
-            let _ = crate::session_index::update(log.path(), from, input, Some(model));
+            // `update` folds every input record committed to the log since
+            // `from` straight from the log's tail, so a resumed pending input
+            // (which lies before `from`) is never recounted and a concurrent
+            // writer's prompt (after `from`) is never lost.
+            let _ = crate::session_index::update(log.path(), from, Some(model));
         }
         match &outcome {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),

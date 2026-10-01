@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
 use dialoguer::theme::{ColorfulTheme, Theme};
 use fuzzy_matcher::skim::SkimMatcherV2;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::session_index::{self, Summary};
 
@@ -72,8 +72,12 @@ pub fn topic(summary: &Summary) -> String {
 
 /// Terminal-cell width of `text` (CJK and wide emoji count as two cells), so
 /// rows are fitted the way the terminal renders them, not by char count.
+/// Measured with `UnicodeWidthStr` (not a per-`char` sum): `unicode-width`
+/// only resolves emoji presentation / variation-selector / ZWJ sequences at
+/// the string level, so `"#\u{fe0f}"` is two cells as a string but its chars
+/// sum to one — a per-`char` sum would undercount and let a row wrap.
 fn cells(text: &str) -> usize {
-    text.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+    UnicodeWidthStr::width(text)
 }
 
 /// `text` fitted to at most `width` terminal cells, with an ellipsis when
@@ -90,14 +94,17 @@ fn truncate(text: &str, width: usize) -> String {
     }
     let budget = width.saturating_sub(1);
     let mut out = String::new();
-    let mut used = 0;
     for c in text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > budget {
+        // Measure the whole candidate prefix with `UnicodeWidthStr`, not this
+        // char's width in isolation: a variation selector or ZWJ joins with
+        // the preceding scalar, so a per-scalar budget check would admit a
+        // sequence that pushes the string past `budget` and make the final
+        // ellipsis exceed `width`.
+        out.push(c);
+        if cells(&out) > budget {
+            out.pop();
             break;
         }
-        out.push(c);
-        used += w;
     }
     out.push('…');
     out
@@ -110,6 +117,9 @@ fn truncate(text: &str, width: usize) -> String {
 /// session — but dialoguer renders the item verbatim and would let a long row
 /// wrap. This theme truncates only the rendered label, so matching stays
 /// full-text while no drawn row exceeds the terminal.
+///
+/// Each item carries a hidden `\0<id>` disambiguator (see `pick`); it is
+/// stripped here before rendering so the id never reaches the terminal.
 struct FitTheme {
     inner: ColorfulTheme,
     width: usize,
@@ -125,16 +135,29 @@ impl Theme for FitTheme {
         matcher: &SkimMatcherV2,
         search_term: &str,
     ) -> fmt::Result {
-        // Render the width-fitted label; `text` stays full for the matcher.
+        // Render the width-fitted label (the hidden id suffix removed); the
+        // full `text` still reaches dialoguer's matcher for filtering.
         self.inner.format_fuzzy_select_prompt_item(
             f,
-            &truncate(text, self.width),
+            &truncate(label_of(text), self.width),
             active,
             highlight_matches,
             matcher,
             search_term,
         )
     }
+}
+
+/// The separator between a picker item's visible label and its hidden,
+/// uniquifying session-id suffix. `NUL` can never appear in a label: prompt,
+/// project, and cwd text are all run through `sanitize_terminal_text`, which
+/// drops control characters.
+const ITEM_ID_SEP: char = '\u{0}';
+
+/// The visible portion of a picker item string (everything before the hidden
+/// `\0<id>` disambiguator added in `pick`).
+fn label_of(item: &str) -> &str {
+    item.split(ITEM_ID_SEP).next().unwrap_or(item)
 }
 
 /// A picker or list row, fitted to `width` columns: when last used, the
@@ -177,8 +200,16 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
         let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
         // Give the picker the full row text so fuzzy matching can see a
         // keyword anywhere in a long prompt; the theme truncates only what is
-        // rendered, so a row still never wraps the terminal.
-        let mut items: Vec<String> = shown.iter().map(|s| row(s, now, usize::MAX)).collect();
+        // rendered, so a row still never wraps the terminal. Append a hidden
+        // `\0<id>` suffix so no two items are ever byte-identical: dialoguer
+        // 0.11 maps the chosen row back to an index with
+        // `items.iter().position(|i| i == selected)`, so two sessions that
+        // render the same row (same relative time, project, count and topic)
+        // would otherwise both resolve to the first one and resume the wrong
+        // session. `FitTheme` strips the suffix before drawing, and ids are
+        // unique, so each item is unique and `position` is exact.
+        let mut items: Vec<String> =
+            shown.iter().map(|s| format!("{}{ITEM_ID_SEP}{}", row(s, now, usize::MAX), s.id)).collect();
         let hidden = sessions.len() - shown.len();
         if hidden > 0 {
             items.push(format!("Show all sessions ({hidden} more in other directories)"));
@@ -319,6 +350,39 @@ mod tests {
         assert!(super::cells(&two) <= 2 && two.ends_with('…'), "{two}");
         // Untruncated text is returned as-is.
         assert_eq!(super::truncate("hi", 5), "hi");
+    }
+
+    #[test]
+    fn truncate_counts_variation_selector_width_as_a_string() {
+        // `"#\u{fe0f}"` is two terminal cells as a string (emoji
+        // presentation), though its chars sum to one. `cells` must report the
+        // string width, and `truncate` must not admit a sequence that pushes
+        // the result past `width`.
+        let emoji = "#\u{fe0f}x";
+        assert_eq!(super::cells(emoji), 3);
+        let fitted = super::truncate(emoji, 2);
+        assert!(super::cells(&fitted) <= 2, "{fitted:?} exceeds width 2");
+    }
+
+    #[test]
+    fn picker_items_are_unique_even_when_rows_render_identically() {
+        // Two sessions that render the same row (same time/project/count/
+        // topic) must still map back to distinct items: dialoguer resolves a
+        // selection by `items.position(|i| i == chosen)`, so identical item
+        // strings would both resolve to the first and resume the wrong id.
+        let now = crate::session::now();
+        let a = summary("sess-a", Some("/work/repo"), "same prompt", None);
+        let b = summary("sess-b", Some("/work/repo"), "same prompt", None);
+        let items: Vec<String> =
+            [&a, &b].iter().map(|s| format!("{}{ITEM_ID_SEP}{}", row(s, now, usize::MAX), s.id)).collect();
+        // The visible labels are identical...
+        assert_eq!(label_of(&items[0]), label_of(&items[1]));
+        // ...but the items themselves are not, so `position` is exact and the
+        // hidden suffix never reaches the rendered label.
+        assert_ne!(items[0], items[1]);
+        assert_eq!(items.iter().position(|i| i == &items[1]), Some(1));
+        assert!(!label_of(&items[1]).contains(ITEM_ID_SEP));
+        assert!(!label_of(&items[1]).contains("sess-b"));
     }
 
     #[test]
