@@ -845,7 +845,30 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         }
         for name in &changes.providers {
             let Some(provider) = config.providers.get(name) else { continue };
+            // Replacing the whole provider table rebuilds it from scratch and
+            // drops every decoration. If this same provider's temperature (or a
+            // model's) was also edited in this session, the decoration-
+            // preserving `set_nested` edits above (e.g. a `# tuned` comment)
+            // would be discarded. Snapshot those temperature items' decorations
+            // first and reapply them after the replacement so their comments
+            // survive overlapping provider + temperature edits.
+            let mut saved: Vec<(Vec<&str>, toml_edit::Decor)> = Vec::new();
+            if changes.provider_temperatures.contains(name)
+                && let Some(d) = temperature_decor(&doc, &["providers", name])
+            {
+                saved.push((vec!["providers", name], d));
+            }
+            for (p, model) in &changes.model_temperatures {
+                if p == name
+                    && let Some(d) = temperature_decor(&doc, &["providers", name, "models", model])
+                {
+                    saved.push((vec!["providers", name, "models", model], d));
+                }
+            }
             doc["providers"][name.as_str()] = toml_edit::Item::Table(provider_table(provider)?);
+            for (path, decor) in saved {
+                set_temperature_decor(&mut doc, &path, decor);
+            }
         }
     }
     has_secret |= config.providers.values().any(|p| p.api_key.is_some());
@@ -864,8 +887,35 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
-    let text = toml::to_string(provider).context("serializing provider")?;
+/// The decoration (prefix/suffix, i.e. any attached comment) of the
+/// `temperature` value at `path`, if it is present as a plain value.
+fn temperature_decor(doc: &toml_edit::DocumentMut, path: &[&str]) -> Option<toml_edit::Decor> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    for segment in path {
+        table = table.get(segment)?.as_table_like()?;
+    }
+    match table.get("temperature")? {
+        toml_edit::Item::Value(v) => Some(v.decor().clone()),
+        _ => None,
+    }
+}
+
+/// Reapply a previously captured decoration to the `temperature` value at
+/// `path`, so a comment survives a whole-provider table replacement.
+fn set_temperature_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], decor: toml_edit::Decor) {
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for segment in path {
+        let Some(next) = table.get_mut(segment).and_then(toml_edit::Item::as_table_like_mut) else {
+            return;
+        };
+        table = next;
+    }
+    if let Some(toml_edit::Item::Value(v)) = table.get_mut("temperature") {
+        *v.decor_mut() = decor;
+    }
+}
+
+fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {    let text = toml::to_string(provider).context("serializing provider")?;
     let doc: toml_edit::DocumentMut = text.parse().context("re-parsing provider")?;
     let mut table = doc.as_table().clone();
     table.retain(|_, item| !item.as_table_like().is_some_and(|t| t.is_empty()));
@@ -992,6 +1042,42 @@ mod tests {
         assert_eq!(reloaded.providers["anthropic"].models["claude"].temperature, Some(Temperature::Value(0.3)));
         assert_eq!(reloaded.providers["kimi"].models["k3"].temperature, None);
         assert_eq!(reloaded.providers["groq"].max_retries, Some(2));
+    }
+
+    #[test]
+    fn save_keeps_temperature_comments_when_the_provider_is_also_edited() {
+        use crate::temperature::Temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[providers.groq]\nmax_retries = 2\ntemperature = 0.1 # tuned\n\n[providers.groq.models.\"k3\"]\ntemperature = 0.5 # per-model\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Edit the provider wholesale (a non-temperature field) *and* both its
+        // provider- and model-level temperatures in the same session.
+        config.providers.get_mut("groq").unwrap().max_retries = Some(5);
+        config.providers.get_mut("groq").unwrap().temperature = Some(Temperature::Value(0.4));
+        config.providers.get_mut("groq").unwrap().models.get_mut("k3").unwrap().temperature =
+            Some(Temperature::Value(0.6));
+        let changes = Changes {
+            providers: ["groq".to_string()].into(),
+            provider_temperatures: ["groq".to_string()].into(),
+            model_temperatures: [("groq".to_string(), "k3".to_string())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The whole-provider replacement must not discard the temperature
+        // comments the in-place edits preserved.
+        assert!(text.contains("temperature = 0.4 # tuned"), "provider temp comment kept: {text}");
+        assert!(text.contains("temperature = 0.6 # per-model"), "model temp comment kept: {text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(5));
+        assert_eq!(reloaded.providers["groq"].temperature, Some(Temperature::Value(0.4)));
+        assert_eq!(reloaded.providers["groq"].models["k3"].temperature, Some(Temperature::Value(0.6)));
     }
 
     #[test]

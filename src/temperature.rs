@@ -167,13 +167,25 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
         (global, Source::Global)
     };
     let mut effective = chosen;
+    // An `extra_body` temperature overrides everything else (it is merged into
+    // the request last). TOML permits `nan`/`inf`, but serde_json emits a
+    // non-finite f64 as JSON `null` while `/context`, ACP and the trajectory
+    // report the value as a number — so, like the `Temperature` deserializer,
+    // ignore a non-finite override (with a warning) rather than let the
+    // reported and transmitted values diverge.
+    let mut extra_body_warning = None;
     if let Some(v) = provider.extra_body.as_ref().and_then(|b| b.get("temperature")).and_then(|v| match v {
         toml::Value::Float(f) => Some(*f),
         toml::Value::Integer(i) => Some(*i as f64),
         _ => None,
     }) {
-        effective = Temperature::Value(v);
-        source = Source::ExtraBody;
+        if v.is_finite() {
+            effective = Temperature::Value(v);
+            source = Source::ExtraBody;
+        } else {
+            extra_body_warning =
+                Some(format!("extra_body temperature {v} is not finite and is ignored; using {chosen}"));
+        }
     }
 
     if let Some(reason) = fixed_reason(kind, provider, model) {
@@ -188,7 +200,7 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
         return Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning };
     }
 
-    let mut warning = None;
+    let mut warning = extra_body_warning;
     // Anthropic's Messages API takes 0..=1, and `anthropic::build_body` clamps
     // out-of-range values silently. That builder is used for Anthropic
     // providers and for Copilot's Claude 4.x/5.x models (routed to
@@ -266,6 +278,16 @@ mod tests {
         let p = provider("temperature = 0.4\nextra_body = { temperature = 0.1 }\n");
         let r = resolve(global, Some(ProviderKind::Openai), &p, "m");
         assert_eq!((r.value(), r.source), (Some(0.1), Source::ExtraBody));
+
+        // A non-finite extra_body override would be sent as JSON `null` while
+        // reported as a number, so it is ignored (with a warning) and the next
+        // most specific setting is used instead.
+        for text in ["nan", "inf", "-inf"] {
+            let p = provider(&format!("temperature = 0.4\nextra_body = {{ temperature = {text} }}\n"));
+            let r = resolve(global, Some(ProviderKind::Openai), &p, "m");
+            assert_eq!((r.value(), r.source), (Some(0.4), Source::Provider), "{text}");
+            assert!(r.warning.as_deref().unwrap().contains("not finite"), "{text}: {:?}", r.warning);
+        }
     }
 
     #[test]
