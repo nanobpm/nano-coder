@@ -30,6 +30,16 @@ pub fn terminal_size() -> Option<(u16, u16)> {
     (ok && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
 }
 
+/// Size of the terminal on **stderr**, where dialoguer pickers render. The
+/// `--resume` picker is gated on stdin/stderr being terminals (stdout may be
+/// redirected), so measuring stdout would fall back to a default even when
+/// the stderr terminal is narrower and the supposedly fitted rows wrap.
+pub fn stderr_terminal_size() -> Option<(u16, u16)> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    (ok && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
 fn write_raw(bytes: &str) {
     with_term_lock(|| emit(bytes));
 }

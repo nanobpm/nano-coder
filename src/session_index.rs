@@ -93,6 +93,12 @@ pub fn summarize(path: &Path) -> Result<Summary> {
         context_prompt: None,
         log_bytes: bytes.len() as u64,
     };
+    // The id comes from the file name, which `SessionLog::open` validates
+    // before resuming; a log whose name is not a valid id (`.hidden`, over
+    // 128 bytes, outside [A-Za-z0-9._-]) would always fail to open, so it
+    // must not be advertised in the picker as a resumable session.
+    crate::session::validate_id(&summary.id)
+        .with_context(|| format!("session log {} has an invalid id", path.display()))?;
     // Only newline-terminated records are committed (see `session`).
     let committed = bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
     let mut records = bytes[..committed].split(|&b| b == b'\n').filter(|line| !line.is_empty());
@@ -379,6 +385,24 @@ mod tests {
         let summary = summarize(good.path()).unwrap();
         assert_eq!(summary.id, "good");
         assert_eq!(summary.prompts, 1);
+    }
+
+    #[test]
+    fn summarize_rejects_ids_open_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        // `.hidden` and over-128-byte ids are rejected by `SessionLog::open`
+        // (`validate_id`), so a log named one must not be summarized — the
+        // picker would otherwise advertise a session that always fails to
+        // resume. Craft one by writing a valid log under a bad file name.
+        let mut log = SessionLog::create(dir.path(), "good").unwrap();
+        input(&mut log, "i1", "A prompt in a badly named log");
+        let good = log.path().to_path_buf();
+        drop(log);
+        let hidden = dir.path().join(".hidden.jsonl");
+        fs::rename(&good, &hidden).unwrap();
+        // The header id ("good") no longer matches the file stem (".hidden"),
+        // and ".hidden" is itself an invalid id: rejected either way.
+        assert!(summarize(&hidden).is_err(), "a log named with an invalid id must not summarize");
     }
 
     #[test]
