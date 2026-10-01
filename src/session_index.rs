@@ -1,12 +1,17 @@
 //! Summaries of saved sessions for `--resume`: where each ran, how much was
 //! said, and the last prompt, so sessions can be told apart.
 //!
-//! Summaries are cached in `index.jsonl` in the session directory, one JSON
+//! Summaries are cached in `.index.jsonl` in the session directory, one JSON
 //! object per line; the latest line for an ID wins. Writers only append (one
 //! `write` per line), so several running nano-coders can share the file
 //! without locking. A summary records the size of the log it was made from:
 //! when the log has grown since (a session from an older version, or another
 //! process that didn't update the index), it is rebuilt from the log.
+//!
+//! The cache is named `.index.jsonl` (not `index.jsonl`) so its file stem
+//! `.index` is rejected by [`crate::session::validate_id`] (ids may not start
+//! with `.`): the cache can therefore never collide with — or hide — a real
+//! session log, which `index.jsonl` could (a session whose id is `index`).
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -19,7 +24,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::Record;
 
-const INDEX_FILE: &str = "index.jsonl";
+// The cache file's stem (`.index`) is rejected by `validate_id`, so it can
+// never collide with a valid session log name. A leading dot also keeps it
+// out of the way of `list()`'s per-entry scan (a `.`-prefixed stem fails
+// `validate_id`, so it is skipped like any other non-session file).
+const INDEX_FILE: &str = ".index.jsonl";
 
 /// What the session picker shows for one saved session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -312,6 +321,14 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
         // success, contradicting the read_dir error handling above.
         let entry = entry.with_context(|| format!("read entry in session directory {}", dir.display()))?;
         let path = entry.path();
+        // Skip the cache. Its stem `.index` is already rejected by the
+        // `validate_id` check below, but name it explicitly so the intent is
+        // clear and a future rename stays correct. A legacy `index.jsonl`
+        // cache (from before the rename) is NOT skipped here: its stem
+        // `index` is a valid id, so if it is a real session log it is listed
+        // (it was hidden before), and if it is just a stale cache its first
+        // line is a `Summary`, not a `Session` header, so `summarize` rejects
+        // it and it is skipped as an unresumable log.
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || path.file_name() == Some(INDEX_FILE.as_ref()) {
             continue;
         }
@@ -478,6 +495,33 @@ mod tests {
         let sessions = list(dir.path()).unwrap();
         assert_eq!(sessions[0].prompts, 2);
         assert_eq!(sessions[0].last_prompt.as_deref(), Some("Second prompt for the session"));
+    }
+
+    #[test]
+    fn cache_filename_cannot_collide_with_a_session_id() {
+        // The cache file's stem must be an id `validate_id` rejects, so the
+        // cache can never collide with — or hide — a real session log.
+        let stem = Path::new(INDEX_FILE).file_stem().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            crate::session::validate_id(stem).is_err(),
+            "cache file stem {stem:?} must not be a valid session id"
+        );
+
+        // A session whose id is `index` (the legacy cache name's stem) is a
+        // real, resumable session and must be listed, not hidden by the cache.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "index").unwrap();
+        input(&mut log, "i1", "A prompt from the session named index");
+        drop(log);
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["index"],
+            "a session named `index` must be listed, not hidden by the cache"
+        );
+        // Listing it wrote the cache under its own non-colliding name, leaving
+        // the session's own `index.jsonl` log untouched as a session log.
+        assert!(index_path(dir.path()).exists(), "the cache is written to {INDEX_FILE}");
     }
 
     #[test]
