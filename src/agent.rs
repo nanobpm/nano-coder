@@ -879,13 +879,15 @@ impl Agent {
 
     /// Resume a persisted session.
     pub fn load_session(&mut self, id: &str) -> Result<()> {
-        let (mut log, restored) = SessionLog::open(&self.config.session_dir(), id)?;
+        let (mut log, mut restored) = SessionLog::open(&self.config.session_dir(), id)?;
         // Stage the repair on a scratch conversation and append its records
         // *before* committing any agent state: when this append fails (a full
         // disk, say), the load reports an error with this process still in
         // the previous session instead of switched over with the renderer
-        // left on the old transcript.
-        let mut staged = restored.conversation.clone();
+        // left on the old transcript. The conversation is moved out of
+        // `restored` rather than cloned: the original is never read again, so
+        // a load never holds two copies of a potentially large history.
+        let mut staged = std::mem::take(&mut restored.conversation);
         let mut repairs = Self::repair_dangling_tool_calls_on(&staged);
         for message in &mut repairs {
             // Stamp and number each repair exactly like `push` does, so the
