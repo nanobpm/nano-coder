@@ -23,7 +23,7 @@ use super::openai;
 use super::openai_responses;
 use super::retry::ApiError;
 use super::{HttpTransport, ResolvedProvider};
-use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
+use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -509,10 +509,32 @@ impl LLMClient for GithubCopilotClient {
             let entry =
                 models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
             // Copilot enforces the prompt budget, which is below the full window.
-            ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
-                let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
-                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
-            })
+            let limit = |field: &str| {
+                entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
+            };
+            let prompt = limit("max_prompt_tokens");
+            let combined = limit("max_context_window_tokens");
+            match (prompt, combined) {
+                // `max_prompt_tokens` caps the prompt alone: output tokens do not
+                // consume it. Keep the larger `max_context_window_tokens` too —
+                // leaving `max_tokens` unchanged against the prompt cap can still
+                // push prompt + output past the full window, so it is enforced as
+                // a second limit.
+                (Some(tokens), combined) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_prompt_tokens".to_string(),
+                    cap: ContextCap::Prompt,
+                    total_tokens: combined,
+                }),
+                // `max_context_window_tokens` alone is the full window.
+                (None, Some(tokens)) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_context_window_tokens".to_string(),
+                    cap: ContextCap::Total,
+                    total_tokens: None,
+                }),
+                (None, None) => None,
+            }
         })
         .await
         .ok()
@@ -872,7 +894,8 @@ mod tests {
     #[tokio::test]
     async fn detects_context_window_field_fallbacks() {
         // `max_prompt_tokens` is Copilot's enforced prompt budget and wins over
-        // `max_context_window_tokens` when both are present.
+        // `max_context_window_tokens` when both are present — but the larger
+        // combined window is kept as a second limit on prompt + output.
         let window = detect_window(json!({
             "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": {
                 "max_prompt_tokens": 111,
@@ -883,6 +906,8 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 111);
         assert_eq!(window.source, "Copilot /models max_prompt_tokens");
+        assert_eq!(window.cap, ContextCap::Prompt, "the prompt budget caps the prompt alone");
+        assert_eq!(window.total_tokens, Some(999), "the combined window is kept as a second limit");
 
         // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
         let window = detect_window(json!({
@@ -894,6 +919,8 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 222);
         assert_eq!(window.source, "Copilot /models max_context_window_tokens");
+        assert_eq!(window.cap, ContextCap::Total, "the full window caps prompt + output");
+        assert_eq!(window.total_tokens, None, "a total cap needs no second limit");
 
         // Neither field present: no detection rather than a bogus default.
         assert!(
