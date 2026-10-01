@@ -385,7 +385,7 @@ pub fn build_client(
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
         ProviderKind::GithubCopilot => Box::new(github_copilot::GithubCopilotClient::new(resolved)?),
-        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.model)),
+        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.name, &resolved.model)),
     })
 }
 

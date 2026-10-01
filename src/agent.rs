@@ -2310,6 +2310,31 @@ mod tests {
         assert_eq!(resolved.warning, None);
     }
 
+    /// A custom provider with `kind = "mock"` must keep its own name on the
+    /// built client, so temperature resolution reads its entry — not the
+    /// built-in `mock` preset (which has no temperature, so the global would
+    /// be reported/sent instead).
+    #[test]
+    fn temperature_resolves_for_a_custom_mock_provider() {
+        let mut config = Config { model: "demo/foo".into(), ..Default::default() };
+        config.providers.insert(
+            "demo".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Mock),
+                default_model: Some("foo".into()),
+                temperature: Some(crate::temperature::Temperature::Value(0.2)),
+                ..Default::default()
+            },
+        );
+        let client = providers::build_client("demo/foo", &config.providers, "mock").unwrap();
+        // The client was built from the `demo` entry, so it reports `demo` …
+        assert_eq!(client.provider_name(), "demo");
+        let agent = Agent::new(client, config);
+        // … and the temperature lookup resolves against `demo`, not `mock`.
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.2), crate::temperature::Source::Provider));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn logs_thinking_usage_and_duration_with_assistant_messages() {
         let dir = tempfile::tempdir().unwrap();
