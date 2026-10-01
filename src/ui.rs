@@ -719,7 +719,13 @@ impl Renderer {
         }
         let mut state = self.state.lock().unwrap();
         let mut items: Vec<Item> = std::mem::take(&mut state.deferred).into_iter().map(Item::Note).collect();
-        let thinking = std::mem::take(&mut state.last_thinking);
+        // Borrow the cached reasoning, don't take it: `last_thinking` is the
+        // legacy Ctrl-O cache, and clearing it here means a legacy → frame →
+        // legacy round trip with no intervening turn leaves Ctrl-O reporting
+        // "no thinking yet" instead of expanding the reasoning that was shown
+        // before the switch. The frame only needs the char count for its
+        // collapsed `Item::Thinking`; cloning keeps the legacy cache intact.
+        let thinking = state.last_thinking.clone();
         if !thinking.trim().is_empty() {
             items.push(Item::Thinking { chars: thinking.trim().chars().count(), seconds: 0.0 });
         }
