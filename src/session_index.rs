@@ -95,20 +95,28 @@ pub fn summarize(path: &Path) -> Result<Summary> {
     };
     // Only newline-terminated records are committed (see `session`).
     let committed = bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
-    for line in bytes[..committed].split(|&b| b == b'\n') {
-        let header = line.starts_with(br#"{"type":"session""#);
-        if !header && !line.starts_with(br#"{"type":"input""#) {
+    let mut records = bytes[..committed].split(|&b| b == b'\n').filter(|line| !line.is_empty());
+    // The first committed record must be a session header this build can open:
+    // the same format version and an id matching the file name. An input-only,
+    // renamed, or future-version log would be rejected by `SessionLog::open`
+    // (see `session`), so it must not be advertised in the picker as a
+    // resumable session.
+    match records.next().map(serde_json::from_slice::<Record>) {
+        Some(Ok(Record::Session { version, id, created_at, cwd, model }))
+            if version == crate::session::FORMAT_VERSION && id == summary.id =>
+        {
+            summary.created_at = Some(created_at);
+            summary.cwd = cwd;
+            summary.model = model;
+        }
+        _ => anyhow::bail!("session log {} has no resumable header", path.display()),
+    }
+    for line in records {
+        if !line.starts_with(br#"{"type":"input""#) {
             continue;
         }
-        match serde_json::from_slice::<Record>(line) {
-            Ok(Record::Session { id, created_at, cwd, model, .. }) => {
-                summary.id = id;
-                summary.created_at = Some(created_at);
-                summary.cwd = cwd;
-                summary.model = model;
-            }
-            Ok(Record::Input { text, .. }) => fold_input(&mut summary, &text),
-            _ => {}
+        if let Ok(Record::Input { text, .. }) = serde_json::from_slice::<Record>(line) {
+            fold_input(&mut summary, &text);
         }
     }
     Ok(summary)
@@ -345,6 +353,32 @@ mod tests {
         let summary = summarize(log.path()).unwrap();
         assert_eq!(summary.context_prompt, None);
         assert_eq!(summary.cwd, None, "older logs have no cwd");
+    }
+
+    #[test]
+    fn summarize_rejects_logs_open_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        // A renamed log: the header id no longer matches the file name, so
+        // `SessionLog::open` would reject it — it must not be summarized.
+        let mut log = SessionLog::create(dir.path(), "original").unwrap();
+        input(&mut log, "i1", "A prompt in the renamed log");
+        let original = log.path().to_path_buf();
+        drop(log);
+        let renamed = dir.path().join("renamed.jsonl");
+        fs::rename(&original, &renamed).unwrap();
+        assert!(summarize(&renamed).is_err(), "renamed log must not summarize");
+
+        // An input-only log (no session header) is unresumable too.
+        let headerless = dir.path().join("headerless.jsonl");
+        fs::write(&headerless, b"{\"type\":\"input\",\"data\":{\"id\":\"i1\",\"text\":\"hi\"}}\n").unwrap();
+        assert!(summarize(&headerless).is_err(), "input-only log must not summarize");
+
+        // A valid log whose header id matches its file name still summarizes.
+        let mut good = SessionLog::create(dir.path(), "good").unwrap();
+        input(&mut good, "i1", "A valid prompt here");
+        let summary = summarize(good.path()).unwrap();
+        assert_eq!(summary.id, "good");
+        assert_eq!(summary.prompts, 1);
     }
 
     #[test]
