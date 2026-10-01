@@ -859,7 +859,8 @@ before relying on them". The rest is reachable with `memory_search`.
   files are human-readable and can be edited directly.
 - Obvious secrets (keys, tokens, passwords, `.env`-style assignments, private-key blocks) are
   rejected on save - store where to find them instead.
-- Using an entry (a `memory_search` match) bumps its last-used date; entries unused for
+- Using an entry (a `memory_search` match) in a writable session bumps its last-used date;
+  read-only and Plan-mode searches never bump it. Entries unused for
   `memory_expiry_days` (default 90; `0` disables) expire on the next load.
 - Memories never touch the permission rules.
 

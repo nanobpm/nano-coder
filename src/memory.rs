@@ -811,6 +811,17 @@ impl FileLock {
             // `GENERIC_WRITE` so the lock open actually succeeds.
             const GENERIC_WRITE: u32 = 0x4000_0000;
             const DELETE: u32 = 0x0001_0000;
+            // An access-denied open (`PermissionDenied`) is broader than lock
+            // contention: with `share_mode(0)` a live holder makes other opens
+            // fail with `ERROR_SHARING_VIOLATION`, so the only *transient*
+            // access-denied is the brief delete-pending window just after the
+            // previous holder released the handle. A persistent access-denied
+            // is a genuine ACL failure that waiting cannot resolve — retrying it
+            // for the full budget would burn five seconds and then falsely
+            // report a live lock. Ride out the transient with a short grace,
+            // then propagate the real error (Copilot finding, src/memory.rs).
+            const DENIED_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+            let mut denied_since: Option<std::time::Instant> = None;
             loop {
                 match std::fs::OpenOptions::new()
                     .write(true)
@@ -822,14 +833,22 @@ impl FileLock {
                     .open(&lock)
                 {
                     Ok(file) => return Ok(FileLock { file }),
-                    Err(e)
-                        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
-                            || e.kind() == std::io::ErrorKind::PermissionDenied =>
-                    {
+                    Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
                         // The lock is held by a live process; wait and retry so
                         // a holder mid-transaction is never preempted.
+                        denied_since = None;
                         if std::time::Instant::now() >= deadline {
                             bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        // Possibly a transient delete-pending window. Retry only
+                        // within a short grace, then surface the access failure
+                        // itself rather than masquerading as lock contention.
+                        let since = *denied_since.get_or_insert_with(std::time::Instant::now);
+                        if std::time::Instant::now() >= since + DENIED_GRACE {
+                            return Err(e.into());
                         }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
@@ -1040,7 +1059,15 @@ fn strip_uri_password(scheme: Option<&str>, authority: &str) -> String {
                 return host.to_string();
             }
             let user = userinfo.split_once(':').map_or(userinfo, |(u, _)| u);
-            if user.is_empty() {
+            // A non-HTTP username is normally repository identity (a relative
+            // SSH path resolves under that user's home), but a token-only
+            // userinfo such as `ssh://ghp_…@host/repo` embeds a PAT *as* the
+            // username, which would then leak into the project key, prompt
+            // label and readable filename. Drop a username the module
+            // recognises as a secret (checking the percent-decoded form so an
+            // escaped token can't slip through); keep an ordinary username
+            // (Copilot finding, src/memory.rs).
+            if user.is_empty() || looks_like_secret(&percent_decode_lossy(user)).is_some() {
                 host.to_string()
             } else {
                 format!("{user}@{host}")
@@ -2582,6 +2609,21 @@ mod tests {
         // A password-only userinfo (`:pass@host`, e.g. a Redis-style secret)
         // collapses to just the host, since there is no username discriminator.
         assert_eq!(normalize_remote("ssh://:secret@host/repo.git"), "ssh://host/repo.git");
+        // A non-HTTP *username* that is itself a recognisable secret (a
+        // token-only userinfo such as `ssh://ghp_…@host/repo`) is not an
+        // identity discriminator — it is a PAT — so it is stripped like a
+        // password rather than preserved, and never leaks into the key, label
+        // or filename (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("ssh://ghp_0123456789abcdefghij0123@host/repo.git"),
+            "ssh://host/repo.git"
+        );
+        // Percent-encoded secret usernames are decoded before the check, so an
+        // escaped token cannot slip through as an "identity".
+        assert_eq!(
+            normalize_remote("ssh://ghp%5F0123456789abcdefghij0123@host/repo.git"),
+            "ssh://host/repo.git"
+        );
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct
         // keys (Copilot finding, src/memory.rs).
