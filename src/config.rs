@@ -177,19 +177,39 @@ pub enum Migration {
     LinkFailed { from: PathBuf, to: PathBuf, err: String },
 }
 
+/// True when `from` is already the compatibility symlink we would create, i.e. a
+/// symlink whose target is the relative [`APP_NAME`]. Used to treat a racing
+/// `AlreadyExists` as success rather than a spurious failure.
+fn compat_link_is_valid(from: &Path) -> bool {
+    fs::read_link(from).is_ok_and(|target| target == Path::new(APP_NAME))
+}
+
 /// Create the compatibility symlink `from -> APP_NAME` so an older nano-coder
-/// still pointed at the legacy path keeps finding its files. On non-unix this
-/// is a no-op success: symlinks need extra privileges there and the move has
-/// already happened, so the current build is unaffected.
+/// still pointed at the legacy path keeps finding its files. On Windows a
+/// directory symlink is attempted (so the `Moved` contract — a working link at
+/// `from` — still holds); its failure is propagated rather than silently
+/// swallowed. Platforms with no symlink support propagate an error too, so a
+/// move is never reported as `Moved` when no compatibility path was created.
+/// Creation is race-idempotent: if a concurrent start installed the exact link
+/// first, the resulting `AlreadyExists` is treated as success.
 fn create_compat_link(from: &Path) -> std::result::Result<(), String> {
     #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(APP_NAME, from).map_err(|e| e.to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = from;
-        Ok(())
+    let res = std::os::unix::fs::symlink(APP_NAME, from);
+    #[cfg(windows)]
+    let res = std::os::windows::fs::symlink_dir(APP_NAME, from);
+    #[cfg(not(any(unix, windows)))]
+    let res: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "compatibility symlinks are not supported on this platform",
+    ));
+
+    match res {
+        Ok(()) => Ok(()),
+        // A concurrent start may have installed the exact link between the
+        // caller's existence check (or our winning the rename) and this call;
+        // if the required link is now in place, that is a success, not a failure.
+        Err(_) if compat_link_is_valid(from) => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -346,6 +366,21 @@ mod tests {
             fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink(),
             "the compatibility link is restored on a later start"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_compat_link_is_race_idempotent() {
+        let base = tempfile::tempdir().unwrap();
+        let from = base.path().join("agentic-harness");
+        // A concurrent start already installed the exact compatibility link.
+        std::os::unix::fs::symlink(APP_NAME, &from).unwrap();
+        // Creating it again must report success, not a spurious AlreadyExists failure.
+        assert!(create_compat_link(&from).is_ok(), "existing valid link is treated as success");
+        // A pre-existing symlink to something else is still reported as a failure.
+        let other = base.path().join("other");
+        std::os::unix::fs::symlink("somewhere-else", &other).unwrap();
+        assert!(create_compat_link(&other).is_err(), "a wrong-target link is a real failure");
     }
 
     #[test]
