@@ -551,7 +551,7 @@ mod tests {
         }
         let (index, lines) = load(dir.path());
         assert_eq!(index.len(), 1, "one live session");
-        assert!(lines <= 1 * 2 + 64, "index grew past the compaction threshold: {lines} lines");
+        assert!(lines <= index.len() * 2 + 64, "index grew past the compaction threshold: {lines} lines");
         // The surviving summary is still correct.
         let sessions = list(dir.path()).unwrap();
         assert_eq!(sessions[0].id, "s");
