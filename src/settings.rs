@@ -21,6 +21,10 @@ const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 struct Changes {
     model: bool,
     temperature: bool,
+    /// Providers whose `temperature` changed.
+    provider_temperatures: BTreeSet<String>,
+    /// `(provider, model)` pairs whose `temperature` changed.
+    model_temperatures: BTreeSet<(String, String)>,
     max_tokens: bool,
     max_iterations: bool,
     system_prompt: bool,
@@ -34,6 +38,8 @@ impl Changes {
     fn any(&self) -> bool {
         self.model
             || self.temperature
+            || !self.provider_temperatures.is_empty()
+            || !self.model_temperatures.is_empty()
             || self.max_tokens
             || self.max_iterations
             || self.system_prompt
@@ -91,7 +97,7 @@ pub async fn run(
         let items = [
             format!("Model            {} (provider {})", config.model, agent.provider_name()),
             "Add or edit a provider".to_string(),
-            format!("Temperature      {}", config.temperature),
+            format!("Temperature      {}", agent.temperature().describe()),
             format!("Max tokens       {}", config.max_tokens),
             format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
@@ -132,14 +138,7 @@ pub async fn run(
                     }
                 }
             }
-            2 => {
-                let value: f64 = Input::new()
-                    .with_prompt("Temperature (0.0-2.0)")
-                    .default(agent.config().temperature)
-                    .interact_text()?;
-                agent.config_mut().temperature = value;
-                changes.temperature = true;
-            }
+            2 => edit_temperature(agent, &mut changes)?,
             3 => {
                 let value: i32 =
                     Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
@@ -223,6 +222,9 @@ async fn switch_model(
             changes.model = true;
             record_switch(agent, &previous, recents, recents_path);
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+            if let Some(warning) = agent.temperature().warning {
+                println!("Warning: {warning}");
+            }
         }
         Err(e) => println!("Could not switch model: {e:#}"),
     }
@@ -644,6 +646,142 @@ fn diff_from(preset: &ProviderConfig, existing: &ProviderConfig, updated: &Provi
     entry
 }
 
+/// Set the temperature for the current model, its provider, or every model.
+/// A model that accepts no temperature can only use its default, so there is
+/// nothing to edit for it.
+fn edit_temperature(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
+    use crate::temperature::{MAX, Temperature};
+    let current = agent.temperature();
+    // Target the live client's provider/model, not `config.model`: after a
+    // provider's `default_model` is edited and the user declines to switch,
+    // the two diverge, and the menu (via `agent.temperature()`) reports the
+    // live model — so the edit must write to that same model, not the newly
+    // configured default.
+    let provider = agent.provider_name().to_string();
+    let model = agent.model_name().to_string();
+    if let Some(reason) = &current.fixed {
+        println!("{provider}/{model} always uses the model default: {reason}.");
+        return Ok(());
+    }
+    let scopes = [
+        format!("This model ({provider}/{model})"),
+        format!("All {provider} models"),
+        "All models (global)".to_string(),
+    ];
+    let scope = Select::new().with_prompt("Set the temperature for").items(&scopes).default(0).interact()?;
+    let config = agent.config();
+    let entry = config.providers.get(&provider);
+    let existing = match scope {
+        0 => entry.and_then(|p| p.models.get(&model)).and_then(|m| m.temperature),
+        1 => entry.and_then(|p| p.temperature),
+        _ => Some(config.temperature),
+    };
+    let unset_hint = if scope < 2 { ", empty to unset" } else { "" };
+    let text: String = Input::new()
+        .with_prompt(format!("Temperature (0-{MAX}, \"default\" for the model default{unset_hint})"))
+        .with_initial_text(existing.map(|t| t.to_string()).unwrap_or_default())
+        .allow_empty(scope < 2)
+        .validate_with(|s: &String| -> Result<(), String> {
+            if s.trim().is_empty() { Ok(()) } else { s.parse::<Temperature>().map(|_| ()) }
+        })
+        .interact_text()?;
+    let value =
+        if text.trim().is_empty() { None } else { Some(text.parse::<Temperature>().map_err(anyhow::Error::msg)?) };
+    let config = agent.config_mut();
+    match scope {
+        0 => {
+            let entry = config.providers.entry(provider.clone()).or_default();
+            match value {
+                Some(t) => entry.models.entry(model.clone()).or_default().temperature = Some(t),
+                None => {
+                    if let Some(settings) = entry.models.get_mut(&model) {
+                        settings.temperature = None;
+                    }
+                    if entry.models.get(&model).is_some_and(|m| *m == Default::default()) {
+                        entry.models.remove(&model);
+                    }
+                }
+            }
+            changes.model_temperatures.insert((provider, model));
+        }
+        1 => {
+            config.providers.entry(provider.clone()).or_default().temperature = value;
+            changes.provider_temperatures.insert(provider);
+        }
+        _ => {
+            if let Some(t) = value {
+                config.temperature = t;
+                changes.temperature = true;
+            }
+        }
+    }
+    let now = agent.temperature();
+    println!("Temperature for this model: {}", now.describe());
+    if let Some(warning) = now.warning {
+        println!("Note: {warning}");
+    }
+    Ok(())
+}
+
+/// A temperature as a TOML value: a number, or the string `"default"`.
+fn temperature_item(t: crate::temperature::Temperature) -> toml_edit::Item {
+    match t {
+        crate::temperature::Temperature::Default => toml_edit::value("default"),
+        crate::temperature::Temperature::Value(v) => toml_edit::value(v),
+    }
+}
+
+/// Set (or with `None`, remove) `key` in the table at `path`, creating the
+/// tables on the way as implicit ones (so `[providers.x.models."m"]` doesn't
+/// also write empty `[providers]` headers).
+fn set_nested(
+    doc: &mut toml_edit::DocumentMut,
+    path: &[&str],
+    key: &str,
+    value: Option<crate::temperature::Temperature>,
+) {
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    // Inside an inline table (`models = { … }`) new tables must be inline too.
+    let mut inline = false;
+    for segment in path {
+        if table.get(segment).and_then(toml_edit::Item::as_table_like).is_none() {
+            if value.is_none() {
+                return;
+            }
+            let new = if inline {
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
+            } else {
+                let mut new = toml_edit::Table::new();
+                new.set_implicit(true);
+                toml_edit::Item::Table(new)
+            };
+            table.insert(segment, new);
+        }
+        let item = table.get_mut(segment).expect("inserted above");
+        inline = item.is_inline_table();
+        table = item.as_table_like_mut().expect("checked above");
+    }
+    match value {
+        Some(t) => {
+            let mut item = temperature_item(t);
+            // `TableLike::insert` replaces the whole item, including its
+            // decoration, so editing an existing temperature would drop an
+            // attached comment (`temperature = 0.3 # tuned for this model`).
+            // Carry the old value's prefix/suffix over to keep it.
+            if let Some(toml_edit::Item::Value(old)) = table.get(key)
+                && let toml_edit::Item::Value(new) = &mut item
+            {
+                new.decor_mut().set_prefix(old.decor().prefix().cloned().unwrap_or_default());
+                new.decor_mut().set_suffix(old.decor().suffix().cloned().unwrap_or_default());
+            }
+            table.insert(key, item);
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
 /// Write the changed keys into the config file, preserving its comments and
 /// anything else the user put there.
 fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
@@ -657,7 +795,18 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         doc["model"] = toml_edit::value(config.model.as_str());
     }
     if changes.temperature {
-        doc["temperature"] = toml_edit::value(config.temperature);
+        // Reuse the decoration-preserving helper so editing the global
+        // temperature keeps an attached comment (`temperature = 0.2 # tuned`),
+        // matching the provider/model path.
+        set_nested(&mut doc, &[], "temperature", Some(config.temperature));
+    }
+    for name in &changes.provider_temperatures {
+        let value = config.providers.get(name).and_then(|p| p.temperature);
+        set_nested(&mut doc, &["providers", name], "temperature", value);
+    }
+    for (name, model) in &changes.model_temperatures {
+        let value = config.providers.get(name).and_then(|p| p.models.get(model)).and_then(|m| m.temperature);
+        set_nested(&mut doc, &["providers", name, "models", model], "temperature", value);
     }
     if changes.max_tokens {
         doc["max_tokens"] = toml_edit::value(i64::from(config.max_tokens));
@@ -696,7 +845,30 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         }
         for name in &changes.providers {
             let Some(provider) = config.providers.get(name) else { continue };
+            // Replacing the whole provider table rebuilds it from scratch and
+            // drops every decoration. If this same provider's temperature (or a
+            // model's) was also edited in this session, the decoration-
+            // preserving `set_nested` edits above (e.g. a `# tuned` comment)
+            // would be discarded. Snapshot those temperature items' decorations
+            // first and reapply them after the replacement so their comments
+            // survive overlapping provider + temperature edits.
+            let mut saved: Vec<(Vec<&str>, toml_edit::Decor)> = Vec::new();
+            if changes.provider_temperatures.contains(name)
+                && let Some(d) = temperature_decor(&doc, &["providers", name])
+            {
+                saved.push((vec!["providers", name], d));
+            }
+            for (p, model) in &changes.model_temperatures {
+                if p == name
+                    && let Some(d) = temperature_decor(&doc, &["providers", name, "models", model])
+                {
+                    saved.push((vec!["providers", name, "models", model], d));
+                }
+            }
             doc["providers"][name.as_str()] = toml_edit::Item::Table(provider_table(provider)?);
+            for (path, decor) in saved {
+                set_temperature_decor(&mut doc, &path, decor);
+            }
         }
     }
     has_secret |= config.providers.values().any(|p| p.api_key.is_some());
@@ -713,6 +885,34 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     }
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+/// The decoration (prefix/suffix, i.e. any attached comment) of the
+/// `temperature` value at `path`, if it is present as a plain value.
+fn temperature_decor(doc: &toml_edit::DocumentMut, path: &[&str]) -> Option<toml_edit::Decor> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    for segment in path {
+        table = table.get(segment)?.as_table_like()?;
+    }
+    match table.get("temperature")? {
+        toml_edit::Item::Value(v) => Some(v.decor().clone()),
+        _ => None,
+    }
+}
+
+/// Reapply a previously captured decoration to the `temperature` value at
+/// `path`, so a comment survives a whole-provider table replacement.
+fn set_temperature_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], decor: toml_edit::Decor) {
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for segment in path {
+        let Some(next) = table.get_mut(segment).and_then(toml_edit::Item::as_table_like_mut) else {
+            return;
+        };
+        table = next;
+    }
+    if let Some(toml_edit::Item::Value(v)) = table.get_mut("temperature") {
+        *v.decor_mut() = decor;
+    }
 }
 
 fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
@@ -803,6 +1003,85 @@ mod tests {
     }
 
     #[test]
+    fn save_writes_provider_and_model_temperatures_in_place() {
+        use crate::temperature::Temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config.temperature = Temperature::Default;
+        config.providers.get_mut("groq").unwrap().temperature = Some(Temperature::Value(0.4));
+        let anthropic = config.providers.entry("anthropic".into()).or_default();
+        anthropic.models.entry("claude".into()).or_default().temperature = Some(Temperature::Value(0.3));
+        // Unsetting inside an inline table removes just that key.
+        config.providers.get_mut("kimi").unwrap().models.get_mut("k3").unwrap().temperature = None;
+        let changes = Changes {
+            temperature: true,
+            provider_temperatures: ["groq".to_string()].into(),
+            model_temperatures: [("anthropic".to_string(), "claude".to_string()), ("kimi".into(), "k3".into())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("temperature = \"default\" # global tune"), "global comment kept: {text}");
+        // Replacing an existing value keeps its attached comment.
+        assert!(
+            text.contains("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider"),
+            "{text}"
+        );
+        assert!(text.contains("[providers.anthropic.models.claude]\ntemperature = 0.3"), "{text}");
+        assert!(!text.contains("[providers]\n") && !text.contains("[providers.anthropic]\n"), "implicit: {text}");
+        assert!(!text.contains("0.5"), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.temperature, Temperature::Default);
+        assert_eq!(reloaded.providers["groq"].temperature, Some(Temperature::Value(0.4)));
+        assert_eq!(reloaded.providers["anthropic"].models["claude"].temperature, Some(Temperature::Value(0.3)));
+        assert_eq!(reloaded.providers["kimi"].models["k3"].temperature, None);
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(2));
+    }
+
+    #[test]
+    fn save_keeps_temperature_comments_when_the_provider_is_also_edited() {
+        use crate::temperature::Temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[providers.groq]\nmax_retries = 2\ntemperature = 0.1 # tuned\n\n[providers.groq.models.\"k3\"]\ntemperature = 0.5 # per-model\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Edit the provider wholesale (a non-temperature field) *and* both its
+        // provider- and model-level temperatures in the same session.
+        config.providers.get_mut("groq").unwrap().max_retries = Some(5);
+        config.providers.get_mut("groq").unwrap().temperature = Some(Temperature::Value(0.4));
+        config.providers.get_mut("groq").unwrap().models.get_mut("k3").unwrap().temperature =
+            Some(Temperature::Value(0.6));
+        let changes = Changes {
+            providers: ["groq".to_string()].into(),
+            provider_temperatures: ["groq".to_string()].into(),
+            model_temperatures: [("groq".to_string(), "k3".to_string())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The whole-provider replacement must not discard the temperature
+        // comments the in-place edits preserved.
+        assert!(text.contains("temperature = 0.4 # tuned"), "provider temp comment kept: {text}");
+        assert!(text.contains("temperature = 0.6 # per-model"), "model temp comment kept: {text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(5));
+        assert_eq!(reloaded.providers["groq"].temperature, Some(Temperature::Value(0.4)));
+        assert_eq!(reloaded.providers["groq"].models["k3"].temperature, Some(Temperature::Value(0.6)));
+    }
+
+    #[test]
     fn save_updates_only_changed_keys_and_keeps_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -813,7 +1092,7 @@ mod tests {
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         config.model = "work/llama3".into();
-        config.temperature = 0.9;
+        config.temperature = crate::temperature::Temperature::Value(0.9);
         config.providers.insert(
             "work".into(),
             ProviderConfig {

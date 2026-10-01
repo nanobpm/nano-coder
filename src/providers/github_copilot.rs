@@ -22,7 +22,7 @@ use super::anthropic;
 use super::openai;
 use super::openai_responses;
 use super::retry::ApiError;
-use super::{HttpTransport, ResolvedProvider};
+use super::{HttpTransport, ProviderKind, ResolvedProvider};
 use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
@@ -83,19 +83,7 @@ impl CopilotApi {
 /// `grok-`, `oswe`, `mai-` for Responses; GPT-4.x and earlier for Chat
 /// Completions).
 fn copilot_api_for_model(model_id: &str) -> CopilotApi {
-    // Claude 4.x/5.x are served through the Anthropic Messages endpoint. Older
-    // Claude (3.x) and everything else keep the legacy Chat Completions path.
-    const CLAUDE_FAMILIES: [&str; 4] = ["claude-haiku-", "claude-sonnet-", "claude-opus-", "claude-fable-"];
-    let is_claude_4_or_5 = CLAUDE_FAMILIES.iter().any(|family| {
-        model_id.strip_prefix(family).is_some_and(|rest| {
-            let mut chars = rest.chars();
-            // The major version must be 4 or 5, and be a whole token — followed
-            // by a separator (`.`/`-`) or the end, so `claude-sonnet-42` (a
-            // hypothetical future line) is not misread as v4.
-            matches!(chars.next(), Some('4' | '5')) && matches!(chars.next(), None | Some('.' | '-'))
-        })
-    });
-    if is_claude_4_or_5 {
+    if uses_anthropic_messages(model_id) {
         return CopilotApi::Messages;
     }
     // GPT before 5 (gpt-4.1, gpt-4o, gpt-3.5-turbo) is Chat Completions only:
@@ -108,6 +96,24 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
         return CopilotApi::Responses;
     }
     CopilotApi::Completions
+}
+
+/// Whether Copilot serves `model_id` through the Anthropic Messages endpoint
+/// (`/v1/messages`): Claude 4.x/5.x models. Older Claude (3.x) and everything
+/// else keep the legacy Chat Completions path. Temperature resolution uses this
+/// to apply Anthropic's 0..=1 range to exactly the requests whose body is built
+/// by `anthropic::build_body` (which clamps to that range).
+pub(crate) fn uses_anthropic_messages(model_id: &str) -> bool {
+    const CLAUDE_FAMILIES: [&str; 4] = ["claude-haiku-", "claude-sonnet-", "claude-opus-", "claude-fable-"];
+    CLAUDE_FAMILIES.iter().any(|family| {
+        model_id.strip_prefix(family).is_some_and(|rest| {
+            let mut chars = rest.chars();
+            // The major version must be 4 or 5, and be a whole token — followed
+            // by a separator (`.`/`-`) or the end, so `claude-sonnet-42` (a
+            // hypothetical future line) is not misread as v4.
+            matches!(chars.next(), Some('4' | '5')) && matches!(chars.next(), None | Some('.' | '-'))
+        })
+    })
 }
 
 /// Whether a Copilot model reasons, and so (1) needs its reasoning items
@@ -563,6 +569,10 @@ impl LLMClient for GithubCopilotClient {
 
     fn provider_name(&self) -> &str {
         &self.transport.provider().name
+    }
+
+    fn kind(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::GithubCopilot)
     }
 }
 

@@ -14,7 +14,9 @@ pub struct Config {
     pub model: String,
     /// Provider for model specs without a known provider prefix.
     pub default_provider: String,
-    pub temperature: f64,
+    /// Temperature for every model, unless a provider or model sets its own:
+    /// a number, or `"default"` to send none.
+    pub temperature: crate::temperature::Temperature,
     pub max_tokens: i32,
     pub system_prompt: String,
     /// Legacy: applied to `default_provider` (which becomes `openai` if it was `mock`).
@@ -71,7 +73,7 @@ impl Default for Config {
         Self {
             model: "gpt-4o-mini".to_string(),
             default_provider: "mock".to_string(),
-            temperature: 0.7,
+            temperature: crate::temperature::Temperature::Value(0.7),
             max_tokens: 4096,
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             api_key: None,

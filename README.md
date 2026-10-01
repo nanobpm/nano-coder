@@ -368,7 +368,7 @@ Create `~/.config/nano-coder/config.toml` (every field is optional). Directories
 ```toml
 model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
-temperature = 0.7
+temperature = 0.7                       # or "default" to send none (see Temperature below)
 max_tokens = 4096
 max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
@@ -480,6 +480,30 @@ or your workspace domain override `base_url`, e.g.
 `replay_reasoning = true`, which sends each assistant message's `reasoning_content` back
 as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
 make K3 think less.
+
+### Temperature
+
+`temperature` is a number, or `"default"` to send none so the model uses its own default.
+It can be set for all models, for one provider, or for one model; the most specific
+setting wins:
+
+```toml
+temperature = 0.7                       # all models
+
+[providers.groq]
+temperature = "default"                 # every groq model uses its own default
+
+[providers.anthropic.models."claude-sonnet-4-5"]
+temperature = 0.3                       # this model only
+```
+
+Some models accept no temperature, and for them the model default is the only option:
+GitHub Copilot's reasoning models (GPT-5 and later, Grok, …) and any provider with
+`drop_params = ["temperature"]` (such as the `kimi` preset). A number set for such a
+provider or model is ignored with a warning at startup and when you switch to it; the
+top-level `temperature` just doesn't apply to them. Anthropic accepts 0 to 1, so a higher
+value is sent as 1, with a warning. `/context` shows the temperature in use and where it
+comes from, and `/settings` edits it for the current model, its provider, or all models.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and

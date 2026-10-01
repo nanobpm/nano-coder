@@ -541,6 +541,28 @@ impl Agent {
         self.client.model_name()
     }
 
+    /// The temperature the current model is sent, and where it comes from.
+    pub fn temperature(&self) -> crate::temperature::Resolved {
+        // Resolve against the live client, not `config.model`: a `/settings`
+        // edit to the active provider (e.g. its `default_model`, kept when
+        // "Pick a model … now?" is declined) mutates the config without
+        // rebuilding the client, and requests still go to the client's model.
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let entry = providers.get(self.provider_name()).cloned();
+        // The live client's API kind is what governs the request: a `/settings`
+        // edit can change the active provider's `kind` while the user declines
+        // the model switch, so the client still speaks the old API even though
+        // the config now names a new one. A client reporting no kind (a test
+        // double imitating no real provider API) gets no kind-specific rule —
+        // falling back to the provider entry's kind would apply rules from a
+        // mutated config entry to a client that never spoke that API. Clients
+        // that need kind-specific rules report their kind explicitly.
+        let kind = self.client.kind();
+        let provider = entry.unwrap_or_default();
+        crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
+    }
+
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         self.client = Self::client_for(&self.config, spec)?;
@@ -1342,6 +1364,10 @@ impl Agent {
             // Reset per attempt, so the recorded duration is the request that
             // produced the response, not earlier overflowed attempts.
             let mut request_started;
+            // Resolve once per turn: the model/provider/config that decide the
+            // temperature do not change across overflow retries, and the
+            // trajectory records the same effective value that is sent.
+            let resolved_temperature = self.temperature();
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Rebuilt every retry iteration, not just once before the loop:
@@ -1353,7 +1379,7 @@ impl Agent {
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
-                    temperature: Some(self.config.temperature),
+                    temperature: resolved_temperature.value(),
                     max_tokens: Some(self.request_max_tokens()),
                 };
                 let control = self.control.clone();
@@ -1490,6 +1516,7 @@ impl Agent {
                 thinking: response.thinking.clone(),
                 usage: response.usage.clone(),
                 duration_ms: Some(duration_ms),
+                temperature: Some(resolved_temperature.describe()),
                 ..message
             };
 
@@ -1863,7 +1890,11 @@ impl Agent {
         let request = ChatRequest {
             messages: &summary_messages,
             tools: &[],
-            temperature: None,
+            // Compaction goes through the same resolution as a chat turn, so a
+            // legacy `extra_body` temperature override still applies (the
+            // transport no longer re-inserts it) and fixed-temperature models
+            // still send none.
+            temperature: self.temperature().value(),
             max_tokens: Some(context::SUMMARY_MAX_TOKENS.min(self.config.max_tokens as i64)),
         };
         let control = self.control.clone();
@@ -2152,6 +2183,11 @@ mod tests {
         fn provider_name(&self) -> &str {
             "test"
         }
+        /// Reports a kind explicitly: a kindless client gets no kind-specific
+        /// temperature rules, even when its config provider entry has one.
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
     }
 
     type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
@@ -2159,7 +2195,7 @@ mod tests {
     /// `message` without its timestamp (or other timing), for comparing with a
     /// constructed one.
     fn unstamped(message: &Message) -> Message {
-        Message { timestamp: None, log_line: None, duration_ms: None, ..message.clone() }
+        Message { timestamp: None, log_line: None, duration_ms: None, temperature: None, ..message.clone() }
     }
 
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
@@ -2194,6 +2230,109 @@ mod tests {
 
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn temperature_resolves_against_the_live_client() {
+        // `Scripted` reports provider "test" and model "scripted", whatever
+        // `config.model` says — so resolution must follow the client.
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        assert_eq!(agent.temperature().source, crate::temperature::Source::Global);
+
+        // A temperature set for the client's provider/model is what it is sent …
+        let mut config = agent.config().clone();
+        config.providers.insert(
+            "test".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Openai),
+                temperature: Some(crate::temperature::Temperature::Value(0.4)),
+                ..Default::default()
+            },
+        );
+        let agent = Agent::new(
+            Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
+            config,
+        );
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.4), crate::temperature::Source::Provider));
+
+        // … even when `config.model` drifts from the live client, as a
+        // `/settings` edit to the provider's `default_model` leaves it: the
+        // config now points at a fixed-temperature reasoning model, but the
+        // client still speaks for "scripted", which takes a temperature.
+        let mut config = agent.config().clone();
+        config.model = "github-copilot/gpt-5".into();
+        let agent = Agent::new(
+            Box::new(Scripted { responses: Mutex::new(vec![]), seen: Arc::new(Mutex::new(vec![])) }),
+            config,
+        );
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.4), crate::temperature::Source::Provider));
+        assert_eq!(resolved.fixed, None);
+    }
+
+    /// A kindless client (one imitating no real provider API) gets no
+    /// kind-specific rule, even when its config provider entry names a kind:
+    /// editing the provider's `kind` must not clamp or fix the temperature of
+    /// a client that never spoke that API.
+    struct Kindless;
+
+    #[async_trait]
+    impl LLMClient for Kindless {
+        async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            unreachable!("no chat in this test")
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[test]
+    fn temperature_ignores_config_kind_for_a_kindless_client() {
+        let mut config = Config::default();
+        // The active `mock` provider edited to Anthropic, the switch declined:
+        // the kindless client must not inherit Anthropic's 0..=1 clamp.
+        config.providers.insert(
+            "mock".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Anthropic),
+                temperature: Some(crate::temperature::Temperature::Value(1.5)),
+                ..Default::default()
+            },
+        );
+        let agent = Agent::new(Box::new(Kindless), config);
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(1.5), crate::temperature::Source::Provider));
+        assert_eq!(resolved.warning, None);
+    }
+
+    /// A custom provider with `kind = "mock"` must keep its own name on the
+    /// built client, so temperature resolution reads its entry — not the
+    /// built-in `mock` preset (which has no temperature, so the global would
+    /// be reported/sent instead).
+    #[test]
+    fn temperature_resolves_for_a_custom_mock_provider() {
+        let mut config = Config { model: "demo/foo".into(), ..Default::default() };
+        config.providers.insert(
+            "demo".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Mock),
+                default_model: Some("foo".into()),
+                temperature: Some(crate::temperature::Temperature::Value(0.2)),
+                ..Default::default()
+            },
+        );
+        let client = providers::build_client("demo/foo", &config.providers, "mock").unwrap();
+        // The client was built from the `demo` entry, so it reports `demo` …
+        assert_eq!(client.provider_name(), "demo");
+        let agent = Agent::new(client, config);
+        // … and the temperature lookup resolves against `demo`, not `mock`.
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(0.2), crate::temperature::Source::Provider));
     }
 
     #[tokio::test(flavor = "multi_thread")]

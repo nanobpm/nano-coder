@@ -316,7 +316,9 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             "model": config.model,
                             "provider": agent.provider_name(),
                             "provider_model": agent.model_name(),
-                            "temperature": config.temperature,
+                            // The value sent to the model (null: its default).
+                            "temperature": agent.temperature().value(),
+                            "temperature_source": agent.temperature().source.label(),
                             "max_tokens": config.max_tokens,
                             "system_prompt": config.system_prompt,
                             "session_id": agent.session_id(),
@@ -346,10 +348,24 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
 
             if let Some(spec) = command.strip_prefix("/model ") {
                 return Some(match agent.set_model(spec.trim()).await {
-                    Ok(()) => result(
-                        id,
-                        json!({ "stopReason": "end_turn", "provider": agent.provider_name(), "model": agent.model_name() }),
-                    ),
+                    Ok(()) => {
+                        let temp = agent.temperature();
+                        let mut body = json!({
+                            "stopReason": "end_turn",
+                            "provider": agent.provider_name(),
+                            "model": agent.model_name(),
+                            // The value sent to the new model (null: its default).
+                            "temperature": temp.value(),
+                            "temperature_source": temp.source.label(),
+                        });
+                        // Surface the ignored/adjusted-setting warning so an ACP
+                        // client switching to a fixed-temperature model sees the
+                        // same condition as the interactive path.
+                        if let Some(warning) = temp.warning {
+                            body["warning"] = json!(warning);
+                        }
+                        result(id, body)
+                    }
                     Err(e) => error(id, -32602, format!("{e:#}")),
                 });
             }
