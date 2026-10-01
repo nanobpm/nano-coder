@@ -245,6 +245,21 @@ impl DoubleEscape {
     }
 }
 
+/// The terminal-owning state shared between the SIGWINCH resize task and a live
+/// renderer switch (`Terminal::renderer_switched`). Both must serialise against
+/// each other: a resize that passes its `is_frame()` check and then debounces
+/// must not draw while a transition is mid flip/clear/replay (on frame → legacy
+/// that would reprint the prompt before `replay_transcript`, placing history
+/// after it). `lock` is that serialisation point; the remaining fields are the
+/// state the two draw paths touch, grouped so `Terminal::start` stays lean.
+#[derive(Clone)]
+struct TransitionShared {
+    view: lineedit::SharedView,
+    status: Option<std::sync::Arc<status::StatusLine>>,
+    renderer: std::sync::Arc<ui::Renderer>,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
 struct Terminal {
     want: std::sync::mpsc::Sender<()>,
     outstanding: bool,
@@ -311,13 +326,12 @@ impl InputGate {
 impl Terminal {
     fn start(
         config_path: std::path::PathBuf,
-        view: lineedit::SharedView,
-        renderer: std::sync::Arc<ui::Renderer>,
         recents: recents::SharedRecents,
         recents_path: std::path::PathBuf,
-        status: Option<std::sync::Arc<status::StatusLine>>,
         renderer_before: crate::frame::RendererMode,
+        transition: TransitionShared,
     ) -> Self {
+        let TransitionShared { view, status, renderer, lock: picker_lock } = transition;
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
         let lines = tx.clone();
@@ -387,7 +401,7 @@ impl Terminal {
             status,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            picker_lock,
         }
     }
 
@@ -429,11 +443,21 @@ impl Terminal {
     /// transcript into the now-active renderer. No-op when the mode is
     /// unchanged. The transcript state is preserved across the flip, so the
     /// conversation is simply re-emitted into whichever renderer is active.
-    fn renderer_switched(&mut self, agent: &mut Agent) {
+    ///
+    /// The whole flip/clear/replay runs under `picker_lock` — the same lock the
+    /// SIGWINCH resize task takes before drawing — so a resize cannot pass its
+    /// `is_frame()` check, finish debouncing mid-transition, and `view.resize()`
+    /// while the screen is being cleared/replayed (which on frame → legacy would
+    /// redraw the prompt before `replay_transcript`, placing history after it).
+    async fn renderer_switched(&mut self, agent: &mut Agent) {
         let mode = agent.config().renderer;
         if mode == self.renderer_before {
             return;
         }
+        // Serialize against the SIGWINCH resize task: hold the terminal-owning
+        // lock for the whole multi-step transition so no resize redraw can
+        // interleave with the mode flip, screen clear, and transcript replay.
+        let _transition_guard = self.picker_lock.lock().await;
         self.renderer_before = mode;
         let switching_to_frame = mode == crate::frame::RendererMode::Frame;
         // Leaving frame mode: the frame's full redraws cleared the legacy
@@ -1467,7 +1491,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // the frame renderer, the line editor's drawing path, and the
             // scroll region, and replay the transcript into the new renderer.
             if agent.config().renderer != renderer_before {
-                terminal.renderer_switched(agent);
+                terminal.renderer_switched(agent).await;
             }
             // Re-show any notice the dialog retained (e.g. a client-rebuild
             // failure) THROUGH the renderer, now that the redraw has run. The
@@ -2154,16 +2178,35 @@ async fn main() -> Result<()> {
                 },
             ));
         }
+        // Serialises every terminal-owning operation that must not interleave
+        // with a multi-step renderer transition: the SIGWINCH resize task takes
+        // it before drawing, and `Terminal::renderer_switched` holds it across
+        // the flip/clear/replay. Created here (before `Terminal::start`) so both
+        // sides share one lock. The SIGWINCH task and `Terminal` each get a clone.
+        let transition = TransitionShared {
+            view: view.clone(),
+            status: status.clone(),
+            renderer: renderer.clone(),
+            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        };
         if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            let view = view.clone();
-            let status = status.clone();
-            let renderer = renderer.clone();
+            let transition = transition.clone();
             tokio::spawn(async move {
+                let TransitionShared { view, status, renderer, lock: transition_lock } = &transition;
                 // Debounce a burst of resizes (a window drag) into one render at
                 // the final size: after a resize, wait for ~40 ms of quiet.
                 let quiet = std::time::Duration::from_millis(40);
                 let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
+                    // Hold the transition lock from the `is_frame()` check through
+                    // the draw, so a renderer switch cannot flip the mode, clear
+                    // the screen, and replay the transcript in between (which would
+                    // let this redraw interleave with the transition — on frame →
+                    // legacy it would reprint the prompt before `replay_transcript`,
+                    // placing history after it). The lock is uncontended except
+                    // during that brief transition, so this costs nothing in the
+                    // common case.
+                    let _transition_guard = transition_lock.lock().await;
                     if !renderer.is_frame() {
                         // Legacy: re-anchor immediately, as before.
                         if let Some(status) = &status {
@@ -2215,12 +2258,10 @@ async fn main() -> Result<()> {
         }
         let mut terminal = Terminal::start(
             config_path,
-            view,
-            renderer,
             recents,
             recents_path,
-            status.clone(),
             agent.config().renderer,
+            transition,
         );
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved

@@ -414,10 +414,15 @@ impl Renderer {
                 let summary = crate::sanitize_terminal_line(summary);
                 self.out(state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}\n"));
             }
-            Item::ToolResult { ok, output, .. } => {
+            Item::ToolResult { ok, output, verbose } => {
                 self.newline(state);
                 let output = crate::sanitize_terminal_text(output);
-                let text = stamp_block_with(stamp, &self.tool_result(*ok, &output));
+                // Format from the verbosity captured WITH the result, not the
+                // current global: if the user changed verbosity and renderer in
+                // the same settings visit, replaying with today's verbosity would
+                // show more (or fewer) lines than the frame ever did, so the
+                // captured transcript would not be lossless.
+                let text = stamp_block_with(stamp, &self.tool_result(*ok, &output, *verbose));
                 self.out(state, &text);
             }
             Item::Plan(plan) => {
@@ -663,7 +668,10 @@ impl Renderer {
                     Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
                     Some(crate::goal::Status::Completed) => "✔ completed".to_string(),
                     None => {
-                        let raw = crate::sanitize_terminal_text(
+                        // This marker is a single status row, so a model-supplied
+                        // `\n` (e.g. `{"status":"oops\nINJECT"}`) would inject an
+                        // unprefixed extra row; use the single-line sanitizer.
+                        let raw = crate::sanitize_terminal_line(
                             call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default(),
                         );
                         if raw.is_empty() { "• unknown".to_string() } else { format!("• {raw}") }
@@ -1102,7 +1110,7 @@ impl Renderer {
                 let text = stamp_block(&format!(
                     "{RED}●{RESET} {BOLD}{}{RESET}\n{}",
                     call.name,
-                    self.tool_result(false, output)
+                    self.tool_result(false, output, verbosity() >= Verbosity::Verbose)
                 ));
                 self.out(&mut state, &text);
             }
@@ -1126,8 +1134,11 @@ impl Renderer {
                         // (e.g. `{"status":"oops"}`) is not shown as a green ✔.
                         // `status` is model-controlled; strip control/escape
                         // characters so an invalid value cannot smuggle ANSI/OSC
-                        // sequences into the terminal via this fallback.
-                        let raw = crate::sanitize_terminal_text(
+                        // sequences into the terminal via this fallback. This is a
+                        // single status row, so also drop `\n` (the single-line
+                        // sanitizer): an embedded line feed would inject an
+                        // unprefixed extra row, not multi-line content to keep.
+                        let raw = crate::sanitize_terminal_line(
                             call.arguments.get("status").and_then(serde_json::Value::as_str).unwrap_or_default(),
                         );
                         if raw.is_empty() {
@@ -1160,7 +1171,7 @@ impl Renderer {
             }
             AgentEvent::ToolResult { ok, output, .. } => {
                 self.newline(&mut state);
-                let text = stamp_block(&self.tool_result(*ok, output));
+                let text = stamp_block(&self.tool_result(*ok, output, verbosity() >= Verbosity::Verbose));
                 self.out(&mut state, &text);
             }
             AgentEvent::Compacted if state.in_turn => {
@@ -1172,14 +1183,14 @@ impl Renderer {
         }
     }
 
-    fn tool_result(&self, ok: bool, output: &str) -> String {
+    fn tool_result(&self, ok: bool, output: &str, verbose: bool) -> String {
         let width = self.width().saturating_sub(8 + strip_ansi(&stamp()).chars().count());
         let lines: Vec<&str> = output.trim_end().lines().collect();
         let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
         if lines.is_empty() {
             return format!("  {color}{mark} (no output){RESET}\n");
         }
-        if verbosity() >= Verbosity::Verbose {
+        if verbose {
             let mut text = String::new();
             for (i, line) in lines.iter().take(PREVIEW_LINES).enumerate() {
                 let lead = if i == 0 { mark } else { " " };
