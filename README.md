@@ -155,6 +155,8 @@ src/
 ├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
+├── session_index.rs # Session summaries (index.jsonl) for the --resume picker
+├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
 ├── ui.rs        # Verbosity levels and the streaming output renderer
@@ -357,9 +359,24 @@ cargo run
 cargo run -- --model anthropic/claude-sonnet-4-5
 cargo run -- --model ollama/qwen2.5:1.5b
 cargo run -- --resume sess-20260923T012518-7e7923f8
+cargo run -- --resume        # pick a session
+cargo run -- --resume last   # the most recent session in this directory
 ```
 
-Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
+**Resuming.** `--resume` without an ID opens a picker of this directory's saved sessions, most
+recently used first. Each row shows when the session was last used, its project (the last part of
+its directory), how many prompts it has, and its last prompt. When the last prompt says little
+("do it"), the row also shows the more telling prompt before it. Type to filter, Enter to resume,
+Esc to cancel. The last entry shows sessions from every directory. Sessions with no prompts are
+left out. Sessions from before this feature don't record their directory: they are shown in every
+directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
+`--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
+
+The picker reads `index.jsonl` in the session directory: one summary per session, updated at the
+end of each turn. It is only a cache. A session that is missing from it, or whose log changed
+since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
+
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 

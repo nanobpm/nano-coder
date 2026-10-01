@@ -1,0 +1,210 @@
+//! Choosing a session to resume: `--resume` without an ID, `--resume last`,
+//! and `--list-sessions`.
+
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::{Result, bail};
+use chrono::{DateTime, FixedOffset, Local};
+
+use crate::session_index::{self, Summary};
+
+/// Sessions that ran in `cwd`, plus those from older logs that don't say
+/// where they ran.
+pub fn in_dir<'a>(sessions: &'a [Summary], cwd: &str) -> Vec<&'a Summary> {
+    sessions.iter().filter(|s| s.cwd.as_deref().is_none_or(|c| c == cwd)).collect()
+}
+
+/// The most recent session that ran in `cwd` (`--resume last`).
+pub fn last(dir: &Path, cwd: &str) -> Result<String> {
+    let sessions = session_index::list(dir)?;
+    match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd)) {
+        Some(session) => Ok(session.id.clone()),
+        None => bail!("no saved session for {cwd}; run with --resume to pick one"),
+    }
+}
+
+/// How long ago `then` was, briefly.
+pub fn ago(then: DateTime<FixedOffset>, now: DateTime<FixedOffset>) -> String {
+    let minutes = (now - then).num_minutes();
+    match minutes {
+        ..1 => "just now".into(),
+        1..60 => format!("{minutes}m ago"),
+        60..1440 => format!("{}h ago", minutes / 60),
+        1440..2880 => "yesterday".into(),
+        2880..10080 => format!("{}d ago", minutes / 1440),
+        _ => then.with_timezone(&Local).format("%b %-d").to_string(),
+    }
+}
+
+/// The last component of the session's directory, or `?` when unknown.
+pub fn project(summary: &Summary) -> String {
+    summary
+        .cwd
+        .as_deref()
+        .map(|cwd| Path::new(cwd).file_name().map_or(cwd.to_string(), |n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// One line of prompt text: whitespace (including newlines) collapsed.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What the session was last about: the last prompt, and when that says
+/// little, the more telling one before it.
+pub fn topic(summary: &Summary) -> String {
+    let last = one_line(summary.last_prompt.as_deref().unwrap_or_default());
+    match &summary.context_prompt {
+        Some(context) => format!("{last}  ← {}", one_line(context)),
+        None => last,
+    }
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// A picker or list row, fitted to `width` columns.
+pub fn row(summary: &Summary, now: DateTime<FixedOffset>, width: usize) -> String {
+    let prompts = if summary.prompts == 1 { "1 prompt".to_string() } else { format!("{} prompts", summary.prompts) };
+    let head = format!("{:<10} {:<16} {:>11}  ", ago(summary.last_used, now), truncate(&project(summary), 16), prompts);
+    let room = width.saturating_sub(head.chars().count()).max(20);
+    format!("{head}{}", truncate(&topic(summary), room))
+}
+
+/// Let the user pick a session in the terminal: this directory's sessions
+/// first, with an entry to show all. `None` when cancelled or there is
+/// nothing to resume.
+pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
+    let sessions = session_index::list(dir)?;
+    if sessions.is_empty() {
+        eprintln!("No saved sessions to resume.");
+        return Ok(None);
+    }
+    let now = crate::session::now();
+    let width = crate::status::terminal_size().map_or(100, |(_, cols)| cols as usize);
+    // Room for the picker's own marker and padding.
+    let width = width.saturating_sub(4).max(40);
+    let mut show_all = in_dir(&sessions, cwd).is_empty();
+    loop {
+        let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
+        let mut items: Vec<String> = shown.iter().map(|s| row(s, now, width)).collect();
+        let hidden = sessions.len() - shown.len();
+        if hidden > 0 {
+            items.push(format!("Show all sessions ({hidden} more in other directories)"));
+        }
+        let prompt = if show_all {
+            "Resume which session? (type to filter, Esc to cancel)".to_string()
+        } else {
+            format!("Resume which session in {}? (type to filter, Esc to cancel)", cwd)
+        };
+        let choice = dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&items)
+            .default(0)
+            .max_length(15)
+            .interact_opt()?;
+        match choice {
+            None => return Ok(None),
+            Some(i) if i == shown.len() => show_all = true,
+            Some(i) => return Ok(Some(shown[i].id.clone())),
+        }
+    }
+}
+
+/// `--list-sessions` and `--resume` without a terminal: one row per session
+/// (this directory's unless `all`), or JSON summaries.
+pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
+    let sessions = session_index::list(dir)?;
+    let shown: Vec<&Summary> = if all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
+    // Write errors (a closed pipe, as with `| head`) just end the listing.
+    let mut out = std::io::stdout().lock();
+    if json {
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&shown)?);
+        return Ok(());
+    }
+    if shown.is_empty() {
+        let scope = if all { String::new() } else { format!(" for {cwd} (--all lists every directory)") };
+        eprintln!("No saved sessions{scope}.");
+        return Ok(());
+    }
+    let now = crate::session::now();
+    for summary in shown {
+        if writeln!(out, "{}  {}", summary.id, row(summary, now, 100)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{Record, SessionLog};
+    use chrono::Duration;
+
+    fn summary(id: &str, cwd: Option<&str>, last: &str, context: Option<&str>) -> Summary {
+        Summary {
+            id: id.into(),
+            cwd: cwd.map(Into::into),
+            model: None,
+            created_at: None,
+            last_used: crate::session::now(),
+            prompts: 3,
+            first_prompt: None,
+            last_prompt: Some(last.into()),
+            context_prompt: context.map(Into::into),
+            log_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn ago_is_brief() {
+        let now = crate::session::now();
+        assert_eq!(ago(now, now), "just now");
+        assert_eq!(ago(now - Duration::minutes(5), now), "5m ago");
+        assert_eq!(ago(now - Duration::hours(3), now), "3h ago");
+        assert_eq!(ago(now - Duration::hours(30), now), "yesterday");
+        assert_eq!(ago(now - Duration::days(4), now), "4d ago");
+        let old = now - Duration::days(40);
+        assert_eq!(ago(old, now), old.with_timezone(&Local).format("%b %-d").to_string());
+    }
+
+    #[test]
+    fn row_shows_project_count_and_topic() {
+        let s = summary("s", Some("/work/rusty-harness"), "do it\nnow", Some("Fix the flaky\n deploy test"));
+        let row = row(&s, crate::session::now(), 200);
+        assert!(row.starts_with("just now   rusty-harness"), "{row}");
+        assert!(row.contains("  3 prompts  do it now  ← Fix the flaky deploy test"), "{row}");
+        let narrow = super::row(&s, crate::session::now(), 70);
+        assert!(narrow.ends_with('…') && narrow.chars().count() <= 70, "{narrow}");
+        assert_eq!(project(&summary("s", None, "x", None)), "?");
+    }
+
+    #[test]
+    fn directory_view_includes_unknown_cwd() {
+        let sessions = [
+            summary("here", Some("/a"), "x", None),
+            summary("there", Some("/b"), "x", None),
+            summary("old", None, "x", None),
+        ];
+        let ids: Vec<&str> = in_dir(&sessions, "/a").iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["here", "old"]);
+    }
+
+    #[test]
+    fn last_requires_a_session_from_this_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create_with(dir.path(), "s", Some("/a".into()), None).unwrap();
+        let input = Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
+        log.append(&input).unwrap();
+        assert_eq!(last(dir.path(), "/a").unwrap(), "s");
+        assert!(last(dir.path(), "/b").unwrap_err().to_string().contains("no saved session for /b"));
+    }
+}
