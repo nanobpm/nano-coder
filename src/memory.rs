@@ -1815,9 +1815,19 @@ fn copular_value_is_secret(rest: &str) -> bool {
         if flagged {
             return true;
         }
-        // The first substantive token was judged benign (a placeholder or a
-        // location) — the rest of the phrase is commentary, not the value.
-        return false;
+        if !in_location {
+            // The first substantive token was judged a benign *value* (a
+            // placeholder) — the rest of the phrase is commentary, not the
+            // value.
+            return false;
+        }
+        // …but a benign *location* (`stored in vault`) does not end the
+        // statement: a later value-introducing connective can still clear
+        // `in_location` and name the secret outright. Returning here let
+        // `password is stored in vault as hunter2` slip through — the scan
+        // stopped at the benign `vault` and never reached `as hunter2`
+        // (Copilot finding, src/memory.rs). Keep scanning so the connective
+        // is honoured and the trailing value is rejected.
     }
     false
 }
@@ -2192,6 +2202,11 @@ mod tests {
         assert!(store.save(Scope::User, "database password is stored as swordfish", None, None).is_err());
         assert!(store.save(Scope::User, "the secret is saved as mypassword", None, None).is_err());
         assert!(store.save(Scope::User, "the password is stored in the vault", None, None).is_ok());
+        // A benign location must not end the scan: returning after `vault`
+        // let a later `as hunter2` value bypass the filter (Copilot finding,
+        // src/memory.rs).
+        assert!(store.save(Scope::User, "password is stored in vault as hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "the password is stored in the vault as hunter2", None, None).is_err());
         // The short `.env`-style password labels `pass`/`pwd`/`passphrase` state
         // a secret in copular form too, but the main copular alternation carries
         // only the longer `password`/`passwd` forms — so these matched no rule
