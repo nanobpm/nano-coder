@@ -1472,6 +1472,8 @@ fn parse_args() -> Result<Args> {
 async fn main() -> Result<()> {
     // Detect execution mode from command-line args
     let args = parse_args()?;
+    // Before anything reads the config or data directories.
+    config::migrate_legacy_dirs();
 
     if let Some(provider) = &args.login {
         if provider != "github-copilot" {

@@ -364,7 +364,7 @@ and `cargo test`; CI checks all three. To keep `git blame` past the one-time ref
 
 ## Configuration
 
-Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`) are still used if the new ones don't exist:
+Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"   # provider/model
