@@ -162,37 +162,102 @@ pub fn app_dir(base: &Path) -> PathBuf {
     if !current.exists() && legacy.exists() { legacy } else { current }
 }
 
+/// Outcome of attempting to migrate one legacy directory.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// Nothing to do: no legacy directory to move, or the move already happened
+    /// and the compatibility link is in place.
+    None,
+    /// Moved `from` to `to`, and the compatibility symlink at `from` is in place.
+    Moved { from: PathBuf, to: PathBuf },
+    /// The data lives at `to` (moved just now, or by an earlier run) but the
+    /// compatibility symlink at `from` could not be (re)created, so an older
+    /// nano-coder still pointed at `from` can no longer reach the moved data.
+    /// This is retried on every later start until the link is restored.
+    LinkFailed { from: PathBuf, to: PathBuf, err: String },
+}
+
+/// Create the compatibility symlink `from -> APP_NAME` so an older nano-coder
+/// still pointed at the legacy path keeps finding its files. On non-unix this
+/// is a no-op success: symlinks need extra privileges there and the move has
+/// already happened, so the current build is unaffected.
+fn create_compat_link(from: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(APP_NAME, from).map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = from;
+        Ok(())
+    }
+}
+
+/// Recreate the compatibility link at `from` if it is missing. Called when the
+/// data already lives at `to`, so the move itself is safe but an earlier run may
+/// have failed to leave the link.
+fn ensure_compat_link(from: &Path, to: &Path) -> Migration {
+    // Anything already present at `from` (the symlink, or defensively any other
+    // entry a user put back) means we must not clobber it; the link is handled.
+    if fs::symlink_metadata(from).is_ok() {
+        return Migration::None;
+    }
+    match create_compat_link(from) {
+        Ok(()) => Migration::None,
+        Err(err) => Migration::LinkFailed { from: from.to_path_buf(), to: to.to_path_buf(), err },
+    }
+}
+
 /// Move `<base>/agentic-harness` to `<base>/nano-coder` when only the old
 /// one exists, leaving a symlink at the old path so an older nano-coder that
-/// is still running (or installed elsewhere) keeps finding its files. Returns
-/// the move made, if any. Already-open files are unaffected by the rename.
-pub fn migrate_legacy_dir(base: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+/// is still running (or installed elsewhere) keeps finding its files.
+/// Already-open files are unaffected by the rename. When the move already
+/// happened but its compatibility link is missing (e.g. an earlier run failed
+/// to create it), the link is recreated here so the failure self-heals on a
+/// later start. A move that could not leave its link is reported as
+/// [`Migration::LinkFailed`], never silently as a success.
+pub fn migrate_legacy_dir(base: &Path) -> Result<Migration> {
     let current = base.join(APP_NAME);
     let legacy = base.join(LEGACY_APP_NAME);
     let legacy_is_dir = fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
-    if current.exists() || !legacy_is_dir {
-        return Ok(None);
+    if current.exists() {
+        // The move already happened; retry the compatibility link if it is gone.
+        return Ok(ensure_compat_link(&legacy, &current));
+    }
+    if !legacy_is_dir {
+        return Ok(Migration::None);
     }
     if let Err(err) = fs::rename(&legacy, &current) {
         // Another nano-coder may have moved it first.
         if current.exists() {
-            return Ok(None);
+            return Ok(ensure_compat_link(&legacy, &current));
         }
         return Err(err).with_context(|| format!("move {} to {}", legacy.display(), current.display()));
     }
-    #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(APP_NAME, &legacy);
-    Ok(Some((legacy, current)))
+    Ok(match create_compat_link(&legacy) {
+        Ok(()) => Migration::Moved { from: legacy, to: current },
+        Err(err) => Migration::LinkFailed { from: legacy, to: current, err },
+    })
 }
 
-/// [`migrate_legacy_dir`] for the config and data directories, with a note
-/// on stderr for each move (or failure; the old directory is then still used).
+/// [`migrate_legacy_dir`] for the config and data directories, with a note on
+/// stderr for each move, for a move whose compatibility link could not be
+/// created, or for a failed move (the old directory is then still used).
 pub fn migrate_legacy_dirs() {
     let bases = [dirs::home_dir().map(|h| h.join(".config")), dirs::data_local_dir()];
     for base in bases.into_iter().flatten() {
         match migrate_legacy_dir(&base) {
-            Ok(Some((from, to))) => eprintln!("Moved {} to {}", from.display(), to.display()),
-            Ok(None) => {}
+            Ok(Migration::Moved { from, to }) => eprintln!("Moved {} to {}", from.display(), to.display()),
+            Ok(Migration::LinkFailed { from, to, err }) => eprintln!(
+                "warning: moved {} to {} but could not create the compatibility symlink at {} ({}); \
+                 older nano-coder builds pointed at the old path will not find the moved data \
+                 (will retry on the next start)",
+                from.display(),
+                to.display(),
+                from.display(),
+                err,
+            ),
+            Ok(Migration::None) => {}
             Err(err) => eprintln!("warning: {err:#} (still using the old directory)"),
         }
     }
@@ -247,14 +312,14 @@ mod tests {
     #[test]
     fn migrates_legacy_dir_once_and_leaves_a_link() {
         let base = tempfile::tempdir().unwrap();
-        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None, "nothing to move");
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None, "nothing to move");
         let legacy = base.path().join("agentic-harness");
         fs::create_dir_all(legacy.join("sessions")).unwrap();
         fs::write(legacy.join("sessions/s.jsonl"), "x\n").unwrap();
 
         let moved = migrate_legacy_dir(base.path()).unwrap();
         let current = base.path().join("nano-coder");
-        assert_eq!(moved, Some((legacy.clone(), current.clone())));
+        assert_eq!(moved, Migration::Moved { from: legacy.clone(), to: current.clone() });
         assert_eq!(fs::read_to_string(current.join("sessions/s.jsonl")).unwrap(), "x\n");
         assert_eq!(app_dir(base.path()), current);
         #[cfg(unix)]
@@ -262,7 +327,25 @@ mod tests {
             assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
             assert_eq!(fs::read_to_string(legacy.join("sessions/s.jsonl")).unwrap(), "x\n", "old path still works");
         }
-        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None, "the link is not moved again");
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None, "the link is not moved again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreates_a_missing_compatibility_link_on_a_later_start() {
+        let base = tempfile::tempdir().unwrap();
+        let legacy = base.path().join("agentic-harness");
+        fs::create_dir_all(&legacy).unwrap();
+        assert!(matches!(migrate_legacy_dir(base.path()).unwrap(), Migration::Moved { .. }));
+        // Simulate an earlier run that moved the data but failed to leave a link.
+        fs::remove_file(&legacy).unwrap();
+        assert!(fs::symlink_metadata(&legacy).is_err(), "link is gone");
+
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None, "link recreated, no new move");
+        assert!(
+            fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink(),
+            "the compatibility link is restored on a later start"
+        );
     }
 
     #[test]
@@ -270,7 +353,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         fs::create_dir(base.path().join("agentic-harness")).unwrap();
         fs::create_dir(base.path().join("nano-coder")).unwrap();
-        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None);
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None);
         assert!(base.path().join("agentic-harness").is_dir());
     }
 
