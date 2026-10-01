@@ -155,7 +155,7 @@ src/
 ├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
-├── session_index.rs # Session summaries (index.jsonl) for the --resume picker
+├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
 ├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
@@ -367,7 +367,7 @@ left out. Sessions from before this feature don't record their directory: they a
 directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
 `--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
 
-The picker reads `index.jsonl` in the session directory: one summary per session, updated at the
+The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed
 since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
 

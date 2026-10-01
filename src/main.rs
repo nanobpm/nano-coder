@@ -1509,6 +1509,19 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     if args.list_sessions && args.resume.is_some() {
         anyhow::bail!("--list-sessions and --resume are mutually exclusive");
     }
+    // `--list-sessions` likewise conflicts with the other top-level action
+    // modes. Dispatch runs `--login` before the listing, and the listing before
+    // `--list-models` and `--acp`, so accepting any of these pairs would
+    // silently perform one action and ignore the other; reject them.
+    if args.list_sessions && args.login.is_some() {
+        anyhow::bail!("--list-sessions and --login are mutually exclusive");
+    }
+    if args.list_sessions && args.list_models.is_some() {
+        anyhow::bail!("--list-sessions and --list-models are mutually exclusive");
+    }
+    if args.list_sessions && args.acp {
+        anyhow::bail!("--list-sessions and --acp are mutually exclusive");
+    }
     Ok(args)
 }
 
@@ -2028,6 +2041,22 @@ mod tests {
         assert!(parse_args_from(argv(&["--list-sessions", "--resume", "sess-1"])).is_err());
         assert!(parse_args_from(argv(&["--resume", "sess-1", "--list-sessions"])).is_err());
         assert!(parse_args_from(argv(&["--list-sessions", "--resume"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each action mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        assert!(parse_args_from(argv(&["--acp"])).is_ok());
+        // …but combining `--list-sessions` with any of them is rejected rather
+        // than silently performing one action (login first, or the listing
+        // before `--list-models`/`--acp`) and ignoring the other.
+        assert!(parse_args_from(argv(&["--list-sessions", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--acp"])).is_err());
+        assert!(parse_args_from(argv(&["--acp", "--list-sessions"])).is_err());
     }
 
     #[test]
