@@ -1495,6 +1495,12 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     if args.all && !args.list_sessions {
         anyhow::bail!("--all requires --list-sessions");
     }
+    // `--list-sessions` and `--trajectory` select different, exclusive modes.
+    // The trajectory branch runs first, so accepting both would silently emit
+    // trajectory output and ignore the requested session list; reject it.
+    if args.list_sessions && args.trajectory.is_some() {
+        anyhow::bail!("--list-sessions and --trajectory are mutually exclusive");
+    }
     Ok(args)
 }
 
@@ -1988,6 +1994,18 @@ mod tests {
         // separated form would leave `-sess` in the stream as an unknown flag.
         assert_eq!(parse_args_from(argv(&["--resume=-sess"])).unwrap().resume.as_deref(), Some("-sess"));
         assert!(parse_args_from(argv(&["--resume", "-sess"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_trajectory_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently running the
+        // trajectory branch and ignoring the requested session list.
+        assert!(parse_args_from(argv(&["--list-sessions", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--list-sessions", "--json"])).is_err());
     }
 
     #[test]
