@@ -181,6 +181,13 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
             .items(&items)
             .default(0)
             .max_length(15)
+            // Suppress dialoguer's post-selection confirmation: it re-renders
+            // the chosen item through `format_input_prompt_selection` with the
+            // full, untruncated row, bypassing `FitTheme`'s width-fitting, so a
+            // long prompt would wrap past the terminal. The menu is cleared on
+            // selection and the session resumes immediately, so the report adds
+            // nothing but the wrap risk.
+            .report(false)
             .interact_opt()?;
         match choice {
             None => return Ok(None),
