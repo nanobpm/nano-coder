@@ -1878,7 +1878,21 @@ impl Agent {
         }
 
         let output_budget = context::summary_output_budget(window, self.config.max_tokens as i64);
-        let summary_input_chars = window.saturating_sub(output_budget as usize + 2_000).max(2_000) * 3;
+        // The transcript and the summary's own output share the request budget.
+        // Against a total/combined cap the prompt and output must fit together,
+        // so the output budget is carved out of the window. A prompt-only cap
+        // (GitHub Copilot's `max_prompt_tokens`) does not spend output tokens,
+        // so the transcript gets the whole prompt window; only a combined window
+        // the endpoint advertised still bounds prompt + output. This mirrors
+        // `request_max_tokens()`'s cap handling.
+        let input_window = match self.context_cap() {
+            ContextCap::Prompt => match self.combined_window() {
+                Some(combined) => window.min(combined.saturating_sub(output_budget as usize)),
+                None => window,
+            },
+            ContextCap::Total => window.saturating_sub(output_budget as usize),
+        };
+        let summary_input_chars = input_window.saturating_sub(2_000).max(2_000) * 3;
         let transcript = context::render_transcript(summarized, summary_input_chars, smart);
         let lines: Vec<u64> = summarized.iter().filter_map(|m| m.log_line).collect();
         let range = lines.iter().min().zip(lines.iter().max()).map(|(a, b)| (*a, *b));
