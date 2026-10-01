@@ -1062,12 +1062,12 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         return if agent.config().memory.writable() {
             format!(
                 "No memories yet. The model saves them with memory_save; files live under {}.",
-                agent.config().memory_dir().display()
+                store.root().display()
             )
         } else {
             format!(
                 "No memories yet. Memory is read-only here, so the model cannot save them; files live under {}.",
-                agent.config().memory_dir().display()
+                store.root().display()
             )
         };
     }
@@ -1076,7 +1076,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         entries.len(),
         if entries.len() == 1 { "y" } else { "ies" },
         agent.config().memory.as_str(),
-        agent.config().memory_dir().display(),
+        store.root().display(),
         if agent.config().memory.writable() { ", or /memory forget <id>" } else { "" }
     )];
     for (scope, entry) in &entries {

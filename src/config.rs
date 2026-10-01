@@ -169,8 +169,8 @@ impl Config {
         self.session_dir.clone().unwrap_or_else(crate::session::default_dir)
     }
 
-    pub fn memory_dir(&self) -> PathBuf {
-        self.memory_dir.clone().unwrap_or_else(crate::memory::default_dir)
+    pub fn memory_dir(&self) -> Option<PathBuf> {
+        self.memory_dir.clone().or_else(crate::memory::default_dir)
     }
 }
 

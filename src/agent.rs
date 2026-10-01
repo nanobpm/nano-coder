@@ -524,13 +524,17 @@ impl Agent {
 
     /// Build the memory store from config: `None` when memory is off, else a
     /// store rooted at the configured directory and keyed to the current git
-    /// repository (project scope is unavailable outside a repo).
+    /// repository (project scope is unavailable outside a repo). Also `None`
+    /// when no per-user data directory is available and none was configured:
+    /// `memory_dir()` refuses the world-shared system temp fallback, so memory
+    /// is disabled rather than persisted to an attacker-reachable location.
     fn build_memory(config: &Config) -> Option<memory::Store> {
         if !config.memory.enabled() {
             return None;
         }
+        let dir = config.memory_dir()?;
         let project = std::env::current_dir().ok().and_then(|cwd| memory::project_key(&cwd));
-        Some(memory::Store::new(config.memory_dir(), project, config.memory_expiry_days))
+        Some(memory::Store::new(dir, project, config.memory_expiry_days))
     }
 
     /// Rekey the memory store's project scope from the current working

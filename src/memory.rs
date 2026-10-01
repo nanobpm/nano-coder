@@ -132,6 +132,11 @@ impl Store {
         Self { root, project, expiry_days }
     }
 
+    /// The directory the store's JSONL files live under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn path(&self, scope: Scope) -> Result<PathBuf> {
         Ok(match scope {
             Scope::User => self.root.join("user.jsonl"),
@@ -893,9 +898,14 @@ impl Drop for FileLock {
 }
 
 /// The memory root for a config, defaulting to `<data>/memory` next to
-/// `sessions/`.
-pub fn default_dir() -> PathBuf {
-    crate::config::app_dir(&dirs::data_local_dir().unwrap_or_else(std::env::temp_dir)).join("memory")
+/// `sessions/`. `None` when no per-user data directory is available: we refuse
+/// to fall back to the world-shared system temp directory (e.g.
+/// `/tmp/nano-coder/memory`), whose predictable, potentially world-readable or
+/// attacker-pre-created path would let another local user inject prompt entries
+/// or read back saved memories. Callers disable memory in that case rather than
+/// persist secrets to a shared location.
+pub fn default_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|base| crate::config::app_dir(&base).join("memory"))
 }
 
 /// The project scope key for a working directory: its git remote (normalised),
@@ -1746,6 +1756,22 @@ mod tests {
 
     fn store(dir: &Path) -> Store {
         Store::new(dir.join("memory"), Some("github.com/nanobpm/nano-coder".to_string()), DEFAULT_EXPIRY_DAYS)
+    }
+
+    #[test]
+    fn default_dir_never_falls_back_to_shared_temp() {
+        // The default memory root must never resolve inside the world-shared
+        // system temp directory: a predictable path like `/tmp/nano-coder/memory`
+        // lets another local user pre-create a world-readable `user.jsonl` to
+        // inject prompt entries or read back saved memories. When no per-user
+        // data directory is available `default_dir()` returns `None` (callers
+        // then disable memory) rather than persisting to a shared location.
+        if let Some(dir) = default_dir() {
+            assert!(
+                !dir.starts_with(std::env::temp_dir()),
+                "default memory dir {dir:?} must not live under the shared temp dir"
+            );
+        }
     }
 
     #[test]
