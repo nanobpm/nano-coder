@@ -162,6 +162,42 @@ pub fn app_dir(base: &Path) -> PathBuf {
     if !current.exists() && legacy.exists() { legacy } else { current }
 }
 
+/// Move `<base>/agentic-harness` to `<base>/nano-coder` when only the old
+/// one exists, leaving a symlink at the old path so an older nano-coder that
+/// is still running (or installed elsewhere) keeps finding its files. Returns
+/// the move made, if any. Already-open files are unaffected by the rename.
+pub fn migrate_legacy_dir(base: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    let current = base.join(APP_NAME);
+    let legacy = base.join(LEGACY_APP_NAME);
+    let legacy_is_dir = fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
+    if current.exists() || !legacy_is_dir {
+        return Ok(None);
+    }
+    if let Err(err) = fs::rename(&legacy, &current) {
+        // Another nano-coder may have moved it first.
+        if current.exists() {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("move {} to {}", legacy.display(), current.display()));
+    }
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(APP_NAME, &legacy);
+    Ok(Some((legacy, current)))
+}
+
+/// [`migrate_legacy_dir`] for the config and data directories, with a note
+/// on stderr for each move (or failure; the old directory is then still used).
+pub fn migrate_legacy_dirs() {
+    let bases = [dirs::home_dir().map(|h| h.join(".config")), dirs::data_local_dir()];
+    for base in bases.into_iter().flatten() {
+        match migrate_legacy_dir(&base) {
+            Ok(Some((from, to))) => eprintln!("Moved {} to {}", from.display(), to.display()),
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: {err:#} (still using the old directory)"),
+        }
+    }
+}
+
 impl ConfigManager {
     pub fn new() -> Result<Self> {
         Self::from_path(Self::default_config_path()?)
@@ -207,6 +243,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn migrates_legacy_dir_once_and_leaves_a_link() {
+        let base = tempfile::tempdir().unwrap();
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None, "nothing to move");
+        let legacy = base.path().join("agentic-harness");
+        fs::create_dir_all(legacy.join("sessions")).unwrap();
+        fs::write(legacy.join("sessions/s.jsonl"), "x\n").unwrap();
+
+        let moved = migrate_legacy_dir(base.path()).unwrap();
+        let current = base.path().join("nano-coder");
+        assert_eq!(moved, Some((legacy.clone(), current.clone())));
+        assert_eq!(fs::read_to_string(current.join("sessions/s.jsonl")).unwrap(), "x\n");
+        assert_eq!(app_dir(base.path()), current);
+        #[cfg(unix)]
+        {
+            assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_to_string(legacy.join("sessions/s.jsonl")).unwrap(), "x\n", "old path still works");
+        }
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None, "the link is not moved again");
+    }
+
+    #[test]
+    fn leaves_legacy_dir_when_current_exists() {
+        let base = tempfile::tempdir().unwrap();
+        fs::create_dir(base.path().join("agentic-harness")).unwrap();
+        fs::create_dir(base.path().join("nano-coder")).unwrap();
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), None);
+        assert!(base.path().join("agentic-harness").is_dir());
+    }
 
     #[test]
     fn parses_partial_config_with_providers() {
