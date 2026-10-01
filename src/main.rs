@@ -994,6 +994,69 @@ async fn run_compaction(
     }
 }
 
+/// `/resume [ID|last]`: switch this process to a saved session. Without an
+/// argument, pick one (or, without a terminal, list them).
+fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Result<()> {
+    if terminal.outstanding {
+        // A stdin read is pending (typed during a turn), so a picker would
+        // race it, and switching sessions mid-turn would orphan the turn.
+        terminal.renderer.print_block("/resume switches sessions: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    if !agent.config().persist_sessions {
+        terminal
+            .renderer
+            .print_block("Sessions aren't saved (persist_sessions = false), so there is nothing to resume");
+        return Ok(());
+    }
+    let dir = agent.config().session_dir();
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let current = agent.session_id().map(str::to_string);
+    let id = match arg {
+        "" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            let rows = resume::list_rows(&dir, &cwd)?;
+            let text = if rows.is_empty() {
+                "No saved sessions for this directory".to_string()
+            } else {
+                format!("Saved sessions (switch with /resume ID):\n{}", rows.join("\n"))
+            };
+            terminal.renderer.print_block(&text);
+            return Ok(());
+        }
+        "" => {
+            let picked = resume::pick(&dir, &cwd, current.as_deref());
+            // The picker drew over the owned frame: repaint it fully, also on error.
+            terminal.renderer.frame_resize();
+            match picked? {
+                Some(id) => id,
+                None => {
+                    terminal.renderer.print_block("Session unchanged");
+                    return Ok(());
+                }
+            }
+        }
+        "last" => resume::last(&dir, &cwd, current.as_deref())?,
+        id => id.to_string(),
+    };
+    if current.as_deref() == Some(id.as_str()) {
+        terminal.renderer.print_block(&format!("Already in session {id}"));
+        return Ok(());
+    }
+    if session::validate_id(&id).is_err() || !dir.join(format!("{id}.jsonl")).is_file() {
+        terminal.renderer.print_block(&format!("No saved session {id:?}: /resume without an ID lists them"));
+        return Ok(());
+    }
+    agent.load_session(&id)?;
+    terminal.renderer.clear_screen();
+    // As at startup with --resume: the frame renderer rebuilds the
+    // transcript from the loaded conversation; the legacy one starts clean.
+    if terminal.renderer.is_frame() {
+        agent.replay_history();
+    }
+    terminal.renderer.print_block(&format!("Resumed session {id} (resume later with --resume {id})"));
+    Ok(())
+}
+
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     match cmd {
         "/exit" | "/quit" => Ok(false),
@@ -1273,6 +1336,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        _ if cmd == "/resume" || cmd.starts_with("/resume ") => {
+            resume_command(agent, cmd["/resume".len()..].trim(), terminal)?;
+            Ok(true)
+        }
         "/restart" => {
             // Start a brand-new session in place: new ID, context reset to
             // just the system prompt, empty plan, counters zeroed. The
@@ -1536,7 +1603,7 @@ async fn main() -> Result<()> {
     match args.resume.as_deref() {
         Some("") if args.acp => anyhow::bail!("--resume needs a session ID with --acp"),
         Some("") if io::stdin().is_terminal() && io::stderr().is_terminal() => {
-            match resume::pick(&config.session_dir(), &cwd)? {
+            match resume::pick(&config.session_dir(), &cwd, None)? {
                 Some(id) => args.resume = Some(id),
                 None => return Ok(()),
             }
@@ -1546,7 +1613,7 @@ async fn main() -> Result<()> {
             resume::print_list(&config.session_dir(), &cwd, false, false)?;
             return Ok(());
         }
-        Some("last") => args.resume = Some(resume::last(&config.session_dir(), &cwd)?),
+        Some("last") => args.resume = Some(resume::last(&config.session_dir(), &cwd, None)?),
         _ => {}
     }
     if let Some(spec) = &args.list_models {

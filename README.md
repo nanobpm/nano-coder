@@ -336,6 +336,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt with the frame renderer: invoked mid-turn (while a turn runs) or under the legacy renderer it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -361,7 +362,7 @@ cargo run -- --resume last   # the most recent session in this directory
 recently used first. Each row shows when the session was last used, its project (the last part of
 its directory), how many prompts it has, and its last prompt. When the last prompt says little
 ("do it"), the row also shows the more telling prompt before it. Type to filter, Enter to resume,
-Esc to cancel. The last entry shows sessions from every directory. Sessions with no prompts are
+Esc to cancel. The last entry shows sessions from every directory. At the prompt, `/resume` does the same without restarting. Sessions with no prompts are
 left out. Sessions from before this feature don't record their directory: they are shown in every
 directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
 `--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).

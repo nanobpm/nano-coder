@@ -19,10 +19,11 @@ pub fn in_dir<'a>(sessions: &'a [Summary], cwd: &str) -> Vec<&'a Summary> {
     sessions.iter().filter(|s| s.cwd.as_deref().is_none_or(|c| c == cwd)).collect()
 }
 
-/// The most recent session that ran in `cwd` (`--resume last`).
-pub fn last(dir: &Path, cwd: &str) -> Result<String> {
+/// The most recent session that ran in `cwd` (`--resume last`), other than
+/// `exclude` (the session in use, for `/resume last`).
+pub fn last(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<String> {
     let sessions = session_index::list(dir)?;
-    match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd)) {
+    match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd) && Some(s.id.as_str()) != exclude) {
         Some(session) => Ok(session.id.clone()),
         None => bail!("no saved session for {}; run with --resume to pick one", crate::sanitize_terminal_text(cwd)),
     }
@@ -142,11 +143,27 @@ pub fn row(summary: &Summary, now: DateTime<FixedOffset>, width: usize) -> Strin
     truncate(&line, width)
 }
 
-/// Let the user pick a session in the terminal: this directory's sessions
-/// first, with an entry to show all. `None` when cancelled or there is
-/// nothing to resume.
-pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
+/// A row prefixed with the session ID, for plain lists.
+fn id_row(summary: &Summary, now: DateTime<FixedOffset>) -> String {
+    // The id comes from a log header, which a crafted log can fill with
+    // control characters; sanitize it for the terminal (JSON stays raw).
+    format!("{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100))
+}
+
+/// Plain list rows (with IDs) of this directory's sessions, for `/resume`
+/// without a terminal.
+pub fn list_rows(dir: &Path, cwd: &str) -> Result<Vec<String>> {
     let sessions = session_index::list(dir)?;
+    let now = crate::session::now();
+    Ok(in_dir(&sessions, cwd).into_iter().map(|s| id_row(s, now)).collect())
+}
+
+/// Let the user pick a session in the terminal: this directory's sessions
+/// first, with an entry to show all. `exclude` (the session in use) is left
+/// out. `None` when cancelled or there is nothing to resume.
+pub fn pick(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Option<String>> {
+    let mut sessions = session_index::list(dir)?;
+    sessions.retain(|s| Some(s.id.as_str()) != exclude);
     if sessions.is_empty() {
         eprintln!("No saved sessions to resume.");
         return Ok(None);
@@ -224,9 +241,9 @@ pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
     }
     let now = crate::session::now();
     for summary in shown {
-        // The id comes from a log header, which a crafted log can fill with
-        // control characters; sanitize it for the terminal (JSON stays raw).
-        let line = writeln!(out, "{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100));
+        // id_row sanitizes the id, which comes from a log header a crafted log
+        // can fill with control characters (JSON stays raw).
+        let line = writeln!(out, "{}", id_row(summary, now));
         match line {
             Ok(()) => {}
             // Only a closed pipe ends the listing quietly; other write errors
@@ -305,7 +322,7 @@ mod tests {
     fn errors_and_plain_ids_drop_control_characters() {
         // `--resume last` from a crafted directory name cannot inject escapes.
         let dir = tempfile::tempdir().unwrap();
-        let err = last(dir.path(), "/work/evil\u{1b}[2J").unwrap_err().to_string();
+        let err = last(dir.path(), "/work/evil\u{1b}[2J", None).unwrap_err().to_string();
         assert!(err.contains("no saved session for /work/evil[2J"), "{err}");
         assert!(!err.contains('\u{1b}'), "{err}");
         // A crafted session id is sanitized by the same helper for plain output.
@@ -329,7 +346,8 @@ mod tests {
         let mut log = SessionLog::create_with(dir.path(), "s", Some("/a".into()), None).unwrap();
         let input = Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
         log.append(&input).unwrap();
-        assert_eq!(last(dir.path(), "/a").unwrap(), "s");
-        assert!(last(dir.path(), "/b").unwrap_err().to_string().contains("no saved session for /b"));
+        assert_eq!(last(dir.path(), "/a", None).unwrap(), "s");
+        assert!(last(dir.path(), "/a", Some("s")).is_err(), "the session in use is skipped");
+        assert!(last(dir.path(), "/b", None).unwrap_err().to_string().contains("no saved session for /b"));
     }
 }
