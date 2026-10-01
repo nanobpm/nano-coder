@@ -214,6 +214,11 @@ impl SessionLog {
         &self.path
     }
 
+    /// Current size of the log in bytes (everything appended so far).
+    pub fn size(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Append a record; returns its 1-based line number in the log.
     pub fn append(&mut self, record: &Record) -> Result<u64> {
         self.file
