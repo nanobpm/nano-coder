@@ -480,7 +480,17 @@ pub struct Agent {
     /// promptly; a `writable` flip (plan-mode toggle) rebuilds once to vary the
     /// save guidance.
     memory_index_cache: Option<(bool, String)>,
+    /// Session IDs a title has already been requested for in this process, so
+    /// a title is asked for at most once per session per process even as the
+    /// agent switches between sessions (A → B → A) before the background task
+    /// stores A's title (see `request_title`).
+    titles_requested: HashSet<String>,
 }
+
+/// System prompt for session titles (`session_titles = true`).
+const TITLE_PROMPT: &str = "You name coding-assistant sessions. Reply with a title of at most six words \
+that says what the user is working on, from their requests below. Reply with the title only: no quotes, \
+no trailing period.";
 
 /// Upper bound on context-window detection at startup and model switches.
 const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -523,6 +533,7 @@ impl Agent {
             turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
+            titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
         }
@@ -581,6 +592,51 @@ impl Agent {
         }
         let client = Self::client_for(&config, &config.model)?;
         Ok(Self::new(client, config))
+    }
+
+    /// With `session_titles` on, ask the model (`title_model`, else the
+    /// session's) for a title in the background, once the session has a
+    /// telling prompt and no title yet. Failures are silent: the request is
+    /// tried again in a later run.
+    fn request_title(&mut self, path: std::path::PathBuf, summary: &crate::session_index::Summary) {
+        if !self.config.session_titles || self.titles_requested.contains(&summary.id) || summary.title.is_some() {
+            return;
+        }
+        let Some(source) = crate::session_index::title_source(summary) else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        // The fallback is the model actually serving this session (the live
+        // client's resolved provider/model), not `config.model` re-resolved:
+        // a bare or provider-only spec would re-resolve against a provider
+        // default a `/settings` visit may have edited without switching the
+        // live client (see `settings.rs`), picking a different model.
+        let spec = self
+            .config
+            .title_model
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", self.client.provider_name(), self.client.model_name()));
+        let config = self.config.clone();
+        self.titles_requested.insert(summary.id.clone());
+        runtime.spawn(async move {
+            // Client setup can run a configured `api_key_command` via a
+            // blocking `Command::output`, so it belongs off the turn path:
+            // build it inside the task, on the blocking pool.
+            let Ok(client) = tokio::task::spawn_blocking(move || Self::client_for(&config, &spec))
+                .await
+                .unwrap_or_else(|join| Err(anyhow::anyhow!("title client setup: {join}")))
+            else {
+                return;
+            };
+            let messages = [Message::system(TITLE_PROMPT), Message::user(&source)];
+            // Room for reasoning models that think before answering.
+            let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(400) };
+            let reply = tokio::time::timeout(Duration::from_secs(60), client.chat(&request)).await;
+            if let Ok(Ok(response)) = reply
+                && let Some(title) = crate::session_index::clean_title(&response.content)
+                && let Ok(false) = crate::session_index::set_title(&path, &title)
+            {
+                // Another process titled the session first; keep that one.
+            }
+        });
     }
 
     fn client_for(config: &Config, spec: &str) -> Result<Box<dyn LLMClient>> {
@@ -1117,6 +1173,9 @@ impl Agent {
         self.plan = restored.plan.unwrap_or_default();
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::default();
+        // `titles_requested` is deliberately not reset: it tracks which
+        // sessions this process already asked to title, so switching
+        // A → B → A does not launch a second (paid) title request for A.
         self.session = Some(log);
         self.session_id = Some(id.to_string());
         self.set_spill_dir(id);
@@ -1951,7 +2010,10 @@ impl Agent {
             // `from` straight from the log's tail, so a resumed pending input
             // (which lies before `from`) is never recounted and a concurrent
             // writer's prompt (after `from`) is never lost.
-            let _ = crate::session_index::update(log.path(), from, Some(model));
+            if let Ok(summary) = crate::session_index::update(log.path(), from, Some(model)) {
+                let path = log.path().to_path_buf();
+                self.request_title(path, &summary);
+            }
         }
         match &outcome {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
@@ -2965,6 +3027,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn titles_sessions_once_a_prompt_says_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two"), text("three")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.title_model = Some("mock/titler".into());
+        agent.new_session().unwrap();
+        let title = |dir: &std::path::Path| crate::session_index::list(dir).unwrap()[0].title.clone();
+
+        agent.send_input(None, "hi").await.unwrap();
+        assert!(agent.titles_requested.is_empty(), "a terse first prompt is not enough to name the session");
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(!agent.titles_requested.is_empty());
+        let mut found = None;
+        for _ in 0..50 {
+            found = title(dir.path());
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let found = found.expect("the title arrives in the index");
+        // The seven-word mock reply is held to six words (see `clean_title`).
+        assert_eq!(found, "This is a mock response from…", "{found}");
+        // Later turns keep it (the per-turn summary carries it over).
+        agent.send_input(None, "and the release notes").await.unwrap();
+        assert_eq!(title(dir.path()), Some(found));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_title_fallback_uses_the_sessions_live_model() {
+        // With no `title_model` configured the title request must fall back to
+        // the model actually serving this session (the live client's resolved
+        // provider/model), not `config.model` re-resolved. Here `config.model`
+        // is the bare provider `ollama`, which has no `default_model`, so
+        // re-resolving it fails to build a client and the title is silently
+        // skipped. The live client (`test/scripted`) resolves to a mock, so
+        // the session still gets titled.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.model = "ollama".into();
+        assert_eq!(agent.model_name(), "scripted");
+        assert!(agent.config.title_model.is_none());
+        agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        let mut found = None;
+        for _ in 0..50 {
+            found =
+                crate::session_index::list(dir.path()).ok().and_then(|s| s.into_iter().next()).and_then(|s| s.title);
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            found.is_some(),
+            "the fallback titled the session from the live model, not the unresolvable config.model"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_title_is_requested_at_most_once_per_session_across_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.title_model = Some("mock/titler".into());
+        let a = agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(agent.titles_requested.contains(&a));
+        // Switching A → B → A must not forget that A was already requested:
+        // loading a session no longer clears the per-process set, so A cannot
+        // launch a second paid title request before its first one lands.
+        let _b = agent.new_session().unwrap();
+        agent.load_session(&a).unwrap();
+        assert!(agent.titles_requested.contains(&a), "A stays requested across the switch");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_titles_unless_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(agent.titles_requested.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn switching_sessions_in_process_resets_totals_and_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![text("one"), text("two")], dir.path());
@@ -3040,6 +3189,52 @@ mod tests {
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "recovered");
         let request = &seen.lock().unwrap()[0];
         assert_eq!(request.iter().filter(|m| m.role == Role::User).count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_repair_on_resume_leaves_the_live_session_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // The live session the agent is currently in.
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        let live = agent.new_session().unwrap();
+        assert_eq!(agent.send_input(Some("msg-1"), "hello").await.unwrap(), "one");
+        let live_len = agent.conversation_length();
+
+        // A crashed session on disk whose resume needs a (fallible) repair append.
+        let crashed = "sess-readonly";
+        let mut log = SessionLog::create(dir.path(), crashed).unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Input { id: "m1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Message::user("run it"))).unwrap();
+        log.append(&Record::Message(Message::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c9".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+        )))
+        .unwrap();
+        drop(log);
+        // Make the crashed session's log read-only so the repair append fails.
+        let log_path = dir.path().join(format!("{crashed}.jsonl"));
+        let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&log_path, perms).unwrap();
+
+        // The switch must fail and leave the agent in its prior live session,
+        // not half-switched into the crashed one.
+        assert!(agent.load_session(crashed).is_err());
+        assert_eq!(agent.session_id(), Some(live.as_str()));
+        assert_eq!(agent.conversation_length(), live_len);
+
+        // Restore writability so the tempdir cleanup (and any retry) works.
+        let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&log_path, perms).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
