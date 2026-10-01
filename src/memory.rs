@@ -1343,15 +1343,19 @@ fn normalize_remote(url: &str) -> String {
     // collapse onto one project key and share a memory file.
     let s: String = if scp {
         // SCP-style `[user@]host:owner/repo`: the authority is before the `:`.
-        // Unlike a URI authority, SCP syntax carries no password — only an
-        // optional login username — so there is no credential to strip. The
-        // username is part of the repository *identity*: a relative path is
-        // resolved under that user's home, so `alice@host:repo.git` and
-        // `bob@host:repo.git` may name different repositories. Keep the
-        // username so these scopes cannot collide on one project-memory file
-        // (Copilot finding, src/memory.rs).
+        // SCP syntax carries no password — only an optional login username — and
+        // an ordinary username is part of the repository *identity*: a relative
+        // path is resolved under that user's home, so `alice@host:repo.git` and
+        // `bob@host:repo.git` may name different repositories and must not
+        // collide on one project-memory file. But a *secret-shaped* username
+        // (e.g. a token-only `ghp_…@host:repo.git`) is a credential, not an
+        // identity, and must be stripped so it never leaks into the project key,
+        // prompt label or readable filename — exactly as the URI/ssh branch
+        // does. `strip_uri_password(None, …)` applies that same secret-aware
+        // rule: a non-HTTP userinfo keeps an ordinary username but drops one the
+        // module recognises as a secret (Copilot finding, src/memory.rs).
         match s.split_once(':') {
-            Some((authority, path)) => format!("{authority}/{path}"),
+            Some((authority, path)) => format!("{}/{path}", strip_uri_password(None, authority)),
             None => s.to_string(),
         }
     } else if uri {
@@ -1424,7 +1428,7 @@ fn sanitize_key(key: &str) -> String {
     let cleaned = cleaned.trim_matches('-');
     // FNV-1a over the raw key, so collisions between two different keys are
     // vanishingly unlikely regardless of how cleaning mangled them.
-    let mut hash: u64 = 1469598103934665603;
+    let mut hash: u64 = 14695981039346656037;
     for b in key.bytes() {
         hash ^= b as u64;
         hash = hash.wrapping_mul(1099511628211);
@@ -2723,6 +2727,27 @@ mod tests {
         assert_eq!(
             normalize_remote("ssh://ghp%5F0123456789abcdefghij0123@host/repo.git"),
             "ssh://host/repo.git"
+        );
+        // The SCP branch applies the same secret-aware rule as the URI/ssh
+        // branch: an ordinary SCP username is identity and is kept, but a
+        // token-only `ghp_…@host:repo.git` userinfo is a credential — it is
+        // stripped so it never leaks into the project key, prompt label or
+        // readable filename (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("ghp_0123456789abcdefghij0123@host:org/repo.git"),
+            "host/org/repo.git"
+        );
+        // …including a percent-encoded spelling, decoded before the check.
+        assert_eq!(
+            normalize_remote("ghp%5F0123456789abcdefghij0123@host:org/repo.git"),
+            "host/org/repo.git"
+        );
+        // …while a non-secret SCP username stays an identity discriminator, so
+        // distinct login users keep distinct project scopes.
+        assert_eq!(normalize_remote("git@host:org/repo.git"), "git@host/org/repo.git");
+        assert_ne!(
+            normalize_remote("ghp_0123456789abcdefghij0123@host:org/repo.git"),
+            normalize_remote("git@host:org/repo.git")
         );
         // host. On a local-path remote `?`/`#` are ordinary filename
         // characters, so two paths differing only there must keep distinct
