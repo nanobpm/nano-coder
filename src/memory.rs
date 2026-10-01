@@ -659,6 +659,43 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_
     }
 }
 
+/// Create a memory directory chain owner-only. `create_dir_all` honours the
+/// process umask, which typically leaves directories `0755`: because project
+/// filenames embed a readable remote-derived prefix, a world-readable
+/// `memory/` or `memory/projects/` lets other local users enumerate private
+/// repository names even though the JSONL files themselves are `0600`. On Unix
+/// tighten every component we just created to `0700` so the whole memory tree
+/// is owner-only (Copilot finding, src/memory.rs).
+///
+/// Only directories that did not already exist are chmodded: a pre-existing
+/// directory keeps whatever permissions its owner chose, so a user who
+/// deliberately relaxed their memory dir is never overridden.
+fn create_dir_all_private(dir: &Path) -> Result<()> {
+    // Collect the chain from `dir` up to the first component that already
+    // exists; those are the directories `create_dir_all` will actually create.
+    let mut created: Vec<&Path> = Vec::new();
+    let mut cursor = dir;
+    loop {
+        if cursor.exists() {
+            break;
+        }
+        created.push(cursor);
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in created {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite a scope file atomically: write a sibling temp file, then rename.
 /// The temp name is unique per process + call so concurrent writers never
 /// share (and clobber) one temp file or make each other's rename fail. Any
@@ -666,7 +703,7 @@ pub fn run(store: &Store, tool: &str, args: &Value, session: Option<&str>, read_
 /// so a rewrite never deletes a malformed hand-edit or a newer-version record.
 fn write_all(path: &Path, entries: &[Entry], unknown: &[Vec<u8>]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_private(parent)?;
     }
     let mut body: Vec<u8> = Vec::new();
     for entry in entries {
@@ -755,7 +792,7 @@ impl FileLock {
     fn acquire(path: &Path) -> Result<Self> {
         let lock = path.with_extension("jsonl.lock");
         if let Some(parent) = lock.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_dir_all_private(parent)?;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
 
@@ -2212,6 +2249,69 @@ mod tests {
         write_all(&path, std::slice::from_ref(&entry), &[]).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "new memory file not owner-only: {mode:#o}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn memory_directories_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        let store = Store::new(root.clone(), Some("github.com/nanobpm/nano-coder".to_string()), 0);
+        let path = store.path(Scope::Project).unwrap();
+        // `create_dir_all` honours the umask, leaving `memory/` and
+        // `memory/projects/` at `0755`: because project filenames embed a
+        // readable remote-derived prefix, other local users could enumerate
+        // private repository names even though the JSONL files are `0600`. Both
+        // directory levels must be created owner-only (`0700`) (Copilot finding,
+        // src/memory.rs).
+        assert!(!root.exists(), "precondition: no memory dir yet");
+        let entry = store.save(Scope::Project, "dir privacy fact", None, None).unwrap();
+        write_all(&path, std::slice::from_ref(&entry), &[]).unwrap();
+        let projects = root.join("projects");
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let projects_mode = std::fs::metadata(&projects).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700, "memory root not owner-only: {root_mode:#o}");
+        assert_eq!(projects_mode, 0o700, "memory projects dir not owner-only: {projects_mode:#o}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn memory_directories_lock_path_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        let store = Store::new(root.clone(), Some("github.com/nanobpm/nano-coder".to_string()), 0);
+        let path = store.path(Scope::Project).unwrap();
+        // The advisory-lock path creates the same directories; it must apply the
+        // same owner-only permissions (Copilot finding, src/memory.rs).
+        assert!(!root.exists(), "precondition: no memory dir yet");
+        let guard = FileLock::acquire(&path).expect("lock acquisition failed");
+        drop(guard);
+        let projects = root.join("projects");
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let projects_mode = std::fs::metadata(&projects).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700, "memory root not owner-only via lock path: {root_mode:#o}");
+        assert_eq!(projects_mode, 0o700, "memory projects dir not owner-only via lock path: {projects_mode:#o}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preexisting_memory_directory_permissions_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        // A directory the user already created keeps whatever permissions they
+        // chose: creating the file inside must not tighten (or otherwise alter)
+        // a pre-existing directory.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = Store::new(root.clone(), None, 0);
+        let path = store.path(Scope::User).unwrap();
+        let entry = store.save(Scope::User, "preserve dir perms", None, None).unwrap();
+        write_all(&path, std::slice::from_ref(&entry), &[]).unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "pre-existing memory dir permissions overridden: {mode:#o}");
     }
 
     #[test]
