@@ -879,8 +879,18 @@ impl Agent {
 
     /// Resume a persisted session.
     pub fn load_session(&mut self, id: &str) -> Result<()> {
-        let (log, restored) = SessionLog::open(&self.config.session_dir(), id)?;
-        self.conversation = restored.conversation;
+        let (mut log, restored) = SessionLog::open(&self.config.session_dir(), id)?;
+        // Stage the repair on a scratch conversation and append its records
+        // *before* committing any agent state: when this append fails (a full
+        // disk, say), the load reports an error with this process still in
+        // the previous session instead of switched over with the renderer
+        // left on the old transcript.
+        let mut staged = restored.conversation.clone();
+        let repairs = Self::repair_dangling_tool_calls_on(&mut staged);
+        for message in &repairs {
+            log.append(&Record::Message(message.clone()))?;
+        }
+        self.conversation = staged;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
         let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
@@ -920,7 +930,6 @@ impl Agent {
             stats.history_searches = 0;
             stats.history_reads = 0;
         }
-        self.repair_dangling_tool_calls()?;
         // A loaded session starts in the default mode, not whatever mode the
         // previous session left selected.
         self.control.set_mode(crate::mode::AgentMode::default());
@@ -928,25 +937,28 @@ impl Agent {
         Ok(())
     }
 
-    /// Give every tool call without a result a synthetic error result, so the
-    /// conversation is valid for providers that require paired results.
-    fn repair_dangling_tool_calls(&mut self) -> Result<()> {
-        let Some(index) = self.conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    /// Append a synthetic error result for every tool call without one, so the
+    /// conversation is valid for providers that require paired results. Pure:
+    /// `load_session` stages the repair and persists its records *before*
+    /// committing the conversation, so a failed repair write cannot leave the
+    /// agent switched while the UI still shows the previous session.
+    fn repair_dangling_tool_calls_on(conversation: &mut Vec<Message>) -> Vec<Message> {
+        let Some(index) = conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
         else {
-            return Ok(());
+            return Vec::new();
         };
         let answered: HashSet<&str> =
-            self.conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
-        let missing: Vec<Message> = self.conversation[index]
+            conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+        let missing: Vec<Message> = conversation[index]
             .tool_calls
             .iter()
             .filter(|call| !answered.contains(call.id.as_str()))
             .map(|call| Message::tool_error(&call.id, &call.name, INTERRUPTED_TOOL_RESULT))
             .collect();
-        for message in missing {
-            self.push(message)?;
+        for message in &missing {
+            conversation.push(message.clone());
         }
-        Ok(())
+        missing
     }
 
     fn push(&mut self, mut message: Message) -> Result<()> {

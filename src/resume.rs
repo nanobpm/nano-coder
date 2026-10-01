@@ -163,11 +163,29 @@ pub fn list_rows(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Vec<Str
 /// first, with an entry to show all. `exclude` (the session in use) is left
 /// out. `None` when cancelled or there is nothing to resume.
 pub fn pick(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Option<String>> {
+    Ok(match pick_outcome(dir, cwd, exclude)? {
+        Pick::Selected(id) => Some(id),
+        Pick::Cancelled | Pick::Empty => None,
+    })
+}
+
+/// The picker result with the reason there is no selection: `Cancelled` is
+/// Esc, `Empty` is "no saved sessions to resume" (nothing was ever shown).
+/// Callers that repaint over the picker's stderr notice use this to keep the
+/// two outcomes distinct.
+pub enum Pick {
+    Selected(String),
+    Cancelled,
+    Empty,
+}
+
+/// [`pick`], but reports *why* there is no selection.
+pub fn pick_outcome(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Pick> {
     let mut sessions = session_index::list(dir)?;
     sessions.retain(|s| Some(s.id.as_str()) != exclude);
     if sessions.is_empty() {
         eprintln!("No saved sessions to resume.");
-        return Ok(None);
+        return Ok(Pick::Empty);
     }
     let now = crate::session::now();
     // The picker renders on stderr (dialoguer) and is gated on stdin/stderr
@@ -208,9 +226,9 @@ pub fn pick(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Option<Strin
             .report(false)
             .interact_opt()?;
         match choice {
-            None => return Ok(None),
+            None => return Ok(Pick::Cancelled),
             Some(i) if i == shown.len() => show_all = true,
-            Some(i) => return Ok(Some(shown[i].id.clone())),
+            Some(i) => return Ok(Pick::Selected(shown[i].id.clone())),
         }
     }
 }
@@ -366,5 +384,20 @@ mod tests {
         let rows = list_rows(dir.path(), "/a", Some("s")).unwrap();
         assert_eq!(rows.len(), 1, "the session in use is left out: {rows:?}");
         assert!(rows[0].starts_with("t  "), "{rows:?}");
+    }
+
+    #[test]
+    fn pick_outcome_reports_empty_apart_from_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing saved at all: `Empty`, so the caller can say *why* instead
+        // of the bare "Session unchanged" an Esc gets.
+        assert!(matches!(pick_outcome(dir.path(), "/a", None).unwrap(), Pick::Empty));
+        let mut log = SessionLog::create_with(dir.path(), "s", Some("/a".into()), None).unwrap();
+        let input = Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
+        log.append(&input).unwrap();
+        // The only saved session is the one in use: still `Empty`.
+        assert!(matches!(pick_outcome(dir.path(), "/a", Some("s")).unwrap(), Pick::Empty));
+        // The Option-based wrapper keeps mapping both to `None`.
+        assert_eq!(pick(dir.path(), "/a", Some("s")).unwrap(), None);
     }
 }

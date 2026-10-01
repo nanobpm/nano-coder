@@ -1024,12 +1024,19 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
             return Ok(());
         }
         "" => {
-            let picked = resume::pick(&dir, &cwd, current.as_deref());
+            let picked = resume::pick_outcome(&dir, &cwd, current.as_deref());
             // The picker drew over the owned frame: repaint it fully, also on error.
             terminal.renderer.frame_resize();
             match picked? {
-                Some(id) => id,
-                None => {
+                resume::Pick::Selected(id) => id,
+                // The repaint already covered the picker's "No saved sessions"
+                // stderr notice, so repeat it where the user can see it; keep
+                // "Session unchanged" for an actual Esc.
+                resume::Pick::Empty => {
+                    terminal.renderer.print_block("No saved sessions to resume");
+                    return Ok(());
+                }
+                resume::Pick::Cancelled => {
                     terminal.renderer.print_block("Session unchanged");
                     return Ok(());
                 }
