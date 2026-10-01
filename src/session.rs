@@ -164,7 +164,7 @@ impl SessionLog {
         Self::create_with(dir, id, None, None)
     }
 
-    /// [`create`](Self::create), recording where and with what model the
+    /// Creates a session log, recording where and with what model the
     /// session started (shown when picking a session to resume).
     pub fn create_with(dir: &Path, id: &str, cwd: Option<String>, model: Option<String>) -> Result<Self> {
         validate_id(id)?;

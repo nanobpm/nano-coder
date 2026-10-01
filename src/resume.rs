@@ -183,6 +183,19 @@ fn physical_rows(line: &str, cols: usize) -> usize {
     dialoguer::console::measure_text_width(line).div_ceil(cols).max(1)
 }
 
+/// Restores the terminal cursor on drop, so every early `?` return from
+/// [`interactive_pick`] (clear/write/flush/read failures) still un-hides the
+/// cursor instead of leaving the user's terminal with an invisible cursor.
+struct CursorGuard<'a> {
+    term: &'a Term,
+}
+
+impl Drop for CursorGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.term.show_cursor();
+    }
+}
+
 /// Let the user fuzzy-filter `items` on the stderr terminal and pick one,
 /// returning its index (or `None` on Esc / Ctrl-C). Unlike dialoguer's
 /// `FuzzySelect`, the search runs over each item's full text while only a
@@ -192,6 +205,7 @@ fn interactive_pick(
     prompt: &str,
     theme: &FitTheme,
     items: &[String],
+    rows: usize,
     cols: usize,
     max_visible: usize,
 ) -> Result<Option<usize>> {
@@ -203,24 +217,37 @@ fn interactive_pick(
     let mut drawn = 0usize; // physical rows drawn by the last frame
 
     term.hide_cursor()?;
+    // Restore the cursor on *every* exit path, including an early `?` from any
+    // clear/write/flush/read below, not only the normal return.
+    let _cursor = CursorGuard { term: &term };
     let selected = loop {
         if drawn > 0 {
             term.clear_last_lines(drawn)?;
         }
         let filtered = rank(&matcher, items, &search);
+
+        // Render the prompt first so its wrapped height is known: it carries the
+        // full working directory and an unbounded search string, so a long
+        // path/query can wrap across several rows. Reserve those rows and show
+        // only as many items as still fit, keeping the whole frame within the
+        // terminal so `clear_last_lines(drawn)` never erases scrollback above
+        // the picker.
+        let mut prompt_line = String::new();
+        Theme::format_fuzzy_select_prompt(theme, &mut prompt_line, prompt, &search, search.len())?;
+        let prompt_rows = physical_rows(&prompt_line, cols);
+        let window = max_visible.min(rows.saturating_sub(prompt_rows)).max(1);
+
         if filtered.is_empty() {
             sel = 0;
             top = 0;
         } else {
             sel = sel.min(filtered.len() - 1);
-            top = scroll_top(top, sel, max_visible);
+            top = scroll_top(top, sel, window);
         }
 
-        let mut lines: Vec<String> = Vec::with_capacity(max_visible + 1);
-        let mut prompt_line = String::new();
-        Theme::format_fuzzy_select_prompt(theme, &mut prompt_line, prompt, &search, search.len())?;
+        let mut lines: Vec<String> = Vec::with_capacity(window + 1);
         lines.push(prompt_line);
-        for (pos, &item) in filtered.iter().enumerate().skip(top).take(max_visible) {
+        for (pos, &item) in filtered.iter().enumerate().skip(top).take(window) {
             let mut rendered = String::new();
             Theme::format_fuzzy_select_prompt_item(theme, &mut rendered, &items[item], pos == sel, true, &matcher, &search)?;
             lines.push(rendered);
@@ -256,11 +283,10 @@ fn interactive_pick(
         }
     };
     // Clear the final frame so the menu leaves nothing behind, matching the old
-    // `FuzzySelect::clear(true)` behaviour.
+    // `FuzzySelect::clear(true)` behaviour; `_cursor` then restores the cursor.
     if drawn > 0 {
         term.clear_last_lines(drawn)?;
     }
-    term.show_cursor()?;
     Ok(selected)
 }
 
@@ -323,7 +349,7 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
         } else {
             format!("Resume which session in {}? (type to filter, Esc to cancel)", crate::sanitize_terminal_text(cwd))
         };
-        match interactive_pick(&prompt, &theme, &items, cols, max_visible)? {
+        match interactive_pick(&prompt, &theme, &items, rows, cols, max_visible)? {
             None => return Ok(None),
             Some(i) if i == shown.len() => show_all = true,
             Some(i) => return Ok(Some(shown[i].id.clone())),
