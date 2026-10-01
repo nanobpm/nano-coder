@@ -1578,6 +1578,28 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
             }
         }
     }
+    // Short `.env`-style password labels `pass`/`pwd` (`DB_PASS=hunter2`,
+    // `DB_PWD=hunter2`). These are not in the label alternation above (which
+    // carries the longer `password`/`passwd` forms), so a bare `pass`/`pwd`
+    // assignment slips past every rule and is persisted despite the
+    // secret-rejection guarantee (Copilot finding, src/memory.rs).
+    //
+    // The label must be *separator-anchored*: the character immediately before
+    // `pass`/`pwd` is the start of the text or a non-alphanumeric separator
+    // (`_`, `-`, space, …). Unlike the other labels there is no `\w*` prefix
+    // that could swallow the separator, so a word that merely *contains* the
+    // substring — `COMPASS=…`, `encompass=…` — has an alphanumeric directly
+    // before `pass` and is not flagged, while `DB_PASS`/`my-pass`/`PASSWORDS`
+    // (separator or start before the label, optional `\w*` suffix) still match.
+    let short_assignment = r#"(?i)(?:^|[^A-Za-z0-9])(?:pass|pwd)\w*["']?\s*[:=]\s*["']?(\S+)"#;
+    if let Ok(re) = RegexBuilder::new(short_assignment).build() {
+        for caps in re.captures_iter(text) {
+            let value = caps[1].trim_matches(|c: char| ['"', '\''].contains(&c));
+            if !is_placeholder(value) {
+                return Some("credential assignment");
+            }
+        }
+    }
     // Natural-language copular forms: `database password is hunter2`, `the token
     // was abc123`. These carry no `:`/`=`, so the assignment rule above misses
     // them and the obvious secret is persisted in plaintext even though memory
@@ -1926,6 +1948,21 @@ mod tests {
         // must not gate detection (Copilot finding, src/memory.rs).
         assert!(store.save(Scope::User, "API_KEY=secret", None, None).is_err());
         assert!(store.save(Scope::User, "PASSWORD=hunter2", None, None).is_err());
+        // The short `.env`-style labels `pass`/`pwd` are credentials too:
+        // `DB_PASS=hunter2` and `DB_PWD=hunter2` match no other rule and must be
+        // rejected (Copilot finding, src/memory.rs). The label is
+        // separator-anchored, so a prefixed (`DB_PASS`), hyphenated (`my-pass`)
+        // or suffixed (`PASSWORDS`) form matches, but a word that merely
+        // *contains* the substring (`COMPASS=…`, `encompass=…`) is not a label
+        // and must not be flagged.
+        assert!(store.save(Scope::User, "DB_PASS=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "DB_PWD=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "db_pass=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "config: my-pass: s3cr3tvalue", None, None).is_err());
+        assert!(store.save(Scope::User, "PASSWORDS=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "DB_PASSWORD=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "note: COMPASS=points north", None, None).is_ok());
+        assert!(store.save(Scope::User, "note: encompass=hunter2", None, None).is_ok());
         // Angle brackets around a *real* credential do not make it a
         // placeholder: only a bracketed interior that is itself placeholder
         // filler is exempt (Copilot finding, src/memory.rs).
