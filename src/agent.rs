@@ -502,8 +502,10 @@ pub struct Agent {
     /// the summary) so a legacy → frame renderer switch rebuilds the visible
     /// transcript instead of exposing the summary as a user turn and dropping
     /// the folded turns — the frame's first full redraw clears the legacy
-    /// scrollback, so the replay is the only copy. `None` when no compaction
-    /// has run (or none was captured).
+    /// scrollback, so the replay is the only copy. Kept across replays (every
+    /// renderer rebuild needs it), replaced by the next compaction, and
+    /// cleared on a new or resumed session. `None` when no compaction has run
+    /// (or none was captured).
     pre_compaction_transcript: Option<Vec<Message>>,
 }
 
@@ -1018,9 +1020,12 @@ impl Agent {
         // switch clears the legacy scrollback on the frame's first redraw, so
         // this replay is the only copy). Replay the captured pre-compaction
         // turns first, then skip the summary (the first non-system message) so
-        // the internal text is never exposed. One-shot: `take` clears the
-        // stash, and with no stash the conversation replays exactly as-is.
-        let pre_compaction = self.pre_compaction_transcript.take();
+        // the internal text is never exposed. The stash is kept (cloned, not
+        // taken) so every renderer rebuild replays the real turns — a legacy →
+        // frame → legacy → frame round trip must not fall back to exposing the
+        // summary on the second switch. It is replaced by the next compaction
+        // and cleared on a new or resumed session.
+        let pre_compaction = self.pre_compaction_transcript.clone();
         let skip_summary = pre_compaction.is_some();
         let conversation = self.conversation.clone();
         let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
@@ -2599,8 +2604,8 @@ mod tests {
         // first redraw clears the legacy scrollback, so the replay is the only
         // copy of the visible transcript. After a compaction the conversation
         // holds the synthetic summary where the folded turns were: the replay
-        // must restore the REAL pre-compaction turns from the session log and
-        // never expose the summary as a user turn.
+        // must restore the REAL pre-compaction turns from the captured stash
+        // and never expose the summary as a user turn.
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _seen) = agent(vec![tool_call("c1"), text("done"), text("SUMMARY: pinged once")], dir.path());
         agent.new_session().unwrap();
@@ -2622,6 +2627,16 @@ mod tests {
         let users = seen.lock().unwrap().clone();
         assert!(users.contains(&"ping".to_string()), "real pre-compaction turn restored: {users:?}");
         assert!(!users.iter().any(|t| t.contains("SUMMARY")), "synthetic summary not exposed: {users:?}");
+
+        // A legacy → frame → legacy → frame round trip replays history a
+        // second time: the stash must persist across replays so the second
+        // switch restores the real turns again instead of falling back to the
+        // compacted conversation (which would expose the summary).
+        seen.lock().unwrap().clear();
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping".to_string()), "second replay still restores the real turn: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "second replay still hides the summary: {users:?}");
     }
 
     #[test]
