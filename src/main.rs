@@ -689,9 +689,7 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
-        .collect()
+    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -1053,8 +1051,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         // guarantee. Gate it on the live mode the same way (Copilot finding,
         // src/main.rs).
         if agent.mode() == crate::mode::AgentMode::Plan {
-            return "Memory is read-only in plan mode; /memory forget cannot delete entries."
-                .to_string();
+            return "Memory is read-only in plan mode; /memory forget cannot delete entries.".to_string();
         }
         if !agent.config().memory.writable() {
             return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
@@ -2155,12 +2152,7 @@ mod tests {
         // finding, src/main.rs).
         let dir = tempfile::tempdir().unwrap();
         let mut agent = memory_command_agent(dir.path());
-        let id = agent
-            .memory()
-            .unwrap()
-            .save(memory::Scope::User, "a fact to keep", None, None)
-            .unwrap()
-            .id;
+        let id = agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap().id;
         agent.set_mode(crate::mode::AgentMode::Plan);
         let msg = memory_command(&mut agent, &format!("forget {id}"));
         assert!(msg.contains("plan mode"), "forget refused in plan mode: {msg}");
@@ -2198,11 +2190,7 @@ mod tests {
         assert!(msg.contains("memory_save"), "normal-mode empty hint offers memory_save: {msg}");
 
         // Populated memory, Plan mode: no `/memory forget` hint.
-        agent
-            .memory()
-            .unwrap()
-            .save(memory::Scope::User, "a fact to keep", None, None)
-            .unwrap();
+        agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap();
         agent.set_mode(crate::mode::AgentMode::Plan);
         let msg = memory_command(&mut agent, "");
         assert!(!msg.contains("/memory forget"), "plan-mode list hides forget hint: {msg}");

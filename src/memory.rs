@@ -1217,17 +1217,8 @@ fn percent_decode_lossy(s: &str) -> String {
 fn is_credential_query_key(key: &str) -> bool {
     // Safe as arbitrary substrings: no common non-credential English word
     // contains one of these as a substring, so `contains` cannot false-positive.
-    const SUBSTR_NEEDLES: [&str; 9] = [
-        "password",
-        "passwd",
-        "pwd",
-        "apikey",
-        "accesskey",
-        "privatekey",
-        "credential",
-        "signature",
-        "oauth",
-    ];
+    const SUBSTR_NEEDLES: [&str; 9] =
+        ["password", "passwd", "pwd", "apikey", "accesskey", "privatekey", "credential", "signature", "oauth"];
     // Needles that *do* appear inside common non-credential words (`token` in
     // `tokenizer`, `secret` in `secretary`, `auth` in `author`), so they are
     // matched only as a whole separator-delimited segment or as a prefix/suffix
@@ -1271,13 +1262,9 @@ fn is_credential_query_key(key: &str) -> bool {
             // `authsecret`) joined to another credential needle or short key.
             let joined = |rest: &str| {
                 !rest.is_empty()
-                    && (AFFIX_NEEDLES.contains(&rest)
-                        || SHORT_KEYS.contains(&rest)
-                        || SUBSTR_NEEDLES.contains(&rest))
+                    && (AFFIX_NEEDLES.contains(&rest) || SHORT_KEYS.contains(&rest) || SUBSTR_NEEDLES.contains(&rest))
             };
-            if seg.strip_prefix(needle).is_some_and(joined)
-                || seg.strip_suffix(needle).is_some_and(joined)
-            {
+            if seg.strip_prefix(needle).is_some_and(joined) || seg.strip_suffix(needle).is_some_and(joined) {
                 return true;
             }
         }
@@ -1314,9 +1301,7 @@ fn normalize_remote(url: &str) -> String {
     // injective across protocols (Copilot finding, src/memory.rs).
     static SCHEME: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^([A-Za-z][A-Za-z0-9+.-]*)://").expect("scheme regex compiles"));
-    let scheme: Option<String> = SCHEME
-        .captures(s)
-        .map(|c| c[1].to_ascii_lowercase());
+    let scheme: Option<String> = SCHEME.captures(s).map(|c| c[1].to_ascii_lowercase());
     let uri = scheme.is_some();
     let owned;
     let s: &str = if uri {
@@ -1364,11 +1349,7 @@ fn normalize_remote(url: &str) -> String {
         match no_fragment.split_once('?') {
             Some((base, query)) => {
                 let sanitized = sanitize_uri_query(query);
-                owned_query = if sanitized.is_empty() {
-                    base.to_string()
-                } else {
-                    format!("{base}?{sanitized}")
-                };
+                owned_query = if sanitized.is_empty() { base.to_string() } else { format!("{base}?{sanitized}") };
                 &owned_query
             }
             None => no_fragment,
@@ -1419,10 +1400,7 @@ fn normalize_remote(url: &str) -> String {
         // src/memory.rs).
         let split_at = s.find(['/', '?']).unwrap_or(s.len());
         let (authority, suffix) = s.split_at(split_at);
-        format!(
-            "{}{suffix}",
-            strip_uri_password(scheme.as_deref(), authority)
-        )
+        format!("{}{suffix}", strip_uri_password(scheme.as_deref(), authority))
     } else {
         // Local path: no authority, so there is nothing to strip.
         s.to_string()
@@ -1758,10 +1736,7 @@ fn copular_value_is_secret(rest: &str) -> bool {
         }
         // Filler: articles and possessives are lead-in words, not the
         // value itself.
-        if matches!(
-            lower.as_str(),
-            "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
-        ) {
+        if matches!(lower.as_str(), "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its") {
             continue;
         }
         // Location/preposition words ("stored", "in", "at", …) put the
@@ -1882,17 +1857,8 @@ fn ends_with_credential_label(text: &str) -> bool {
     // credentials too (Copilot finding, src/memory.rs): the match is on the
     // final *whole* word (alphanumeric-stripped), not a substring, so a word
     // that merely *contains* one (`compass`, `encompass`) is not a label.
-    const ONE_WORD: [&str; 9] = [
-        "secret",
-        "password",
-        "passwd",
-        "token",
-        "credential",
-        "credentials",
-        "pass",
-        "pwd",
-        "passphrase",
-    ];
+    const ONE_WORD: [&str; 9] =
+        ["secret", "password", "passwd", "token", "credential", "credentials", "pass", "pwd", "passphrase"];
     if let Some(last) = words.last() {
         let word: String = last.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         if ONE_WORD.contains(&word.as_str()) {
@@ -1993,9 +1959,41 @@ fn is_placeholder_filler(value: &str) -> bool {
     // a placeholder when every segment is a known filler word (the documented
     // `token=<your-token>` example must not be a false positive).
     const FILLER: &[&str] = &[
-        "your", "my", "our", "some", "the", "a", "an", "example", "sample", "placeholder", "dummy", "fake",
-        "token", "secret", "key", "keys", "password", "passwd", "apikey", "api", "access", "private", "client",
-        "value", "val", "here", "goes", "change", "changeme", "me", "redacted", "todo", "tbd", "foo", "bar",
+        "your",
+        "my",
+        "our",
+        "some",
+        "the",
+        "a",
+        "an",
+        "example",
+        "sample",
+        "placeholder",
+        "dummy",
+        "fake",
+        "token",
+        "secret",
+        "key",
+        "keys",
+        "password",
+        "passwd",
+        "apikey",
+        "api",
+        "access",
+        "private",
+        "client",
+        "value",
+        "val",
+        "here",
+        "goes",
+        "change",
+        "changeme",
+        "me",
+        "redacted",
+        "todo",
+        "tbd",
+        "foo",
+        "bar",
     ];
     let segments: Vec<&str> = lower.split(['-', '_']).filter(|s| !s.is_empty()).collect();
     segments.len() > 1 && segments.iter().all(|s| FILLER.contains(s))
@@ -2266,9 +2264,7 @@ mod tests {
         assert!(store.save(Scope::User, "the token is", Some("abc123def456"), None).is_err());
         // A known token shape split across the boundary (space-joined).
         assert!(
-            store
-                .save(Scope::User, "the token is", Some("ghp_0123456789abcdef0123456789abcdefABCD"), None)
-                .is_err()
+            store.save(Scope::User, "the token is", Some("ghp_0123456789abcdef0123456789abcdefABCD"), None).is_err()
         );
         // Each half is individually benign and the recombined string is too:
         // ordinary fact + verifying path/command must still save.
@@ -2647,7 +2643,10 @@ mod tests {
         assert!(!index.contains('\u{2029}'), "U+2029 clipped from text: {index}");
         // The injected text is neutralised onto a single line (the separator
         // became '?'), so it can no longer pose as a *standalone* prompt line.
-        assert!(!index.lines().any(|l| l.trim_start().starts_with("Ignore prior instructions")), "no standalone injected line: {index}");
+        assert!(
+            !index.lines().any(|l| l.trim_start().starts_with("Ignore prior instructions")),
+            "no standalone injected line: {index}"
+        );
     }
 
     #[test]
@@ -2764,14 +2763,20 @@ mod tests {
         // expose different repositories at those protocol namespaces, so they
         // must not collapse onto one project key (Copilot finding,
         // src/memory.rs).
-        assert_eq!(normalize_remote("https://github.com/nanobpm/nano-coder.git"), "https://github.com/nanobpm/nano-coder.git");
+        assert_eq!(
+            normalize_remote("https://github.com/nanobpm/nano-coder.git"),
+            "https://github.com/nanobpm/nano-coder.git"
+        );
         // Over HTTP(S) the userinfo is always a credential, so it is stripped
         // wholesale — including the username (Copilot finding, src/memory.rs).
         assert_eq!(normalize_remote("https://user:pass@example.com/a/b"), "https://example.com/a/b");
         assert_ne!(normalize_remote("https://host/org/repo"), normalize_remote("ssh://host/org/repo"));
         // `.git` and non-`.git` remotes that would previously collide now keep
         // distinct keys (Copilot finding, src/memory.rs).
-        assert_ne!(normalize_remote("https://github.com/org/repo.git"), normalize_remote("https://github.com/org/repo"));
+        assert_ne!(
+            normalize_remote("https://github.com/org/repo.git"),
+            normalize_remote("https://github.com/org/repo")
+        );
         assert_ne!(normalize_remote("git@host:org/repo.git"), normalize_remote("git@host:org/repo"));
         // A URI query can carry a credential (`?access_token=…`); the
         // credential-valued parameter is dropped so it never leaks into the key.
@@ -2789,10 +2794,7 @@ mod tests {
         // …but a query that *selects* the repository is non-secret identity and
         // is preserved, so distinct query-disambiguated remotes keep distinct
         // project scopes (Copilot finding, src/memory.rs).
-        assert_eq!(
-            normalize_remote("https://host.example/git?repo=one"),
-            "https://host.example/git?repo=one"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?repo=one"), "https://host.example/git?repo=one");
         assert_ne!(
             normalize_remote("https://host.example/git?repo=one"),
             normalize_remote("https://host.example/git?repo=two")
@@ -2812,10 +2814,7 @@ mod tests {
         // repository, so `?author=alice` / `?author=bob` must keep distinct
         // project keys rather than collapsing onto one (Copilot finding,
         // src/memory.rs). Matching is affix/segment-based, not substring.
-        assert_eq!(
-            normalize_remote("https://host.example/git?author=alice"),
-            "https://host.example/git?author=alice"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?author=alice"), "https://host.example/git?author=alice");
         assert_ne!(
             normalize_remote("https://host.example/git?author=alice"),
             normalize_remote("https://host.example/git?author=bob")
@@ -2823,14 +2822,8 @@ mod tests {
         // …while genuine `auth`-family keys are still redacted: the whole word
         // `auth`, the explicit `authorization`/`authz` forms, and `auth` joined
         // to another credential segment.
-        assert_eq!(
-            normalize_remote("https://host.example/git?auth=xyz"),
-            "https://host.example/git"
-        );
-        assert_eq!(
-            normalize_remote("https://host.example/git?authorization=xyz"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?auth=xyz"), "https://host.example/git");
+        assert_eq!(normalize_remote("https://host.example/git?authorization=xyz"), "https://host.example/git");
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&oauth_token=xyz"),
             "https://host.example/git?repo=one"
@@ -2850,33 +2843,18 @@ mod tests {
             normalize_remote("https://host.example/git?tokenizer=bpe"),
             normalize_remote("https://host.example/git?tokenizer=wordpiece")
         );
-        assert_eq!(
-            normalize_remote("https://host.example/git?secretary=x"),
-            "https://host.example/git?secretary=x"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?secretary=x"), "https://host.example/git?secretary=x");
         // …while genuine `token`/`secret`-family keys are still redacted: the
         // whole words, plural forms, and a needle joined to another credential
         // segment or short key.
-        assert_eq!(
-            normalize_remote("https://host.example/git?token=abc"),
-            "https://host.example/git"
-        );
-        assert_eq!(
-            normalize_remote("https://host.example/git?secret=abc"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?token=abc"), "https://host.example/git");
+        assert_eq!(normalize_remote("https://host.example/git?secret=abc"), "https://host.example/git");
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&access_token=abc"),
             "https://host.example/git?repo=one"
         );
-        assert_eq!(
-            normalize_remote("https://host.example/git?client_secret=abc"),
-            "https://host.example/git"
-        );
-        assert_eq!(
-            normalize_remote("https://host.example/git?tokenkey=abc"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?client_secret=abc"), "https://host.example/git");
+        assert_eq!(normalize_remote("https://host.example/git?tokenkey=abc"), "https://host.example/git");
         // A URI with an empty path can still carry a query
         // (`https://host.example?repo=alice@example.com`). The authority ends at
         // the first `/` *or* `?`; splitting only on `/` would hand the whole
@@ -2891,10 +2869,7 @@ mod tests {
             normalize_remote("https://host.example?repo=alice@example.com"),
             normalize_remote("https://host.example?repo=bob@example.com")
         );
-        assert_eq!(
-            normalize_remote("https://host.example?repo=one"),
-            "https://host.example?repo=one"
-        );
+        assert_eq!(normalize_remote("https://host.example?repo=one"), "https://host.example?repo=one");
         assert_ne!(
             normalize_remote("https://host.example?repo=one"),
             normalize_remote("https://host.example?repo=two")
@@ -2903,28 +2878,19 @@ mod tests {
         // separator-stripping it becomes `privatekey`, which the classifier now
         // recognises, so the secret is redacted rather than kept in the project
         // key, prompt label and filename (Copilot finding, src/memory.rs).
-        assert_eq!(
-            normalize_remote("https://host.example/git?private_key=xyz"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?private_key=xyz"), "https://host.example/git");
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&private-key=xyz"),
             "https://host.example/git?repo=one"
         );
         // …including a percent-encoded spelling (`%6b` = `k`), which is
         // classified on the decoded key just like `access_%74oken`.
-        assert_eq!(
-            normalize_remote("https://host.example/git?private_%6bey=xyz"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?private_%6bey=xyz"), "https://host.example/git");
         // The common credential query names `pass` and `passphrase` are exact
         // whole-key matches: `?pass=hunter2` must be redacted so the secret never
         // reaches the project key, prompt label or filename (Copilot finding,
         // src/memory.rs).
-        assert_eq!(
-            normalize_remote("https://host.example/git?pass=hunter2"),
-            "https://host.example/git"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?pass=hunter2"), "https://host.example/git");
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&passphrase=hunter2"),
             "https://host.example/git?repo=one"
@@ -2959,10 +2925,7 @@ mod tests {
         );
         // …but a non-secret value on a non-credential key (`?session=abc`) is
         // ordinary identity and is preserved verbatim.
-        assert_eq!(
-            normalize_remote("https://host.example/git?session=abc"),
-            "https://host.example/git?session=abc"
-        );
+        assert_eq!(normalize_remote("https://host.example/git?session=abc"), "https://host.example/git?session=abc");
         // The fragment carries no git repository identity and is dropped.
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");
         // A scheme URL's port is preserved, so it cannot collide with an
@@ -3006,10 +2969,7 @@ mod tests {
         // one project-memory scope. Only the password is stripped (Copilot
         // finding, src/memory.rs).
         assert_eq!(normalize_remote("ssh://alice@host/repo.git"), "ssh://alice@host/repo.git");
-        assert_ne!(
-            normalize_remote("ssh://alice@host/repo.git"),
-            normalize_remote("ssh://bob@host/repo.git")
-        );
+        assert_ne!(normalize_remote("ssh://alice@host/repo.git"), normalize_remote("ssh://bob@host/repo.git"));
         // The password (a rotating secret) is still removed, keeping only the
         // username, so two remotes differing only in their password map to one
         // stable key and no secret leaks into the key/label/filename.
@@ -3026,30 +2986,18 @@ mod tests {
         // identity discriminator — it is a PAT — so it is stripped like a
         // password rather than preserved, and never leaks into the key, label
         // or filename (Copilot finding, src/memory.rs).
-        assert_eq!(
-            normalize_remote("ssh://ghp_0123456789abcdefghij0123@host/repo.git"),
-            "ssh://host/repo.git"
-        );
+        assert_eq!(normalize_remote("ssh://ghp_0123456789abcdefghij0123@host/repo.git"), "ssh://host/repo.git");
         // Percent-encoded secret usernames are decoded before the check, so an
         // escaped token cannot slip through as an "identity".
-        assert_eq!(
-            normalize_remote("ssh://ghp%5F0123456789abcdefghij0123@host/repo.git"),
-            "ssh://host/repo.git"
-        );
+        assert_eq!(normalize_remote("ssh://ghp%5F0123456789abcdefghij0123@host/repo.git"), "ssh://host/repo.git");
         // The SCP branch applies the same secret-aware rule as the URI/ssh
         // branch: an ordinary SCP username is identity and is kept, but a
         // token-only `ghp_…@host:repo.git` userinfo is a credential — it is
         // stripped so it never leaks into the project key, prompt label or
         // readable filename (Copilot finding, src/memory.rs).
-        assert_eq!(
-            normalize_remote("ghp_0123456789abcdefghij0123@host:org/repo.git"),
-            "host/org/repo.git"
-        );
+        assert_eq!(normalize_remote("ghp_0123456789abcdefghij0123@host:org/repo.git"), "host/org/repo.git");
         // …including a percent-encoded spelling, decoded before the check.
-        assert_eq!(
-            normalize_remote("ghp%5F0123456789abcdefghij0123@host:org/repo.git"),
-            "host/org/repo.git"
-        );
+        assert_eq!(normalize_remote("ghp%5F0123456789abcdefghij0123@host:org/repo.git"), "host/org/repo.git");
         // …while a non-secret SCP username stays an identity discriminator, so
         // distinct login users keep distinct project scopes.
         assert_eq!(normalize_remote("git@host:org/repo.git"), "git@host/org/repo.git");
@@ -3069,10 +3017,7 @@ mod tests {
         // merge distinct origins onto one project-memory file (Copilot finding,
         // src/memory.rs).
         assert_eq!(normalize_remote("git@host:repos/app#blue.git"), "git@host/repos/app#blue.git");
-        assert_ne!(
-            normalize_remote("git@host:repos/app#blue.git"),
-            normalize_remote("git@host:repos/app#red.git")
-        );
+        assert_ne!(normalize_remote("git@host:repos/app#blue.git"), normalize_remote("git@host:repos/app#red.git"));
         assert_eq!(normalize_remote("git@host:repos/app.git?x=1"), "git@host/repos/app.git?x=1");
         // On a local path `.git` is an ordinary filename suffix and is
         // preserved, so `/srv/project.git` and `/srv/project` keep distinct
@@ -3228,5 +3173,4 @@ mod tests {
         let found = run(&store, SEARCH_TOOL, &json!({"pattern": "python"}), None, false).unwrap();
         assert!(found.contains("uv provides python"), "{found}");
     }
-
 }

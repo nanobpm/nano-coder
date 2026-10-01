@@ -1244,10 +1244,8 @@ impl Agent {
         memory: Option<&memory::Store>,
     ) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        let memory = memory
-            .filter(|_| self.config.memory.enabled())
-            .map(|store| store.index(writable))
-            .unwrap_or_default();
+        let memory =
+            memory.filter(|_| self.config.memory.enabled()).map(|store| store.index(writable)).unwrap_or_default();
         format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
     }
 
@@ -2266,8 +2264,7 @@ impl Agent {
         // bumps `last_used`, and rewrites the JSONL file (Copilot finding,
         // src/agent.rs). Route search through the read-only path in both cases
         // so it neither bumps `last_used` nor prunes/rewrites the store.
-        let read_only =
-            self.control.mode() == crate::mode::AgentMode::Plan || !self.config.memory.writable();
+        let read_only = self.control.mode() == crate::mode::AgentMode::Plan || !self.config.memory.writable();
         // A mode switch can land after the outer dispatch gate but before this
         // handler runs (the control is switchable while a turn holds `&mut
         // Agent`). `memory::run` only honours `read_only` for search — save and
