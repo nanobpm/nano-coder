@@ -33,7 +33,7 @@ cargo install nano-coder             # or build from source
 ### Interactive CLI Mode (default)
 
 ```bash
-cargo run
+nano-coder
 ```
 
 Starts the interactive REPL where you can chat with the agent and use slash commands.
@@ -61,7 +61,7 @@ With piped (non-terminal) stdin, lines read during a turn are queued as later pr
 ### ACP Headless Mode (--acp flag)
 
 ```bash
-cargo run -- --acp
+nano-coder --acp
 ```
 
 Speaks the Agent Communication Protocol (ACP) over stdio using newline-delimited JSON-RPC 2.0 messages. Compatible with c8ctl-nano's `spawnCaptureAcp` executor.
