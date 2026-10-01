@@ -34,8 +34,10 @@ mod question;
 mod queue;
 mod recents;
 mod reminders;
+mod resume;
 mod sandbox;
 mod session;
+mod session_index;
 mod settings;
 mod shell;
 mod skills;
@@ -1124,6 +1126,81 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
     out.join("\n")
 }
 
+/// `/resume [ID|last]`: switch this process to a saved session. Without an
+/// argument, pick one (or, without a terminal, list them).
+fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Result<()> {
+    if terminal.outstanding {
+        // A stdin read is pending (typed during a turn), so a picker would
+        // race it, and switching sessions mid-turn would orphan the turn.
+        terminal.renderer.print_block("/resume switches sessions: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    if !agent.config().persist_sessions {
+        terminal
+            .renderer
+            .print_block("Sessions aren't saved (persist_sessions = false), so there is nothing to resume");
+        return Ok(());
+    }
+    let dir = agent.config().session_dir();
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let current = agent.session_id().map(str::to_string);
+    let id = match arg {
+        "" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            let rows = resume::list_rows(&dir, &cwd, current.as_deref())?;
+            let text = if rows.is_empty() {
+                "No saved sessions for this directory".to_string()
+            } else {
+                format!("Saved sessions (switch with /resume ID):\n{}", rows.join("\n"))
+            };
+            terminal.renderer.print_block(&text);
+            return Ok(());
+        }
+        "" => {
+            let picked = resume::pick_outcome(&dir, &cwd, current.as_deref());
+            // The picker drew over the owned frame: repaint it fully, also on error.
+            terminal.renderer.frame_resize();
+            match picked? {
+                resume::Pick::Selected(id) => id,
+                // The picker already printed "No saved sessions to resume." to
+                // stderr. In frame mode the repaint above painted over it, so
+                // repeat it where the user can see it; with the legacy renderer
+                // frame_resize() is a no-op and the stderr notice is still on
+                // screen, so printing again would duplicate it. Keep
+                // "Session unchanged" for an actual Esc.
+                resume::Pick::Empty => {
+                    if terminal.renderer.is_frame() {
+                        terminal.renderer.print_block("No saved sessions to resume");
+                    }
+                    return Ok(());
+                }
+                resume::Pick::Cancelled => {
+                    terminal.renderer.print_block("Session unchanged");
+                    return Ok(());
+                }
+            }
+        }
+        "last" => resume::last(&dir, &cwd, current.as_deref())?,
+        id => id.to_string(),
+    };
+    if current.as_deref() == Some(id.as_str()) {
+        terminal.renderer.print_block(&format!("Already in session {id}"));
+        return Ok(());
+    }
+    if session::validate_id(&id).is_err() || !dir.join(format!("{id}.jsonl")).is_file() {
+        terminal.renderer.print_block(&format!("No saved session {id:?}: /resume without an ID lists them"));
+        return Ok(());
+    }
+    agent.load_session(&id)?;
+    terminal.renderer.clear_screen();
+    // As at startup with --resume: the frame renderer rebuilds the
+    // transcript from the loaded conversation; the legacy one starts clean.
+    if terminal.renderer.is_frame() {
+        agent.replay_history();
+    }
+    terminal.renderer.print_block(&format!("Resumed session {id} (resume later with --resume {id})"));
+    Ok(())
+}
+
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     match cmd {
         "/exit" | "/quit" => Ok(false),
@@ -1402,6 +1479,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
+        _ if cmd == "/resume" || cmd.starts_with("/resume ") => {
+            resume_command(agent, cmd["/resume".len()..].trim(), terminal)?;
+            Ok(true)
+        }
         "/restart" => {
             // Start a brand-new session in place: new ID, context reset to
             // just the system prompt, empty plan, counters zeroed. The
@@ -1494,7 +1575,10 @@ struct Args {
     login: Option<String>,
     list_models: Option<String>,
     model: Option<String>,
+    /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    list_sessions: bool,
+    all: bool,
     config: Option<std::path::PathBuf>,
     verbosity: Option<ui::Verbosity>,
     sandbox: Option<sandbox::SandboxMode>,
@@ -1510,9 +1594,12 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
+    println!(
+        "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
+    );
     println!("                  [--verbosity quiet|normal|verbose|debug]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot");
     println!("       nano-coder --list-models PROVIDER[/model]");
@@ -1535,12 +1622,20 @@ fn parse_args() -> Result<Args> {
             _ => {}
         }
     }
+    parse_args_from(env::args().skip(1))
+}
+
+/// Parse the argument stream (without the program name) into [`Args`].
+/// Split from [`parse_args`] so tests can drive it with a fixed argv.
+fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     let mut args = Args {
         acp: false,
         login: None,
         list_models: None,
         model: None,
         resume: None,
+        list_sessions: false,
+        all: false,
         config: None,
         verbosity: None,
         sandbox: None,
@@ -1550,7 +1645,7 @@ fn parse_args() -> Result<Args> {
         json: false,
         markdown: false,
     };
-    let mut iter = env::args().skip(1);
+    let mut iter = argv.into_iter().peekable();
     while let Some(arg) = iter.next() {
         let mut value = |name: &str| iter.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
         match arg.as_str() {
@@ -1558,7 +1653,15 @@ fn parse_args() -> Result<Args> {
             "--login" => args.login = Some(value("--login")?),
             "--list-models" => args.list_models = Some(value("--list-models")?),
             "--model" => args.model = Some(value("--model")?),
-            "--resume" => args.resume = Some(value("--resume")?),
+            // The ID is optional: without one, pick from the saved sessions.
+            // The attached `--resume=<id>` form is unambiguous and is the only
+            // way to name a dash-prefixed id: the separated form leaves any
+            // `-…` value in the stream (it looks like a flag), where it would
+            // be rejected as an unknown argument.
+            "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
+            _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
+            "--list-sessions" => args.list_sessions = true,
+            "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
             "--trajectory" => args.trajectory = Some(value("--trajectory")?),
             "--json" => args.json = true,
@@ -1587,8 +1690,57 @@ fn parse_args() -> Result<Args> {
     if args.json && args.markdown {
         anyhow::bail!("--json and --markdown are mutually exclusive");
     }
-    if (args.json || args.markdown) && args.trajectory.is_none() {
-        anyhow::bail!("--json/--markdown require --trajectory <id>");
+    if args.markdown && args.trajectory.is_none() {
+        anyhow::bail!("--markdown requires --trajectory <id>");
+    }
+    if args.json && args.trajectory.is_none() && !args.list_sessions {
+        anyhow::bail!("--json requires --trajectory <id> or --list-sessions");
+    }
+    if args.all && !args.list_sessions {
+        anyhow::bail!("--all requires --list-sessions");
+    }
+    // `--list-sessions` and `--trajectory` select different, exclusive modes.
+    // The trajectory branch runs first, so accepting both would silently emit
+    // trajectory output and ignore the requested session list; reject it.
+    if args.list_sessions && args.trajectory.is_some() {
+        anyhow::bail!("--list-sessions and --trajectory are mutually exclusive");
+    }
+    // `--list-sessions` and `--resume` also select different, exclusive modes.
+    // The listing branch runs before the resume branch, so accepting both would
+    // silently print the session list and ignore the requested resume; reject
+    // it rather than let argument order-independent input pick an unrelated
+    // action.
+    if args.list_sessions && args.resume.is_some() {
+        anyhow::bail!("--list-sessions and --resume are mutually exclusive");
+    }
+    // `--list-sessions` likewise conflicts with the other top-level action
+    // modes. Dispatch runs `--login` before the listing, and the listing before
+    // `--list-models` and `--acp`, so accepting any of these pairs would
+    // silently perform one action and ignore the other; reject them.
+    if args.list_sessions && args.login.is_some() {
+        anyhow::bail!("--list-sessions and --login are mutually exclusive");
+    }
+    if args.list_sessions && args.list_models.is_some() {
+        anyhow::bail!("--list-sessions and --list-models are mutually exclusive");
+    }
+    if args.list_sessions && args.acp {
+        anyhow::bail!("--list-sessions and --acp are mutually exclusive");
+    }
+    // `--resume` likewise conflicts with the other exclusive action modes.
+    // Dispatch runs `--login`, then `--trajectory`, then `--list-models` before
+    // the resume branch, so accepting `--resume` with any of them would
+    // silently perform that action and ignore the requested resume; reject
+    // those pairs. `--acp` is the exception: an explicit `--resume <id>` is
+    // honoured in ACP mode (the session is loaded before serving requests), so
+    // only a bare picker `--resume` is rejected there (in `main`).
+    if args.resume.is_some() && args.login.is_some() {
+        anyhow::bail!("--resume and --login are mutually exclusive");
+    }
+    if args.resume.is_some() && args.trajectory.is_some() {
+        anyhow::bail!("--resume and --trajectory are mutually exclusive");
+    }
+    if args.resume.is_some() && args.list_models.is_some() {
+        anyhow::bail!("--resume and --list-models are mutually exclusive");
     }
     Ok(args)
 }
@@ -1596,7 +1748,7 @@ fn parse_args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Detect execution mode from command-line args
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     // Before anything reads the config or data directories.
     config::migrate_legacy_dirs();
 
@@ -1630,6 +1782,27 @@ async fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    if args.list_sessions {
+        resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
+        return Ok(());
+    }
+    match args.resume.as_deref() {
+        Some("") if args.acp => anyhow::bail!("--resume needs a session ID with --acp"),
+        Some("") if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+            match resume::pick(&config.session_dir(), &cwd, None)? {
+                Some(id) => args.resume = Some(id),
+                None => return Ok(()),
+            }
+        }
+        Some("") => {
+            // No terminal to pick in: list what could be resumed.
+            resume::print_list(&config.session_dir(), &cwd, false, false)?;
+            return Ok(());
+        }
+        Some("last") => args.resume = Some(resume::last(&config.session_dir(), &cwd, None)?),
+        _ => {}
     }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();
@@ -2070,6 +2243,86 @@ mod tests {
         assert_eq!(sanitize_terminal_text("head\u{2029}forged row"), "headforged row");
         // Ordinary printable text (including non-ASCII) is left intact.
         assert_eq!(sanitize_terminal_text("café — label"), "café — label");
+    }
+
+    #[test]
+    fn resume_attached_form_names_dash_prefixed_ids() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The separated form still takes a following non-flag value…
+        assert_eq!(parse_args_from(argv(&["--resume", "sess-1"])).unwrap().resume.as_deref(), Some("sess-1"));
+        // …and no value means "pick one".
+        assert_eq!(parse_args_from(argv(&["--resume"])).unwrap().resume.as_deref(), Some(""));
+        // A dash-prefixed id is only addressable in the attached form: the
+        // separated form would leave `-sess` in the stream as an unknown flag.
+        assert_eq!(parse_args_from(argv(&["--resume=-sess"])).unwrap().resume.as_deref(), Some("-sess"));
+        assert!(parse_args_from(argv(&["--resume", "-sess"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_trajectory_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently running the
+        // trajectory branch and ignoring the requested session list.
+        assert!(parse_args_from(argv(&["--list-sessions", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--list-sessions", "--json"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_resume_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently printing the
+        // list and ignoring the requested resume, regardless of order or
+        // whether `--resume` carries an explicit id.
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "sess-1", "--list-sessions"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each action mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        assert!(parse_args_from(argv(&["--acp"])).is_ok());
+        // …but combining `--list-sessions` with any of them is rejected rather
+        // than silently performing one action (login first, or the listing
+        // before `--list-models`/`--acp`) and ignoring the other.
+        assert!(parse_args_from(argv(&["--list-sessions", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--acp"])).is_err());
+        assert!(parse_args_from(argv(&["--acp", "--list-sessions"])).is_err());
+    }
+
+    #[test]
+    fn resume_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // `--resume` (bare picker or explicit id) and each other action mode on
+        // their own parse fine…
+        assert!(parse_args_from(argv(&["--resume"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        // …but combining `--resume` with `--login`, `--trajectory`, or
+        // `--list-models` is rejected rather than silently running that mode
+        // (each dispatches before the resume branch) and ignoring the resume.
+        assert!(parse_args_from(argv(&["--resume", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--login", "github-copilot", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--resume"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-models", "openai", "--resume=sess-1"])).is_err());
+        // `--acp` stays compatible with an explicit `--resume <id>` (the session
+        // is loaded before serving ACP requests); only a bare picker `--resume`
+        // is rejected there (in `main`, not parse_args).
+        assert!(parse_args_from(argv(&["--acp", "--resume", "sess-1"])).is_ok());
     }
 
     #[test]

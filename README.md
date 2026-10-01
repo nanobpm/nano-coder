@@ -155,6 +155,8 @@ src/
 ├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
+├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
+├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
 ├── ui.rs        # Verbosity levels and the streaming output renderer
@@ -340,6 +342,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt with the frame renderer: invoked mid-turn (while a turn runs) or under the legacy renderer it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -357,9 +360,32 @@ cargo run
 cargo run -- --model anthropic/claude-sonnet-4-5
 cargo run -- --model ollama/qwen2.5:1.5b
 cargo run -- --resume sess-20260923T012518-7e7923f8
+cargo run -- --resume        # pick a session
+cargo run -- --resume last   # the most recent session in this directory
 ```
 
-Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
+**Resuming.** `--resume` without an ID opens a picker of this directory's saved sessions, most
+recently used first. Each row shows when the session was last used, its project (the last part of
+its directory), how many prompts it has, and its last prompt. When the last prompt says little
+("do it"), the row also shows the more telling prompt before it. Type to filter, Enter to resume,
+Esc to cancel. The last entry shows sessions from every directory. At the prompt, `/resume` does the same without restarting. Sessions with no prompts are
+left out. Sessions from before this feature don't record their directory: they are shown in every
+directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
+`--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
+
+The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
+end of each turn. It is only a cache. A session that is missing from it, or whose log changed
+since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
+
+**Titles.** With `session_titles = true`, once a session has a prompt that says something (not
+just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
+`title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
+tried at most once per session per run (so a failed or deleted title is retried after a restart,
+not on the next turn). The picker then shows `title · last prompt`. Titles live only in the index,
+so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
+asks again on the session's next turn.
+
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
@@ -381,6 +407,8 @@ system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
+session_titles = false                  # ask the model for a few-word title per session (--resume picker)
+# title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)

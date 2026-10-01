@@ -27,6 +27,11 @@ pub struct Config {
     pub max_iterations: usize,
     /// Persist conversations as JSONL session logs.
     pub persist_sessions: bool,
+    /// Ask the model for a few-word title for each session (shown by the
+    /// `--resume` picker). Off by default: it costs a small extra request.
+    pub session_titles: bool,
+    /// `provider/model` for session titles (default: the session's model).
+    pub title_model: Option<String>,
     /// Session log directory (default: platform data dir/nano-coder/sessions).
     pub session_dir: Option<PathBuf>,
     /// Default timeout for the bash tool, in seconds.
@@ -121,6 +126,8 @@ impl Default for Config {
             base_url: None,
             max_iterations: 0,
             persist_sessions: true,
+            session_titles: false,
+            title_model: None,
             session_dir: None,
             bash_timeout_secs: crate::bash::DEFAULT_TIMEOUT_SECS,
             providers: HashMap::new(),

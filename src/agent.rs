@@ -453,6 +453,11 @@ pub struct Agent {
     spill_dir: Arc<RwLock<std::path::PathBuf>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
+    /// Session-log size when the current turn began; the session-index update
+    /// in `finish_turn` folds the input records committed since into the
+    /// cached summary (from the log's tail) instead of rescanning the whole
+    /// log.
+    turn_log_offset: Option<u64>,
     /// Whether a real smart-compaction summary is in context, gating the
     /// history tools. Tracked explicitly (set by compaction, restored from the
     /// replace record's mode) rather than sniffed from message text, so a user
@@ -475,7 +480,17 @@ pub struct Agent {
     /// promptly; a `writable` flip (plan-mode toggle) rebuilds once to vary the
     /// save guidance.
     memory_index_cache: Option<(bool, String)>,
+    /// Session IDs a title has already been requested for in this process, so
+    /// a title is asked for at most once per session per process even as the
+    /// agent switches between sessions (A → B → A) before the background task
+    /// stores A's title (see `request_title`).
+    titles_requested: HashSet<String>,
 }
+
+/// System prompt for session titles (`session_titles = true`).
+const TITLE_PROMPT: &str = "You name coding-assistant sessions. Reply with a title of at most six words \
+that says what the user is working on, from their requests below. Reply with the title only: no quotes, \
+no trailing period.";
 
 /// Upper bound on context-window detection at startup and model switches.
 const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -515,8 +530,10 @@ impl Agent {
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
+            turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
+            titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
         }
@@ -575,6 +592,51 @@ impl Agent {
         }
         let client = Self::client_for(&config, &config.model)?;
         Ok(Self::new(client, config))
+    }
+
+    /// With `session_titles` on, ask the model (`title_model`, else the
+    /// session's) for a title in the background, once the session has a
+    /// telling prompt and no title yet. Failures are silent: the request is
+    /// tried again in a later run.
+    fn request_title(&mut self, path: std::path::PathBuf, summary: &crate::session_index::Summary) {
+        if !self.config.session_titles || self.titles_requested.contains(&summary.id) || summary.title.is_some() {
+            return;
+        }
+        let Some(source) = crate::session_index::title_source(summary) else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        // The fallback is the model actually serving this session (the live
+        // client's resolved provider/model), not `config.model` re-resolved:
+        // a bare or provider-only spec would re-resolve against a provider
+        // default a `/settings` visit may have edited without switching the
+        // live client (see `settings.rs`), picking a different model.
+        let spec = self
+            .config
+            .title_model
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", self.client.provider_name(), self.client.model_name()));
+        let config = self.config.clone();
+        self.titles_requested.insert(summary.id.clone());
+        runtime.spawn(async move {
+            // Client setup can run a configured `api_key_command` via a
+            // blocking `Command::output`, so it belongs off the turn path:
+            // build it inside the task, on the blocking pool.
+            let Ok(client) = tokio::task::spawn_blocking(move || Self::client_for(&config, &spec))
+                .await
+                .unwrap_or_else(|join| Err(anyhow::anyhow!("title client setup: {join}")))
+            else {
+                return;
+            };
+            let messages = [Message::system(TITLE_PROMPT), Message::user(&source)];
+            // Room for reasoning models that think before answering.
+            let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(400) };
+            let reply = tokio::time::timeout(Duration::from_secs(60), client.chat(&request)).await;
+            if let Ok(Ok(response)) = reply
+                && let Some(title) = crate::session_index::clean_title(&response.content)
+                && let Ok(false) = crate::session_index::set_title(&path, &title)
+            {
+                // Another process titled the session first; keep that one.
+            }
+        });
     }
 
     fn client_for(config: &Config, spec: &str) -> Result<Box<dyn LLMClient>> {
@@ -1016,7 +1078,9 @@ impl Agent {
         // instructions, skills, mode, memory scope) intact instead of detaching
         // the agent from it.
         let session = if self.config.persist_sessions {
-            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
+            let cwd = std::env::current_dir().ok().map(|d| d.display().to_string());
+            let model = Some(format!("{}/{}", self.client.provider_name(), self.client.model_name()));
+            let mut log = SessionLog::create_with(&self.config.session_dir(), &id, cwd, model)?;
             log.append(&Record::Message(system.clone()))?;
             Some(log)
         } else {
@@ -1064,8 +1128,26 @@ impl Agent {
 
     /// Resume a persisted session.
     pub fn load_session(&mut self, id: &str) -> Result<()> {
-        let (log, restored) = SessionLog::open(&self.config.session_dir(), id)?;
-        self.conversation = restored.conversation;
+        let (mut log, mut restored) = SessionLog::open(&self.config.session_dir(), id)?;
+        // Stage the repair on a scratch conversation and append its records
+        // *before* committing any agent state: when this append fails (a full
+        // disk, say), the load reports an error with this process still in
+        // the previous session instead of switched over with the renderer
+        // left on the old transcript. The conversation is moved out of
+        // `restored` rather than cloned: the original is never read again, so
+        // a load never holds two copies of a potentially large history.
+        let mut staged = std::mem::take(&mut restored.conversation);
+        let mut repairs = Self::repair_dangling_tool_calls_on(&staged);
+        for message in &mut repairs {
+            // Stamp and number each repair exactly like `push` does, so the
+            // repaired result keeps its event time (for `/trajectory`) and its
+            // persisted `#N` (for citations) without waiting for a reload.
+            message.timestamp.get_or_insert_with(session::now);
+            let line = log.append(&Record::Message(message.clone()))?;
+            message.log_line.get_or_insert(line);
+        }
+        staged.extend(repairs);
+        self.conversation = staged;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
         // Rekey memory to the session cwd (ACP applies it before this runs), so
@@ -1089,6 +1171,11 @@ impl Agent {
         self.completed_outcomes = restored.outcomes;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
+        // Reminders belong to the session being left (`/resume` mid-process).
+        self.reminders = Reminders::default();
+        // `titles_requested` is deliberately not reset: it tracks which
+        // sessions this process already asked to title, so switching
+        // A → B → A does not launch a second (paid) title request for A.
         self.session = Some(log);
         self.session_id = Some(id.to_string());
         self.set_spill_dir(id);
@@ -1105,37 +1192,42 @@ impl Agent {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
             // made after the load, not ones left over from a prior session in
-            // this same agent. Mirrors `new_session`.
+            // this same agent. Mirrors `new_session`, including the token
+            // totals (only nonzero when `/resume` switches sessions).
             let mut stats = self.stats.lock().unwrap();
+            stats.session_input_tokens = 0;
+            stats.session_output_tokens = 0;
+            stats.session_aic = None;
+            stats.compactions = 0;
             stats.history_searches = 0;
             stats.history_reads = 0;
         }
-        self.repair_dangling_tool_calls()?;
-        // The mode was already reset to the default before the system prompt
-        // was rendered above, so the memory index guidance is correct.
+        // Tool-call repair ran on the staged conversation above; the mode was
+        // already reset to the default before the system prompt was rendered
+        // above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(())
     }
 
-    /// Give every tool call without a result a synthetic error result, so the
-    /// conversation is valid for providers that require paired results.
-    fn repair_dangling_tool_calls(&mut self) -> Result<()> {
-        let Some(index) = self.conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    /// Append a synthetic error result for every tool call without one, so the
+    /// conversation is valid for providers that require paired results. Pure:
+    /// `load_session` persists the returned repairs (stamped and numbered like
+    /// `push` does) *before* committing the conversation, so a failed repair
+    /// write cannot leave the agent switched while the UI still shows the
+    /// previous session.
+    fn repair_dangling_tool_calls_on(conversation: &[Message]) -> Vec<Message> {
+        let Some(index) = conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
         else {
-            return Ok(());
+            return Vec::new();
         };
         let answered: HashSet<&str> =
-            self.conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
-        let missing: Vec<Message> = self.conversation[index]
+            conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+        conversation[index]
             .tool_calls
             .iter()
             .filter(|call| !answered.contains(call.id.as_str()))
             .map(|call| Message::tool_error(&call.id, &call.name, INTERRUPTED_TOOL_RESULT))
-            .collect();
-        for message in missing {
-            self.push(message)?;
-        }
-        Ok(())
+            .collect()
     }
 
     fn push(&mut self, mut message: Message) -> Result<()> {
@@ -1415,6 +1507,11 @@ impl Agent {
         self.reminders.start_turn();
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
+        // Log size before this turn's records: the session-index update in
+        // `finish_turn` folds the input records committed by this turn into
+        // the cached summary (from the log's tail) instead of rescanning the
+        // whole log.
+        self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
         let input_id = match input_id {
             Some(id) => id.to_string(),
@@ -1905,6 +2002,18 @@ impl Agent {
                 history_calls: self.turn_history_calls,
                 recorded_at: session::now(),
             })?;
+            // Keep the `--resume` picker's summary current. Only a cache:
+            // the picker rebuilds a missing or stale summary from the log.
+            let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+            let from = self.turn_log_offset.unwrap_or(0);
+            // `update` folds every input record committed to the log since
+            // `from` straight from the log's tail, so a resumed pending input
+            // (which lies before `from`) is never recounted and a concurrent
+            // writer's prompt (after `from`) is never lost.
+            if let Ok(summary) = crate::session_index::update(log.path(), from, Some(model)) {
+                let path = log.path().to_path_buf();
+                self.request_title(path, &summary);
+            }
         }
         match &outcome {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
@@ -2918,6 +3027,135 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn titles_sessions_once_a_prompt_says_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two"), text("three")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.title_model = Some("mock/titler".into());
+        agent.new_session().unwrap();
+        let title = |dir: &std::path::Path| crate::session_index::list(dir).unwrap()[0].title.clone();
+
+        agent.send_input(None, "hi").await.unwrap();
+        assert!(agent.titles_requested.is_empty(), "a terse first prompt is not enough to name the session");
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(!agent.titles_requested.is_empty());
+        let mut found = None;
+        for _ in 0..50 {
+            found = title(dir.path());
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let found = found.expect("the title arrives in the index");
+        // The seven-word mock reply is held to six words (see `clean_title`).
+        assert_eq!(found, "This is a mock response from…", "{found}");
+        // Later turns keep it (the per-turn summary carries it over).
+        agent.send_input(None, "and the release notes").await.unwrap();
+        assert_eq!(title(dir.path()), Some(found));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_title_fallback_uses_the_sessions_live_model() {
+        // With no `title_model` configured the title request must fall back to
+        // the model actually serving this session (the live client's resolved
+        // provider/model), not `config.model` re-resolved. Here `config.model`
+        // is the bare provider `ollama`, which has no `default_model`, so
+        // re-resolving it fails to build a client and the title is silently
+        // skipped. The live client (`test/scripted`) resolves to a mock, so
+        // the session still gets titled.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.model = "ollama".into();
+        assert_eq!(agent.model_name(), "scripted");
+        assert!(agent.config.title_model.is_none());
+        agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        let mut found = None;
+        for _ in 0..50 {
+            found =
+                crate::session_index::list(dir.path()).ok().and_then(|s| s.into_iter().next()).and_then(|s| s.title);
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            found.is_some(),
+            "the fallback titled the session from the live model, not the unresolvable config.model"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_title_is_requested_at_most_once_per_session_across_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two")], dir.path());
+        agent.config.session_titles = true;
+        agent.config.title_model = Some("mock/titler".into());
+        let a = agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(agent.titles_requested.contains(&a));
+        // Switching A → B → A must not forget that A was already requested:
+        // loading a session no longer clears the per-process set, so A cannot
+        // launch a second paid title request before its first one lands.
+        let _b = agent.new_session().unwrap();
+        agent.load_session(&a).unwrap();
+        assert!(agent.titles_requested.contains(&a), "A stays requested across the switch");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_titles_unless_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_input(None, "Fix the flaky deploy test in CI").await.unwrap();
+        assert!(agent.titles_requested.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_sessions_in_process_resets_totals_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two")], dir.path());
+        let a = agent.new_session().unwrap();
+        agent.send_input(None, "alpha question here").await.unwrap();
+        let b = agent.new_session().unwrap();
+        agent.send_input(None, "beta question here").await.unwrap();
+        agent.stats.lock().unwrap().session_input_tokens = 99;
+        {
+            // Seed every counter `load_session` resets so each reset is
+            // actually exercised, not just the input-token one.
+            let mut stats = agent.stats.lock().unwrap();
+            stats.session_output_tokens = 77;
+            stats.session_aic = Some(1.25);
+            stats.compactions = 2;
+            stats.history_searches = 3;
+            stats.history_reads = 4;
+        }
+
+        // `/resume` mid-process: back to A, with B's totals gone.
+        agent.load_session(&a).unwrap();
+        assert_eq!(agent.session_id(), Some(a.as_str()));
+        assert!(agent.conversation.iter().any(|m| m.content == "alpha question here"));
+        assert!(!agent.conversation.iter().any(|m| m.content == "beta question here"));
+        {
+            let stats = agent.stats.lock().unwrap();
+            assert_eq!(stats.session_input_tokens, 0);
+            assert_eq!(stats.session_output_tokens, 0);
+            assert_eq!(stats.session_aic, None);
+            assert_eq!(stats.compactions, 0);
+            assert_eq!(stats.history_searches, 0);
+            assert_eq!(stats.history_reads, 0);
+        }
+
+        // Each finished turn updated the picker's index.
+        let sessions = crate::session_index::list(dir.path()).unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()), "{ids:?}");
+        assert!(sessions.iter().all(|s| s.cwd.is_some() && s.model.is_some()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn repairs_interrupted_turns_on_resume() {
         let dir = tempfile::tempdir().unwrap();
         let id = "sess-crash";
@@ -2940,11 +3178,82 @@ mod tests {
 
         let (mut agent, seen) = agent(vec![text("recovered")], dir.path());
         agent.load_session(id).unwrap();
-        assert_eq!(unstamped(&agent.conversation()[3]), Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
+        let repaired = &agent.conversation()[3];
+        assert_eq!(unstamped(repaired), Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
+        // The repair is stamped and numbered like a `push`: `/trajectory` can
+        // show its event time and citations can use its persisted `#N`
+        // without waiting for a reload.
+        assert!(repaired.timestamp.is_some());
+        assert_eq!(repaired.log_line, Some(6));
         // Redelivering the interrupted input resumes without duplicating the user message.
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "recovered");
         let request = &seen.lock().unwrap()[0];
         assert_eq!(request.iter().filter(|m| m.role == Role::User).count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_repair_on_resume_leaves_the_live_session_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // The live session the agent is currently in.
+        let (mut agent, _) = agent(vec![text("one")], dir.path());
+        let live = agent.new_session().unwrap();
+        assert_eq!(agent.send_input(Some("msg-1"), "hello").await.unwrap(), "one");
+        let live_len = agent.conversation_length();
+
+        // A crashed session on disk whose resume needs a (fallible) repair append.
+        let crashed = "sess-readonly";
+        let mut log = SessionLog::create(dir.path(), crashed).unwrap();
+        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Input { id: "m1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Message::user("run it"))).unwrap();
+        log.append(&Record::Message(Message::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c9".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+        )))
+        .unwrap();
+        drop(log);
+        // Make the crashed session's log read-only so the repair append fails.
+        let log_path = dir.path().join(format!("{crashed}.jsonl"));
+        let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&log_path, perms).unwrap();
+
+        // The switch must fail and leave the agent in its prior live session,
+        // not half-switched into the crashed one.
+        assert!(agent.load_session(crashed).is_err());
+        assert_eq!(agent.session_id(), Some(live.as_str()));
+        assert_eq!(agent.conversation_length(), live_len);
+
+        // Restore writability so the tempdir cleanup (and any retry) works.
+        let mut perms = std::fs::metadata(&log_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&log_path, perms).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumed_pending_input_is_not_folded_into_the_index_twice() {
+        // An interrupted session whose pending input is already in the log:
+        // resuming and finishing that turn must not fold the prompt into the
+        // session-index summary again (the cache already covers it).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(dir.path(), "sess", vec![]);
+        // The picker/listing indexes the interrupted log before the resume.
+        assert_eq!(crate::session_index::list(dir.path()).unwrap()[0].prompts, 1);
+
+        let (mut agent, _) = agent(vec![text("done")], dir.path());
+        agent.load_session("sess").unwrap();
+        assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "done");
+
+        let sessions = crate::session_index::list(dir.path()).unwrap();
+        assert_eq!(sessions[0].prompts, 1, "the resumed input is counted once, not folded again");
+        assert_eq!(sessions[0].last_prompt.as_deref(), Some("run it"));
     }
 
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
