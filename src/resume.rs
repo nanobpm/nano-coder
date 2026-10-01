@@ -21,10 +21,11 @@ pub fn in_dir<'a>(sessions: &'a [Summary], cwd: &str) -> Vec<&'a Summary> {
     sessions.iter().filter(|s| s.cwd.as_deref().is_none_or(|c| c == cwd)).collect()
 }
 
-/// The most recent session that ran in `cwd` (`--resume last`).
-pub fn last(dir: &Path, cwd: &str) -> Result<String> {
+/// The most recent session that ran in `cwd` (`--resume last`), other than
+/// `exclude` (the session in use, for `/resume last`).
+pub fn last(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<String> {
     let sessions = session_index::list(dir)?;
-    match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd)) {
+    match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd) && Some(s.id.as_str()) != exclude) {
         Some(session) => Ok(session.id.clone()),
         None => bail!("no saved session for {}; run with --resume to pick one", crate::sanitize_terminal_text(cwd)),
     }
@@ -271,7 +272,15 @@ fn interactive_pick(
         lines.push(prompt_line);
         for (pos, &item) in filtered.iter().enumerate().skip(top).take(window) {
             let mut rendered = String::new();
-            Theme::format_fuzzy_select_prompt_item(theme, &mut rendered, &items[item], pos == sel, true, &matcher, &search)?;
+            Theme::format_fuzzy_select_prompt_item(
+                theme,
+                &mut rendered,
+                &items[item],
+                pos == sel,
+                true,
+                &matcher,
+                &search,
+            )?;
             lines.push(rendered);
         }
         drawn = 0;
@@ -323,21 +332,55 @@ pub fn row(summary: &Summary, now: DateTime<FixedOffset>, width: usize) -> Strin
     truncate(&line, width)
 }
 
-/// Let the user pick a session in the terminal: this directory's sessions
-/// first, with an entry to show all. `None` when cancelled or there is
-/// nothing to resume.
-pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
+/// A row prefixed with the session ID, for plain lists.
+fn id_row(summary: &Summary, now: DateTime<FixedOffset>) -> String {
+    // The id comes from a log header, which a crafted log can fill with
+    // control characters; sanitize it for the terminal (JSON stays raw).
+    format!("{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100))
+}
+
+/// Plain list rows (with IDs) of this directory's sessions, for `/resume`
+/// without a terminal. `exclude` (the session in use) is left out, as in
+/// `pick` and `last`.
+pub fn list_rows(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Vec<String>> {
     let sessions = session_index::list(dir)?;
+    let now = crate::session::now();
+    Ok(in_dir(&sessions, cwd).into_iter().filter(|s| Some(s.id.as_str()) != exclude).map(|s| id_row(s, now)).collect())
+}
+
+/// Let the user pick a session in the terminal: this directory's sessions
+/// first, with an entry to show all. `exclude` (the session in use) is left
+/// out. `None` when cancelled or there is nothing to resume.
+pub fn pick(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Option<String>> {
+    Ok(match pick_outcome(dir, cwd, exclude)? {
+        Pick::Selected(id) => Some(id),
+        Pick::Cancelled | Pick::Empty => None,
+    })
+}
+
+/// The picker result with the reason there is no selection: `Cancelled` is
+/// Esc, `Empty` is "no saved sessions to resume" (nothing was ever shown).
+/// Callers that repaint over the picker's stderr notice use this to keep the
+/// two outcomes distinct.
+pub enum Pick {
+    Selected(String),
+    Cancelled,
+    Empty,
+}
+
+/// [`pick`], but reports *why* there is no selection.
+pub fn pick_outcome(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Pick> {
+    let mut sessions = session_index::list(dir)?;
+    sessions.retain(|s| Some(s.id.as_str()) != exclude);
     if sessions.is_empty() {
         eprintln!("No saved sessions to resume.");
-        return Ok(None);
+        return Ok(Pick::Empty);
     }
     let now = crate::session::now();
     // The picker draws on stderr (console) and is gated on stdin/stderr being
     // terminals, so measure the stderr terminal — stdout may be redirected, and
     // its size would not reflect where the rows are drawn.
-    let (rows, cols) =
-        crate::status::stderr_terminal_size().map_or((24, 100), |(r, c)| (r as usize, c as usize));
+    let (rows, cols) = crate::status::stderr_terminal_size().map_or((24, 100), |(r, c)| (r as usize, c as usize));
     // Fit each row to the available width (less the picker's own marker and
     // padding) so none is wider than the terminal, even a narrow one.
     let width = cols.saturating_sub(4);
@@ -372,9 +415,9 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
             format!("Resume which session in {}? (type to filter, Esc to cancel)", crate::sanitize_terminal_text(cwd))
         };
         match interactive_pick(&prompt, &theme, &items, rows, cols, max_visible)? {
-            None => return Ok(None),
+            None => return Ok(Pick::Cancelled),
             Some(i) if i == shown.len() => show_all = true,
-            Some(i) => return Ok(Some(shown[i].id.clone())),
+            Some(i) => return Ok(Pick::Selected(shown[i].id.clone())),
         }
     }
 }
@@ -406,9 +449,9 @@ pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
     }
     let now = crate::session::now();
     for summary in shown {
-        // The id comes from a log header, which a crafted log can fill with
-        // control characters; sanitize it for the terminal (JSON stays raw).
-        let line = writeln!(out, "{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100));
+        // id_row sanitizes the id, which comes from a log header a crafted log
+        // can fill with control characters (JSON stays raw).
+        let line = writeln!(out, "{}", id_row(summary, now));
         match line {
             Ok(()) => {}
             // Only a closed pipe ends the listing quietly; other write errors
@@ -579,7 +622,7 @@ mod tests {
     fn errors_and_plain_ids_drop_control_characters() {
         // `--resume last` from a crafted directory name cannot inject escapes.
         let dir = tempfile::tempdir().unwrap();
-        let err = last(dir.path(), "/work/evil\u{1b}[2J").unwrap_err().to_string();
+        let err = last(dir.path(), "/work/evil\u{1b}[2J", None).unwrap_err().to_string();
         assert!(err.contains("no saved session for /work/evil[2J"), "{err}");
         assert!(!err.contains('\u{1b}'), "{err}");
         // A crafted session id is sanitized by the same helper for plain output.
@@ -603,7 +646,39 @@ mod tests {
         let mut log = SessionLog::create_with(dir.path(), "s", Some("/a".into()), None).unwrap();
         let input = Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
         log.append(&input).unwrap();
-        assert_eq!(last(dir.path(), "/a").unwrap(), "s");
-        assert!(last(dir.path(), "/b").unwrap_err().to_string().contains("no saved session for /b"));
+        assert_eq!(last(dir.path(), "/a", None).unwrap(), "s");
+        assert!(last(dir.path(), "/a", Some("s")).is_err(), "the session in use is skipped");
+        assert!(last(dir.path(), "/b", None).unwrap_err().to_string().contains("no saved session for /b"));
+    }
+
+    #[test]
+    fn list_rows_skips_the_session_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["s", "t"] {
+            let mut log = SessionLog::create_with(dir.path(), id, Some("/a".into()), None).unwrap();
+            let input =
+                Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
+            log.append(&input).unwrap();
+        }
+        let rows = list_rows(dir.path(), "/a", None).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let rows = list_rows(dir.path(), "/a", Some("s")).unwrap();
+        assert_eq!(rows.len(), 1, "the session in use is left out: {rows:?}");
+        assert!(rows[0].starts_with("t  "), "{rows:?}");
+    }
+
+    #[test]
+    fn pick_outcome_reports_empty_apart_from_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing saved at all: `Empty`, so the caller can say *why* instead
+        // of the bare "Session unchanged" an Esc gets.
+        assert!(matches!(pick_outcome(dir.path(), "/a", None).unwrap(), Pick::Empty));
+        let mut log = SessionLog::create_with(dir.path(), "s", Some("/a".into()), None).unwrap();
+        let input = Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
+        log.append(&input).unwrap();
+        // The only saved session is the one in use: still `Empty`.
+        assert!(matches!(pick_outcome(dir.path(), "/a", Some("s")).unwrap(), Pick::Empty));
+        // The Option-based wrapper keeps mapping both to `None`.
+        assert_eq!(pick(dir.path(), "/a", Some("s")).unwrap(), None);
     }
 }

@@ -1072,8 +1072,26 @@ impl Agent {
 
     /// Resume a persisted session.
     pub fn load_session(&mut self, id: &str) -> Result<()> {
-        let (log, restored) = SessionLog::open(&self.config.session_dir(), id)?;
-        self.conversation = restored.conversation;
+        let (mut log, mut restored) = SessionLog::open(&self.config.session_dir(), id)?;
+        // Stage the repair on a scratch conversation and append its records
+        // *before* committing any agent state: when this append fails (a full
+        // disk, say), the load reports an error with this process still in
+        // the previous session instead of switched over with the renderer
+        // left on the old transcript. The conversation is moved out of
+        // `restored` rather than cloned: the original is never read again, so
+        // a load never holds two copies of a potentially large history.
+        let mut staged = std::mem::take(&mut restored.conversation);
+        let mut repairs = Self::repair_dangling_tool_calls_on(&staged);
+        for message in &mut repairs {
+            // Stamp and number each repair exactly like `push` does, so the
+            // repaired result keeps its event time (for `/trajectory`) and its
+            // persisted `#N` (for citations) without waiting for a reload.
+            message.timestamp.get_or_insert_with(session::now);
+            let line = log.append(&Record::Message(message.clone()))?;
+            message.log_line.get_or_insert(line);
+        }
+        staged.extend(repairs);
+        self.conversation = staged;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
         // Rekey memory to the session cwd (ACP applies it before this runs), so
@@ -1097,6 +1115,8 @@ impl Agent {
         self.completed_outcomes = restored.outcomes;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
+        // Reminders belong to the session being left (`/resume` mid-process).
+        self.reminders = Reminders::default();
         self.session = Some(log);
         self.session_id = Some(id.to_string());
         self.set_spill_dir(id);
@@ -1113,37 +1133,42 @@ impl Agent {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
             // made after the load, not ones left over from a prior session in
-            // this same agent. Mirrors `new_session`.
+            // this same agent. Mirrors `new_session`, including the token
+            // totals (only nonzero when `/resume` switches sessions).
             let mut stats = self.stats.lock().unwrap();
+            stats.session_input_tokens = 0;
+            stats.session_output_tokens = 0;
+            stats.session_aic = None;
+            stats.compactions = 0;
             stats.history_searches = 0;
             stats.history_reads = 0;
         }
-        self.repair_dangling_tool_calls()?;
-        // The mode was already reset to the default before the system prompt
-        // was rendered above, so the memory index guidance is correct.
+        // Tool-call repair ran on the staged conversation above; the mode was
+        // already reset to the default before the system prompt was rendered
+        // above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(())
     }
 
-    /// Give every tool call without a result a synthetic error result, so the
-    /// conversation is valid for providers that require paired results.
-    fn repair_dangling_tool_calls(&mut self) -> Result<()> {
-        let Some(index) = self.conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    /// Append a synthetic error result for every tool call without one, so the
+    /// conversation is valid for providers that require paired results. Pure:
+    /// `load_session` persists the returned repairs (stamped and numbered like
+    /// `push` does) *before* committing the conversation, so a failed repair
+    /// write cannot leave the agent switched while the UI still shows the
+    /// previous session.
+    fn repair_dangling_tool_calls_on(conversation: &[Message]) -> Vec<Message> {
+        let Some(index) = conversation.iter().rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
         else {
-            return Ok(());
+            return Vec::new();
         };
         let answered: HashSet<&str> =
-            self.conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
-        let missing: Vec<Message> = self.conversation[index]
+            conversation[index + 1..].iter().filter_map(|m| m.tool_call_id.as_deref()).collect();
+        conversation[index]
             .tool_calls
             .iter()
             .filter(|call| !answered.contains(call.id.as_str()))
             .map(|call| Message::tool_error(&call.id, &call.name, INTERRUPTED_TOOL_RESULT))
-            .collect();
-        for message in missing {
-            self.push(message)?;
-        }
-        Ok(())
+            .collect()
     }
 
     fn push(&mut self, mut message: Message) -> Result<()> {
@@ -2940,6 +2965,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn switching_sessions_in_process_resets_totals_and_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("one"), text("two")], dir.path());
+        let a = agent.new_session().unwrap();
+        agent.send_input(None, "alpha question here").await.unwrap();
+        let b = agent.new_session().unwrap();
+        agent.send_input(None, "beta question here").await.unwrap();
+        agent.stats.lock().unwrap().session_input_tokens = 99;
+        {
+            // Seed every counter `load_session` resets so each reset is
+            // actually exercised, not just the input-token one.
+            let mut stats = agent.stats.lock().unwrap();
+            stats.session_output_tokens = 77;
+            stats.session_aic = Some(1.25);
+            stats.compactions = 2;
+            stats.history_searches = 3;
+            stats.history_reads = 4;
+        }
+
+        // `/resume` mid-process: back to A, with B's totals gone.
+        agent.load_session(&a).unwrap();
+        assert_eq!(agent.session_id(), Some(a.as_str()));
+        assert!(agent.conversation.iter().any(|m| m.content == "alpha question here"));
+        assert!(!agent.conversation.iter().any(|m| m.content == "beta question here"));
+        {
+            let stats = agent.stats.lock().unwrap();
+            assert_eq!(stats.session_input_tokens, 0);
+            assert_eq!(stats.session_output_tokens, 0);
+            assert_eq!(stats.session_aic, None);
+            assert_eq!(stats.compactions, 0);
+            assert_eq!(stats.history_searches, 0);
+            assert_eq!(stats.history_reads, 0);
+        }
+
+        // Each finished turn updated the picker's index.
+        let sessions = crate::session_index::list(dir.path()).unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()), "{ids:?}");
+        assert!(sessions.iter().all(|s| s.cwd.is_some() && s.model.is_some()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn repairs_interrupted_turns_on_resume() {
         let dir = tempfile::tempdir().unwrap();
         let id = "sess-crash";
@@ -2962,7 +3029,13 @@ mod tests {
 
         let (mut agent, seen) = agent(vec![text("recovered")], dir.path());
         agent.load_session(id).unwrap();
-        assert_eq!(unstamped(&agent.conversation()[3]), Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
+        let repaired = &agent.conversation()[3];
+        assert_eq!(unstamped(repaired), Message::tool_error("c9", "echo", INTERRUPTED_TOOL_RESULT));
+        // The repair is stamped and numbered like a `push`: `/trajectory` can
+        // show its event time and citations can use its persisted `#N`
+        // without waiting for a reload.
+        assert!(repaired.timestamp.is_some());
+        assert_eq!(repaired.log_line, Some(6));
         // Redelivering the interrupted input resumes without duplicating the user message.
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "recovered");
         let request = &seen.lock().unwrap()[0];
