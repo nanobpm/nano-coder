@@ -547,6 +547,17 @@ impl Terminal {
             // now-active frame — no separate per-event tap is needed (a tap via
             // `replay_event` would no-op here: it early-returns while the frame
             // is active).
+            //
+            // DOCUMENTED LIMITATION: only `drain_pending` (deferred notes + the
+            // collapsed reasoning summary) migrates into the frame here.
+            // Transient legacy output that `print_block`/`print_raw` wrote
+            // straight to scrollback in legacy mode — `/help`, the banner, raw
+            // JSON exports — was never recorded, so it is erased when the
+            // frame's first redraw clears scrollback. Keeping a renderer-owned
+            // ordered transcript in BOTH modes and replaying it here without
+            // duplicating the conversation entries `replay_history` re-derives
+            // is a substantial redesign with real double-print hazards; we
+            // accept the incidental loss on a live legacy → frame switch.
             self.renderer.push_items(pending);
             self.renderer.frame_batch(|| agent.replay_history());
         } else if frame_was_active {

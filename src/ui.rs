@@ -758,6 +758,12 @@ impl Renderer {
     /// Emit command / informational output (e.g. slash-command replies). In
     /// frame mode it is captured as a transcript item so direct writes can't
     /// corrupt the owned frame; otherwise it prints inline as before.
+    ///
+    /// DOCUMENTED LIMITATION: in legacy mode this writes straight to scrollback
+    /// and is NOT recorded, so it does not survive a live legacy → frame switch
+    /// (the frame's first redraw clears scrollback and rebuilds only the
+    /// conversation). This is an accepted tradeoff — see the note at the
+    /// frame-entry path in `main.rs`.
     pub fn print_block(&self, text: &str) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
