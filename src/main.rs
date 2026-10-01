@@ -1046,6 +1046,16 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         if id.is_empty() {
             return "Usage: /memory forget <id>".to_string();
         }
+        // Plan mode is read-only: the tool path already refuses `memory_forget`
+        // (the dispatch backstop in `run_memory_tool`), but this slash command
+        // reaches `Store::forget` directly and would otherwise delete the
+        // persistent scope file mid-plan, bypassing the no-modification
+        // guarantee. Gate it on the live mode the same way (Copilot finding,
+        // src/main.rs).
+        if agent.mode() == crate::mode::AgentMode::Plan {
+            return "Memory is read-only in plan mode; /memory forget cannot delete entries."
+                .to_string();
+        }
         if !agent.config().memory.writable() {
             return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
         }
@@ -2100,5 +2110,68 @@ mod tests {
         // Unrelated args are not forget requests either.
         assert_eq!(parse_forget_id(""), None);
         assert_eq!(parse_forget_id("list"), None);
+    }
+
+    /// Minimal `LLMClient` for `memory_command` tests: the slash command never
+    /// calls the model, so a client that panics if it ever is suffices.
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LLMClient for NoModel {
+        async fn chat(&self, _: &crate::llm::ChatRequest<'_>) -> Result<crate::llm::LLMResponse> {
+            panic!("memory_command must not call the model")
+        }
+        fn model_name(&self) -> &str {
+            "none"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// A memory-enabled agent (user+project store under `dir`) for
+    /// `memory_command` tests.
+    fn memory_command_agent(dir: &std::path::Path) -> Agent {
+        let config = config::Config {
+            session_dir: Some(dir.join("sessions")),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory: config::MemoryMode::On,
+            memory_dir: Some(dir.join("memory")),
+            ..config::Config::default()
+        };
+        Agent::new(Box::new(NoModel), config)
+    }
+
+    #[test]
+    fn memory_forget_is_refused_in_plan_mode() {
+        // `/memory forget` reaches `Store::forget` directly, bypassing the tool
+        // dispatch that refuses `memory_forget` in Plan mode. It must gate on
+        // the live mode itself, or a mid-plan `/memory forget` would delete the
+        // persistent scope file despite Plan mode's read-only promise (Copilot
+        // finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+        let id = agent
+            .memory()
+            .unwrap()
+            .save(memory::Scope::User, "a fact to keep", None, None)
+            .unwrap()
+            .id;
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(msg.contains("plan mode"), "forget refused in plan mode: {msg}");
+        assert!(
+            agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "plan mode did not delete the entry"
+        );
+        // Leaving Plan mode lifts the gate: the same forget now succeeds.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(!msg.contains("plan mode"), "normal mode forgets: {msg}");
+        assert!(
+            !agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "normal mode deleted the entry"
+        );
     }
 }
