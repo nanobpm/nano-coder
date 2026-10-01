@@ -126,14 +126,42 @@ pub async fn run(
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
-        // `interact_opt` distinguishes Esc (Ok(None) → Done) from a genuine
-        // terminal I/O failure (Err), which must surface rather than be read as
-        // a normal exit. The nested selectors already do this; the top-level
-        // loop must too, so a failed read/write is not silently reported as a
-        // plain Done. Any retained notices ride along on the error path.
+        // `interact_opt` distinguishes Esc (Ok(None)) from a genuine terminal
+        // I/O failure (Err), which must surface rather than be read as a normal
+        // exit. The nested selectors already do this; the top-level loop must
+        // too, so a failed read/write is not silently reported as a plain Done.
+        // Any retained notices ride along on the error path.
+        //
+        // Esc is a plain Done: it must follow the SAME completion path as the
+        // explicit `Done` item, which offers to save when `changes.any()`.
+        // Returning early here would leave edits active only in memory without
+        // offering to persist them. `finish!` is that shared path (a macro, not
+        // a closure, so its `return` exits `run` from either call site).
+        macro_rules! finish {
+            () => {{
+                // Esc on the save confirm is a supported "no" (`interact_opt` →
+                // `Ok(None)`); only a genuine I/O failure is `Err` and surfaces.
+                let save = if changes.any() {
+                    match Confirm::new()
+                        .with_prompt(format!("Save changes to {}?", config_path.display()))
+                        .default(true)
+                        .interact_opt()
+                    {
+                        Ok(save) => save.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    }
+                } else {
+                    false
+                };
+                if save {
+                    save_and_report(agent.config(), &mut changes, config_path);
+                }
+                return (notices, Ok(()));
+            }};
+        }
         let selection = match Select::new().with_prompt("Select setting").items(&items).default(0).interact_opt() {
             Ok(Some(selection)) => selection,
-            Ok(None) => return (notices, Ok(())),
+            Ok(None) => finish!(),
             Err(e) => return (notices, Err(e.into())),
         };
         match selection {
@@ -294,26 +322,9 @@ pub async fn run(
                 }
             }
             9 => save_and_report(agent.config(), &mut changes, config_path),
-            _ => {
-                // Esc is a supported "no" (`interact_opt` → `Ok(None)`); only a
-                // genuine I/O failure is `Err` and must surface.
-                let save = if changes.any() {
-                    match Confirm::new()
-                        .with_prompt(format!("Save changes to {}?", config_path.display()))
-                        .default(true)
-                        .interact_opt()
-                    {
-                        Ok(save) => save.unwrap_or(false),
-                        Err(e) => return (notices, Err(e.into())),
-                    }
-                } else {
-                    false
-                };
-                if save {
-                    save_and_report(agent.config(), &mut changes, config_path);
-                }
-                return (notices, Ok(()));
-            }
+            // `Done` and Esc share the one completion path (`finish!`), so both
+            // offer to save when `changes.any()` before returning.
+            _ => finish!(),
         }
     }
 }
