@@ -634,7 +634,9 @@ sets the window). The window a server has *loaded* is preferred over the model's
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model
-call when usage passes the threshold. It won't run again until the context has grown by
+call when usage passes the threshold, or earlier if the prompt would leave less than the
+reserved output room (`MIN_OUTPUT_RESERVE`, plus an estimation margin) within the window.
+It won't run again until the context has grown by
 another 10% of the window, so a context that can't shrink isn't summarized on every call.
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.
