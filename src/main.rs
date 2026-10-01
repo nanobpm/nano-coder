@@ -1079,10 +1079,13 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         Err(e) => return format!("Could not read memory: {e}"),
     };
     if entries.is_empty() {
-        // Branch on writability: in read-only mode (including headless/ACP runs)
-        // the `memory_save` tool is unavailable, so pointing the user at it
-        // would describe an action the model cannot take.
-        return if agent.config().memory.writable() {
+        // Branch on *effective* writability: in read-only mode (including
+        // headless/ACP runs) *and in Plan mode* the `memory_save` tool is
+        // unavailable, so pointing the user at it would describe an action the
+        // model cannot take. `config().memory.writable()` alone stays `On` in
+        // Plan mode, so use `memory_writable()`, which also gates on the live
+        // mode (Copilot finding, src/main.rs).
+        return if agent.memory_writable() {
             format!(
                 "No memories yet. The model saves them with memory_save; files live under {}.",
                 store.root().display()
@@ -1100,7 +1103,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         if entries.len() == 1 { "y" } else { "ies" },
         agent.config().memory.as_str(),
         store.root().display(),
-        if agent.config().memory.writable() { ", or /memory forget <id>" } else { "" }
+        if agent.memory_writable() { ", or /memory forget <id>" } else { "" }
     )];
     for (scope, entry) in &entries {
         // Sanitise every interpolated field before it reaches the terminal: the
@@ -2173,5 +2176,39 @@ mod tests {
             !agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
             "normal mode deleted the entry"
         );
+    }
+
+    #[test]
+    fn memory_list_hints_gate_on_effective_plan_mode_writability() {
+        // In Plan mode the configured memory stays `On`, but `memory_save` is
+        // removed and `/memory forget` is refused. The `/memory` output must not
+        // advertise either: gate both the empty-list `memory_save` pointer and
+        // the populated-list `/memory forget <id>` hint on `memory_writable()`,
+        // which includes the live mode (Copilot finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+
+        // Empty memory, Plan mode: no `memory_save` suggestion.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("memory_save"), "plan-mode empty hint hides memory_save: {msg}");
+        // Normal mode restores the suggestion.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("memory_save"), "normal-mode empty hint offers memory_save: {msg}");
+
+        // Populated memory, Plan mode: no `/memory forget` hint.
+        agent
+            .memory()
+            .unwrap()
+            .save(memory::Scope::User, "a fact to keep", None, None)
+            .unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("/memory forget"), "plan-mode list hides forget hint: {msg}");
+        // Normal mode restores the hint.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("/memory forget"), "normal-mode list offers forget hint: {msg}");
     }
 }

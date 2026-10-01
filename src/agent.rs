@@ -1212,7 +1212,7 @@ impl Agent {
     /// writable *and* the agent must not be in plan mode, whose read-only tool
     /// gating drops `memory_save`. The memory index guidance uses this so a
     /// plan-mode prompt never advertises an unavailable tool.
-    fn memory_writable(&self) -> bool {
+    pub fn memory_writable(&self) -> bool {
         self.config.memory.writable() && self.control.mode() != crate::mode::AgentMode::Plan
     }
 

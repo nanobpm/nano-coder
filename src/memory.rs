@@ -1632,7 +1632,7 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // classifier's explicit avoidance of `tokenizer`/`secretary`. Anchoring
     // keeps `DB_TOKEN=…`, `API key: …`, `PASSWORDS=…` matched while
     // `tokenizer`/`secretary` are not (Copilot finding, src/memory.rs).
-    let assignment = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?["']?\s*[:=]\s*["']?(\S+)"#;
+    let assignment = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|credential|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?["']?\s*[:=]\s*["']?(\S+)"#;
     if let Ok(re) = RegexBuilder::new(assignment).build() {
         for caps in re.captures_iter(text) {
             // Strip any surrounding quotes the value capture picked up from a
@@ -1690,7 +1690,7 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // identifier (`tokenizer is bpe` tripping `token`+`izer`), so anchor the
     // label to a start/non-alphanumeric boundary and allow only an optional
     // plural `s` before the copula (Copilot finding, src/memory.rs).
-    let copular = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?\s+(?:is|was|are|be)\s+["']?(.+)"#;
+    let copular = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|credential|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?\s+(?:is|was|are|be)\s+["']?(.+)"#;
     if let Ok(re) = RegexBuilder::new(copular).build() {
         for caps in re.captures_iter(text) {
             if copular_value_is_secret(&caps[1]) {
@@ -1882,7 +1882,17 @@ fn ends_with_credential_label(text: &str) -> bool {
     // credentials too (Copilot finding, src/memory.rs): the match is on the
     // final *whole* word (alphanumeric-stripped), not a substring, so a word
     // that merely *contains* one (`compass`, `encompass`) is not a label.
-    const ONE_WORD: [&str; 7] = ["secret", "password", "passwd", "token", "pass", "pwd", "passphrase"];
+    const ONE_WORD: [&str; 9] = [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "credential",
+        "credentials",
+        "pass",
+        "pwd",
+        "passphrase",
+    ];
     if let Some(last) = words.last() {
         let word: String = last.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         if ONE_WORD.contains(&word.as_str()) {
@@ -2129,6 +2139,14 @@ mod tests {
         // finding, src/memory.rs).
         assert!(store.save(Scope::User, "API key: hunter2", None, None).is_err());
         assert!(store.save(Scope::User, "client secret = abc123", None, None).is_err());
+        // `credential`/`credentials` are credential labels too: `CREDENTIAL=…`,
+        // `credentials = …` and the copular `the credential is …` must be
+        // rejected, while a benign word that merely contains the substring
+        // (`credentialing`) is not a label (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "CREDENTIAL=hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "credentials = abc123", None, None).is_err());
+        assert!(store.save(Scope::User, "the credential is hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "credentialing starts next week", None, None).is_ok());
         assert!(store.save(Scope::User, r#"config: {"access key":"s3cr3tvalue"}"#, None, None).is_err());
         assert!(store.save(Scope::User, "my private key: abcdef123456", None, None).is_err());
         // A punctuation-only value is a real credential, not a placeholder:
