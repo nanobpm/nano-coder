@@ -361,6 +361,8 @@ pub struct CompactReport {
     pub summarized: usize,
     /// Why summarizing failed, when messages were dropped instead.
     pub fallback: Option<String>,
+    /// The summary hit the output limit and is incomplete.
+    pub truncated: bool,
     /// The mode the compaction ran in.
     pub mode: CompactionMode,
 }
@@ -379,6 +381,8 @@ impl std::fmt::Display for CompactReport {
         )?;
         if let Some(reason) = &self.fallback {
             write!(f, "; summary failed ({reason}), older messages were dropped")?;
+        } else if self.truncated {
+            write!(f, "; the summary hit the output limit and is incomplete")?;
         }
         Ok(())
     }
@@ -1873,7 +1877,8 @@ impl Agent {
             return Ok(None);
         }
 
-        let summary_input_chars = window.saturating_sub(context::SUMMARY_MAX_TOKENS as usize + 2_000).max(2_000) * 3;
+        let output_budget = context::summary_output_budget(window, self.config.max_tokens as i64);
+        let summary_input_chars = window.saturating_sub(output_budget as usize + 2_000).max(2_000) * 3;
         let transcript = context::render_transcript(summarized, summary_input_chars, smart);
         let lines: Vec<u64> = summarized.iter().filter_map(|m| m.log_line).collect();
         let range = lines.iter().min().zip(lines.iter().max()).map(|(a, b)| (*a, *b));
@@ -1895,7 +1900,7 @@ impl Agent {
             // transport no longer re-inserts it) and fixed-temperature models
             // still send none.
             temperature: self.temperature().value(),
-            max_tokens: Some(context::SUMMARY_MAX_TOKENS.min(self.config.max_tokens as i64)),
+            max_tokens: Some(output_budget),
         };
         let control = self.control.clone();
         // Stream the summary even though its text is used only once complete.
@@ -1910,24 +1915,32 @@ impl Agent {
             result = self.client.chat_stream(&request, &discard) => result,
             () = control.cancelled() => return Ok(None),
         };
+        let mut truncated = false;
         let (summary, fallback) = match result {
             Ok(response) if !response.content.trim().is_empty() => {
                 self.record_usage(&response, false);
+                // A summary cut off at the output limit silently loses whatever
+                // it had not reached yet; say so, so the agent re-checks state
+                // instead of trusting an incomplete record.
+                truncated = crate::llm::stop_reason_is_length(response.stop_reason.as_deref());
+                let mut body = response.content.trim().to_string();
+                if truncated {
+                    body.push_str(context::SUMMARY_TRUNCATED_NOTE);
+                }
                 let summary = if smart {
-                    format!(
-                        "{}\n{}\n\n{}",
-                        context::SMART_SUMMARY_PREFIX,
-                        response.content.trim(),
-                        context::smart_summary_note(range)
-                    )
+                    format!("{}\n{}\n\n{}", context::SMART_SUMMARY_PREFIX, body, context::smart_summary_note(range))
                 } else {
-                    format!("{}\n{}", context::SUMMARY_PREFIX, response.content.trim())
+                    format!("{}\n{}", context::SUMMARY_PREFIX, body)
                 };
                 (summary, None)
             }
-            Ok(_) => (
+            Ok(response) => (
                 self.dropped_note(summarized.len(), smart.then_some(range).flatten()),
-                Some("empty summary".to_string()),
+                Some(if crate::llm::stop_reason_is_length(response.stop_reason.as_deref()) {
+                    "empty summary: the output limit was reached before any summary text".to_string()
+                } else {
+                    "empty summary".to_string()
+                }),
             ),
             Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
@@ -1973,6 +1986,7 @@ impl Agent {
             tokens_after: self.estimate_context_tokens().0,
             summarized,
             fallback,
+            truncated,
             mode,
         }))
     }
@@ -2506,6 +2520,40 @@ mod tests {
         drop(agent);
         let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
         assert_eq!(restored.conversation, conversation);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_cut_off_at_the_output_limit_is_flagged() {
+        // A reasoning model can spend most of the summary's output budget
+        // thinking; a summary that stops at the limit must say it is
+        // incomplete instead of passing for a full record.
+        let dir = tempfile::tempdir().unwrap();
+        let cut = LLMResponse {
+            content: "SUMMARY: step 1 half do".into(),
+            stop_reason: Some("length".into()),
+            ..Default::default()
+        };
+        let (mut agent, _) = agent(vec![tool_call("c1"), text("done"), cut], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None);
+        assert!(report.truncated);
+        assert!(report.to_string().contains("hit the output limit"), "{report}");
+        let summary = &agent.conversation()[1].content;
+        assert!(summary.contains("SUMMARY: step 1 half do"), "{summary}");
+        assert!(summary.contains(context::SUMMARY_TRUNCATED_NOTE.trim()), "{summary}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_summary_at_the_output_limit_names_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = LLMResponse { stop_reason: Some("length".into()), ..Default::default() };
+        let (mut agent, _) = agent(vec![tool_call("c1"), text("done"), empty], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.fallback.as_deref().is_some_and(|f| f.contains("output limit")), "{report}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
