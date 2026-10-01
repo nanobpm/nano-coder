@@ -823,7 +823,9 @@ impl Agent {
         // failure leaves the current session (conversation, id, log,
         // instructions, skills) intact instead of detaching the agent from it.
         let session = if self.config.persist_sessions {
-            let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
+            let cwd = std::env::current_dir().ok().map(|d| d.display().to_string());
+            let model = Some(format!("{}/{}", self.client.provider_name(), self.client.model_name()));
+            let mut log = SessionLog::create_with(&self.config.session_dir(), &id, cwd, model)?;
             log.append(&Record::Message(system.clone()))?;
             Some(log)
         } else {
@@ -1621,6 +1623,10 @@ impl Agent {
                 history_calls: self.turn_history_calls,
                 recorded_at: session::now(),
             })?;
+            // Keep the `--resume` picker's summary current. Only a cache:
+            // the picker rebuilds a missing or stale summary from the log.
+            let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+            let _ = crate::session_index::update(log.path(), Some(model));
         }
         match &outcome {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),

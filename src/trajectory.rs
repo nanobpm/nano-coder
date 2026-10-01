@@ -766,7 +766,7 @@ mod tests {
             ..Default::default()
         }];
         vec![
-            Record::Session { version: 1, id: "sess-x".into(), created_at: now() },
+            Record::Session { version: 1, id: "sess-x".into(), created_at: now(), cwd: None, model: None },
             Record::Message(Message { timestamp: Some(now()), ..Message::system("sys") }),
             Record::Input { id: "in-1".into(), text: "add a feature".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("add a feature") }),
@@ -882,7 +882,7 @@ mod tests {
         // request, so the row carries no usage/duration and must not count as
         // a second call.
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message({
                 let mut msg = assistant("", "");
@@ -922,7 +922,7 @@ mod tests {
         // final-answer row (its text matches the persisted turn response) is
         // excluded.
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
             // A real legacy request: no usage, no duration_ms.
@@ -951,7 +951,7 @@ mod tests {
         // one-call turn with no recorded outcome is one real request, not
         // `(no activity)`.
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
             // The one real request: no usage, no duration_ms (legacy log).
@@ -978,7 +978,7 @@ mod tests {
         let mut thinking_request = Message { timestamp: Some(now()), ..Message::assistant("thought through") };
         thinking_request.thinking = "let me think".into();
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
             Record::Message(thinking_request),
@@ -1014,7 +1014,7 @@ mod tests {
             json!({"type": "redacted_thinking", "data": "..."}),
         ];
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(msg),
         ];
@@ -1034,7 +1034,7 @@ mod tests {
         // (src/agent.rs): the plain/pager rendering must still show it, as the
         // JSON/Markdown exports do.
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
             Record::TurnEnd {
@@ -1103,7 +1103,7 @@ mod tests {
             ..Default::default()
         }];
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(msg),
         ];
@@ -1143,7 +1143,7 @@ mod tests {
             ..Default::default()
         }];
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
             Record::Message(msg),
             Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "read_file", "ok") }),
@@ -1239,7 +1239,7 @@ mod tests {
         // row is still materialized from the input so the pager can
         // navigate/search to the prompt.
         let recs = vec![
-            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "unanswered prompt".into(), recorded_at: now() },
         ];
         let traj = Trajectory::from_records(&recs);

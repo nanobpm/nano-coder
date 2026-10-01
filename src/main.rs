@@ -33,8 +33,10 @@ mod question;
 mod queue;
 mod recents;
 mod reminders;
+mod resume;
 mod sandbox;
 mod session;
+mod session_index;
 mod settings;
 mod shell;
 mod skills;
@@ -1363,7 +1365,10 @@ struct Args {
     login: Option<String>,
     list_models: Option<String>,
     model: Option<String>,
+    /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    list_sessions: bool,
+    all: bool,
     config: Option<std::path::PathBuf>,
     verbosity: Option<ui::Verbosity>,
     sandbox: Option<sandbox::SandboxMode>,
@@ -1379,9 +1384,10 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
+    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last]] [--config PATH]");
     println!("                  [--verbosity quiet|normal|verbose|debug]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot");
     println!("       nano-coder --list-models PROVIDER[/model]");
@@ -1410,6 +1416,8 @@ fn parse_args() -> Result<Args> {
         list_models: None,
         model: None,
         resume: None,
+        list_sessions: false,
+        all: false,
         config: None,
         verbosity: None,
         sandbox: None,
@@ -1419,7 +1427,7 @@ fn parse_args() -> Result<Args> {
         json: false,
         markdown: false,
     };
-    let mut iter = env::args().skip(1);
+    let mut iter = env::args().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let mut value = |name: &str| iter.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
         match arg.as_str() {
@@ -1427,7 +1435,10 @@ fn parse_args() -> Result<Args> {
             "--login" => args.login = Some(value("--login")?),
             "--list-models" => args.list_models = Some(value("--list-models")?),
             "--model" => args.model = Some(value("--model")?),
-            "--resume" => args.resume = Some(value("--resume")?),
+            // The ID is optional: without one, pick from the saved sessions.
+            "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
+            "--list-sessions" => args.list_sessions = true,
+            "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
             "--trajectory" => args.trajectory = Some(value("--trajectory")?),
             "--json" => args.json = true,
@@ -1456,8 +1467,14 @@ fn parse_args() -> Result<Args> {
     if args.json && args.markdown {
         anyhow::bail!("--json and --markdown are mutually exclusive");
     }
-    if (args.json || args.markdown) && args.trajectory.is_none() {
-        anyhow::bail!("--json/--markdown require --trajectory <id>");
+    if args.markdown && args.trajectory.is_none() {
+        anyhow::bail!("--markdown requires --trajectory <id>");
+    }
+    if args.json && args.trajectory.is_none() && !args.list_sessions {
+        anyhow::bail!("--json requires --trajectory <id> or --list-sessions");
+    }
+    if args.all && !args.list_sessions {
+        anyhow::bail!("--all requires --list-sessions");
     }
     Ok(args)
 }
@@ -1465,7 +1482,7 @@ fn parse_args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Detect execution mode from command-line args
-    let args = parse_args()?;
+    let mut args = parse_args()?;
 
     if let Some(provider) = &args.login {
         if provider != "github-copilot" {
@@ -1497,6 +1514,27 @@ async fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    if args.list_sessions {
+        resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
+        return Ok(());
+    }
+    match args.resume.as_deref() {
+        Some("") if args.acp => anyhow::bail!("--resume needs a session ID with --acp"),
+        Some("") if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+            match resume::pick(&config.session_dir(), &cwd)? {
+                Some(id) => args.resume = Some(id),
+                None => return Ok(()),
+            }
+        }
+        Some("") => {
+            // No terminal to pick in: list what could be resumed.
+            resume::print_list(&config.session_dir(), &cwd, false, false)?;
+            return Ok(());
+        }
+        Some("last") => args.resume = Some(resume::last(&config.session_dir(), &cwd)?),
+        _ => {}
     }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();

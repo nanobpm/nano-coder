@@ -33,6 +33,12 @@ pub enum Record {
         version: u32,
         id: String,
         created_at: DateTime<FixedOffset>,
+        /// Working directory the session started in (absent in older logs).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// `provider/model` the session started with (absent in older logs).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Input {
         id: String,
@@ -153,7 +159,14 @@ fn encode(record: &Record) -> Result<Vec<u8>> {
 }
 
 impl SessionLog {
+    #[cfg(test)]
     pub fn create(dir: &Path, id: &str) -> Result<Self> {
+        Self::create_with(dir, id, None, None)
+    }
+
+    /// [`create`](Self::create), recording where and with what model the
+    /// session started (shown when picking a session to resume).
+    pub fn create_with(dir: &Path, id: &str, cwd: Option<String>, model: Option<String>) -> Result<Self> {
         validate_id(id)?;
         fs::create_dir_all(dir).with_context(|| format!("create session dir {}", dir.display()))?;
         let path = path_for(dir, id);
@@ -162,7 +175,8 @@ impl SessionLog {
             .append(true)
             .open(&path)
             .with_context(|| format!("create session log {}", path.display()))?;
-        file.write_all(&encode(&Record::Session { version: FORMAT_VERSION, id: id.to_string(), created_at: now() })?)?;
+        let header = Record::Session { version: FORMAT_VERSION, id: id.to_string(), created_at: now(), cwd, model };
+        file.write_all(&encode(&header)?)?;
         file.sync_data()?;
         Ok(Self { path, file, lines: 1 })
     }
@@ -434,9 +448,11 @@ mod tests {
             serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi","log_line":99}}"#).unwrap();
         assert_eq!(stale, Record::Message(Message { log_line: Some(99), ..Message::user("hi") }));
         let mut log = String::new();
-        for record in
-            [Record::Session { version: FORMAT_VERSION, id: "s".into(), created_at: now() }, input("i"), stale]
-        {
+        for record in [
+            Record::Session { version: FORMAT_VERSION, id: "s".into(), created_at: now(), cwd: None, model: None },
+            input("i"),
+            stale,
+        ] {
             log.push_str(&serde_json::to_string(&record).unwrap());
             log.push('\n');
         }
@@ -610,9 +626,14 @@ mod tests {
         // must not shift the `#N` of every message after it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s7.jsonl");
-        let header =
-            serde_json::to_string(&Record::Session { version: FORMAT_VERSION, id: "s7".into(), created_at: now() })
-                .unwrap();
+        let header = serde_json::to_string(&Record::Session {
+            version: FORMAT_VERSION,
+            id: "s7".into(),
+            created_at: now(),
+            cwd: None,
+            model: None,
+        })
+        .unwrap();
         let user = serde_json::to_string(&Record::Message(Message::user("hi"))).unwrap();
         let answer = serde_json::to_string(&Record::Message(Message::assistant("hello"))).unwrap();
         // Physical lines: 1 header, 2 user, 3 BLANK, 4 assistant.
