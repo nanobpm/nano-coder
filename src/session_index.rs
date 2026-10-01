@@ -196,12 +196,22 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Resu
     if let Ok(mut file) = OpenOptions::new().read(true).open(index_path(dir))
         && let Ok(pos) = file.seek(SeekFrom::Start(since))
     {
-        let mut rest = String::new();
-        if pos == since && file.read_to_string(&mut rest).is_ok() {
-            // `since` is a whole-line boundary, so every complete line read
-            // from it is a full record; a torn trailing line is dropped.
-            for line in rest.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(summary) = serde_json::from_str::<Summary>(line) {
+        // Read bytes and split on `b'\n'` (as `load()` does) rather than
+        // `read_to_string`: one non-UTF-8 or torn line must be isolated, not
+        // fail the whole tail read — otherwise every later valid concurrent
+        // summary is discarded here and then lost to the rename (an
+        // index-only model change included), defeating `load()`'s per-line
+        // corruption isolation. `since` is a whole-line boundary, so each
+        // complete line is a full record; a torn trailing line fails to
+        // deserialize and is skipped.
+        let mut rest = Vec::new();
+        if pos == since && file.read_to_end(&mut rest).is_ok() {
+            for line in rest.split(|&b| b == b'\n') {
+                let line = trim_ascii(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(summary) = serde_json::from_slice::<Summary>(line) {
                     merged.insert(summary.id.clone(), summary);
                 }
             }
@@ -576,6 +586,39 @@ mod tests {
         let sessions = list(dir.path()).unwrap();
         let b = sessions.iter().find(|s| s.id == "b").unwrap();
         assert_eq!(b.model.as_deref(), Some("anthropic/claude"));
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn rewrite_isolates_a_corrupt_tail_line_instead_of_discarding_later_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = SessionLog::create(dir.path(), "a").unwrap();
+        input(&mut a, "i1", "Session a's prompt");
+        let mut b = SessionLog::create(dir.path(), "b").unwrap();
+        input(&mut b, "i1", "Session b's prompt");
+        list(dir.path()).unwrap();
+
+        // A rewrite that read the index before a torn/corrupt line and then a
+        // valid concurrent summary landed must still merge the valid one: a
+        // non-UTF-8 tail must not make the read discard the lines after it
+        // (which can carry an index-only model change), or the rename loses
+        // them — the same per-line isolation `load()` guarantees.
+        let (current, _) = load(dir.path());
+        let since = fs::metadata(index_path(dir.path())).unwrap().len();
+        let mut tail = b"\xff\xfe not utf8\n".to_vec();
+        let mut newer = summarize(b.path()).unwrap();
+        newer.model = Some("anthropic/claude".into());
+        let mut line = serde_json::to_vec(&newer).unwrap();
+        line.push(b'\n');
+        tail.extend_from_slice(&line);
+        let mut file = OpenOptions::new().append(true).open(index_path(dir.path())).unwrap();
+        file.write_all(&tail).unwrap();
+        drop(file);
+        rewrite(dir.path(), &current, since).unwrap();
+
+        let sessions = list(dir.path()).unwrap();
+        let b = sessions.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.model.as_deref(), Some("anthropic/claude"), "the valid line after the corrupt one survives");
         assert_eq!(sessions.len(), 2);
     }
 

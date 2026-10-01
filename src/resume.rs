@@ -166,7 +166,13 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
     // padding) so no row is wider than the terminal, even a narrow one.
     let width = width.saturating_sub(4);
     let theme = FitTheme { inner: ColorfulTheme::default(), width };
-    let mut show_all = in_dir(&sessions, cwd).is_empty();
+    // Start directory-scoped even when this directory has no sessions: the
+    // documented behaviour (and the non-terminal list) is a directory-scoped
+    // view whose "Show all sessions" entry is the explicit opt-in to every
+    // directory. With no local rows that entry is the sole choice, so the
+    // user still reaches all sessions — but only by asking for them, matching
+    // `print_list` rather than bypassing the scoping outright.
+    let mut show_all = false;
     loop {
         let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
         // Give the picker the full row text so fuzzy matching can see a
