@@ -1286,17 +1286,21 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
         // JSONL is documented as human-editable, so a record can carry `\r`, ESC,
         // or other control bytes that the legacy renderer would otherwise print
         // verbatim (`print_block` → `println!`), enabling terminal escape
-        // sequences or forged list lines. `sanitize_terminal_text` drops C0/C1
-        // control chars (including ESC and newlines) while keeping printable text.
+        // sequences or forged list lines. The ID and evidence are single-line
+        // fields, so they use `sanitize_terminal_line`, which drops `\n` too:
+        // memory JSONL is human-editable and loaded without single-line
+        // validation (`memory.rs`), so an escaped newline must not inject an
+        // extra, unprefixed row into this listing. The text is already reduced
+        // to its first line below.
         let mut line = format!(
             "  {} [{}] ({}) {}",
             scope.as_str(),
-            sanitize_terminal_text(&entry.id),
+            sanitize_terminal_line(&entry.id),
             entry.created.format("%Y-%m-%d"),
-            sanitize_terminal_text(entry.text.lines().next().unwrap_or("").trim())
+            sanitize_terminal_line(entry.text.lines().next().unwrap_or("").trim())
         );
         if let Some(evidence) = &entry.evidence {
-            line.push_str(&format!(" (check: {})", sanitize_terminal_text(evidence)));
+            line.push_str(&format!(" (check: {})", sanitize_terminal_line(evidence)));
         }
         out.push(line);
     }

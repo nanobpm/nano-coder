@@ -97,8 +97,9 @@ pub async fn run(
     // They are returned on EVERY exit — including a cancel/error at a later
     // prompt — so a rebuild failure already recorded is never dropped (the
     // dialog's own `println!` of it is gone by then, and the session keeps the
-    // old client). Every `?` below is a dialoguer prompt: on cancel/error it
-    // maps to `None`, which the loop treats as Done and returns `notices`.
+    // old client). The prompts below distinguish Esc/cancel (a plain Done that
+    // returns `notices`) from a genuine terminal I/O failure, which surfaces as
+    // an `Err` carried out alongside the retained `notices`.
     let mut notices: Vec<String> = Vec::new();
     loop {
         let config = agent.config();
@@ -125,9 +126,15 @@ pub async fn run(
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
-        let Some(selection) = Select::new().with_prompt("Select setting").items(&items).default(0).interact().ok()
-        else {
-            return (notices, Ok(()));
+        // `interact_opt` distinguishes Esc (Ok(None) → Done) from a genuine
+        // terminal I/O failure (Err), which must surface rather than be read as
+        // a normal exit. The nested selectors already do this; the top-level
+        // loop must too, so a failed read/write is not silently reported as a
+        // plain Done. Any retained notices ride along on the error path.
+        let selection = match Select::new().with_prompt("Select setting").items(&items).default(0).interact_opt() {
+            Ok(Some(selection)) => selection,
+            Ok(None) => return (notices, Ok(())),
+            Err(e) => return (notices, Err(e.into())),
         };
         match selection {
             0 => {

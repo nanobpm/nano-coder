@@ -156,7 +156,15 @@ impl EditView {
     /// app-owned frame renderer on or off.
     pub fn set_frame_mode(&mut self, on: bool, hook: Option<EditHook>) {
         self.on_edit = on.then(|| hook.expect("a hook is required when enabling frame mode"));
-        self.menu_enabled = !on;
+        // Only re-enable the inline editor/menu (which writes cursor/erase
+        // sequences straight to stdout) when both stdin and stdout are real
+        // terminals, matching `Terminal::start`'s `key_mode`. Off a tty the
+        // frame is never active, so a configured-renderer switch calls this
+        // with `on == false`; without this guard it would turn inline drawing
+        // on and the following `resize()` would spew escape sequences into
+        // redirected output.
+        use std::io::IsTerminal;
+        self.menu_enabled = !on && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     }
 
     /// Forget where the last inline redraw left the prompt: the frame renderer
