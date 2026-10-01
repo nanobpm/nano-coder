@@ -1647,6 +1647,22 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     if args.list_sessions && args.acp {
         anyhow::bail!("--list-sessions and --acp are mutually exclusive");
     }
+    // `--resume` likewise conflicts with the other exclusive action modes.
+    // Dispatch runs `--login`, then `--trajectory`, then `--list-models` before
+    // the resume branch, so accepting `--resume` with any of them would
+    // silently perform that action and ignore the requested resume; reject
+    // those pairs. `--acp` is the exception: an explicit `--resume <id>` is
+    // honoured in ACP mode (the session is loaded before serving requests), so
+    // only a bare picker `--resume` is rejected there (in `main`).
+    if args.resume.is_some() && args.login.is_some() {
+        anyhow::bail!("--resume and --login are mutually exclusive");
+    }
+    if args.resume.is_some() && args.trajectory.is_some() {
+        anyhow::bail!("--resume and --trajectory are mutually exclusive");
+    }
+    if args.resume.is_some() && args.list_models.is_some() {
+        anyhow::bail!("--resume and --list-models are mutually exclusive");
+    }
     Ok(args)
 }
 
@@ -2203,6 +2219,31 @@ mod tests {
         assert!(parse_args_from(argv(&["--list-sessions", "--list-models", "openai"])).is_err());
         assert!(parse_args_from(argv(&["--list-sessions", "--acp"])).is_err());
         assert!(parse_args_from(argv(&["--acp", "--list-sessions"])).is_err());
+    }
+
+    #[test]
+    fn resume_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // `--resume` (bare picker or explicit id) and each other action mode on
+        // their own parse fine…
+        assert!(parse_args_from(argv(&["--resume"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        // …but combining `--resume` with `--login`, `--trajectory`, or
+        // `--list-models` is rejected rather than silently running that mode
+        // (each dispatches before the resume branch) and ignoring the resume.
+        assert!(parse_args_from(argv(&["--resume", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--login", "github-copilot", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--resume"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-models", "openai", "--resume=sess-1"])).is_err());
+        // `--acp` stays compatible with an explicit `--resume <id>` (the session
+        // is loaded before serving ACP requests); only a bare picker `--resume`
+        // is rejected there (in `main`, not parse_args).
+        assert!(parse_args_from(argv(&["--acp", "--resume", "sess-1"])).is_ok());
     }
 
     #[test]
