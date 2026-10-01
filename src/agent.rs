@@ -504,8 +504,9 @@ pub struct Agent {
     /// the folded turns — the frame's first full redraw clears the legacy
     /// scrollback, so the replay is the only copy. Kept across replays (every
     /// renderer rebuild needs it), replaced by the next compaction, and
-    /// cleared on a new or resumed session. `None` when no compaction has run
-    /// (or none was captured).
+    /// cleared by any non-compaction conversation replacement (a plain rebuild
+    /// or system-prompt change) and on a new or resumed session. `None` when
+    /// no compaction has run (or none was captured).
     pre_compaction_transcript: Option<Vec<Message>>,
 }
 
@@ -1370,9 +1371,12 @@ impl Agent {
         self.history_available = history_available;
         self.history_hint_pending = history_available;
         self.conversation = messages;
-        if let Some(folded) = folded_turns.filter(|f| !f.is_empty()) {
-            self.pre_compaction_transcript = Some(folded);
-        }
+        // Assign unconditionally: a compaction stashes its folded turns for the
+        // replay, and any other replacement (a plain rebuild, a system-prompt
+        // change, …) clears the stash so a later replay cannot resurrect the
+        // previous conversation and skip the first new user turn as though it
+        // were a synthetic summary.
+        self.pre_compaction_transcript = folded_turns.filter(|f| !f.is_empty());
         self.pending_input = match (self.pending_input.take(), pending_position) {
             (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
             _ => None,
@@ -2637,6 +2641,17 @@ mod tests {
         let users = seen.lock().unwrap().clone();
         assert!(users.contains(&"ping".to_string()), "second replay still restores the real turn: {users:?}");
         assert!(!users.iter().any(|t| t.contains("SUMMARY")), "second replay still hides the summary: {users:?}");
+
+        // A plain conversation replacement (no compaction — e.g. a system-prompt
+        // change) must CLEAR the stash: replaying the new conversation must not
+        // resurrect the folded turns or skip the first new user turn as though
+        // it were a synthetic summary.
+        agent.set_system_prompt("fresh prompt").unwrap();
+        seen.lock().unwrap().clear();
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(!users.contains(&"ping".to_string()), "stale stash not resurrected after plain replacement: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "summary not replayed after plain replacement: {users:?}");
     }
 
     #[test]
