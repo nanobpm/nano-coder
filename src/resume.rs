@@ -272,7 +272,15 @@ fn interactive_pick(
         lines.push(prompt_line);
         for (pos, &item) in filtered.iter().enumerate().skip(top).take(window) {
             let mut rendered = String::new();
-            Theme::format_fuzzy_select_prompt_item(theme, &mut rendered, &items[item], pos == sel, true, &matcher, &search)?;
+            Theme::format_fuzzy_select_prompt_item(
+                theme,
+                &mut rendered,
+                &items[item],
+                pos == sel,
+                true,
+                &matcher,
+                &search,
+            )?;
             lines.push(rendered);
         }
         drawn = 0;
@@ -372,8 +380,7 @@ pub fn pick_outcome(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Pick
     // The picker draws on stderr (console) and is gated on stdin/stderr being
     // terminals, so measure the stderr terminal — stdout may be redirected, and
     // its size would not reflect where the rows are drawn.
-    let (rows, cols) =
-        crate::status::stderr_terminal_size().map_or((24, 100), |(r, c)| (r as usize, c as usize));
+    let (rows, cols) = crate::status::stderr_terminal_size().map_or((24, 100), |(r, c)| (r as usize, c as usize));
     // Fit each row to the available width (less the picker's own marker and
     // padding) so none is wider than the terminal, even a narrow one.
     let width = cols.saturating_sub(4);

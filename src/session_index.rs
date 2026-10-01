@@ -368,9 +368,7 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
         if crate::session::validate_id(&id).is_err() {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("read metadata for session log {}", path.display()))?;
+        let metadata = entry.metadata().with_context(|| format!("read metadata for session log {}", path.display()))?;
         // Skip anything that is not a regular file before reading it as a
         // session log. A directory named `foo.jsonl` makes `fs::read` fail and
         // would abort the whole listing, and a FIFO with that name can block
@@ -538,10 +536,7 @@ mod tests {
         // The cache file's stem must be an id `validate_id` rejects, so the
         // cache can never collide with — or hide — a real session log.
         let stem = Path::new(INDEX_FILE).file_stem().and_then(|s| s.to_str()).unwrap();
-        assert!(
-            crate::session::validate_id(stem).is_err(),
-            "cache file stem {stem:?} must not be a valid session id"
-        );
+        assert!(crate::session::validate_id(stem).is_err(), "cache file stem {stem:?} must not be a valid session id");
 
         // A session whose id is `index` (the legacy cache name's stem) is a
         // real, resumable session and must be listed, not hidden by the cache.
