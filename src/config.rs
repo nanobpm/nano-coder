@@ -291,12 +291,11 @@ pub fn migrate_legacy_dirs() {
         match migrate_legacy_dir(&base) {
             Ok(Migration::Moved { from, to }) => eprintln!("Moved {} to {}", from.display(), to.display()),
             Ok(Migration::LinkFailed { from, to, err }) => eprintln!(
-                "warning: moved {} to {} but could not create the compatibility symlink at {} ({}); \
-                 older nano-coder builds pointed at the old path will not find the moved data \
-                 (will retry on the next start)",
+                "warning: could not create the compatibility symlink at {} -> {} ({}); \
+                 the two directories may now hold split data — older nano-coder builds pointed at \
+                 the old path can miss anything written to the other tree (will retry on the next start)",
                 from.display(),
                 to.display(),
-                from.display(),
                 err,
             ),
             Ok(Migration::None) => {}
