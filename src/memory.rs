@@ -1657,100 +1657,134 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // is your real-key" slips past (Copilot finding, src/memory.rs).
     let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*\s+(?:is|was|are|be)\s+["']?(.+)"#;
     if let Ok(re) = RegexBuilder::new(copular).build() {
-        'caps: for caps in re.captures_iter(text) {
-            // Walk *all* the tokens after the copula to find the first
-            // substantive one (the candidate value), skipping filler and
-            // location words along the way. Judging only the first token would
-            // let a location preamble swallow the real secret behind it —
-            // `password is stored as hunter2` leads with the location verb
-            // `stored` (and the value connective `as`), yet still states the
-            // secret `hunter2`; `token is in abc123` leads with the preposition
-            // `in`, yet `abc123` is the value (Copilot finding, src/memory.rs).
-            let mut in_location = false;
-            for word in caps[1].split_whitespace() {
-                let w = word.trim_matches(|c: char| ['"', '\'', ',', '.', ';', ':'].contains(&c));
-                if w.is_empty() {
-                    continue;
-                }
-                let lower = w.to_ascii_lowercase();
-                // Value-introducing connectives (`stored as hunter2`,
-                // `password = swordfish`) announce that the *next* token is the
-                // value itself, not a location — so they cancel any location
-                // mode a preceding verb set. Without this, `database password is
-                // stored as swordfish` is accepted: `stored` sets `in_location`,
-                // `as` was mere filler, and an all-alphabetic secret escapes the
-                // digit-requiring `is_secret_shaped` location check. Clearing
-                // `in_location` makes the following token a direct value, so a
-                // plaintext password after `stored as`/`= ` is still rejected
-                // (Copilot finding, src/memory.rs).
-                if matches!(lower.as_str(), "as" | "=" | "equals" | "equal") {
-                    in_location = false;
-                    continue;
-                }
-                // Filler: articles and possessives are lead-in words, not the
-                // value itself.
-                if matches!(
-                    lower.as_str(),
-                    "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
-                ) {
-                    continue;
-                }
-                // Location/preposition words ("stored", "in", "at", …) put the
-                // sentence into *where-it-lives* mode: the noun that follows is
-                // a location, not the secret — unless it is itself credential-
-                // shaped (see below), which catches `token is in abc123`.
-                if matches!(
-                    lower.as_str(),
-                    "stored"
-                        | "in"
-                        | "at"
-                        | "kept"
-                        | "lives"
-                        | "set"
-                        | "saved"
-                        | "located"
-                        | "found"
-                        | "defined"
-                        | "configured"
-                        | "managed"
-                        | "read"
-                        | "loaded"
-                        | "fetched"
-                        | "from"
-                        | "under"
-                        | "inside"
-                        | "within"
-                        | "into"
-                        | "to"
-                        | "on"
-                        | "via"
-                ) {
-                    in_location = true;
-                    continue;
-                }
-                // First substantive token: the candidate value. A direct
-                // statement (`password is hunter2`, `api key is real-key`) flags
-                // any non-placeholder. Inside a location clause (`stored in X`)
-                // the token is presumed a location name and only flagged when it
-                // is credential-shaped (contains a digit and is long enough), so
-                // benign destinations like `vault`, `~/.config/app/creds` or
-                // `1password` are not blocked while an explicit secret such as
-                // `abc123` still is.
-                let flagged = if is_placeholder(w) {
-                    false
-                } else if in_location {
-                    is_secret_shaped(w) && !is_secret_store_noun(&lower)
-                } else {
-                    true
-                };
-                if flagged {
-                    return Some("credential statement");
-                }
-                continue 'caps;
+        for caps in re.captures_iter(text) {
+            if copular_value_is_secret(&caps[1]) {
+                return Some("credential statement");
+            }
+        }
+    }
+    // Short `.env`-style password labels `pass`/`pwd`/`passphrase` in copular
+    // form (`DB_PWD is hunter2`, `pass was swordfish`, `passphrase is …`). The
+    // copular alternation above carries only the longer `password`/`passwd`
+    // forms, so a short-label statement slips past every rule and is persisted
+    // despite the secret-rejection guarantee (Copilot finding, src/memory.rs).
+    //
+    // As with the short *assignment* labels above, the label must be
+    // *separator-anchored*: the character immediately before `pass`/`pwd` is the
+    // start of the text or a non-alphanumeric separator (`_`, `-`, space, …).
+    // Unlike the other labels there is no `\w*` prefix that could swallow the
+    // separator, so a word that merely *contains* the substring — `compass is
+    // …`, `encompass was …` — has an alphanumeric directly before `pass` and is
+    // not flagged, while `DB_PWD`/`my-pass`/`the passphrase` (separator or start
+    // before the label, optional `\w*` suffix) still match. The value judgment
+    // (filler/location/placeholder) is shared with the main copular rule.
+    let short_copular = r#"(?i)(?:^|[^A-Za-z0-9])(?:pass|pwd|passphrase)\w*\s+(?:is|was|are|be)\s+["']?(.+)"#;
+    if let Ok(re) = RegexBuilder::new(short_copular).build() {
+        for caps in re.captures_iter(text) {
+            if copular_value_is_secret(&caps[1]) {
+                return Some("credential statement");
             }
         }
     }
     None
+}
+
+/// Whether the text captured *after* a copular secret label (`<label> is
+/// <capture>`) states an actual secret value. Walks *all* the tokens after the
+/// copula to find the first substantive one (the candidate value), skipping
+/// filler and location words along the way. Judging only the first token would
+/// let a location preamble swallow the real secret behind it — `password is
+/// stored as hunter2` leads with the location verb `stored` (and the value
+/// connective `as`), yet still states the secret `hunter2`; `token is in
+/// abc123` leads with the preposition `in`, yet `abc123` is the value (Copilot
+/// finding, src/memory.rs). Shared by the main copular rule and the
+/// separator-anchored short-label (`pass`/`pwd`/`passphrase`) copular rule.
+fn copular_value_is_secret(rest: &str) -> bool {
+    let mut in_location = false;
+    for word in rest.split_whitespace() {
+        let w = word.trim_matches(|c: char| ['"', '\'', ',', '.', ';', ':'].contains(&c));
+        if w.is_empty() {
+            continue;
+        }
+        let lower = w.to_ascii_lowercase();
+        // Value-introducing connectives (`stored as hunter2`,
+        // `password = swordfish`) announce that the *next* token is the
+        // value itself, not a location — so they cancel any location
+        // mode a preceding verb set. Without this, `database password is
+        // stored as swordfish` is accepted: `stored` sets `in_location`,
+        // `as` was mere filler, and an all-alphabetic secret escapes the
+        // digit-requiring `is_secret_shaped` location check. Clearing
+        // `in_location` makes the following token a direct value, so a
+        // plaintext password after `stored as`/`= ` is still rejected
+        // (Copilot finding, src/memory.rs).
+        if matches!(lower.as_str(), "as" | "=" | "equals" | "equal") {
+            in_location = false;
+            continue;
+        }
+        // Filler: articles and possessives are lead-in words, not the
+        // value itself.
+        if matches!(
+            lower.as_str(),
+            "the" | "a" | "an" | "your" | "my" | "our" | "their" | "his" | "her" | "its"
+        ) {
+            continue;
+        }
+        // Location/preposition words ("stored", "in", "at", …) put the
+        // sentence into *where-it-lives* mode: the noun that follows is
+        // a location, not the secret — unless it is itself credential-
+        // shaped (see below), which catches `token is in abc123`.
+        if matches!(
+            lower.as_str(),
+            "stored"
+                | "in"
+                | "at"
+                | "kept"
+                | "lives"
+                | "set"
+                | "saved"
+                | "located"
+                | "found"
+                | "defined"
+                | "configured"
+                | "managed"
+                | "read"
+                | "loaded"
+                | "fetched"
+                | "from"
+                | "under"
+                | "inside"
+                | "within"
+                | "into"
+                | "to"
+                | "on"
+                | "via"
+        ) {
+            in_location = true;
+            continue;
+        }
+        // First substantive token: the candidate value. A direct
+        // statement (`password is hunter2`, `api key is real-key`) flags
+        // any non-placeholder. Inside a location clause (`stored in X`)
+        // the token is presumed a location name and only flagged when it
+        // is credential-shaped (contains a digit and is long enough), so
+        // benign destinations like `vault`, `~/.config/app/creds` or
+        // `1password` are not blocked while an explicit secret such as
+        // `abc123` still is.
+        let flagged = if is_placeholder(w) {
+            false
+        } else if in_location {
+            is_secret_shaped(w) && !is_secret_store_noun(&lower)
+        } else {
+            true
+        };
+        if flagged {
+            return true;
+        }
+        // The first substantive token was judged benign (a placeholder or a
+        // location) — the rest of the phrase is commentary, not the value.
+        return false;
+    }
+    false
 }
 
 /// Whether a token inside a *location clause* (`… is stored in X`) looks like an
@@ -1798,8 +1832,12 @@ fn ends_with_credential_label(text: &str) -> bool {
         }
     }
     // Single-word labels match on the final word (stripped of any trailing
-    // punctuation, so `config: token` still ends with the label `token`).
-    const ONE_WORD: [&str; 4] = ["secret", "password", "passwd", "token"];
+    // punctuation, so `config: token` still ends with the label `token`). The
+    // short `.env`-style password labels `pass`/`pwd`/`passphrase` are
+    // credentials too (Copilot finding, src/memory.rs): the match is on the
+    // final *whole* word (alphanumeric-stripped), not a substring, so a word
+    // that merely *contains* one (`compass`, `encompass`) is not a label.
+    const ONE_WORD: [&str; 7] = ["secret", "password", "passwd", "token", "pass", "pwd", "passphrase"];
     if let Some(last) = words.last() {
         let word: String = last.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
         if ONE_WORD.contains(&word.as_str()) {
@@ -2111,6 +2149,25 @@ mod tests {
         assert!(store.save(Scope::User, "database password is stored as swordfish", None, None).is_err());
         assert!(store.save(Scope::User, "the secret is saved as mypassword", None, None).is_err());
         assert!(store.save(Scope::User, "the password is stored in the vault", None, None).is_ok());
+        // The short `.env`-style password labels `pass`/`pwd`/`passphrase` state
+        // a secret in copular form too, but the main copular alternation carries
+        // only the longer `password`/`passwd` forms — so these matched no rule
+        // and were persisted (Copilot finding, src/memory.rs). The short-label
+        // copular matcher is separator-anchored, so a prefixed (`DB_PWD`),
+        // hyphenated (`my-pass`) or article-led (`the passphrase`) form matches,
+        // while a word that merely *contains* the substring (`compass`,
+        // `encompass`) is not a label.
+        assert!(store.save(Scope::User, "DB_PWD is hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "pass was swordfish", None, None).is_err());
+        assert!(store.save(Scope::User, "passphrase is correct horse battery", None, None).is_err());
+        assert!(store.save(Scope::User, "db pass is hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "the pwd is hunter2", None, None).is_err());
+        assert!(store.save(Scope::User, "my-pass is s3cr3tvalue", None, None).is_err());
+        // …but a non-label word containing the substring is not flagged, and the
+        // location exemption still applies to a short label.
+        assert!(store.save(Scope::User, "the compass is pointing north", None, None).is_ok());
+        assert!(store.save(Scope::User, "the pwd is in the vault", None, None).is_ok());
+        assert!(store.save(Scope::User, "the passphrase is stored in 1password", None, None).is_ok());
         assert!(store.save(Scope::User, &"x".repeat(MAX_TEXT_CHARS + 1), None, None).is_err());
     }
 
@@ -2160,6 +2217,22 @@ mod tests {
         assert!(store.save(Scope::User, "database password", Some("in the vault"), None).is_ok());
         assert!(store.save(Scope::User, "the password", Some("stored in ~/.config/app/creds"), None).is_ok());
         assert!(store.save(Scope::User, "the password", Some("1password"), None).is_ok());
+        // The short `.env`-style password labels `pass`/`pwd`/`passphrase` end a
+        // bare `text` label too: `text = "DB_PWD"` + `evidence = "hunter2"`
+        // carries no `:`/`=`/copula, so the joins above miss it, yet the prompt
+        // renders the secret beside its label (Copilot finding, src/memory.rs).
+        // The trailing-label vocabulary must recognise them so an obvious
+        // credential cannot bypass filtering by splitting across fields.
+        assert!(store.save(Scope::User, "DB_PWD", Some("hunter2"), None).is_err());
+        assert!(store.save(Scope::User, "db pass", Some("s3cr3tvalue"), None).is_err());
+        assert!(store.save(Scope::User, "passphrase", Some("correct horse battery"), None).is_err());
+        assert!(store.save(Scope::User, "the pwd", Some("hunter2"), None).is_err());
+        // …but a word that merely *contains* a short label (`compass`, `bypass`)
+        // is not a label, and the location exemption still applies.
+        assert!(store.save(Scope::User, "the compass", Some("points north"), None).is_ok());
+        assert!(store.save(Scope::User, "the bypass", Some("hunter2"), None).is_ok());
+        assert!(store.save(Scope::User, "the pwd", Some("in the vault"), None).is_ok());
+        assert!(store.save(Scope::User, "passphrase", Some("1password"), None).is_ok());
     }
 
     #[test]
