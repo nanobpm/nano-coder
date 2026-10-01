@@ -802,12 +802,22 @@ impl FileLock {
             use std::os::windows::fs::OpenOptionsExt;
             const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
             const ERROR_SHARING_VIOLATION: i32 = 32;
+            // `FILE_FLAG_DELETE_ON_CLOSE` requires `DELETE` in the desired
+            // access, but `.write(true)` requests only `GENERIC_WRITE`. Without
+            // `DELETE` the open fails with access denied (`PermissionDenied`),
+            // which the retry loop below misclassifies as lock contention and
+            // turns every writable memory operation into a five-second timeout
+            // (Copilot finding, src/memory.rs). Request `DELETE` alongside
+            // `GENERIC_WRITE` so the lock open actually succeeds.
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const DELETE: u32 = 0x0001_0000;
             loop {
                 match std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .share_mode(0)
+                    .access_mode(GENERIC_WRITE | DELETE)
                     .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
                     .open(&lock)
                 {
@@ -1063,7 +1073,19 @@ fn sanitize_uri_query(query: &str) -> String {
             // classification uses the decoded form; the surviving non-credential
             // params below are emitted with their original spelling, so a param
             // that merely *selects* the repository keeps its exact identity.
-            !is_credential_query_key(&percent_decode_lossy(key))
+            if is_credential_query_key(&percent_decode_lossy(key)) {
+                return false;
+            }
+            // A non-credential *key* can still carry a recognisable secret as its
+            // *value*: `?session=ghp_<token>` survives the key filter above even
+            // though the value matches the module's known-secret detector, so the
+            // token would leak into the project key, prompt label and readable
+            // filename (Copilot finding, src/memory.rs). Inspect the
+            // percent-decoded value (and, for a valueless bare parameter, the
+            // param itself) with `looks_like_secret` before retaining it.
+            let value = param.split_once('=').map_or("", |(_, v)| v);
+            let decoded_value = percent_decode_lossy(value);
+            looks_like_secret(&decoded_value).is_none() && looks_like_secret(param).is_none()
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -2474,6 +2496,33 @@ mod tests {
         assert_eq!(
             normalize_remote("https://host.example/git?compass=north"),
             "https://host.example/git?compass=north"
+        );
+        // A non-credential *key* can still carry a recognisable secret as its
+        // *value*: `?session=ghp_<token>` survives the key filter, so the value
+        // is inspected with the known-secret detector and the whole parameter is
+        // dropped — the token never leaks into the project key, prompt label or
+        // filename (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example/git?session=ghp_0123456789abcdef0123456789abcdefABCD"),
+            "https://host.example/git"
+        );
+        // …including when the secret value is percent-encoded (`%5f` = `_`), so
+        // the decoded value is what the detector sees.
+        assert_eq!(
+            normalize_remote("https://host.example/git?session=ghp%5f0123456789abcdef0123456789abcdefABCD"),
+            "https://host.example/git"
+        );
+        // A secret-valued parameter alongside an identity parameter keeps only
+        // the identity one.
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&session=ghp_0123456789abcdef0123456789abcdefABCD"),
+            "https://host.example/git?repo=one"
+        );
+        // …but a non-secret value on a non-credential key (`?session=abc`) is
+        // ordinary identity and is preserved verbatim.
+        assert_eq!(
+            normalize_remote("https://host.example/git?session=abc"),
+            "https://host.example/git?session=abc"
         );
         // The fragment carries no git repository identity and is dropped.
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");
