@@ -2568,7 +2568,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("gpt-4o-mini")), config);
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), config);
         let before = agent.config().model.clone();
         let error = agent.set_model("broken/some-model").await.unwrap_err();
         assert!(format!("{error:#}").contains("definitely-not-a-real-command-nano"), "unexpected error: {error:#}");
@@ -2587,7 +2587,7 @@ mod tests {
         // line is not part of the conversation (it is recorded only when
         // submitted), so no user message is skipped — including a trailing one
         // with no assistant reply yet, and repeated texts.
-        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("gpt-4o-mini")), Config::default());
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
         agent.set_event_sink(Box::new(move |_, event| {

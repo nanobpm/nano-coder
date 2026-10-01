@@ -89,7 +89,7 @@ pub async fn run(
     config_path: &Path,
     recents: &recents::SharedRecents,
     recents_path: &Path,
-) -> Vec<String> {
+) -> (Vec<String>, Result<()>) {
     let mut changes = Changes::default();
     // Notices (e.g. a client-rebuild failure) that must survive the dialog's
     // exit redraw: the caller re-shows them through the renderer after
@@ -127,7 +127,7 @@ pub async fn run(
         ];
         let Some(selection) = Select::new().with_prompt("Select setting").items(&items).default(0).interact().ok()
         else {
-            return notices;
+            return (notices, Ok(()));
         };
         match selection {
             0 => {
@@ -186,7 +186,12 @@ pub async fn run(
                     }
                 }
             }
-            2 => edit_temperature(agent, &mut changes)?,
+            2 => {
+                match edit_temperature(agent, &mut changes) {
+                    Ok(()) => {}
+                    Err(e) => return (notices, Err(e)),
+                }
+            }
             3 => {
                 match Input::<i32>::new()
                     .with_prompt("Max tokens")
@@ -300,7 +305,7 @@ pub async fn run(
                 if save {
                     save_and_report(agent.config(), &mut changes, config_path);
                 }
-                return notices;
+                return (notices, Ok(()));
             }
         }
     }

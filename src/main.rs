@@ -551,23 +551,17 @@ impl Terminal {
             self.renderer.frame_batch(|| agent.replay_history());
         } else if frame_was_active {
             // Legacy scrollback was cleared by the frame's redraws: reprint
-            // the conversation so older turns stay accessible. The tap prints
-            // only the user turns (the sink's legacy `Renderer::event` renders
-            // everything else and ignores replayed user messages). First flush
-            // the frame-only items `set_mode` migrated (banner, `/help`,
-            // notes, raw exports): a fresh session has no history events to
-            // trigger `out()`'s deferred flush and the next prompt is drawn by
-            // `EditView`, so without this they would stay invisible until the
-            // first turn's output. Then reprint the plan snapshots the frame
-            // accumulated: the replay emits only the CURRENT plan (once, at
-            // the end), so without them the earlier checklist states the frame
-            // showed would be lost. `replay_plan_snapshots` skips the last
-            // snapshot when it is the plan the replay just printed.
-            self.renderer.flush_pending();
-            let plans = self.renderer.take_pending_plans();
-            let renderer = self.renderer.clone();
-            agent.replay_history_with(|event| renderer.replay_event(event));
-            self.renderer.replay_plan_snapshots(plans, agent.current_plan());
+            // the visible transcript so it stays accessible. `set_mode`
+            // captured the frame's full transcript (in on-screen order), and
+            // `replay_transcript` reprints it now — AFTER the clear above, so
+            // nothing is erased. Replaying the captured transcript rather than
+            // `Agent::conversation` keeps the switch lossless: frame-only
+            // items, turns and plan updates stay in their shown order, the
+            // real pre-compaction turns are restored (the compacted
+            // conversation would print the synthetic summary as a user turn
+            // and drop the compacted-away turns), and the current plan prints
+            // exactly once (it is simply the last `Item::Plan`).
+            self.renderer.replay_transcript();
         }
     }
 
@@ -1482,7 +1476,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // switch must still be applied here — returning early would leave
             // the renderer and editor in the old mode with no diff left to
             // retrigger the switch on the next visit.
-            let notices = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
+            let (notices, outcome) = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
@@ -1510,6 +1504,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // editor's argument suggestions read (providers or the model may
             // have changed).
             terminal.sync_context(agent);
+            // Propagate a genuine dialog I/O failure only AFTER the renderer
+            // switch and notices above, so an errored exit still leaves the
+            // terminal in the new mode and shows what the dialog retained.
+            outcome?;
             Ok(true)
         }
         "/tools" => {
