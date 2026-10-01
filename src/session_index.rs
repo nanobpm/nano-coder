@@ -83,6 +83,33 @@ fn fold_input(summary: &mut Summary, text: &str) {
     }
 }
 
+/// Fold every committed input record in `path` after byte offset `from` into
+/// `summary`. Only the tail past `from` is read (the file is seeked, not
+/// re-read whole), so per-turn maintenance stays bounded even though it folds
+/// more than the caller's own input: a second process resuming the same
+/// session can commit its prompt between `from` and now, and folding only the
+/// current turn's text while advancing `log_bytes` to the full file would
+/// lose that concurrent prompt from the cache (it would never be rediscovered
+/// because `list()` trusts the matching `log_bytes`).
+fn fold_inputs_since(path: &Path, from: u64, summary: &mut Summary) -> Result<()> {
+    let mut file = fs::File::open(path).with_context(|| format!("read session log {}", path.display()))?;
+    file.seek(SeekFrom::Start(from)).with_context(|| format!("seek session log {}", path.display()))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).with_context(|| format!("read session log {}", path.display()))?;
+    // Only whole, newline-terminated records are committed; `from` names a
+    // committed boundary, so the tail begins at a record start.
+    let committed = tail.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+    for line in tail[..committed].split(|&b| b == b'\n').filter(|line| !line.is_empty()) {
+        if !line.starts_with(br#"{"type":"input""#) {
+            continue;
+        }
+        if let Ok(Record::Input { text, .. }) = serde_json::from_slice::<Record>(line) {
+            fold_input(summary, &text);
+        }
+    }
+    Ok(())
+}
+
 /// Summarize the session log at `path`. Only the header and input records are
 /// decoded; other lines (often large tool output) are skipped unparsed.
 pub fn summarize(path: &Path) -> Result<Summary> {
@@ -243,15 +270,15 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Resu
 /// the `provider/model` in use now, which may differ from the one the
 /// session started with.
 ///
-/// The turn's own input is folded into the cached summary rather than
-/// rescanning the whole log: rereading every prior prompt and tool-output
-/// record on each completed turn would make index maintenance cumulative
-/// quadratic I/O. The cached summary must cover the log up to `from` (the
-/// log's size before the turn's input was appended); when it is missing or
-/// older — the first turn, an older version that didn't index, a crash —
-/// fall back to one full scan. `list()` likewise rebuilds from the log
+/// The committed input records appended since `from` are folded into the
+/// cached summary rather than rescanning the whole log: rereading every prior
+/// prompt and tool-output record on each completed turn would make index
+/// maintenance cumulative quadratic I/O. The cached summary must cover the log
+/// up to `from` (the log's size before the turn's input was appended); when it
+/// is missing or older — the first turn, an older version that didn't index, a
+/// crash — fall back to one full scan. `list()` likewise rebuilds from the log
 /// whenever a summary is missing or stale.
-pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>) -> Result<()> {
+pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<()> {
     let dir = path.parent().context("session log has no directory")?;
     let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let metadata = fs::metadata(path)?;
@@ -262,12 +289,12 @@ pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>
     let (mut index, lines) = load(dir);
     let mut summary = match index.remove(id) {
         Some(mut cached) if cached.log_bytes == from => {
-            // The cache covers the log up to the turn's first record, so the
-            // input is not in it yet: fold just this one instead of
-            // rescanning the log.
-            if let Some(text) = input {
-                fold_input(&mut cached, text);
-            }
+            // The cache covers the log up to `from`. Fold every input record
+            // committed since — reading only the tail past `from`, not the
+            // whole log. Folding all of them (not just this turn's own text)
+            // keeps a concurrent writer's prompt from being lost when
+            // `log_bytes` is advanced to the full file below.
+            fold_inputs_since(path, from, &mut cached)?;
             cached
         }
         // Missing or stale: rebuild from the log, which already holds the
@@ -570,7 +597,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create_with(dir.path(), "m", None, Some("openai/gpt-5".into())).unwrap();
         input(&mut log, "i1", "Switch models halfway through");
-        update(log.path(), 0, None, Some("anthropic/claude".into())).unwrap();
+        update(log.path(), 0, Some("anthropic/claude".into())).unwrap();
         assert_eq!(list(dir.path()).unwrap()[0].model.as_deref(), Some("anthropic/claude"));
         // Even when the log has changed since, the later model survives.
         input(&mut log, "i2", "Another prompt after switching");
@@ -584,7 +611,7 @@ mod tests {
         // First turn: no cached summary, so the log is scanned once (the
         // input record is already in the log, so nothing is folded).
         input(&mut log, "i1", "Investigate the flaky deploy test");
-        update(log.path(), 0, None, None).unwrap();
+        update(log.path(), 0, None).unwrap();
         let scanned = list(dir.path()).unwrap();
         assert_eq!(scanned[0].prompts, 1);
         assert_eq!(scanned[0].first_prompt.as_deref(), Some("Investigate the flaky deploy test"));
@@ -592,16 +619,44 @@ mod tests {
         // Later turns fold just their own input into the cached summary.
         let from = log.size();
         input(&mut log, "i2", "Fix the retry logic in the deployer");
-        update(log.path(), from, Some("Fix the retry logic in the deployer"), None).unwrap();
+        update(log.path(), from, None).unwrap();
         let from = log.size();
         input(&mut log, "i3", "do it");
-        update(log.path(), from, Some("do it"), None).unwrap();
+        update(log.path(), from, None).unwrap();
 
         let sessions = list(dir.path()).unwrap();
         assert_eq!(sessions[0].prompts, 3);
         assert_eq!(sessions[0].last_prompt.as_deref(), Some("do it"));
         assert_eq!(sessions[0].context_prompt.as_deref(), Some("Fix the retry logic in the deployer"));
         assert_eq!(sessions[0].log_bytes, log.size());
+    }
+
+    #[test]
+    fn update_folds_an_input_a_concurrent_writer_appended_since_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create_with(dir.path(), "s", Some("/work/repo".into()), None).unwrap();
+        input(&mut log, "i1", "First turn prompt");
+        update(log.path(), 0, None).unwrap();
+        assert_eq!(list(dir.path()).unwrap()[0].prompts, 1);
+
+        // This process starts its turn at `from`; a second process resuming
+        // the same session commits its own prompt before this turn's `update`
+        // runs. Both inputs now sit in the log past `from`.
+        let from = log.size();
+        input(&mut log, "i2", "This process's prompt");
+        input(&mut log, "i3", "A concurrent process's prompt");
+        update(log.path(), from, None).unwrap();
+
+        // Every input committed since `from` is folded, so the concurrent
+        // writer's prompt is not lost even though `log_bytes` now covers the
+        // whole file.
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions[0].prompts, 3);
+        assert_eq!(sessions[0].last_prompt.as_deref(), Some("A concurrent process's prompt"));
+        assert_eq!(sessions[0].log_bytes, log.size());
+        // The cache covers the whole log, so a later listing trusts it and
+        // does not rescan-and-refold (which would double-count).
+        assert_eq!(list(dir.path()).unwrap()[0].prompts, 3);
     }
 
     #[test]
@@ -612,7 +667,7 @@ mod tests {
         // `from` naming a different log size than the cache cannot match:
         // the summary is rebuilt from the log and the input is not folded
         // (the rescan already saw its record).
-        update(log.path(), u64::MAX, Some("First prompt for the session"), None).unwrap();
+        update(log.path(), u64::MAX, None).unwrap();
         let sessions = list(dir.path()).unwrap();
         assert_eq!(sessions[0].prompts, 1);
         assert_eq!(sessions[0].last_prompt.as_deref(), Some("First prompt for the session"));
@@ -682,7 +737,7 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "k").unwrap();
         input(&mut log, "i1", "Keep this session around");
         for _ in 0..100 {
-            update(log.path(), 0, None, None).unwrap();
+            update(log.path(), 0, None).unwrap();
         }
         let gone = SessionLog::create(dir.path(), "gone").unwrap();
         list(dir.path()).unwrap();
@@ -705,7 +760,7 @@ mod tests {
         // 200 appends would be 200 lines unbounded; bounded it never exceeds
         // the compaction threshold of `sessions * 2 + 64`.
         for _ in 0..200 {
-            update(log.path(), 0, None, None).unwrap();
+            update(log.path(), 0, None).unwrap();
         }
         let (index, lines) = load(dir.path());
         assert_eq!(index.len(), 1, "one live session");
