@@ -412,6 +412,12 @@ impl Renderer {
                 // single-line sanitizer to match what live output shows.
                 let name = crate::sanitize_terminal_line(name);
                 let summary = crate::sanitize_terminal_line(summary);
+                // Fit the summary to the row's remaining width: the frame
+                // truncated it to one row (and live legacy output fits it too),
+                // so replaying the raw captured value would wrap across rows and
+                // the frame → legacy replay would not preserve the transcript.
+                let used = strip_ansi(stamp).chars().count() + name.chars().count() + 4;
+                let summary = fit(&summary, self.width().saturating_sub(used));
                 self.out(state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}\n"));
             }
             Item::ToolResult { ok, output, verbose } => {
