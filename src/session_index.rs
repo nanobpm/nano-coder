@@ -368,10 +368,19 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
         if crate::session::validate_id(&id).is_err() {
             continue;
         }
-        let size = entry
+        let metadata = entry
             .metadata()
-            .with_context(|| format!("read metadata for session log {}", path.display()))?
-            .len();
+            .with_context(|| format!("read metadata for session log {}", path.display()))?;
+        // Skip anything that is not a regular file before reading it as a
+        // session log. A directory named `foo.jsonl` makes `fs::read` fail and
+        // would abort the whole listing, and a FIFO with that name can block
+        // the picker indefinitely. Only regular files are logs; checking here
+        // still surfaces real filesystem errors (the `metadata` call above and
+        // the reads in `summarize`) for genuine logs.
+        if !metadata.is_file() {
+            continue;
+        }
+        let size = metadata.len();
         let summary = match index.remove(&id) {
             Some(summary) if summary.log_bytes == size => summary,
             stale => match summarize(&path) {
@@ -590,6 +599,23 @@ mod tests {
         let not_a_dir = dir.path().join("a-file");
         fs::write(&not_a_dir, b"x").unwrap();
         assert!(list(&not_a_dir).is_err(), "a non-NotFound read_dir error must propagate");
+    }
+
+    #[test]
+    fn list_skips_non_regular_jsonl_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s").unwrap();
+        input(&mut log, "i1", "A real session prompt");
+        drop(log);
+        // A directory named like a session log must be skipped, not read:
+        // `fs::read` on it would fail and abort the whole listing. (A FIFO
+        // with that name could block the picker indefinitely; it is skipped
+        // by the same `is_file` check, but a blocking read is not testable
+        // here.)
+        fs::create_dir(dir.path().join("notalog.jsonl")).unwrap();
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1, "the directory entry is skipped, the real log listed");
+        assert_eq!(sessions[0].id, "s");
     }
 
     #[test]
