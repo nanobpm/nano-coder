@@ -1948,14 +1948,21 @@ impl Agent {
                 };
                 (summary, None)
             }
-            Ok(response) => (
-                self.dropped_note(summarized.len(), smart.then_some(range).flatten()),
-                Some(if crate::llm::stop_reason_is_length(response.stop_reason.as_deref()) {
+            Ok(response) => {
+                // An empty summary can still have burned the whole output
+                // allowance on reasoning; account for it like any other
+                // successful response so the status line and `/context` do not
+                // under-report this compaction request. Computed before the
+                // mutable borrow in `record_usage`.
+                let dropped = self.dropped_note(summarized.len(), smart.then_some(range).flatten());
+                let reason = if crate::llm::stop_reason_is_length(response.stop_reason.as_deref()) {
                     "empty summary: the output limit was reached before any summary text".to_string()
                 } else {
                     "empty summary".to_string()
-                }),
-            ),
+                };
+                self.record_usage(&response, false);
+                (dropped, Some(reason))
+            }
             Err(e) => (self.dropped_note(summarized.len(), smart.then_some(range).flatten()), Some(format!("{e:#}"))),
         };
 
