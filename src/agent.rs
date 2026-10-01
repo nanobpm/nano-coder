@@ -16,6 +16,7 @@ use crate::instructions::ProjectInstructions;
 use crate::llm::{
     ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, ToolCall,
 };
+use crate::memory;
 use crate::output;
 use crate::permissions::Policy;
 use crate::plan::{self, Plan};
@@ -462,6 +463,18 @@ pub struct Agent {
     /// was only in the conversation). Cleared once shown or once the agent
     /// uses a history tool.
     history_hint_pending: bool,
+    /// Cross-session memory store, present when `config.memory` is not `off`
+    /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
+    memory: Option<memory::Store>,
+    /// Cached rendered memory index, tagged with the `writable` flag it was
+    /// built for. `apply_mode_to_system_prompt` runs at turn start and before
+    /// every LLM request, and building the index synchronously reads and parses
+    /// both scope files, so without this cache each model iteration would add
+    /// filesystem work proportional to the whole store. Invalidated whenever the
+    /// store is mutated (save/search/forget) so a change still surfaces
+    /// promptly; a `writable` flip (plan-mode toggle) rebuilds once to vary the
+    /// save guidance.
+    memory_index_cache: Option<(bool, String)>,
 }
 
 /// Upper bound on context-window detection at startup and model switches.
@@ -471,6 +484,7 @@ impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
         let policy = Policy::new(&config.permissions, &config.sandbox);
+        let memory = Self::build_memory(&config);
         Self {
             policy,
             client,
@@ -503,6 +517,53 @@ impl Agent {
             turn_history_calls: 0,
             history_available: false,
             history_hint_pending: false,
+            memory,
+            memory_index_cache: None,
+        }
+    }
+
+    /// Build the memory store from config: `None` when memory is off, else a
+    /// store rooted at the configured directory and keyed to the current git
+    /// repository (project scope is unavailable outside a repo). Also `None`
+    /// when no per-user data directory is available and none was configured:
+    /// `memory_dir()` refuses the world-shared system temp fallback, so memory
+    /// is disabled rather than persisted to an attacker-reachable location.
+    fn build_memory(config: &Config) -> Option<memory::Store> {
+        if !config.memory.enabled() {
+            return None;
+        }
+        let dir = config.memory_dir()?;
+        let project = std::env::current_dir().ok().and_then(|cwd| memory::project_key(&cwd));
+        Some(memory::Store::new(dir, project, config.memory_expiry_days))
+    }
+
+    /// Rekey the memory store's project scope from the current working
+    /// directory. ACP applies `params.cwd` only *after* the agent is
+    /// constructed, so the store — keyed to the launch directory at build time —
+    /// must be rebuilt once a session's cwd is known, or ACP sessions read the
+    /// wrong repository's project memories. A no-op for the CLI, where the cwd
+    /// never changes.
+    fn rekey_memory(&mut self) {
+        if self.memory.is_some() {
+            self.memory = Self::build_memory(&self.config);
+            self.memory_index_cache = None;
+        }
+    }
+
+    /// Whether the memory tools are offered at all.
+    fn memory_enabled(&self) -> bool {
+        self.config.memory.enabled() && self.memory.is_some()
+    }
+
+    pub fn memory(&self) -> Option<&memory::Store> {
+        self.memory.as_ref()
+    }
+
+    /// Downgrade full memory to read-only (headless/ACP default: no human vets
+    /// a save live). A no-op if memory is already read-only or off.
+    pub fn restrict_memory_to_read_only(&mut self) {
+        if self.config.memory == crate::config::MemoryMode::On {
+            self.config.memory = crate::config::MemoryMode::ReadOnly;
         }
     }
 
@@ -779,14 +840,36 @@ impl Agent {
     /// a read-only note (and leaving plan mode removes it). Advisory only —
     /// the tool gating is the real guarantee. Needs `&mut`, so callers apply it
     /// between turns.
+    ///
+    /// Rebuilds the full system prompt (not just the note) so the memory index
+    /// guidance reflects the current mode: `memory_writable()` is false in plan
+    /// mode, so the index must not advertise `memory_save` while planning.
     fn apply_mode_to_system_prompt(&mut self) {
-        let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
-        // Strip any existing note, then add it back only in plan mode.
-        let base = first.content.replace(crate::mode::PLAN_PROMPT_NOTE, "");
-        first.content = match self.control.mode() {
+        // Compute the prompt before borrowing the conversation mutably, so the
+        // immutable borrow of `self` (for `system_prompt`) does not conflict.
+        let base = self.system_prompt_cached();
+        let content = match self.control.mode() {
             crate::mode::AgentMode::Plan => format!("{base}{}", crate::mode::PLAN_PROMPT_NOTE),
             _ => base,
         };
+        let Some(first) = self.conversation.first_mut().filter(|m| m.role == Role::System) else { return };
+        first.content = content;
+    }
+
+    /// Rebuild the system message so the folded memory index reflects the
+    /// current store. Called after a `/memory forget` (or the forget tool) so a
+    /// deleted memory leaves the active system prompt immediately instead of
+    /// lingering until the next session. A no-op when memory is off.
+    pub fn refresh_memory_index(&mut self) {
+        if self.memory.is_none() {
+            return;
+        }
+        // Drop the cached index so the rebuild re-reads the store rather than
+        // reusing a snapshot taken before the change.
+        self.memory_index_cache = None;
+        // `apply_mode_to_system_prompt` rebuilds the full system prompt
+        // (including the memory index) and applies the plan-mode note.
+        self.apply_mode_to_system_prompt();
     }
 
     /// Add queued steering messages to the conversation.
@@ -895,18 +978,43 @@ impl Agent {
     /// Start a fresh conversation, persisted under a new session ID if enabled.
     pub fn new_session(&mut self) -> Result<String> {
         let id = session::new_session_id();
+        // ACP sets the session cwd before this runs, so the memory store (keyed
+        // to the launch directory at build time) must be rekeyed to the new
+        // project scope, and that rekeyed index folded into the prompt below.
+        // Build it into a *temporary* rather than committing to `self.memory`
+        // now: in ACP `cwd` has already changed, so a `SessionLog::create` /
+        // initial-append failure below must not leave the live store rekeyed to
+        // the new repository while the old conversation/session are still
+        // active. The staged store is committed with the rest of the live state
+        // only after staging succeeds (failure-atomic staging; Copilot finding,
+        // src/agent.rs).
+        let staged_memory = self.memory.is_some().then(|| Self::build_memory(&self.config));
         // Discover instructions/skills into temporaries so a staging failure
         // below leaves self.instructions/self.skills (and the live system
         // prompt they render) untouched, rather than pairing the old
         // conversation with newly discovered instructions.
         let (instructions, skills) = self.discover_project_instructions();
+        // Render the prompt with the fresh session's default (Normal) mode's
+        // writability — a previous Plan mode would otherwise suppress the memory
+        // save guidance — and against the *staged* memory store, so the folded
+        // index reflects the new scope without committing it. Do *not* reset
+        // `control` or `self.memory` here: the live session must stay untouched
+        // until staging below succeeds, so a `SessionLog::create` /
+        // initial-append failure cannot leave the current session switched out
+        // of Plan/Auto mode, or paired with the new repository's memory scope,
+        // while `new_session` returns an error (failure-atomic staging; Copilot
+        // finding, src/agent.rs).
+        let default_mode = crate::mode::AgentMode::default();
+        let writable = self.config.memory.writable() && default_mode != crate::mode::AgentMode::Plan;
+        let staged_store = staged_memory.as_ref().and_then(|m| m.as_ref());
         let system = Message {
             timestamp: Some(session::now()),
-            ..Message::system(&self.system_prompt_from(&instructions, &skills))
+            ..Message::system(&self.system_prompt_with(&instructions, &skills, writable, staged_store))
         };
         // Stage the new log before mutating any live state so a disk/permission
         // failure leaves the current session (conversation, id, log,
-        // instructions, skills) intact instead of detaching the agent from it.
+        // instructions, skills, mode, memory scope) intact instead of detaching
+        // the agent from it.
         let session = if self.config.persist_sessions {
             let mut log = SessionLog::create(&self.config.session_dir(), &id)?;
             log.append(&Record::Message(system.clone()))?;
@@ -914,7 +1022,13 @@ impl Agent {
         } else {
             None
         };
-        // Staging succeeded — now commit all live state.
+        // Staging succeeded — now commit all live state, including the mode
+        // reset and the memory rekey deferred from above.
+        self.control.set_mode(default_mode);
+        if let Some(memory) = staged_memory {
+            self.memory = memory;
+            self.memory_index_cache = None;
+        }
         self.instructions = instructions;
         self.skills = skills;
         self.conversation = vec![system];
@@ -942,9 +1056,8 @@ impl Agent {
             stats.history_searches = 0;
             stats.history_reads = 0;
         }
-        // Each session starts in the default mode; a plan/auto selection does
-        // not leak across `/restart` or a later session load.
-        self.control.set_mode(crate::mode::AgentMode::default());
+        // Mode was already reset to the default before the system prompt was
+        // rendered above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(id)
     }
@@ -955,6 +1068,18 @@ impl Agent {
         self.conversation = restored.conversation;
         // Instructions are re-read so a resumed session sees the current files.
         self.load_project_instructions();
+        // Rekey memory to the session cwd (ACP applies it before this runs), so
+        // memory_search hits the requested repository's project scope.
+        self.rekey_memory();
+        // A loaded session starts in the default mode, not whatever mode the
+        // previous session left selected. Reset it *before* rendering the
+        // system prompt below: `system_prompt()` derives memory writability
+        // from the live mode, so rendering while still in Plan would bake
+        // read-only memory guidance into a session that is actually writable
+        // (Normal) until the next prompt refresh (Copilot finding,
+        // src/agent.rs). Mirrors `new_session`, which renders for the default
+        // mode's writability.
+        self.control.set_mode(crate::mode::AgentMode::default());
         let system = Message { timestamp: Some(session::now()), ..Message::system(&self.system_prompt()) };
         match self.conversation.first_mut() {
             Some(first) if first.role == Role::System => *first = system,
@@ -986,9 +1111,8 @@ impl Agent {
             stats.history_reads = 0;
         }
         self.repair_dangling_tool_calls()?;
-        // A loaded session starts in the default mode, not whatever mode the
-        // previous session left selected.
-        self.control.set_mode(crate::mode::AgentMode::default());
+        // The mode was already reset to the default before the system prompt
+        // was rendered above, so the memory index guidance is correct.
         self.refresh_stats();
         Ok(())
     }
@@ -1084,12 +1208,76 @@ impl Agent {
         self.system_prompt_from(&self.instructions, &self.skills)
     }
 
+    /// Whether memory saves are actually offered right now: the mode must be
+    /// writable *and* the agent must not be in plan mode, whose read-only tool
+    /// gating drops `memory_save`. The memory index guidance uses this so a
+    /// plan-mode prompt never advertises an unavailable tool.
+    pub fn memory_writable(&self) -> bool {
+        self.config.memory.writable() && self.control.mode() != crate::mode::AgentMode::Plan
+    }
+
     /// Render the system prompt from a given instruction/skill set, so a new
     /// session can build its prompt from freshly discovered temporaries before
-    /// committing them to `self`.
+    /// committing them to `self`. Uses the current mode's memory writability.
     fn system_prompt_from(&self, instructions: &Option<ProjectInstructions>, skills: &Skills) -> String {
+        self.system_prompt_for(instructions, skills, self.memory_writable())
+    }
+
+    /// Render the system prompt with an explicit memory-writability value, so a
+    /// caller can render for a mode other than the one currently committed to
+    /// `control` (e.g. a fresh session's default mode before that mode is
+    /// applied). `system_prompt_from` is this with the live writability.
+    fn system_prompt_for(&self, instructions: &Option<ProjectInstructions>, skills: &Skills, writable: bool) -> String {
+        self.system_prompt_with(instructions, skills, writable, self.memory.as_ref())
+    }
+
+    /// Like [`Agent::system_prompt_for`] but with an explicit memory store, so a
+    /// caller can fold in a *staged* store that has not yet been committed to
+    /// `self.memory` (e.g. `new_session` renders with the rekeyed store before
+    /// committing it, so a later staging failure cannot leave the store paired
+    /// with the old session — failure-atomic staging).
+    fn system_prompt_with(
+        &self,
+        instructions: &Option<ProjectInstructions>,
+        skills: &Skills,
+        writable: bool,
+        memory: Option<&memory::Store>,
+    ) -> String {
         let extra = instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
-        format!("{}{extra}{}", self.config.system_prompt, skills.render_index())
+        let memory =
+            memory.filter(|_| self.config.memory.enabled()).map(|store| store.index(writable)).unwrap_or_default();
+        format!("{}{extra}{}{memory}", self.config.system_prompt, skills.render_index())
+    }
+
+    /// Like [`Agent::system_prompt`] but serves the memory index from the
+    /// per-session cache. `apply_mode_to_system_prompt` runs before every model
+    /// request, and rendering the index reads and parses both scope files, so
+    /// recomputing it each iteration would add filesystem work proportional to
+    /// the whole store to every turn. Instructions and skills are already
+    /// in-memory, so only the memory index is cached.
+    fn system_prompt_cached(&mut self) -> String {
+        let memory = self.cached_memory_index();
+        let extra = self.instructions.as_ref().map(ProjectInstructions::render).unwrap_or_default();
+        format!("{}{extra}{}{memory}", self.config.system_prompt, self.skills.render_index())
+    }
+
+    /// The rendered memory index, cached for the current `writable` state. The
+    /// cache is invalidated on any store mutation (see `refresh_memory_index`
+    /// and the memory-tool dispatch); a `writable` flip rebuilds once so the
+    /// save guidance matches the mode.
+    fn cached_memory_index(&mut self) -> String {
+        if self.memory.is_none() || !self.config.memory.enabled() {
+            return String::new();
+        }
+        let writable = self.memory_writable();
+        if let Some((cached_writable, index)) = &self.memory_index_cache
+            && *cached_writable == writable
+        {
+            return index.clone();
+        }
+        let index = self.memory.as_ref().map(|store| store.index(writable)).unwrap_or_default();
+        self.memory_index_cache = Some((writable, index.clone()));
+        index
     }
 
     /// Discover instruction files and skills for the current working directory,
@@ -1177,6 +1365,9 @@ impl Agent {
         }
         if self.history_tools_enabled() {
             tools.extend(history::definitions());
+        }
+        if self.memory_enabled() {
+            tools.extend(memory::definitions(self.memory_writable()));
         }
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
@@ -1573,6 +1764,7 @@ impl Agent {
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
+                let is_memory_tool = memory::is_memory_tool(&tool_call.name) && self.memory_enabled();
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -1595,6 +1787,8 @@ impl Agent {
                     self.skills.load(&tool_call.arguments).map(Value::String)
                 } else if is_history_tool {
                     self.run_history_tool(tool_call).map(Value::String)
+                } else if is_memory_tool {
+                    self.run_memory_tool(tool_call).map(Value::String)
                 } else if is_outcome_tool {
                     Outcome::from_args(&tool_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
@@ -2053,6 +2247,60 @@ impl Agent {
         }
     }
 
+    fn run_memory_tool(&mut self, call: &ToolCall) -> Result<String> {
+        let store = self.memory.as_ref().ok_or_else(|| anyhow::anyhow!("memory is disabled"))?;
+        // Read-only memory offers only search; refuse a save/forget that
+        // arrived anyway (e.g. an in-flight call from before a mode change).
+        if !self.config.memory.writable() && call.name != memory::SEARCH_TOOL {
+            return Err(anyhow::anyhow!("{} is disabled: memory is read-only here", call.name));
+        }
+        let session = self.session_id.as_deref();
+        // A search must not mutate the store when the session is read-only —
+        // either because the agent is in Plan mode, OR because memory is
+        // configured read-only (`MemoryMode::ReadOnly`, e.g. a configured
+        // read-only session or any ACP/headless session downgraded to it).
+        // Checking only Plan mode let a configured read-only search still reach
+        // the mutating path, where it acquires locks, prunes expired records,
+        // bumps `last_used`, and rewrites the JSONL file (Copilot finding,
+        // src/agent.rs). Route search through the read-only path in both cases
+        // so it neither bumps `last_used` nor prunes/rewrites the store.
+        let read_only = self.control.mode() == crate::mode::AgentMode::Plan || !self.config.memory.writable();
+        // A mode switch can land after the outer dispatch gate but before this
+        // handler runs (the control is switchable while a turn holds `&mut
+        // Agent`). `memory::run` only honours `read_only` for search — save and
+        // forget mutate unconditionally — so re-check the mode here and refuse a
+        // mutating op that arrived while the agent is in Plan mode, or it would
+        // write to the store despite the read-only guarantee (Copilot finding,
+        // src/agent.rs).
+        if read_only && call.name != memory::SEARCH_TOOL {
+            return Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", call.name));
+        }
+        let result = memory::run(store, &call.name, &call.arguments, session, read_only);
+        // Any non-plan memory op can change the folded system-prompt index — a
+        // save adds an entry, a matching search bumps `last_used` (and may
+        // prune), a forget deletes one — so drop the cached index; the next
+        // prompt rebuild re-reads the store. A plan-mode/read-only search never
+        // mutates, so it need not invalidate.
+        //
+        // Invalidate on *every* non-plan op, not only on `Ok`: a failed mutating
+        // operation can already have changed disk state — `read_scope_file(..,
+        // true)` may prune a scope before a later error, and a two-scope search
+        // may write the first scope before the second write fails — so the
+        // cached prompt could otherwise retain expired entries or a stale MRU
+        // ordering. Invalidating on an error with no mutation is harmless
+        // (Copilot finding, src/agent.rs).
+        if !read_only {
+            self.memory_index_cache = None;
+        }
+        // A successful forget deletes an entry the folded system-prompt index
+        // still shows; rebuild it so the removed fact leaves the active prompt
+        // at once rather than resurfacing on the next turn.
+        if call.name == memory::FORGET_TOOL && result.is_ok() {
+            self.refresh_memory_index();
+        }
+        result
+    }
+
     /// Get conversation length
     #[cfg(test)]
     pub fn conversation_length(&self) -> usize {
@@ -2368,6 +2616,228 @@ mod tests {
         // … and the temperature lookup resolves against `demo`, not `mock`.
         let resolved = agent.temperature();
         assert_eq!((resolved.value(), resolved.source), (Some(0.2), crate::temperature::Source::Provider));
+    }
+
+    fn memory_agent(mode: crate::config::MemoryMode, responses: Vec<LLMResponse>, dir: &std::path::Path) -> Agent {
+        let client = Scripted { responses: Mutex::new(responses), seen: Arc::new(Mutex::new(Vec::new())) };
+        let config = Config {
+            session_dir: Some(dir.join("sessions")),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory: mode,
+            memory_dir: Some(dir.join("memory")),
+            ..Config::default()
+        };
+        Agent::new(Box::new(client), config)
+    }
+
+    #[test]
+    fn memory_tools_track_the_configured_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = |a: &Agent| a.tool_definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+
+        let on = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        let on_names = names(&on);
+        for tool in [memory::SAVE_TOOL, memory::SEARCH_TOOL, memory::FORGET_TOOL] {
+            assert!(on_names.contains(&tool.to_string()), "on offers {tool}");
+        }
+
+        let read_only = memory_agent(crate::config::MemoryMode::ReadOnly, vec![], dir.path());
+        let ro_names = names(&read_only);
+        assert!(ro_names.contains(&memory::SEARCH_TOOL.to_string()));
+        assert!(!ro_names.contains(&memory::SAVE_TOOL.to_string()), "read-only hides save");
+
+        let off = memory_agent(crate::config::MemoryMode::Off, vec![], dir.path());
+        assert!(!names(&off).iter().any(|n| memory::is_memory_tool(n)), "off offers no memory tools");
+        assert!(off.memory().is_none());
+    }
+
+    #[test]
+    fn plan_mode_drops_save_from_tools_and_index_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        // A saved fact gives the index something to render.
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+
+        let normal_prompt = agent.system_prompt();
+        assert!(normal_prompt.contains(memory::SAVE_TOOL), "normal mode offers save guidance: {normal_prompt}");
+        let names = |a: &Agent| a.tool_definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert!(names(&agent).contains(&memory::SAVE_TOOL.to_string()), "normal mode offers the save tool");
+
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let plan_prompt = agent.system_prompt();
+        assert!(
+            !plan_prompt.contains(memory::SAVE_TOOL),
+            "plan mode drops the unavailable save tool from the index guidance: {plan_prompt}"
+        );
+        assert!(plan_prompt.contains(memory::SEARCH_TOOL), "plan mode still offers search: {plan_prompt}");
+        assert!(!names(&agent).contains(&memory::SAVE_TOOL.to_string()), "plan mode hides the save tool");
+
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        assert!(agent.system_prompt().contains(memory::SAVE_TOOL), "leaving plan mode restores save guidance");
+    }
+
+    #[test]
+    fn stored_system_message_reflects_mode_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+        agent.new_session().unwrap();
+
+        // In Normal mode the stored system message advertises memory_save.
+        assert!(
+            agent.conversation.first().unwrap().content.contains(memory::SAVE_TOOL),
+            "normal mode stored prompt offers save"
+        );
+
+        // Entering plan mode must rebuild the stored prompt so it no longer
+        // advertises the unavailable save tool (Copilot finding, src/agent.rs).
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.apply_mode_to_system_prompt();
+        let plan_content = agent.conversation.first().unwrap().content.clone();
+        assert!(!plan_content.contains(memory::SAVE_TOOL), "plan mode stored prompt drops save guidance");
+        assert!(plan_content.contains("PLAN MODE"), "plan note present");
+
+        // Leaving plan mode restores the save guidance.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        agent.apply_mode_to_system_prompt();
+        let normal_content = agent.conversation.first().unwrap().content.clone();
+        assert!(normal_content.contains(memory::SAVE_TOOL), "normal mode restores save guidance");
+        assert!(!normal_content.contains("PLAN MODE"), "plan note removed");
+    }
+
+    #[test]
+    fn load_session_renders_prompt_with_default_mode_writability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.memory().unwrap().save(memory::Scope::User, "a durable fact", None, None).unwrap();
+        let id = agent.new_session().unwrap();
+
+        // Load while still in Plan mode: the resumed session is Normal
+        // (writable), so its stored system prompt must advertise memory_save —
+        // not Plan's read-only guidance (Copilot finding, src/agent.rs).
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        agent.load_session(&id).unwrap();
+        assert_eq!(agent.mode(), crate::mode::AgentMode::Normal, "load_session resets the mode");
+        let loaded = agent.conversation.first().unwrap().content.clone();
+        assert!(
+            loaded.contains(memory::SAVE_TOOL),
+            "loaded session is writable, so its prompt offers save guidance: {loaded}"
+        );
+        assert!(!loaded.contains("PLAN MODE"), "loaded session carries no plan note: {loaded}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memory_save_persists_and_surfaces_in_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "m1".into(),
+                name: memory::SAVE_TOOL.into(),
+                arguments: json!({"scope": "user", "text": "python comes from uv"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![save, text("done")], dir.path());
+        agent.new_session().unwrap();
+        assert_eq!(agent.send_message("remember that").await.unwrap(), "done");
+        // The save is confirmed to the model (and so shown in the transcript).
+        let path = agent.session_path().unwrap().to_path_buf();
+        let logged: Vec<Message> = history::load(&path).unwrap().into_iter().map(|(_, m)| m).collect();
+        assert!(
+            logged.iter().any(|m| m.role == Role::Tool && m.content.contains("remembered (user")),
+            "transcript records the save"
+        );
+        // A fresh session on the same store surfaces the fact in its prompt.
+        let mut next = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        next.new_session().unwrap();
+        assert!(next.system_prompt().contains("python comes from uv"), "index carries into the next session");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_memory_refuses_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "m1".into(),
+                name: memory::SAVE_TOOL.into(),
+                arguments: json!({"scope": "user", "text": "should not persist"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, vec![save, text("ok")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("try to save").await.unwrap();
+        assert!(agent.memory().unwrap().all().unwrap().is_empty(), "read-only did not persist the save");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_mode_blocks_a_memory_mutation_that_reached_the_handler() {
+        // A mode switch can land after the outer dispatch gate but before the
+        // memory handler runs (the control is switchable while a turn holds
+        // `&mut Agent`). `memory::run` only honours `read_only` for search, so
+        // the handler must re-check the mode itself and refuse a save/forget
+        // that arrived while the agent is in Plan mode (Copilot finding,
+        // src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::On, vec![], dir.path());
+        agent.new_session().unwrap();
+        // Switch to Plan mode *after* dispatch would have occurred, then call
+        // the handler directly — the in-flight save must be refused.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let save = ToolCall {
+            id: "m1".into(),
+            name: memory::SAVE_TOOL.into(),
+            arguments: json!({"scope": "user", "text": "should not persist"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        let err = agent.run_memory_tool(&save).unwrap_err();
+        assert!(err.to_string().contains("plan mode"), "save refused in plan mode: {err}");
+        assert!(agent.memory().unwrap().all().unwrap().is_empty(), "plan mode did not persist the save");
+        // A read-only search is still allowed in Plan mode.
+        let search = ToolCall {
+            id: "m2".into(),
+            name: memory::SEARCH_TOOL.into(),
+            arguments: json!({"pattern": "anything"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_memory_tool(&search).is_ok(), "plan mode still allows a read-only search");
+    }
+
+    #[test]
+    fn configured_read_only_memory_search_does_not_mutate_the_store() {
+        // A session configured `MemoryMode::ReadOnly` (e.g. an ACP/headless
+        // session downgraded to read-only) must keep search read-only: the
+        // `read_only` flag now honours the configured memory mode, not only Plan
+        // mode, so a search no longer acquires a write lock, prunes, bumps
+        // `last_used`, or rewrites the JSONL file (Copilot finding, src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, vec![], dir.path());
+        agent.new_session().unwrap();
+        // Seed a matching fact directly through the store (save mutates
+        // regardless of mode; the mode gate lives at the agent layer).
+        agent.memory().unwrap().save(memory::Scope::User, "the deploy command is make ship", None, None).unwrap();
+        let file = dir.path().join("memory").join("user.jsonl");
+        let before = std::fs::read(&file).unwrap();
+
+        let search = ToolCall {
+            id: "s1".into(),
+            name: memory::SEARCH_TOOL.into(),
+            arguments: json!({"pattern": "deploy"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        let out = agent.run_memory_tool(&search).unwrap();
+        assert!(out.contains("make ship"), "the read-only search still returns the matching fact: {out}");
+
+        let after = std::fs::read(&file).unwrap();
+        assert_eq!(before, after, "a read-only-mode search must leave the store file byte-for-byte unchanged");
     }
 
     #[tokio::test(flavor = "multi_thread")]

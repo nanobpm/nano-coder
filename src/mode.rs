@@ -84,6 +84,8 @@ const PLAN_ALLOWED_TOOLS: &[&str] = &[
     // summary's folded detail stays reachable in plan mode.
     "history_search",
     "history_read",
+    // Read-only cross-session memory lookup is safe while planning.
+    "memory_search",
 ];
 
 /// Whether `tool` may run in plan mode.

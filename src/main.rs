@@ -24,6 +24,7 @@ mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod memory;
 mod mode;
 mod output;
 mod permissions;
@@ -681,8 +682,14 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// clipboard/title writes) through the interactive picker. Dropping C0/C1
 /// control characters — including ESC (0x1B), which begins every such sequence —
 /// neutralises them while leaving ordinary printable text intact.
+///
+/// The Unicode line/paragraph separators U+2028/U+2029 are dropped too: they are
+/// not `char::is_control`, but terminals and this crate's own memory guards
+/// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
+/// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
+/// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -1003,6 +1010,120 @@ async fn run_compaction(
     }
 }
 
+/// Parse the id from `/memory forget <id>` args, requiring a token boundary
+/// after `forget`: the next character must be whitespace (or end of args).
+/// Without it, `/memory forgetmem-…` would strip the `forget` prefix and treat
+/// `mem-…` as an id, deleting an entry instead of reporting an unknown command
+/// (Copilot finding, src/main.rs). Returns `None` when `args` is not a
+/// `forget` request at all, so the caller falls through to the
+/// unknown-argument branch.
+fn parse_forget_id(args: &str) -> Option<&str> {
+    let rest = args.strip_prefix("forget")?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) { Some(rest.trim()) } else { None }
+}
+
+/// `/memory` (list) and `/memory forget <id>`.
+fn memory_command(agent: &mut Agent, args: &str) -> String {
+    if agent.memory().is_none() {
+        // `memory()` is `None` for two distinct reasons: memory is genuinely
+        // off, or it is *enabled* but no per-user data directory is available
+        // and no `memory_dir` was configured (`memory_dir()` refuses the
+        // world-shared temp fallback). Telling the latter user to "set
+        // `memory = \"on\"`" is wrong — it already is — and leaves them unable
+        // to diagnose the real problem, so direct that case to `memory_dir`
+        // instead (Copilot finding, src/main.rs).
+        if agent.config().memory.enabled() {
+            return "Memory is enabled but no storage directory is available: this platform has \
+                    no per-user data directory and none was configured. Set `memory_dir` in \
+                    config to a directory you control."
+                .to_string();
+        }
+        return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
+    }
+    if let Some(id) = parse_forget_id(args) {
+        if id.is_empty() {
+            return "Usage: /memory forget <id>".to_string();
+        }
+        // Plan mode is read-only: the tool path already refuses `memory_forget`
+        // (the dispatch backstop in `run_memory_tool`), but this slash command
+        // reaches `Store::forget` directly and would otherwise delete the
+        // persistent scope file mid-plan, bypassing the no-modification
+        // guarantee. Gate it on the live mode the same way (Copilot finding,
+        // src/main.rs).
+        if agent.mode() == crate::mode::AgentMode::Plan {
+            return "Memory is read-only in plan mode; /memory forget cannot delete entries.".to_string();
+        }
+        if !agent.config().memory.writable() {
+            return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
+        }
+        let (msg, ok) = match agent.memory().unwrap().forget(id) {
+            Ok(msg) => (msg, true),
+            Err(e) => (format!("{e}"), false),
+        };
+        // Rebuild the folded system prompt so the deleted memory stops appearing
+        // in the active session's index (it is captured at session start).
+        if ok {
+            agent.refresh_memory_index();
+        }
+        return msg;
+    }
+    if !args.is_empty() {
+        return format!("Unknown /memory argument {args:?}; use /memory or /memory forget <id>.");
+    }
+    let store = agent.memory().unwrap();
+    let entries = match store.all() {
+        Ok(entries) => entries,
+        Err(e) => return format!("Could not read memory: {e}"),
+    };
+    if entries.is_empty() {
+        // Branch on *effective* writability: in read-only mode (including
+        // headless/ACP runs) *and in Plan mode* the `memory_save` tool is
+        // unavailable, so pointing the user at it would describe an action the
+        // model cannot take. `config().memory.writable()` alone stays `On` in
+        // Plan mode, so use `memory_writable()`, which also gates on the live
+        // mode (Copilot finding, src/main.rs).
+        return if agent.memory_writable() {
+            format!(
+                "No memories yet. The model saves them with memory_save; files live under {}.",
+                store.root().display()
+            )
+        } else {
+            format!(
+                "No memories yet. Memory is read-only here, so the model cannot save them; files live under {}.",
+                store.root().display()
+            )
+        };
+    }
+    let mut out = vec![format!(
+        "{} memor{} (memory is {}; edit the files under {}{}):",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        agent.config().memory.as_str(),
+        store.root().display(),
+        if agent.memory_writable() { ", or /memory forget <id>" } else { "" }
+    )];
+    for (scope, entry) in &entries {
+        // Sanitise every interpolated field before it reaches the terminal: the
+        // JSONL is documented as human-editable, so a record can carry `\r`, ESC,
+        // or other control bytes that the legacy renderer would otherwise print
+        // verbatim (`print_block` → `println!`), enabling terminal escape
+        // sequences or forged list lines. `sanitize_terminal_text` drops C0/C1
+        // control chars (including ESC and newlines) while keeping printable text.
+        let mut line = format!(
+            "  {} [{}] ({}) {}",
+            scope.as_str(),
+            sanitize_terminal_text(&entry.id),
+            entry.created.format("%Y-%m-%d"),
+            sanitize_terminal_text(entry.text.lines().next().unwrap_or("").trim())
+        );
+        if let Some(evidence) = &entry.evidence {
+            line.push_str(&format!(" (check: {})", sanitize_terminal_text(evidence)));
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     match cmd {
         "/exit" | "/quit" => Ok(false),
@@ -1139,6 +1260,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 terminal.renderer.print_block(agent.plan().render(true, usize::MAX).trim_end());
             }
+            Ok(true)
+        }
+        _ if cmd == "/memory" || cmd.starts_with("/memory ") => {
+            terminal.renderer.print_block(&memory_command(agent, cmd.strip_prefix("/memory").unwrap_or("").trim()));
             Ok(true)
         }
         _ if let Some(op) = queue_command(cmd) => {
@@ -1548,7 +1673,10 @@ async fn main() -> Result<()> {
     register_hooks(&mut agent);
 
     if args.acp {
-        // ACP headless mode; sessions start with session/new or session/load
+        // ACP headless mode; sessions start with session/new or session/load.
+        // No human vets a memory save live here, so full memory is downgraded
+        // to read-only (the model can still consult earlier notes).
+        agent.restrict_memory_to_read_only();
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
@@ -1567,6 +1695,13 @@ async fn main() -> Result<()> {
         // instead of blocking in dialoguer while `Terminal` also reads stdin.
         let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
         agent.questions().set_interactive(interactive);
+        if !interactive {
+            // Piped stdin/stdout is a headless run (a script or agent fleet
+            // drives the CLI): like ACP, no human vets a memory save live, so
+            // downgrade full memory to read-only to uphold the headless
+            // guarantee that the model cannot persist memories unvetted.
+            agent.restrict_memory_to_read_only();
+        }
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
@@ -1927,6 +2062,17 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_terminal_text_strips_unicode_line_separators() {
+        // U+2028/U+2029 are not `char::is_control`, but a terminal folds them as
+        // line breaks, so a hand-edited `/memory` id/text/evidence value could
+        // otherwise render a forged extra row (Copilot finding, src/main.rs).
+        assert_eq!(sanitize_terminal_text("mem-evil\u{2028}forged row"), "mem-evilforged row");
+        assert_eq!(sanitize_terminal_text("head\u{2029}forged row"), "headforged row");
+        // Ordinary printable text (including non-ASCII) is left intact.
+        assert_eq!(sanitize_terminal_text("café — label"), "café — label");
+    }
+
+    #[test]
     fn classify_steer_input_routes_line_queue_and_commands() {
         // Plain Enter (`TermInput::Line`, steer = true) steers the running turn.
         assert!(matches!(classify_steer_input("keep going", true), SteerRoute::Steer));
@@ -1946,5 +2092,111 @@ mod tests {
         // Blank input is a no-op on both paths.
         assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
+    }
+
+    #[test]
+    fn forget_id_requires_a_token_boundary() {
+        // A well-formed `forget` request yields the trimmed id.
+        assert_eq!(parse_forget_id("forget mem-abc"), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget  mem-abc  "), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget\tmem-abc"), Some("mem-abc"));
+        // `forget` alone is a forget request with an empty id (usage error).
+        assert_eq!(parse_forget_id("forget"), Some(""));
+        // No token boundary: `forgetmem-…` is NOT a forget request, so the
+        // caller reports an unknown argument instead of deleting `mem-…`
+        // (Copilot finding, src/main.rs).
+        assert_eq!(parse_forget_id("forgetmem-abc"), None);
+        assert_eq!(parse_forget_id("forgetful"), None);
+        // Unrelated args are not forget requests either.
+        assert_eq!(parse_forget_id(""), None);
+        assert_eq!(parse_forget_id("list"), None);
+    }
+
+    /// Minimal `LLMClient` for `memory_command` tests: the slash command never
+    /// calls the model, so a client that panics if it ever is suffices.
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LLMClient for NoModel {
+        async fn chat(&self, _: &crate::llm::ChatRequest<'_>) -> Result<crate::llm::LLMResponse> {
+            panic!("memory_command must not call the model")
+        }
+        fn model_name(&self) -> &str {
+            "none"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// A memory-enabled agent (user+project store under `dir`) for
+    /// `memory_command` tests.
+    fn memory_command_agent(dir: &std::path::Path) -> Agent {
+        let config = config::Config {
+            session_dir: Some(dir.join("sessions")),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory: config::MemoryMode::On,
+            memory_dir: Some(dir.join("memory")),
+            ..config::Config::default()
+        };
+        Agent::new(Box::new(NoModel), config)
+    }
+
+    #[test]
+    fn memory_forget_is_refused_in_plan_mode() {
+        // `/memory forget` reaches `Store::forget` directly, bypassing the tool
+        // dispatch that refuses `memory_forget` in Plan mode. It must gate on
+        // the live mode itself, or a mid-plan `/memory forget` would delete the
+        // persistent scope file despite Plan mode's read-only promise (Copilot
+        // finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+        let id = agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap().id;
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(msg.contains("plan mode"), "forget refused in plan mode: {msg}");
+        assert!(
+            agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "plan mode did not delete the entry"
+        );
+        // Leaving Plan mode lifts the gate: the same forget now succeeds.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(!msg.contains("plan mode"), "normal mode forgets: {msg}");
+        assert!(
+            !agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "normal mode deleted the entry"
+        );
+    }
+
+    #[test]
+    fn memory_list_hints_gate_on_effective_plan_mode_writability() {
+        // In Plan mode the configured memory stays `On`, but `memory_save` is
+        // removed and `/memory forget` is refused. The `/memory` output must not
+        // advertise either: gate both the empty-list `memory_save` pointer and
+        // the populated-list `/memory forget <id>` hint on `memory_writable()`,
+        // which includes the live mode (Copilot finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+
+        // Empty memory, Plan mode: no `memory_save` suggestion.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("memory_save"), "plan-mode empty hint hides memory_save: {msg}");
+        // Normal mode restores the suggestion.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("memory_save"), "normal-mode empty hint offers memory_save: {msg}");
+
+        // Populated memory, Plan mode: no `/memory forget` hint.
+        agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("/memory forget"), "plan-mode list hides forget hint: {msg}");
+        // Normal mode restores the hint.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("/memory forget"), "normal-mode list offers forget hint: {msg}");
     }
 }
