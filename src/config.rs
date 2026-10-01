@@ -216,15 +216,37 @@ fn create_compat_link(from: &Path) -> std::result::Result<(), String> {
 /// Recreate the compatibility link at `from` if it is missing. Called when the
 /// data already lives at `to`, so the move itself is safe but an earlier run may
 /// have failed to leave the link.
+///
+/// The one occupant that is *not* a failure is the exact compatibility link we
+/// would create (a racing start may have installed it). Anything else at `from`
+/// — typically a real directory recreated by an older running process in the
+/// rename/link window — is reported as [`Migration::LinkFailed`] on every start
+/// until it is resolved: the data lives at `to` while that process keeps writing
+/// to `from`, so the trees are split and the warning must not go silent.
 fn ensure_compat_link(from: &Path, to: &Path) -> Migration {
-    // Anything already present at `from` (the symlink, or defensively any other
-    // entry a user put back) means we must not clobber it; the link is handled.
-    if fs::symlink_metadata(from).is_ok() {
+    if compat_link_is_valid(from) {
         return Migration::None;
     }
-    match create_compat_link(from) {
-        Ok(()) => Migration::None,
-        Err(err) => Migration::LinkFailed { from: from.to_path_buf(), to: to.to_path_buf(), err },
+    if let Err(_metadata_err) = fs::symlink_metadata(from) {
+        // Nothing at `from`: the common case — (re)create the link.
+        return match create_compat_link(from) {
+            Ok(()) => Migration::None,
+            Err(err) => Migration::LinkFailed { from: from.to_path_buf(), to: to.to_path_buf(), err },
+        };
+    }
+    // `from` is occupied by something other than the expected link. Do not
+    // clobber it, but keep reporting the partial migration instead of treating
+    // any entry as success.
+    Migration::LinkFailed {
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        err: format!(
+            "{} is occupied and is not the expected compatibility link; \
+             the data lives at {} — remove the stray entry (after merging anything \
+             an older process wrote there) so the link can be restored",
+            from.display(),
+            to.display(),
+        ),
     }
 }
 
@@ -384,12 +406,50 @@ mod tests {
     }
 
     #[test]
-    fn leaves_legacy_dir_when_current_exists() {
+    fn reports_link_failure_when_current_exists_and_legacy_is_occupied() {
+        // Both real directories coexist: either the user has two independent
+        // trees, or (far more likely) an older agentic-harness build recreated
+        // its directory after the move. Either way the legacy data is a split
+        // tree unreachable from the moved location, so surface it rather than
+        // silently succeeding — and never clobber the existing directory.
         let base = tempfile::tempdir().unwrap();
         fs::create_dir(base.path().join("agentic-harness")).unwrap();
         fs::create_dir(base.path().join("nano-coder")).unwrap();
-        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None);
+        assert!(matches!(
+            migrate_legacy_dir(base.path()).unwrap(),
+            Migration::LinkFailed { .. }
+        ));
         assert!(base.path().join("agentic-harness").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_reporting_link_failure_while_legacy_path_stays_occupied() {
+        let base = tempfile::tempdir().unwrap();
+        let legacy = base.path().join("agentic-harness");
+        let current = base.path().join("nano-coder");
+        fs::create_dir(&legacy).unwrap();
+        assert!(matches!(migrate_legacy_dir(base.path()).unwrap(), Migration::Moved { .. }));
+        // An older process still running in the rename/link window recreates the
+        // legacy directory (e.g. SessionLog::create -> create_dir_all).
+        fs::remove_file(&legacy).unwrap();
+        fs::create_dir(&legacy).unwrap();
+
+        let migration = migrate_legacy_dir(base.path()).unwrap();
+        let Migration::LinkFailed { from, to, .. } = &migration else {
+            panic!("an occupied legacy path must keep reporting LinkFailed, got {migration:?}");
+        };
+        assert_eq!((from.as_path(), to.as_path()), (legacy.as_path(), current.as_path()), "still points at the split trees");
+        // It is reported on every later start, not silently abandoned ...
+        assert!(matches!(migrate_legacy_dir(base.path()).unwrap(), Migration::LinkFailed { .. }));
+        // ... and the stray directory is never clobbered.
+        assert!(fs::symlink_metadata(&legacy).unwrap().is_dir());
+
+        // Once the stray directory is removed, the next start self-heals.
+        fs::remove_dir(&legacy).unwrap();
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None, "link restored");
+        assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+        assert_eq!(migrate_legacy_dir(base.path()).unwrap(), Migration::None, "link in place, quiet again");
     }
 
     #[test]
