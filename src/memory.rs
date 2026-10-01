@@ -1133,7 +1133,12 @@ fn is_credential_query_key(key: &str) -> bool {
     if SUBSTR_NEEDLES.iter().any(|needle| k.contains(needle)) {
         return true;
     }
-    if matches!(k.as_str(), "key" | "sig" | "pat" | "sso") {
+    // Exact-match keys: too short or too common as a substring to match loosely
+    // (`pass` would false-positive on `compass`/`passage`/`bypass`), but as a
+    // whole query-parameter name each is a credential. `pass` and `passphrase`
+    // are common credential query names (`?pass=hunter2`) that no substring
+    // needle covers (Copilot finding, src/memory.rs).
+    if matches!(k.as_str(), "key" | "sig" | "pat" | "sso" | "pass" | "passphrase") {
         return true;
     }
     // The `auth` family: split on the `-`/`_`/`.` separators and match only a
@@ -1408,6 +1413,11 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     let patterns: &[(&str, &str)] = &[
         (r"\b(gh[pousr])_[A-Za-z0-9]{20,}", "GitHub token"),
         (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "GitHub PAT"),
+        // GitLab personal/project/group access tokens (`glpat-…`): a standalone
+        // token shape no other pattern or assignment rule recognises, so it must
+        // be rejected on save like every other known token (Copilot finding,
+        // src/memory.rs).
+        (r"\bglpat-[A-Za-z0-9_-]{20,}", "GitLab access token"),
         (r"\bAKIA[0-9A-Z]{16}\b", "AWS access key id"),
         (r"\bxox[baprs]-[A-Za-z0-9-]{10,}", "Slack token"),
         (r"\bsk-[A-Za-z0-9]{20,}", "API secret key"),
@@ -1802,6 +1812,10 @@ mod tests {
         let store = store(dir.path());
         for secret in [
             "the token is ghp_0123456789abcdef0123456789abcdefABCD",
+            // A standalone GitLab access token (`glpat-…`) is a known token shape
+            // and must be rejected even with no variable-name label (Copilot
+            // finding, src/memory.rs).
+            "the token is glpat-0123456789abcdefghij",
             "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIabcdefghijklmnop1234567890",
             "password: hunter2hunter2",
             "aws id AKIAIOSFODNN7EXAMPLE",
@@ -2441,6 +2455,25 @@ mod tests {
         assert_eq!(
             normalize_remote("https://host.example/git?private_%6bey=xyz"),
             "https://host.example/git"
+        );
+        // The common credential query names `pass` and `passphrase` are exact
+        // whole-key matches: `?pass=hunter2` must be redacted so the secret never
+        // reaches the project key, prompt label or filename (Copilot finding,
+        // src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example/git?pass=hunter2"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&passphrase=hunter2"),
+            "https://host.example/git?repo=one"
+        );
+        // …but `pass` is matched only as a whole key, never as a substring, so a
+        // non-credential key that merely *contains* it (`compass`) keeps its
+        // repository-selecting identity rather than collapsing onto another key.
+        assert_eq!(
+            normalize_remote("https://host.example/git?compass=north"),
+            "https://host.example/git?compass=north"
         );
         // The fragment carries no git repository identity and is dropped.
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");
