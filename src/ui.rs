@@ -557,6 +557,18 @@ impl Renderer {
                     None => {}
                 }
                 fs.think_streamed = false;
+                // Cache the full reasoning for legacy Ctrl-O. The frame keeps
+                // only the collapsed char count (`Item::Thinking`), discarding
+                // the text, and frame events never reach `finish_thinking` — so
+                // without this a frame → legacy switch leaves Ctrl-O reporting
+                // "no thinking yet" (or expanding a stale legacy turn) even
+                // though reasoning just ran. `event()` already holds `frame`
+                // here, and `set_mode` establishes the `frame` → `state` lock
+                // order, so taking `state` to store the text is deadlock-free.
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    self.state.lock().unwrap().last_thinking = trimmed.to_string();
+                }
                 // Do NOT reset `fs.stream` here: a streamed assistant message
                 // may already be in flight (reasoning can arrive after the
                 // answer starts). Only `AssistantMessage` finalizes the stream;
@@ -1392,6 +1404,11 @@ mod tests {
         fn in_turn(&self) -> bool {
             self.state.lock().unwrap().in_turn
         }
+
+        #[cfg(test)]
+        fn cached_last_thinking(&self) -> String {
+            self.state.lock().unwrap().last_thinking.clone()
+        }
     }
 
     #[test]
@@ -1651,6 +1668,21 @@ mod tests {
         r.event(&AgentEvent::Thinking { text: "quick thought" });
         let thinking = r.frame_items().iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
         assert_eq!(thinking, 1);
+    }
+
+    #[test]
+    fn frame_thinking_is_cached_for_legacy_ctrl_o() {
+        let r = Renderer::frame_for_test();
+        // Reasoning in frame mode shows collapsed (char count only) and never
+        // reaches `finish_thinking`, so without caching it `last_thinking`
+        // stays empty and a frame → legacy switch leaves Ctrl-O reporting
+        // "no thinking yet". The full text must be cached for that expansion.
+        assert!(r.cached_last_thinking().is_empty());
+        r.event(&AgentEvent::Thinking { text: "pondering the plan" });
+        assert_eq!(r.cached_last_thinking(), "pondering the plan");
+        // A later reasoning block supersedes the earlier one.
+        r.event(&AgentEvent::Thinking { text: "a second, newer thought" });
+        assert_eq!(r.cached_last_thinking(), "a second, newer thought");
     }
 
     #[test]
