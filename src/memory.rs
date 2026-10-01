@@ -733,11 +733,16 @@ fn write_all(path: &Path, entries: &[Entry], unknown: &[Vec<u8>]) -> Result<()> 
 /// measures how long *this* waiter has waited, not how old the lock is, so a
 /// live holder mid-transaction must never be preempted. Released on drop.
 struct FileLock {
-    #[cfg(unix)]
+    /// The held lock file. On Unix the lock is the `flock` on this handle; on
+    /// Windows it is the exclusive (no-sharing) open plus `DELETE_ON_CLOSE`, so
+    /// in both cases the OS releases the lock — and frees any waiter — the
+    /// instant this handle closes, whether on a clean drop or a crash.
+    #[cfg(any(unix, windows))]
     file: std::fs::File,
-    /// Path of the lock file, kept only for the non-Unix fallback (which uses
-    /// lock-file creation as the mutex and must remove it on drop).
-    #[cfg(not(unix))]
+    /// Path of the lock file, kept only for the exotic non-Unix, non-Windows
+    /// fallback (which uses lock-file creation as the mutex and must remove it
+    /// on drop).
+    #[cfg(all(not(unix), not(windows)))]
     path: PathBuf,
 }
 
@@ -777,10 +782,52 @@ impl FileLock {
             }
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Portable fallback: lock-file creation as the mutex. A crash while
-            // holding the lock would otherwise leave the `create_new` file
+            // Windows OS-level exclusive lock with automatic crash recovery.
+            // Open the lock file with no sharing (`share_mode(0)`) plus
+            // `FILE_FLAG_DELETE_ON_CLOSE`: while a holder keeps the handle open,
+            // every other opener fails with a sharing violation, and the moment
+            // the holder's process ends — cleanly OR by crash — the OS closes
+            // its handle and deletes the file, freeing the next waiter. This
+            // lets the OS prove whether the holder is still alive instead of
+            // guessing from the lock file's age, so a slow-but-live writer is
+            // never preempted and two writers can never both rewrite a stale
+            // snapshot (Copilot finding, src/memory.rs).
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            const ERROR_SHARING_VIOLATION: i32 = 32;
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .share_mode(0)
+                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                    .open(&lock)
+                {
+                    Ok(file) => return Ok(FileLock { file }),
+                    Err(e)
+                        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+                            || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        // The lock is held by a live process; wait and retry so
+                        // a holder mid-transaction is never preempted.
+                        if std::time::Instant::now() >= deadline {
+                            bail!("memory scope is locked by another process (timed out acquiring {})", lock.display());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            // Portable fallback for exotic non-Unix, non-Windows targets with no
+            // OS advisory lock available. Lock-file creation is the mutex. A
+            // crash while holding the lock would otherwise leave the `create_new` file
             // behind, so every later save/search/forget sees `AlreadyExists`,
             // times out, and the scope is disabled until a user manually deletes
             // the file (Copilot finding, src/memory.rs). Recover such a *stale*
@@ -830,7 +877,15 @@ impl Drop for FileLock {
             // lock file itself is left behind — unlocked, it blocks no one.
             let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Nothing to do: the handle was opened with FILE_FLAG_DELETE_ON_CLOSE,
+            // so closing `self.file` here (on drop) both releases the exclusive
+            // lock and removes the lock file. We never remove it by path, so we
+            // can never delete a lock a different process now owns.
+            let _ = &self.file;
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -1047,7 +1102,7 @@ fn percent_decode_lossy(s: &str) -> String {
 fn is_credential_query_key(key: &str) -> bool {
     // Safe as arbitrary substrings: no common non-credential English word
     // contains one of these as a substring, so `contains` cannot false-positive.
-    const SUBSTR_NEEDLES: [&str; 10] = [
+    const SUBSTR_NEEDLES: [&str; 11] = [
         "token",
         "password",
         "passwd",
@@ -1055,6 +1110,7 @@ fn is_credential_query_key(key: &str) -> bool {
         "secret",
         "apikey",
         "accesskey",
+        "privatekey",
         "credential",
         "signature",
         "oauth",
@@ -2341,6 +2397,24 @@ mod tests {
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&oauth_token=xyz"),
             "https://host.example/git?repo=one"
+        );
+        // A `private_key`/`private-key` query parameter is a credential: after
+        // separator-stripping it becomes `privatekey`, which the classifier now
+        // recognises, so the secret is redacted rather than kept in the project
+        // key, prompt label and filename (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example/git?private_key=xyz"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&private-key=xyz"),
+            "https://host.example/git?repo=one"
+        );
+        // …including a percent-encoded spelling (`%6b` = `k`), which is
+        // classified on the decoded key just like `access_%74oken`.
+        assert_eq!(
+            normalize_remote("https://host.example/git?private_%6bey=xyz"),
+            "https://host.example/git"
         );
         // The fragment carries no git repository identity and is dropped.
         assert_eq!(normalize_remote("https://github.com/a/b.git#frag"), "https://github.com/a/b.git");

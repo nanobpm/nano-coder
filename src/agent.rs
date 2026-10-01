@@ -2253,9 +2253,17 @@ impl Agent {
             return Err(anyhow::anyhow!("{} is disabled: memory is read-only here", call.name));
         }
         let session = self.session_id.as_deref();
-        // Plan mode must not mutate: route search through the read-only path so
-        // it neither bumps last_used nor prunes/rewrites the store.
-        let read_only = self.control.mode() == crate::mode::AgentMode::Plan;
+        // A search must not mutate the store when the session is read-only —
+        // either because the agent is in Plan mode, OR because memory is
+        // configured read-only (`MemoryMode::ReadOnly`, e.g. a configured
+        // read-only session or any ACP/headless session downgraded to it).
+        // Checking only Plan mode let a configured read-only search still reach
+        // the mutating path, where it acquires locks, prunes expired records,
+        // bumps `last_used`, and rewrites the JSONL file (Copilot finding,
+        // src/agent.rs). Route search through the read-only path in both cases
+        // so it neither bumps `last_used` nor prunes/rewrites the store.
+        let read_only =
+            self.control.mode() == crate::mode::AgentMode::Plan || !self.config.memory.writable();
         // A mode switch can land after the outer dispatch gate but before this
         // handler runs (the control is switchable while a turn holds `&mut
         // Agent`). `memory::run` only honours `read_only` for search — save and
@@ -2799,6 +2807,36 @@ mod tests {
             malformed_arguments: None,
         };
         assert!(agent.run_memory_tool(&search).is_ok(), "plan mode still allows a read-only search");
+    }
+
+    #[test]
+    fn configured_read_only_memory_search_does_not_mutate_the_store() {
+        // A session configured `MemoryMode::ReadOnly` (e.g. an ACP/headless
+        // session downgraded to read-only) must keep search read-only: the
+        // `read_only` flag now honours the configured memory mode, not only Plan
+        // mode, so a search no longer acquires a write lock, prunes, bumps
+        // `last_used`, or rewrites the JSONL file (Copilot finding, src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, vec![], dir.path());
+        agent.new_session().unwrap();
+        // Seed a matching fact directly through the store (save mutates
+        // regardless of mode; the mode gate lives at the agent layer).
+        agent.memory().unwrap().save(memory::Scope::User, "the deploy command is make ship", None, None).unwrap();
+        let file = dir.path().join("memory").join("user.jsonl");
+        let before = std::fs::read(&file).unwrap();
+
+        let search = ToolCall {
+            id: "s1".into(),
+            name: memory::SEARCH_TOOL.into(),
+            arguments: json!({"pattern": "deploy"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        let out = agent.run_memory_tool(&search).unwrap();
+        assert!(out.contains("make ship"), "the read-only search still returns the matching fact: {out}");
+
+        let after = std::fs::read(&file).unwrap();
+        assert_eq!(before, after, "a read-only-mode search must leave the store file byte-for-byte unchanged");
     }
 
     #[tokio::test(flavor = "multi_thread")]
