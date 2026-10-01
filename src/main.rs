@@ -1515,7 +1515,9 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last]] [--config PATH]");
+    println!(
+        "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
+    );
     println!("                  [--verbosity quiet|normal|verbose|debug]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
     println!("       nano-coder --list-sessions [--all] [--json]");
@@ -1541,6 +1543,12 @@ fn parse_args() -> Result<Args> {
             _ => {}
         }
     }
+    parse_args_from(env::args().skip(1))
+}
+
+/// Parse the argument stream (without the program name) into [`Args`].
+/// Split from [`parse_args`] so tests can drive it with a fixed argv.
+fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     let mut args = Args {
         acp: false,
         login: None,
@@ -1558,7 +1566,7 @@ fn parse_args() -> Result<Args> {
         json: false,
         markdown: false,
     };
-    let mut iter = env::args().skip(1).peekable();
+    let mut iter = argv.into_iter().peekable();
     while let Some(arg) = iter.next() {
         let mut value = |name: &str| iter.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
         match arg.as_str() {
@@ -1567,7 +1575,12 @@ fn parse_args() -> Result<Args> {
             "--list-models" => args.list_models = Some(value("--list-models")?),
             "--model" => args.model = Some(value("--model")?),
             // The ID is optional: without one, pick from the saved sessions.
+            // The attached `--resume=<id>` form is unambiguous and is the only
+            // way to name a dash-prefixed id: the separated form leaves any
+            // `-…` value in the stream (it looks like a flag), where it would
+            // be rejected as an unknown argument.
             "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
+            _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
             "--list-sessions" => args.list_sessions = true,
             "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
@@ -2108,6 +2121,19 @@ mod tests {
         assert_eq!(sanitize_terminal_text("head\u{2029}forged row"), "headforged row");
         // Ordinary printable text (including non-ASCII) is left intact.
         assert_eq!(sanitize_terminal_text("café — label"), "café — label");
+    }
+
+    #[test]
+    fn resume_attached_form_names_dash_prefixed_ids() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The separated form still takes a following non-flag value…
+        assert_eq!(parse_args_from(argv(&["--resume", "sess-1"])).unwrap().resume.as_deref(), Some("sess-1"));
+        // …and no value means "pick one".
+        assert_eq!(parse_args_from(argv(&["--resume"])).unwrap().resume.as_deref(), Some(""));
+        // A dash-prefixed id is only addressable in the attached form: the
+        // separated form would leave `-sess` in the stream as an unknown flag.
+        assert_eq!(parse_args_from(argv(&["--resume=-sess"])).unwrap().resume.as_deref(), Some("-sess"));
+        assert!(parse_args_from(argv(&["--resume", "-sess"])).is_err());
     }
 
     #[test]

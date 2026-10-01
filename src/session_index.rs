@@ -237,7 +237,11 @@ pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>
     let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let metadata = fs::metadata(path)?;
     let last_used = DateTime::<Local>::from(metadata.modified()?).fixed_offset();
-    let mut summary = match load(dir).0.remove(id) {
+    // Sample the index size before reading so a compaction's `since` never
+    // names a byte the read did not cover (the same race `list()` guards).
+    let index_len = fs::metadata(index_path(dir)).map(|m| m.len()).unwrap_or(0);
+    let (mut index, lines) = load(dir);
+    let mut summary = match index.remove(id) {
         Some(mut cached) if cached.log_bytes == from => {
             // The cache covers the log up to the turn's first record, so the
             // input is not in it yet: fold just this one instead of
@@ -256,7 +260,19 @@ pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>
     if model.is_some() {
         summary.model = model;
     }
-    append(dir, &[summary])
+    // Without a listing, one append per turn grows the index without bound and
+    // makes the next turn's `load` reread all of it (1+2+…+N over a session).
+    // When the file has grown well past one line per indexed session, compact
+    // it instead of appending. `index` is the latest-per-id map `load` just
+    // read; it may still hold sessions whose logs were deleted, which a later
+    // `list()` drops — keeping them here only delays that cleanup, it never
+    // resurrects them into a listing.
+    if lines > index.len() * 2 + 64 {
+        index.insert(summary.id.clone(), summary);
+        rewrite(dir, &index, index_len)
+    } else {
+        append(dir, &[summary])
+    }
 }
 
 /// Every saved session with at least one prompt, most recently used first.
@@ -519,6 +535,27 @@ mod tests {
         // Garbage in the index is skipped, not fatal.
         fs::write(index_path(dir.path()), "not json\n").unwrap();
         assert_eq!(list(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_compacts_the_index_without_a_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s").unwrap();
+        input(&mut log, "i1", "Keep this session around");
+        // Many turns with no intervening `list()`: the index must stay bounded
+        // (compacted once it passes the threshold), not grow one line per turn.
+        // 200 appends would be 200 lines unbounded; bounded it never exceeds
+        // the compaction threshold of `sessions * 2 + 64`.
+        for _ in 0..200 {
+            update(log.path(), 0, None, None).unwrap();
+        }
+        let (index, lines) = load(dir.path());
+        assert_eq!(index.len(), 1, "one live session");
+        assert!(lines <= 1 * 2 + 64, "index grew past the compaction threshold: {lines} lines");
+        // The surviving summary is still correct.
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions[0].id, "s");
+        assert_eq!(sessions[0].prompts, 1);
     }
 
     #[test]
