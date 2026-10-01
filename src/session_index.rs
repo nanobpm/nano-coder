@@ -295,7 +295,12 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
     };
     let mut current: HashMap<String, Summary> = HashMap::new();
     let mut updates = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Propagate per-entry traversal errors with directory context rather
+        // than silently flattening them away: `flatten()` would drop an
+        // `io::Result<DirEntry>` failure and return an incomplete list as
+        // success, contradicting the read_dir error handling above.
+        let entry = entry.with_context(|| format!("read entry in session directory {}", dir.display()))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || path.file_name() == Some(INDEX_FILE.as_ref()) {
             continue;
