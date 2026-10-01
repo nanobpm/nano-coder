@@ -407,8 +407,11 @@ impl Renderer {
             }
             Item::ToolCall { name, summary } => {
                 self.newline(state);
-                let name = crate::sanitize_terminal_text(name);
-                let summary = crate::sanitize_terminal_text(summary);
+                // Name and summary share one status row, so a `\n` would inject
+                // an unprefixed extra line (the frame layout drops it); use the
+                // single-line sanitizer to match what live output shows.
+                let name = crate::sanitize_terminal_line(name);
+                let summary = crate::sanitize_terminal_line(summary);
                 self.out(state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}\n"));
             }
             Item::ToolResult { ok, output, .. } => {
@@ -1026,8 +1029,13 @@ impl Renderer {
     pub fn event(&self, event: &AgentEvent) {
         let mut guard = self.frame.lock().unwrap();
         if let Some(fs) = guard.as_mut() {
+            // Quiet mode suppresses live steer/user chatter, but a history
+            // replay (`fs.batch`) must keep its recorded user prompts — else
+            // switching a quiet session to frame clears scrollback and rebuilds
+            // only assistant replies, losing every earlier user message.
             if verbosity() == Verbosity::Quiet
                 && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
+                && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
                 return;
             }

@@ -699,8 +699,12 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     // the guard rebuilds the wrong one.
     let resolves_to_edited = {
         let config = agent.config();
-        let (providers, default_provider) = config.effective_providers();
-        let providers: std::collections::BTreeMap<_, _> = providers.into_iter().collect();
+        let (user, default_provider) = config.effective_providers();
+        // Overlay the built-in presets the way `Agent::client_for` does (via
+        // `providers::build_client` -> `resolve`), so a spec naming an
+        // unmodified preset (e.g. `anthropic/...`) resolves to that preset
+        // here too, not a spurious fallback to the default provider.
+        let providers = providers::effective_providers(&user);
         providers::parse_model_spec(&config.model, &providers, &default_provider).0 == name
     };
     if agent.provider_name() == name || resolves_to_edited {
