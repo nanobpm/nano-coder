@@ -452,6 +452,10 @@ pub struct Agent {
     spill_dir: Arc<RwLock<std::path::PathBuf>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
+    /// Session-log size when the current turn began; the session-index update
+    /// in `finish_turn` folds just this turn's input into the cached summary
+    /// instead of rescanning the whole log.
+    turn_log_offset: Option<u64>,
     /// Whether a real smart-compaction summary is in context, gating the
     /// history tools. Tracked explicitly (set by compaction, restored from the
     /// replace record's mode) rather than sniffed from message text, so a user
@@ -501,6 +505,7 @@ impl Agent {
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
+            turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
         }
@@ -1226,6 +1231,10 @@ impl Agent {
         self.reminders.start_turn();
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
+        // Log size before this turn's records: the session-index update in
+        // `finish_turn` folds just this turn's input into the cached summary
+        // instead of rescanning the whole log.
+        self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
         let input_id = match input_id {
             Some(id) => id.to_string(),
@@ -1716,7 +1725,9 @@ impl Agent {
             // Keep the `--resume` picker's summary current. Only a cache:
             // the picker rebuilds a missing or stale summary from the log.
             let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
-            let _ = crate::session_index::update(log.path(), Some(model));
+            let from = self.turn_log_offset.unwrap_or(0);
+            let input = self.pending_input.as_ref().map(|pending| pending.text.as_str());
+            let _ = crate::session_index::update(log.path(), from, input, Some(model));
         }
         match &outcome {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
