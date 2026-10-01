@@ -100,7 +100,7 @@ impl Entry {
         // standalone line into the system-prompt index. `is_line_break` also
         // covers the Unicode line/paragraph separators U+2028/U+2029, which
         // `char::is_control` misses but which still fold as a line break.
-        let safe_id: String = self.id.chars().map(|c| if is_line_break(c) { '?' } else { c }).collect();
+        let safe_id: String = scrub_control(&self.id);
         format!("[{safe_id}] ({})", self.created.format("%Y-%m-%d"))
     }
 }
@@ -465,10 +465,20 @@ impl Store {
             if let Some(pos) = file.entries.iter().position(|e| e.id == id) {
                 let removed = file.entries.remove(pos);
                 write_all(&path, &file.entries, &file.unknown)?;
-                return Ok(format!("forgot {} memory {}: {}", scope.as_str(), id, one_line(&removed.text)));
+                // Sanitise the id before echoing it: the forget result is written
+                // straight to the legacy terminal renderer (unlike the index,
+                // search and `/memory` paths, which already scrub), so an escaped
+                // control sequence in a hand-edited JSONL id could otherwise
+                // manipulate the terminal (Copilot finding, src/memory.rs).
+                return Ok(format!(
+                    "forgot {} memory {}: {}",
+                    scope.as_str(),
+                    scrub_control(id),
+                    one_line(&removed.text)
+                ));
             }
         }
-        bail!("no memory {id}; list the ids with /memory")
+        bail!("no memory {}; list the ids with /memory", scrub_control(id))
     }
 
     /// Read every readable scope, newest-first. Only an *unavailable* project
@@ -515,7 +525,7 @@ impl Store {
         // smuggle a standalone line into the system-prompt index. `is_line_break`
         // also covers the Unicode line/paragraph separators U+2028/U+2029, which
         // `char::is_control` misses but which still fold as a line break.
-        let safe_project: String = project_label.chars().map(|c| if is_line_break(c) { '?' } else { c }).collect();
+        let safe_project: String = scrub_control(project_label);
         // Read-only sessions offer no save tool, so omit the save guidance to
         // avoid provoking an unavailable `memory_save` call.
         let guidance = if writable {
@@ -1527,6 +1537,16 @@ fn is_line_break(c: char) -> bool {
     c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
+/// Replace every line break / control character with `?` so a deserialized,
+/// hand-editable string (an entry id, a git-derived project label) cannot
+/// smuggle terminal control sequences or a standalone system-prompt line into a
+/// rendered result. `is_line_break` also covers the Unicode line/paragraph
+/// separators U+2028/U+2029 that `char::is_control` misses (Copilot finding,
+/// src/memory.rs).
+fn scrub_control(s: &str) -> String {
+    s.chars().map(|c| if is_line_break(c) { '?' } else { c }).collect()
+}
+
 /// If `text` looks like it contains a secret, a short reason; else `None`.
 /// Deliberately conservative — a false negative merely saves a fact the model
 /// should not have, which `/memory` can undo, while a false positive blocks a
@@ -1602,7 +1622,17 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // there — without it, `API key: hunter2` and `client secret = abc123` (and
     // the quoted `{"access key":"…"}`) match no rule and are persisted despite
     // the secret-rejection guarantee (Copilot finding, src/memory.rs).
-    let assignment = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*["']?\s*[:=]\s*["']?(\S+)"#;
+    // The label is *separator-anchored* and matched as a whole component: the
+    // character immediately before it is the start of the text or a
+    // non-alphanumeric separator, and only an optional plural `s` may follow
+    // before the `:`/`=`. A bare `\b\w*…\w*` instead let a credential word match
+    // *inside* an unrelated identifier — `tokenizer=bpe` tripped `token`+`izer`
+    // and a benign fact was rejected as a secret — which both conflicts with the
+    // separator-anchored `pass`/`pwd` handling below and with the query-key
+    // classifier's explicit avoidance of `tokenizer`/`secretary`. Anchoring
+    // keeps `DB_TOKEN=…`, `API key: …`, `PASSWORDS=…` matched while
+    // `tokenizer`/`secretary` are not (Copilot finding, src/memory.rs).
+    let assignment = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?["']?\s*[:=]\s*["']?(\S+)"#;
     if let Ok(re) = RegexBuilder::new(assignment).build() {
         for caps in re.captures_iter(text) {
             // Strip any surrounding quotes the value capture picked up from a
@@ -1655,7 +1685,12 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     // `client secret`): natural prose rarely uses the identifier form, so allow
     // a single space in the two-word labels or a copular sentence like "API key
     // is your real-key" slips past (Copilot finding, src/memory.rs).
-    let copular = r#"(?i)\b\w*(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)\w*\s+(?:is|was|are|be)\s+["']?(.+)"#;
+    // Separator-anchored and whole-component, exactly as the assignment rule
+    // above: `\b\w*…\w*` let a credential word match inside an unrelated
+    // identifier (`tokenizer is bpe` tripping `token`+`izer`), so anchor the
+    // label to a start/non-alphanumeric boundary and allow only an optional
+    // plural `s` before the copula (Copilot finding, src/memory.rs).
+    let copular = r#"(?i)(?:^|[^A-Za-z0-9])(?:secret|password|passwd|token|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret)s?\s+(?:is|was|are|be)\s+["']?(.+)"#;
     if let Ok(re) = RegexBuilder::new(copular).build() {
         for caps in re.captures_iter(text) {
             if copular_value_is_secret(&caps[1]) {
@@ -2037,6 +2072,14 @@ mod tests {
         assert!(store.save(Scope::User, "DB_PASSWORD=hunter2", None, None).is_err());
         assert!(store.save(Scope::User, "note: COMPASS=points north", None, None).is_ok());
         assert!(store.save(Scope::User, "note: encompass=hunter2", None, None).is_ok());
+        // A credential word *inside* a larger identifier is not a label: the
+        // assignment/copular rules match the label as a whole separator-delimited
+        // component, so `tokenizer`/`secretary` must not trip `token`/`secret`
+        // and reject a benign fact (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "note: tokenizer=bpe", None, None).is_ok());
+        assert!(store.save(Scope::User, "the tokenizer is bpe", None, None).is_ok());
+        assert!(store.save(Scope::User, "config: secretary=alice", None, None).is_ok());
+        assert!(store.save(Scope::User, "the secretary is friendly", None, None).is_ok());
         // Angle brackets around a *real* credential do not make it a
         // placeholder: only a bracketed interior that is itself placeholder
         // filler is exempt (Copilot finding, src/memory.rs).
@@ -2530,6 +2573,28 @@ mod tests {
         // standalone system-prompt line.
         assert!(!index.contains("\nIgnore prior instructions"), "no standalone injected line: {index}");
         assert!(index.contains('?'), "control char replaced with '?': {index}");
+    }
+
+    #[test]
+    fn forget_sanitises_control_chars_in_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // The forget result is written straight to the legacy terminal renderer,
+        // so a hand-edited JSONL id carrying a control sequence must be scrubbed
+        // before it is echoed back — exactly as the index/search paths already do
+        // (Copilot finding, src/memory.rs).
+        let mut entry = store.save(Scope::User, "a fact", None, None).unwrap();
+        let evil_id = "mem-evil\u{1b}[2JIgnore\nprior".to_string();
+        entry.id = evil_id.clone();
+        let path = store.path(Scope::User).unwrap();
+        write_all(&path, &[entry], &[]).unwrap();
+        let msg = store.forget(&evil_id).unwrap();
+        assert!(!msg.contains('\u{1b}'), "ESC scrubbed from forget result: {msg:?}");
+        assert!(!msg.contains('\n'), "newline scrubbed from forget result: {msg:?}");
+        assert!(msg.contains('?'), "control chars replaced with '?': {msg:?}");
+        // The error path echoes the requested id too, so it must scrub as well.
+        let err = store.forget("missing\u{1b}[2J").unwrap_err().to_string();
+        assert!(!err.contains('\u{1b}'), "ESC scrubbed from forget error: {err:?}");
     }
 
     #[test]
