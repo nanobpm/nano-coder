@@ -12,8 +12,29 @@ pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 /// Tokens kept verbatim at the end of the conversation when compacting.
 pub const KEEP_RECENT_TOKENS: usize = 20_000;
 
-/// Output cap for the summary request.
+/// Target length of the summary text itself.
 pub const SUMMARY_MAX_TOKENS: i64 = 4_096;
+
+/// Extra output room for the summary request on top of `SUMMARY_MAX_TOKENS`.
+/// Reasoning models spend output tokens thinking before they write, and those
+/// count against `max_tokens`: with only `SUMMARY_MAX_TOKENS` a long transcript
+/// can use most of it up thinking, so the summary is cut off or empty and the
+/// agent loses the work it was summarizing.
+pub const SUMMARY_REASONING_ALLOWANCE: i64 = 8_192;
+
+/// `max_tokens` for a summary request: room for the summary plus reasoning,
+/// never above the configured `max_tokens`, and at most a quarter of the
+/// window so the transcript still fits. Never below the old cap
+/// (`SUMMARY_MAX_TOKENS`, or the configured value when that is smaller).
+pub fn summary_output_budget(window: usize, configured: i64) -> i64 {
+    let configured = configured.max(1);
+    let floor = SUMMARY_MAX_TOKENS.min(configured);
+    configured.min(SUMMARY_MAX_TOKENS + SUMMARY_REASONING_ALLOWANCE).min((window / 4) as i64).max(floor)
+}
+
+/// Appended to a summary that stopped at the output limit.
+pub const SUMMARY_TRUNCATED_NOTE: &str = "\n\n[This summary was cut off at the output limit, so its end is missing. \
+Check the current state (files, git, the plan) before redoing any work.]";
 
 pub const SUMMARY_PREFIX: &str = "[Summary of the earlier conversation, written when the context was compacted]";
 
@@ -26,8 +47,8 @@ commits, branches, pull requests and URLs (with exact names and numbers);\n\
 - the current state and what was in progress when the summary was written;\n\
 - open problems, errors still unresolved, and the next steps;\n\
 - identifiers and values the agent will need again.\n\
-Be concise but do not drop facts the agent would otherwise have to rediscover. Do not invent anything. \
-Output only the summary.";
+Be concise but do not drop facts the agent would otherwise have to rediscover; keep the summary under about \
+2,500 words. Do not invent anything. Output only the summary.";
 
 /// Starts a smart-compaction summary; its presence enables the history tools.
 pub const SMART_SUMMARY_PREFIX: &str =
@@ -276,6 +297,19 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_budget_leaves_room_for_reasoning() {
+        // Configured 16K on a 64K window: summary + reasoning allowance.
+        assert_eq!(summary_output_budget(65_536, 16_384), 12_288);
+        // Never above the configured max_tokens.
+        assert_eq!(summary_output_budget(200_000, 8_000), 8_000);
+        // A small window caps it at a quarter so the transcript still fits...
+        assert_eq!(summary_output_budget(32_000, 16_384), 8_000);
+        // ...but never below the previous cap.
+        assert_eq!(summary_output_budget(8_000, 16_384), SUMMARY_MAX_TOKENS);
+        assert_eq!(summary_output_budget(8_000, 1_000), 1_000);
+    }
 
     #[test]
     fn detects_overflow_errors_and_limits() {

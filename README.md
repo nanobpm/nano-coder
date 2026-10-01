@@ -117,7 +117,8 @@ escalation). Redelivering the input returns the same outcome. See [Outcomes](#ou
 
 **Slash commands work via ACP too:**
 - `/compact [--smart|--standard] [focus]` - summarizes the conversation; the result has
-  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode` and `fallback`
+  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode`, `fallback`
+  and `truncated`
 - `/settings` - returns current settings as JSON
 - `/tools` - lists registered tools
 - `/plan` - returns `plan` (JSON) and `text` (the rendered plan)

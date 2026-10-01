@@ -300,6 +300,7 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             "summarized": report.summarized,
                             "mode": report.mode.as_str(),
                             "fallback": report.fallback,
+                            "truncated": report.truncated,
                         }),
                     ),
                 });

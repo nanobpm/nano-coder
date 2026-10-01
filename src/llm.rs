@@ -279,7 +279,7 @@ impl ToolCall {
 /// (e.g. `max_output_tokens`) before it reaches here, so only a genuine
 /// length reason is classified as one and a generic `incomplete` keeps the
 /// cause-neutral advice.
-fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
+pub(crate) fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
         matches!(reason.to_ascii_lowercase().as_str(), "length" | "max_tokens" | "max_output_tokens")
     })
