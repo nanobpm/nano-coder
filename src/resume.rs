@@ -151,11 +151,12 @@ fn id_row(summary: &Summary, now: DateTime<FixedOffset>) -> String {
 }
 
 /// Plain list rows (with IDs) of this directory's sessions, for `/resume`
-/// without a terminal.
-pub fn list_rows(dir: &Path, cwd: &str) -> Result<Vec<String>> {
+/// without a terminal. `exclude` (the session in use) is left out, as in
+/// `pick` and `last`.
+pub fn list_rows(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Vec<String>> {
     let sessions = session_index::list(dir)?;
     let now = crate::session::now();
-    Ok(in_dir(&sessions, cwd).into_iter().map(|s| id_row(s, now)).collect())
+    Ok(in_dir(&sessions, cwd).into_iter().filter(|s| Some(s.id.as_str()) != exclude).map(|s| id_row(s, now)).collect())
 }
 
 /// Let the user pick a session in the terminal: this directory's sessions
@@ -349,5 +350,21 @@ mod tests {
         assert_eq!(last(dir.path(), "/a", None).unwrap(), "s");
         assert!(last(dir.path(), "/a", Some("s")).is_err(), "the session in use is skipped");
         assert!(last(dir.path(), "/b", None).unwrap_err().to_string().contains("no saved session for /b"));
+    }
+
+    #[test]
+    fn list_rows_skips_the_session_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["s", "t"] {
+            let mut log = SessionLog::create_with(dir.path(), id, Some("/a".into()), None).unwrap();
+            let input =
+                Record::Input { id: "i".into(), text: "hello there".into(), recorded_at: crate::session::now() };
+            log.append(&input).unwrap();
+        }
+        let rows = list_rows(dir.path(), "/a", None).unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let rows = list_rows(dir.path(), "/a", Some("s")).unwrap();
+        assert_eq!(rows.len(), 1, "the session in use is left out: {rows:?}");
+        assert!(rows[0].starts_with("t  "), "{rows:?}");
     }
 }

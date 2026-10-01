@@ -1014,7 +1014,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     let current = agent.session_id().map(str::to_string);
     let id = match arg {
         "" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
-            let rows = resume::list_rows(&dir, &cwd)?;
+            let rows = resume::list_rows(&dir, &cwd, current.as_deref())?;
             let text = if rows.is_empty() {
                 "No saved sessions for this directory".to_string()
             } else {
