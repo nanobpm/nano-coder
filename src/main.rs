@@ -1501,6 +1501,14 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     if args.list_sessions && args.trajectory.is_some() {
         anyhow::bail!("--list-sessions and --trajectory are mutually exclusive");
     }
+    // `--list-sessions` and `--resume` also select different, exclusive modes.
+    // The listing branch runs before the resume branch, so accepting both would
+    // silently print the session list and ignore the requested resume; reject
+    // it rather than let argument order-independent input pick an unrelated
+    // action.
+    if args.list_sessions && args.resume.is_some() {
+        anyhow::bail!("--list-sessions and --resume are mutually exclusive");
+    }
     Ok(args)
 }
 
@@ -2006,6 +2014,20 @@ mod tests {
         // trajectory branch and ignoring the requested session list.
         assert!(parse_args_from(argv(&["--list-sessions", "--trajectory", "sess-1"])).is_err());
         assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--list-sessions", "--json"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_resume_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently printing the
+        // list and ignoring the requested resume, regardless of order or
+        // whether `--resume` carries an explicit id.
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "sess-1", "--list-sessions"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume"])).is_err());
     }
 
     #[test]

@@ -324,7 +324,10 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
         if crate::session::validate_id(&id).is_err() {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = entry
+            .metadata()
+            .with_context(|| format!("read metadata for session log {}", path.display()))?
+            .len();
         let summary = match index.remove(&id) {
             Some(summary) if summary.log_bytes == size => summary,
             stale => match summarize(&path) {
@@ -336,6 +339,13 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
                     updates.push(fresh.clone());
                     fresh
                 }
+                // A structurally invalid/unresumable log is skipped like
+                // `summarize` intends, but a real filesystem failure (an
+                // `io::Error` in the chain, from `fs::read`/`metadata`/
+                // `modified`) must surface, not be misreported as a missing or
+                // corrupt session — same contract as the `read_dir` and
+                // per-entry errors above.
+                Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => return Err(e),
                 Err(_) => continue,
             },
         };
