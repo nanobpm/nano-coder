@@ -66,7 +66,11 @@ impl<'de> Deserialize<'de> for Temperature {
             Text(String),
         }
         match Raw::deserialize(deserializer)? {
-            Raw::Number(v) => Ok(Temperature::Value(v)),
+            // TOML permits `nan`/`inf`, but serde_json emits a non-finite f64
+            // as JSON `null` while `/context` and the trajectory report the
+            // value as sent — reject them so the two cannot diverge.
+            Raw::Number(v) if v.is_finite() => Ok(Temperature::Value(v)),
+            Raw::Number(v) => Err(serde::de::Error::custom(format!("temperature must be finite, not {v}"))),
             Raw::Int(v) => Ok(Temperature::Value(v as f64)),
             Raw::Text(s) if s.trim().eq_ignore_ascii_case("default") => Ok(Temperature::Default),
             Raw::Text(s) => {
@@ -232,6 +236,17 @@ mod tests {
         // Round-trips through the config file.
         let text = toml::to_string(&Config { temperature: Temperature::Default, ..Default::default() }).unwrap();
         assert!(text.contains("temperature = \"default\""), "{text}");
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        // TOML parses these as f64 nan/inf; serde_json would emit them as JSON
+        // `null` while `/context` reports the value as sent, so they are
+        // rejected at load.
+        for text in ["temperature = nan", "temperature = inf", "temperature = -inf"] {
+            let err = toml::from_str::<Config>(text).unwrap_err();
+            assert!(err.message().contains("temperature must be finite"), "{text}: {err}");
+        }
     }
 
     #[test]

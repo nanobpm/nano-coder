@@ -550,13 +550,15 @@ impl Agent {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
         let entry = providers.get(self.provider_name()).cloned();
-        // Prefer the live client's API kind: a `/settings` edit can change the
-        // active provider's `kind` while the user declines the model switch, so
-        // the client still speaks the old API even though the config now names a
-        // new one. The client's kind is what actually governs the request, so
-        // use it for temperature rules; fall back to the config kind only for a
-        // kindless test double (a client reporting no kind).
-        let kind = self.client.kind().or_else(|| entry.as_ref().and_then(|p| p.kind));
+        // The live client's API kind is what governs the request: a `/settings`
+        // edit can change the active provider's `kind` while the user declines
+        // the model switch, so the client still speaks the old API even though
+        // the config now names a new one. A client reporting no kind (a test
+        // double imitating no real provider API) gets no kind-specific rule —
+        // falling back to the provider entry's kind would apply rules from a
+        // mutated config entry to a client that never spoke that API. Clients
+        // that need kind-specific rules report their kind explicitly.
+        let kind = self.client.kind();
         let provider = entry.unwrap_or_default();
         crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
     }
@@ -2181,6 +2183,11 @@ mod tests {
         fn provider_name(&self) -> &str {
             "test"
         }
+        /// Reports a kind explicitly: a kindless client gets no kind-specific
+        /// temperature rules, even when its config provider entry has one.
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
     }
 
     type Seen = Arc<Mutex<Vec<Vec<Message>>>>;
@@ -2263,6 +2270,44 @@ mod tests {
         let resolved = agent.temperature();
         assert_eq!((resolved.value(), resolved.source), (Some(0.4), crate::temperature::Source::Provider));
         assert_eq!(resolved.fixed, None);
+    }
+
+    /// A kindless client (one imitating no real provider API) gets no
+    /// kind-specific rule, even when its config provider entry names a kind:
+    /// editing the provider's `kind` must not clamp or fix the temperature of
+    /// a client that never spoke that API.
+    struct Kindless;
+
+    #[async_trait]
+    impl LLMClient for Kindless {
+        async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            unreachable!("no chat in this test")
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[test]
+    fn temperature_ignores_config_kind_for_a_kindless_client() {
+        let mut config = Config::default();
+        // The active `mock` provider edited to Anthropic, the switch declined:
+        // the kindless client must not inherit Anthropic's 0..=1 clamp.
+        config.providers.insert(
+            "mock".into(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Anthropic),
+                temperature: Some(crate::temperature::Temperature::Value(1.5)),
+                ..Default::default()
+            },
+        );
+        let agent = Agent::new(Box::new(Kindless), config);
+        let resolved = agent.temperature();
+        assert_eq!((resolved.value(), resolved.source), (Some(1.5), crate::temperature::Source::Provider));
+        assert_eq!(resolved.warning, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
