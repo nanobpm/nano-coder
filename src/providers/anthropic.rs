@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{HttpTransport, ResolvedProvider, StreamAction};
+use super::{HttpTransport, ProviderKind, ResolvedProvider, StreamAction};
 use crate::llm::{
     ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
 };
@@ -380,6 +380,10 @@ impl LLMClient for AnthropicClient {
 
     fn provider_name(&self) -> &str {
         &self.transport.provider().name
+    }
+
+    fn kind(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Anthropic)
     }
 }
 

@@ -117,7 +117,8 @@ escalation). Redelivering the input returns the same outcome. See [Outcomes](#ou
 
 **Slash commands work via ACP too:**
 - `/compact [--smart|--standard] [focus]` - summarizes the conversation; the result has
-  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode` and `fallback`
+  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode`, `fallback`
+  and `truncated`
 - `/settings` - returns current settings as JSON
 - `/tools` - lists registered tools
 - `/plan` - returns `plan` (JSON) and `text` (the rendered plan)
@@ -154,7 +155,7 @@ src/
 ├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
-├── session_index.rs # Session summaries (index.jsonl) for the --resume picker
+├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
 ├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
@@ -367,7 +368,7 @@ left out. Sessions from before this feature don't record their directory: they a
 directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
 `--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
 
-The picker reads `index.jsonl` in the session directory: one summary per session, updated at the
+The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed
 since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
 
@@ -381,12 +382,12 @@ and `cargo test`; CI checks all three. To keep `git blame` past the one-time ref
 
 ## Configuration
 
-Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`) are still used if the new ones don't exist:
+Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
-temperature = 0.7
+temperature = 0.7                       # or "default" to send none (see Temperature below)
 max_tokens = 4096
 max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
@@ -498,6 +499,30 @@ or your workspace domain override `base_url`, e.g.
 `replay_reasoning = true`, which sends each assistant message's `reasoning_content` back
 as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
 make K3 think less.
+
+### Temperature
+
+`temperature` is a number, or `"default"` to send none so the model uses its own default.
+It can be set for all models, for one provider, or for one model; the most specific
+setting wins:
+
+```toml
+temperature = 0.7                       # all models
+
+[providers.groq]
+temperature = "default"                 # every groq model uses its own default
+
+[providers.anthropic.models."claude-sonnet-4-5"]
+temperature = 0.3                       # this model only
+```
+
+Some models accept no temperature, and for them the model default is the only option:
+GitHub Copilot's reasoning models (GPT-5 and later, Grok, …) and any provider with
+`drop_params = ["temperature"]` (such as the `kimi` preset). A number set for such a
+provider or model is ignored with a warning at startup and when you switch to it; the
+top-level `temperature` just doesn't apply to them. Anthropic accepts 0 to 1, so a higher
+value is sent as 1, with a warning. `/context` shows the temperature in use and where it
+comes from, and `/settings` edits it for the current model, its provider, or all models.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
@@ -652,7 +677,9 @@ sets the window). The window a server has *loaded* is preferred over the model's
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model
-call when usage passes the threshold. It won't run again until the context has grown by
+call when usage passes the threshold, or earlier if the prompt would leave less than the
+reserved output room (`MIN_OUTPUT_RESERVE`, plus an estimation margin) within the window.
+It won't run again until the context has grown by
 another 10% of the window, so a context that can't shrink isn't summarized on every call.
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.

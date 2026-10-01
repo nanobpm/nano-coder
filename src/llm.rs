@@ -67,6 +67,12 @@ pub struct Message {
     /// message, in milliseconds. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Assistant messages: the effective sampling temperature sent for the
+    /// request that produced this message and where it came from, e.g.
+    /// `0.3 (set for this model)` or `model default (global setting)`. Recorded
+    /// so runs can be compared. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<String>,
 }
 
 impl Message {
@@ -84,6 +90,7 @@ impl Message {
             thinking: String::new(),
             usage: None,
             duration_ms: None,
+            temperature: None,
         }
     }
 
@@ -272,7 +279,7 @@ impl ToolCall {
 /// (e.g. `max_output_tokens`) before it reaches here, so only a genuine
 /// length reason is classified as one and a generic `incomplete` keeps the
 /// cause-neutral advice.
-fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
+pub(crate) fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
         matches!(reason.to_ascii_lowercase().as_str(), "length" | "max_tokens" | "max_output_tokens")
     })
@@ -339,6 +346,11 @@ pub trait LLMClient: Send + Sync {
     }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    /// The provider API kind this client speaks. `None` for test doubles that
+    /// imitate no real provider API.
+    fn kind(&self) -> Option<crate::providers::ProviderKind> {
+        None
+    }
 }
 
 /// A context window reported by the provider's endpoint.
@@ -347,6 +359,39 @@ pub struct DetectedWindow {
     pub tokens: usize,
     /// Where it came from, e.g. `/v1/models max_model_len`.
     pub source: String,
+    /// Whether `tokens` caps the whole request (prompt + output) or the prompt
+    /// alone. Total unless the endpoint says otherwise.
+    pub cap: ContextCap,
+    /// The combined prompt + output window, when the endpoint reports it
+    /// alongside a prompt-only `tokens` cap (GitHub Copilot advertises both
+    /// `max_prompt_tokens` and the larger `max_context_window_tokens`). A
+    /// prompt-only `cap` leaves `max_tokens` unchanged, which can still push
+    /// prompt + output past this window, so it is enforced as a second limit.
+    /// `None` for a `Total` cap, where `tokens` already is the combined window.
+    pub total_tokens: Option<usize>,
+}
+
+impl DetectedWindow {
+    /// A window that caps the whole request, prompt + output.
+    pub fn total(tokens: usize, source: impl Into<String>) -> Self {
+        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total, total_tokens: None }
+    }
+}
+
+/// Whether a context window caps the whole request or only the prompt.
+///
+/// Most endpoints reject a request whose prompt *plus* `max_tokens` exceeds the
+/// window, so the output reservation counts against it (`Total`). GitHub Copilot
+/// instead enforces a prompt-only budget (`max_prompt_tokens`) that sits below
+/// the full window: output tokens do not consume it, so subtracting the output
+/// reservation would compact and cap completions earlier than the real limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextCap {
+    /// `tokens` is the combined prompt + output budget; reserve output room in it.
+    #[default]
+    Total,
+    /// `tokens` caps the prompt alone; output tokens do not consume it.
+    Prompt,
 }
 
 /// Splits `<think>...</think>` sections out of streamed content (servers that

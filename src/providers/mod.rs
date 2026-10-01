@@ -84,6 +84,13 @@ pub struct ProviderConfig {
     /// for thinking models that require it in multi-turn and tool-call
     /// conversations (e.g. Kimi K3). Default false.
     pub replay_reasoning: Option<bool>,
+    /// Temperature for this provider's models: a number, or `"default"` to
+    /// send none. Overrides the top-level `temperature`.
+    pub temperature: Option<crate::temperature::Temperature>,
+    /// Per-model settings (`[providers.NAME.models."MODEL"]`), which win over
+    /// the provider's.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, crate::temperature::ModelSettings>,
 }
 
 impl ProviderConfig {
@@ -118,9 +125,16 @@ impl ProviderConfig {
             retry_initial_backoff_ms,
             retry_max_backoff_ms,
             retryable_statuses,
-            replay_reasoning
+            replay_reasoning,
+            temperature
         );
         self.headers.extend(other.headers.clone());
+        for (model, settings) in &other.models {
+            let entry = self.models.entry(model.clone()).or_default();
+            if settings.temperature.is_some() {
+                entry.temperature = settings.temperature;
+            }
+        }
         self
     }
 }
@@ -371,7 +385,7 @@ pub fn build_client(
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
         ProviderKind::GithubCopilot => Box::new(github_copilot::GithubCopilotClient::new(resolved)?),
-        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.model)),
+        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.name, &resolved.model)),
     })
 }
 
@@ -416,6 +430,16 @@ impl HttpTransport {
     pub fn finish_body(&self, mut body: Value) -> Value {
         if let Some(object) = body.as_object_mut() {
             for (key, value) in &self.provider.extra_body {
+                // `temperature` is owned by the resolution path
+                // (`temperature::resolve`), which already folds any
+                // `extra_body` value into the request's effective temperature
+                // — capping it for Anthropic and dropping it for models that
+                // reject one. Re-inserting the raw value here would overwrite
+                // that resolved value, so the request would no longer match the
+                // effective temperature reported to the user. Skip it.
+                if key == "temperature" {
+                    continue;
+                }
                 object.insert(key.clone(), value.clone());
             }
             for key in &self.provider.drop_params {
@@ -822,6 +846,26 @@ mod key_command_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_body_keeps_resolved_temperature() {
+        // `temperature` is owned by the resolution path; even when a provider's
+        // extra_body carries one, `finish_body` must not re-insert it over the
+        // value the request already set. Other extra_body keys still merge.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some("http://localhost/v1".into()),
+                extra_body: Some(toml::from_str("temperature = 2.0\nthink = false").unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"temperature": 0.3}));
+        assert_eq!(finished["temperature"], serde_json::json!(0.3));
+        assert_eq!(finished["think"], serde_json::json!(false));
+    }
 
     #[test]
     fn parses_model_specs() {

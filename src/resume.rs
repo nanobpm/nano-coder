@@ -7,9 +7,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
+use dialoguer::console::{Key, Term, truncate_str};
 use dialoguer::theme::{ColorfulTheme, Theme};
+use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::session_index::{self, Summary};
 
@@ -73,38 +75,51 @@ pub fn topic(summary: &Summary) -> String {
 
 /// Terminal-cell width of `text` (CJK and wide emoji count as two cells), so
 /// rows are fitted the way the terminal renders them, not by char count.
+/// Measured with `UnicodeWidthStr` (not a per-`char` sum): `unicode-width`
+/// only resolves emoji presentation / variation-selector / ZWJ sequences at
+/// the string level, so `"#\u{fe0f}"` is two cells as a string but its chars
+/// sum to one — a per-`char` sum would undercount and let a row wrap.
 fn cells(text: &str) -> usize {
-    text.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+    UnicodeWidthStr::width(text)
 }
 
 /// `text` fitted to at most `width` terminal cells, with an ellipsis when
 /// truncated. Never splits a wide glyph across the boundary.
 fn truncate(text: &str, width: usize) -> String {
+    // A zero budget (the picker on a 1–4-column terminal, after
+    // `saturating_sub(4)`) cannot hold even the one-cell ellipsis, so the
+    // only string that fits is empty — honour the at-most-`width` contract.
+    if width == 0 {
+        return String::new();
+    }
     if cells(text) <= width {
         return text.to_string();
     }
     let budget = width.saturating_sub(1);
     let mut out = String::new();
-    let mut used = 0;
     for c in text.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > budget {
+        // Measure the whole candidate prefix with `UnicodeWidthStr`, not this
+        // char's width in isolation: a variation selector or ZWJ joins with
+        // the preceding scalar, so a per-scalar budget check would admit a
+        // sequence that pushes the string past `budget` and make the final
+        // ellipsis exceed `width`.
+        out.push(c);
+        if cells(&out) > budget {
+            out.pop();
             break;
         }
-        out.push(c);
-        used += w;
     }
     out.push('…');
     out
 }
 
-/// A dialoguer theme that renders each picker row fitted to the terminal
-/// width while fuzzy matching still sees the row's full text. `FuzzySelect`
-/// matches against and renders the same item string, so passing the full
-/// (untruncated) row lets a keyword anywhere in a long prompt find the
-/// session — but dialoguer renders the item verbatim and would let a long row
-/// wrap. This theme truncates only the rendered label, so matching stays
-/// full-text while no drawn row exceeds the terminal.
+/// Renders each picker row fitted to the terminal width while the selector's
+/// fuzzy matcher still sees the row's full, untruncated text. Keeping the
+/// searched text separate from the drawn text lets a keyword anywhere in a long
+/// prompt find the session while no drawn row ever exceeds the terminal — and
+/// it lets [`interactive_pick`] clear exactly the rows it drew. Delegating the
+/// per-item formatting to `ColorfulTheme` preserves dialoguer's match
+/// highlighting.
 struct FitTheme {
     inner: ColorfulTheme,
     width: usize,
@@ -120,7 +135,8 @@ impl Theme for FitTheme {
         matcher: &SkimMatcherV2,
         search_term: &str,
     ) -> fmt::Result {
-        // Render the width-fitted label; `text` stays full for the matcher.
+        // Fit the drawn label to the terminal; the selector matches the full
+        // `text` itself, so filtering stays full-text while the row cannot wrap.
         self.inner.format_fuzzy_select_prompt_item(
             f,
             &truncate(text, self.width),
@@ -130,6 +146,171 @@ impl Theme for FitTheme {
             search_term,
         )
     }
+}
+
+/// Fuzzy-match every item's full text against `search`, returning the matching
+/// items' indices (into `items`), best match first. An empty search keeps every
+/// item; equal scores keep the input order (a stable sort), so the picker's
+/// most-recent-first default survives until the user narrows it.
+fn rank(matcher: &SkimMatcherV2, items: &[String], search: &str) -> Vec<usize> {
+    let mut scored: Vec<(usize, i64)> =
+        items.iter().enumerate().filter_map(|(i, t)| matcher.fuzzy_match(t, search).map(|s| (i, s))).collect();
+    // A stable sort on the negated score keeps equal-score items in input order.
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
+/// The scroll offset (index of the first visible row) that keeps the selected
+/// row inside a `max_visible`-row window, given the current offset.
+fn scroll_top(top: usize, sel: usize, max_visible: usize) -> usize {
+    if sel < top {
+        sel
+    } else if max_visible > 0 && sel >= top + max_visible {
+        sel + 1 - max_visible
+    } else {
+        top
+    }
+}
+
+/// How many terminal rows a written line occupies once the terminal wraps it at
+/// `cols` columns. dialoguer's `FuzzySelect` ignores wrapping and clears by each
+/// item's *byte* length instead, over-erasing the scrollback above a long row;
+/// measuring the rendered width here is what makes `interactive_pick`'s clear
+/// exact.
+fn physical_rows(line: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    dialoguer::console::measure_text_width(line).div_ceil(cols).max(1)
+}
+
+/// How many item rows fit beneath a `prompt_rows`-tall prompt in a `rows`-row
+/// terminal, capped at `max_visible`. Zero when the prompt already fills the
+/// screen: forcing a row there would make the frame (`prompt_rows + window`)
+/// exceed `rows`, so `interactive_pick`'s `clear_last_lines(drawn)` would erase
+/// scrollback above the picker.
+fn item_window(rows: usize, prompt_rows: usize, max_visible: usize) -> usize {
+    max_visible.min(rows.saturating_sub(prompt_rows))
+}
+
+/// Restores the terminal cursor on drop, so every early `?` return from
+/// [`interactive_pick`] (clear/write/flush/read failures) still un-hides the
+/// cursor instead of leaving the user's terminal with an invisible cursor.
+struct CursorGuard<'a> {
+    term: &'a Term,
+}
+
+impl Drop for CursorGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.term.show_cursor();
+    }
+}
+
+/// Let the user fuzzy-filter `items` on the stderr terminal and pick one,
+/// returning its index (or `None` on Esc / Ctrl-C). Unlike dialoguer's
+/// `FuzzySelect`, the search runs over each item's full text while only a
+/// terminal-fitted label is drawn, and the menu is cleared by its *rendered*
+/// height — so a long row never corrupts the scrollback above the picker.
+fn interactive_pick(
+    prompt: &str,
+    theme: &FitTheme,
+    items: &[String],
+    rows: usize,
+    cols: usize,
+    max_visible: usize,
+) -> Result<Option<usize>> {
+    let term = Term::stderr();
+    let matcher = SkimMatcherV2::default();
+    let mut search = String::new();
+    let mut sel = 0usize; // index into the filtered list
+    let mut top = 0usize; // first visible filtered row
+    let mut drawn = 0usize; // physical rows drawn by the last frame
+
+    term.hide_cursor()?;
+    // Restore the cursor on *every* exit path, including an early `?` from any
+    // clear/write/flush/read below, not only the normal return.
+    let _cursor = CursorGuard { term: &term };
+    let selected = loop {
+        if drawn > 0 {
+            term.clear_last_lines(drawn)?;
+        }
+        let filtered = rank(&matcher, items, &search);
+
+        // Render the prompt first so its wrapped height is known, then reserve
+        // those rows and show only as many items as still fit — keeping the
+        // whole frame within the terminal so `clear_last_lines(drawn)` never
+        // erases scrollback above the picker.
+        let mut prompt_line = String::new();
+        Theme::format_fuzzy_select_prompt(theme, &mut prompt_line, prompt, &search, search.len())?;
+        // Cap the prompt to at most `rows` physical rows before measuring it:
+        // it carries the full working directory and an unbounded search string,
+        // so a long path or query can wrap past the terminal height on its own.
+        // Left uncapped, that alone makes `drawn` exceed `rows` and the next
+        // `clear_last_lines(drawn)` erase scrollback above the picker.
+        // `truncate_str` is ANSI-aware, so it bounds the rendered width without
+        // splitting the theme's colour escapes.
+        let prompt_budget = rows.saturating_mul(cols);
+        if prompt_budget > 0 && physical_rows(&prompt_line, cols) > rows {
+            prompt_line = truncate_str(&prompt_line, prompt_budget, "…").into_owned();
+        }
+        let prompt_rows = physical_rows(&prompt_line, cols);
+        // Reserve the prompt's rows and show only as many items as still fit,
+        // allowing a *zero*-item window: when the prompt already fills the
+        // terminal no item row fits, and forcing one (a trailing `.max(1)`)
+        // would push the frame past `rows` and over-erase on the next clear.
+        let window = item_window(rows, prompt_rows, max_visible);
+
+        if filtered.is_empty() {
+            sel = 0;
+            top = 0;
+        } else {
+            sel = sel.min(filtered.len() - 1);
+            top = scroll_top(top, sel, window);
+        }
+
+        let mut lines: Vec<String> = Vec::with_capacity(window + 1);
+        lines.push(prompt_line);
+        for (pos, &item) in filtered.iter().enumerate().skip(top).take(window) {
+            let mut rendered = String::new();
+            Theme::format_fuzzy_select_prompt_item(theme, &mut rendered, &items[item], pos == sel, true, &matcher, &search)?;
+            lines.push(rendered);
+        }
+        drawn = 0;
+        for line in &lines {
+            term.write_line(line)?;
+            drawn += physical_rows(line, cols);
+        }
+        term.flush()?;
+
+        match term.read_key()? {
+            Key::Escape | Key::CtrlC => break None,
+            Key::Enter if !filtered.is_empty() => break Some(filtered[sel]),
+            Key::ArrowUp | Key::BackTab if !filtered.is_empty() => {
+                sel = (sel + filtered.len() - 1) % filtered.len();
+            }
+            Key::ArrowDown | Key::Tab if !filtered.is_empty() => {
+                sel = (sel + 1) % filtered.len();
+            }
+            Key::Backspace => {
+                if search.pop().is_some() {
+                    sel = 0;
+                    top = 0;
+                }
+            }
+            Key::Char(c) if !c.is_ascii_control() => {
+                search.push(c);
+                sel = 0;
+                top = 0;
+            }
+            _ => {}
+        }
+    };
+    // Clear the final frame so the menu leaves nothing behind, matching the old
+    // `FuzzySelect::clear(true)` behaviour; `_cursor` then restores the cursor.
+    if drawn > 0 {
+        term.clear_last_lines(drawn)?;
+    }
+    Ok(selected)
 }
 
 /// A picker or list row, fitted to `width` columns: when last used, the
@@ -188,20 +369,34 @@ pub fn pick_outcome(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Pick
         return Ok(Pick::Empty);
     }
     let now = crate::session::now();
-    // The picker renders on stderr (dialoguer) and is gated on stdin/stderr
-    // being terminals, so measure the stderr terminal — stdout may be
-    // redirected, and its width would not reflect where the rows are drawn.
-    let width = crate::status::stderr_terminal_size().map_or(100, |(_, cols)| cols as usize);
-    // Use the actual available width (less the picker's own marker and
-    // padding) so no row is wider than the terminal, even a narrow one.
-    let width = width.saturating_sub(4);
+    // The picker draws on stderr (console) and is gated on stdin/stderr being
+    // terminals, so measure the stderr terminal — stdout may be redirected, and
+    // its size would not reflect where the rows are drawn.
+    let (rows, cols) =
+        crate::status::stderr_terminal_size().map_or((24, 100), |(r, c)| (r as usize, c as usize));
+    // Fit each row to the available width (less the picker's own marker and
+    // padding) so none is wider than the terminal, even a narrow one.
+    let width = cols.saturating_sub(4);
+    // Leave two rows for the prompt line and cap the window like the old
+    // `max_length(15)`, so a long list scrolls rather than filling the screen.
+    let max_visible = rows.saturating_sub(2).clamp(1, 15);
     let theme = FitTheme { inner: ColorfulTheme::default(), width };
-    let mut show_all = in_dir(&sessions, cwd).is_empty();
+    // Start directory-scoped even when this directory has no sessions: the
+    // documented behaviour (and the non-terminal list) is a directory-scoped
+    // view whose "Show all sessions" entry is the explicit opt-in to every
+    // directory. With no local rows that entry is the sole choice, so the
+    // user still reaches all sessions — but only by asking for them, matching
+    // `print_list` rather than bypassing the scoping outright.
+    let mut show_all = false;
     loop {
         let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
-        // Give the picker the full row text so fuzzy matching can see a
-        // keyword anywhere in a long prompt; the theme truncates only what is
-        // rendered, so a row still never wraps the terminal.
+        // Give the selector each row's full text so fuzzy matching can see a
+        // keyword anywhere in a long prompt; `FitTheme` fits only what is drawn
+        // and `interactive_pick` clears only the rows it drew, so a long row
+        // neither wraps the terminal nor over-erases the scrollback above it.
+        // Selection comes back by index, so two sessions that render an
+        // identical row still map back to their own id — no disambiguator
+        // suffix needed.
         let mut items: Vec<String> = shown.iter().map(|s| row(s, now, usize::MAX)).collect();
         let hidden = sessions.len() - shown.len();
         if hidden > 0 {
@@ -212,20 +407,7 @@ pub fn pick_outcome(dir: &Path, cwd: &str, exclude: Option<&str>) -> Result<Pick
         } else {
             format!("Resume which session in {}? (type to filter, Esc to cancel)", crate::sanitize_terminal_text(cwd))
         };
-        let choice = dialoguer::FuzzySelect::with_theme(&theme)
-            .with_prompt(prompt)
-            .items(&items)
-            .default(0)
-            .max_length(15)
-            // Suppress dialoguer's post-selection confirmation: it re-renders
-            // the chosen item through `format_input_prompt_selection` with the
-            // full, untruncated row, bypassing `FitTheme`'s width-fitting, so a
-            // long prompt would wrap past the terminal. The menu is cleared on
-            // selection and the session resumes immediately, so the report adds
-            // nothing but the wrap risk.
-            .report(false)
-            .interact_opt()?;
-        match choice {
+        match interactive_pick(&prompt, &theme, &items, rows, cols, max_visible)? {
             None => return Ok(Pick::Cancelled),
             Some(i) if i == shown.len() => show_all = true,
             Some(i) => return Ok(Pick::Selected(shown[i].id.clone())),
@@ -328,6 +510,98 @@ mod tests {
         let wide = summary("s", Some("/work/プロジェクト"), "修正テストを直す", None);
         let row = row(&wide, crate::session::now(), 40);
         assert!(super::cells(&row) <= 40, "{row}");
+    }
+
+    #[test]
+    fn truncate_never_exceeds_width_even_zero() {
+        // The at-most-`width` contract holds at the boundary: a zero budget
+        // (a 1–4-column terminal) cannot hold even the ellipsis, so the only
+        // fitting string is empty.
+        assert_eq!(super::truncate("hello", 0), "");
+        assert_eq!(super::truncate("", 0), "");
+        // Width 1 fits just the ellipsis; width 2 fits one cell plus it.
+        assert_eq!(super::cells(&super::truncate("hello", 1)), 1);
+        let two = super::truncate("hello", 2);
+        assert!(super::cells(&two) <= 2 && two.ends_with('…'), "{two}");
+        // Untruncated text is returned as-is.
+        assert_eq!(super::truncate("hi", 5), "hi");
+    }
+
+    #[test]
+    fn truncate_counts_variation_selector_width_as_a_string() {
+        // `"#\u{fe0f}"` is two terminal cells as a string (emoji
+        // presentation), though its chars sum to one. `cells` must report the
+        // string width, and `truncate` must not admit a sequence that pushes
+        // the result past `width`.
+        let emoji = "#\u{fe0f}x";
+        assert_eq!(super::cells(emoji), 3);
+        let fitted = super::truncate(emoji, 2);
+        assert!(super::cells(&fitted) <= 2, "{fitted:?} exceeds width 2");
+    }
+
+    #[test]
+    fn rank_keeps_recency_order_when_search_is_empty() {
+        // An empty search must keep every item in input order (most-recent
+        // first), so the picker opens on the same default as the list.
+        let matcher = SkimMatcherV2::default();
+        let items: Vec<String> = ["aaa", "bbb", "ccc"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(rank(&matcher, &items, ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn rank_matches_full_row_text_and_drops_non_matches() {
+        // Matching runs over each row's full text, so a keyword deep in a long
+        // row still selects it; rows without the keyword are filtered out.
+        let matcher = SkimMatcherV2::default();
+        let items: Vec<String> =
+            ["morning  acme  2 prompts  fix the parser bug", "evening  other  1 prompt  write docs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(rank(&matcher, &items, "parser"), vec![0]);
+        assert!(rank(&matcher, &items, "zzzzz").is_empty());
+    }
+
+    #[test]
+    fn rank_returns_distinct_indices_for_identical_rows() {
+        // Two sessions that render an identical row must still be addressable
+        // by their own index: the selector returns the index, so the caller
+        // maps it back to the right session id (no disambiguator suffix).
+        let matcher = SkimMatcherV2::default();
+        let items: Vec<String> = ["same row", "same row"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(rank(&matcher, &items, "same"), vec![0, 1]);
+    }
+
+    #[test]
+    fn scroll_top_keeps_selection_in_the_window() {
+        // Selecting above the window scrolls up to it; below scrolls down so
+        // the selected row is the last visible one; inside leaves it put.
+        assert_eq!(scroll_top(3, 1, 4), 1);
+        assert_eq!(scroll_top(0, 6, 4), 3);
+        assert_eq!(scroll_top(2, 3, 4), 2);
+    }
+
+    #[test]
+    fn physical_rows_counts_terminal_wrapping() {
+        // A line within the width is one row; one wider than the terminal
+        // wraps to more — the accounting dialoguer's clear gets wrong.
+        assert_eq!(physical_rows("short", 80), 1);
+        assert_eq!(physical_rows(&"x".repeat(80), 80), 1);
+        assert_eq!(physical_rows(&"x".repeat(81), 80), 2);
+        assert_eq!(physical_rows("", 80), 1);
+    }
+
+    #[test]
+    fn item_window_never_pushes_the_frame_past_the_terminal() {
+        // Room to spare: the window is capped at `max_visible`.
+        assert_eq!(item_window(24, 1, 15), 15);
+        // The prompt leaves fewer rows than `max_visible`: shrink to the slack.
+        assert_eq!(item_window(5, 2, 15), 3);
+        // The prompt fills the terminal exactly, or wraps past it: zero items,
+        // so `prompt_rows + window` can never exceed `rows` and the next clear
+        // cannot erase scrollback above the picker.
+        assert_eq!(item_window(3, 3, 15), 0);
+        assert_eq!(item_window(3, 7, 15), 0);
     }
 
     #[test]

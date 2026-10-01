@@ -22,8 +22,8 @@ use super::anthropic;
 use super::openai;
 use super::openai_responses;
 use super::retry::ApiError;
-use super::{HttpTransport, ResolvedProvider};
-use crate::llm::{ChatRequest, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
+use super::{HttpTransport, ProviderKind, ResolvedProvider};
+use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, Role, StreamSink, report_whole};
 
 /// VS Code Copilot Chat's public OAuth app client ID.
 pub const DEFAULT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -83,19 +83,7 @@ impl CopilotApi {
 /// `grok-`, `oswe`, `mai-` for Responses; GPT-4.x and earlier for Chat
 /// Completions).
 fn copilot_api_for_model(model_id: &str) -> CopilotApi {
-    // Claude 4.x/5.x are served through the Anthropic Messages endpoint. Older
-    // Claude (3.x) and everything else keep the legacy Chat Completions path.
-    const CLAUDE_FAMILIES: [&str; 4] = ["claude-haiku-", "claude-sonnet-", "claude-opus-", "claude-fable-"];
-    let is_claude_4_or_5 = CLAUDE_FAMILIES.iter().any(|family| {
-        model_id.strip_prefix(family).is_some_and(|rest| {
-            let mut chars = rest.chars();
-            // The major version must be 4 or 5, and be a whole token — followed
-            // by a separator (`.`/`-`) or the end, so `claude-sonnet-42` (a
-            // hypothetical future line) is not misread as v4.
-            matches!(chars.next(), Some('4' | '5')) && matches!(chars.next(), None | Some('.' | '-'))
-        })
-    });
-    if is_claude_4_or_5 {
+    if uses_anthropic_messages(model_id) {
         return CopilotApi::Messages;
     }
     // GPT before 5 (gpt-4.1, gpt-4o, gpt-3.5-turbo) is Chat Completions only:
@@ -108,6 +96,24 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
         return CopilotApi::Responses;
     }
     CopilotApi::Completions
+}
+
+/// Whether Copilot serves `model_id` through the Anthropic Messages endpoint
+/// (`/v1/messages`): Claude 4.x/5.x models. Older Claude (3.x) and everything
+/// else keep the legacy Chat Completions path. Temperature resolution uses this
+/// to apply Anthropic's 0..=1 range to exactly the requests whose body is built
+/// by `anthropic::build_body` (which clamps to that range).
+pub(crate) fn uses_anthropic_messages(model_id: &str) -> bool {
+    const CLAUDE_FAMILIES: [&str; 4] = ["claude-haiku-", "claude-sonnet-", "claude-opus-", "claude-fable-"];
+    CLAUDE_FAMILIES.iter().any(|family| {
+        model_id.strip_prefix(family).is_some_and(|rest| {
+            let mut chars = rest.chars();
+            // The major version must be 4 or 5, and be a whole token — followed
+            // by a separator (`.`/`-`) or the end, so `claude-sonnet-42` (a
+            // hypothetical future line) is not misread as v4.
+            matches!(chars.next(), Some('4' | '5')) && matches!(chars.next(), None | Some('.' | '-'))
+        })
+    })
 }
 
 /// Whether a Copilot model reasons, and so (1) needs its reasoning items
@@ -509,10 +515,32 @@ impl LLMClient for GithubCopilotClient {
             let entry =
                 models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
             // Copilot enforces the prompt budget, which is below the full window.
-            ["max_prompt_tokens", "max_context_window_tokens"].iter().find_map(|field| {
-                let tokens = entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0)?;
-                Some(DetectedWindow { tokens: tokens as usize, source: format!("Copilot /models {field}") })
-            })
+            let limit = |field: &str| {
+                entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
+            };
+            let prompt = limit("max_prompt_tokens");
+            let combined = limit("max_context_window_tokens");
+            match (prompt, combined) {
+                // `max_prompt_tokens` caps the prompt alone: output tokens do not
+                // consume it. Keep the larger `max_context_window_tokens` too —
+                // leaving `max_tokens` unchanged against the prompt cap can still
+                // push prompt + output past the full window, so it is enforced as
+                // a second limit.
+                (Some(tokens), combined) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_prompt_tokens".to_string(),
+                    cap: ContextCap::Prompt,
+                    total_tokens: combined,
+                }),
+                // `max_context_window_tokens` alone is the full window.
+                (None, Some(tokens)) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_context_window_tokens".to_string(),
+                    cap: ContextCap::Total,
+                    total_tokens: None,
+                }),
+                (None, None) => None,
+            }
         })
         .await
         .ok()
@@ -541,6 +569,10 @@ impl LLMClient for GithubCopilotClient {
 
     fn provider_name(&self) -> &str {
         &self.transport.provider().name
+    }
+
+    fn kind(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::GithubCopilot)
     }
 }
 
@@ -872,7 +904,8 @@ mod tests {
     #[tokio::test]
     async fn detects_context_window_field_fallbacks() {
         // `max_prompt_tokens` is Copilot's enforced prompt budget and wins over
-        // `max_context_window_tokens` when both are present.
+        // `max_context_window_tokens` when both are present — but the larger
+        // combined window is kept as a second limit on prompt + output.
         let window = detect_window(json!({
             "data": [{ "id": "gpt-5-mini", "capabilities": { "limits": {
                 "max_prompt_tokens": 111,
@@ -883,6 +916,8 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 111);
         assert_eq!(window.source, "Copilot /models max_prompt_tokens");
+        assert_eq!(window.cap, ContextCap::Prompt, "the prompt budget caps the prompt alone");
+        assert_eq!(window.total_tokens, Some(999), "the combined window is kept as a second limit");
 
         // With `max_prompt_tokens` absent, fall back to `max_context_window_tokens`.
         let window = detect_window(json!({
@@ -894,6 +929,8 @@ mod tests {
         .unwrap();
         assert_eq!(window.tokens, 222);
         assert_eq!(window.source, "Copilot /models max_context_window_tokens");
+        assert_eq!(window.cap, ContextCap::Total, "the full window caps prompt + output");
+        assert_eq!(window.total_tokens, None, "a total cap needs no second limit");
 
         // Neither field present: no detection rather than a bogus default.
         assert!(
