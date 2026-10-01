@@ -79,6 +79,12 @@ fn cells(text: &str) -> usize {
 /// `text` fitted to at most `width` terminal cells, with an ellipsis when
 /// truncated. Never splits a wide glyph across the boundary.
 fn truncate(text: &str, width: usize) -> String {
+    // A zero budget (the picker on a 1–4-column terminal, after
+    // `saturating_sub(4)`) cannot hold even the one-cell ellipsis, so the
+    // only string that fits is empty — honour the at-most-`width` contract.
+    if width == 0 {
+        return String::new();
+    }
     if cells(text) <= width {
         return text.to_string();
     }
@@ -292,6 +298,21 @@ mod tests {
         let wide = summary("s", Some("/work/プロジェクト"), "修正テストを直す", None);
         let row = row(&wide, crate::session::now(), 40);
         assert!(super::cells(&row) <= 40, "{row}");
+    }
+
+    #[test]
+    fn truncate_never_exceeds_width_even_zero() {
+        // The at-most-`width` contract holds at the boundary: a zero budget
+        // (a 1–4-column terminal) cannot hold even the ellipsis, so the only
+        // fitting string is empty.
+        assert_eq!(super::truncate("hello", 0), "");
+        assert_eq!(super::truncate("", 0), "");
+        // Width 1 fits just the ellipsis; width 2 fits one cell plus it.
+        assert_eq!(super::cells(&super::truncate("hello", 1)), 1);
+        let two = super::truncate("hello", 2);
+        assert!(super::cells(&two) <= 2 && two.ends_with('…'), "{two}");
+        // Untruncated text is returned as-is.
+        assert_eq!(super::truncate("hi", 5), "hi");
     }
 
     #[test]

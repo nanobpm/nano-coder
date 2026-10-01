@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -285,7 +285,14 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
     // would seek past it and the rename would discard it.
     let index_len = fs::metadata(index_path(dir)).map(|m| m.len()).unwrap_or(0);
     let (mut index, lines) = load(dir);
-    let Ok(entries) = fs::read_dir(dir) else { return Ok(Vec::new()) };
+    // Only a missing directory means "no sessions". A permission or I/O error
+    // must surface, not be misreported as an empty directory ("No saved
+    // sessions" / "no match"), which would hide the real failure.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read session directory {}", dir.display())),
+    };
     let mut current: HashMap<String, Summary> = HashMap::new();
     let mut updates = Vec::new();
     for entry in entries.flatten() {
@@ -294,6 +301,14 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+        // Validate the file-stem id before trusting a cache hit: a cached
+        // summary lets a log whose name `SessionLog::open` would reject
+        // (`.hidden`, over 128 bytes, outside [A-Za-z0-9._-]) bypass
+        // `summarize`'s check, so it would be advertised yet always fail to
+        // resume. Skip it like `summarize` would.
+        if crate::session::validate_id(&id).is_err() {
+            continue;
+        }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let summary = match index.remove(&id) {
             Some(summary) if summary.log_bytes == size => summary,
@@ -438,6 +453,47 @@ mod tests {
         let sessions = list(dir.path()).unwrap();
         assert_eq!(sessions[0].prompts, 2);
         assert_eq!(sessions[0].last_prompt.as_deref(), Some("Second prompt for the session"));
+    }
+
+    #[test]
+    fn list_skips_invalid_id_even_on_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        // A log named with an id `SessionLog::open` rejects (`.hidden`), with a
+        // cache entry whose `log_bytes` matches, must not be advertised: the
+        // cache hit would otherwise bypass `summarize`'s `validate_id` and the
+        // picker would offer a session that always fails to resume.
+        let hidden = dir.path().join(".hidden.jsonl");
+        fs::write(&hidden, b"{\"type\":\"input\",\"data\":{\"id\":\"i1\",\"text\":\"hi\"}}\n").unwrap();
+        let size = fs::metadata(&hidden).unwrap().len();
+        let cached = Summary {
+            id: ".hidden".into(),
+            cwd: None,
+            model: None,
+            created_at: None,
+            last_used: crate::session::now(),
+            prompts: 1,
+            first_prompt: Some("hi".into()),
+            last_prompt: Some("hi".into()),
+            context_prompt: None,
+            log_bytes: size,
+        };
+        append(dir.path(), &[cached]).unwrap();
+        // Despite the matching cache entry, the invalid id is skipped.
+        assert!(list(dir.path()).unwrap().is_empty(), "an invalid id must not be listed from cache");
+    }
+
+    #[test]
+    fn list_propagates_directory_errors_except_not_found() {
+        // A missing directory is "no sessions", not an error.
+        let missing = tempfile::tempdir().unwrap();
+        let absent = missing.path().join("does-not-exist");
+        assert!(list(&absent).unwrap().is_empty(), "a missing directory means no sessions");
+        // Any other read failure (here: the path is a file, so `read_dir`
+        // yields ENOTDIR) must surface, not be misreported as empty.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("a-file");
+        fs::write(&not_a_dir, b"x").unwrap();
+        assert!(list(&not_a_dir).is_err(), "a non-NotFound read_dir error must propagate");
     }
 
     #[test]
