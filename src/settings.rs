@@ -915,7 +915,8 @@ fn set_temperature_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], decor:
     }
 }
 
-fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {    let text = toml::to_string(provider).context("serializing provider")?;
+fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
+    let text = toml::to_string(provider).context("serializing provider")?;
     let doc: toml_edit::DocumentMut = text.parse().context("re-parsing provider")?;
     let mut table = doc.as_table().clone();
     table.retain(|_, item| !item.as_table_like().is_some_and(|t| t.is_empty()));
