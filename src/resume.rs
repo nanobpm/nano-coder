@@ -21,7 +21,7 @@ pub fn last(dir: &Path, cwd: &str) -> Result<String> {
     let sessions = session_index::list(dir)?;
     match sessions.iter().find(|s| s.cwd.as_deref() == Some(cwd)) {
         Some(session) => Ok(session.id.clone()),
-        None => bail!("no saved session for {cwd}; run with --resume to pick one"),
+        None => bail!("no saved session for {}; run with --resume to pick one", crate::sanitize_terminal_text(cwd)),
     }
 }
 
@@ -160,13 +160,19 @@ pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
         return Ok(());
     }
     if shown.is_empty() {
-        let scope = if all { String::new() } else { format!(" for {cwd} (--all lists every directory)") };
+        let scope = if all {
+            String::new()
+        } else {
+            format!(" for {} (--all lists every directory)", crate::sanitize_terminal_text(cwd))
+        };
         eprintln!("No saved sessions{scope}.");
         return Ok(());
     }
     let now = crate::session::now();
     for summary in shown {
-        if writeln!(out, "{}  {}", summary.id, row(summary, now, 100)).is_err() {
+        // The id comes from a log header, which a crafted log can fill with
+        // control characters; sanitize it for the terminal (JSON stays raw).
+        if writeln!(out, "{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100)).is_err() {
             break;
         }
     }
@@ -234,6 +240,17 @@ mod tests {
         let s = summary("s", Some("/work/evil\u{1b}[2J"), "hi\u{1b}]8;;x\u{7}", None);
         assert_eq!(project(&s), "evil[2J");
         assert_eq!(topic(&s), "hi]8;;x");
+    }
+
+    #[test]
+    fn errors_and_plain_ids_drop_control_characters() {
+        // `--resume last` from a crafted directory name cannot inject escapes.
+        let dir = tempfile::tempdir().unwrap();
+        let err = last(dir.path(), "/work/evil\u{1b}[2J").unwrap_err().to_string();
+        assert!(err.contains("no saved session for /work/evil[2J"), "{err}");
+        assert!(!err.contains('\u{1b}'), "{err}");
+        // A crafted session id is sanitized by the same helper for plain output.
+        assert_eq!(crate::sanitize_terminal_text("s\u{1b}[2J"), "s[2J");
     }
 
     #[test]
