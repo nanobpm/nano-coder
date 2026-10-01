@@ -136,7 +136,7 @@ pub async fn run(
                 // must surface (not be read as "no model picked"); Esc maps to
                 // `Ok(None)` and is a plain skip.
                 match pick_model_interactive(agent, &snapshot).await {
-                    Ok(Some(spec)) => switch_model(agent, &spec, &mut changes, recents, recents_path).await,
+                    Ok(Some(spec)) => switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await,
                     Ok(None) => {}
                     Err(e) => return (notices, Err(e)),
                 }
@@ -178,7 +178,7 @@ pub async fn run(
                         let all = providers::effective_providers(&user);
                         match pick_model_from_provider(&name, &all, &user, &default_provider).await {
                             Ok(Step::Done(spec)) => {
-                                switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                                switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await;
                             }
                             Ok(Step::Back) => {}
                             Err(e) => return (notices, Err(e)),
@@ -312,12 +312,21 @@ async fn switch_model(
     changes: &mut Changes,
     recents: &recents::SharedRecents,
     recents_path: &Path,
+    notices: &mut Vec<String>,
 ) {
     let previous = format!("{}/{}", agent.provider_name(), agent.model_name());
     match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
             record_switch(agent, &previous, recents, recents_path);
+            // A successful switch installs a fresh live client for the
+            // now-current provider, so any earlier "could not rebuild the
+            // client" failure notice for that same provider is stale: the
+            // client it warned about has now been rebuilt. Drop it, or the exit
+            // redraw would incorrectly warn the live client was not rebuilt.
+            let stale =
+                format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
+            notices.retain(|n| !n.starts_with(&stale));
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             if let Some(warning) = agent.temperature().warning {
                 println!("Warning: {warning}");
