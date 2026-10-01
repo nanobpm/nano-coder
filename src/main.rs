@@ -1029,11 +1029,16 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
             terminal.renderer.frame_resize();
             match picked? {
                 resume::Pick::Selected(id) => id,
-                // The repaint already covered the picker's "No saved sessions"
-                // stderr notice, so repeat it where the user can see it; keep
+                // The picker already printed "No saved sessions to resume." to
+                // stderr. In frame mode the repaint above painted over it, so
+                // repeat it where the user can see it; with the legacy renderer
+                // frame_resize() is a no-op and the stderr notice is still on
+                // screen, so printing again would duplicate it. Keep
                 // "Session unchanged" for an actual Esc.
                 resume::Pick::Empty => {
-                    terminal.renderer.print_block("No saved sessions to resume");
+                    if terminal.renderer.is_frame() {
+                        terminal.renderer.print_block("No saved sessions to resume");
+                    }
                     return Ok(());
                 }
                 resume::Pick::Cancelled => {
