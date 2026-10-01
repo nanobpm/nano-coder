@@ -119,18 +119,34 @@ fn index_path(dir: &Path) -> PathBuf {
 }
 
 /// The index's summaries by ID (latest line wins) and its line count.
-/// Unreadable lines are skipped: the index is only a cache.
+/// Unreadable lines are skipped: the index is only a cache. Bytes are read
+/// (not `read_to_string`) and split on `b'\n'` so one non-UTF-8 or otherwise
+/// corrupt line is isolated rather than discarding the whole index — a
+/// discarded index never reaches the rewrite threshold (it reports zero
+/// lines), so it could not self-heal and every listing would rescan every log.
 fn load(dir: &Path) -> (HashMap<String, Summary>, usize) {
-    let Ok(text) = fs::read_to_string(index_path(dir)) else { return Default::default() };
+    let Ok(bytes) = fs::read(index_path(dir)) else { return Default::default() };
     let mut map = HashMap::new();
     let mut lines = 0;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = trim_ascii(line);
+        if line.is_empty() {
+            continue;
+        }
         lines += 1;
-        if let Ok(summary) = serde_json::from_str::<Summary>(line) {
+        if let Ok(summary) = serde_json::from_slice::<Summary>(line) {
             map.insert(summary.id.clone(), summary);
         }
     }
     (map, lines)
+}
+
+/// `line` without leading/trailing ASCII whitespace (the byte-level
+/// counterpart of `str::trim` for the index's per-line reads).
+fn trim_ascii(line: &[u8]) -> &[u8] {
+    let start = line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(line.len());
+    let end = line.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |i| i + 1);
+    &line[start..end]
 }
 
 /// Append summaries, one `write` per line so concurrent writers don't
@@ -154,10 +170,13 @@ fn append(dir: &Path, summaries: &[Summary]) -> Result<()> {
 }
 
 /// Rewrite the index with one line per session (atomically, via rename).
-/// Lines another process appends between the read and the rename are lost,
-/// which only costs a rebuild from the log later — except a lost line can
-/// carry a model change that only exists in the index, so the rewrite merges
-/// whatever landed in the file since the read before renaming.
+/// The rewrite merges whatever landed in the file since the read before
+/// renaming, so a concurrent append (which can carry a model change that
+/// exists only in the index) survives. `since` is sampled before the read, so
+/// it never names a byte the read missed; an append landing after the merge
+/// read and before the rename is still lost without cross-process locking,
+/// which costs only a rebuild from the log — except when that line carried an
+/// index-only model change, a known residual risk of the lock-free design.
 fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Result<()> {
     let mut merged = summaries.clone();
     if let Ok(mut file) = OpenOptions::new().read(true).open(index_path(dir))
@@ -230,8 +249,12 @@ pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated.
 pub fn list(dir: &Path) -> Result<Vec<Summary>> {
-    let (mut index, lines) = load(dir);
+    // Sample the size before reading so `index_len` never names a byte the
+    // read did not cover: sampled after `load`, an append landing between the
+    // two would be absent from `index` yet inside `since`, and `rewrite`
+    // would seek past it and the rename would discard it.
     let index_len = fs::metadata(index_path(dir)).map(|m| m.len()).unwrap_or(0);
+    let (mut index, lines) = load(dir);
     let Ok(entries) = fs::read_dir(dir) else { return Ok(Vec::new()) };
     let mut current: HashMap<String, Summary> = HashMap::new();
     let mut updates = Vec::new();
@@ -438,5 +461,29 @@ mod tests {
         // Garbage in the index is skipped, not fatal.
         fs::write(index_path(dir.path()), "not json\n").unwrap();
         assert_eq!(list(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn load_isolates_a_non_utf8_line_instead_of_discarding_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = SessionLog::create(dir.path(), "a").unwrap();
+        input(&mut a, "i1", "Session a's prompt");
+        let mut b = SessionLog::create(dir.path(), "b").unwrap();
+        input(&mut b, "i1", "Session b's prompt");
+        list(dir.path()).unwrap();
+        let (before, _) = load(dir.path());
+        assert_eq!(before.len(), 2);
+
+        // A line that is not valid UTF-8 must not make the read discard the
+        // whole index: the good lines still load, so the listing reuses them
+        // and the rewrite threshold still counts them.
+        let mut bytes = fs::read(index_path(dir.path())).unwrap();
+        bytes.extend_from_slice(b"\xff\xfe not utf8\n");
+        fs::write(index_path(dir.path()), bytes).unwrap();
+        let (after, lines) = load(dir.path());
+        assert_eq!(after.len(), 2, "the two good lines survive the corrupt one");
+        assert_eq!(lines, 3, "the corrupt line still counts toward compaction");
+        assert_eq!(after["a"].prompts, 1);
+        assert_eq!(after["b"].prompts, 1);
     }
 }

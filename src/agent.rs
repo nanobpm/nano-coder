@@ -456,6 +456,11 @@ pub struct Agent {
     /// in `finish_turn` folds just this turn's input into the cached summary
     /// instead of rescanning the whole log.
     turn_log_offset: Option<u64>,
+    /// Whether the current turn appended a new `Record::Input` (a fresh
+    /// input) rather than redelivering a resumed pending one. Only a fresh
+    /// input's text is folded into the session-index summary; a resumed one
+    /// already lies before `turn_log_offset`, so folding it would double-count.
+    turn_appended_input: bool,
     /// Whether a real smart-compaction summary is in context, gating the
     /// history tools. Tracked explicitly (set by compaction, restored from the
     /// replace record's mode) rather than sniffed from message text, so a user
@@ -506,6 +511,7 @@ impl Agent {
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             turn_history_calls: 0,
             turn_log_offset: None,
+            turn_appended_input: false,
             history_available: false,
             history_hint_pending: false,
         }
@@ -1236,6 +1242,12 @@ impl Agent {
         // instead of rescanning the whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // Whether this turn appends a new `Record::Input` (a fresh input) or
+        // redelivers a resumed pending one already in the log. Only the fresh
+        // case may fold the text into the session-index summary: the resumed
+        // input lies before `turn_log_offset`, so a cache covering the log to
+        // there already holds it, and folding it again would double-count it.
+        self.turn_appended_input = resuming.is_none();
         let input_id = match input_id {
             Some(id) => id.to_string(),
             None => {
@@ -1726,7 +1738,11 @@ impl Agent {
             // the picker rebuilds a missing or stale summary from the log.
             let model = format!("{}/{}", self.client.provider_name(), self.client.model_name());
             let from = self.turn_log_offset.unwrap_or(0);
-            let input = self.pending_input.as_ref().map(|pending| pending.text.as_str());
+            // Fold the text only when this turn appended the input record; a
+            // resumed pending input already lies before `from`, so a cache
+            // covering the log to `from` holds it and folding would recount it.
+            let input =
+                if self.turn_appended_input { self.pending_input.as_ref().map(|p| p.text.as_str()) } else { None };
             let _ = crate::session_index::update(log.path(), from, input, Some(model));
         }
         match &outcome {
@@ -2492,6 +2508,25 @@ mod tests {
         assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "recovered");
         let request = &seen.lock().unwrap()[0];
         assert_eq!(request.iter().filter(|m| m.role == Role::User).count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumed_pending_input_is_not_folded_into_the_index_twice() {
+        // An interrupted session whose pending input is already in the log:
+        // resuming and finishing that turn must not fold the prompt into the
+        // session-index summary again (the cache already covers it).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(dir.path(), "sess", vec![]);
+        // The picker/listing indexes the interrupted log before the resume.
+        assert_eq!(crate::session_index::list(dir.path()).unwrap()[0].prompts, 1);
+
+        let (mut agent, _) = agent(vec![text("done")], dir.path());
+        agent.load_session("sess").unwrap();
+        assert_eq!(agent.send_input(Some("msg-1"), "run it").await.unwrap(), "done");
+
+        let sessions = crate::session_index::list(dir.path()).unwrap();
+        assert_eq!(sessions[0].prompts, 1, "the resumed input is counted once, not folded again");
+        assert_eq!(sessions[0].last_prompt.as_deref(), Some("run it"));
     }
 
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
