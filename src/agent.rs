@@ -1719,12 +1719,15 @@ impl Agent {
         // (GitHub Copilot's `max_prompt_tokens`), where output tokens do not
         // consume it and reserving them would compact early. `request_max_tokens`
         // shrinks the reservation down to MIN_OUTPUT_RESERVE; compact before even
-        // that would not fit.
+        // that would not fit. A prompt-only cap still keeps the estimation
+        // margin: the prompt estimate can undercount, and without the margin a
+        // prompt estimated just under the cap could really exceed it and be
+        // rejected.
         let reserved = match self.context_cap() {
             ContextCap::Total => {
                 (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
             }
-            ContextCap::Prompt => 0,
+            ContextCap::Prompt => output_margin(window),
         };
         let limit = (window as f64 * threshold).min(window.saturating_sub(reserved) as f64);
         // A prompt-only cap does not consume output tokens, but the endpoint's
@@ -2750,6 +2753,39 @@ mod tests {
         // compaction here.
         agent.push(Message::user("q")).unwrap();
         agent.push(Message::assistant(&"a".repeat(388_000))).unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.response, "done");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "summary, then the real call: {seen:?}");
+        assert!(seen[0].1, "the first request is the compaction summary: {seen:?}");
+        assert!(agent.context_stats().lock().unwrap().compactions >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_only_window_keeps_the_estimation_margin() {
+        // Copilot reports only `max_prompt_tokens = 100K` (prompt-only) and no
+        // combined window. The prompt cap does not consume output tokens, so no
+        // output reservation is carved out of it — but the estimation margin
+        // (`output_margin`) still is, because the prompt estimate can undercount
+        // and a prompt estimated just under the cap could really exceed it and
+        // be rejected. A prompt sitting between the margin-protected limit
+        // (100K - 100K/50 = 98K) and the raw 0.99 threshold (99K) must compact.
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_window = 100_000;
+        let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
+        agent.config_mut().context_window = None;
+        agent.detected_window = Some(DetectedWindow {
+            tokens: prompt_window,
+            source: "Copilot /models max_prompt_tokens".into(),
+            cap: ContextCap::Prompt,
+            total_tokens: None,
+        });
+        agent.new_session().unwrap();
+        // A ~98.5K-token prompt: over the margin-protected limit (98K) but under
+        // the raw 0.99 threshold (99K), so only the estimation margin can
+        // trigger compaction here.
+        agent.push(Message::user("q")).unwrap();
+        agent.push(Message::assistant(&"a".repeat(392_000))).unwrap();
         let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
         assert_eq!(outcome.response, "done");
         let seen = seen.lock().unwrap().clone();
