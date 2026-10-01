@@ -132,12 +132,25 @@ pub async fn run(
         match selection {
             0 => {
                 let snapshot = recents.lock().unwrap().models().to_vec();
-                if let Some(spec) = pick_model_interactive(agent, &snapshot).await.ok().flatten() {
-                    switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                // A genuine terminal I/O failure inside the picker is `Err` and
+                // must surface (not be read as "no model picked"); Esc maps to
+                // `Ok(None)` and is a plain skip.
+                match pick_model_interactive(agent, &snapshot).await {
+                    Ok(Some(spec)) => switch_model(agent, &spec, &mut changes, recents, recents_path).await,
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e)),
                 }
             }
             1 => {
-                if let Some(edit) = edit_provider(agent).await.ok().flatten() {
+                // Surface a genuine I/O failure from the provider editor; Esc is
+                // `Ok(None)` (a skip). The rebuild-failure notice is retained and
+                // returned on every exit, so it is not lost on this error path.
+                let edit = match edit_provider(agent).await {
+                    Ok(Some(edit)) => edit,
+                    Ok(None) => continue,
+                    Err(e) => return (notices, Err(e)),
+                };
+                {
                     let name = edit.name;
                     // Keep only the LATEST rebuild outcome for this provider:
                     // a prior failure notice for the same provider is now
@@ -150,49 +163,63 @@ pub async fn run(
                         notices.push(notice);
                     }
                     changes.providers.insert(name.clone());
-                    let pick_now = Confirm::new()
+                    // Esc is a supported "no" here (`interact_opt` → `Ok(None)`);
+                    // only a genuine I/O failure is `Err` and must surface.
+                    let pick_now = match Confirm::new()
                         .with_prompt(format!("Pick a model from {name} now?"))
                         .default(true)
-                        .interact()
-                        .unwrap_or(false);
+                        .interact_opt()
+                    {
+                        Ok(pick) => pick.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    };
                     if pick_now {
                         let (user, default_provider) = agent.config().effective_providers();
                         let all = providers::effective_providers(&user);
-                        if let Ok(Step::Done(spec)) =
-                            pick_model_from_provider(&name, &all, &user, &default_provider).await
-                        {
-                            switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                        match pick_model_from_provider(&name, &all, &user, &default_provider).await {
+                            Ok(Step::Done(spec)) => {
+                                switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                            }
+                            Ok(Step::Back) => {}
+                            Err(e) => return (notices, Err(e)),
                         }
                     }
                 }
             }
             2 => edit_temperature(agent, &mut changes)?,
             3 => {
-                if let Ok(value) = Input::<i32>::new()
+                match Input::<i32>::new()
                     .with_prompt("Max tokens")
                     .default(agent.config().max_tokens)
                     .interact_text()
                 {
-                    agent.config_mut().max_tokens = value;
-                    changes.max_tokens = true;
+                    Ok(value) => {
+                        agent.config_mut().max_tokens = value;
+                        changes.max_tokens = true;
+                    }
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
             4 => {
-                if let Ok(value) = Input::<usize>::new()
+                match Input::<usize>::new()
                     .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
                     .interact_text()
                 {
-                    agent.config_mut().max_iterations = value;
-                    changes.max_iterations = true;
+                    Ok(value) => {
+                        agent.config_mut().max_iterations = value;
+                        changes.max_iterations = true;
+                    }
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
             5 => {
-                if let Ok(value) = Input::<String>::new()
+                match Input::<String>::new()
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
                     .interact_text()
                 {
+                    Ok(value) => {
                     // `set_system_prompt` is atomic (it rolls its config change
                     // back on failure), so on error the prompt is unchanged;
                     // retain a notice since the dialog's own `println!` is wiped
@@ -206,52 +233,71 @@ pub async fn run(
                         Ok(()) => changes.system_prompt = true,
                         Err(e) => notices.push(format!("{SYSTEM_PROMPT_NOTICE} {e:#}")),
                     }
+                    }
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
             6 => {
-                if edit_context(agent).is_ok() {
-                    changes.compaction = true;
+                match edit_context(agent) {
+                    Ok(()) => changes.compaction = true,
+                    Err(e) => return (notices, Err(e)),
                 }
             }
             7 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
-                if let Ok(choice) =
-                    Select::new().with_prompt("Verbosity").items(&labels).default(current).interact()
-                {
-                    agent.config_mut().verbosity = levels[choice];
-                    crate::ui::set_verbosity(levels[choice]);
-                    changes.verbosity = true;
+                // Esc keeps the current setting (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Verbosity").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        agent.config_mut().verbosity = levels[choice];
+                        crate::ui::set_verbosity(levels[choice]);
+                        changes.verbosity = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
             8 => {
                 let modes = crate::frame::RendererMode::ALL;
                 let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
                 let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                if let Ok(choice) =
-                    Select::new().with_prompt("Renderer").items(&labels).default(current).interact()
-                {
-                    let previous = agent.config().renderer;
-                    agent.config_mut().renderer = modes[choice];
-                    changes.renderer = true;
-                    if modes[choice] != previous {
-                        // The switch is applied live by `main` (which detects the
-                        // changed `renderer` after the dialog returns and flips the
-                        // frame renderer, the line editor, and the scroll region).
-                        println!("Renderer set to {} — taking effect now.", modes[choice]);
+                // Esc keeps the current renderer (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Renderer").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        let previous = agent.config().renderer;
+                        agent.config_mut().renderer = modes[choice];
+                        changes.renderer = true;
+                        if modes[choice] != previous {
+                            // The switch is applied live by `main` (which detects the
+                            // changed `renderer` after the dialog returns and flips the
+                            // frame renderer, the line editor, and the scroll region).
+                            println!("Renderer set to {} — taking effect now.", modes[choice]);
+                        }
                     }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
             9 => save_and_report(agent.config(), &mut changes, config_path),
             _ => {
-                if changes.any()
-                    && Confirm::new()
+                // Esc is a supported "no" (`interact_opt` → `Ok(None)`); only a
+                // genuine I/O failure is `Err` and must surface.
+                let save = if changes.any() {
+                    match Confirm::new()
                         .with_prompt(format!("Save changes to {}?", config_path.display()))
                         .default(true)
-                        .interact()
-                        .unwrap_or(false)
-                {
+                        .interact_opt()
+                    {
+                        Ok(save) => save.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    }
+                } else {
+                    false
+                };
+                if save {
                     save_and_report(agent.config(), &mut changes, config_path);
                 }
                 return notices;
