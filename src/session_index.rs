@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -55,6 +55,25 @@ pub fn is_terse(text: &str) -> bool {
     text.starts_with('/') || (text.chars().count() < 24 && text.split_whitespace().count() <= 4)
 }
 
+/// Fold one input record into `summary` (bump the count, track first/last and
+/// context prompts). Shared by [`summarize`], which scans a whole log, and
+/// [`update`], which folds just the turn's own input.
+fn fold_input(summary: &mut Summary, text: &str) {
+    summary.prompts += 1;
+    if summary.first_prompt.is_none() {
+        summary.first_prompt = Some(text.to_string());
+    }
+    if let Some(previous) = summary.last_prompt.replace(text.to_string())
+        && !is_terse(&previous)
+    {
+        summary.context_prompt = Some(previous);
+    }
+    // Context is only worth showing when the last prompt needs it.
+    if summary.last_prompt.as_deref().is_none_or(|last| !is_terse(last)) {
+        summary.context_prompt = None;
+    }
+}
+
 /// Summarize the session log at `path`. Only the header and input records are
 /// decoded; other lines (often large tool output) are skipped unparsed.
 pub fn summarize(path: &Path) -> Result<Summary> {
@@ -88,24 +107,9 @@ pub fn summarize(path: &Path) -> Result<Summary> {
                 summary.cwd = cwd;
                 summary.model = model;
             }
-            Ok(Record::Input { text, .. }) => {
-                summary.prompts += 1;
-                if summary.first_prompt.is_none() {
-                    summary.first_prompt = Some(text.clone());
-                }
-                if let Some(previous) = summary.last_prompt.take()
-                    && !is_terse(&previous)
-                {
-                    summary.context_prompt = Some(previous);
-                }
-                summary.last_prompt = Some(text);
-            }
+            Ok(Record::Input { text, .. }) => fold_input(&mut summary, &text),
             _ => {}
         }
-    }
-    // Context is only worth showing when the last prompt needs it.
-    if summary.last_prompt.as_deref().is_none_or(|last| !is_terse(last)) {
-        summary.context_prompt = None;
     }
     Ok(summary)
 }
@@ -130,7 +134,10 @@ fn load(dir: &Path) -> (HashMap<String, Summary>, usize) {
 }
 
 /// Append summaries, one `write` per line so concurrent writers don't
-/// interleave within a line.
+/// interleave within a line. A short write is a failed cache update, not
+/// something to retry: `write_all` would issue a second `write` for the
+/// remainder, and another append-only writer could land between the two
+/// fragments and corrupt both records.
 fn append(dir: &Path, summaries: &[Summary]) -> Result<()> {
     if summaries.is_empty() {
         return Ok(());
@@ -139,17 +146,36 @@ fn append(dir: &Path, summaries: &[Summary]) -> Result<()> {
     for summary in summaries {
         let mut line = serde_json::to_vec(summary)?;
         line.push(b'\n');
-        file.write_all(&line)?;
+        if file.write(&line)? != line.len() {
+            anyhow::bail!("short write to session index");
+        }
     }
     Ok(())
 }
 
 /// Rewrite the index with one line per session (atomically, via rename).
 /// Lines another process appends between the read and the rename are lost,
-/// which only costs a rebuild from the log later.
-fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>) -> Result<()> {
+/// which only costs a rebuild from the log later — except a lost line can
+/// carry a model change that only exists in the index, so the rewrite merges
+/// whatever landed in the file since the read before renaming.
+fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Result<()> {
+    let mut merged = summaries.clone();
+    if let Ok(mut file) = OpenOptions::new().read(true).open(index_path(dir))
+        && let Ok(pos) = file.seek(SeekFrom::Start(since))
+    {
+        let mut rest = String::new();
+        if pos == since && file.read_to_string(&mut rest).is_ok() {
+            // `since` is a whole-line boundary, so every complete line read
+            // from it is a full record; a torn trailing line is dropped.
+            for line in rest.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(summary) = serde_json::from_str::<Summary>(line) {
+                    merged.insert(summary.id.clone(), summary);
+                }
+            }
+        }
+    }
     let mut text = String::new();
-    let mut sorted: Vec<&Summary> = summaries.values().collect();
+    let mut sorted: Vec<&Summary> = merged.values().collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     for summary in sorted {
         text.push_str(&serde_json::to_string(summary)?);
@@ -164,9 +190,36 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>) -> Result<()> {
 /// Record the session log at `path` in the index, after a turn. `model` is
 /// the `provider/model` in use now, which may differ from the one the
 /// session started with.
-pub fn update(path: &Path, model: Option<String>) -> Result<()> {
+///
+/// The turn's own input is folded into the cached summary rather than
+/// rescanning the whole log: rereading every prior prompt and tool-output
+/// record on each completed turn would make index maintenance cumulative
+/// quadratic I/O. The cached summary must cover the log up to `from` (the
+/// log's size before the turn's input was appended); when it is missing or
+/// older — the first turn, an older version that didn't index, a crash —
+/// fall back to one full scan. `list()` likewise rebuilds from the log
+/// whenever a summary is missing or stale.
+pub fn update(path: &Path, from: u64, input: Option<&str>, model: Option<String>) -> Result<()> {
     let dir = path.parent().context("session log has no directory")?;
-    let mut summary = summarize(path)?;
+    let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let metadata = fs::metadata(path)?;
+    let last_used = DateTime::<Local>::from(metadata.modified()?).fixed_offset();
+    let mut summary = match load(dir).0.remove(id) {
+        Some(mut cached) if cached.log_bytes == from => {
+            // The cache covers the log up to the turn's first record, so the
+            // input is not in it yet: fold just this one instead of
+            // rescanning the log.
+            if let Some(text) = input {
+                fold_input(&mut cached, text);
+            }
+            cached
+        }
+        // Missing or stale: rebuild from the log, which already holds the
+        // input record, so fold nothing.
+        _ => summarize(path)?,
+    };
+    summary.last_used = last_used;
+    summary.log_bytes = metadata.len();
     if model.is_some() {
         summary.model = model;
     }
@@ -178,6 +231,7 @@ pub fn update(path: &Path, model: Option<String>) -> Result<()> {
 /// summarized from their logs, and the index is updated.
 pub fn list(dir: &Path) -> Result<Vec<Summary>> {
     let (mut index, lines) = load(dir);
+    let index_len = fs::metadata(index_path(dir)).map(|m| m.len()).unwrap_or(0);
     let Ok(entries) = fs::read_dir(dir) else { return Ok(Vec::new()) };
     let mut current: HashMap<String, Summary> = HashMap::new();
     let mut updates = Vec::new();
@@ -207,7 +261,7 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
     // Rewrite when the file has grown well past one line per session (or
     // lists logs that are gone); otherwise just append what changed.
     if lines + updates.len() > current.len() * 2 + 64 || !index.is_empty() {
-        let _ = rewrite(dir, &current);
+        let _ = rewrite(dir, &current, index_len);
     } else {
         let _ = append(dir, &updates);
     }
@@ -294,11 +348,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create_with(dir.path(), "m", None, Some("openai/gpt-5".into())).unwrap();
         input(&mut log, "i1", "Switch models halfway through");
-        update(log.path(), Some("anthropic/claude".into())).unwrap();
+        update(log.path(), 0, None, Some("anthropic/claude".into())).unwrap();
         assert_eq!(list(dir.path()).unwrap()[0].model.as_deref(), Some("anthropic/claude"));
         // Even when the log has changed since, the later model survives.
         input(&mut log, "i2", "Another prompt after switching");
         assert_eq!(list(dir.path()).unwrap()[0].model.as_deref(), Some("anthropic/claude"));
+    }
+
+    #[test]
+    fn update_folds_the_turns_input_into_the_cached_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create_with(dir.path(), "s", Some("/work/repo".into()), None).unwrap();
+        // First turn: no cached summary, so the log is scanned once (the
+        // input record is already in the log, so nothing is folded).
+        input(&mut log, "i1", "Investigate the flaky deploy test");
+        update(log.path(), 0, None, None).unwrap();
+        let scanned = list(dir.path()).unwrap();
+        assert_eq!(scanned[0].prompts, 1);
+        assert_eq!(scanned[0].first_prompt.as_deref(), Some("Investigate the flaky deploy test"));
+
+        // Later turns fold just their own input into the cached summary.
+        let from = log.size();
+        input(&mut log, "i2", "Fix the retry logic in the deployer");
+        update(log.path(), from, Some("Fix the retry logic in the deployer"), None).unwrap();
+        let from = log.size();
+        input(&mut log, "i3", "do it");
+        update(log.path(), from, Some("do it"), None).unwrap();
+
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions[0].prompts, 3);
+        assert_eq!(sessions[0].last_prompt.as_deref(), Some("do it"));
+        assert_eq!(sessions[0].context_prompt.as_deref(), Some("Fix the retry logic in the deployer"));
+        assert_eq!(sessions[0].log_bytes, log.size());
+    }
+
+    #[test]
+    fn update_rescans_when_the_cache_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s").unwrap();
+        input(&mut log, "i1", "First prompt for the session");
+        // `from` naming a different log size than the cache cannot match:
+        // the summary is rebuilt from the log and the input is not folded
+        // (the rescan already saw its record).
+        update(log.path(), u64::MAX, Some("First prompt for the session"), None).unwrap();
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions[0].prompts, 1);
+        assert_eq!(sessions[0].last_prompt.as_deref(), Some("First prompt for the session"));
+    }
+
+    #[test]
+    fn rewrite_merges_lines_appended_since_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = SessionLog::create(dir.path(), "a").unwrap();
+        input(&mut a, "i1", "Session a's prompt");
+        let mut b = SessionLog::create(dir.path(), "b").unwrap();
+        input(&mut b, "i1", "Session b's prompt");
+        list(dir.path()).unwrap();
+
+        // A rewrite that read the index before another process appended b's
+        // newer summary must not lose that line (it can carry a model change
+        // that exists only in the index).
+        let (current, _) = load(dir.path());
+        let since = fs::metadata(index_path(dir.path())).unwrap().len();
+        let mut newer = summarize(b.path()).unwrap();
+        newer.model = Some("anthropic/claude".into());
+        append(dir.path(), &[newer]).unwrap();
+        rewrite(dir.path(), &current, since).unwrap();
+
+        let sessions = list(dir.path()).unwrap();
+        let b = sessions.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.model.as_deref(), Some("anthropic/claude"));
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
@@ -307,7 +427,7 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "k").unwrap();
         input(&mut log, "i1", "Keep this session around");
         for _ in 0..100 {
-            update(log.path(), None).unwrap();
+            update(log.path(), 0, None, None).unwrap();
         }
         let gone = SessionLog::create(dir.path(), "gone").unwrap();
         list(dir.path()).unwrap();

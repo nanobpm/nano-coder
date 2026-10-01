@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
+use unicode_width::UnicodeWidthChar;
 
 use crate::session_index::{self, Summary};
 
@@ -38,17 +39,22 @@ pub fn ago(then: DateTime<FixedOffset>, now: DateTime<FixedOffset>) -> String {
 }
 
 /// The last component of the session's directory, or `?` when unknown.
+/// Control characters are dropped: the path is persisted or current
+/// filesystem text, and a crafted directory name could otherwise inject
+/// terminal escape sequences into the picker and listing.
 pub fn project(summary: &Summary) -> String {
     summary
         .cwd
         .as_deref()
-        .map(|cwd| Path::new(cwd).file_name().map_or(cwd.to_string(), |n| n.to_string_lossy().into_owned()))
+        .map(|cwd| crate::sanitize_terminal_text(Path::new(cwd).file_name().map_or(cwd, |n| n.to_str().unwrap_or(cwd))))
         .unwrap_or_else(|| "?".into())
 }
 
-/// One line of prompt text: whitespace (including newlines) collapsed.
+/// One line of prompt text: whitespace (including newlines) collapsed, and
+/// control characters dropped, since prompt text is echoed back into the
+/// terminal by the picker and listing.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    crate::sanitize_terminal_text(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// What the session was last about: the last prompt, and when that says
@@ -61,11 +67,29 @@ pub fn topic(summary: &Summary) -> String {
     }
 }
 
+/// Terminal-cell width of `text` (CJK and wide emoji count as two cells), so
+/// rows are fitted the way the terminal renders them, not by char count.
+fn cells(text: &str) -> usize {
+    text.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+
+/// `text` fitted to at most `width` terminal cells, with an ellipsis when
+/// truncated. Never splits a wide glyph across the boundary.
 fn truncate(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if cells(text) <= width {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
     out
 }
@@ -73,9 +97,15 @@ fn truncate(text: &str, width: usize) -> String {
 /// A picker or list row, fitted to `width` columns.
 pub fn row(summary: &Summary, now: DateTime<FixedOffset>, width: usize) -> String {
     let prompts = if summary.prompts == 1 { "1 prompt".to_string() } else { format!("{} prompts", summary.prompts) };
-    let head = format!("{:<10} {:<16} {:>11}  ", ago(summary.last_used, now), truncate(&project(summary), 16), prompts);
-    let room = width.saturating_sub(head.chars().count()).max(20);
-    format!("{head}{}", truncate(&topic(summary), room))
+    let head = format!("{:<10} {:>11}  ", ago(summary.last_used, now), prompts);
+    let text = format!("{}  {}", project(summary), topic(summary));
+    fit_row(head, &text, width)
+}
+
+/// `head` plus `text` truncated so the whole row fits `width` cells.
+fn fit_row(head: String, text: &str, width: usize) -> String {
+    let room = width.saturating_sub(cells(&head));
+    format!("{head}{}", truncate(text, room))
 }
 
 /// Let the user pick a session in the terminal: this directory's sessions
@@ -102,7 +132,7 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
         let prompt = if show_all {
             "Resume which session? (type to filter, Esc to cancel)".to_string()
         } else {
-            format!("Resume which session in {}? (type to filter, Esc to cancel)", cwd)
+            format!("Resume which session in {}? (type to filter, Esc to cancel)", crate::sanitize_terminal_text(cwd))
         };
         let choice = dialoguer::FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt(prompt)
@@ -180,11 +210,30 @@ mod tests {
     fn row_shows_project_count_and_topic() {
         let s = summary("s", Some("/work/rusty-harness"), "do it\nnow", Some("Fix the flaky\n deploy test"));
         let row = row(&s, crate::session::now(), 200);
-        assert!(row.starts_with("just now   rusty-harness"), "{row}");
-        assert!(row.contains("  3 prompts  do it now  ← Fix the flaky deploy test"), "{row}");
+        assert!(row.starts_with("just now     3 prompts  rusty-harness"), "{row}");
+        assert!(row.contains("rusty-harness  do it now  ← Fix the flaky deploy test"), "{row}");
         let narrow = super::row(&s, crate::session::now(), 70);
-        assert!(narrow.ends_with('…') && narrow.chars().count() <= 70, "{narrow}");
+        assert!(narrow.ends_with('…') && super::cells(&narrow) <= 70, "{narrow}");
         assert_eq!(project(&summary("s", None, "x", None)), "?");
+    }
+
+    #[test]
+    fn row_fits_narrow_and_wide_text() {
+        let s = summary("s", Some("/w"), "Fix the flaky deploy test in CI", None);
+        // A narrow terminal truncates rather than wrapping or overflowing.
+        let narrow = row(&s, crate::session::now(), 30);
+        assert!(super::cells(&narrow) <= 30, "{narrow}");
+        // CJK text measures two cells per glyph, so the row still fits.
+        let wide = summary("s", Some("/work/プロジェクト"), "修正テストを直す", None);
+        let row = row(&wide, crate::session::now(), 40);
+        assert!(super::cells(&row) <= 40, "{row}");
+    }
+
+    #[test]
+    fn project_and_topic_drop_control_characters() {
+        let s = summary("s", Some("/work/evil\u{1b}[2J"), "hi\u{1b}]8;;x\u{7}", None);
+        assert_eq!(project(&s), "evil[2J");
+        assert_eq!(topic(&s), "hi]8;;x");
     }
 
     #[test]
