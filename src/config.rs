@@ -414,10 +414,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         fs::create_dir(base.path().join("agentic-harness")).unwrap();
         fs::create_dir(base.path().join("nano-coder")).unwrap();
-        assert!(matches!(
-            migrate_legacy_dir(base.path()).unwrap(),
-            Migration::LinkFailed { .. }
-        ));
+        assert!(matches!(migrate_legacy_dir(base.path()).unwrap(), Migration::LinkFailed { .. }));
         assert!(base.path().join("agentic-harness").is_dir());
     }
 
@@ -438,7 +435,11 @@ mod tests {
         let Migration::LinkFailed { from, to, .. } = &migration else {
             panic!("an occupied legacy path must keep reporting LinkFailed, got {migration:?}");
         };
-        assert_eq!((from.as_path(), to.as_path()), (legacy.as_path(), current.as_path()), "still points at the split trees");
+        assert_eq!(
+            (from.as_path(), to.as_path()),
+            (legacy.as_path(), current.as_path()),
+            "still points at the split trees"
+        );
         // It is reported on every later start, not silently abandoned ...
         assert!(matches!(migrate_legacy_dir(base.path()).unwrap(), Migration::LinkFailed { .. }));
         // ... and the stray directory is never clobbered.
