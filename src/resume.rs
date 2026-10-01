@@ -94,18 +94,15 @@ fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-/// A picker or list row, fitted to `width` columns.
+/// A picker or list row, fitted to `width` columns: when last used, the
+/// project, the prompt count, then the last prompt — the order the README and
+/// `--list-sessions` document. The whole row (the fixed header included) is
+/// truncated to `width`, so an item never exceeds the terminal, even one
+/// narrower than that header.
 pub fn row(summary: &Summary, now: DateTime<FixedOffset>, width: usize) -> String {
     let prompts = if summary.prompts == 1 { "1 prompt".to_string() } else { format!("{} prompts", summary.prompts) };
-    let head = format!("{:<10} {:>11}  ", ago(summary.last_used, now), prompts);
-    let text = format!("{}  {}", project(summary), topic(summary));
-    fit_row(head, &text, width)
-}
-
-/// `head` plus `text` truncated so the whole row fits `width` cells.
-fn fit_row(head: String, text: &str, width: usize) -> String {
-    let room = width.saturating_sub(cells(&head));
-    format!("{head}{}", truncate(text, room))
+    let line = format!("{:<10}  {}  {}  {}", ago(summary.last_used, now), project(summary), prompts, topic(summary));
+    truncate(&line, width)
 }
 
 /// Let the user pick a session in the terminal: this directory's sessions
@@ -119,8 +116,9 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
     }
     let now = crate::session::now();
     let width = crate::status::terminal_size().map_or(100, |(_, cols)| cols as usize);
-    // Room for the picker's own marker and padding.
-    let width = width.saturating_sub(4).max(40);
+    // Use the actual available width (less the picker's own marker and
+    // padding) so no row is wider than the terminal, even a narrow one.
+    let width = width.saturating_sub(4);
     let mut show_all = in_dir(&sessions, cwd).is_empty();
     loop {
         let shown: Vec<&Summary> = if show_all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
@@ -216,8 +214,8 @@ mod tests {
     fn row_shows_project_count_and_topic() {
         let s = summary("s", Some("/work/rusty-harness"), "do it\nnow", Some("Fix the flaky\n deploy test"));
         let row = row(&s, crate::session::now(), 200);
-        assert!(row.starts_with("just now     3 prompts  rusty-harness"), "{row}");
-        assert!(row.contains("rusty-harness  do it now  ← Fix the flaky deploy test"), "{row}");
+        assert!(row.starts_with("just now    rusty-harness  3 prompts"), "{row}");
+        assert!(row.contains("3 prompts  do it now  ← Fix the flaky deploy test"), "{row}");
         let narrow = super::row(&s, crate::session::now(), 70);
         assert!(narrow.ends_with('…') && super::cells(&narrow) <= 70, "{narrow}");
         assert_eq!(project(&summary("s", None, "x", None)), "?");
