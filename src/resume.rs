@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
-use dialoguer::console::{Key, Term};
+use dialoguer::console::{Key, Term, truncate_str};
 use dialoguer::theme::{ColorfulTheme, Theme};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -183,6 +183,15 @@ fn physical_rows(line: &str, cols: usize) -> usize {
     dialoguer::console::measure_text_width(line).div_ceil(cols).max(1)
 }
 
+/// How many item rows fit beneath a `prompt_rows`-tall prompt in a `rows`-row
+/// terminal, capped at `max_visible`. Zero when the prompt already fills the
+/// screen: forcing a row there would make the frame (`prompt_rows + window`)
+/// exceed `rows`, so `interactive_pick`'s `clear_last_lines(drawn)` would erase
+/// scrollback above the picker.
+fn item_window(rows: usize, prompt_rows: usize, max_visible: usize) -> usize {
+    max_visible.min(rows.saturating_sub(prompt_rows))
+}
+
 /// Restores the terminal cursor on drop, so every early `?` return from
 /// [`interactive_pick`] (clear/write/flush/read failures) still un-hides the
 /// cursor instead of leaving the user's terminal with an invisible cursor.
@@ -226,16 +235,29 @@ fn interactive_pick(
         }
         let filtered = rank(&matcher, items, &search);
 
-        // Render the prompt first so its wrapped height is known: it carries the
-        // full working directory and an unbounded search string, so a long
-        // path/query can wrap across several rows. Reserve those rows and show
-        // only as many items as still fit, keeping the whole frame within the
-        // terminal so `clear_last_lines(drawn)` never erases scrollback above
-        // the picker.
+        // Render the prompt first so its wrapped height is known, then reserve
+        // those rows and show only as many items as still fit — keeping the
+        // whole frame within the terminal so `clear_last_lines(drawn)` never
+        // erases scrollback above the picker.
         let mut prompt_line = String::new();
         Theme::format_fuzzy_select_prompt(theme, &mut prompt_line, prompt, &search, search.len())?;
+        // Cap the prompt to at most `rows` physical rows before measuring it:
+        // it carries the full working directory and an unbounded search string,
+        // so a long path or query can wrap past the terminal height on its own.
+        // Left uncapped, that alone makes `drawn` exceed `rows` and the next
+        // `clear_last_lines(drawn)` erase scrollback above the picker.
+        // `truncate_str` is ANSI-aware, so it bounds the rendered width without
+        // splitting the theme's colour escapes.
+        let prompt_budget = rows.saturating_mul(cols);
+        if prompt_budget > 0 && physical_rows(&prompt_line, cols) > rows {
+            prompt_line = truncate_str(&prompt_line, prompt_budget, "…").into_owned();
+        }
         let prompt_rows = physical_rows(&prompt_line, cols);
-        let window = max_visible.min(rows.saturating_sub(prompt_rows)).max(1);
+        // Reserve the prompt's rows and show only as many items as still fit,
+        // allowing a *zero*-item window: when the prompt already fills the
+        // terminal no item row fits, and forcing one (a trailing `.max(1)`)
+        // would push the frame past `rows` and over-erase on the next clear.
+        let window = item_window(rows, prompt_rows, max_visible);
 
         if filtered.is_empty() {
             sel = 0;
@@ -531,6 +553,19 @@ mod tests {
         assert_eq!(physical_rows(&"x".repeat(80), 80), 1);
         assert_eq!(physical_rows(&"x".repeat(81), 80), 2);
         assert_eq!(physical_rows("", 80), 1);
+    }
+
+    #[test]
+    fn item_window_never_pushes_the_frame_past_the_terminal() {
+        // Room to spare: the window is capped at `max_visible`.
+        assert_eq!(item_window(24, 1, 15), 15);
+        // The prompt leaves fewer rows than `max_visible`: shrink to the slack.
+        assert_eq!(item_window(5, 2, 15), 3);
+        // The prompt fills the terminal exactly, or wraps past it: zero items,
+        // so `prompt_rows + window` can never exceed `rows` and the next clear
+        // cannot erase scrollback above the picker.
+        assert_eq!(item_window(3, 3, 15), 0);
+        assert_eq!(item_window(3, 7, 15), 0);
     }
 
     #[test]
