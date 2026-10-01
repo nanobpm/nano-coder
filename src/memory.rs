@@ -268,10 +268,20 @@ impl Store {
         // string in both join forms — directly concatenated (no separator, for
         // the `KEY`+`=value` split) and space-joined (for the `password is` +
         // `hunter2` split) — so neither boundary split is persisted.
+        //
+        // A third split form carries no `:`/`=`/copula at all, so neither join
+        // above trips the filter: `text = "database password"` (a bare label) +
+        // `evidence = "hunter2"` (its value). When `text` ends with a credential
+        // label, the evidence *is* that label's value, so judge it as one —
+        // while still exempting placeholders and location-only evidence
+        // (Copilot finding, src/memory.rs).
         if let Some(evidence) = &evidence {
             let concatenated = format!("{text}{evidence}");
             let space_joined = format!("{text} {evidence}");
-            if looks_like_secret(&concatenated).is_some() || looks_like_secret(&space_joined).is_some() {
+            if looks_like_secret(&concatenated).is_some()
+                || looks_like_secret(&space_joined).is_some()
+                || evidence_states_label_value(text, evidence)
+            {
                 bail!(
                     "refusing to save: the text and evidence together look like a secret. Memory is \
                      human-readable and shared across sessions; never store keys, tokens or passwords, \
@@ -1022,9 +1032,22 @@ fn percent_decode_lossy(s: &str) -> String {
 /// Whether a query-parameter name denotes a credential whose value must not be
 /// kept in the identity key. Matching is case-insensitive and ignores `-`/`_`/
 /// `.` separators (`access-token`, `access_token`, `ACCESSTOKEN` all match).
+///
+/// Matching is **affix-based, not arbitrary substring**: a needle must be a
+/// whole separator-delimited segment, or a prefix/suffix joined to another
+/// credential segment. Plain substring matching lets a non-credential key such
+/// as `author` trip the `auth` needle, so remotes differing only in
+/// `?author=alice` / `?author=bob` would normalise to the same project key and
+/// one project's memories could surface in another (Copilot finding,
+/// src/memory.rs). Most needles (`token`, `password`, …) appear in no common
+/// non-credential word, so they stay substring matches; only the `auth` family
+/// — which collides with `author`/`authority`/`authenticate` — is restricted to
+/// segment-boundary and explicit whole-word forms (`auth`, `authorization`,
+/// `authz`).
 fn is_credential_query_key(key: &str) -> bool {
-    let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-    const NEEDLES: [&str; 11] = [
+    // Safe as arbitrary substrings: no common non-credential English word
+    // contains one of these as a substring, so `contains` cannot false-positive.
+    const SUBSTR_NEEDLES: [&str; 10] = [
         "token",
         "password",
         "passwd",
@@ -1032,12 +1055,38 @@ fn is_credential_query_key(key: &str) -> bool {
         "secret",
         "apikey",
         "accesskey",
-        "auth",
         "credential",
         "signature",
         "oauth",
     ];
-    NEEDLES.iter().any(|needle| k.contains(needle)) || matches!(k.as_str(), "key" | "sig" | "pat" | "sso")
+    // Explicit `auth`-family forms matched only as a whole segment/key, so the
+    // `auth` inside `author` (or `authority`, `authenticate`) is not read as a
+    // credential while the real credential keys still are.
+    const WHOLE_AUTH: [&str; 3] = ["auth", "authorization", "authz"];
+    let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    if SUBSTR_NEEDLES.iter().any(|needle| k.contains(needle)) {
+        return true;
+    }
+    if matches!(k.as_str(), "key" | "sig" | "pat" | "sso") {
+        return true;
+    }
+    // The `auth` family: split on the `-`/`_`/`.` separators and match only a
+    // whole segment (`auth`, `authorization`, `authz`) or a segment where `auth`
+    // is a prefix/suffix joined to another credential needle (`authkey`,
+    // `authsecret`). A bare mid-word substring (`author`) matches neither.
+    let lower = key.to_ascii_lowercase();
+    for segment in lower.split(['-', '_', '.']).filter(|s| !s.is_empty()) {
+        let seg: String = segment.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if WHOLE_AUTH.contains(&seg.as_str()) {
+            return true;
+        }
+        if (seg.starts_with("auth") || seg.ends_with("auth"))
+            && SUBSTR_NEEDLES.iter().any(|needle| seg.contains(needle))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// A git remote URL reduced to a stable identity key. A trailing `.git` is
@@ -1499,6 +1548,67 @@ fn is_secret_store_noun(lower: &str) -> bool {
     matches!(lower, "1password" | "onepassword" | "route53" | "keepassxc")
 }
 
+/// Whether `text` *ends with* a credential label (`… password`, `the token`,
+/// `API key`) with no value after it. When it does, a companion `evidence`
+/// field is the value for that label, so the pair must be judged together even
+/// though neither half alone trips the filter: `text = "database password"` +
+/// `evidence = "hunter2"` carries no `:`/`=`/copula, so the assignment and
+/// copular rules both miss it, yet the prompt renders the secret beside its
+/// label (Copilot finding, src/memory.rs).
+///
+/// The label vocabulary matches the assignment/copular rules. `_`/`-` are
+/// normalised to spaces so `api_key`/`api-key`/`api key` are one form, and a
+/// trailing label is matched on the final word(s) only, so an ordinary fact
+/// (`the project uses Rust`, `run the tests with`) or a non-label word that
+/// merely *contains* a label substring (`tokenize`) is not a label.
+fn ends_with_credential_label(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let normalised: String = lower.chars().map(|c| if c == '_' || c == '-' { ' ' } else { c }).collect();
+    let words: Vec<&str> = normalised.split_whitespace().collect();
+    // Two-word labels (`api key`, `access key`, …) need the final two words.
+    const TWO_WORD: [&str; 4] = ["api key", "access key", "private key", "client secret"];
+    if words.len() >= 2 {
+        let last_two = format!("{} {}", words[words.len() - 2], words[words.len() - 1]);
+        if TWO_WORD.contains(&last_two.as_str()) {
+            return true;
+        }
+    }
+    // Single-word labels match on the final word (stripped of any trailing
+    // punctuation, so `config: token` still ends with the label `token`).
+    const ONE_WORD: [&str; 4] = ["secret", "password", "passwd", "token"];
+    if let Some(last) = words.last() {
+        let word: String = last.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if ONE_WORD.contains(&word.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `evidence` states the *value* for a credential label that `text`
+/// ends with (see [`ends_with_credential_label`]). The pair is judged by
+/// re-running the secret filter over a synthetic copular phrase
+/// (`"<text> is <evidence>"`), which reuses the copular rule's existing value
+/// judgment — including its placeholder (`<your-token>`, `$TOKEN`) and
+/// location (`in the vault`, `stored in ~/.config/…`) exemptions — instead of
+/// duplicating that logic here.
+///
+/// A *bare* secret-store noun (`evidence = "1password"`, no preposition) names
+/// where the secret lives rather than the secret itself, so it is exempted
+/// explicitly: the synthetic phrase would read it as a direct value because no
+/// location word sets `in_location` first.
+fn evidence_states_label_value(text: &str, evidence: &str) -> bool {
+    if !ends_with_credential_label(text) {
+        return false;
+    }
+    let first = evidence.split_whitespace().next().unwrap_or("");
+    let first_word = first.trim_matches(|c: char| ['"', '\'', ',', '.', ';', ':'].contains(&c)).to_ascii_lowercase();
+    if !first_word.is_empty() && is_secret_store_noun(&first_word) {
+        return false;
+    }
+    looks_like_secret(&format!("{text} is {evidence}")).is_some()
+}
+
 /// Whether an assignment's value is an obvious placeholder rather than a real
 /// secret, so a template line like `token=<your-token>` is not rejected.
 fn is_placeholder(value: &str) -> bool {
@@ -1774,6 +1884,23 @@ mod tests {
         assert!(store.save(Scope::User, "run the tests with", Some("cargo test"), None).is_ok());
         // A placeholder split across the boundary stays a placeholder.
         assert!(store.save(Scope::User, "config: token", Some("=<your-token>"), None).is_ok());
+        // A bare label in `text` with its value in `evidence` carries no
+        // `:`/`=`/copula, so neither join above trips the filter — yet the
+        // prompt renders the secret beside its label. When `text` ends with a
+        // credential label, the evidence is that label's value and must be
+        // rejected (Copilot finding, src/memory.rs).
+        assert!(store.save(Scope::User, "database password", Some("hunter2"), None).is_err());
+        assert!(store.save(Scope::User, "the token", Some("abc123def456"), None).is_err());
+        assert!(store.save(Scope::User, "API key", Some("real-key-value-123"), None).is_err());
+        assert!(store.save(Scope::User, "my client secret", Some("s3cr3tvalue"), None).is_err());
+        // …but the placeholder and location exemptions still apply to the
+        // evidence-as-value form: a placeholder, a `stored in <place>` /
+        // `in <place>` location, and a bare secret-store noun all stay allowed.
+        assert!(store.save(Scope::User, "the token", Some("<your-token>"), None).is_ok());
+        assert!(store.save(Scope::User, "the token", Some("$TOKEN"), None).is_ok());
+        assert!(store.save(Scope::User, "database password", Some("in the vault"), None).is_ok());
+        assert!(store.save(Scope::User, "the password", Some("stored in ~/.config/app/creds"), None).is_ok());
+        assert!(store.save(Scope::User, "the password", Some("1password"), None).is_ok());
     }
 
     #[test]
@@ -2185,6 +2312,34 @@ mod tests {
         );
         assert_eq!(
             normalize_remote("https://host.example/git?repo=one&token=xyz"),
+            "https://host.example/git?repo=one"
+        );
+        // A non-credential key that merely *contains* a credential needle as a
+        // substring is not redacted: `author` contains `auth`, but it selects a
+        // repository, so `?author=alice` / `?author=bob` must keep distinct
+        // project keys rather than collapsing onto one (Copilot finding,
+        // src/memory.rs). Matching is affix/segment-based, not substring.
+        assert_eq!(
+            normalize_remote("https://host.example/git?author=alice"),
+            "https://host.example/git?author=alice"
+        );
+        assert_ne!(
+            normalize_remote("https://host.example/git?author=alice"),
+            normalize_remote("https://host.example/git?author=bob")
+        );
+        // …while genuine `auth`-family keys are still redacted: the whole word
+        // `auth`, the explicit `authorization`/`authz` forms, and `auth` joined
+        // to another credential segment.
+        assert_eq!(
+            normalize_remote("https://host.example/git?auth=xyz"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?authorization=xyz"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&oauth_token=xyz"),
             "https://host.example/git?repo=one"
         );
         // The fragment carries no git repository identity and is dropped.
