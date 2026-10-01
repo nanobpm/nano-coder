@@ -48,12 +48,20 @@ pub struct Summary {
     pub prompts: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
+    /// The first prompt that says something (not terse), used to name the
+    /// session even when the literal first prompt was just "hi".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_telling_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
     /// When the last prompt says little on its own ("do it"), the most recent
     /// one before it that says more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_prompt: Option<String>,
+    /// A few-word title from the model (`session_titles = true`). Kept only
+    /// here, not in the log, so it is carried over when a summary is rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Size of the log this summary was made from.
     pub log_bytes: u64,
 }
@@ -64,15 +72,29 @@ pub fn is_terse(text: &str) -> bool {
     text.starts_with('/') || (text.chars().count() < 24 && text.split_whitespace().count() <= 4)
 }
 
+/// Prompts are kept in a summary only to name and describe the session: the
+/// title request uses at most 600 characters of one, and the picker shows a
+/// single truncated line. A pasted log or file can otherwise be megabytes, and
+/// a summary is appended after every turn, so storing the whole prompt would
+/// duplicate it into every index line. Keep only the prefix a title is made
+/// from; `title_source` compares these clipped values, so a prompt that was
+/// originally identical is still not sent to the model twice.
+fn clip_prompt(text: &str) -> String {
+    text.chars().take(600).collect()
+}
+
 /// Fold one input record into `summary` (bump the count, track first/last and
 /// context prompts). Shared by [`summarize`], which scans a whole log, and
 /// [`update`], which folds just the turn's own input.
 fn fold_input(summary: &mut Summary, text: &str) {
     summary.prompts += 1;
     if summary.first_prompt.is_none() {
-        summary.first_prompt = Some(text.to_string());
+        summary.first_prompt = Some(clip_prompt(text));
     }
-    if let Some(previous) = summary.last_prompt.replace(text.to_string())
+    if summary.first_telling_prompt.is_none() && !is_terse(text) {
+        summary.first_telling_prompt = Some(clip_prompt(text));
+    }
+    if let Some(previous) = summary.last_prompt.replace(clip_prompt(text))
         && !is_terse(&previous)
     {
         summary.context_prompt = Some(previous);
@@ -81,6 +103,22 @@ fn fold_input(summary: &mut Summary, text: &str) {
     if summary.last_prompt.as_deref().is_none_or(|last| !is_terse(last)) {
         summary.context_prompt = None;
     }
+}
+
+/// Whether `summary` is a pre-upgrade index line that predates
+/// `first_telling_prompt`. Such a line deserializes the new field as `None`,
+/// yet may already hold a non-terse prompt that the current [`fold_input`]
+/// would have recorded as the first telling prompt. Folding the next turn onto
+/// it would wrongly make that turn the "first" telling prompt (losing the
+/// promised first-plus-latest title input), so [`update`] must rebuild from
+/// the log instead. A current session that is genuinely title-less (every
+/// prompt terse) has no non-terse prompt here, so it is not misread as legacy.
+fn missing_telling_prompt(summary: &Summary) -> bool {
+    summary.first_telling_prompt.is_none()
+        && [summary.first_prompt.as_deref(), summary.last_prompt.as_deref(), summary.context_prompt.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|p| !is_terse(p))
 }
 
 /// Fold every committed input record in `path` after byte offset `from` into
@@ -125,8 +163,10 @@ pub fn summarize(path: &Path) -> Result<Summary> {
         last_used,
         prompts: 0,
         first_prompt: None,
+        first_telling_prompt: None,
         last_prompt: None,
         context_prompt: None,
+        title: None,
         log_bytes: bytes.len() as u64,
     };
     // The id comes from the file name, which `SessionLog::open` validates
@@ -184,7 +224,15 @@ fn load(dir: &Path) -> (HashMap<String, Summary>, usize) {
             continue;
         }
         lines += 1;
-        if let Ok(summary) = serde_json::from_slice::<Summary>(line) {
+        if let Ok(mut summary) = serde_json::from_slice::<Summary>(line) {
+            // Titles are monotonic: a later line that lacks one (a plain
+            // `update` whose read lost a race with `set_title`) must not hide
+            // a title an earlier line already recorded for this session.
+            if summary.title.is_none()
+                && let Some(title) = map.get(&summary.id).and_then(|prev: &Summary| prev.title.clone())
+            {
+                summary.title = Some(title);
+            }
             map.insert(summary.id.clone(), summary);
         }
     }
@@ -247,7 +295,13 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Resu
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(summary) = serde_json::from_slice::<Summary>(line) {
+                if let Ok(mut summary) = serde_json::from_slice::<Summary>(line) {
+                    // Titles are monotonic: a newer line without one must not
+                    // drop a title an earlier line (or the caller's snapshot)
+                    // recorded, since a title cannot be rebuilt from the log.
+                    if summary.title.is_none() {
+                        summary.title = merged.get(&summary.id).and_then(|m| m.title.clone());
+                    }
                     merged.insert(summary.id.clone(), summary);
                 }
             }
@@ -266,9 +320,9 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Resu
     Ok(())
 }
 
-/// Record the session log at `path` in the index, after a turn. `model` is
-/// the `provider/model` in use now, which may differ from the one the
-/// session started with.
+/// Record the session log at `path` in the index, after a turn, and return
+/// the resulting summary. `model` is the `provider/model` in use now, which
+/// may differ from the one the session started with.
 ///
 /// The committed input records appended since `from` are folded into the
 /// cached summary rather than rescanning the whole log: rereading every prior
@@ -278,7 +332,7 @@ fn rewrite(dir: &Path, summaries: &HashMap<String, Summary>, since: u64) -> Resu
 /// is missing or older — the first turn, an older version that didn't index, a
 /// crash — fall back to one full scan. `list()` likewise rebuilds from the log
 /// whenever a summary is missing or stale.
-pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<()> {
+pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<Summary> {
     let dir = path.parent().context("session log has no directory")?;
     let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let metadata = fs::metadata(path)?;
@@ -287,8 +341,12 @@ pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<()> {
     // names a byte the read did not cover (the same race `list()` guards).
     let index_len = fs::metadata(index_path(dir)).map(|m| m.len()).unwrap_or(0);
     let (mut index, lines) = load(dir);
-    let mut summary = match index.remove(id) {
-        Some(mut cached) if cached.log_bytes == from => {
+    let cached = index.remove(id);
+    // A title lives only in the index (it cannot be rebuilt from the log), so
+    // carry it forward whether the summary is folded or rebuilt from scratch.
+    let cached_title = cached.as_ref().and_then(|c| c.title.clone());
+    let mut summary = match cached {
+        Some(mut cached) if cached.log_bytes == from && !missing_telling_prompt(&cached) => {
             // The cache covers the log up to `from`. Fold every input record
             // committed since — reading only the tail past `from`, not the
             // whole log. Folding all of them (not just this turn's own text)
@@ -303,6 +361,7 @@ pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<()> {
     };
     summary.last_used = last_used;
     summary.log_bytes = metadata.len();
+    summary.title = summary.title.or(cached_title);
     if model.is_some() {
         summary.model = model;
     }
@@ -314,14 +373,92 @@ pub fn update(path: &Path, from: u64, model: Option<String>) -> Result<()> {
     // `list()` drops — keeping them here only delays that cleanup, it never
     // resurrects them into a listing.
     if lines > index.len() * 2 + 64 {
-        index.insert(summary.id.clone(), summary);
-        rewrite(dir, &index, index_len)
+        index.insert(summary.id.clone(), summary.clone());
+        rewrite(dir, &index, index_len)?;
     } else {
-        append(dir, &[summary])
+        append(dir, std::slice::from_ref(&summary))?;
+    }
+    Ok(summary)
+}
+
+/// Give the session log at `path` a title in the index. Returns `false` when
+/// the index already has a title for the session (another process won the
+/// race), leaving the existing one alone.
+///
+/// The index is lock-free (append-only, latest line wins, with `rewrite`
+/// merging whatever landed since its read before renaming): a title appended
+/// here is carried forward by `load`'s monotonic merge, so a later plain
+/// `update` line cannot hide it. The one residual loss window — a `rewrite`
+/// that sampled its merge point before this append yet renames after it — is
+/// the same rare race the lock-free design already accepts for an index-only
+/// model change.
+pub fn set_title(path: &Path, title: &str) -> Result<bool> {
+    let dir = path.parent().context("session log has no directory")?;
+    let mut summary = summarize(path)?;
+    let indexed = load(dir).0;
+    if indexed.get(&summary.id).and_then(|o| o.title.clone()).is_some() {
+        // Another process titled the session first; keep that one.
+        return Ok(false);
+    }
+    // Keep a model learned after the session started (see `update`).
+    summary.model = indexed.get(&summary.id).and_then(|o| o.model.clone()).or(summary.model);
+    summary.title = Some(title.to_string());
+    append(dir, std::slice::from_ref(&summary))?;
+    Ok(true)
+}
+
+/// The prompts a title is made from: the first telling prompt and, when
+/// different, the latest one. `None` while every prompt is terse ("hi").
+/// The summary's prompts are already clipped to the title's input size (see
+/// `clip_prompt`), so these are used as stored.
+pub fn title_source(summary: &Summary) -> Option<String> {
+    let first = summary.first_telling_prompt.as_deref();
+    let last = [summary.last_prompt.as_deref(), summary.context_prompt.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|p| !is_terse(p));
+    match (first, last) {
+        (Some(first), Some(last)) if first != last => Some(format!("{first}\n\n{last}")),
+        (Some(one), _) | (None, Some(one)) => Some(one.to_string()),
+        (None, None) => None,
     }
 }
 
-/// Every saved session with at least one prompt, most recently used first.
+/// Tidy a model's title reply: first line, no quotes, labels or trailing
+/// period, at most six words and at most 60 characters (ellipsis included).
+/// `None` when nothing usable is left.
+///
+/// The title is model-controlled and is later rendered verbatim by `dialoguer`
+/// and plain terminal output, so — like the other model-controlled picker text
+/// sanitized in `main.rs` — C0/C1 control characters (including ESC, which
+/// begins every ANSI/OSC sequence) are dropped before the title is stored,
+/// neutralising terminal control-sequence injection while leaving ordinary
+/// printable text intact.
+pub fn clean_title(reply: &str) -> Option<String> {
+    let wrapper = |c: char| matches!(c, '"' | '\'' | '`' | '*' | '#' | '_') || c.is_whitespace();
+    let line =
+        reply.lines().map(str::trim).find(|l| !l.is_empty())?.chars().filter(|c| !c.is_control()).collect::<String>();
+    let line = line.trim_matches(wrapper);
+    let line = line.strip_prefix("Title:").unwrap_or(line);
+    let line = line.trim_matches(wrapper);
+    let line = line.trim_end_matches('.').trim();
+    if line.is_empty() {
+        return None;
+    }
+    // The title prompt asks for at most six words; hold the model to it.
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let mut title = words.iter().take(6).copied().collect::<Vec<_>>().join(" ");
+    let mut elided = words.len() > 6;
+    if title.chars().count() > 60 {
+        elided = true;
+    }
+    if elided {
+        // Reserve one of the 60 characters for the ellipsis.
+        title = title.chars().take(59).collect::<String>().trim_end().to_string();
+        title.push('…');
+    }
+    Some(title)
+}
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated.
 pub fn list(dir: &Path) -> Result<Vec<Summary>> {
@@ -383,9 +520,11 @@ pub fn list(dir: &Path) -> Result<Vec<Summary>> {
             Some(summary) if summary.log_bytes == size => summary,
             stale => match summarize(&path) {
                 Ok(mut fresh) => {
-                    // Keep a model the index learned after the session started.
+                    // Keep a model and title the index learned after the
+                    // session started (a title cannot be rebuilt from the log).
                     if let Some(old) = stale {
                         fresh.model = old.model.or(fresh.model);
+                        fresh.title = fresh.title.or(old.title);
                     }
                     updates.push(fresh.clone());
                     fresh
@@ -423,6 +562,100 @@ mod tests {
         log.append(&Record::Input { id: id.into(), text: text.into(), recorded_at: now() }).unwrap();
     }
 
+    fn summarize_text(prompts: &[&str]) -> Summary {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        for (i, prompt) in prompts.iter().enumerate() {
+            input(&mut log, &format!("i{i}"), prompt);
+        }
+        summarize(log.path()).unwrap()
+    }
+
+    #[test]
+    fn cleans_title_replies() {
+        assert_eq!(clean_title("\n  \"Flaky deploy test fix.\"\nmore").as_deref(), Some("Flaky deploy test fix"));
+        assert_eq!(clean_title("Title: **Session picker**").as_deref(), Some("Session picker"));
+        // Wrappers around the whole label are stripped before the label check.
+        assert_eq!(clean_title("**Title: Session picker**").as_deref(), Some("Session picker"));
+        assert_eq!(clean_title("\"Title: Session picker\"").as_deref(), Some("Session picker"));
+        // Underscore emphasis is stripped too.
+        assert_eq!(clean_title("_Session picker_").as_deref(), Some("Session picker"));
+        assert_eq!(clean_title("__Title: Session picker__").as_deref(), Some("Session picker"));
+        assert_eq!(clean_title("  \n ''"), None);
+        // At most six words, marked with an ellipsis.
+        assert_eq!(clean_title("one two three four five six seven").as_deref(), Some("one two three four five six…"));
+        // At most 60 characters including the ellipsis.
+        let long = clean_title(&"word ".repeat(30)).unwrap();
+        assert!(long.ends_with('…') && long.chars().count() <= 60, "{long}");
+    }
+
+    #[test]
+    fn clean_title_strips_terminal_control_characters() {
+        // A model reply smuggling ANSI/OSC sequences (cursor moves, screen
+        // clears, clipboard writes) loses the control bytes that drive them.
+        assert_eq!(clean_title("Fix\x1b[2J the bug").as_deref(), Some("Fix[2J the bug"));
+        // OSC clipboard-write: ESC ] 52 ; ... BEL — both terminators are control.
+        assert_eq!(clean_title("Title\x1b]52;c;YQ==\x07here").as_deref(), Some("Title]52;c;YQ==here"));
+        assert_eq!(clean_title("a\x00\x07\x1bb").as_deref(), Some("ab"));
+        // A reply of only an escape sequence keeps the now-inert text bytes
+        // (the ESC that drove it is gone), and a reply with no text at all
+        // leaves nothing usable.
+        assert_eq!(clean_title("\x1b[2J\x07").as_deref(), Some("[2J"));
+        assert_eq!(clean_title("\x00\x07\x1b"), None);
+    }
+
+    #[test]
+    fn title_source_skips_terse_prompts() {
+        let mut s = summarize_text(&["hi", "do it"]);
+        assert_eq!(title_source(&s), None);
+        s = summarize_text(&["Fix the flaky deploy test", "do it"]);
+        assert_eq!(title_source(&s).as_deref(), Some("Fix the flaky deploy test"));
+        s = summarize_text(&["Fix the flaky deploy test", "Now write the release notes", "ok"]);
+        assert_eq!(title_source(&s).as_deref(), Some("Fix the flaky deploy test\n\nNow write the release notes"));
+    }
+
+    #[test]
+    fn prompts_are_clipped_to_the_title_input_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s").unwrap();
+        let huge = "x".repeat(10_000);
+        input(&mut log, "i1", &huge);
+        let summary = summarize(log.path()).unwrap();
+        assert_eq!(summary.first_prompt.as_deref().map(str::len), Some(600));
+        assert_eq!(summary.first_telling_prompt.as_deref().map(str::len), Some(600));
+        assert_eq!(summary.last_prompt.as_deref().map(str::len), Some(600));
+        // A repeated long prompt is clipped identically, so `title_source`
+        // still sees the first and latest as equal and does not send it twice.
+        assert_eq!(title_source(&summary).as_deref(), Some(huge.chars().take(600).collect::<String>().as_str()));
+    }
+
+    #[test]
+    fn set_title_does_not_replace_an_existing_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        input(&mut log, "i1", "Fix the flaky deploy test");
+        assert!(set_title(log.path(), "First title").unwrap());
+        assert!(!set_title(log.path(), "Second title").unwrap());
+        assert_eq!(list(dir.path()).unwrap()[0].title.as_deref(), Some("First title"));
+    }
+
+    #[test]
+    fn title_survives_updates_and_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "t").unwrap();
+        input(&mut log, "i1", "Fix the flaky deploy test");
+        assert!(set_title(log.path(), "Flaky deploy test").unwrap());
+        // A plain per-turn update (no title of its own) must carry the title
+        // forward, not erase it: titles are the one field a rebuild cannot
+        // recover from the log.
+        update(log.path(), 0, Some("mock/x".into())).unwrap();
+        assert_eq!(list(dir.path()).unwrap()[0].title.as_deref(), Some("Flaky deploy test"));
+        // The log grows without an index update: rebuilt from the log, with the
+        // indexed title still carried over.
+        input(&mut log, "i2", "Another prompt that changes the log");
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!((sessions[0].prompts, sessions[0].title.as_deref()), (2, Some("Flaky deploy test")));
+    }
     #[test]
     fn terse_prompts() {
         assert!(is_terse("Do it"));
@@ -573,8 +806,10 @@ mod tests {
             last_used: crate::session::now(),
             prompts: 1,
             first_prompt: Some("hi".into()),
+            first_telling_prompt: None,
             last_prompt: Some("hi".into()),
             context_prompt: None,
+            title: None,
             log_bytes: size,
         };
         append(dir.path(), &[cached]).unwrap();
@@ -650,6 +885,31 @@ mod tests {
         assert_eq!(sessions[0].last_prompt.as_deref(), Some("do it"));
         assert_eq!(sessions[0].context_prompt.as_deref(), Some("Fix the retry logic in the deployer"));
         assert_eq!(sessions[0].log_bytes, log.size());
+    }
+
+    #[test]
+    fn update_rescans_a_legacy_line_missing_the_first_telling_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s").unwrap();
+        input(&mut log, "i1", "Investigate the flaky deploy test");
+        // Simulate an index line written before `first_telling_prompt` existed:
+        // the field deserializes as `None` even though a non-terse prompt
+        // (the first one) is already recorded.
+        let mut legacy = summarize(log.path()).unwrap();
+        legacy.first_telling_prompt = None;
+        append(dir.path(), &[legacy]).unwrap();
+        let from = log.size();
+        // A later turn folded onto that legacy line must NOT make its own
+        // input the "first" telling prompt: the cache is rebuilt from the log,
+        // recovering the real first telling prompt.
+        input(&mut log, "i2", "Now fix the retry logic in the deployer");
+        update(log.path(), from, None).unwrap();
+        let sessions = list(dir.path()).unwrap();
+        assert_eq!(sessions[0].first_telling_prompt.as_deref(), Some("Investigate the flaky deploy test"));
+        assert_eq!(
+            title_source(&sessions[0]).as_deref(),
+            Some("Investigate the flaky deploy test\n\nNow fix the retry logic in the deployer"),
+        );
     }
 
     #[test]

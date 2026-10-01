@@ -377,6 +377,14 @@ The picker reads `.index.jsonl` in the session directory: one summary per sessio
 end of each turn. It is only a cache. A session that is missing from it, or whose log changed
 since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
 
+**Titles.** With `session_titles = true`, once a session has a prompt that says something (not
+just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
+`title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
+tried at most once per session per run (so a failed or deleted title is retried after a restart,
+not on the next turn). The picker then shows `title · last prompt`. Titles live only in the index,
+so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
+asks again on the session's next turn.
+
 Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
@@ -399,6 +407,8 @@ system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
+session_titles = false                  # ask the model for a few-word title per session (--resume picker)
+# title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)

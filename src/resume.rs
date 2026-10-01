@@ -67,6 +67,14 @@ fn one_line(text: &str) -> String {
 /// little, the more telling one before it.
 pub fn topic(summary: &Summary) -> String {
     let last = one_line(summary.last_prompt.as_deref().unwrap_or_default());
+    // A title says what the session is about; the last prompt, where it got to.
+    // The title is read from the user-writable index cache, so sanitize and
+    // collapse it at the rendering boundary like every other echoed field: a
+    // crafted or corrupt `index.jsonl` title could otherwise carry newlines or
+    // ESC/OSC bytes straight into the picker and listing.
+    if let Some(title) = &summary.title {
+        return format!("{} · {last}", one_line(title));
+    }
     match &summary.context_prompt {
         Some(context) => format!("{last}  ← {}", one_line(context)),
         None => last,
@@ -478,10 +486,28 @@ mod tests {
             last_used: crate::session::now(),
             prompts: 3,
             first_prompt: None,
+            first_telling_prompt: None,
             last_prompt: Some(last.into()),
             context_prompt: context.map(Into::into),
             log_bytes: 0,
+            title: None,
         }
+    }
+
+    #[test]
+    fn title_leads_the_topic() {
+        let mut s = summary("s", None, "do it", Some("Fix the flaky deploy test"));
+        s.title = Some("Flaky deploy test".into());
+        assert_eq!(topic(&s), "Flaky deploy test · do it");
+    }
+
+    #[test]
+    fn title_drops_control_characters() {
+        // A title is read from the user-writable index cache; a crafted or
+        // corrupt one must be sanitized and collapsed at the render boundary.
+        let mut s = summary("s", None, "do it", None);
+        s.title = Some("evil\u{1b}[2J\ntitle".into());
+        assert_eq!(topic(&s), "evil[2J title · do it");
     }
 
     #[test]
