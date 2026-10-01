@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, Local};
 use dialoguer::theme::{ColorfulTheme, Theme};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -195,11 +195,16 @@ pub fn pick(dir: &Path, cwd: &str) -> Result<Option<String>> {
 pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
     let sessions = session_index::list(dir)?;
     let shown: Vec<&Summary> = if all { sessions.iter().collect() } else { in_dir(&sessions, cwd) };
-    // Write errors (a closed pipe, as with `| head`) just end the listing.
     let mut out = std::io::stdout().lock();
     if json {
-        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&shown)?);
-        return Ok(());
+        // A closed pipe (`| head`) ends the listing quietly, but any other
+        // write failure (EIO, ENOSPC mid-write) must surface: returning
+        // success after one would hand scripts a truncated, invalid document.
+        return match writeln!(out, "{}", serde_json::to_string_pretty(&shown)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e).context("write session list"),
+        };
     }
     if shown.is_empty() {
         let scope = if all {
@@ -214,8 +219,13 @@ pub fn print_list(dir: &Path, cwd: &str, all: bool, json: bool) -> Result<()> {
     for summary in shown {
         // The id comes from a log header, which a crafted log can fill with
         // control characters; sanitize it for the terminal (JSON stays raw).
-        if writeln!(out, "{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100)).is_err() {
-            break;
+        let line = writeln!(out, "{}  {}", crate::sanitize_terminal_text(&summary.id), row(summary, now, 100));
+        match line {
+            Ok(()) => {}
+            // Only a closed pipe ends the listing quietly; other write errors
+            // mean real output loss and must be returned, not swallowed.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(e) => return Err(e).context("write session list"),
         }
     }
     Ok(())
