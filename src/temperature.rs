@@ -191,11 +191,14 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
     if let Some(reason) = fixed_reason(kind, provider, model) {
         // The global setting applies to every model, so a number there is not
         // a mistake for this one; a number set for this provider or model is.
+        // A non-finite `extra_body` override carries no fixed-temperature
+        // warning (the model default is used either way), but its own warning
+        // must survive this early return rather than be silently dropped.
         let warning = match (effective, source) {
             (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
                 Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", source.label()))
             }
-            _ => None,
+            _ => extra_body_warning,
         };
         return Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning };
     }
@@ -311,6 +314,12 @@ mod tests {
         // "default" set for it is what it gets anyway: no warning.
         let p = provider("drop_params = [\"temperature\"]\ntemperature = \"default\"\n");
         assert_eq!(resolve(global, Some(ProviderKind::Openai), &p, "k3").warning, None);
+        // A non-finite extra_body override keeps its own warning even when the
+        // model accepts no temperature: the early return must not drop it.
+        let p = provider("drop_params = [\"temperature\"]\nextra_body = { temperature = nan }\n");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
+        assert_eq!((r.value(), r.source), (None, Source::Required));
+        assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
     }
 
     #[test]
