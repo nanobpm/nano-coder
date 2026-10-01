@@ -1027,6 +1027,19 @@ fn parse_forget_id(args: &str) -> Option<&str> {
 /// `/memory` (list) and `/memory forget <id>`.
 fn memory_command(agent: &mut Agent, args: &str) -> String {
     if agent.memory().is_none() {
+        // `memory()` is `None` for two distinct reasons: memory is genuinely
+        // off, or it is *enabled* but no per-user data directory is available
+        // and no `memory_dir` was configured (`memory_dir()` refuses the
+        // world-shared temp fallback). Telling the latter user to "set
+        // `memory = \"on\"`" is wrong — it already is — and leaves them unable
+        // to diagnose the real problem, so direct that case to `memory_dir`
+        // instead (Copilot finding, src/main.rs).
+        if agent.config().memory.enabled() {
+            return "Memory is enabled but no storage directory is available: this platform has \
+                    no per-user data directory and none was configured. Set `memory_dir` in \
+                    config to a directory you control."
+                .to_string();
+        }
         return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
     }
     if let Some(id) = parse_forget_id(args) {

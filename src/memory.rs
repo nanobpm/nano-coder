@@ -1145,11 +1145,19 @@ fn sanitize_uri_query(query: &str) -> String {
             // though the value matches the module's known-secret detector, so the
             // token would leak into the project key, prompt label and readable
             // filename (Copilot finding, src/memory.rs). Inspect the
-            // percent-decoded value (and, for a valueless bare parameter, the
-            // param itself) with `looks_like_secret` before retaining it.
-            let value = param.split_once('=').map_or("", |(_, v)| v);
-            let decoded_value = percent_decode_lossy(value);
-            looks_like_secret(&decoded_value).is_none() && looks_like_secret(param).is_none()
+            // percent-decoded value with `looks_like_secret` before retaining it.
+            // For a *valueless* bare parameter (no `=`) the param itself is the
+            // only place a secret could sit, so inspect it whole. Running the
+            // detector over a full `key=value` string would misread the
+            // assignment shape: a non-credential key whose name embeds a
+            // credential substring (`tokenizer=bpe`) would trip the
+            // assignment detector and be redacted even though its value is
+            // benign, collapsing distinct remotes onto one key (Copilot
+            // finding, src/memory.rs).
+            match param.split_once('=') {
+                Some((_, value)) => looks_like_secret(&percent_decode_lossy(value)).is_none(),
+                None => looks_like_secret(param).is_none(),
+            }
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -1190,20 +1198,19 @@ fn percent_decode_lossy(s: &str) -> String {
 /// as `author` trip the `auth` needle, so remotes differing only in
 /// `?author=alice` / `?author=bob` would normalise to the same project key and
 /// one project's memories could surface in another (Copilot finding,
-/// src/memory.rs). Most needles (`token`, `password`, …) appear in no common
-/// non-credential word, so they stay substring matches; only the `auth` family
-/// — which collides with `author`/`authority`/`authenticate` — is restricted to
-/// segment-boundary and explicit whole-word forms (`auth`, `authorization`,
-/// `authz`).
+/// src/memory.rs). Most needles (`password`, `apikey`, …) appear in no common
+/// non-credential word, so they stay substring matches. The `token`/`secret`/
+/// `auth` family, however, collides with ordinary words — `token` with
+/// `tokenizer`, `secret` with `secretary`, `auth` with `author`/`authority`/
+/// `authenticate` — so those three are restricted to segment-boundary and
+/// affix forms (Copilot finding, src/memory.rs).
 fn is_credential_query_key(key: &str) -> bool {
     // Safe as arbitrary substrings: no common non-credential English word
     // contains one of these as a substring, so `contains` cannot false-positive.
-    const SUBSTR_NEEDLES: [&str; 11] = [
-        "token",
+    const SUBSTR_NEEDLES: [&str; 9] = [
         "password",
         "passwd",
         "pwd",
-        "secret",
         "apikey",
         "accesskey",
         "privatekey",
@@ -1211,36 +1218,58 @@ fn is_credential_query_key(key: &str) -> bool {
         "signature",
         "oauth",
     ];
-    // Explicit `auth`-family forms matched only as a whole segment/key, so the
-    // `auth` inside `author` (or `authority`, `authenticate`) is not read as a
-    // credential while the real credential keys still are.
-    const WHOLE_AUTH: [&str; 3] = ["auth", "authorization", "authz"];
-    let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-    if SUBSTR_NEEDLES.iter().any(|needle| k.contains(needle)) {
-        return true;
-    }
+    // Needles that *do* appear inside common non-credential words (`token` in
+    // `tokenizer`, `secret` in `secretary`, `auth` in `author`), so they are
+    // matched only as a whole separator-delimited segment or as a prefix/suffix
+    // joined to another credential needle — never as a bare mid-word substring.
+    const AFFIX_NEEDLES: [&str; 3] = ["token", "secret", "auth"];
+    // Explicit whole-segment credential forms that are not reachable by affixing
+    // a needle (`authorization`, `authz`), plus the needles themselves.
+    const WHOLE_FORMS: [&str; 5] = ["auth", "authorization", "authz", "token", "secret"];
     // Exact-match keys: too short or too common as a substring to match loosely
     // (`pass` would false-positive on `compass`/`passage`/`bypass`), but as a
     // whole query-parameter name each is a credential. `pass` and `passphrase`
     // are common credential query names (`?pass=hunter2`) that no substring
     // needle covers (Copilot finding, src/memory.rs).
-    if matches!(k.as_str(), "key" | "sig" | "pat" | "sso" | "pass" | "passphrase") {
+    const SHORT_KEYS: [&str; 6] = ["key", "sig", "pat", "sso", "pass", "passphrase"];
+    let k: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    if SUBSTR_NEEDLES.iter().any(|needle| k.contains(needle)) {
         return true;
     }
-    // The `auth` family: split on the `-`/`_`/`.` separators and match only a
-    // whole segment (`auth`, `authorization`, `authz`) or a segment where `auth`
-    // is a prefix/suffix joined to another credential needle (`authkey`,
-    // `authsecret`). A bare mid-word substring (`author`) matches neither.
+    if SHORT_KEYS.contains(&k.as_str()) {
+        return true;
+    }
+    // The `token`/`secret`/`auth` family: split on the `-`/`_`/`.` separators
+    // and match only a whole segment (`token`, `secret`, `auth`,
+    // `authorization`, `authz`), a short-key segment (`tokenizer` carries no
+    // credential, but `tokenizer_key` ends in a `key` segment), or a segment
+    // where a needle is a prefix/suffix joined to another credential needle
+    // (`tokenkey`, `secretkey`, `authsecret`, `access_token_secret`). A bare
+    // mid-word substring (`tokenizer`, `secretary`, `author`) matches neither.
     let lower = key.to_ascii_lowercase();
     for segment in lower.split(['-', '_', '.']).filter(|s| !s.is_empty()) {
         let seg: String = segment.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-        if WHOLE_AUTH.contains(&seg.as_str()) {
+        if WHOLE_FORMS.contains(&seg.as_str()) || SHORT_KEYS.contains(&seg.as_str()) {
             return true;
         }
-        if (seg.starts_with("auth") || seg.ends_with("auth"))
-            && SUBSTR_NEEDLES.iter().any(|needle| seg.contains(needle))
-        {
-            return true;
+        for needle in AFFIX_NEEDLES {
+            // A whole segment, optionally pluralised (`tokens`, `secrets`).
+            if seg == needle || seg == format!("{needle}s") {
+                return true;
+            }
+            // A needle used as a prefix (`tokenkey`) or suffix (`secretkey`,
+            // `authsecret`) joined to another credential needle or short key.
+            let joined = |rest: &str| {
+                !rest.is_empty()
+                    && (AFFIX_NEEDLES.contains(&rest)
+                        || SHORT_KEYS.contains(&rest)
+                        || SUBSTR_NEEDLES.contains(&rest))
+            };
+            if seg.strip_prefix(needle).is_some_and(joined)
+                || seg.strip_suffix(needle).is_some_and(joined)
+            {
+                return true;
+            }
         }
     }
     false
@@ -1359,7 +1388,14 @@ fn normalize_remote(url: &str) -> String {
             None => s.to_string(),
         }
     } else if uri {
-        // URI `[user[:pass]@]host[:port]/path`: the authority is before the `/`.
+        // URI `[user[:pass]@]host[:port][/path][?query]`: the authority ends at
+        // the first `/` *or* `?`. A URI with an empty path can still carry a
+        // query (`https://host.example?repo=alice@example.com`); splitting only
+        // on `/` would hand the whole `host?query` to `strip_uri_password`,
+        // whose `rsplit_once('@')` would then read the query prefix as userinfo
+        // and collapse distinct remotes onto one key (Copilot finding,
+        // src/memory.rs). Split at whichever delimiter comes first and keep the
+        // suffix (path or query) verbatim.
         // How much of the userinfo to strip is scheme-dependent (see
         // `strip_uri_password`): over HTTP(S) the userinfo is always a
         // credential — including a token-only `<pat>@` with no colon — so it is
@@ -1371,12 +1407,12 @@ fn normalize_remote(url: &str) -> String {
         // exactly as the SCP branch keeps its username). Either way the secret
         // never leaks into the key, label or filename (Copilot finding,
         // src/memory.rs).
-        match s.split_once('/') {
-            Some((authority, path)) => {
-                format!("{}/{path}", strip_uri_password(scheme.as_deref(), authority))
-            }
-            None => strip_uri_password(scheme.as_deref(), s),
-        }
+        let split_at = s.find(['/', '?']).unwrap_or(s.len());
+        let (authority, suffix) = s.split_at(split_at);
+        format!(
+            "{}{suffix}",
+            strip_uri_password(scheme.as_deref(), authority)
+        )
     } else {
         // Local path: no authority, so there is nothing to strip.
         s.to_string()
@@ -2628,6 +2664,70 @@ mod tests {
             normalize_remote("https://host.example/git?repo=one&oauth_token=xyz"),
             "https://host.example/git?repo=one"
         );
+        // The `token`/`secret` needles are matched by affix/segment, not bare
+        // substring, so a non-credential key that merely *contains* one keeps
+        // its repository-selecting identity: `tokenizer` contains `token` and
+        // `secretary` contains `secret`, but neither is a credential, so
+        // `?tokenizer=bpe` / `?tokenizer=wordpiece` must keep distinct project
+        // keys rather than collapsing onto one (Copilot finding,
+        // src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example/git?tokenizer=bpe"),
+            "https://host.example/git?tokenizer=bpe"
+        );
+        assert_ne!(
+            normalize_remote("https://host.example/git?tokenizer=bpe"),
+            normalize_remote("https://host.example/git?tokenizer=wordpiece")
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?secretary=x"),
+            "https://host.example/git?secretary=x"
+        );
+        // …while genuine `token`/`secret`-family keys are still redacted: the
+        // whole words, plural forms, and a needle joined to another credential
+        // segment or short key.
+        assert_eq!(
+            normalize_remote("https://host.example/git?token=abc"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?secret=abc"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?repo=one&access_token=abc"),
+            "https://host.example/git?repo=one"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?client_secret=abc"),
+            "https://host.example/git"
+        );
+        assert_eq!(
+            normalize_remote("https://host.example/git?tokenkey=abc"),
+            "https://host.example/git"
+        );
+        // A URI with an empty path can still carry a query
+        // (`https://host.example?repo=alice@example.com`). The authority ends at
+        // the first `/` *or* `?`; splitting only on `/` would hand the whole
+        // `host?query` to the userinfo stripper, whose `@` split would read the
+        // query prefix as a credential and collapse distinct remotes onto one
+        // key (Copilot finding, src/memory.rs).
+        assert_eq!(
+            normalize_remote("https://host.example?repo=alice@example.com"),
+            "https://host.example?repo=alice@example.com"
+        );
+        assert_ne!(
+            normalize_remote("https://host.example?repo=alice@example.com"),
+            normalize_remote("https://host.example?repo=bob@example.com")
+        );
+        assert_eq!(
+            normalize_remote("https://host.example?repo=one"),
+            "https://host.example?repo=one"
+        );
+        assert_ne!(
+            normalize_remote("https://host.example?repo=one"),
+            normalize_remote("https://host.example?repo=two")
+        );
         // A `private_key`/`private-key` query parameter is a credential: after
         // separator-stripping it becomes `privatekey`, which the classifier now
         // recognises, so the secret is redacted rather than kept in the project
@@ -2957,4 +3057,5 @@ mod tests {
         let found = run(&store, SEARCH_TOOL, &json!({"pattern": "python"}), None, false).unwrap();
         assert!(found.contains("uv provides python"), "{found}");
     }
+
 }
