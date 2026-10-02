@@ -347,8 +347,7 @@ async fn switch_model(
             // client" failure notice for that same provider is stale: the
             // client it warned about has now been rebuilt. Drop it, or the exit
             // redraw would incorrectly warn the live client was not rebuilt.
-            let stale =
-                format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
+            let stale = format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
             notices.retain(|n| !n.starts_with(&stale));
             // The switch succeeded, so any earlier "Could not switch model:"
             // failure from this same visit is now stale — the model it said

@@ -2638,7 +2638,8 @@ mod tests {
         // line is not part of the conversation (it is recorded only when
         // submitted), so no user message is skipped — including a trailing one
         // with no assistant reply yet, and repeated texts.
-        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
+        let mut agent =
+            Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
         agent.set_event_sink(Box::new(move |_, event| {
@@ -2702,7 +2703,10 @@ mod tests {
         agent.replay_history();
         let users = seen.lock().unwrap().clone();
         assert!(!users.contains(&"ping".to_string()), "stale stash not resurrected after plain replacement: {users:?}");
-        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "summary not replayed after plain replacement: {users:?}");
+        assert!(
+            !users.iter().any(|t| t.contains("SUMMARY")),
+            "summary not replayed after plain replacement: {users:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

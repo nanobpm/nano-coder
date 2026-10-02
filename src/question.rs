@@ -388,12 +388,8 @@ mod tests {
         // comma-joined summary, so a newline must be dropped (not retained like
         // multiline transcript content) or the answer disappears into a hidden
         // continuation line in the first-line tool-result preview.
-        let questions = vec![Question {
-            question: "line1\nline2".into(),
-            header: String::new(),
-            options: vec![],
-            custom: true,
-        }];
+        let questions =
+            vec![Question { question: "line1\nline2".into(), header: String::new(), options: vec![], custom: true }];
         let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["ans\nwer".into()]));
         assert!(answered.contains("\"line1line2\"=\"answer\""), "{answered}");
         assert!(!answered.contains('\n'), "newline leaked: {answered:?}");

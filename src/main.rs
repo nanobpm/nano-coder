@@ -864,9 +864,7 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars()
-        .filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}')
-        .collect()
+    s.chars().filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 /// Like [`sanitize_terminal_text`], but for single-line fields: drops every
@@ -877,9 +875,7 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
 /// content to keep but injected layout that would spill an unprefixed extra row
 /// or move an interactive selector's cursor.
 pub(crate) fn sanitize_terminal_line(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
-        .collect()
+    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -1491,7 +1487,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // switch must still be applied here — returning early would leave
             // the renderer and editor in the old mode with no diff left to
             // retrigger the switch on the next visit.
-            let (notices, outcome) = settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
+            let (notices, outcome) =
+                settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
@@ -2269,13 +2266,7 @@ async fn main() -> Result<()> {
         if frame_mode && args.resume.is_some() {
             renderer.frame_batch(|| agent.replay_history());
         }
-        let mut terminal = Terminal::start(
-            config_path,
-            recents,
-            recents_path,
-            agent.config().renderer,
-            transition,
-        );
+        let mut terminal = Terminal::start(config_path, recents, recents_path, agent.config().renderer, transition);
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved
         // key or a queued/empty line cannot silently disarm it (see
