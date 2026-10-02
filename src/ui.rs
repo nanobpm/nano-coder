@@ -1538,13 +1538,20 @@ mod tests {
     fn replay_transcript_locks_frame_before_state() {
         // `replay_transcript` must use the canonical `frame` → `state` lock
         // order (the order `set_mode`, `event`, `urgent_note` and
-        // `clear_screen` all use). A reader holding `state` and waiting on
-        // `frame` must NOT block the replay: with the correct order the replay
-        // acquires `frame` first and never waits on `state` while holding it,
-        // so it completes even while `state` is held elsewhere. With the OLD
-        // (`state` → `frame`) order this replay would deadlock against the
-        // `state`-holder below; the channel + timeout turn that deadlock into a
-        // test failure instead of a hang.
+        // `clear_screen` all use): correct replay waits for `state` *while
+        // holding* `frame`.
+        //
+        // To actually detect an inverted (`state` → `frame`) regression the
+        // test must build a genuine circular wait — a holder that merely grabs
+        // `state` and lets go cannot, because it never requests `frame`, so no
+        // cycle forms and *both* lock orders would finish. Instead the `holder`
+        // below takes `frame` first and then, on cue, requests `state` (the
+        // canonical order). Against a buggy replay that took `state` first and
+        // then waited on `frame`, that closes the loop — holder holds `frame`
+        // wanting `state`, replay holds `state` wanting `frame` — and the
+        // replay never signals, so the timeout fails the test. Correct replay
+        // simply waits for `frame` (held by the holder) and completes once the
+        // holder releases it.
         use std::sync::mpsc;
         use std::time::Duration;
         let r = Renderer::frame_for_test();
@@ -1552,25 +1559,38 @@ mod tests {
         r.set_mode(crate::frame::RendererMode::Legacy);
         assert!(!r.pending_transcript().is_empty(), "transcript captured");
 
-        // Hold `state` on another thread (simulating a legacy writer mid-
-        // `out()`), then run the replay; it must still finish.
+        let (held_tx, held_rx) = mpsc::channel(); // holder signals it owns `frame`
+        let (go_tx, go_rx) = mpsc::channel(); // test tells holder to request `state`
         let holder = std::thread::spawn({
             let r = Arc::clone(&r);
             move || {
-                let _guard = r.state.lock().unwrap();
-                std::thread::sleep(Duration::from_millis(150));
+                let frame = r.frame.lock().unwrap();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                // Request `state` in the canonical order; a buggy replay that
+                // already holds `state` and wants `frame` deadlocks here.
+                let _state = r.state.lock().unwrap();
+                drop(frame);
             }
         });
-        std::thread::sleep(Duration::from_millis(20)); // let the holder win `state`
-        let (tx, rx) = mpsc::channel();
+        held_rx.recv().unwrap(); // holder now owns `frame`
+
+        let (done_tx, done_rx) = mpsc::channel();
         let replay = std::thread::spawn({
             let r = Arc::clone(&r);
             move || {
                 r.replay_transcript();
-                tx.send(()).unwrap();
+                done_tx.send(()).unwrap();
             }
         });
-        rx.recv_timeout(Duration::from_secs(5))
+        // Let a buggy replay grab `state` before the holder asks for it, so the
+        // inverted order closes the cycle; correct replay is already parked on
+        // `frame` and unaffected by this delay.
+        std::thread::sleep(Duration::from_millis(50));
+        go_tx.send(()).unwrap();
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("replay_transcript deadlocked: it must lock frame before state");
         replay.join().unwrap();
         holder.join().unwrap();
