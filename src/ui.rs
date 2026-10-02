@@ -531,6 +531,18 @@ impl Renderer {
                     chars: text.chars().count(),
                     seconds: started.elapsed().as_secs_f64(),
                 }));
+                // A cancelled/failed stream can finalize accumulated reasoning
+                // here (or in `TextDelta`) without the closing `Thinking` event
+                // ever arriving. That event is the only other place the frame
+                // caches `last_thinking`, so without caching here too a
+                // frame → legacy switch after a partial stream leaves Ctrl-O
+                // expanding older reasoning (or none). Sanitize before caching:
+                // the frame never displayed this raw model text, and
+                // `toggle_thinking` writes the cache straight through `out()`.
+                let trimmed = crate::sanitize_terminal_text(text);
+                if !trimmed.is_empty() {
+                    self.state.lock().unwrap().last_thinking = trimmed;
+                }
             }
         }
     }
@@ -604,6 +616,17 @@ impl Renderer {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
                         }));
+                        // The answer is starting without a closing `Thinking`
+                        // event, so this finalization is the only place the
+                        // streamed reasoning is consumed — cache it for legacy
+                        // Ctrl-O here too, or a frame → legacy switch expands a
+                        // stale turn. Sanitize: the frame never displayed this
+                        // raw model text. `event()` already holds `frame`, and
+                        // the lock order is `frame` → `state`, so this is safe.
+                        let trimmed = crate::sanitize_terminal_text(think);
+                        if !trimmed.is_empty() {
+                            self.state.lock().unwrap().last_thinking = trimmed;
+                        }
                     }
                 }
                 match fs.stream {
@@ -1762,6 +1785,29 @@ mod tests {
         assert!(!cached.contains('\x1b'), "escape survived caching: {cached:?}");
         assert!(!cached.contains('\x07'), "control char survived caching: {cached:?}");
         assert_eq!(cached, "plan[2J[32mOK[0m done");
+    }
+
+    #[test]
+    fn partial_reasoning_is_cached_when_text_finalizes_without_thinking_event() {
+        let r = Renderer::frame_for_test();
+        // A cancelled/failed stream can emit `ThinkingDelta` then finalize via
+        // `TextDelta` (the answer starts) without the closing `Thinking` event.
+        // The partial thought must still reach the Ctrl-O cache, or a frame →
+        // legacy switch expands older reasoning / reports none.
+        r.event(&AgentEvent::ThinkingDelta { text: "half-formed plan" });
+        r.event(&AgentEvent::TextDelta { text: "partial answer" });
+        assert_eq!(r.cached_last_thinking(), "half-formed plan");
+    }
+
+    #[test]
+    fn partial_reasoning_is_cached_when_turn_ends_without_thinking_event() {
+        let r = Renderer::frame_for_test();
+        // Same gap, finalized by `end_turn` (`frame_finish_stream`) instead of a
+        // `TextDelta`: reasoning streamed but the turn closed with no `Thinking`
+        // event and no answer text.
+        r.event(&AgentEvent::ThinkingDelta { text: "interrupted thought" });
+        r.end_turn();
+        assert_eq!(r.cached_last_thinking(), "interrupted thought");
     }
 
     #[test]

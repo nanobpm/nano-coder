@@ -350,6 +350,11 @@ async fn switch_model(
             let stale =
                 format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
             notices.retain(|n| !n.starts_with(&stale));
+            // The switch succeeded, so any earlier "Could not switch model:"
+            // failure from this same visit is now stale — the model it said
+            // could not be set is active. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not switch model:"));
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             if let Some(warning) = agent.temperature().warning {
                 println!("Warning: {warning}");
@@ -393,6 +398,11 @@ fn save_and_report(config: &Config, changes: &mut Changes, path: &Path, notices:
     match save(config, changes, path) {
         Ok(()) => {
             *changes = Changes::default();
+            // The save succeeded, so any earlier "Could not save:" failure from
+            // this same visit is now stale — the configuration it said could
+            // not be persisted was written. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not save:"));
             println!("Saved to {}", path.display());
         }
         // Return the failure as a retained notice (not a `println!`): in frame
@@ -1393,5 +1403,21 @@ mod tests {
         let resolved = providers::resolve("openai/gpt", &[("openai".to_string(), entry)].into(), "openai").unwrap();
         assert_eq!(merged.api_key_env.as_deref(), Some(""));
         assert_eq!(resolved.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn a_successful_save_clears_an_earlier_save_failure_notice() {
+        // A failed save queues a "Could not save:" notice; a retry that succeeds
+        // in the same visit must drop it, or the exit redraw warns about a
+        // failure the retry already resolved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config::default();
+        let mut notices = vec!["Could not save: earlier disk error".to_string()];
+        let mut changes = Changes { model: true, ..Changes::default() };
+        save_and_report(&config, &mut changes, &path, &mut notices);
+        assert!(notices.iter().all(|n| !n.starts_with("Could not save:")), "stale save notice survived: {notices:?}");
+        assert!(path.exists(), "successful save did not write the config");
+        assert!(!changes.any(), "successful save must reset the change flags");
     }
 }
