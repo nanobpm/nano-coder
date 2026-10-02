@@ -397,6 +397,23 @@ enum CompactTrigger {
     Overflow,
 }
 
+/// What a compaction folded away, handed to `replace_keeping_pending` so the
+/// durable `Record::Replace` keeps the log-line range and mode while the real
+/// pre-compaction turns are stashed for `replay_history` to restore on a
+/// legacy → frame switch (which otherwise replays only the synthetic summary).
+struct CompactionRecord {
+    /// First and last log line folded into the summary.
+    range: Option<(u64, u64)>,
+    mode: CompactionMode,
+    /// The folded messages (the real pre-compaction turns), in order.
+    folded: Vec<Message>,
+    /// Index, in the new (compacted) conversation, of the synthetic
+    /// restatement of the active input when it was itself folded into the
+    /// summary. `replay_history` skips it so the one submitted prompt is not
+    /// shown twice (once from `folded`, once from the restatement).
+    restated: Option<usize>,
+}
+
 /// Receives events with the active session ID.
 pub type EventSink = Box<dyn Fn(Option<&str>, &AgentEvent) + Send + Sync>;
 
@@ -468,6 +485,23 @@ pub struct Agent {
     /// was only in the conversation). Cleared once shown or once the agent
     /// uses a history tool.
     history_hint_pending: bool,
+    /// The real pre-compaction turns, captured when a compaction folded them
+    /// into the synthetic summary. `replay_history` replays THESE (and skips
+    /// the summary) so a legacy → frame renderer switch rebuilds the visible
+    /// transcript instead of exposing the summary as a user turn and dropping
+    /// the folded turns — the frame's first full redraw clears the legacy
+    /// scrollback, so the replay is the only copy. Kept across replays (every
+    /// renderer rebuild needs it), replaced by the next compaction, and
+    /// cleared by any non-compaction conversation replacement (a plain rebuild
+    /// or system-prompt change) and on a new or resumed session. `None` when
+    /// no compaction has run (or none was captured).
+    pre_compaction_transcript: Option<Vec<Message>>,
+    /// Index, in the compacted conversation, of the synthetic restatement of
+    /// the active input the current `pre_compaction_transcript` compaction
+    /// folded into its summary (see `CompactionRecord::restated`).
+    /// `replay_history` skips it so the prompt is not shown twice. Tracked and
+    /// cleared in lockstep with `pre_compaction_transcript`.
+    pre_compaction_restated: Option<usize>,
     /// Cross-session memory store, present when `config.memory` is not `off`
     /// (see `memory.rs`). Whether the model may write to it is `config.memory`.
     memory: Option<memory::Store>,
@@ -533,6 +567,8 @@ impl Agent {
             turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
+            pre_compaction_transcript: None,
+            pre_compaction_restated: None,
             titles_requested: HashSet::new(),
             memory,
             memory_index_cache: None,
@@ -691,9 +727,28 @@ impl Agent {
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
+    /// Atomic: when the new spec cannot build a client (a missing credential,
+    /// a failing `api_key_command`, …) the previous model spec is restored so
+    /// the config keeps naming the client the session is actually still using.
+    /// (An unknown provider prefix is not such a failure — `parse_model_spec`
+    /// falls back to the default provider — so it does not trigger this path.)
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
-        self.client = Self::client_for(&self.config, spec)?;
-        self.config.model = spec.to_string();
+        let previous = std::mem::replace(&mut self.config.model, spec.to_string());
+        if let Err(e) = self.refresh_client().await {
+            self.config.model = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Rebuild the LLM client for the current model, resetting the state that
+    /// is tied to a client: the context calibration, the window learned from
+    /// overflow errors, the window detected from the endpoint, and the
+    /// post-compaction floor. Used after a provider edit (which can change the
+    /// endpoint, key, or model the current spec resolves to) and on model
+    /// switches.
+    pub async fn refresh_client(&mut self) -> Result<()> {
+        self.client = Self::client_for(&self.config, &self.config.model)?;
         self.calibration = None;
         self.learned_window = None;
         self.detected_window = None;
@@ -972,30 +1027,68 @@ impl Agent {
         if self.event_sink.is_none() {
             return;
         }
+        // After a compaction the conversation holds the synthetic summary where
+        // the folded turns were; replaying it as-is would show that summary as
+        // a user turn and drop the real pre-compaction turns (a legacy → frame
+        // switch clears the legacy scrollback on the frame's first redraw, so
+        // this replay is the only copy). Replay the captured pre-compaction
+        // turns first, then skip the summary (the first non-system message) so
+        // the internal text is never exposed. The stash is kept (cloned, not
+        // taken) so every renderer rebuild replays the real turns — a legacy →
+        // frame → legacy → frame round trip must not fall back to exposing the
+        // summary on the second switch. It is replaced by the next compaction
+        // and cleared on a new or resumed session.
+        let pre_compaction = self.pre_compaction_transcript.clone();
+        let skip_summary = pre_compaction.is_some();
         let conversation = self.conversation.clone();
         let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
-        for message in &conversation {
-            match message.role {
-                Role::System => {}
-                Role::User => self.emit(AgentEvent::UserMessage { text: &message.content }),
-                Role::Assistant => {
-                    self.emit_assistant_text(&message.content);
-                    for call in &message.tool_calls {
-                        calls.insert(call.id.as_str(), call);
-                        self.emit(AgentEvent::ToolCall { call });
-                    }
-                }
-                Role::Tool => {
-                    let Some(call) = message.tool_call_id.as_deref().and_then(|id| calls.get(id)) else {
-                        continue;
-                    };
-                    let ok = !message.is_error;
-                    self.emit(AgentEvent::ToolResult { call, ok, output: &message.content });
-                }
+        if let Some(turns) = &pre_compaction {
+            for message in turns {
+                self.replay_message(message, &mut calls);
             }
+        }
+        // The summary is the first non-system message of the compacted
+        // conversation; everything after it (kept + new turns) replays as-is,
+        // except the synthetic restatement of a folded active input (its
+        // original is already replayed from the stash above), which is skipped
+        // so the one submitted prompt is not shown twice.
+        let restated = self.pre_compaction_restated;
+        let mut skipped_summary = !skip_summary;
+        for (idx, message) in conversation.iter().enumerate() {
+            if !skipped_summary && message.role != Role::System {
+                skipped_summary = true;
+                continue;
+            }
+            if Some(idx) == restated {
+                continue;
+            }
+            self.replay_message(message, &mut calls);
         }
         if !self.plan.is_empty() {
             self.emit(AgentEvent::Plan { plan: &self.plan });
+        }
+    }
+
+    /// Emit one message's replay events, registering its tool calls so a later
+    /// tool result can be paired back with its call (see `replay_history`).
+    fn replay_message<'m>(&mut self, message: &'m Message, calls: &mut HashMap<&'m str, &'m ToolCall>) {
+        match message.role {
+            Role::System => {}
+            Role::User => self.emit(AgentEvent::UserMessage { text: &message.content }),
+            Role::Assistant => {
+                self.emit_assistant_text(&message.content);
+                for call in &message.tool_calls {
+                    calls.insert(call.id.as_str(), call);
+                    self.emit(AgentEvent::ToolCall { call });
+                }
+            }
+            Role::Tool => {
+                let Some(call) = message.tool_call_id.as_deref().and_then(|id| calls.get(id)) else {
+                    return;
+                };
+                let ok = !message.is_error;
+                self.emit(AgentEvent::ToolResult { call, ok, output: &message.content });
+            }
         }
     }
 
@@ -1108,6 +1201,10 @@ impl Agent {
         self.compact_floor = 0;
         self.history_available = false;
         self.history_hint_pending = false;
+        // A fresh session has no compaction behind it, so there is no
+        // pre-compaction transcript for `replay_history` to restore.
+        self.pre_compaction_transcript = None;
+        self.pre_compaction_restated = None;
         {
             // A fresh session starts with clean cumulative counters so the
             // status line and `/context` reflect only this session. Shared
@@ -1188,6 +1285,13 @@ impl Agent {
         // already emitted (or a history tool already used) after the latest
         // smart compaction, a resume must not append it again.
         self.history_hint_pending = restored.history_available && !restored.history_hint_consumed;
+        // A resumed session does not rebuild the pre-compaction transcript
+        // (the folded turns are recoverable via the history tools, and the
+        // replace record's summarized range is not exposed here), so a
+        // post-resume legacy → frame switch replays the compacted
+        // conversation — the pre-change behaviour.
+        self.pre_compaction_transcript = None;
+        self.pre_compaction_restated = None;
         {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
@@ -1245,13 +1349,16 @@ impl Agent {
     }
 
     /// Replace the conversation; `pending_position` keeps the in-flight input
-    /// alive with its user message at that index.
-    /// `compaction` records the folded log-line range and mode.
+    /// alive with its user message at that index. `compaction` records the
+    /// folded log-line range and mode, and carries the folded messages
+    /// themselves (the real pre-compaction turns) so `replay_history` can
+    /// rebuild the visible transcript after a legacy → frame switch instead
+    /// of exposing the synthetic summary.
     fn replace_keeping_pending(
         &mut self,
         mut messages: Vec<Message>,
         pending_position: Option<usize>,
-        compaction: Option<(Option<(u64, u64)>, CompactionMode)>,
+        compaction: Option<CompactionRecord>,
     ) -> Result<()> {
         let now = session::now();
         for message in &mut messages {
@@ -1260,17 +1367,24 @@ impl Agent {
         // The history tools follow the compaction: a smart summary offers them,
         // any other replacement (standard compaction or a plain rebuild) drops
         // them. Track it explicitly so message text cannot spoof the state.
-        let history_available = matches!(compaction, Some((_, CompactionMode::Smart)));
+        let history_available = matches!(compaction, Some(CompactionRecord { mode: CompactionMode::Smart, .. }));
+        // Destructure once: the folded turns go to the replay stash, the range
+        // and mode to the durable replace record, and the restated-input index
+        // to the replay skip.
+        let (range, mode, folded_turns, restated) = match compaction {
+            Some(CompactionRecord { range, mode, folded, restated }) => (range, Some(mode), Some(folded), restated),
+            None => (None, None, None, None),
+        };
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
                 pending_position,
-                summarized: compaction.and_then(|(range, _)| range),
-                mode: compaction.map(|(_, mode)| mode),
+                summarized: range,
+                mode,
                 // Record the resolved provider/model, not the raw user spec
                 // (which can be a bare model name under a default provider), so
                 // mode comparisons keep the provider dimension.
-                model: compaction.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
+                model: mode.map(|_| format!("{}/{}", self.client.provider_name(), self.client.model_name())),
                 recorded_at: now,
             })?;
         }
@@ -1279,6 +1393,15 @@ impl Agent {
         self.history_available = history_available;
         self.history_hint_pending = history_available;
         self.conversation = messages;
+        // Assign unconditionally: a compaction stashes its folded turns for the
+        // replay, and any other replacement (a plain rebuild, a system-prompt
+        // change, …) clears the stash so a later replay cannot resurrect the
+        // previous conversation and skip the first new user turn as though it
+        // were a synthetic summary.
+        self.pre_compaction_transcript = folded_turns.filter(|f| !f.is_empty());
+        // Track the restatement to skip alongside the stash; a cleared stash
+        // (any non-compaction replacement) clears it too.
+        self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
         self.pending_input = match (self.pending_input.take(), pending_position) {
             (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
             _ => None,
@@ -1290,8 +1413,16 @@ impl Agent {
 
     /// Set the system prompt and reset conversation
     pub fn set_system_prompt(&mut self, prompt: &str) -> Result<()> {
-        self.config.system_prompt = prompt.to_string();
-        self.replace_conversation(vec![Message::system(&self.system_prompt())])
+        let previous = std::mem::replace(&mut self.config.system_prompt, prompt.to_string());
+        let result = self.replace_conversation(vec![Message::system(&self.system_prompt())]);
+        // Keep config and conversation consistent: `replace_conversation` can
+        // fail while appending the durable replace record, which leaves the
+        // active conversation untouched. Roll the config prompt back so the two
+        // never drift out of sync on a failed update.
+        if result.is_err() {
+            self.config.system_prompt = previous;
+        }
+        result
     }
 
     /// The configured system prompt plus any project instructions and the
@@ -2179,6 +2310,29 @@ impl Agent {
         if summarized.is_empty() {
             return Ok(None);
         }
+        // The real turns about to be folded into the summary, kept so a later
+        // legacy → frame switch can replay them (see `replace_keeping_pending`).
+        // On a *repeated* compaction the first summarized message is the
+        // previous synthetic summary and the stash of real turns lives in
+        // `pre_compaction_transcript`: expand that summary back to its real
+        // turns and append only the newly folded ones, so the earlier history
+        // is preserved rather than displayed as the older summary. Any
+        // synthetic restatement a prior compaction appended (tracked by
+        // `pre_compaction_restated`) is dropped from the stash too, so it never
+        // carries forward as a replayed duplicate.
+        let summarized_msgs = match &self.pre_compaction_transcript {
+            Some(prev) => {
+                let mut turns = prev.clone();
+                for (offset, message) in summarized.iter().enumerate().skip(1) {
+                    if self.pre_compaction_restated == Some(body_start + offset) {
+                        continue;
+                    }
+                    turns.push(message.clone());
+                }
+                turns
+            }
+            None => summarized.to_vec(),
+        };
 
         let output_budget = context::summary_output_budget(window, self.config.max_tokens as i64);
         // The transcript and the summary's own output share the request budget.
@@ -2276,11 +2430,17 @@ impl Agent {
             summary
         };
         messages.push(Message::user(&summary));
+        // When the active input is itself folded into the summary it is
+        // restated after it; `restated_index` records where, so the replay can
+        // skip that synthetic copy (the original is in `summarized_msgs`).
+        let mut restated_index = None;
         let pending_position = match &self.pending_input {
             // The in-flight input was folded into the summary: restate it.
             Some(pending) if pending.position < split => {
                 messages.push(Message::user(&pending.text));
-                Some(messages.len() - 1)
+                let idx = messages.len() - 1;
+                restated_index = Some(idx);
+                Some(idx)
             }
             Some(pending) => Some(pending.position - split + messages.len()),
             None => None,
@@ -2299,7 +2459,14 @@ impl Agent {
         }
 
         let summarized = split - body_start;
-        self.replace_keeping_pending(messages, pending_position, Some((range, mode)))?;
+        // The folded turns ride along so `replay_history` can restore them on
+        // a legacy → frame switch (the frame's first redraw clears the legacy
+        // scrollback, and the compacted conversation holds only the summary).
+        self.replace_keeping_pending(
+            messages,
+            pending_position,
+            Some(CompactionRecord { range, mode, folded: summarized_msgs, restated: restated_index }),
+        )?;
         if let Some(instructions) = &mut self.instructions {
             instructions.forget_nested();
         }
@@ -2434,6 +2601,148 @@ mod tests {
     use crate::tools::ToolDefinition;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_model_switch_restores_the_previous_spec() {
+        // A `/model` spec that cannot build a client must not leave
+        // `config.model` naming the rejected spec while the session keeps the
+        // old client: the switch is atomic. (An unknown provider is not a
+        // failure — the spec falls back to the default provider — so the
+        // failing build is a provider whose `api_key_command` cannot run.)
+        let mut config = Config::default();
+        config.providers.insert(
+            "broken".to_string(),
+            providers::ProviderConfig {
+                kind: Some(providers::ProviderKind::Openai),
+                base_url: Some("http://localhost:9".to_string()),
+                api_key_command: Some("definitely-not-a-real-command-nano".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), config);
+        let before = agent.config().model.clone();
+        let error = agent.set_model("broken/some-model").await.unwrap_err();
+        assert!(format!("{error:#}").contains("definitely-not-a-real-command-nano"), "unexpected error: {error:#}");
+        assert_eq!(agent.config().model, before, "config keeps the spec still in use");
+        assert_eq!(agent.model_name(), "gpt-4o-mini", "the live client is unchanged");
+        // …and a valid spec still switches.
+        agent.set_model("mock/other-model").await.unwrap();
+        assert_eq!(agent.config().model, "mock/other-model");
+        assert_eq!(agent.model_name(), "other-model");
+    }
+
+    #[test]
+    fn replay_history_replays_every_user_message() {
+        // A renderer switch replays the conversation into the newly active
+        // renderer via the installed sink. The interactive prompt's in-flight
+        // line is not part of the conversation (it is recorded only when
+        // submitted), so no user message is skipped — including a trailing one
+        // with no assistant reply yet, and repeated texts.
+        let mut agent =
+            Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        agent.conversation.push(Message::user("same"));
+        agent.conversation.push(Message::assistant("first answer"));
+        agent.conversation.push(Message::user("same"));
+        agent.replay_history();
+        assert_eq!(*seen.lock().unwrap(), vec!["same".to_string(), "same".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_history_after_compaction_restores_real_turns_not_summary() {
+        // A legacy → frame renderer switch replays history into a frame whose
+        // first redraw clears the legacy scrollback, so the replay is the only
+        // copy of the visible transcript. After a compaction the conversation
+        // holds the synthetic summary where the folded turns were: the replay
+        // must restore the REAL pre-compaction turns from the captured stash
+        // and never expose the summary as a user turn.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = agent(vec![tool_call("c1"), text("done"), text("SUMMARY: pinged once")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        let report = agent.compact(None, Some("the ping")).await.unwrap().expect("compacted");
+        assert!(report.summarized > 0);
+        // The compacted conversation really did fold the turns into a summary.
+        assert!(agent.conversation().iter().any(|m| m.role == Role::User && m.content.contains("SUMMARY")));
+        assert!(!agent.conversation().iter().any(|m| m.role == Role::User && m.content == "ping"));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping".to_string()), "real pre-compaction turn restored: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "synthetic summary not exposed: {users:?}");
+
+        // A legacy → frame → legacy → frame round trip replays history a
+        // second time: the stash must persist across replays so the second
+        // switch restores the real turns again instead of falling back to the
+        // compacted conversation (which would expose the summary).
+        seen.lock().unwrap().clear();
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping".to_string()), "second replay still restores the real turn: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "second replay still hides the summary: {users:?}");
+
+        // A plain conversation replacement (no compaction — e.g. a system-prompt
+        // change) must CLEAR the stash: replaying the new conversation must not
+        // resurrect the folded turns or skip the first new user turn as though
+        // it were a synthetic summary.
+        agent.set_system_prompt("fresh prompt").unwrap();
+        seen.lock().unwrap().clear();
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(!users.contains(&"ping".to_string()), "stale stash not resurrected after plain replacement: {users:?}");
+        assert!(
+            !users.iter().any(|t| t.contains("SUMMARY")),
+            "summary not replayed after plain replacement: {users:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_after_repeated_compaction_preserves_the_original_turns() {
+        // A second compaction summarizes a conversation that already starts
+        // with the first compaction's synthetic summary. Snapshotting that
+        // slice verbatim would stash the older summary in place of the real
+        // turns, so a later legacy → frame switch would drop the original
+        // history and show that summary as a user message. The stash must
+        // expand the previous summary back to its real turns and append only
+        // the newly folded ones.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) =
+            agent(vec![text("r1"), text("SUMMARY: one"), text("r2"), text("SUMMARY: two")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        assert!(agent.compact(None, None).await.unwrap().is_some());
+        agent.send_message("pong").await.unwrap();
+        assert!(agent.compact(None, None).await.unwrap().is_some());
+        // Both compactions really folded their input away.
+        assert!(!agent.conversation().iter().any(|m| m.role == Role::User && m.content == "ping"));
+        assert!(!agent.conversation().iter().any(|m| m.role == Role::User && m.content == "pong"));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        agent.replay_history();
+        let users = seen.lock().unwrap().clone();
+        assert!(users.contains(&"ping".to_string()), "first-compaction turn preserved: {users:?}");
+        assert!(users.contains(&"pong".to_string()), "second-compaction turn preserved: {users:?}");
+        assert!(!users.iter().any(|t| t.contains("SUMMARY")), "no synthetic summary exposed: {users:?}");
+    }
 
     #[test]
     fn rate_meter_tracks_scripted_stream() {
@@ -3960,7 +4269,50 @@ mod tests {
         assert_eq!(restored.conversation.last().map(unstamped), Some(Message::assistant("done")));
     }
 
-    /// Answers turns through `chat`, but only answers a summary through
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_after_mid_turn_compaction_shows_the_folded_input_once() {
+        // When auto-compaction folds the active input, the compacted
+        // conversation restates it after the summary while the real copy rides
+        // along in the replay stash. A legacy → frame switch replays BOTH the
+        // stash and the conversation, so the synthetic restatement must be
+        // skipped or the one submitted prompt would be shown twice.
+        let dir = tempfile::tempdir().unwrap();
+        let big = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let (mut agent, _seen) = agent(vec![big, text("SUMMARY"), text("done")], dir.path());
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.tools().register(
+            ToolDefinition::new("big", "big", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("x".repeat(8_000)))),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.set_event_sink(Box::new(move |_, event| {
+            if let AgentEvent::UserMessage { text } = event {
+                seen_sink.lock().unwrap().push(text.to_string());
+            }
+        }));
+        agent.replay_history();
+        let gos = seen.lock().unwrap().iter().filter(|t| t.as_str() == "go").count();
+        assert_eq!(gos, 1, "the folded input is replayed exactly once: {:?}", seen.lock().unwrap());
+        assert!(
+            !seen.lock().unwrap().iter().any(|t| t.contains("SUMMARY")),
+            "synthetic summary not exposed: {:?}",
+            seen.lock().unwrap()
+        );
+    }
     /// `chat_stream`: a non-streaming summary request gets an idle-timeout
     /// error, as through a tunnel that drops connections sending no bytes.
     struct StreamOnlySummary {

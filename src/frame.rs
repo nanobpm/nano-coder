@@ -106,6 +106,14 @@ pub enum Item {
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
     Note(String),
+    /// The `report_outcome` status marker (`✔ completed` etc.). Distinct from
+    /// [`Item::Note`] because it is derived from a CONVERSATION event (the
+    /// tool call), not renderer-only output. It is part of the captured
+    /// transcript all the same: on a frame → legacy switch `set_mode` copies
+    /// the WHOLE `items` list and `replay_transcript` reprints it directly
+    /// (the caller does not re-derive history from the conversation on that
+    /// path), so this marker is restored in place, exactly once.
+    OutcomeMark(String),
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
     Output(String),
@@ -190,7 +198,9 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
         }
         Item::ToolResult { ok, output, verbose } => tool_result_lines(*ok, output, *verbose, width),
         Item::Plan(plan) => plan_lines(plan, width),
-        Item::Note(text) => wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect(),
+        Item::Note(text) | Item::OutcomeMark(text) => {
+            wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect()
+        }
         Item::Output(text) => wrap_block(text, width),
         // Normally rendered by the dedicated arm in `render_stamped` (which
         // also skips the timestamp); this keeps a direct `render_item` call
@@ -456,14 +466,24 @@ fn sanitize(line: &str) -> String {
                 let mut seq = String::from(c);
                 seq.push(chars.next().unwrap()); // '['
                 let mut final_byte = None;
+                // Only a well-formed SGR sequence may be replayed verbatim.
+                // Parameter bytes before the final `m` must be digits, `;` or
+                // `:`; anything else (an embedded `\r`, ESC, or cursor-control
+                // byte smuggled into `\x1b[\r31m`) makes this malformed, and
+                // keeping it would let that control execute during replay and
+                // overwrite earlier content. Reject the whole sequence.
+                let mut valid_params = true;
                 while let Some(&n) = chars.peek() {
                     seq.push(chars.next().unwrap());
                     if ('@'..='~').contains(&n) {
                         final_byte = Some(n);
                         break;
                     }
+                    if !(n.is_ascii_digit() || n == ';' || n == ':') {
+                        valid_params = false;
+                    }
                 }
-                if final_byte == Some('m') {
+                if valid_params && final_byte == Some('m') {
                     out.push_str(&seq);
                 }
             }
@@ -493,6 +513,34 @@ fn sanitize(line: &str) -> String {
         col += cell_width(c);
     }
     out
+}
+
+/// Sanitize one captured transcript field for the legacy replay on a frame →
+/// legacy switch, sharing the frame layout's per-line rules so the reprinted
+/// text matches what the frame showed. Unlike
+/// [`crate::sanitize_terminal_text`] — which deletes `\t` outright and strips
+/// only the ESC byte (leaving a literal `[32m` fragment behind) — this expands
+/// tabs to spaces (8-stop) and keeps SGR styling sequences, so a replayed
+/// `read_file` result keeps its indentation and a styled line keeps its colour
+/// instead of degrading to `[32mhello[0m`. Newlines are kept (a transcript
+/// field is multi-line content), the U+2028/U+2029 forged-line-break protection
+/// is preserved, and every other cursor/erase/OSC escape and C0/C1/DEL control
+/// is dropped so model/tool-controlled text cannot move the legacy cursor or
+/// clear the screen. `Item::Raw` exports do NOT come here — they stay
+/// byte-exact.
+pub(crate) fn sanitize_replay(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.split('\n') {
+        // `sanitize` expands tabs and keeps SGR styling but drops every
+        // control, `\n` included; re-add the line feed between logical lines.
+        out.push_str(&sanitize(line));
+        out.push('\n');
+    }
+    out.pop(); // drop the trailing newline `split` does not imply
+    // `sanitize` keeps control chars it has a rule for; U+2028/U+2029 are not
+    // control chars, so strip the forged line breaks here to match
+    // `sanitize_terminal_text`.
+    out.chars().filter(|c| *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 /// Wrap one logical line to `width` visible columns, preserving ANSI escape
@@ -819,6 +867,46 @@ mod tests {
         assert!("fancy".parse::<RendererMode>().is_err());
         assert_eq!(RendererMode::default(), RendererMode::Frame);
         assert_eq!(RendererMode::Frame.to_string(), "frame");
+    }
+
+    #[test]
+    fn sanitize_replay_expands_tabs_and_keeps_sgr_styling() {
+        // A replayed `read_file` result keeps its tab indentation (expanded to
+        // the next 8-stop) instead of losing it, and a styled line keeps its
+        // SGR colour instead of degrading to a literal `[32m` fragment.
+        // `"     1"` is 7 visible columns, so the tab adds 2 spaces (7 → 8).
+        assert_eq!(sanitize_replay("     1\treturn 1"), "     1  return 1");
+        assert_eq!(sanitize_replay("\x1b[32mhello\x1b[0m"), "\x1b[32mhello\x1b[0m");
+        assert_eq!(sanitize_replay("\thello"), "        hello");
+    }
+
+    #[test]
+    fn sanitize_replay_keeps_newlines_but_drops_cursor_erase_and_controls() {
+        // Newlines are multi-line content to keep; cursor/erase CSI and stray
+        // C0 controls are dropped so replayed text cannot move the legacy
+        // cursor or clear the screen. This shares `frame::sanitize`, which only
+        // special-cases CSI escapes — matching exactly what the frame displayed.
+        assert_eq!(sanitize_replay("line one\nline two"), "line one\nline two");
+        assert_eq!(sanitize_replay("a\x1b[2Jb"), "ab");
+        assert_eq!(sanitize_replay("a\x1b[Hb"), "ab");
+        assert_eq!(sanitize_replay("a\x07\x08b"), "ab");
+        // The forged-line-break protection matches `sanitize_terminal_text`.
+        assert_eq!(sanitize_replay("a\u{2028}b\u{2029}c"), "abc");
+    }
+
+    #[test]
+    fn sanitize_replay_rejects_malformed_sgr_parameters() {
+        // A CSI sequence that ends in `m` but hides a control byte in its
+        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT be replayed: the
+        // embedded CR would execute during replay and let model/tool output
+        // overwrite earlier content. Only digits, `;` and `:` are valid SGR
+        // params, so the whole malformed sequence is dropped.
+        assert_eq!(sanitize_replay("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
+        assert_eq!(sanitize_replay("a\x1b[31\x08mb"), "ab");
+        // A space (an SGR intermediate byte, not a parameter byte) is rejected.
+        assert_eq!(sanitize_replay("a\x1b[31 mb"), "ab");
+        // A real, well-formed SGR sequence with digits/`;`/`:` still survives.
+        assert_eq!(sanitize_replay("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
     }
 
     #[test]

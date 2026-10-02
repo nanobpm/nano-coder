@@ -198,6 +198,43 @@ fn resize_sequence(rows: u16) -> String {
     format!("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
 }
 
+/// Bytes that re-own the screen for legacy mode after the frame renderer is
+/// dropped. The frame's last full redraw is still on the display (dropping
+/// `FrameState` emits nothing), so first clear the screen AND scrollback —
+/// the caller replays the conversation and reprints the frame-only items, so
+/// anything left visible is a stale copy that would otherwise scroll into
+/// scrollback as a duplicate. Then re-pin the scroll region to the status
+/// line's rows (the frame's redraws reset it to the whole screen) and leave
+/// the cursor on the last scrollable row, where the replay starts writing.
+///
+/// Unlike [`resize_sequence`] this does NOT erase below a restored cursor and
+/// does NOT restore the frame's saved cursor (which sits on the bottom status
+/// row): the caller runs this BEFORE the legacy editor/status redraw, so
+/// there is no fresh prompt to preserve yet — erasing/restoring there could
+/// wipe the row the editor is about to draw on, and the replay would then
+/// start writing on the reserved status row.
+fn repin_sequence(rows: u16) -> String {
+    format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{}r\x1b[{};1H", scroll_region_bottom(rows), scroll_region_bottom(rows))
+}
+
+/// Bytes that clear the frame-owned screen and scrollback WITHOUT re-pinning
+/// a scroll region: the frame-to-legacy clear for when no status line is
+/// installed (`AGENTIC_NO_STATUS`, or a terminal shorter than five rows). The
+/// frame's last redraw is still on the display, so this drops the region,
+/// homes the cursor and wipes the screen + scrollback — the caller's legacy
+/// replay reprints the conversation, so anything left visible would scroll
+/// into scrollback as a duplicate. Unlike [`repin_sequence`] there is no
+/// bottom row to reserve, so the cursor is simply left at home.
+fn clear_display_sequence() -> &'static str {
+    "\x1b[r\x1b[H\x1b[2J\x1b[3J"
+}
+
+/// Clear the frame-owned screen and scrollback when no status line is
+/// installed (see [`clear_display_sequence`]).
+pub fn clear_display() {
+    with_term_lock(|| emit(clear_display_sequence()));
+}
+
 impl StatusLine {
     /// Reserve the bottom row, when stdin and stdout are a terminal and
     /// `AGENTIC_NO_STATUS` is unset.
@@ -280,6 +317,26 @@ impl StatusLine {
     pub fn resize(&self) {
         self.draw();
         self.anchor();
+    }
+
+    /// Re-pin the scroll region to the status line's rows. The frame renderer's
+    /// full redraw resets the region to the whole screen (`\x1b[r`); after a
+    /// live switch back to legacy the region must be re-pinned or the status
+    /// bar (pinned to the bottom row) would scroll off. `draw()` alone does not
+    /// re-pin it, because it only does so when the terminal *size* changed —
+    /// and a renderer switch does not change the size.
+    ///
+    /// This also clears the frame's last redraw off the screen (dropping the
+    /// frame emits nothing, so without a clear the replayed conversation is
+    /// written over the still-visible frame copy and the surplus scrolls into
+    /// scrollback as a duplicate). It deliberately does NOT use
+    /// [`resize_sequence`]'s erase-below-and-restore: the caller runs this
+    /// before the legacy editor/status redraw, so there is no fresh prompt to
+    /// preserve yet, and restoring the frame's saved cursor (the bottom status
+    /// row) would let the erase wipe the row the editor is about to draw on.
+    pub fn repin_scroll_region(&self) {
+        let Some((rows, _)) = terminal_size() else { return };
+        with_term_lock(|| emit(&repin_sequence(rows)));
     }
 
     /// Close any gap between the cursor and the status line by scrolling the
@@ -918,6 +975,35 @@ mod tests {
             let seq = resize_sequence(rows);
             assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
         }
+    }
+
+    #[test]
+    fn clear_display_sequence_clears_without_repinning_a_region() {
+        // The no-status frame → legacy clear: the frame's last redraw is still
+        // on the display, so the screen AND scrollback are wiped (the replay
+        // reprints everything), but with no status line there is no bottom row
+        // to reserve — no region re-pin and no absolute cursor row.
+        let seq = clear_display_sequence();
+        assert!(seq.contains("\x1b[H\x1b[2J\x1b[3J"), "frame copy not cleared: {seq:?}");
+        assert!(!seq.contains("\x1b[1;"), "no region re-pin: {seq:?}");
+        assert!(!seq.contains(";1H"), "no absolute cursor row: {seq:?}");
+    }
+
+    #[test]
+    fn repin_sequence_clears_the_frame_and_repins_without_a_cursor_restore() {
+        // Frame → legacy: the frame's last redraw is still on the display, so
+        // the sequence clears the screen AND scrollback (the replay reprints
+        // everything), then re-pins the region and parks the cursor on the
+        // last scrollable row, where the replay starts writing.
+        let seq = repin_sequence(40);
+        assert!(seq.contains("\x1b[H\x1b[2J\x1b[3J"), "frame copy not cleared: {seq:?}");
+        assert!(seq.contains("\x1b[1;39r"), "region not re-pinned: {seq:?}");
+        assert!(seq.ends_with("\x1b[39;1H"), "cursor not left on the last scrollable row: {seq:?}");
+        // Unlike a resize there is no fresh prompt to preserve (this runs
+        // before the legacy editor redraw), so no save/restore and no
+        // cursor-relative erase that could wipe the row being drawn on.
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "must not restore the frame's cursor: {seq:?}");
+        assert!(!seq.contains("\x1b[J"), "must not erase below a restored cursor: {seq:?}");
     }
 
     #[test]

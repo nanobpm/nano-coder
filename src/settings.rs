@@ -89,8 +89,18 @@ pub async fn run(
     config_path: &Path,
     recents: &recents::SharedRecents,
     recents_path: &Path,
-) -> Result<()> {
+) -> (Vec<String>, Result<()>) {
     let mut changes = Changes::default();
+    // Notices (e.g. a client-rebuild failure) that must survive the dialog's
+    // exit redraw: the caller re-shows them through the renderer after
+    // `frame_resize`, since a plain `println!` here is wiped in frame mode.
+    // They are returned on EVERY exit — including a cancel/error at a later
+    // prompt — so a rebuild failure already recorded is never dropped (the
+    // dialog's own `println!` of it is gone by then, and the session keeps the
+    // old client). The prompts below distinguish Esc/cancel (a plain Done that
+    // returns `notices`) from a genuine terminal I/O failure, which surfaces as
+    // an `Err` carried out alongside the retained `notices`.
+    let mut notices: Vec<String> = Vec::new();
     loop {
         let config = agent.config();
         println!("\nSettings ({}):", config_path.display());
@@ -116,95 +126,205 @@ pub async fn run(
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
-        let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
+        // `interact_opt` distinguishes Esc (Ok(None)) from a genuine terminal
+        // I/O failure (Err), which must surface rather than be read as a normal
+        // exit. The nested selectors already do this; the top-level loop must
+        // too, so a failed read/write is not silently reported as a plain Done.
+        // Any retained notices ride along on the error path.
+        //
+        // Esc is a plain Done: it must follow the SAME completion path as the
+        // explicit `Done` item, which offers to save when `changes.any()`.
+        // Returning early here would leave edits active only in memory without
+        // offering to persist them. `finish!` is that shared path (a macro, not
+        // a closure, so its `return` exits `run` from either call site).
+        macro_rules! finish {
+            () => {{
+                // Esc on the save confirm is a supported "no" (`interact_opt` →
+                // `Ok(None)`); only a genuine I/O failure is `Err` and surfaces.
+                let save = if changes.any() {
+                    match Confirm::new()
+                        .with_prompt(format!("Save changes to {}?", config_path.display()))
+                        .default(true)
+                        .interact_opt()
+                    {
+                        Ok(save) => save.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    }
+                } else {
+                    false
+                };
+                if save {
+                    save_and_report(agent.config(), &mut changes, config_path, &mut notices);
+                }
+                return (notices, Ok(()));
+            }};
+        }
+        let selection = match Select::new().with_prompt("Select setting").items(&items).default(0).interact_opt() {
+            Ok(Some(selection)) => selection,
+            Ok(None) => finish!(),
+            Err(e) => return (notices, Err(e.into())),
+        };
         match selection {
             0 => {
                 let snapshot = recents.lock().unwrap().models().to_vec();
-                if let Some(spec) = pick_model_interactive(agent, &snapshot).await? {
-                    switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                // A genuine terminal I/O failure inside the picker is `Err` and
+                // must surface (not be read as "no model picked"); Esc maps to
+                // `Ok(None)` and is a plain skip.
+                match pick_model_interactive(agent, &snapshot).await {
+                    Ok(Some(spec)) => switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await,
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e)),
                 }
             }
             1 => {
-                if let Some(name) = edit_provider(agent)? {
+                // Surface a genuine I/O failure from the provider editor; Esc is
+                // `Ok(None)` (a skip). The rebuild-failure notice is retained and
+                // returned on every exit, so it is not lost on this error path.
+                let edit = match edit_provider(agent).await {
+                    Ok(Some(edit)) => edit,
+                    Ok(None) => continue,
+                    Err(e) => return (notices, Err(e)),
+                };
+                {
+                    let name = edit.name;
+                    // Keep only the LATEST rebuild outcome for this provider:
+                    // a prior failure notice for the same provider is now
+                    // resolved (the rebuild just succeeded) or superseded (it
+                    // failed again, with a fresher message), so drop it before
+                    // recording the new outcome.
+                    let stale = format!("Provider {name} saved, but could not rebuild the client:");
+                    notices.retain(|n| !n.starts_with(&stale));
+                    if let Some(notice) = edit.rebuild_notice {
+                        notices.push(notice);
+                    }
                     changes.providers.insert(name.clone());
-                    if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
+                    // Esc is a supported "no" here (`interact_opt` → `Ok(None)`);
+                    // only a genuine I/O failure is `Err` and must surface.
+                    let pick_now = match Confirm::new()
+                        .with_prompt(format!("Pick a model from {name} now?"))
+                        .default(true)
+                        .interact_opt()
+                    {
+                        Ok(pick) => pick.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    };
+                    if pick_now {
                         let (user, default_provider) = agent.config().effective_providers();
                         let all = providers::effective_providers(&user);
-                        if let Step::Done(spec) =
-                            pick_model_from_provider(&name, &all, &user, &default_provider).await?
-                        {
-                            switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                        match pick_model_from_provider(&name, &all, &user, &default_provider).await {
+                            Ok(Step::Done(spec)) => {
+                                switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await;
+                            }
+                            Ok(Step::Back) => {}
+                            Err(e) => return (notices, Err(e)),
                         }
                     }
                 }
             }
-            2 => edit_temperature(agent, &mut changes)?,
+            2 => {
+                match edit_temperature(agent, &mut changes) {
+                    Ok(()) => {}
+                    Err(e) => return (notices, Err(e)),
+                }
+            }
             3 => {
-                let value: i32 =
-                    Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
-                agent.config_mut().max_tokens = value;
-                changes.max_tokens = true;
+                match Input::<i32>::new()
+                    .with_prompt("Max tokens")
+                    .default(agent.config().max_tokens)
+                    .interact_text()
+                {
+                    Ok(value) => {
+                        agent.config_mut().max_tokens = value;
+                        changes.max_tokens = true;
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             4 => {
-                let value: usize = Input::new()
+                match Input::<usize>::new()
                     .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
-                    .interact_text()?;
-                agent.config_mut().max_iterations = value;
-                changes.max_iterations = true;
+                    .interact_text()
+                {
+                    Ok(value) => {
+                        agent.config_mut().max_iterations = value;
+                        changes.max_iterations = true;
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             5 => {
-                let value: String = Input::new()
+                match Input::<String>::new()
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
-                    .interact_text()?;
-                agent.set_system_prompt(&value)?;
-                changes.system_prompt = true;
+                    .interact_text()
+                {
+                    Ok(value) => {
+                    // `set_system_prompt` is atomic (it rolls its config change
+                    // back on failure), so on error the prompt is unchanged;
+                    // retain a notice since the dialog's own `println!` is wiped
+                    // by the exit redraw in frame mode. Keep only the LATEST
+                    // outcome: a prior failure notice is resolved by this
+                    // success (or superseded by a fresher failure), so drop it
+                    // first or the exit redraw would re-show a settled failure.
+                    const SYSTEM_PROMPT_NOTICE: &str = "Could not update the system prompt:";
+                    notices.retain(|n| !n.starts_with(SYSTEM_PROMPT_NOTICE));
+                    match agent.set_system_prompt(&value) {
+                        Ok(()) => changes.system_prompt = true,
+                        Err(e) => notices.push(format!("{SYSTEM_PROMPT_NOTICE} {e:#}")),
+                    }
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             6 => {
-                edit_context(agent)?;
-                changes.compaction = true;
+                match edit_context(agent) {
+                    Ok(()) => changes.compaction = true,
+                    Err(e) => return (notices, Err(e)),
+                }
             }
             7 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
-                let choice = Select::new().with_prompt("Verbosity").items(&labels).default(current).interact()?;
-                agent.config_mut().verbosity = levels[choice];
-                crate::ui::set_verbosity(levels[choice]);
-                changes.verbosity = true;
+                // Esc keeps the current setting (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Verbosity").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        agent.config_mut().verbosity = levels[choice];
+                        crate::ui::set_verbosity(levels[choice]);
+                        changes.verbosity = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             8 => {
                 let modes = crate::frame::RendererMode::ALL;
                 let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
                 let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                let choice = Select::new().with_prompt("Renderer").items(&labels).default(current).interact()?;
-                let previous = agent.config().renderer;
-                agent.config_mut().renderer = modes[choice];
-                changes.renderer = true;
-                if modes[choice] != previous {
-                    // The live renderer and the `frame_mode` branch in `main`
-                    // are fixed at startup, so a renderer switch only takes
-                    // effect on the next launch.
-                    println!(
-                        "Renderer set to {}. Restart nano-coder for it to take effect \
-                         (the active renderer is fixed for this session).",
-                        modes[choice]
-                    );
+                // Esc keeps the current renderer (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Renderer").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        let previous = agent.config().renderer;
+                        agent.config_mut().renderer = modes[choice];
+                        changes.renderer = true;
+                        if modes[choice] != previous {
+                            // The switch is applied live by `main` (which detects the
+                            // changed `renderer` after the dialog returns and flips the
+                            // frame renderer, the line editor, and the scroll region).
+                            println!("Renderer set to {} — taking effect now.", modes[choice]);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => save_and_report(agent.config(), &mut changes, config_path),
-            _ => {
-                if changes.any()
-                    && Confirm::new()
-                        .with_prompt(format!("Save changes to {}?", config_path.display()))
-                        .default(true)
-                        .interact()?
-                {
-                    save_and_report(agent.config(), &mut changes, config_path);
-                }
-                return Ok(());
-            }
+            9 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
+            // `Done` and Esc share the one completion path (`finish!`), so both
+            // offer to save when `changes.any()` before returning.
+            _ => finish!(),
         }
     }
 }
@@ -215,18 +335,39 @@ async fn switch_model(
     changes: &mut Changes,
     recents: &recents::SharedRecents,
     recents_path: &Path,
+    notices: &mut Vec<String>,
 ) {
     let previous = format!("{}/{}", agent.provider_name(), agent.model_name());
     match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
             record_switch(agent, &previous, recents, recents_path);
+            // A successful switch installs a fresh live client for the
+            // now-current provider, so any earlier "could not rebuild the
+            // client" failure notice for that same provider is stale: the
+            // client it warned about has now been rebuilt. Drop it, or the exit
+            // redraw would incorrectly warn the live client was not rebuilt.
+            let stale = format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
+            notices.retain(|n| !n.starts_with(&stale));
+            // The switch succeeded, so any earlier "Could not switch model:"
+            // failure from this same visit is now stale — the model it said
+            // could not be set is active. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not switch model:"));
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             if let Some(warning) = agent.temperature().warning {
                 println!("Warning: {warning}");
             }
         }
-        Err(e) => println!("Could not switch model: {e:#}"),
+        Err(e) => {
+            // Return the failure as a retained notice (not a `println!`): in
+            // frame mode the dialog's exit redraw (`frame_resize`) wipes a
+            // plain `println!`, so a failed model switch would vanish even
+            // though the session keeps the old model. Mirror the client-rebuild
+            // notice so `main` re-shows it through the renderer after the
+            // redraw.
+            notices.push(format!("Could not switch model: {e:#}"));
+        }
     }
 }
 
@@ -252,13 +393,22 @@ fn record_switch(agent: &Agent, previous: &str, recents: &recents::SharedRecents
     recents::save(recents_path, &guard);
 }
 
-fn save_and_report(config: &Config, changes: &mut Changes, path: &Path) {
+fn save_and_report(config: &Config, changes: &mut Changes, path: &Path, notices: &mut Vec<String>) {
     match save(config, changes, path) {
         Ok(()) => {
             *changes = Changes::default();
+            // The save succeeded, so any earlier "Could not save:" failure from
+            // this same visit is now stale — the configuration it said could
+            // not be persisted was written. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not save:"));
             println!("Saved to {}", path.display());
         }
-        Err(e) => println!("Could not save: {e:#}"),
+        // Return the failure as a retained notice (not a `println!`): in frame
+        // mode the dialog's exit redraw wipes a plain `println!`, so a failed
+        // save would vanish even though the edits were not persisted. Mirror
+        // the client-rebuild notice so `main` re-shows it after the redraw.
+        Err(e) => notices.push(format!("Could not save: {e:#}")),
     }
 }
 
@@ -496,8 +646,20 @@ async fn pick_model_from_provider(
     Ok(model_spec(name, &model))
 }
 
-/// Add a provider or edit an existing one. Returns its name.
-fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
+/// The result of adding/editing a provider: its name, plus a rebuild-failure
+/// notice to re-show through the renderer after the dialog's exit redraw (a
+/// plain `println!` is wiped by `frame_resize` in frame mode, and this warning
+/// — saved settings that no longer match the live client — must not be lost).
+struct ProviderEdit {
+    name: String,
+    rebuild_notice: Option<String>,
+}
+
+/// Add a provider or edit an existing one. Returns its name. When the edited
+/// provider is the one serving the current model, the live client is rebuilt
+/// so the running session immediately uses the new endpoint / key / model —
+/// the conversation is kept.
+async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     let (user, _) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut labels: Vec<String> = vec!["New provider".into()];
@@ -622,7 +784,47 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         format!("{kind:?}").to_lowercase(),
         updated.base_url.as_deref().unwrap_or("(from session token)")
     );
-    Ok(Some(name))
+    // Rebuild the live client when the edit touches the provider the session
+    // is actually using. That is broader than `provider_name() == name` (the
+    // provider the CURRENT client was built from): if the model spec is
+    // `work/foo` while `work` does not exist, the spec resolves to the default
+    // provider, so the old client names that default — yet adding `work` makes
+    // the SAME spec resolve to `work`. Rebuild when either side names the
+    // edited provider, or the next request would keep using the old endpoint.
+    // Resolve against the SAME table `Agent::client_for` builds from —
+    // `Config::effective_providers()` merges the legacy top-level credentials
+    // and flips a `mock` default to `openai` — not the raw provider table, or
+    // a bare model resolves to a different provider than the client uses and
+    // the guard rebuilds the wrong one.
+    let resolves_to_edited = {
+        let config = agent.config();
+        let (user, default_provider) = config.effective_providers();
+        // Overlay the built-in presets the way `Agent::client_for` does (via
+        // `providers::build_client` -> `resolve`), so a spec naming an
+        // unmodified preset (e.g. `anthropic/...`) resolves to that preset
+        // here too, not a spurious fallback to the default provider.
+        let providers = providers::effective_providers(&user);
+        providers::parse_model_spec(&config.model, &providers, &default_provider).0 == name
+    };
+    if agent.provider_name() == name || resolves_to_edited {
+        // The edited provider serves the current model: rebuild the client so
+        // the running session uses the new endpoint / key / model at once.
+        match agent.refresh_client().await {
+            Ok(()) => println!("Rebuilt the session's client for {name}."),
+            // A rebuild FAILURE — the one notice the user must not miss, since
+            // the saved settings no longer match the live client — is returned
+            // for `main` to re-show through the renderer after the dialog's
+            // exit redraw. It is NOT printed here: in frame mode a plain
+            // `println!` is wiped by `frame_resize`, and in legacy mode (where
+            // `frame_resize` is a no-op) printing here too would show the same
+            // warning twice — once inline and once via the retained notice.
+            Err(e) => {
+                let notice = format!("Provider {name} saved, but could not rebuild the client: {e:#}");
+                return Ok(Some(ProviderEdit { name, rebuild_notice: Some(notice) }));
+            }
+        }
+    }
+    Ok(Some(ProviderEdit { name, rebuild_notice: None }))
 }
 
 /// The user entry to store for an edited provider: the existing entry with
@@ -985,6 +1187,51 @@ mod tests {
     }
 
     #[test]
+    fn edited_provider_resolution_detects_a_spec_that_newly_resolves_to_it() {
+        // Advisory: the rebuild guard `provider_name() == name` checks the
+        // provider the CURRENT client was built from. With `config.model =
+        // "work/foo"` while `work` is absent, that spec resolves to the
+        // DEFAULT provider — so the old guard skips the rebuild even though
+        // adding `work` makes the SAME spec resolve to `work`. The fix keys the
+        // rebuild off the post-edit resolution too; this pins that resolution.
+        let spec = "work/foo";
+        // Before `work` exists: the spec falls back to the default provider.
+        let before = providers(&["anthropic", "openai"]);
+        assert_eq!(providers::parse_model_spec(spec, &before, "anthropic").0, "anthropic");
+        // After `work` is added: the same spec now resolves to `work`.
+        let after = providers(&["anthropic", "openai", "work"]);
+        assert_eq!(providers::parse_model_spec(spec, &after, "anthropic").0, "work");
+        // So a rebuild is required when the edited provider is `work`, even
+        // though the running client's `provider_name()` is still "anthropic".
+        let edited = "work";
+        let old_guard_would_skip = "anthropic" == edited; // provider_name() == name
+        let resolves_to_edited = providers::parse_model_spec(spec, &after, "anthropic").0 == edited;
+        assert!(!old_guard_would_skip, "the old guard misses the resolution change");
+        assert!(resolves_to_edited, "the resolution check catches it");
+    }
+
+    #[test]
+    fn edited_provider_resolution_uses_the_effective_provider_table() {
+        // Advisory: the rebuild guard must resolve the model against the SAME
+        // table `Agent::client_for` builds from — `Config::effective_providers()`
+        // — not the raw `[providers]` table. With legacy top-level credentials
+        // and `default_provider = "mock"`, the effective default flips to
+        // `openai`, so a bare model actually uses `openai`: editing `mock` must
+        // NOT trigger a rebuild (the raw table would wrongly say it does).
+        let config = crate::config::Config {
+            api_key: Some("sk-test".to_string()), // legacy top-level credential
+            ..crate::config::Config::default()    // default_provider = "mock"
+        };
+        let (providers, default) = config.effective_providers();
+        assert_eq!(default, "openai", "legacy credentials flip a mock default to openai");
+        let providers: std::collections::BTreeMap<_, _> = providers.into_iter().collect();
+        // A bare model resolves to the EFFECTIVE default (openai), not mock.
+        assert_eq!(providers::parse_model_spec(&config.model, &providers, &default).0, "openai");
+        // So editing `mock` does not resolve to the edited provider — no rebuild.
+        assert_ne!(providers::parse_model_spec(&config.model, &providers, &default).0, "mock");
+    }
+
+    #[test]
     fn model_choice_maps_rows_to_steps() {
         let models = vec!["alpha".to_string(), "beta".to_string()];
         assert_eq!(model_choice(None, &models), Step::Back, "Esc steps back");
@@ -1155,5 +1402,21 @@ mod tests {
         let resolved = providers::resolve("openai/gpt", &[("openai".to_string(), entry)].into(), "openai").unwrap();
         assert_eq!(merged.api_key_env.as_deref(), Some(""));
         assert_eq!(resolved.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn a_successful_save_clears_an_earlier_save_failure_notice() {
+        // A failed save queues a "Could not save:" notice; a retry that succeeds
+        // in the same visit must drop it, or the exit redraw warns about a
+        // failure the retry already resolved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config::default();
+        let mut notices = vec!["Could not save: earlier disk error".to_string()];
+        let mut changes = Changes { model: true, ..Changes::default() };
+        save_and_report(&config, &mut changes, &path, &mut notices);
+        assert!(notices.iter().all(|n| !n.starts_with("Could not save:")), "stale save notice survived: {notices:?}");
+        assert!(path.exists(), "successful save did not write the config");
+        assert!(!changes.any(), "successful save must reset the change flags");
     }
 }
