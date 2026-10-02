@@ -354,9 +354,18 @@ impl Renderer {
     ///
     /// No-op in frame mode or when nothing was captured. Goes through `out()`
     /// so a partial streamed line is ended first.
+    ///
+    /// Lock order is `frame` → `state`, matching `set_mode`, `event`,
+    /// `urgent_note` and `clear_screen`: the `frame` guard is acquired FIRST
+    /// and held for the whole replay. Taking `state` first here while a legacy
+    /// writer holds `frame` and waits on `state` would deadlock the two
+    /// threads; holding `frame` throughout is self-deadlock-safe because the
+    /// replay only writes through `out()`/`newline()`/`tool_result()`, none of
+    /// which lock `frame` again.
     pub fn replay_transcript(&self) {
+        let frame = self.frame.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        if self.frame.lock().unwrap().is_some() || state.transcript.is_empty() {
+        if frame.is_some() || state.transcript.is_empty() {
             return;
         }
         // Replay even in quiet mode. Leaving the frame clears the screen AND
@@ -388,7 +397,7 @@ impl Renderer {
         let stamp = &si.stamp;
         match &si.item {
             Item::Message { role, text } => {
-                let text = crate::sanitize_terminal_text(text);
+                let text = crate::frame::sanitize_replay(text);
                 let text = text.trim_end();
                 if text.trim().is_empty() {
                     return;
@@ -420,7 +429,7 @@ impl Renderer {
             }
             Item::ToolResult { ok, output, verbose } => {
                 self.newline(state);
-                let output = crate::sanitize_terminal_text(output);
+                let output = crate::frame::sanitize_replay(output);
                 // Format from the verbosity captured WITH the result, not the
                 // current global: if the user changed verbosity and renderer in
                 // the same settings visit, replaying with today's verbosity would
@@ -437,12 +446,12 @@ impl Renderer {
             }
             Item::Note(text) | Item::OutcomeMark(text) => {
                 self.newline(state);
-                let text = crate::sanitize_terminal_text(text);
+                let text = crate::frame::sanitize_replay(text);
                 self.out(state, &format!("{stamp}{DIM}{}{RESET}\n", text.trim_end()));
             }
             Item::Output(text) => {
                 self.newline(state);
-                let text = crate::sanitize_terminal_text(text);
+                let text = crate::frame::sanitize_replay(text);
                 self.out(state, &format!("{}\n", text.trim_end()));
             }
             // Byte-exact, unstyled, untrimmed, UNSANITIZED: the export must
@@ -1500,6 +1509,49 @@ mod tests {
         );
         r.replay_transcript();
         assert!(r.pending_transcript().is_empty(), "replayed after the clear");
+    }
+
+    #[test]
+    fn replay_transcript_locks_frame_before_state() {
+        // `replay_transcript` must use the canonical `frame` → `state` lock
+        // order (the order `set_mode`, `event`, `urgent_note` and
+        // `clear_screen` all use). A reader holding `state` and waiting on
+        // `frame` must NOT block the replay: with the correct order the replay
+        // acquires `frame` first and never waits on `state` while holding it,
+        // so it completes even while `state` is held elsewhere. With the OLD
+        // (`state` → `frame`) order this replay would deadlock against the
+        // `state`-holder below; the channel + timeout turn that deadlock into a
+        // test failure instead of a hang.
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::UserMessage { text: "hi" });
+        r.set_mode(crate::frame::RendererMode::Legacy);
+        assert!(!r.pending_transcript().is_empty(), "transcript captured");
+
+        // Hold `state` on another thread (simulating a legacy writer mid-
+        // `out()`), then run the replay; it must still finish.
+        let holder = std::thread::spawn({
+            let r = Arc::clone(&r);
+            move || {
+                let _guard = r.state.lock().unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(20)); // let the holder win `state`
+        let (tx, rx) = mpsc::channel();
+        let replay = std::thread::spawn({
+            let r = Arc::clone(&r);
+            move || {
+                r.replay_transcript();
+                tx.send(()).unwrap();
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("replay_transcript deadlocked: it must lock frame before state");
+        replay.join().unwrap();
+        holder.join().unwrap();
+        assert!(r.pending_transcript().is_empty(), "replayed during the transition");
     }
 
     #[test]

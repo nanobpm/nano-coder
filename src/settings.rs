@@ -154,7 +154,7 @@ pub async fn run(
                     false
                 };
                 if save {
-                    save_and_report(agent.config(), &mut changes, config_path);
+                    save_and_report(agent.config(), &mut changes, config_path, &mut notices);
                 }
                 return (notices, Ok(()));
             }};
@@ -321,7 +321,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => save_and_report(agent.config(), &mut changes, config_path),
+            9 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
             // `Done` and Esc share the one completion path (`finish!`), so both
             // offer to save when `changes.any()` before returning.
             _ => finish!(),
@@ -355,7 +355,15 @@ async fn switch_model(
                 println!("Warning: {warning}");
             }
         }
-        Err(e) => println!("Could not switch model: {e:#}"),
+        Err(e) => {
+            // Return the failure as a retained notice (not a `println!`): in
+            // frame mode the dialog's exit redraw (`frame_resize`) wipes a
+            // plain `println!`, so a failed model switch would vanish even
+            // though the session keeps the old model. Mirror the client-rebuild
+            // notice so `main` re-shows it through the renderer after the
+            // redraw.
+            notices.push(format!("Could not switch model: {e:#}"));
+        }
     }
 }
 
@@ -381,13 +389,17 @@ fn record_switch(agent: &Agent, previous: &str, recents: &recents::SharedRecents
     recents::save(recents_path, &guard);
 }
 
-fn save_and_report(config: &Config, changes: &mut Changes, path: &Path) {
+fn save_and_report(config: &Config, changes: &mut Changes, path: &Path, notices: &mut Vec<String>) {
     match save(config, changes, path) {
         Ok(()) => {
             *changes = Changes::default();
             println!("Saved to {}", path.display());
         }
-        Err(e) => println!("Could not save: {e:#}"),
+        // Return the failure as a retained notice (not a `println!`): in frame
+        // mode the dialog's exit redraw wipes a plain `println!`, so a failed
+        // save would vanish even though the edits were not persisted. Mirror
+        // the client-rebuild notice so `main` re-shows it after the redraw.
+        Err(e) => notices.push(format!("Could not save: {e:#}")),
     }
 }
 

@@ -505,6 +505,34 @@ fn sanitize(line: &str) -> String {
     out
 }
 
+/// Sanitize one captured transcript field for the legacy replay on a frame →
+/// legacy switch, sharing the frame layout's per-line rules so the reprinted
+/// text matches what the frame showed. Unlike
+/// [`crate::sanitize_terminal_text`] — which deletes `\t` outright and strips
+/// only the ESC byte (leaving a literal `[32m` fragment behind) — this expands
+/// tabs to spaces (8-stop) and keeps SGR styling sequences, so a replayed
+/// `read_file` result keeps its indentation and a styled line keeps its colour
+/// instead of degrading to `[32mhello[0m`. Newlines are kept (a transcript
+/// field is multi-line content), the U+2028/U+2029 forged-line-break protection
+/// is preserved, and every other cursor/erase/OSC escape and C0/C1/DEL control
+/// is dropped so model/tool-controlled text cannot move the legacy cursor or
+/// clear the screen. `Item::Raw` exports do NOT come here — they stay
+/// byte-exact.
+pub(crate) fn sanitize_replay(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.split('\n') {
+        // `sanitize` expands tabs and keeps SGR styling but drops every
+        // control, `\n` included; re-add the line feed between logical lines.
+        out.push_str(&sanitize(line));
+        out.push('\n');
+    }
+    out.pop(); // drop the trailing newline `split` does not imply
+    // `sanitize` keeps control chars it has a rule for; U+2028/U+2029 are not
+    // control chars, so strip the forged line breaks here to match
+    // `sanitize_terminal_text`.
+    out.chars().filter(|c| *c != '\u{2028}' && *c != '\u{2029}').collect()
+}
+
 /// Wrap one logical line to `width` visible columns, preserving ANSI escape
 /// sequences (they take no columns) and breaking on spaces where possible.
 fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
@@ -829,6 +857,31 @@ mod tests {
         assert!("fancy".parse::<RendererMode>().is_err());
         assert_eq!(RendererMode::default(), RendererMode::Frame);
         assert_eq!(RendererMode::Frame.to_string(), "frame");
+    }
+
+    #[test]
+    fn sanitize_replay_expands_tabs_and_keeps_sgr_styling() {
+        // A replayed `read_file` result keeps its tab indentation (expanded to
+        // the next 8-stop) instead of losing it, and a styled line keeps its
+        // SGR colour instead of degrading to a literal `[32m` fragment.
+        // `"     1"` is 7 visible columns, so the tab adds 2 spaces (7 → 8).
+        assert_eq!(sanitize_replay("     1\treturn 1"), "     1  return 1");
+        assert_eq!(sanitize_replay("\x1b[32mhello\x1b[0m"), "\x1b[32mhello\x1b[0m");
+        assert_eq!(sanitize_replay("\thello"), "        hello");
+    }
+
+    #[test]
+    fn sanitize_replay_keeps_newlines_but_drops_cursor_erase_and_controls() {
+        // Newlines are multi-line content to keep; cursor/erase CSI and stray
+        // C0 controls are dropped so replayed text cannot move the legacy
+        // cursor or clear the screen. This shares `frame::sanitize`, which only
+        // special-cases CSI escapes — matching exactly what the frame displayed.
+        assert_eq!(sanitize_replay("line one\nline two"), "line one\nline two");
+        assert_eq!(sanitize_replay("a\x1b[2Jb"), "ab");
+        assert_eq!(sanitize_replay("a\x1b[Hb"), "ab");
+        assert_eq!(sanitize_replay("a\x07\x08b"), "ab");
+        // The forged-line-break protection matches `sanitize_terminal_text`.
+        assert_eq!(sanitize_replay("a\u{2028}b\u{2029}c"), "abc");
     }
 
     #[test]
