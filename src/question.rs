@@ -252,10 +252,15 @@ pub fn result_text(questions: &[Question], answer: &QuestionAnswer) -> String {
                 .map(|(i, q)| {
                     let answer =
                         answers.get(i).filter(|a| !a.is_empty()).cloned().unwrap_or_else(|| "Unanswered".into());
+                    // Single-line quoted fields in a comma-joined summary: use
+                    // the single-line sanitizer so an embedded newline in the
+                    // question or answer cannot spill the selected answer into a
+                    // hidden continuation line (the tool-result preview shows
+                    // only the first line in normal verbosity).
                     format!(
                         "\"{}\"=\"{}\"",
-                        crate::sanitize_terminal_text(&q.question),
-                        crate::sanitize_terminal_text(&answer)
+                        crate::sanitize_terminal_line(&q.question),
+                        crate::sanitize_terminal_line(&answer)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -375,6 +380,23 @@ mod tests {
         assert!(answered.contains("\"pick[2Jone\"=\"answer\""), "{answered}");
         assert!(!answered.contains('\x1b'), "escape leaked: {answered:?}");
         assert!(!answered.contains('\x07'), "control leaked: {answered:?}");
+    }
+
+    #[test]
+    fn result_text_strips_newlines_from_quoted_question_and_answer() {
+        // Regression: the quoted "q"="a" fields are a single logical line in a
+        // comma-joined summary, so a newline must be dropped (not retained like
+        // multiline transcript content) or the answer disappears into a hidden
+        // continuation line in the first-line tool-result preview.
+        let questions = vec![Question {
+            question: "line1\nline2".into(),
+            header: String::new(),
+            options: vec![],
+            custom: true,
+        }];
+        let answered = result_text(&questions, &QuestionAnswer::Answers(vec!["ans\nwer".into()]));
+        assert!(answered.contains("\"line1line2\"=\"answer\""), "{answered}");
+        assert!(!answered.contains('\n'), "newline leaked: {answered:?}");
     }
 
     #[tokio::test]
