@@ -466,14 +466,24 @@ fn sanitize(line: &str) -> String {
                 let mut seq = String::from(c);
                 seq.push(chars.next().unwrap()); // '['
                 let mut final_byte = None;
+                // Only a well-formed SGR sequence may be replayed verbatim.
+                // Parameter bytes before the final `m` must be digits, `;` or
+                // `:`; anything else (an embedded `\r`, ESC, or cursor-control
+                // byte smuggled into `\x1b[\r31m`) makes this malformed, and
+                // keeping it would let that control execute during replay and
+                // overwrite earlier content. Reject the whole sequence.
+                let mut valid_params = true;
                 while let Some(&n) = chars.peek() {
                     seq.push(chars.next().unwrap());
                     if ('@'..='~').contains(&n) {
                         final_byte = Some(n);
                         break;
                     }
+                    if !(n.is_ascii_digit() || n == ';' || n == ':') {
+                        valid_params = false;
+                    }
                 }
-                if final_byte == Some('m') {
+                if valid_params && final_byte == Some('m') {
                     out.push_str(&seq);
                 }
             }
@@ -882,6 +892,21 @@ mod tests {
         assert_eq!(sanitize_replay("a\x07\x08b"), "ab");
         // The forged-line-break protection matches `sanitize_terminal_text`.
         assert_eq!(sanitize_replay("a\u{2028}b\u{2029}c"), "abc");
+    }
+
+    #[test]
+    fn sanitize_replay_rejects_malformed_sgr_parameters() {
+        // A CSI sequence that ends in `m` but hides a control byte in its
+        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT be replayed: the
+        // embedded CR would execute during replay and let model/tool output
+        // overwrite earlier content. Only digits, `;` and `:` are valid SGR
+        // params, so the whole malformed sequence is dropped.
+        assert_eq!(sanitize_replay("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
+        assert_eq!(sanitize_replay("a\x1b[31\x08mb"), "ab");
+        // A space (an SGR intermediate byte, not a parameter byte) is rejected.
+        assert_eq!(sanitize_replay("a\x1b[31 mb"), "ab");
+        // A real, well-formed SGR sequence with digits/`;`/`:` still survives.
+        assert_eq!(sanitize_replay("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
     }
 
     #[test]
