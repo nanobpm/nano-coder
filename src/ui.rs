@@ -557,17 +557,22 @@ impl Renderer {
                     None => {}
                 }
                 fs.think_streamed = false;
-                // Cache the full reasoning for legacy Ctrl-O. The frame keeps
-                // only the collapsed char count (`Item::Thinking`), discarding
-                // the text, and frame events never reach `finish_thinking` — so
+                // Cache the reasoning for legacy Ctrl-O. The frame keeps only
+                // the collapsed char count (`Item::Thinking`), discarding the
+                // text, and frame events never reach `finish_thinking` — so
                 // without this a frame → legacy switch leaves Ctrl-O reporting
                 // "no thinking yet" (or expanding a stale legacy turn) even
-                // though reasoning just ran. `event()` already holds `frame`
-                // here, and `set_mode` establishes the `frame` → `state` lock
-                // order, so taking `state` to store the text is deadlock-free.
-                let trimmed = text.trim();
+                // though reasoning just ran. Unlike the legacy path, the frame
+                // never displayed this text, so it is raw model-controlled
+                // input: sanitize it before caching, because `toggle_thinking`
+                // writes the cache straight through `out()` and would otherwise
+                // let cursor/erase/OSC escapes reach the real terminal on
+                // expand. `event()` already holds `frame` here, and `set_mode`
+                // establishes the `frame` → `state` lock order, so taking
+                // `state` to store the text is deadlock-free.
+                let trimmed = crate::sanitize_terminal_text(text.trim());
                 if !trimmed.is_empty() {
-                    self.state.lock().unwrap().last_thinking = trimmed.to_string();
+                    self.state.lock().unwrap().last_thinking = trimmed;
                 }
                 // Do NOT reset `fs.stream` here: a streamed assistant message
                 // may already be in flight (reasoning can arrive after the
@@ -827,6 +832,14 @@ impl Renderer {
             fs.think = None;
             fs.out.invalidate();
             self.frame_render(fs);
+            // A fresh session must not keep the previous session's reasoning
+            // cache: `frame_event` now stores reasoning into `last_thinking`,
+            // so without this a `/restart` in frame mode leaves the prior
+            // session's thinking expandable via legacy Ctrl-O. The legacy
+            // branch below resets the whole `State`; mirror that here. Lock
+            // order `frame` → `state` matches `set_mode`.
+            let mut state = self.state.lock().unwrap();
+            *state = State { at_line_start: true, ..Default::default() };
             return;
         }
         match &self.status {
@@ -1683,6 +1696,31 @@ mod tests {
         // A later reasoning block supersedes the earlier one.
         r.event(&AgentEvent::Thinking { text: "a second, newer thought" });
         assert_eq!(r.cached_last_thinking(), "a second, newer thought");
+    }
+
+    #[test]
+    fn frame_thinking_cache_is_sanitized_before_storing() {
+        let r = Renderer::frame_for_test();
+        // The frame renders reasoning collapsed (char count only), so this text
+        // is never displayed before caching — it is raw model-controlled input.
+        // Ctrl-O writes the cache straight through `out()`, so escapes must be
+        // stripped at cache time or a frame → legacy expand would inject them.
+        r.event(&AgentEvent::Thinking { text: "plan\x1b[2J\x1b[32mOK\x1b[0m\x07 done" });
+        let cached = r.cached_last_thinking();
+        assert!(!cached.contains('\x1b'), "escape survived caching: {cached:?}");
+        assert!(!cached.contains('\x07'), "control char survived caching: {cached:?}");
+        assert_eq!(cached, "plan[2J[32mOK[0m done");
+    }
+
+    #[test]
+    fn clear_screen_in_frame_mode_resets_cached_reasoning() {
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::Thinking { text: "prior session reasoning" });
+        assert_eq!(r.cached_last_thinking(), "prior session reasoning");
+        // `/restart` calls clear_screen; the frame branch must clear the shared
+        // reasoning cache too, or the prior session's thinking stays expandable.
+        r.clear_screen();
+        assert!(r.cached_last_thinking().is_empty(), "reasoning survived /restart");
     }
 
     #[test]
