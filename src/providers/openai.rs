@@ -426,7 +426,14 @@ impl LLMClient for OpenAiClient {
 }
 
 /// Per-request timeout for context-window probes.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The most serial requests `detect_capabilities` chains: `/models` and then at
+/// most one follow-up (`/props`, `/api/show`, `/api/v0/models`, or the
+/// concurrent Ollama `/api/ps`+`/api/show` join, which counts as one). The
+/// caller's overall cap must exceed `MAX_PROBE_CHAIN × PROBE_TIMEOUT` so a
+/// window already found by the first request survives a slow optional follow-up.
+pub(crate) const MAX_PROBE_CHAIN: u32 = 2;
 
 /// Ask an OpenAI-compatible endpoint for the loaded model's context window.
 ///

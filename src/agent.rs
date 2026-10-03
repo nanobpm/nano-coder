@@ -530,8 +530,16 @@ const TITLE_PROMPT: &str = "You name coding-assistant sessions. Reply with a tit
 that says what the user is working on, from their requests below. Reply with the title only: no quotes, \
 no trailing period.";
 
-/// Upper bound on context-window detection at startup and model switches.
-const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Backstop for the whole capability probe (window + thinking), which is a
+/// serial chain of at most [`providers::openai::MAX_PROBE_CHAIN`] requests each
+/// already bounded by `providers::openai::PROBE_TIMEOUT`. This outer cap must
+/// exceed that serial budget, else it would fire mid-chain and discard a window
+/// the first request already detected when an optional follow-up (e.g. the
+/// thinking probe) is slow; sized above it, it only trips if a single request
+/// ignores its own timeout. The `+ 2s` is scheduling/connection margin.
+const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    providers::openai::MAX_PROBE_CHAIN as u64 * providers::openai::PROBE_TIMEOUT.as_secs() + 2,
+);
 
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {

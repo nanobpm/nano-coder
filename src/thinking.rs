@@ -803,8 +803,19 @@ pub fn resolve_with(
                     // the wire, so it is no override at all — treating it as one
                     // would claim a control is sent that was removed. Let the
                     // generated-field drop logic below report the real outcome.
-                    body.contains_key(**k)
-                        && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k))
+                    let present = body.contains_key(**k)
+                        && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k));
+                    // On Anthropic Messages a key overrides the generated
+                    // thinking control only when it actually carries one: a
+                    // format-only `output_config` (no `effort`) is a
+                    // structured-output setting, not a thinking override, so it
+                    // must not suppress the requested level. `finish_body` then
+                    // deep-merges it with the generated `output_config.effort`
+                    // so both coexist. Every other key (and `thinking`) is a
+                    // thinking control whenever present.
+                    present
+                        && (wire != Wire::AnthropicMessages
+                            || body.get(**k).and_then(|v| anthropic_extra_body_thinks(k, v)).is_some())
                 })
             })
             .map(|key| key.to_string())
@@ -1211,6 +1222,32 @@ mod tests {
         let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
         assert_eq!(r.extra_body_thinking_on, Some(true), "the thinking control still enables thinking");
         assert!(r.anthropic_thinking_on());
+    }
+
+    #[test]
+    fn format_only_output_config_does_not_override_a_requested_level() {
+        // A format-only `output_config` (no `effort`) is a structured-output
+        // setting, not a thinking override: it must NOT suppress a requested
+        // level. The generated adaptive `output_config.effort` and the
+        // `format` coexist (merged by `finish_body`). Regression: the override
+        // was classified by key presence alone, so a format-only `output_config`
+        // set `overridden`, made `request()` return `None`, and silently dropped
+        // the thinking control. (claude-sonnet-4-7 is adaptive and off-capable.)
+        let anthropic = Some(ProviderKind::Anthropic);
+        let p = provider(r#"extra_body = { output_config = { format = "json" } }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-7");
+        assert!(!r.overridden, "a format-only output_config is not a thinking override");
+        assert_eq!(r.extra_body_override, None);
+        assert_eq!(r.request(), Some(Request::Effort("high".into())), "the requested level is still emitted");
+        assert_eq!(r.warning, None, "no override warning for a non-thinking output_config");
+
+        // An `effort` field IS a thinking override and still suppresses the
+        // generated control (the override owns the thinking decision).
+        let p = provider(r#"extra_body = { output_config = { effort = "low", format = "json" } }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-7");
+        assert!(r.overridden, "an effort-bearing output_config overrides the generated level");
+        assert_eq!(r.extra_body_override.as_deref(), Some("output_config"));
+        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
     }
 
     #[test]
