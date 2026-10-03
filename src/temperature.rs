@@ -171,7 +171,18 @@ impl Resolved {
         }
         let warning = match (self.effective, self.source) {
             (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
-                Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", self.source.label()))
+                let ignored = format!(
+                    "temperature {v} ({}) is ignored: {reason}; using the model default",
+                    self.source.label()
+                );
+                // An unrelated non-finite `extra_body` diagnostic (the value
+                // came from the model/provider, not extra_body) stays true once
+                // the temperature is dropped, so keep it alongside the ignored
+                // warning rather than silently losing it.
+                Some(match self.extra_body_warning {
+                    Some(eb) => format!("{eb}; {ignored}"),
+                    None => ignored,
+                })
             }
             // A global value, or one already `Default`: the "sending N" range
             // warning no longer applies (nothing is sent), so only the
@@ -247,7 +258,16 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
         // must survive this early return rather than be silently dropped.
         let warning = match (effective, source) {
             (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
-                Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", source.label()))
+                let ignored =
+                    format!("temperature {v} ({}) is ignored: {reason}; using the model default", source.label());
+                // A non-finite `extra_body` override carries its own warning
+                // (the chosen value came from the model/provider, so the value
+                // ignored here is unrelated); keep both rather than dropping the
+                // non-finite diagnostic.
+                Some(match extra_body_warning {
+                    Some(eb) => format!("{eb}; {ignored}"),
+                    None => ignored,
+                })
             }
             _ => extra_body_warning,
         };
@@ -390,6 +410,14 @@ mod tests {
         let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
         assert_eq!((r.value(), r.source), (None, Source::Required));
         assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
+        // The chosen value coming from the provider/model (not global) must not
+        // swallow the non-finite diagnostic: both warnings survive the drop.
+        let p = provider("temperature = 0.5\ndrop_params = [\"temperature\"]\nextra_body = { temperature = nan }\n");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
+        assert_eq!((r.value(), r.source), (None, Source::Required));
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
+        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
     }
 
     #[test]
@@ -490,5 +518,16 @@ mod tests {
         let warning = r.warning.as_deref().unwrap();
         assert!(warning.contains("not finite"), "{warning}");
         assert!(!warning.contains("sending 1"), "the stale clamp clause must not leak: {warning}");
+
+        // When the chosen value comes from the provider/model, dropping it
+        // reports it as ignored AND keeps the unrelated non-finite diagnostic —
+        // the first match arm must not swallow the extra_body warning.
+        let p = provider("temperature = 0.5\nextra_body = { temperature = nan }\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6")
+            .fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        assert_eq!(r.value(), None);
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
+        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
     }
 }
