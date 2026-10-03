@@ -839,15 +839,18 @@ impl Agent {
     }
 
     /// Ask the endpoint for the model's context window (unless config sets
-    /// it) and the thinking levels it supports.
+    /// it) and the thinking levels it supports. Both are probed together so a
+    /// server whose window and thinking detections read the same response
+    /// (OpenAI-compatible `/models`, llama.cpp `/props`, Ollama `/api/show`)
+    /// is not queried twice serially.
     pub async fn detect_context_window(&mut self) {
         self.detected_window = None;
+        let probe = self.client.detect_capabilities();
+        let (window, thinking) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         if self.configured_window().is_none() {
-            let probe = self.client.detect_context_window();
-            self.detected_window = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+            self.detected_window = window;
         }
-        let probe = self.client.detect_thinking_levels();
-        self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+        self.reported_thinking = thinking;
         self.refresh_stats();
     }
 

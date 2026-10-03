@@ -356,6 +356,16 @@ pub trait LLMClient: Send + Sync {
     async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
         None
     }
+    /// The window and thinking levels the endpoint reports, probed together.
+    ///
+    /// The default probes each on its own; a provider whose two detections
+    /// would fetch the same endpoint response (OpenAI-compatible servers probe
+    /// `/models`, then llama.cpp `/props` or Ollama `/api/show` for both)
+    /// overrides this to share one fetch, so a slow or unavailable endpoint is
+    /// not probed twice serially.
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+        (self.detect_context_window().await, self.detect_thinking_levels().await)
+    }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
     /// The provider API kind this client speaks. `None` for test doubles that

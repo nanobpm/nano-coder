@@ -385,6 +385,10 @@ impl LLMClient for OpenAiClient {
         detect_thinking(&self.transport).await
     }
 
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+        detect_capabilities(&self.transport).await
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.transport.provider();
         let mut request = self.transport.http().get(format!("{}/models", provider.base_url));
@@ -507,15 +511,77 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
             .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length"));
     }
     if server == Server::Ollama {
-        return ollama_window(transport, root, model).await;
+        return ollama_window(transport, root, model).await.0;
     }
     None
 }
 
+/// Probe the endpoint for both the context window and the thinking levels in
+/// one pass. Both detections need the same `/models` list to identify the
+/// server, and both then query the same server-specific endpoint (llama.cpp
+/// `/props`, Ollama `/api/show`), so fetching each once and deriving both
+/// halves keeps a slow or unavailable endpoint from being probed twice
+/// serially at startup or on a model switch.
+pub(crate) async fn detect_capabilities(
+    transport: &HttpTransport,
+) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    let server = identify(&provider.name, root, entry);
+    match server {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            let props = probe(transport, reqwest::Method::GET, &url, None).await;
+            let window = props
+                .as_ref()
+                .and_then(|p| p.pointer("/default_generation_settings/n_ctx").or_else(|| p.get("n_ctx")))
+                .and_then(as_tokens)
+                .map(|tokens| DetectedWindow::total(tokens, "llama.cpp /props n_ctx"));
+            // A window listed directly on the `/models` entry wins over /props.
+            let window = entry.and_then(window_in_entry).or(window);
+            let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
+            (window, thinking)
+        }
+        Server::Ollama => {
+            let (window, show) = match entry.and_then(window_in_entry) {
+                Some(found) => {
+                    // The window came from `/models`; only thinking needs /api/show.
+                    let url = format!("{root}/api/show");
+                    let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
+                    (Some(found), show)
+                }
+                None => ollama_window(transport, root, model).await,
+            };
+            let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
+            (window, thinking)
+        }
+        Server::LmStudio => {
+            let window = match entry.and_then(window_in_entry) {
+                Some(found) => Some(found),
+                None => probe(transport, reqwest::Method::GET, &format!("{root}/api/v0/models"), None)
+                    .await
+                    .as_ref()
+                    .and_then(|listed| model_entry(listed, model))
+                    .and_then(|m| m.get("loaded_context_length"))
+                    .and_then(as_tokens)
+                    .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length")),
+            };
+            (window, None)
+        }
+        Server::Other => (entry.and_then(window_in_entry), None),
+    }
+}
+
 /// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from the
 /// model's parameters. The model's maximum (`model_info`) is not used: Ollama
-/// runs with a smaller default unless `num_ctx` says otherwise.
-async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Option<DetectedWindow> {
+/// runs with a smaller default unless `num_ctx` says otherwise. Returns the
+/// window alongside the `/api/show` response (probed here once) so the caller
+/// can derive the thinking levels from it without a second fetch.
+async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> (Option<DetectedWindow>, Option<Value>) {
     let same = |name: &str| name == model || name.strip_suffix(":latest") == Some(model);
     if let Some(ps) = probe(transport, reqwest::Method::GET, &format!("{root}/api/ps"), None).await {
         let loaded = ps
@@ -525,16 +591,26 @@ async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> Op
             .flatten()
             .find(|m| ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same)));
         if let Some(tokens) = loaded.and_then(|m| m.get("context_length")).and_then(as_tokens) {
-            return Some(DetectedWindow::total(tokens, "Ollama /api/ps context_length"));
+            let window = DetectedWindow::total(tokens, "Ollama /api/ps context_length");
+            // Still probe /api/show so the caller can read the thinking levels.
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
+            return (Some(window), show);
         }
     }
-    let show =
-        probe(transport, reqwest::Method::POST, &format!("{root}/api/show"), Some(json!({ "model": model }))).await?;
-    let parameters = show.get("parameters").and_then(Value::as_str)?;
-    parameters
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse::<usize>().ok().filter(|&n| n > 0))
-        .map(|tokens| DetectedWindow::total(tokens, "Ollama num_ctx"))
+    let url = format!("{root}/api/show");
+    let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
+    let window = show
+        .as_ref()
+        .and_then(|s| s.get("parameters"))
+        .and_then(Value::as_str)
+        .and_then(|parameters| {
+            parameters
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("num_ctx")?.trim().parse::<usize>().ok().filter(|&n| n > 0))
+        })
+        .map(|tokens| DetectedWindow::total(tokens, "Ollama num_ctx"));
+    (window, show)
 }
 
 async fn probe(transport: &HttpTransport, method: reqwest::Method, url: &str, body: Option<Value>) -> Option<Value> {
@@ -1243,5 +1319,51 @@ mod tests {
         assert_eq!(paths, ["/v1/models"], "unknown servers get no extra probes");
         let (found, _) = detect("hosted", vec![(404, "", "{}".into())]).await;
         assert_eq!(found, None);
+    }
+
+    async fn detect_both(
+        provider_name: &str,
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Vec<String>) {
+        let (url, captured) = test_server::serve(responses).await;
+        let user = HashMap::from([(
+            provider_name.to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
+        let (window, thinking) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
+        let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        (window, thinking, paths)
+    }
+
+    #[tokio::test]
+    async fn combined_detection_probes_each_endpoint_once() {
+        use crate::thinking::Format;
+        // llama.cpp: one /models and one /props serve both the window and the
+        // thinking levels — no second serial round-trip.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp"}]});
+        let props = json!({"default_generation_settings": {"n_ctx": 65536}, "chat_template": "{% if enable_thinking %}"});
+        let (win, thinking, paths) =
+            detect_both("box", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(win, window(65536, "llama.cpp /props n_ctx"));
+        assert_eq!(thinking.map(|r| r.levels), Some(vec!["off".to_string(), "on".to_string()]));
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"], "each endpoint probed once");
+
+        // Ollama: /models, /api/ps, and a single shared /api/show.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let ps = json!({"models": []});
+        let show = json!({"capabilities": ["completion", "thinking"], "parameters": "num_ctx 16384"});
+        let (win, thinking, paths) = detect_both(
+            "ollama",
+            vec![(200, "", models.to_string()), (200, "", ps.to_string()), (200, "", show.to_string())],
+        )
+        .await;
+        assert_eq!(win, window(16384, "Ollama num_ctx"));
+        assert_eq!(thinking.map(|r| r.format), Some(Format::Effort));
+        assert_eq!(paths, ["/v1/models", "/api/ps", "/api/show"], "/api/show is shared, not repeated");
     }
 }
