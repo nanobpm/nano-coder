@@ -1018,8 +1018,9 @@ fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
     };
     // Offer the levels the current model supports for every scope: a provider
     // or global level is still sent to this model, so it must be one it takes.
-    // (A model with no known levels falls back to the standard list, and a
-    // custom existing value is appended so confirming the editor keeps it.)
+    // (A model with no known levels is offered only `default`/`unset` — any
+    // level would be ignored until real choices are known — and a custom
+    // existing value is appended so confirming the editor keeps it.)
     let model_levels = current.levels.clone();
     let config = agent.config();
     let entry = config.providers.get(&provider);

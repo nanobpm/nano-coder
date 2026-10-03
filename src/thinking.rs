@@ -664,10 +664,30 @@ pub fn resolve_with(
         (global.clone(), Source::Global)
     };
     let profile = builtin(model);
+    // Configured `thinking_levels` win over the endpoint and the table, so an
+    // entry that can't even parse as a level name (e.g. "very high") would
+    // break the `/settings` editor, which parses each offered candidate.
+    // Drop invalid names here and say so once, rather than letting an
+    // accepted config fail later.
+    let mut invalid_levels: Vec<String> = Vec::new();
     let levels: Vec<String> = model_settings
         .and_then(|m| m.thinking_levels.clone())
         .or_else(|| provider.thinking_levels.clone())
-        .map(|levels| levels.iter().map(|l| l.trim().to_ascii_lowercase()).collect())
+        .map(|levels| {
+            levels
+                .iter()
+                .map(|l| l.trim().to_ascii_lowercase())
+                .filter(|l| {
+                    // The same grammar `Thinking` parses: a name that fails it
+                    // (e.g. "very high") is no usable level.
+                    let valid = l.parse::<Thinking>().is_ok();
+                    if !valid {
+                        invalid_levels.push(l.clone());
+                    }
+                    valid
+                })
+                .collect()
+        })
         .or_else(|| reported.map(|r| r.levels.clone()))
         .or_else(|| profile.as_ref().map(|p| p.levels.clone()))
         .unwrap_or_default();
@@ -800,6 +820,14 @@ pub fn resolve_with(
         ));
     }
     let dropped = dropped_key.is_some();
+    if !invalid_levels.is_empty() {
+        let notice = format!(
+            "ignoring invalid thinking_levels {} for {model}: a level name is letters, digits, '-' or '_' — \
+             fix them in its provider or model settings",
+            invalid_levels.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")
+        );
+        warning = Some(warning.map_or(notice.clone(), |w| format!("{notice}; {w}")));
+    }
     Resolved {
         requested,
         effective,
@@ -999,6 +1027,39 @@ mod tests {
         assert!(r.warning.unwrap().contains("it has: fast, deep"));
         let r = resolve(&Thinking::Default, Some(&level("deep")), kind, &p, "x");
         assert_eq!(r.request(), Some(Request::Effort("deep".into())));
+    }
+
+    #[test]
+    fn invalid_configured_level_names_are_dropped_with_a_warning() {
+        // A `thinking_levels` entry outside the `Thinking` name grammar would
+        // break the `/settings` editor, which parses each offered candidate:
+        // resolution drops it instead and says so. (Regression: "very high"
+        // loaded fine, then opening the Thinking editor failed on it.)
+        let p = provider(r#"thinking_levels = ["low", "very high", " High "]"#);
+        let kind = Some(ProviderKind::Openai);
+        let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "kimi-k3");
+        assert_eq!(r.levels, ["low", "high"], "entries are trimmed, lowercased, and validated");
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("\"very high\""), "{warning}");
+        assert!(warning.contains("ignoring invalid thinking_levels"), "{warning}");
+        // The notice precedes any other resolution warning.
+        let r = resolve(&Thinking::Default, Some(&level("deep")), kind, &p, "kimi-k3");
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("\"very high\"") && warning.contains("it has: low, high"), "{warning}");
+        // A list left with no valid entries counts as unknown levels, so an
+        // explicit setting is ignored with the usual guidance.
+        let p = provider(r#"thinking_levels = ["very high"]"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "kimi-k3");
+        assert_eq!(r.effective, Thinking::Default);
+        assert_eq!(r.levels, Vec::<String>::new());
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("\"very high\"") && warning.contains("no thinking levels are known"), "{warning}");
+        // Endpoint-reported and built-in levels are not filtered.
+        let p = provider(r#"thinking_levels = ["none", "low"]"#);
+        let r = resolve(&Thinking::Default, Some(&level("none")), kind, &p, "gpt-5.1");
+        assert_eq!(r.request(), Some(Request::Effort("none".into()))); // the "none" alias is a valid level name
+        assert_eq!(r.warning, None);
     }
 
     #[test]
