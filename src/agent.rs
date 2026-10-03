@@ -4366,6 +4366,45 @@ mod tests {
         assert!(warning.contains("leaves no room"), "adds the feasibility warning: {warning}");
     }
 
+    #[test]
+    fn refreshing_stats_tracks_a_max_tokens_driven_thinking_change() {
+        use crate::thinking::Thinking;
+        struct OldClaude;
+        #[async_trait]
+        impl LLMClient for OldClaude {
+            async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!("no chat in this test")
+            }
+            fn model_name(&self) -> &str {
+                "claude-sonnet-4-5"
+            }
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Anthropic)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), max_tokens: 16_384, ..Default::default() };
+        let mut agent = Agent::new(Box::new(OldClaude), config);
+        // A fixed-budget level fits the roomy cap: the status bar shows it.
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        assert_eq!(agent.context_stats().lock().unwrap().thinking.as_deref(), Some("high"));
+
+        // Shrinking `max_tokens` leaves no budget room, so `thinking()` drops
+        // the level. A refresh (what the `/settings` max_tokens edit now does)
+        // must carry that drop into the stats; without it the bar stays stale.
+        agent.config_mut().max_tokens = 1024;
+        agent.refresh_stats();
+        assert_eq!(agent.context_stats().lock().unwrap().thinking, None, "refresh reflects the dropped level");
+
+        // Restoring the cap brings the level back on the next refresh.
+        agent.config_mut().max_tokens = 16_384;
+        agent.refresh_stats();
+        assert_eq!(agent.context_stats().lock().unwrap().thinking.as_deref(), Some("high"), "refresh restores it");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn max_tokens_is_sent_unchanged_when_the_window_has_room() {
         let dir = tempfile::tempdir().unwrap();
