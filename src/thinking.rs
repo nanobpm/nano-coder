@@ -335,24 +335,49 @@ fn extra_body_keys(wire: Wire) -> &'static [&'static str] {
     }
 }
 
-/// The top-level request keys a thinking level is sent under for `wire`/`format`
-/// — the fields `drop_params` can strip after the body is built.
+/// The generated thinking control for `effective` on `wire`/`anthropic`/`format`,
+/// or `None` when nothing is sent (`Thinking::Default`). This is the single
+/// source of truth for which [`Request`] a level maps to; both [`Resolved::request`]
+/// (after the override/`drop_params` gates) and the `drop_params` field-key check
+/// derive from it, so the keys checked always match the variant actually emitted.
+fn generated_request(effective: &Thinking, wire: Wire, anthropic: AnthropicStyle, format: Format) -> Option<Request> {
+    match effective {
+        Thinking::Default => None,
+        Thinking::Off => Some(match (wire, format) {
+            (Wire::ChatCompletions, Format::TemplateSwitch | Format::TemplateEffort) => Request::TemplateSwitch(false),
+            _ => Request::Off,
+        }),
+        Thinking::Level(level) => Some(match (wire, anthropic, format) {
+            (Wire::AnthropicMessages, AnthropicStyle::Budget, _) => Request::Budget(budget_tokens(level)),
+            (Wire::ChatCompletions, _, Format::TemplateSwitch) => Request::TemplateSwitch(true),
+            (Wire::ChatCompletions, _, Format::TemplateEffort) => Request::TemplateEffort(level.clone()),
+            _ => Request::Effort(level.clone()),
+        }),
+    }
+}
+
+/// The top-level request keys a generated thinking `request` is sent under on
+/// `wire` — the fields `drop_params` can strip after the body is built.
 ///
 /// Every generated level lives under one top-level key per wire
-/// (`reasoning_effort` for Chat Completions effort, `reasoning` for Responses,
-/// `thinking` for Anthropic Messages) except an Anthropic *adaptive* effort,
-/// which also sets `output_config`. The Chat Completions chat-template formats
-/// (`chat_template_kwargs`) and an Anthropic `off` share their wire's single
-/// key. Dropping any one key removes the whole level, so these are the keys to
-/// check, not every key a variant may set.
-fn request_field_keys(wire: Wire, format: Format) -> &'static [&'static str] {
-    match wire {
-        Wire::ChatCompletions => match format {
-            Format::TemplateSwitch | Format::TemplateEffort => &["chat_template_kwargs"],
-            Format::Effort => &["reasoning_effort"],
-        },
-        Wire::Responses => &["reasoning"],
-        Wire::AnthropicMessages => &["thinking", "output_config"],
+/// (`reasoning_effort` for Chat Completions effort/off, `reasoning` for
+/// Responses, `thinking` for Anthropic Messages) except an Anthropic *adaptive*
+/// effort ([`Request::Effort`] on Anthropic Messages), which also sets
+/// `output_config`. A Budget-style level ([`Request::Budget`]) and an Anthropic
+/// `off` ([`Request::Off`]) set only `thinking`, so listing `output_config` for
+/// them would wrongly report a drop that `finish_body` never makes. The Chat
+/// Completions chat-template formats (`chat_template_kwargs`) share their wire's
+/// single key. Dropping any one listed key removes the whole level, so these are
+/// the keys to check, not every key a variant may set.
+fn request_field_keys(wire: Wire, request: &Request) -> &'static [&'static str] {
+    match (wire, request) {
+        (Wire::ChatCompletions, Request::TemplateSwitch(_) | Request::TemplateEffort(_)) => &["chat_template_kwargs"],
+        (Wire::ChatCompletions, _) => &["reasoning_effort"],
+        (Wire::Responses, _) => &["reasoning"],
+        // Only an Anthropic adaptive effort also emits `output_config`; Budget
+        // and `off` emit `thinking` alone.
+        (Wire::AnthropicMessages, Request::Effort(_)) => &["thinking", "output_config"],
+        (Wire::AnthropicMessages, _) => &["thinking"],
     }
 }
 
@@ -434,21 +459,7 @@ impl Resolved {
         if self.dropped {
             return None;
         }
-        match &self.effective {
-            Thinking::Default => None,
-            Thinking::Off => Some(match (self.wire, self.format) {
-                (Wire::ChatCompletions, Format::TemplateSwitch | Format::TemplateEffort) => {
-                    Request::TemplateSwitch(false)
-                }
-                _ => Request::Off,
-            }),
-            Thinking::Level(level) => Some(match (self.wire, self.anthropic, self.format) {
-                (Wire::AnthropicMessages, AnthropicStyle::Budget, _) => Request::Budget(budget_tokens(level)),
-                (Wire::ChatCompletions, _, Format::TemplateSwitch) => Request::TemplateSwitch(true),
-                (Wire::ChatCompletions, _, Format::TemplateEffort) => Request::TemplateEffort(level.clone()),
-                _ => Request::Effort(level.clone()),
-            }),
-        }
+        generated_request(&self.effective, self.wire, self.anthropic, self.format)
     }
 
     /// Whether Anthropic Messages is asked to think, which rules out a custom
@@ -653,13 +664,15 @@ pub fn resolve_with(
     // as unsent instead. (The `extra_body` override already suppresses the
     // generated field, so there is nothing left to drop then.)
     let dropped_key = if effective != Thinking::Default && !overridden {
-        provider
-            .drop_params
-            .as_ref()
-            .and_then(|dropped| {
-                request_field_keys(wire, format).iter().find(|k| dropped.iter().any(|d| d == **k))
-            })
-            .map(|key| key.to_string())
+        generated_request(&effective, wire, anthropic, format).and_then(|req| {
+            provider
+                .drop_params
+                .as_ref()
+                .and_then(|dropped| {
+                    request_field_keys(wire, &req).iter().find(|k| dropped.iter().any(|d| d == **k)).copied()
+                })
+                .map(|key| key.to_string())
+        })
     } else {
         None
     };
@@ -912,6 +925,30 @@ mod tests {
             assert_eq!(r.request(), None, "{key}");
             assert!(!r.anthropic_thinking_on(), "{key}: a dropped level does not lock the temperature");
         }
+
+        // A Budget-style model (Claude 3.7–4.5) sends only `thinking`, never
+        // `output_config`, so dropping `output_config` is a no-op: the level is
+        // still sent and must NOT be reported as dropped.
+        let p = provider("drop_params = [\"output_config\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-5");
+        assert_eq!(r.anthropic, AnthropicStyle::Budget);
+        assert!(!r.dropped, "output_config is never sent for a Budget model");
+        assert_eq!(r.request(), Some(Request::Budget(budget_tokens("high"))), "the Budget level is still sent");
+        assert!(r.anthropic_thinking_on(), "a still-sent Budget level locks the temperature");
+        // Dropping the key a Budget model DOES send (`thinking`) removes it.
+        let p = provider("drop_params = [\"thinking\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-5");
+        assert!(r.dropped, "thinking is the Budget field and is dropped");
+        assert_eq!(r.request(), None);
+
+        // Anthropic `off` sends only `thinking` (`type = disabled`), never
+        // `output_config`, so dropping `output_config` is a no-op there too.
+        // (claude-sonnet-4-7 is adaptive AND supports `off`.)
+        let p = provider("drop_params = [\"output_config\"]");
+        let r = resolve(&Thinking::Off, None, Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-7");
+        assert_eq!((r.anthropic, &r.effective), (AnthropicStyle::Adaptive, &Thinking::Off));
+        assert!(!r.dropped, "output_config is not sent for an off request");
+        assert_eq!(r.request(), Some(Request::Off));
 
         // A drop_params key for another wire does not suppress the field.
         let p = provider("drop_params = [\"reasoning\"]");
