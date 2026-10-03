@@ -58,6 +58,10 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     match &request.thinking {
         Some(Request::Effort(level)) => body["reasoning_effort"] = json!(level),
         Some(Request::Off) => body["reasoning_effort"] = json!("none"),
+        // llama.cpp ignores `reasoning_effort`; the chat template's own
+        // variables switch thinking.
+        Some(Request::TemplateSwitch(on)) => body["chat_template_kwargs"] = json!({ "enable_thinking": on }),
+        Some(Request::TemplateEffort(level)) => body["chat_template_kwargs"] = json!({ "reasoning_effort": level }),
         // Budgets are only resolved for Anthropic Messages.
         Some(Request::Budget(_)) | None => {}
     }
@@ -377,6 +381,10 @@ impl LLMClient for OpenAiClient {
         detect_window(&self.transport).await
     }
 
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        detect_thinking(&self.transport).await
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.transport.provider();
         let mut request = self.transport.http().get(format!("{}/models", provider.base_url));
@@ -423,6 +431,54 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// (`max_context_length`). Servers whose `/models` lacks it are recognised by
 /// `owned_by` or name and asked their own API: llama.cpp `/props`, LM Studio
 /// `/api/v0/models`, Ollama `/api/ps` and `/api/show`.
+/// Which server software an OpenAI-compatible endpoint is, as far as the
+/// probes need to know: from the `/models` entry's `owned_by`, the preset name
+/// or Ollama's default port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Server {
+    LlamaCpp,
+    LmStudio,
+    Ollama,
+    Other,
+}
+
+fn identify(provider_name: &str, root: &str, entry: Option<&Value>) -> Server {
+    let owner = entry.and_then(|e| e.get("owned_by")).and_then(Value::as_str).unwrap_or_default();
+    if owner == "llamacpp" || provider_name == "llamacpp" {
+        Server::LlamaCpp
+    } else if owner == "organization_owner" || provider_name == "lmstudio" {
+        Server::LmStudio
+    } else if provider_name == "ollama" || root.ends_with(":11434") || matches!(owner, "library" | "ollama") {
+        Server::Ollama
+    } else {
+        Server::Other
+    }
+}
+
+/// The thinking levels a local server reports for the model: Ollama's
+/// `thinking` capability (`/api/show`), or what llama.cpp's chat template
+/// accepts (`/props`). Other servers report none.
+pub(crate) async fn detect_thinking(transport: &HttpTransport) -> Option<crate::thinking::Reported> {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    match identify(&provider.name, root, entry) {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            crate::thinking::Reported::from_llamacpp_props(&probe(transport, reqwest::Method::GET, &url, None).await?)
+        }
+        Server::Ollama => {
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await?;
+            crate::thinking::Reported::from_ollama_show(&show)
+        }
+        Server::LmStudio | Server::Other => None,
+    }
+}
+
 pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedWindow> {
     let provider = transport.provider();
     let base = provider.base_url.as_str();
@@ -433,9 +489,8 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
     if let Some(found) = entry.and_then(window_in_entry) {
         return Some(found);
     }
-    let owner = entry.and_then(|e| e.get("owned_by")).and_then(Value::as_str).unwrap_or_default();
-    let is_ollama = provider.name == "ollama" || root.ends_with(":11434") || matches!(owner, "library" | "ollama");
-    if owner == "llamacpp" || provider.name == "llamacpp" {
+    let server = identify(&provider.name, root, entry);
+    if server == Server::LlamaCpp {
         let url = format!("{root}/props?model={}", urlencode(model));
         let props = probe(transport, reqwest::Method::GET, &url, None).await?;
         return props
@@ -444,14 +499,14 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
             .and_then(as_tokens)
             .map(|tokens| DetectedWindow::total(tokens, "llama.cpp /props n_ctx"));
     }
-    if owner == "organization_owner" || provider.name == "lmstudio" {
+    if server == Server::LmStudio {
         let listed = probe(transport, reqwest::Method::GET, &format!("{root}/api/v0/models"), None).await?;
         return model_entry(&listed, model)
             .and_then(|m| m.get("loaded_context_length"))
             .and_then(as_tokens)
             .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length"));
     }
-    if is_ollama {
+    if server == Server::Ollama {
         return ollama_window(transport, root, model).await;
     }
     None
@@ -581,6 +636,14 @@ mod tests {
         assert!(client.build_body(&request(None)).get("reasoning_effort").is_none());
         let client = OpenAiClient::new(provider("http://x", "reasoning_effort = \"low\"")).unwrap();
         assert_eq!(client.build_body(&request(Some(Request::Effort("high".into()))))["reasoning_effort"], "low");
+
+        // llama.cpp: chat template variables, no `reasoning_effort`.
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        let body = client.build_body(&request(Some(Request::TemplateSwitch(false))));
+        assert_eq!(body["chat_template_kwargs"], json!({ "enable_thinking": false }));
+        assert!(body.get("reasoning_effort").is_none());
+        let body = client.build_body(&request(Some(Request::TemplateEffort("high".into()))));
+        assert_eq!(body["chat_template_kwargs"], json!({ "reasoning_effort": "high" }));
     }
 
     #[test]
@@ -1128,6 +1191,48 @@ mod tests {
         let ps = json!({"models": [{"name": "qwen3:8b", "context_length": 8192}]});
         let (found, _) = detect("ollama", vec![(200, "", models.to_string()), (200, "", ps.to_string())]).await;
         assert_eq!(found, window(8192, "Ollama /api/ps context_length"));
+    }
+
+    async fn detect_levels(
+        provider_name: &str,
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (Option<crate::thinking::Reported>, Vec<String>) {
+        let (url, captured) = test_server::serve(responses).await;
+        let user = HashMap::from([(
+            provider_name.to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
+        let found = OpenAiClient::new(resolved).unwrap().detect_thinking_levels().await;
+        let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        (found, paths)
+    }
+
+    #[tokio::test]
+    async fn detects_thinking_levels_on_ollama_and_llama_cpp() {
+        use crate::thinking::Format;
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let show = json!({"capabilities": ["completion", "thinking"]});
+        let (found, paths) =
+            detect_levels("box", vec![(200, "", models.to_string()), (200, "", show.to_string())]).await;
+        assert_eq!(found.map(|r| r.format), Some(Format::Effort));
+        assert_eq!(paths, ["/v1/models", "/api/show"]);
+
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp"}]});
+        let props = json!({"chat_template": "{% if enable_thinking %}"});
+        let (found, paths) =
+            detect_levels("box", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(found.map(|r| r.levels), Some(vec!["off".to_string(), "on".to_string()]));
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"]);
+
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "system"}]});
+        let (found, paths) = detect_levels("hosted", vec![(200, "", models.to_string())]).await;
+        assert_eq!(found, None);
+        assert_eq!(paths, ["/v1/models"], "unknown servers get no extra probes");
     }
 
     #[tokio::test]

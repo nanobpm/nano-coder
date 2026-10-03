@@ -83,7 +83,8 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
             body["thinking"] = json!({ "type": "disabled" });
             false
         }
-        None => false,
+        // Chat Completions (llama.cpp) forms; not resolved for this API.
+        Some(Request::TemplateSwitch(_) | Request::TemplateEffort(_)) | None => false,
     };
     if thinking_on && let Some(object) = body.as_object_mut() {
         // Thinking rules out a custom temperature; the agent already sends

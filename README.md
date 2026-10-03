@@ -558,10 +558,21 @@ thinking = "xhigh"                      # this model only
 ```
 
 A model only gets levels it supports. They come from, in order: `thinking_levels` on the
-model or provider; the endpoint's model list (GitHub Copilot's `/models` reports each
-model's levels, read with the same request as its context window); and a built-in table
+model or provider; what the endpoint reports for the model; and a built-in table
 of Claude (3.7 Sonnet and later) and OpenAI reasoning models (GPT-5 and later, o1/o3/o4).
-For other models, list them yourself:
+Endpoints that report levels:
+
+- **GitHub Copilot:** `/models` lists each model's levels, read with the same request as its
+  context window.
+- **Ollama:** a model with the `thinking` capability (`/api/show`) gets `off`, `low`,
+  `medium` and `high`. Ollama refuses a level for a model without it, so none is sent then.
+- **llama.cpp:** the loaded model's chat template (`/props`) decides. A template with an
+  `enable_thinking` switch (Qwen 3 and the like) gets `off` and `on`, and any named level
+  turns thinking on; a template that takes `reasoning_effort` (gpt-oss) gets `low`, `medium`
+  and `high`.
+
+Ollama and llama.cpp are recognized however the provider is named, the same way as for the
+context window. For other models, list the levels yourself:
 
 ```toml
 [providers.together.models."deepseek-r1"]
@@ -573,13 +584,16 @@ lowest), and a model with no known levels is sent nothing. A setting for the pro
 model or the session warns when it is adjusted or ignored; the top-level `thinking` doesn't
 warn, since it applies to every model.
 
-How the level is sent depends on the API: `reasoning_effort` (Chat Completions),
+How the level is sent depends on the API: `reasoning_effort` (Chat Completions, Ollama
+included; Ollama ignores its native `think` flag on `/v1`), `chat_template_kwargs` for
+llama.cpp (`enable_thinking`, or `reasoning_effort` for templates that take a level; it
+ignores the top-level `reasoning_effort`),
 `reasoning.effort` (Responses), and for Anthropic Messages adaptive thinking with
 `output_config.effort`, or on Claude 3.7 to 4.5 a fixed `budget_tokens` (1024 for minimal, then
 2048, 8192, 16384, 32768, 65536 up to max). The budget has to stay below `max_tokens`, so raise
 `max_tokens` to use a large one. Anthropic takes no custom temperature while thinking, so
 none is sent then. A matching key in the provider's `extra_body` (`reasoning_effort`, `reasoning`,
-`thinking`, `output_config`) is sent instead, with a warning. The status bar shows
+`think`, `chat_template_kwargs`, `thinking`, `output_config`) is sent instead, with a warning. The status bar shows
 `think LEVEL` while a level is sent, `/context` shows it with where it comes from,
 `/settings` sets it for the current model, its provider or all models (picking from the
 levels the model supports), and the session log records it for each reply.

@@ -105,7 +105,29 @@ pub enum Request {
     /// Anthropic fixed thinking budget in tokens; the builder caps it below
     /// `max_tokens`.
     Budget(u32),
+    /// llama.cpp, chat templates with an on/off switch (Qwen 3 and the
+    /// like): `chat_template_kwargs.enable_thinking`.
+    TemplateSwitch(bool),
+    /// llama.cpp, chat templates that take a level (gpt-oss):
+    /// `chat_template_kwargs.reasoning_effort`.
+    TemplateEffort(String),
 }
+
+/// How a Chat Completions request carries the level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// `reasoning_effort` (OpenAI, Ollama, most OpenAI-compatible servers).
+    #[default]
+    Effort,
+    /// llama.cpp: `chat_template_kwargs.enable_thinking` (on or off only).
+    TemplateSwitch,
+    /// llama.cpp: `chat_template_kwargs.reasoning_effort`.
+    TemplateEffort,
+}
+
+/// The level of models that can only switch thinking on or off; any named
+/// level selects it.
+pub const ON: &str = "on";
 
 /// Anthropic thinking budget for a level on [`AnthropicStyle::Budget`] models.
 pub fn budget_tokens(level: &str) -> u32 {
@@ -233,6 +255,8 @@ pub struct Reported {
     /// The endpoint says the model uses adaptive thinking
     /// (`capabilities.supports.adaptive_thinking`).
     pub adaptive: bool,
+    /// How the request carries the level for this server.
+    pub format: Format,
 }
 
 impl Reported {
@@ -254,7 +278,34 @@ impl Reported {
             return None;
         }
         let adaptive = supports.get("adaptive_thinking").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        Some(Reported { levels, adaptive })
+        Some(Reported { levels, adaptive, format: Format::Effort })
+    }
+
+    /// Ollama `/api/show`: a model with the `thinking` capability takes
+    /// `reasoning_effort` (`none` turns it off). Ollama rejects a level for a
+    /// model without it, so none is reported then.
+    pub fn from_ollama_show(show: &serde_json::Value) -> Option<Reported> {
+        let thinks = show.get("capabilities")?.as_array()?.iter().any(|c| c.as_str() == Some("thinking"));
+        thinks.then(|| Reported {
+            levels: ["off", "low", "medium", "high"].map(String::from).to_vec(),
+            adaptive: false,
+            format: Format::Effort,
+        })
+    }
+
+    /// llama.cpp `/props`: what the loaded model's chat template accepts.
+    /// llama.cpp ignores `reasoning_effort`; the template's own variables
+    /// (`chat_template_kwargs`) control thinking.
+    pub fn from_llamacpp_props(props: &serde_json::Value) -> Option<Reported> {
+        let template = props.get("chat_template")?.as_str()?;
+        let (levels, format): (&[&str], Format) = if template.contains("reasoning_effort") {
+            (&["low", "medium", "high"], Format::TemplateEffort)
+        } else if template.contains("enable_thinking") {
+            (&["off", ON], Format::TemplateSwitch)
+        } else {
+            return None;
+        };
+        Some(Reported { levels: levels.iter().map(|l| l.to_string()).collect(), adaptive: false, format })
     }
 }
 
@@ -278,7 +329,7 @@ pub fn wire(kind: Option<ProviderKind>, model: &str) -> Wire {
 /// the provider's `extra_body` is merged in last and wins.
 fn extra_body_keys(wire: Wire) -> &'static [&'static str] {
     match wire {
-        Wire::ChatCompletions => &["reasoning_effort", "reasoning", "think"],
+        Wire::ChatCompletions => &["reasoning_effort", "reasoning", "think", "chat_template_kwargs"],
         Wire::Responses => &["reasoning"],
         Wire::AnthropicMessages => &["thinking", "output_config"],
     }
@@ -323,6 +374,8 @@ pub struct Resolved {
     pub wire: Wire,
     /// For Anthropic Messages: adaptive effort or a fixed budget.
     pub anthropic: AnthropicStyle,
+    /// For Chat Completions: the field that carries the level.
+    pub format: Format,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
 }
@@ -332,9 +385,16 @@ impl Resolved {
     pub fn request(&self) -> Option<Request> {
         match &self.effective {
             Thinking::Default => None,
-            Thinking::Off => Some(Request::Off),
-            Thinking::Level(level) => Some(match (self.wire, self.anthropic) {
-                (Wire::AnthropicMessages, AnthropicStyle::Budget) => Request::Budget(budget_tokens(level)),
+            Thinking::Off => Some(match (self.wire, self.format) {
+                (Wire::ChatCompletions, Format::TemplateSwitch | Format::TemplateEffort) => {
+                    Request::TemplateSwitch(false)
+                }
+                _ => Request::Off,
+            }),
+            Thinking::Level(level) => Some(match (self.wire, self.anthropic, self.format) {
+                (Wire::AnthropicMessages, AnthropicStyle::Budget, _) => Request::Budget(budget_tokens(level)),
+                (Wire::ChatCompletions, _, Format::TemplateSwitch) => Request::TemplateSwitch(true),
+                (Wire::ChatCompletions, _, Format::TemplateEffort) => Request::TemplateEffort(level.clone()),
                 _ => Request::Effort(level.clone()),
             }),
         }
@@ -373,6 +433,10 @@ fn nearest<'a>(levels: &'a [String], wanted: &str) -> Option<&'a String> {
     let rank = |l: &str| ORDER.iter().position(|o| *o == l);
     let wanted_rank = rank(wanted)?;
     let ranked: Vec<(usize, &String)> = levels.iter().filter_map(|l| rank(l).map(|r| (r, l))).collect();
+    // A model that only switches thinking on: any named level turns it on.
+    if ranked.is_empty() {
+        return levels.iter().find(|l| *l == ON);
+    }
     ranked
         .iter()
         .filter(|(r, _)| *r <= wanted_rank)
@@ -432,6 +496,7 @@ pub fn resolve_with(
     } else {
         profile.and_then(|p| p.anthropic).unwrap_or(AnthropicStyle::Adaptive)
     };
+    let format = reported.map(|r| r.format).unwrap_or_default();
     // The global setting applies to every model, so a level that one model
     // can't take is not worth a warning; one set for it (or the session) is.
     let explicit = source != Source::Global;
@@ -456,6 +521,10 @@ pub fn resolve_with(
             let on: Vec<String> = levels.iter().filter(|l| *l != "off").cloned().collect();
             match nearest(&on, level) {
                 Some(found) if found == level => (Thinking::Level(found.clone()), None),
+                Some(found) if found == ON => (
+                    Thinking::Level(found.clone()),
+                    explicit.then(|| format!("{model} only switches thinking on or off; {level:?} turns it on")),
+                ),
                 Some(found) => (
                     Thinking::Level(found.clone()),
                     explicit.then(|| format!("{model} has no thinking level {level:?}; using {found:?}")),
@@ -482,7 +551,7 @@ pub fn resolve_with(
              remove it from extra_body to use the thinking setting"
         ));
     }
-    Resolved { requested, effective, source, levels, wire, anthropic, warning }
+    Resolved { requested, effective, source, levels, wire, anthropic, format, warning }
 }
 
 #[cfg(test)]
@@ -618,12 +687,18 @@ mod tests {
         let r = resolve(&Thinking::Default, Some(&level("medium")), kind, &p, "kimi-k3");
         assert_eq!(r.effective, level("low"));
         assert_eq!(r.choices(), "default, low, high");
-        // A custom level name matches only itself.
+        // `on` (an on/off-only model) is chosen by any named level.
         let r = resolve(&Thinking::Default, Some(&level("on")), kind, &p, "qwen3");
         assert_eq!(r.request(), Some(Request::Effort("on".into())));
         let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "qwen3");
+        assert_eq!(r.effective, level("on"));
+        // A custom level name matches only itself.
+        let p = provider(r#"thinking_levels = ["fast", "deep"]"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "x");
         assert_eq!(r.effective, Thinking::Default);
-        assert!(r.warning.unwrap().contains("it has: off, on"));
+        assert!(r.warning.unwrap().contains("it has: fast, deep"));
+        let r = resolve(&Thinking::Default, Some(&level("deep")), kind, &p, "x");
+        assert_eq!(r.request(), Some(Request::Effort("deep".into())));
     }
 
     #[test]
@@ -685,7 +760,11 @@ mod tests {
         let r = resolve_with(&Thinking::Default, Some(&Thinking::Off), copilot, &none_cfg, "gpt-5.4", Some(&reported));
         assert_eq!(r.request(), Some(Request::Off));
         // … and cover models the table doesn't know.
-        let kimi = Reported { levels: vec!["low".into(), "high".into(), "max".into()], adaptive: false };
+        let kimi = Reported {
+            levels: vec!["low".into(), "high".into(), "max".into()],
+            adaptive: false,
+            format: Format::Effort,
+        };
         let r = resolve_with(&Thinking::Default, Some(&level("medium")), copilot, &none_cfg, "kimi-k3", Some(&kimi));
         assert_eq!(r.effective, level("low"));
         // Config levels still win.
@@ -693,7 +772,7 @@ mod tests {
         let r = resolve_with(&Thinking::Default, Some(&level("low")), copilot, &p, "gpt-5.4", Some(&reported));
         assert_eq!(r.effective, level("high"));
         // An adaptive report switches an old-table Claude to effort.
-        let adaptive = Reported { levels: vec!["low".into(), "high".into()], adaptive: true };
+        let adaptive = Reported { levels: vec!["low".into(), "high".into()], adaptive: true, format: Format::Effort };
         let r = resolve_with(
             &Thinking::Default,
             Some(&level("high")),
@@ -703,6 +782,45 @@ mod tests {
             Some(&adaptive),
         );
         assert_eq!(r.request(), Some(Request::Effort("high".into())));
+    }
+
+    #[test]
+    fn reads_levels_from_ollama_and_llama_cpp() {
+        let show = serde_json::json!({ "capabilities": ["completion", "tools", "thinking"] });
+        let ollama = Reported::from_ollama_show(&show).unwrap();
+        assert_eq!(ollama.levels, ["off", "low", "medium", "high"]);
+        assert_eq!(ollama.format, Format::Effort);
+        // Ollama rejects a level for a model that can't think: report none.
+        assert_eq!(Reported::from_ollama_show(&serde_json::json!({ "capabilities": ["completion"] })), None);
+
+        let qwen =
+            serde_json::json!({ "chat_template": "{%- if enable_thinking is defined and enable_thinking is false %}" });
+        let switch = Reported::from_llamacpp_props(&qwen).unwrap();
+        assert_eq!(switch.levels, ["off", "on"]);
+        assert_eq!(switch.format, Format::TemplateSwitch);
+        let oss = serde_json::json!({ "chat_template": "Reasoning: {{ reasoning_effort }}" });
+        let effort = Reported::from_llamacpp_props(&oss).unwrap();
+        assert_eq!(effort.levels, ["low", "medium", "high"]);
+        assert_eq!(effort.format, Format::TemplateEffort);
+        assert_eq!(Reported::from_llamacpp_props(&serde_json::json!({ "chat_template": "{{ messages }}" })), None);
+
+        let openai = Some(ProviderKind::Openai);
+        let none_cfg = ProviderConfig::default();
+        let resolve = |level: &Thinking, reported: &Reported| {
+            resolve_with(&Thinking::Default, Some(level), openai, &none_cfg, "qwen3", Some(reported))
+        };
+        // On/off templates: off switches it off, any named level turns it on.
+        assert_eq!(resolve(&Thinking::Off, &switch).request(), Some(Request::TemplateSwitch(false)));
+        let r = resolve(&level("high"), &switch);
+        assert_eq!((r.effective.clone(), r.request()), (level(ON), Some(Request::TemplateSwitch(true))));
+        assert_eq!(r.warning.as_deref(), Some("qwen3 only switches thinking on or off; \"high\" turns it on"));
+        assert_eq!(resolve(&level(ON), &switch).warning, None);
+        assert_eq!(resolve(&Thinking::Default, &switch).request(), None);
+        // Level templates get the level as a template variable.
+        assert_eq!(resolve(&level("medium"), &effort).request(), Some(Request::TemplateEffort("medium".into())));
+        // Ollama: plain `reasoning_effort`.
+        assert_eq!(resolve(&Thinking::Off, &ollama).request(), Some(Request::Off));
+        assert_eq!(resolve(&level("low"), &ollama).request(), Some(Request::Effort("low".into())));
     }
 
     #[test]
