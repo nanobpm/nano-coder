@@ -593,7 +593,9 @@ ignores the top-level `reasoning_effort`),
 2048, 8192, 16384, 32768, 65536 up to max). The budget has to stay below `max_tokens`, so raise
 `max_tokens` to use a large one. Anthropic takes no custom temperature while thinking, so
 none is sent then. A matching key in the provider's `extra_body` (`reasoning_effort`, `reasoning`,
-`think`, `chat_template_kwargs`, `thinking`, `output_config`) is sent instead, with a warning. The status bar shows
+`think`, `chat_template_kwargs`, `thinking`, `output_config`) is sent instead, with a warning; the
+configured level is then reported as overridden (not as sent), since the override's value is what
+reaches the wire. The status bar shows
 `think LEVEL` while a level is sent, `/context` shows it with where it comes from,
 `/settings` sets it for the current model, its provider or all models (picking from the
 levels the model supports), and the session log records it for each reply.

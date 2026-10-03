@@ -956,9 +956,11 @@ type ThinkingChoice = (Option<crate::thinking::Thinking>, String);
 
 /// The `(choices, default index)` for the thinking-level editor. `scope` is
 /// 0 (this model), 1 (provider), or 2 (global); `model_levels` are the levels
-/// the current model takes (used only for scope 0). The default lands on
-/// `existing`, and a custom `existing` value absent from the standard choices
-/// is appended so merely confirming the editor preserves it instead of
+/// the current model takes, offered for every scope (a provider or global
+/// level is still sent to this model, so it must be one it takes). When the
+/// model has no known levels the standard list is offered instead. The default
+/// lands on `existing`, and a custom `existing` value absent from the standard
+/// choices is appended so merely confirming the editor preserves it instead of
 /// silently resetting the setting.
 fn thinking_choices(
     scope: usize,
@@ -966,7 +968,7 @@ fn thinking_choices(
     existing: &Option<crate::thinking::Thinking>,
 ) -> Result<(Vec<ThinkingChoice>, usize)> {
     use crate::thinking::{ORDER, Thinking};
-    let levels: Vec<String> = if scope == 0 && !model_levels.is_empty() {
+    let levels: Vec<String> = if !model_levels.is_empty() {
         model_levels.to_vec()
     } else {
         std::iter::once("off").chain(ORDER).map(String::from).collect()
@@ -1006,9 +1008,11 @@ fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
     else {
         return Ok(());
     };
-    // This model: the levels it takes. A provider or every model: all named
-    // levels, each fitted to the model in use when it is sent.
-    let model_levels = if scope == 0 { current.levels.clone() } else { Vec::new() };
+    // Offer the levels the current model supports for every scope: a provider
+    // or global level is still sent to this model, so it must be one it takes.
+    // (A model with no known levels falls back to the standard list, and a
+    // custom existing value is appended so confirming the editor keeps it.)
+    let model_levels = current.levels.clone();
     let config = agent.config();
     let entry = config.providers.get(&provider);
     let existing = match scope {
@@ -1320,6 +1324,26 @@ mod tests {
         // No existing value: default is the first choice.
         let (_, default) = thinking_choices(0, &levels, &None).unwrap();
         assert_eq!(default, 0);
+    }
+
+    #[test]
+    fn thinking_choices_offer_the_models_levels_for_every_scope() {
+        // A model with its own level set (e.g. an on/off llama.cpp model).
+        let levels = vec!["off".to_string(), "on".to_string()];
+
+        // Provider and global scopes offer those levels too, not the standard
+        // effort names the model doesn't take.
+        for scope in [1, 2] {
+            let (choices, _) = thinking_choices(scope, &levels, &None).unwrap();
+            let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
+            assert!(labels.contains(&"on"), "scope {scope} must offer the model's levels: {labels:?}");
+            assert!(!labels.contains(&"high"), "scope {scope} must not offer unsupported effort names: {labels:?}");
+        }
+
+        // A model with no known levels falls back to the standard list.
+        let (choices, _) = thinking_choices(1, &[], &None).unwrap();
+        let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(labels.contains(&"high"), "empty model levels fall back to the standard list: {labels:?}");
     }
 
     #[test]

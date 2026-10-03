@@ -381,6 +381,12 @@ pub struct Resolved {
     /// control, so the generated field is suppressed to avoid sending two
     /// conflicting controls in the same payload.
     pub extra_body_override: Option<String>,
+    /// `extra_body_override` suppressed the generated field, so `effective` is
+    /// the configured level, not what the wire carries: the override's value
+    /// (which may be a switch or a budget, not a level name) is sent instead.
+    /// Status, ACP and the trajectory report no generated level then rather
+    /// than `effective`, which never reaches the wire.
+    pub overridden: bool,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
 }
@@ -426,11 +432,16 @@ impl Resolved {
             && matches!(self.effective, Thinking::Level(_))
     }
 
-    /// One line for `/context`, e.g. `high (set for this model)`.
+    /// One line for `/context`, e.g. `high (set for this model)`. An
+    /// `extra_body` override sends its own value instead of `effective`, so
+    /// that is reported as overriding the configured level, not as sending it.
     pub fn describe(&self) -> String {
         let mut text = format!("{} ({})", self.effective, self.source.label());
         if self.effective != self.requested {
             text.push_str(&format!(", {} requested", self.requested));
+        }
+        if self.overridden {
+            text.push_str(", overridden by extra_body");
         }
         text
     }
@@ -577,7 +588,8 @@ pub fn resolve_with(
              remove it from extra_body to use the thinking setting"
         ));
     }
-    Resolved { requested, effective, source, levels, wire, anthropic, format, extra_body_override, warning }
+    let overridden = extra_body_override.is_some();
+    Resolved { requested, effective, source, levels, wire, anthropic, format, extra_body_override, overridden, warning }
 }
 
 #[cfg(test)]
@@ -786,6 +798,25 @@ mod tests {
         assert!(r.warning.is_some());
         assert_eq!(r.request(), None, "generated thinking/output_config must be suppressed");
         assert!(!r.anthropic_thinking_on(), "a suppressed level does not lock Anthropic temperature");
+    }
+
+    #[test]
+    fn extra_body_override_is_reported_as_overriding_not_sent() {
+        // The configured level never reaches the wire (the override owns the
+        // thinking control), so it is flagged as overridden and reported as
+        // such, not as the level sent.
+        let p = provider("extra_body = { reasoning_effort = \"low\" }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.overridden, "extra_body override must flag the resolution");
+        assert_eq!(r.effective, level("high"), "the configured level is unchanged");
+        assert_eq!(r.request(), None, "no generated field is sent");
+        assert!(r.describe().contains("overridden by extra_body"), "{}", r.describe());
+
+        // No override: the level is sent and reported normally.
+        let none = ProviderConfig::default();
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &none, "gpt-5");
+        assert!(!r.overridden);
+        assert!(!r.describe().contains("overridden"), "{}", r.describe());
     }
 
     #[test]

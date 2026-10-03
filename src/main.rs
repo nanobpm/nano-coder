@@ -2183,6 +2183,11 @@ async fn main() -> Result<()> {
         if let Some(warning) = agent.temperature().warning {
             banner.push(format!("Warning: {warning}"));
         }
+        // A preconfigured thinking level that is adjusted or ignored warns too,
+        // not only when /thinking or a model switch surfaces it later.
+        if let Some(warning) = agent.thinking().warning {
+            banner.push(format!("Warning: {warning}"));
+        }
         banner.push("Type /help for commands".to_string());
 
         // Main loop
