@@ -950,10 +950,48 @@ fn thinking_item(t: &crate::thinking::Thinking) -> toml_edit::Item {
     }
 }
 
+/// A thinking-level editor choice: the value to set (`None` unsets) and its
+/// display label.
+type ThinkingChoice = (Option<crate::thinking::Thinking>, String);
+
+/// The `(choices, default index)` for the thinking-level editor. `scope` is
+/// 0 (this model), 1 (provider), or 2 (global); `model_levels` are the levels
+/// the current model takes (used only for scope 0). The default lands on
+/// `existing`, and a custom `existing` value absent from the standard choices
+/// is appended so merely confirming the editor preserves it instead of
+/// silently resetting the setting.
+fn thinking_choices(
+    scope: usize,
+    model_levels: &[String],
+    existing: &Option<crate::thinking::Thinking>,
+) -> Result<(Vec<ThinkingChoice>, usize)> {
+    use crate::thinking::{ORDER, Thinking};
+    let levels: Vec<String> = if scope == 0 && !model_levels.is_empty() {
+        model_levels.to_vec()
+    } else {
+        std::iter::once("off").chain(ORDER).map(String::from).collect()
+    };
+    let mut choices: Vec<ThinkingChoice> = Vec::new();
+    if scope < 2 {
+        choices.push((None, "unset (use the broader setting)".into()));
+    }
+    choices.push((Some(Thinking::Default), "default (send no level; the model decides)".into()));
+    for level in &levels {
+        let value: Thinking = level.parse().map_err(anyhow::Error::msg)?;
+        choices.push((Some(value), level.clone()));
+    }
+    if let Some(value) = existing
+        && !choices.iter().any(|(choice, _)| choice.as_ref() == Some(value))
+    {
+        choices.push((Some(value.clone()), value.to_string()));
+    }
+    let default = choices.iter().position(|(value, _)| value == existing).unwrap_or(0);
+    Ok((choices, default))
+}
+
 /// Set the thinking level for the current model, its provider, or every
 /// model, picked from the levels the model supports.
 fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
-    use crate::thinking::{ORDER, Thinking};
     // The live client's provider/model, as for the temperature.
     let provider = agent.provider_name().to_string();
     let model = agent.model_name().to_string();
@@ -970,20 +1008,7 @@ fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
     };
     // This model: the levels it takes. A provider or every model: all named
     // levels, each fitted to the model in use when it is sent.
-    let levels: Vec<String> = if scope == 0 && !current.levels.is_empty() {
-        current.levels.clone()
-    } else {
-        std::iter::once("off").chain(ORDER).map(String::from).collect()
-    };
-    let mut choices: Vec<(Option<Thinking>, String)> = Vec::new();
-    if scope < 2 {
-        choices.push((None, "unset (use the broader setting)".into()));
-    }
-    choices.push((Some(Thinking::Default), "default (send no level; the model decides)".into()));
-    for level in &levels {
-        let value: Thinking = level.parse().map_err(anyhow::Error::msg)?;
-        choices.push((Some(value), level.clone()));
-    }
+    let model_levels = if scope == 0 { current.levels.clone() } else { Vec::new() };
     let config = agent.config();
     let entry = config.providers.get(&provider);
     let existing = match scope {
@@ -991,7 +1016,7 @@ fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
         1 => entry.and_then(|p| p.thinking.clone()),
         _ => Some(config.thinking.clone()),
     };
-    let default = choices.iter().position(|(value, _)| *value == existing).unwrap_or(0);
+    let (mut choices, default) = thinking_choices(scope, &model_levels, &existing)?;
     let labels: Vec<&str> = choices.iter().map(|(_, label)| label.as_str()).collect();
     let Some(pick) = Select::new().with_prompt("Thinking level").items(&labels).default(default).interact_opt()? else {
         return Ok(());
@@ -1274,6 +1299,27 @@ mod tests {
             specs(&["work/llama3", "anthropic/claude", "bare-model", "openai/gpt-5"])
         );
         assert!(recent_models(&[], &all).is_empty());
+    }
+
+    #[test]
+    fn thinking_choices_default_lands_on_the_existing_level() {
+        use crate::thinking::Thinking;
+        let levels = vec!["low".to_string(), "high".to_string()];
+
+        // A standard level is found among the model's choices.
+        let (choices, default) = thinking_choices(0, &levels, &Some(Thinking::Level("high".into()))).unwrap();
+        assert_eq!(choices[default].0, Some(Thinking::Level("high".into())));
+
+        // A custom level absent from the standard choices is appended and
+        // becomes the default, so confirming preserves it instead of resetting.
+        let (choices, default) = thinking_choices(2, &[], &Some(Thinking::Level("deep".into()))).unwrap();
+        assert_eq!(choices[default].0, Some(Thinking::Level("deep".into())));
+        assert!(choices.iter().any(|(v, label)| *v == Some(Thinking::Level("deep".into())) && label == "deep"));
+        assert_ne!(default, 0, "the default must not fall back to the first choice");
+
+        // No existing value: default is the first choice.
+        let (_, default) = thinking_choices(0, &levels, &None).unwrap();
+        assert_eq!(default, 0);
     }
 
     #[test]

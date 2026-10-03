@@ -376,6 +376,11 @@ pub struct Resolved {
     pub anthropic: AnthropicStyle,
     /// For Chat Completions: the field that carries the level.
     pub format: Format,
+    /// The `extra_body` key that carries a thinking setting for this wire, when
+    /// the provider sets one. It is merged in last and owns the thinking
+    /// control, so the generated field is suppressed to avoid sending two
+    /// conflicting controls in the same payload.
+    pub extra_body_override: Option<String>,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
 }
@@ -383,6 +388,15 @@ pub struct Resolved {
 impl Resolved {
     /// What to put in the request, if anything.
     pub fn request(&self) -> Option<Request> {
+        // The provider's `extra_body` already carries a thinking control for
+        // this wire and is merged in last, so it is the only field sent;
+        // emitting the generated field too would ship two conflicting controls
+        // (one of which `finish_body` may not even overwrite, e.g. a Chat
+        // Completions `think` alongside the generated `reasoning_effort`, or an
+        // Anthropic `thinking` alongside the generated `output_config`).
+        if self.extra_body_override.is_some() {
+            return None;
+        }
         match &self.effective {
             Thinking::Default => None,
             Thinking::Off => Some(match (self.wire, self.format) {
@@ -403,7 +417,13 @@ impl Resolved {
     /// Whether Anthropic Messages is asked to think, which rules out a custom
     /// temperature there.
     pub fn anthropic_thinking_on(&self) -> bool {
-        self.wire == Wire::AnthropicMessages && matches!(self.effective, Thinking::Level(_))
+        // A suppressed level sends no generated thinking control (the
+        // `extra_body` override owns it), so our resolution is not what asks
+        // Anthropic to think; the user's `extra_body` and temperature settings
+        // stand on their own.
+        self.extra_body_override.is_none()
+            && self.wire == Wire::AnthropicMessages
+            && matches!(self.effective, Thinking::Level(_))
     }
 
     /// One line for `/context`, e.g. `high (set for this model)`.
@@ -542,16 +562,22 @@ pub fn resolve_with(
         }
     };
 
-    if effective != Thinking::Default
-        && let Some(key) =
-            provider.extra_body.as_ref().and_then(|body| extra_body_keys(wire).iter().find(|k| body.contains_key(**k)))
-    {
+    let extra_body_override = if effective != Thinking::Default {
+        provider
+            .extra_body
+            .as_ref()
+            .and_then(|body| extra_body_keys(wire).iter().find(|k| body.contains_key(**k)))
+            .map(|key| key.to_string())
+    } else {
+        None
+    };
+    if let Some(key) = &extra_body_override {
         warning = Some(format!(
             "the provider's extra_body sets {key:?}, which is sent instead of thinking {effective}; \
              remove it from extra_body to use the thinking setting"
         ));
     }
-    Resolved { requested, effective, source, levels, wire, anthropic, format, warning }
+    Resolved { requested, effective, source, levels, wire, anthropic, format, extra_body_override, warning }
 }
 
 #[cfg(test)]
@@ -738,6 +764,28 @@ mod tests {
         let p = provider("extra_body = { reasoning_effort = \"low\" }");
         let r = resolve(&Thinking::Default, None, Some(ProviderKind::Openai), &p, "gpt-5");
         assert_eq!(r.warning, None);
+    }
+
+    #[test]
+    fn extra_body_override_suppresses_the_generated_field() {
+        // Chat Completions emits `reasoning_effort`, but the override carries
+        // `think`, which `finish_body` would NOT overwrite — so the generated
+        // field must be suppressed to avoid shipping both controls at once.
+        let p = provider("extra_body = { think = true }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.warning.is_some());
+        assert_eq!(r.request(), None, "generated reasoning_effort must be suppressed");
+        assert_eq!(r.extra_body_override.as_deref(), Some("think"));
+
+        // Anthropic effort emits both `thinking` and `output_config`; an
+        // override on `thinking` alone would leave `output_config` behind, so
+        // suppress the generated control entirely and drop the thinking-on
+        // temperature lock (the override owns the thinking decision now).
+        let p = provider("extra_body = { thinking = { type = \"enabled\" } }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-5.5");
+        assert!(r.warning.is_some());
+        assert_eq!(r.request(), None, "generated thinking/output_config must be suppressed");
+        assert!(!r.anthropic_thinking_on(), "a suppressed level does not lock Anthropic temperature");
     }
 
     #[test]
