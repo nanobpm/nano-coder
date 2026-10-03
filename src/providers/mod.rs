@@ -87,6 +87,12 @@ pub struct ProviderConfig {
     /// Temperature for this provider's models: a number, or `"default"` to
     /// send none. Overrides the top-level `temperature`.
     pub temperature: Option<crate::temperature::Temperature>,
+    /// Thinking level for this provider's models: `"default"`, `"off"` or a
+    /// level name. Overrides the top-level `thinking`.
+    pub thinking: Option<crate::thinking::Thinking>,
+    /// Thinking levels this provider's models accept, overriding the built-in
+    /// table (e.g. `["low", "high"]`; add `"off"` if thinking can be turned off).
+    pub thinking_levels: Option<Vec<String>>,
     /// Per-model settings (`[providers.NAME.models."MODEL"]`), which win over
     /// the provider's.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -126,13 +132,21 @@ impl ProviderConfig {
             retry_max_backoff_ms,
             retryable_statuses,
             replay_reasoning,
-            temperature
+            temperature,
+            thinking,
+            thinking_levels
         );
         self.headers.extend(other.headers.clone());
         for (model, settings) in &other.models {
             let entry = self.models.entry(model.clone()).or_default();
             if settings.temperature.is_some() {
                 entry.temperature = settings.temperature;
+            }
+            if settings.thinking.is_some() {
+                entry.thinking = settings.thinking.clone();
+            }
+            if settings.thinking_levels.is_some() {
+                entry.thinking_levels = settings.thinking_levels.clone();
             }
         }
         self

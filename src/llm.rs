@@ -73,6 +73,11 @@ pub struct Message {
     /// so runs can be compared. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<String>,
+    /// Assistant messages: the thinking level sent for the request that
+    /// produced this message and where it came from, e.g. `high (set for this
+    /// model)`. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 impl Message {
@@ -91,6 +96,7 @@ impl Message {
             usage: None,
             duration_ms: None,
             temperature: None,
+            thinking_level: None,
         }
     }
 
@@ -292,6 +298,8 @@ pub struct ChatRequest<'a> {
     pub tools: &'a [ToolDefinition],
     pub temperature: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// Thinking level to ask for; `None` sends nothing.
+    pub thinking: Option<crate::thinking::Request>,
 }
 
 /// Incremental output while a response streams in.

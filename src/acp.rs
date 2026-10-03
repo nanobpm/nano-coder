@@ -320,6 +320,9 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             // The value sent to the model (null: its default).
                             "temperature": agent.temperature().value(),
                             "temperature_source": agent.temperature().source.label(),
+                            // The level sent to the model (null: none, the model decides).
+                            "thinking": thinking_value(&agent.thinking()),
+                            "thinking_source": agent.thinking().source.label(),
                             "max_tokens": config.max_tokens,
                             "system_prompt": config.system_prompt,
                             "session_id": agent.session_id(),
@@ -339,6 +342,30 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                     id,
                     json!({ "stopReason": "end_turn", "plan": agent.plan(), "text": agent.plan().render(true, usize::MAX) }),
                 ));
+            }
+
+            // `/thinking LEVEL` (or `reset`): the session thinking level.
+            if let Some(arg) = command.strip_prefix("/thinking ") {
+                let arg = arg.trim();
+                if arg.eq_ignore_ascii_case("reset") {
+                    agent.set_thinking(None);
+                } else {
+                    match arg.parse::<crate::thinking::Thinking>() {
+                        Ok(level) => agent.set_thinking(Some(level)),
+                        Err(e) => return Some(error(id, -32602, e)),
+                    }
+                }
+                let thinking = agent.thinking();
+                let mut body = json!({
+                    "stopReason": "end_turn",
+                    "thinking": thinking_value(&thinking),
+                    "thinking_source": thinking.source.label(),
+                    "thinking_levels": thinking.levels,
+                });
+                if let Some(warning) = thinking.warning {
+                    body["warning"] = json!(warning);
+                }
+                return Some(result(id, body));
             }
 
             if command == "/providers" {
@@ -362,8 +389,12 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                         // Surface the ignored/adjusted-setting warning so an ACP
                         // client switching to a fixed-temperature model sees the
                         // same condition as the interactive path.
-                        if let Some(warning) = temp.warning {
-                            body["warning"] = json!(warning);
+                        let thinking = agent.thinking();
+                        body["thinking"] = thinking_value(&thinking);
+                        body["thinking_source"] = json!(thinking.source.label());
+                        let warnings: Vec<String> = temp.warning.into_iter().chain(thinking.warning).collect();
+                        if !warnings.is_empty() {
+                            body["warning"] = json!(warnings.join("\n"));
                         }
                         result(id, body)
                     }
@@ -579,6 +610,15 @@ fn requeue_steers(deferred: &mut VecDeque<Value>, leftover: Vec<Steer>, marks: &
             prompt["id"] = tag;
         }
         deferred.insert(mark.min(deferred.len()), prompt);
+    }
+}
+
+/// The thinking level sent, for ACP replies: the level name, `"off"`, or null
+/// when none is sent.
+fn thinking_value(resolved: &crate::thinking::Resolved) -> serde_json::Value {
+    match &resolved.effective {
+        crate::thinking::Thinking::Default => serde_json::Value::Null,
+        other => json!(other.to_string()),
     }
 }
 

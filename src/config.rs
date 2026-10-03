@@ -17,6 +17,9 @@ pub struct Config {
     /// Temperature for every model, unless a provider or model sets its own:
     /// a number, or `"default"` to send none.
     pub temperature: crate::temperature::Temperature,
+    /// Thinking level for every model, unless a provider or model sets its
+    /// own: `"default"` (send nothing), `"off"`, or a level such as `"high"`.
+    pub thinking: crate::thinking::Thinking,
     pub max_tokens: i32,
     pub system_prompt: String,
     /// Legacy: applied to `default_provider` (which becomes `openai` if it was `mock`).
@@ -120,6 +123,7 @@ impl Default for Config {
             model: "gpt-4o-mini".to_string(),
             default_provider: "mock".to_string(),
             temperature: crate::temperature::Temperature::Value(0.7),
+            thinking: crate::thinking::Thinking::Default,
             max_tokens: 4096,
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             api_key: None,

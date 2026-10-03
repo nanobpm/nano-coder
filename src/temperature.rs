@@ -86,6 +86,13 @@ impl<'de> Deserialize<'de> for Temperature {
 pub struct ModelSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<Temperature>,
+    /// Thinking level for this model (see `crate::thinking`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::thinking::Thinking>,
+    /// Thinking levels this model accepts, overriding the provider's list and
+    /// the built-in table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
 }
 
 /// Where the temperature in effect came from.
@@ -135,6 +142,22 @@ impl Resolved {
             Temperature::Default => None,
             Temperature::Value(v) => Some(v),
         }
+    }
+
+    /// This resolution with the temperature dropped for `reason` (the model
+    /// takes only its default, e.g. while Anthropic thinking is on). A value
+    /// set for this provider or model is reported as ignored.
+    pub fn fixed_by(self, reason: String) -> Resolved {
+        if self.fixed.is_some() {
+            return self;
+        }
+        let warning = match (self.effective, self.source) {
+            (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
+                Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", self.source.label()))
+            }
+            _ => self.warning,
+        };
+        Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning }
     }
 
     /// One line for `/context` and `/settings`, e.g. `0.3 (set for this model)`.

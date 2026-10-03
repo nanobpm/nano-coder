@@ -10,6 +10,7 @@ use crate::llm::{
     ChatRequest, DetectedWindow, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, ThinkSplitter,
     TokenUsage, ToolCall, report_whole,
 };
+use crate::thinking::Request;
 
 pub struct OpenAiClient {
     transport: HttpTransport,
@@ -53,6 +54,12 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     }
     if let Some(max_tokens) = request.max_tokens {
         body[provider.max_tokens_param.as_str()] = json!(max_tokens);
+    }
+    match &request.thinking {
+        Some(Request::Effort(level)) => body["reasoning_effort"] = json!(level),
+        Some(Request::Off) => body["reasoning_effort"] = json!("none"),
+        // Budgets are only resolved for Anthropic Messages.
+        Some(Request::Budget(_)) | None => {}
     }
     transport.finish_body(body)
 }
@@ -564,6 +571,19 @@ mod tests {
     }
 
     #[test]
+    fn encodes_thinking_levels_and_lets_extra_body_win() {
+        let messages = [Message::user("q")];
+        let request =
+            |thinking| ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking };
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        assert_eq!(client.build_body(&request(Some(Request::Effort("high".into()))))["reasoning_effort"], "high");
+        assert_eq!(client.build_body(&request(Some(Request::Off)))["reasoning_effort"], "none");
+        assert!(client.build_body(&request(None)).get("reasoning_effort").is_none());
+        let client = OpenAiClient::new(provider("http://x", "reasoning_effort = \"low\"")).unwrap();
+        assert_eq!(client.build_body(&request(Some(Request::Effort("high".into()))))["reasoning_effort"], "low");
+    }
+
+    #[test]
     fn trajectory_data_is_never_sent() {
         let logged = Message {
             thinking: "private reasoning".into(),
@@ -609,6 +629,7 @@ mod tests {
             tools: &tools,
             temperature: Some(0.2),
             max_tokens: Some(100),
+            thinking: None,
         });
         assert_eq!(body["model"], "some-model");
         assert_eq!(body["think"], false);
@@ -689,7 +710,7 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None })
+            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
             .await
             .unwrap();
         assert_eq!(response.content, "hi");
@@ -708,7 +729,7 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None })
+            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
             .await
             .unwrap();
         assert_eq!(response.content, "whole");
@@ -756,7 +777,10 @@ mod tests {
         let messages = [Message::user("hi")];
         let sink = |_e: StreamEvent<'_>| {};
         let response = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &sink,
+            )
             .await
             .unwrap();
         assert_eq!(response.content, "hello world");
@@ -791,7 +815,10 @@ mod tests {
             }
         };
         let response = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &sink,
+            )
             .await
             .unwrap();
         assert_eq!(response.content, "hello world");
@@ -823,7 +850,10 @@ mod tests {
             }
         };
         let result = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &sink,
+            )
             .await;
         // The mid-stream failure surfaces rather than being silently retried.
         assert!(result.is_err(), "expected the truncated stream to error, got {result:?}");
@@ -865,7 +895,10 @@ mod tests {
             }
         };
         let response = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &sink,
+            )
             .await
             .unwrap();
         // A metadata-only event must not suppress the retry.
@@ -890,7 +923,7 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let err = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None })
+            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("invalid_api_key"), "{err:#}");
@@ -920,7 +953,10 @@ mod tests {
             })
         };
         let response = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &sink)
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &sink,
+            )
             .await
             .unwrap();
         assert_eq!(response.thinking, "Let me check.more");
@@ -957,7 +993,8 @@ mod tests {
         resolved.replay_reasoning = true;
         let client = OpenAiClient::new(resolved.clone()).unwrap();
         let messages = [Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         let response = client.chat_stream(&request, &|_| {}).await.unwrap();
         // Only the provider's reasoning field is replayed, not inline <think> text.
         assert_eq!(response.thinking_blocks, vec![json!({"type": "reasoning_content", "text": "Need ls."})]);
@@ -975,7 +1012,8 @@ mod tests {
                 ..Message::assistant("done")
             },
         ];
-        let request = ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None, thinking: None };
         let body = client.build_body(&request);
         assert_eq!(body["messages"][1]["reasoning_content"], "Need ls.");
         assert!(body["messages"][2].get("reasoning_content").is_none(), "Anthropic blocks are not replayed");
@@ -992,7 +1030,10 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat_stream(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None }, &|_| {})
+            .chat_stream(
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &|_| {},
+            )
             .await
             .unwrap();
         assert_eq!((response.content.as_str(), response.thinking.as_str()), ("hi", "hmm"));

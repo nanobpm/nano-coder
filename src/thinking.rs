@@ -1,0 +1,619 @@
+//! Thinking level: how much the model reasons before it answers. `"default"`
+//! sends nothing (the model decides), `"off"` turns thinking off where the
+//! model allows it, and a level (`"low"`, `"medium"`, `"high"`, `"xhigh"`,
+//! `"max"`, …) asks for that much. Set globally, per provider
+//! (`[providers.NAME]`) and per model (`[providers.NAME.models."MODEL"]`); the
+//! most specific setting wins, and `/thinking LEVEL` overrides all of them for
+//! the session.
+//!
+//! Only levels the model supports can be sent. They come from a
+//! `thinking_levels` list in the config (model, then provider), else a
+//! built-in table of well-known model families. A level the model doesn't
+//! support is moved to the nearest one it does, with a warning.
+//!
+//! Each API gets its own request field (see [`Request`]): Chat Completions
+//! `reasoning_effort`, Responses `reasoning.effort`, and Anthropic Messages
+//! adaptive thinking with `output_config.effort` (or, on older Claude models,
+//! a fixed `budget_tokens`).
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::providers::{ProviderConfig, ProviderKind};
+
+/// Named levels from least to most thinking. "Nearest" is measured on this
+/// scale; a custom level from `thinking_levels` that isn't on it only matches
+/// exactly.
+pub const ORDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// A thinking setting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Thinking {
+    /// Send nothing; the model (or the provider's `extra_body`) decides.
+    #[default]
+    Default,
+    /// Turn thinking off.
+    Off,
+    /// A named level, stored lower-case.
+    Level(String),
+}
+
+impl fmt::Display for Thinking {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Thinking::Default => f.write_str("model default"),
+            Thinking::Off => f.write_str("off"),
+            Thinking::Level(level) => f.write_str(level),
+        }
+    }
+}
+
+impl FromStr for Thinking {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "default" | "model default" | "auto" => Ok(Thinking::Default),
+            "off" | "none" | "disabled" => Ok(Thinking::Off),
+            "" => Err("thinking level is empty; use \"default\", \"off\" or a level such as \"high\"".into()),
+            level if level.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => {
+                Ok(Thinking::Level(level.to_string()))
+            }
+            other => {
+                Err(format!("thinking must be \"default\", \"off\" or a level name such as \"high\"; got {other:?}"))
+            }
+        }
+    }
+}
+
+impl Serialize for Thinking {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Thinking::Default => serializer.serialize_str("default"),
+            other => serializer.serialize_str(&other.to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Thinking {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// How an Anthropic Messages model takes a thinking level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicStyle {
+    /// `thinking = { type = "adaptive" }` plus `output_config.effort`.
+    Adaptive,
+    /// `thinking = { type = "enabled", budget_tokens = N }` (Claude 3.7 to 4.5).
+    Budget,
+}
+
+/// What the request asks for, after resolution. Built by [`Resolved::request`]
+/// and turned into fields by each provider's body builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// Turn thinking off.
+    Off,
+    /// A named effort level (`reasoning_effort`, `reasoning.effort`, or
+    /// Anthropic adaptive thinking with `output_config.effort`).
+    Effort(String),
+    /// Anthropic fixed thinking budget in tokens; the builder caps it below
+    /// `max_tokens`.
+    Budget(u32),
+}
+
+/// Anthropic thinking budget for a level on [`AnthropicStyle::Budget`] models.
+pub fn budget_tokens(level: &str) -> u32 {
+    match level {
+        "minimal" => 1024,
+        "low" => 2048,
+        "medium" => 8192,
+        "high" => 16384,
+        "xhigh" => 32768,
+        _ => 65536,
+    }
+}
+
+/// Smallest budget Anthropic accepts.
+pub const MIN_BUDGET: u32 = 1024;
+
+/// The thinking budget to send under an output cap of `max_tokens`, which the
+/// budget must stay below; `None` when the cap leaves no room for the minimum.
+pub fn capped_budget(budget: u32, max_tokens: i64) -> Option<u32> {
+    let room = max_tokens.saturating_sub(1).clamp(0, u32::MAX as i64) as u32;
+    let budget = budget.min(room);
+    (budget >= MIN_BUDGET).then_some(budget)
+}
+
+/// What a model supports, from the built-in table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// Levels it accepts, `"off"` included when thinking can be turned off.
+    pub levels: Vec<String>,
+    /// How Anthropic Messages takes the level (for Claude models only).
+    pub anthropic: Option<AnthropicStyle>,
+}
+
+impl Profile {
+    fn new(levels: &[&str], anthropic: Option<AnthropicStyle>) -> Self {
+        Profile { levels: levels.iter().map(|l| l.to_string()).collect(), anthropic }
+    }
+}
+
+/// `(family, major, minor)` of a Claude model id, e.g. `claude-sonnet-4-5-20250929`
+/// → `("sonnet", 4, 5)`, `claude-opus-4.7` → `("opus", 4, 7)`,
+/// `claude-3-7-sonnet-latest` → `("sonnet", 3, 7)`. The id may carry a vendor
+/// prefix (`anthropic/…`, `anthropic.…` on Bedrock).
+fn claude_version(id: &str) -> Option<(&'static str, u32, u32)> {
+    let rest = &id[id.find("claude-")? + "claude-".len()..];
+    // A one- or two-digit number at the start of `s`, and what follows it.
+    fn number(s: &str) -> Option<(u32, &str)> {
+        let digits = s.chars().take_while(char::is_ascii_digit).count();
+        // Two digits at most: a date suffix (`20250929`) is not a version.
+        if digits == 0 || digits > 2 {
+            return None;
+        }
+        Some((s[..digits].parse().ok()?, &s[digits..]))
+    }
+    // `minor` is one digit after `.`/`-`, followed by the end or a non-digit.
+    fn minor(s: &str) -> u32 {
+        let Some(tail) = s.strip_prefix(['.', '-']) else { return 0 };
+        match number(tail) {
+            Some((m, after)) if m < 10 && !after.starts_with(|c: char| c.is_ascii_digit()) => m,
+            _ => 0,
+        }
+    }
+    for family in ["opus", "sonnet", "haiku", "fable"] {
+        // `claude-sonnet-4-5`, `claude-opus-4.7`, `claude-fable-5`.
+        if let Some(after) = rest.strip_prefix(family).and_then(|r| r.strip_prefix('-'))
+            && let Some((major, tail)) = number(after)
+        {
+            return Some((family, major, minor(tail)));
+        }
+    }
+    // The older `claude-3-7-sonnet` order.
+    let (major, tail) = number(rest)?;
+    let minor_value = minor(tail);
+    for family in ["opus", "sonnet", "haiku"] {
+        if tail.contains(family) {
+            return Some((family, major, minor_value));
+        }
+    }
+    None
+}
+
+/// The built-in profile for a model id, if its family is known.
+pub fn builtin(model: &str) -> Option<Profile> {
+    use AnthropicStyle::{Adaptive, Budget};
+    let id = model.to_ascii_lowercase();
+    if let Some((family, major, minor)) = claude_version(&id) {
+        let version = (major, minor);
+        return match family {
+            // Fable and Opus/Sonnet 5.5 and later always think; effort sets how much.
+            "fable" => Some(Profile::new(&["low", "medium", "high", "xhigh", "max"], Some(Adaptive))),
+            "opus" | "sonnet" if version >= (5, 5) => {
+                Some(Profile::new(&["low", "medium", "high", "xhigh", "max"], Some(Adaptive)))
+            }
+            "opus" | "sonnet" if version >= (4, 7) => {
+                Some(Profile::new(&["off", "low", "medium", "high", "xhigh", "max"], Some(Adaptive)))
+            }
+            "opus" | "sonnet" if version == (4, 6) => {
+                Some(Profile::new(&["off", "low", "medium", "high", "max"], Some(Adaptive)))
+            }
+            // Extended thinking with a fixed budget: Claude 3.7 Sonnet to 4.5.
+            _ if ((3, 7)..(4, 6)).contains(&version) && !(family == "haiku" && version < (4, 5)) => {
+                Some(Profile::new(&["off", "low", "medium", "high"], Some(Budget)))
+            }
+            _ => None,
+        };
+    }
+    // The last path segment: `openai/gpt-5` on OpenRouter is `gpt-5`.
+    let id = id.rsplit('/').next().unwrap_or(&id);
+    let major = |rest: &str| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok();
+    if id.strip_prefix("gpt-").and_then(major).is_some_and(|m| m >= 5) {
+        return Some(Profile::new(&["low", "medium", "high"], None));
+    }
+    if ["o1", "o3", "o4"].iter().any(|p| id == *p || id.starts_with(&format!("{p}-"))) {
+        return Some(Profile::new(&["low", "medium", "high"], None));
+    }
+    None
+}
+
+/// Which request format `model` is sent in by a client of `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    ChatCompletions,
+    Responses,
+    AnthropicMessages,
+}
+
+pub fn wire(kind: Option<ProviderKind>, model: &str) -> Wire {
+    match kind {
+        Some(ProviderKind::Anthropic) => Wire::AnthropicMessages,
+        Some(ProviderKind::GithubCopilot) => crate::providers::github_copilot::wire_for_model(model),
+        _ => Wire::ChatCompletions,
+    }
+}
+
+/// `extra_body` keys that carry a thinking setting for `wire`; one of these in
+/// the provider's `extra_body` is merged in last and wins.
+fn extra_body_keys(wire: Wire) -> &'static [&'static str] {
+    match wire {
+        Wire::ChatCompletions => &["reasoning_effort", "reasoning", "think"],
+        Wire::Responses => &["reasoning"],
+        Wire::AnthropicMessages => &["thinking", "output_config"],
+    }
+}
+
+/// Where the thinking level in effect came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `/thinking LEVEL` in this session.
+    Session,
+    /// `[providers.NAME.models."MODEL"] thinking`.
+    Model,
+    /// `[providers.NAME] thinking`.
+    Provider,
+    /// The top-level `thinking`.
+    Global,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Session => "set for this session",
+            Source::Model => "set for this model",
+            Source::Provider => "set for this provider",
+            Source::Global => "global setting",
+        }
+    }
+}
+
+/// The thinking level a model is sent, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    /// The setting that applied, before fitting it to the model.
+    pub requested: Thinking,
+    /// What is sent: `Default` sends nothing.
+    pub effective: Thinking,
+    pub source: Source,
+    /// Levels the model supports (`"off"` included when it can be turned
+    /// off); empty when nothing is known about the model.
+    pub levels: Vec<String>,
+    /// How the request carries the level.
+    pub wire: Wire,
+    /// For Anthropic Messages: adaptive effort or a fixed budget.
+    pub anthropic: AnthropicStyle,
+    /// A setting that is ignored or adjusted, worth telling the user about.
+    pub warning: Option<String>,
+}
+
+impl Resolved {
+    /// What to put in the request, if anything.
+    pub fn request(&self) -> Option<Request> {
+        match &self.effective {
+            Thinking::Default => None,
+            Thinking::Off => Some(Request::Off),
+            Thinking::Level(level) => Some(match (self.wire, self.anthropic) {
+                (Wire::AnthropicMessages, AnthropicStyle::Budget) => Request::Budget(budget_tokens(level)),
+                _ => Request::Effort(level.clone()),
+            }),
+        }
+    }
+
+    /// Whether Anthropic Messages is asked to think, which rules out a custom
+    /// temperature there.
+    pub fn anthropic_thinking_on(&self) -> bool {
+        self.wire == Wire::AnthropicMessages && matches!(self.effective, Thinking::Level(_))
+    }
+
+    /// One line for `/context`, e.g. `high (set for this model)`.
+    pub fn describe(&self) -> String {
+        let mut text = format!("{} ({})", self.effective, self.source.label());
+        if self.effective != self.requested {
+            text.push_str(&format!(", {} requested", self.requested));
+        }
+        text
+    }
+
+    /// The levels `/thinking` can set for this model, for display.
+    pub fn choices(&self) -> String {
+        let mut all = vec!["default".to_string()];
+        all.extend(self.levels.iter().cloned());
+        all.join(", ")
+    }
+}
+
+/// The level in `levels` nearest to `wanted`: the highest at or below it on
+/// [`ORDER`], else the lowest above it. A name not on the scale matches only
+/// itself.
+fn nearest<'a>(levels: &'a [String], wanted: &str) -> Option<&'a String> {
+    if let Some(exact) = levels.iter().find(|l| *l == wanted) {
+        return Some(exact);
+    }
+    let rank = |l: &str| ORDER.iter().position(|o| *o == l);
+    let wanted_rank = rank(wanted)?;
+    let ranked: Vec<(usize, &String)> = levels.iter().filter_map(|l| rank(l).map(|r| (r, l))).collect();
+    ranked
+        .iter()
+        .filter(|(r, _)| *r <= wanted_rank)
+        .max_by_key(|(r, _)| *r)
+        .or_else(|| ranked.iter().filter(|(r, _)| *r > wanted_rank).min_by_key(|(r, _)| *r))
+        .map(|(_, l)| *l)
+}
+
+/// The thinking level for `model` on `provider` (the merged provider entry):
+/// the session override, else the model's setting, else the provider's, else
+/// `global`, fitted to the levels the model supports.
+pub fn resolve(
+    global: &Thinking,
+    session: Option<&Thinking>,
+    kind: Option<ProviderKind>,
+    provider: &ProviderConfig,
+    model: &str,
+) -> Resolved {
+    let model_settings = provider.models.get(model);
+    let (requested, source) = if let Some(t) = session {
+        (t.clone(), Source::Session)
+    } else if let Some(t) = model_settings.and_then(|m| m.thinking.clone()) {
+        (t, Source::Model)
+    } else if let Some(t) = provider.thinking.clone() {
+        (t, Source::Provider)
+    } else {
+        (global.clone(), Source::Global)
+    };
+    let profile = builtin(model);
+    let levels: Vec<String> = model_settings
+        .and_then(|m| m.thinking_levels.clone())
+        .or_else(|| provider.thinking_levels.clone())
+        .map(|levels| levels.iter().map(|l| l.trim().to_ascii_lowercase()).collect())
+        .or_else(|| profile.as_ref().map(|p| p.levels.clone()))
+        .unwrap_or_default();
+    let wire = wire(kind, model);
+    // A Claude model the table doesn't know: assume the current (adaptive) API.
+    let anthropic = profile.and_then(|p| p.anthropic).unwrap_or(AnthropicStyle::Adaptive);
+    // The global setting applies to every model, so a level that one model
+    // can't take is not worth a warning; one set for it (or the session) is.
+    let explicit = source != Source::Global;
+
+    let (effective, mut warning) = match &requested {
+        Thinking::Default => (Thinking::Default, None),
+        _ if levels.is_empty() => (
+            Thinking::Default,
+            explicit.then(|| {
+                format!(
+                    "thinking {requested} ({}) is ignored: no thinking levels are known for {model}; \
+                     list them with thinking_levels in its provider or model settings",
+                    source.label()
+                )
+            }),
+        ),
+        Thinking::Off if levels.iter().any(|l| l == "off") => (Thinking::Off, None),
+        Thinking::Off => {
+            (Thinking::Default, explicit.then(|| format!("{model} can't turn thinking off; using the model default")))
+        }
+        Thinking::Level(level) => {
+            let on: Vec<String> = levels.iter().filter(|l| *l != "off").cloned().collect();
+            match nearest(&on, level) {
+                Some(found) if found == level => (Thinking::Level(found.clone()), None),
+                Some(found) => (
+                    Thinking::Level(found.clone()),
+                    explicit.then(|| format!("{model} has no thinking level {level:?}; using {found:?}")),
+                ),
+                None => (
+                    Thinking::Default,
+                    explicit.then(|| {
+                        format!(
+                            "{model} has no thinking level {level:?} (it has: {}); using the model default",
+                            levels.join(", ")
+                        )
+                    }),
+                ),
+            }
+        }
+    };
+
+    if effective != Thinking::Default
+        && let Some(key) =
+            provider.extra_body.as_ref().and_then(|body| extra_body_keys(wire).iter().find(|k| body.contains_key(**k)))
+    {
+        warning = Some(format!(
+            "the provider's extra_body sets {key:?}, which is sent instead of thinking {effective}; \
+             remove it from extra_body to use the thinking setting"
+        ));
+    }
+    Resolved { requested, effective, source, levels, wire, anthropic, warning }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn provider(toml_text: &str) -> ProviderConfig {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    fn level(l: &str) -> Thinking {
+        Thinking::Level(l.into())
+    }
+
+    #[test]
+    fn parses_and_round_trips() {
+        assert_eq!("default".parse::<Thinking>(), Ok(Thinking::Default));
+        assert_eq!(" Off ".parse::<Thinking>(), Ok(Thinking::Off));
+        assert_eq!("HIGH".parse::<Thinking>(), Ok(level("high")));
+        assert!("".parse::<Thinking>().is_err());
+        assert!("very high!".parse::<Thinking>().is_err());
+
+        let config: Config = toml::from_str("thinking = \"high\"").unwrap();
+        assert_eq!(config.thinking, level("high"));
+        assert_eq!(Config::default().thinking, Thinking::Default);
+        assert!(toml::from_str::<Config>("thinking = 3").is_err());
+        let text = toml::to_string(&Config { thinking: Thinking::Off, ..Default::default() }).unwrap();
+        assert!(text.contains("thinking = \"off\""), "{text}");
+    }
+
+    #[test]
+    fn knows_model_families() {
+        let levels = |m: &str| builtin(m).map(|p| p.levels.join(","));
+        let style = |m: &str| builtin(m).and_then(|p| p.anthropic);
+        // Adaptive models, with and without an off switch.
+        assert_eq!(levels("claude-fable-5-1").as_deref(), Some("low,medium,high,xhigh,max"));
+        assert_eq!(levels("claude-opus-5-5").as_deref(), Some("low,medium,high,xhigh,max"));
+        assert_eq!(levels("claude-sonnet-5").as_deref(), Some("off,low,medium,high,xhigh,max"));
+        assert_eq!(levels("claude-opus-4.7").as_deref(), Some("off,low,medium,high,xhigh,max"));
+        assert_eq!(levels("claude-sonnet-4-6").as_deref(), Some("off,low,medium,high,max"));
+        assert_eq!(style("claude-sonnet-4-6"), Some(AnthropicStyle::Adaptive));
+        // Fixed-budget models, including dated, dotted and vendor-prefixed ids.
+        for m in [
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4.5",
+            "anthropic/claude-opus-4.1",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+            "claude-haiku-4-5",
+            "claude-3-7-sonnet-latest",
+        ] {
+            assert_eq!(style(m), Some(AnthropicStyle::Budget), "{m}");
+            assert_eq!(levels(m).as_deref(), Some("off,low,medium,high"), "{m}");
+        }
+        // No extended thinking.
+        assert_eq!(builtin("claude-3-5-sonnet-latest"), None);
+        assert_eq!(builtin("claude-3-5-haiku"), None);
+        // OpenAI reasoning models.
+        assert_eq!(levels("gpt-5").as_deref(), Some("low,medium,high"));
+        assert_eq!(levels("openai/gpt-5.6-sol").as_deref(), Some("low,medium,high"));
+        assert_eq!(levels("o4-mini").as_deref(), Some("low,medium,high"));
+        assert_eq!(builtin("gpt-4.1"), None);
+        assert_eq!(builtin("llama3.3"), None);
+        assert_eq!(builtin("omni-moderation"), None);
+    }
+
+    #[test]
+    fn most_specific_setting_wins() {
+        let p = provider(
+            r#"
+            kind = "openai"
+            thinking = "low"
+            [models."gpt-5"]
+            thinking = "high"
+            "#,
+        );
+        let kind = Some(ProviderKind::Openai);
+        let global = level("medium");
+        let r = resolve(&global, None, kind, &p, "gpt-5");
+        assert_eq!((r.effective.clone(), r.source), (level("high"), Source::Model));
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
+        let r = resolve(&global, None, kind, &p, "gpt-5.1");
+        assert_eq!((r.effective, r.source), (level("low"), Source::Provider));
+        let r = resolve(&global, None, kind, &ProviderConfig::default(), "gpt-5");
+        assert_eq!((r.effective, r.source), (level("medium"), Source::Global));
+        // The session override beats everything.
+        let r = resolve(&global, Some(&Thinking::Default), kind, &p, "gpt-5");
+        assert_eq!((r.effective.clone(), r.source), (Thinking::Default, Source::Session));
+        assert_eq!(r.request(), None);
+    }
+
+    #[test]
+    fn fits_the_level_to_the_model() {
+        let none = ProviderConfig::default();
+        let anthropic = Some(ProviderKind::Anthropic);
+        // xhigh on Sonnet 4.6 (no xhigh) runs as high, with a warning.
+        let r = resolve(&Thinking::Default, Some(&level("xhigh")), anthropic, &none, "claude-sonnet-4-6");
+        assert_eq!(r.effective, level("high"));
+        assert!(r.warning.as_deref().unwrap().contains("using \"high\""), "{:?}", r.warning);
+        assert!(r.describe().contains("xhigh requested"), "{}", r.describe());
+        // Below the lowest level: the lowest one.
+        let r = resolve(&Thinking::Default, Some(&level("minimal")), anthropic, &none, "claude-opus-5-5");
+        assert_eq!(r.effective, level("low"));
+        // Off where the model can't: the model default.
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), anthropic, &none, "claude-fable-5-1");
+        assert_eq!(r.effective, Thinking::Default);
+        assert!(r.warning.unwrap().contains("can't turn thinking off"));
+        // Off where it can.
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), anthropic, &none, "claude-sonnet-4-5");
+        assert_eq!(r.request(), Some(Request::Off));
+        // A model with no known levels sends nothing; only an explicit
+        // setting warns, not the global one.
+        let r = resolve(&level("high"), None, Some(ProviderKind::Openai), &none, "llama3.3");
+        assert_eq!((r.effective, r.warning), (Thinking::Default, None));
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &none, "llama3.3");
+        assert_eq!(r.effective, Thinking::Default);
+        assert!(r.warning.unwrap().contains("thinking_levels"));
+        // A global level a model lacks is fitted silently.
+        let r = resolve(&level("max"), None, Some(ProviderKind::Openai), &none, "gpt-5");
+        assert_eq!((r.effective, r.warning), (level("high"), None));
+    }
+
+    #[test]
+    fn config_levels_override_the_table() {
+        let p = provider(
+            r#"
+            thinking_levels = ["low", "high"]
+            [models."qwen3"]
+            thinking_levels = ["off", "on"]
+            "#,
+        );
+        let kind = Some(ProviderKind::Openai);
+        let r = resolve(&Thinking::Default, Some(&level("medium")), kind, &p, "kimi-k3");
+        assert_eq!(r.effective, level("low"));
+        assert_eq!(r.choices(), "default, low, high");
+        // A custom level name matches only itself.
+        let r = resolve(&Thinking::Default, Some(&level("on")), kind, &p, "qwen3");
+        assert_eq!(r.request(), Some(Request::Effort("on".into())));
+        let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "qwen3");
+        assert_eq!(r.effective, Thinking::Default);
+        assert!(r.warning.unwrap().contains("it has: off, on"));
+    }
+
+    #[test]
+    fn picks_the_request_form_for_the_api() {
+        let none = ProviderConfig::default();
+        let high = level("high");
+        let anthropic = Some(ProviderKind::Anthropic);
+        let copilot = Some(ProviderKind::GithubCopilot);
+        // Anthropic: adaptive effort on new models, a budget on older ones.
+        let r = resolve(&Thinking::Default, Some(&high), anthropic, &none, "claude-opus-4-7");
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
+        assert!(r.anthropic_thinking_on());
+        let r = resolve(&Thinking::Default, Some(&high), anthropic, &none, "claude-sonnet-4-5");
+        assert_eq!(r.request(), Some(Request::Budget(16384)));
+        // Copilot routes by model: Claude 4.x to Messages, GPT-5 to Responses.
+        let r = resolve(&Thinking::Default, Some(&high), copilot, &none, "claude-sonnet-4.5");
+        assert_eq!((r.wire, r.request()), (Wire::AnthropicMessages, Some(Request::Budget(16384))));
+        let r = resolve(&Thinking::Default, Some(&high), copilot, &none, "gpt-5.6-sol");
+        assert_eq!((r.wire, r.request()), (Wire::Responses, Some(Request::Effort("high".into()))));
+        assert!(!r.anthropic_thinking_on());
+        // A Claude model on an OpenAI-compatible endpoint takes an effort name.
+        let r =
+            resolve(&Thinking::Default, Some(&high), Some(ProviderKind::Openai), &none, "anthropic/claude-sonnet-4.5");
+        assert_eq!((r.wire, r.request()), (Wire::ChatCompletions, Some(Request::Effort("high".into()))));
+    }
+
+    #[test]
+    fn warns_when_extra_body_sets_the_same_field() {
+        let p = provider("extra_body = { reasoning_effort = \"low\" }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.warning.unwrap().contains("\"reasoning_effort\""));
+        // An extra_body field for another API is not a conflict.
+        let p = provider("extra_body = { thinking = { type = \"enabled\" } }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert_eq!(r.warning, None);
+        // Nor is anything when no level is sent.
+        let p = provider("extra_body = { reasoning_effort = \"low\" }");
+        let r = resolve(&Thinking::Default, None, Some(ProviderKind::Openai), &p, "gpt-5");
+        assert_eq!(r.warning, None);
+    }
+
+    #[test]
+    fn caps_budgets_below_max_tokens() {
+        assert_eq!(capped_budget(16384, 32000), Some(16384));
+        assert_eq!(capped_budget(16384, 4096), Some(4095));
+        assert_eq!(capped_budget(2048, 1024), None);
+    }
+}

@@ -420,6 +420,8 @@ pub type EventSink = Box<dyn Fn(Option<&str>, &AgentEvent) + Send + Sync>;
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
     client: Box<dyn LLMClient>,
+    /// `/thinking LEVEL` for this session; wins over the config.
+    thinking_override: Option<crate::thinking::Thinking>,
     tools: ToolRegistry,
     hooks: HookRegistry,
     config: Config,
@@ -535,6 +537,7 @@ impl Agent {
         let policy = Policy::new(&config.permissions, &config.sandbox);
         let memory = Self::build_memory(&config);
         Self {
+            thinking_override: None,
             policy,
             client,
             tools: ToolRegistry::new(),
@@ -664,7 +667,13 @@ impl Agent {
             };
             let messages = [Message::system(TITLE_PROMPT), Message::user(&source)];
             // Room for reasoning models that think before answering.
-            let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(400) };
+            let request = ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: Some(400),
+                thinking: None,
+            };
             let reply = tokio::time::timeout(Duration::from_secs(60), client.chat(&request)).await;
             if let Ok(Ok(response)) = reply
                 && let Some(title) = crate::session_index::clean_title(&response.content)
@@ -723,7 +732,55 @@ impl Agent {
         // that need kind-specific rules report their kind explicitly.
         let kind = self.client.kind();
         let provider = entry.unwrap_or_default();
-        crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
+        let resolved = crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name());
+        // Anthropic accepts no custom temperature while the model thinks.
+        if self.thinking().anthropic_thinking_on() {
+            return resolved.fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        }
+        resolved
+    }
+
+    /// The thinking level the current model is sent, and where it comes from.
+    /// Resolved against the live client, like [`Agent::temperature`].
+    pub fn thinking(&self) -> crate::thinking::Resolved {
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        let mut resolved = crate::thinking::resolve(
+            &self.config.thinking,
+            self.thinking_override.as_ref(),
+            self.client.kind(),
+            &provider,
+            self.model_name(),
+        );
+        // A fixed budget must stay below the output cap; say so when the cap
+        // shrinks the level's budget.
+        if resolved.warning.is_none()
+            && let Some(crate::thinking::Request::Budget(budget)) = resolved.request()
+        {
+            let max_tokens = self.request_max_tokens();
+            match crate::thinking::capped_budget(budget, max_tokens) {
+                Some(sent) if sent < budget => {
+                    resolved.warning = Some(format!(
+                        "max_tokens {max_tokens} caps the {} thinking budget at {sent} of {budget} tokens; \
+                         raise max_tokens for the full budget",
+                        resolved.effective
+                    ))
+                }
+                None => {
+                    resolved.warning = Some(format!(
+                        "max_tokens {max_tokens} leaves no room for a thinking budget; thinking stays off"
+                    ))
+                }
+                _ => {}
+            }
+        }
+        resolved
+    }
+
+    /// Set (or with `None`, clear) the thinking level for this session.
+    pub fn set_thinking(&mut self, thinking: Option<crate::thinking::Thinking>) {
+        self.thinking_override = thinking;
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
@@ -1791,6 +1848,7 @@ impl Agent {
             // temperature do not change across overflow retries, and the
             // trajectory records the same effective value that is sent.
             let resolved_temperature = self.temperature();
+            let resolved_thinking = self.thinking();
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Rebuilt every retry iteration, not just once before the loop:
@@ -1804,6 +1862,7 @@ impl Agent {
                     tools: &tools,
                     temperature: resolved_temperature.value(),
                     max_tokens: Some(self.request_max_tokens()),
+                    thinking: resolved_thinking.request(),
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
@@ -1940,6 +1999,11 @@ impl Agent {
                 usage: response.usage.clone(),
                 duration_ms: Some(duration_ms),
                 temperature: Some(resolved_temperature.describe()),
+                // Only when a level is sent or set for this model, provider or
+                // session, so logs without thinking levels stay unchanged.
+                thinking_level: (resolved_thinking.effective != crate::thinking::Thinking::Default
+                    || resolved_thinking.source != crate::thinking::Source::Global)
+                    .then(|| resolved_thinking.describe()),
                 ..message
             };
 
@@ -2372,6 +2436,9 @@ impl Agent {
             // still send none.
             temperature: self.temperature().value(),
             max_tokens: Some(output_budget),
+            // A summary needs no extended reasoning; the model's own default
+            // applies, as before thinking levels existed.
+            thinking: None,
         };
         let control = self.control.clone();
         // Stream the summary even though its text is used only once complete.
@@ -3930,6 +3997,101 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// An Anthropic-kind Claude client that records the temperature and
+    /// thinking level of each request.
+    type SeenSettings = Arc<Mutex<Vec<(Option<f64>, Option<crate::thinking::Request>)>>>;
+
+    struct Claude {
+        seen: SeenSettings,
+    }
+
+    #[async_trait]
+    impl LLMClient for Claude {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.seen.lock().unwrap().push((request.temperature, request.thinking.clone()));
+            Ok(text("ok"))
+        }
+        fn model_name(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Anthropic)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thinking_level_is_sent_and_drops_the_temperature_on_anthropic() {
+        use crate::thinking::{Request, Source, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(Claude { seen: seen.clone() }), config);
+        agent.new_session().unwrap();
+
+        // Nothing configured: no level, and the temperature is sent.
+        agent.run_turn(Some("in-1"), "a").await.unwrap();
+        // A session level: sent as adaptive effort, and the temperature dropped.
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        assert_eq!(agent.thinking().source, Source::Session);
+        assert!(agent.temperature().fixed.is_some());
+        agent.run_turn(Some("in-2"), "b").await.unwrap();
+        // Off: sent, and the temperature comes back.
+        agent.set_thinking(Some(Thinking::Off));
+        agent.run_turn(Some("in-3"), "c").await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some(0.5), None), (None, Some(Request::Effort("high".into()))), (Some(0.5), Some(Request::Off))]
+        );
+        // The log records the level only once one is set.
+        let logged: Vec<Option<String>> = agent
+            .conversation()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.thinking_level.clone())
+            .collect();
+        assert_eq!(
+            logged,
+            vec![None, Some("high (set for this session)".into()), Some("off (set for this session)".into())]
+        );
+
+        // `reset` goes back to the config.
+        agent.set_thinking(None);
+        assert_eq!((agent.thinking().effective, agent.thinking().source), (Thinking::Default, Source::Global));
+    }
+
+    #[test]
+    fn a_small_max_tokens_caps_the_thinking_budget_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), max_tokens: 4096, ..Default::default() };
+        struct OldClaude;
+        #[async_trait]
+        impl LLMClient for OldClaude {
+            async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!("no chat in this test")
+            }
+            fn model_name(&self) -> &str {
+                "claude-sonnet-4-5"
+            }
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Anthropic)
+            }
+        }
+        let mut agent = Agent::new(Box::new(OldClaude), config);
+        agent.set_thinking(Some(crate::thinking::Thinking::Level("high".into())));
+        let warning = agent.thinking().warning.unwrap();
+        assert!(warning.contains("caps the high thinking budget"), "{warning}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
