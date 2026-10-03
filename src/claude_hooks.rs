@@ -1142,7 +1142,7 @@ fn interpret(event: Event, hook: &Hook, run: ProcessRun) -> HookResult {
 }
 
 fn apply_json_output(event: Event, json: Value, result: &mut HookResult) {
-    let get_str = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(|s| cap(s));
+    let get_str = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(cap);
 
     if json.get("continue").and_then(Value::as_bool) == Some(false) {
         result.stop = Some(get_str(&json, "stopReason").unwrap_or_default());
@@ -1157,10 +1157,8 @@ fn apply_json_output(event: Event, json: Value, result: &mut HookResult) {
             result.blocked = true;
             result.reason = get_str(&json, "reason");
         }
-        Some("approve") | Some("allow") => {
-            if event == Event::PreToolUse {
-                result.decision = Some(Decision::Allow);
-            }
+        Some("approve") | Some("allow") if event == Event::PreToolUse => {
+            result.decision = Some(Decision::Allow);
         }
         _ => {}
     }
@@ -1726,8 +1724,7 @@ mod tests {
         two_args.args = Some(vec!["a".to_string(), "b".to_string()]);
         let mut joined_arg = command_hook(Event::PreToolUse, "echo hi");
         joined_arg.args = Some(vec!["a\u{0}b".to_string()]);
-        let mut manager =
-            manager_with(vec![no_args, empty_arg, two_args, joined_arg], dir.path());
+        let mut manager = manager_with(vec![no_args, empty_arg, two_args, joined_arg], dir.path());
         manager.dedup();
         assert_eq!(
             manager.hooks().len(),

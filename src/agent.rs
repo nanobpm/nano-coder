@@ -2259,17 +2259,14 @@ impl Agent {
                 let mut effective_arguments = tool_call.arguments.clone();
                 let mut hook_context: Vec<String> = Vec::new();
                 let mut pre_hook_deny: Option<String> = None;
-                if self.claude_hooks.is_some() {
+                if let Some(claude_hooks) = self.claude_hooks.as_ref() {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
                         && !(self.control.mode() == crate::mode::AgentMode::Plan
                             && !crate::mode::plan_allows(&tool_call.name))
                         && self.policy.check(&tool_call.name, &tool_call.arguments).is_ok();
                     if runnable {
-                        let outcome = self.claude_hooks.as_ref().expect("checked").run_pre_tool_use(
-                            &tool_call.name,
-                            &tool_call.arguments,
-                            &tool_call.id,
-                        );
+                        let outcome =
+                            claude_hooks.run_pre_tool_use(&tool_call.name, &tool_call.arguments, &tool_call.id);
                         // A hook's `additionalContext` applies whatever the
                         // decision: a deny/ask hook can still have useful context
                         // for the model (e.g. why the call is risky), so collect
