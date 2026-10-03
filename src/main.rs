@@ -1563,7 +1563,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/hooks" => {
-            terminal.renderer.print_block(agent.claude_hooks_listing().trim_end());
+            // The listing embeds config-derived commands, matchers, skip
+            // reasons and paths. In legacy renderer mode `print_block` writes
+            // straight to the terminal (`println!`), so an escaped
+            // terminal-control sequence in project settings would become active
+            // when `/hooks` is displayed. Sanitize before printing; the frame
+            // renderer's own filtering does not cover this path.
+            terminal.renderer.print_block(&sanitize_terminal_text(agent.claude_hooks_listing().trim_end()));
             Ok(true)
         }
         _ if let Some(op) = queue_command(cmd) => {

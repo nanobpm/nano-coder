@@ -321,10 +321,17 @@ impl HookManager {
                         });
                         continue;
                     }
+                    // Normalize a blank/whitespace-only `if` to `None`. Stored as
+                    // `Some("  ")`, it would reach `if_selects` -> `Rule::parse`,
+                    // which fails, so the hook would never run despite being
+                    // listed as loaded — the same silent-disable the validation
+                    // above rejects for a malformed rule. A blank filter means
+                    // "no filter", so treat it as absent.
+                    let if_rule = entry.if_rule.clone().filter(|r| !r.trim().is_empty());
                     self.hooks.push(Hook {
                         event,
                         matcher: group.matcher.clone().filter(|m| !m.is_empty()),
-                        if_rule: entry.if_rule.clone(),
+                        if_rule,
                         command,
                         args: entry.args.clone(),
                         timeout: Duration::from_secs(entry.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
@@ -782,7 +789,23 @@ fn execute(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // `setsid()` starts the hook in a new session *and* a new process group
+        // whose id is the child pid. The new session detaches the controlling
+        // terminal, so an interactive hook cannot open `/dev/tty` to write into
+        // nano's UI or block on a terminal read until the timeout — the
+        // terminal-isolation issue #92 requires. The pid-named process group is
+        // the one `kill_process_group(child.id())` signals on timeout, so the
+        // whole descendant tree is still cleaned up. (`process_group(0)` alone
+        // makes the group but keeps nano's controlling terminal.)
+        // SAFETY: `setsid` is async-signal-safe and the closure does nothing else.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = match command.spawn() {
@@ -1701,6 +1724,25 @@ mod tests {
         assert!(outcome.denies(), "incomplete hook output is untrustworthy; PreToolUse fails closed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hook_runs_in_a_new_session_without_controlling_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        // `setsid` detaches the hook into its own session, so its session id is
+        // its own pid — not nano's. A hook that echoes `$$` (its shell pid) and
+        // its `ps` session id proves the new session: with only
+        // `process_group(0)` the sid would be nano's, not the hook's.
+        let hook = command_hook(Event::PreToolUse, "echo \"$$ $(ps -o sid= -p $$ | tr -d ' ')\"");
+        let manager = manager_with(vec![hook], dir.path());
+        let hook = &manager.hooks()[0];
+        let run = execute(hook, "{}", &manager.sandbox, &manager.project_dir, hook.timeout);
+        assert!(run.launch_error.is_none(), "hook launches: {:?}", run.launch_error);
+        let mut parts = run.stdout.split_whitespace();
+        let pid: u32 = parts.next().unwrap().parse().unwrap();
+        let sid: u32 = parts.next().unwrap().parse().unwrap();
+        assert_eq!(pid, sid, "setsid makes the hook its own session leader (terminal detached)");
+    }
+
     #[test]
     fn malformed_if_filter_is_reported_as_skipped() {
         let dir = tempfile::tempdir().unwrap();
@@ -1730,5 +1772,37 @@ mod tests {
         assert_eq!(manager.hooks()[0].command, "echo good");
         assert_eq!(manager.skipped.len(), 1, "the malformed filter is reported, not dropped silently");
         assert!(manager.skipped[0].reason.contains("invalid `if` filter"), "the skip reason names the parse error");
+    }
+
+    #[test]
+    fn blank_if_filter_is_normalized_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // A whitespace-only `if` carries no filter. Stored as `Some("  ")` it
+        // would reach `Rule::parse` via `if_selects` and fail, silently
+        // disabling the hook while `/hooks` lists it as loaded. It must be
+        // normalized to `None` so the hook runs unfiltered.
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"echo hi","if":"   "}
+            ]}]}}"#,
+        )
+        .unwrap();
+        let nano = NanoHooks::new();
+        let opts = LoadOptions {
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: false,
+            nano_hooks: &nano,
+            sandbox: SandboxConfig::default(),
+        };
+        let manager = HookManager::load(&opts, dir.path());
+        assert_eq!(manager.hooks().len(), 1, "the blank filter still loads the hook");
+        assert_eq!(manager.hooks()[0].if_rule, None, "a blank `if` is stored as no filter");
+        // And it selects a call rather than being silently disabled.
+        let selected = manager.selected(Event::PreToolUse, Some(("Bash", "bash", &json!({"command":"ls"}))), None);
+        assert_eq!(selected.len(), 1, "a blank-filtered hook is not silently disabled");
     }
 }
