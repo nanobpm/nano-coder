@@ -2189,6 +2189,23 @@ impl Agent {
                     }
                 }
 
+                // A PreToolUse hook may have rewritten the arguments into
+                // `effective_arguments`. From here on that rewritten input is the
+                // single source of truth for what actually runs: build an
+                // effective call and dispatch every branch against it. Reading the
+                // original `tool_call.arguments` below would let a hook rewrite
+                // bypass the permission policy, be silently dropped by a special-
+                // tool branch (plan/skill/history/memory/outcome), or point the
+                // nested-instructions lookup at the wrong file.
+                let rewritten_call = if effective_arguments == tool_call.arguments {
+                    None
+                } else {
+                    let mut call = tool_call.clone();
+                    call.arguments = effective_arguments.clone();
+                    Some(call)
+                };
+                let effective_call: &ToolCall = rewritten_call.as_ref().unwrap_or(tool_call);
+
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
@@ -2206,30 +2223,34 @@ impl Agent {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
-                } else if let Err(reason) = self.policy.check(&tool_call.name, &tool_call.arguments) {
+                } else if let Err(reason) = self.policy.check(&effective_call.name, &effective_call.arguments) {
                     // The policy is consulted before dispatching to any handler, so deny
                     // rules and the pre-tool check also cover plan, skill and outcome tools.
+                    // Re-check the *effective* (possibly hook-rewritten) arguments here:
+                    // the earlier check ran on the original input, so without this a
+                    // PreToolUse hook could rewrite a bash command or a file path past
+                    // the user's allow/deny rules.
                     Err(anyhow::anyhow!(reason))
                 } else if let Some(reason) = pre_hook_deny {
                     // A PreToolUse hook denied the call (or failed closed).
                     Err(anyhow::anyhow!(reason))
                 } else if is_plan_tool {
-                    self.run_plan_tool(tool_call)
+                    self.run_plan_tool(effective_call)
                 } else if is_skill_tool {
-                    self.skills.load(&tool_call.arguments).map(Value::String)
+                    self.skills.load(&effective_call.arguments).map(Value::String)
                 } else if is_history_tool {
-                    self.run_history_tool(tool_call).map(Value::String)
+                    self.run_history_tool(effective_call).map(Value::String)
                 } else if is_memory_tool {
-                    self.run_memory_tool(tool_call).map(Value::String)
+                    self.run_memory_tool(effective_call).map(Value::String)
                 } else if is_outcome_tool {
-                    Outcome::from_args(&tool_call.arguments).map(|outcome| {
+                    Outcome::from_args(&effective_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
                         reported = Some(outcome);
                         Value::String(text)
                     })
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
-                    self.tools.execute_blocking(&tool_call.name, effective_arguments.clone()).await
+                    self.tools.execute_blocking(&effective_call.name, effective_call.arguments.clone()).await
                 };
                 let ok = result.is_ok();
                 let result = match result {
@@ -2250,7 +2271,7 @@ impl Agent {
                 };
                 if ok
                     && matches!(tool_call.name.as_str(), "read_file" | "write_file" | "edit_file")
-                    && let Some(path) = tool_call.arguments.get("path").and_then(Value::as_str)
+                    && let Some(path) = effective_call.arguments.get("path").and_then(Value::as_str)
                     && let Some(nested) =
                         self.instructions.as_mut().and_then(|i| i.nested_for(std::path::Path::new(path)))
                 {
@@ -5039,6 +5060,97 @@ mod tests {
         let again = resumed.run_turn(Some("msg-1"), "ship it").await.unwrap();
         assert_eq!(again.outcome, outcome.outcome);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Build an agent with custom permission `deny` rules (and no helper
+    /// tools), for the PreToolUse-rewrite tests below.
+    fn agent_with_deny(responses: Vec<LLMResponse>, dir: &std::path::Path, deny: Vec<String>) -> Agent {
+        let client = Scripted { responses: Mutex::new(responses), seen: Arc::new(Mutex::new(Vec::new())) };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            permissions: crate::permissions::PermissionsConfig { deny, ..Default::default() },
+            ..Config::default()
+        };
+        Agent::new(Box::new(client), config)
+    }
+
+    /// Write a project `.claude/settings.json` with a PreToolUse hook that
+    /// rewrites a matched tool's input to `updated_input_json` (Claude
+    /// `tool_input` space) and allows it.
+    fn write_pre_tool_use_hook(dir: &std::path::Path, matcher: &str, updated_input_json: &str) {
+        let command = format!(
+            "cat >/dev/null; printf '%s' '{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"updatedInput\":{updated_input_json}}}}}'",
+        );
+        let settings = json!({
+            "hooks": { "PreToolUse": [ { "matcher": matcher, "hooks": [ { "type": "command", "command": command } ] } ] }
+        });
+        let claude = dir.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), serde_json::to_string(&settings).unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_rewrite_is_rechecked_against_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        // A PreToolUse hook rewrites every Bash command to `forbidden-cmd`,
+        // which the policy denies — even though the original `ls` is allowed.
+        write_pre_tool_use_hook(dir.path(), "Bash", r#"{"command":"forbidden-cmd"}"#);
+        let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = ran.clone();
+        let response = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let mut agent = agent_with_deny(vec![response, text("done")], dir.path(), vec!["Bash(forbidden-cmd*)".into()]);
+        agent.tools().register(
+            ToolDefinition::new("bash", "bash", json!({"type": "object"})),
+            Box::new(move |args| {
+                recorder.lock().unwrap().push(args["command"].as_str().unwrap_or("").to_string());
+                Ok(json!("ran"))
+            }),
+        );
+        agent.load_claude_hooks(dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "list files").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        let conversation = agent.conversation();
+        let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(
+            tool_result.is_error,
+            "the hook-rewritten command must be re-checked against the policy and denied: {}",
+            tool_result.content
+        );
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "the denied, rewritten command must never reach the bash handler, saw: {:?}",
+            ran.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_rewrite_reaches_special_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hook rewrites the outcome tool's `status` — a special-tool branch
+        // that must honour the rewrite rather than silently drop it.
+        write_pre_tool_use_hook(dir.path(), "report_outcome", r#"{"status":"blocked"}"#);
+        let response = LLMResponse { tool_calls: vec![report("o1", "completed", "all green")], ..Default::default() };
+        let mut agent = agent_with_deny(vec![response], dir.path(), Vec::new());
+        agent.load_claude_hooks(dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "finish").await.unwrap();
+        assert_eq!(
+            outcome.outcome.map(|o| o.status),
+            Some(goal::Status::Blocked),
+            "a PreToolUse rewrite of a special tool's arguments must reach its handler, not be dropped"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
