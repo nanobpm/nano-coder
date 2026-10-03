@@ -257,6 +257,12 @@ pub fn builtin(model: &str) -> Option<Profile> {
             return Some(Profile::new(&["off", "low", "medium", "high"], None));
         }
     }
+    // `o1-mini` (and its snapshots) always reason and reject the
+    // `reasoning_effort` parameter, so the broad o1/o3/o4 family fallback must
+    // not offer it adjustable levels.
+    if id == "o1-mini" || id.starts_with("o1-mini-") {
+        return None;
+    }
     if ["o1", "o3", "o4"].iter().any(|p| id == *p || id.starts_with(&format!("{p}-"))) {
         return Some(Profile::new(&["low", "medium", "high"], None));
     }
@@ -400,7 +406,11 @@ fn generated_request(effective: &Thinking, wire: Wire, anthropic: AnthropicStyle
     match effective {
         Thinking::Default => None,
         Thinking::Off => Some(match (wire, format) {
-            (Wire::ChatCompletions, Format::TemplateSwitch | Format::TemplateEffort) => Request::TemplateSwitch(false),
+            (Wire::ChatCompletions, Format::TemplateSwitch) => Request::TemplateSwitch(false),
+            // A `reasoning_effort` template was selected because it consumes
+            // that variable, so an `enable_thinking` switch would be ignored:
+            // turn thinking off the way the template reads it.
+            (Wire::ChatCompletions, Format::TemplateEffort) => Request::TemplateEffort("none".into()),
             _ => Request::Off,
         }),
         Thinking::Level(level) => Some(match (wire, anthropic, format) {
@@ -668,8 +678,14 @@ pub fn resolve_with(
     // entry that can't even parse as a level name (e.g. "very high") would
     // break the `/settings` editor, which parses each offered candidate.
     // Drop invalid names here and say so once, rather than letting an
-    // accepted config fail later.
+    // accepted config fail later. Entries keep the spelling the wire expects
+    // (GPT-5.1 takes "none", an on/off template takes "on"), but the `off`
+    // aliases `Thinking` also accepts ("none", "disabled") are rejected in
+    // favor of the internal "off" spelling — as the reported-level path
+    // already normalizes — so the `levels.contains("off")` check below agrees
+    // with a `thinking = "none"` setting, which parses to `Thinking::Off`.
     let mut invalid_levels: Vec<String> = Vec::new();
+    let mut alias_levels: Vec<String> = Vec::new();
     let levels: Vec<String> = model_settings
         .and_then(|m| m.thinking_levels.clone())
         .or_else(|| provider.thinking_levels.clone())
@@ -677,14 +693,18 @@ pub fn resolve_with(
             levels
                 .iter()
                 .map(|l| l.trim().to_ascii_lowercase())
-                .filter(|l| {
+                .filter_map(|l| match l.parse::<Thinking>() {
                     // The same grammar `Thinking` parses: a name that fails it
                     // (e.g. "very high") is no usable level.
-                    let valid = l.parse::<Thinking>().is_ok();
-                    if !valid {
-                        invalid_levels.push(l.clone());
+                    Ok(Thinking::Off) if l != "off" => {
+                        alias_levels.push(l);
+                        None
                     }
-                    valid
+                    Ok(_) => Some(l),
+                    Err(_) => {
+                        invalid_levels.push(l);
+                        None
+                    }
                 })
                 .collect()
         })
@@ -820,12 +840,22 @@ pub fn resolve_with(
         ));
     }
     let dropped = dropped_key.is_some();
+    let mut notices: Vec<String> = Vec::new();
     if !invalid_levels.is_empty() {
-        let notice = format!(
+        notices.push(format!(
             "ignoring invalid thinking_levels {} for {model}: a level name is letters, digits, '-' or '_' — \
              fix them in its provider or model settings",
             invalid_levels.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")
-        );
+        ));
+    }
+    if !alias_levels.is_empty() {
+        notices.push(format!(
+            "ignoring thinking_levels {} for {model}: an off alias is not a level — use \"off\"",
+            alias_levels.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !notices.is_empty() {
+        let notice = notices.join("; ");
         warning = Some(warning.map_or(notice.clone(), |w| format!("{notice}; {w}")));
     }
     Resolved {
@@ -910,6 +940,10 @@ mod tests {
         // The non-reasoning chat model takes no reasoning_effort.
         assert_eq!(builtin("gpt-5-chat-latest"), None);
         assert_eq!(levels("o4-mini").as_deref(), Some("low,medium,high"));
+        // `o1-mini` always reasons and rejects `reasoning_effort`: no levels.
+        assert_eq!(builtin("o1-mini"), None);
+        assert_eq!(builtin("o1-mini-2024-09-12"), None);
+        assert_eq!(levels("o1").as_deref(), Some("low,medium,high"));
         assert_eq!(builtin("gpt-4.1"), None);
         assert_eq!(builtin("llama3.3"), None);
         assert_eq!(builtin("omni-moderation"), None);
@@ -1055,11 +1089,42 @@ mod tests {
         assert_eq!(r.levels, Vec::<String>::new());
         let warning = r.warning.unwrap();
         assert!(warning.contains("\"very high\"") && warning.contains("no thinking levels are known"), "{warning}");
-        // Endpoint-reported and built-in levels are not filtered.
-        let p = provider(r#"thinking_levels = ["none", "low"]"#);
-        let r = resolve(&Thinking::Default, Some(&level("none")), kind, &p, "gpt-5.1");
-        assert_eq!(r.request(), Some(Request::Effort("none".into()))); // the "none" alias is a valid level name
+        // Endpoint-reported and built-in levels are not filtered, and the
+        // built-in table already uses the canonical "off" spelling for
+        // GPT-5.1, so a `thinking = "none"` setting (which parses to
+        // `Thinking::Off`) turns it off.
+        let p = ProviderConfig::default();
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), kind, &p, "gpt-5.1");
+        assert_eq!(r.request(), Some(Request::Off));
         assert_eq!(r.warning, None);
+    }
+
+    #[test]
+    fn off_aliases_in_configured_levels_are_rejected() {
+        // `Thinking` accepts "none"/"disabled" as `off` aliases, but a
+        // configured list is matched verbatim: `thinking = "none"` parses to
+        // `Thinking::Off`, so a list holding the alias would fail the
+        // `levels.contains("off")` check and wrongly claim the model cannot
+        // turn thinking off. Reject the alias and say which spelling to use.
+        let kind = Some(ProviderKind::Openai);
+        let p = provider(r#"thinking_levels = ["none", "low"]"#);
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), kind, &p, "x");
+        assert_eq!(r.levels, ["low"]);
+        assert_eq!(r.effective, Thinking::Default);
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("an off alias is not a level"), "{warning}");
+        assert!(warning.contains("\"none\""), "{warning}");
+        assert!(warning.contains("can't turn thinking off"), "{warning}");
+        // The canonical spelling passes and turns thinking off.
+        let p = provider(r#"thinking_levels = ["off", "low"]"#);
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), kind, &p, "x");
+        assert_eq!(r.request(), Some(Request::Off), "warning: {:?}", r.warning);
+        assert_eq!(r.warning, None);
+        let p = provider(r#"thinking_levels = ["disabled"]"#);
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), kind, &p, "x");
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("an off alias is not a level"), "{warning}");
+        assert!(warning.contains("\"disabled\""), "{warning}");
     }
 
     #[test]
@@ -1469,6 +1534,13 @@ mod tests {
         assert_eq!(resolve(&Thinking::Default, &switch).request(), None);
         // Level templates get the level as a template variable.
         assert_eq!(resolve(&level("medium"), &effort).request(), Some(Request::TemplateEffort("medium".into())));
+        // A `reasoning_effort` template consumes that variable, so off is
+        // encoded as `reasoning_effort = "none"` — an `enable_thinking`
+        // switch would be ignored. (Reachable via a `thinking_levels`
+        // override adding `off`; the detected list has none.)
+        let off_cfg = provider(r#"thinking_levels = ["off", "low", "medium", "high"]"#);
+        let r = resolve_with(&Thinking::Default, Some(&Thinking::Off), openai, &off_cfg, "qwen3", Some(&effort));
+        assert_eq!(r.request(), Some(Request::TemplateEffort("none".into())));
         // Ollama: plain `reasoning_effort`.
         assert_eq!(resolve(&Thinking::Off, &ollama).request(), Some(Request::Off));
         assert_eq!(resolve(&level("low"), &ollama).request(), Some(Request::Effort("low".into())));
