@@ -476,6 +476,12 @@ pub struct Agent {
     claude_hooks: Option<claude_hooks::HookManager>,
     /// Whether the `SessionStart` hooks have run for the active session.
     claude_session_started: bool,
+    /// `SessionStart` context that has been collected but not yet delivered to
+    /// the model. `SessionStart` runs once per session and may have side
+    /// effects, so its context must survive a `UserPromptSubmit` rejection of
+    /// the first prompt: it is cached here and delivered with the first
+    /// *accepted* prompt (or the resumed turn) rather than re-running the hook.
+    pending_session_start_context: Option<String>,
     /// Whether the active session was resumed (loaded) rather than created new,
     /// so `SessionStart` reports `source: "resume"` instead of `"startup"`.
     claude_session_resumed: bool,
@@ -561,6 +567,7 @@ impl Agent {
             hooks: HookRegistry::new(),
             claude_hooks: None,
             claude_session_started: false,
+            pending_session_start_context: None,
             claude_session_resumed: false,
             claude_stop_blocks: 0,
             config,
@@ -726,6 +733,7 @@ impl Agent {
         let manager = claude_hooks::HookManager::load(&opts, cwd);
         self.claude_hooks = Some(manager);
         self.claude_session_started = false;
+        self.pending_session_start_context = None;
         self.sync_claude_hook_session();
     }
 
@@ -785,17 +793,34 @@ impl Agent {
     }
 
     /// Run the once-per-session `SessionStart` hooks if they have not run yet.
-    /// Returns any context to attach. Separate from `UserPromptSubmit` so the
-    /// resume path (which must not re-validate an already-accepted prompt) can
-    /// still deliver `SessionStart` context when a restored session continues.
-    fn run_claude_session_start(&mut self) -> Option<String> {
+    /// Any context is cached in `pending_session_start_context` (not returned)
+    /// so it survives a `UserPromptSubmit` rejection of the first prompt:
+    /// `SessionStart` runs once and may have side effects, so its context must
+    /// not be re-collected by re-running the hook. Separate from
+    /// `UserPromptSubmit` so the resume path (which must not re-validate an
+    /// already-accepted prompt) can still deliver `SessionStart` context when a
+    /// restored session continues.
+    fn run_claude_session_start(&mut self) {
         if self.claude_hooks.is_none() || self.claude_session_started {
-            return None;
+            return;
         }
         self.claude_session_started = true;
         let trigger = if self.claude_session_resumed { "resume" } else { "startup" };
         let outcome = self.claude_hooks.as_ref().expect("checked above").run_session_start(trigger);
-        outcome.context_block()
+        if let Some(ctx) = outcome.context_block() {
+            // Prepend to anything already cached (there should not be, but do
+            // not drop context if the hook somehow produced it twice).
+            let cached = self.pending_session_start_context.take();
+            self.pending_session_start_context = Some(match cached {
+                Some(existing) if !existing.is_empty() => format!("{existing}\n\n{ctx}"),
+                _ => ctx,
+            });
+        }
+    }
+
+    /// Drain any cached `SessionStart` context for delivery to the model.
+    fn take_session_start_context(&mut self) -> Option<String> {
+        self.pending_session_start_context.take()
     }
 
     /// Run the `SessionStart` (once per session) and `UserPromptSubmit` hooks
@@ -805,13 +830,20 @@ impl Agent {
         if self.claude_hooks.is_none() {
             return ClaudePromptHook::Proceed(None);
         }
-        let mut contexts = Vec::new();
-        if let Some(ctx) = self.run_claude_session_start() {
-            contexts.push(ctx);
-        }
+        self.run_claude_session_start();
         let outcome = self.claude_hooks.as_ref().expect("checked above").run_user_prompt_submit(user_input);
         if outcome.blocked {
+            // The prompt is rejected, so its context is not delivered — but the
+            // SessionStart context collected above must NOT be discarded with
+            // it. `claude_session_started` is already true, so leaving it cached
+            // in `pending_session_start_context` delivers it with the first
+            // accepted prompt instead of losing it (or re-running the hook).
             return ClaudePromptHook::Reject(outcome.block_reason.unwrap_or_default());
+        }
+        let mut contexts = Vec::new();
+        // The prompt was accepted: deliver any cached SessionStart context now.
+        if let Some(ctx) = self.take_session_start_context() {
+            contexts.push(ctx);
         }
         if let Some(ctx) = outcome.context_block() {
             contexts.push(ctx);
@@ -1355,6 +1387,7 @@ impl Agent {
         self.session_id = Some(id.clone());
         self.set_spill_dir(&id);
         self.claude_session_started = false;
+        self.pending_session_start_context = None;
         self.claude_session_resumed = false;
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
@@ -1454,6 +1487,7 @@ impl Agent {
         self.pre_compaction_transcript = None;
         self.pre_compaction_restated = None;
         self.claude_session_started = false;
+        self.pending_session_start_context = None;
         self.claude_session_resumed = true;
         self.sync_claude_hook_session();
         self.persist_claude_hook_config();
@@ -1834,8 +1868,13 @@ impl Agent {
                 // re-run: the prompt was already accepted before the interrupt,
                 // so validating it again could reject input the user already
                 // sent. Any SessionStart context is appended as a user message
-                // so the model sees it on the continued turn.
-                let session_ctx = self.run_claude_session_start();
+                // so the model sees it on the continued turn. The hook runs at
+                // most once and caches its context; the cache is drained only
+                // when the context is actually delivered (below), so the two
+                // early-return replay branches — which complete an
+                // already-answered turn from the log without a model call —
+                // leave it cached rather than dropping it.
+                self.run_claude_session_start();
                 let recorded = self.conversation.get(pending.position);
                 if !recorded.is_some_and(|m| m.role == Role::User) {
                     // The input was logged but its user message was not.
@@ -1859,7 +1898,7 @@ impl Agent {
                     self.push(Message::assistant(&response))?;
                     return self.finish_turn(input_id, response, Some(outcome)).map(end_turn);
                 }
-                if let Some(ctx) = session_ctx {
+                if let Some(ctx) = self.take_session_start_context() {
                     self.push(Message::user(&reminders::wrap(&ctx)))?;
                 }
             }
@@ -5317,6 +5356,50 @@ mod tests {
         assert!(resumed, "SessionStart resume context is delivered on the continued turn: {request:?}");
         let revalidated = request.iter().any(|m| m.content.contains("should-not-run-on-resume"));
         assert!(!revalidated, "UserPromptSubmit is not re-run for an already-accepted prompt: {request:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_start_context_survives_a_rejected_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        // SessionStart emits context once per session. UserPromptSubmit rejects
+        // the first prompt (the one containing "reject-me") and accepts the
+        // next. The SessionStart context collected on the rejected attempt must
+        // NOT be discarded with the rejection — `claude_session_started` is
+        // already true, so without caching it would never be delivered. It must
+        // reach the model with the first *accepted* prompt, and SessionStart
+        // must not re-run (it may have side effects).
+        let settings = json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": "echo startup-context; echo ran >> session_start_count" } ] } ],
+                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "grep -q reject-me && exit 2 || exit 0" } ] } ]
+            }
+        });
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let (mut agent, seen) = agent(vec![text("accepted answer")], dir.path());
+        agent.load_claude_hooks(dir.path());
+
+        // First prompt is rejected by UserPromptSubmit: no model call is made.
+        let rejected = agent.send_message("reject-me").await.unwrap();
+        assert!(rejected.contains("blocked") || !rejected.is_empty(), "the rejection is surfaced: {rejected}");
+        assert!(seen.lock().unwrap().is_empty(), "a rejected prompt never reaches the model");
+
+        // Second prompt is accepted; the model must see the SessionStart context
+        // even though SessionStart ran on the (rejected) first attempt.
+        let response = agent.send_message("hello").await.unwrap();
+        assert_eq!(response, "accepted answer");
+        let request = &seen.lock().unwrap()[0];
+        let delivered = request.iter().any(|m| m.role == Role::User && m.content.contains("startup-context"));
+        assert!(delivered, "SessionStart context is delivered with the first accepted prompt: {request:?}");
+        // SessionStart ran exactly once (on the first attempt), not re-run.
+        let count = std::fs::read_to_string(dir.path().join("session_start_count")).unwrap_or_default();
+        assert_eq!(
+            count.matches("ran").count(),
+            1,
+            "SessionStart runs once per session, not re-run on the accepted prompt"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

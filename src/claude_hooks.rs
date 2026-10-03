@@ -306,6 +306,21 @@ impl HookManager {
                         });
                         continue;
                     };
+                    // Validate the `if` filter now rather than at call time:
+                    // `permissions::rule_matches` returns `false` for a malformed
+                    // rule, so a broken filter (e.g. `Bash(git push *`, missing
+                    // its closing `)`) would silently never run while `/hooks`
+                    // still lists it as loaded. Report it as skipped instead.
+                    if let Some(rule) = entry.if_rule.as_deref().filter(|r| !r.trim().is_empty())
+                        && let Err(err) = permissions::validate_rule(rule)
+                    {
+                        self.skipped.push(Skipped {
+                            event_name: event_name.clone(),
+                            reason: format!("invalid `if` filter {rule:?}: {err}"),
+                            source,
+                        });
+                        continue;
+                    }
                     self.hooks.push(Hook {
                         event,
                         matcher: group.matcher.clone().filter(|m| !m.is_empty()),
@@ -701,6 +716,20 @@ fn execute(
     project_dir: &Path,
     timeout: Duration,
 ) -> ProcessRun {
+    // Reject an unrepresentable timeout *before* spawning: `Instant::now() +
+    // timeout` panics on overflow (e.g. a `u64::MAX`-second timeout), which
+    // would abort the agent after the hook was already spawned. Failing closed
+    // here turns a bad config into a hook failure (PreToolUse blocks the call)
+    // instead of a crash.
+    let Some(deadline) = std::time::Instant::now().checked_add(timeout) else {
+        return ProcessRun {
+            exit: None,
+            timed_out: false,
+            launch_error: Some(format!("hook timeout of {}s is not representable", timeout.as_secs())),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    };
     let dir = project_dir.display().to_string();
     // Project hooks run inside the sandbox when one is active; user hooks run
     // outside it.
@@ -807,8 +836,7 @@ fn execute(
     // inherits the pipes can keep them (and the readers/writer) blocked after
     // the group is killed. Bound every wait on the same timeout plus a grace
     // period for the kill to take effect, so a stuck descendant cannot wedge
-    // the agent.
-    let deadline = std::time::Instant::now() + timeout;
+    // the agent. `deadline` was computed with `checked_add` before spawning.
     let grace = Duration::from_secs(2);
     let wait_result = match rx.recv_timeout(timeout) {
         Ok(result) => Some(result.ok()),
@@ -831,12 +859,23 @@ fn execute(
     // Collect the drained streams with the same deadline awareness. The readers
     // finish as soon as the child closes its ends (normal exit or the kill
     // above), so these joins return promptly in the common case; bound them so
-    // a descendant holding a pipe cannot block shutdown.
-    let (out_buf, out_overflow) = join_reader(out_reader, deadline, grace);
-    let (err_buf, err_overflow) = join_reader(err_reader, deadline, grace);
+    // a descendant holding a pipe cannot block shutdown. `join_reader` reports
+    // whether the stream actually finished: a blown deadline means a descendant
+    // is still holding the pipe open and the drained bytes are incomplete.
+    let (out_buf, out_overflow, out_finished) = join_reader(out_reader, deadline, grace);
+    let (err_buf, err_overflow, err_finished) = join_reader(err_reader, deadline, grace);
     // The stdin writer unblocks once the read end closes (kill) or the child
     // exits; bound its join for the same reason.
-    let _ = join_thread(writer, deadline, grace);
+    let writer_finished = join_thread(writer, deadline, grace).is_some();
+    let io_unfinished = !(out_finished && err_finished && writer_finished);
+    if io_unfinished {
+        // A descendant survived the child and still holds a pipe open, so the
+        // drained output is incomplete. An exit-0 hook whose JSON denial (or
+        // any decision) was cut off must not be read as success — that would
+        // let PreToolUse allow a denied call. Kill the surviving process group
+        // and fail closed.
+        kill_process_group(pid);
+    }
 
     match wait_result {
         Some(Some(status)) => {
@@ -846,7 +885,18 @@ fn execute(
                 timed_out: false,
                 // Over-cap output is untrustworthy (truncated JSON would be
                 // misparsed), so report it as a failure and fail closed.
-                launch_error: if overflow { Some(format!("hook output exceeded {} bytes", OUTPUT_CAP)) } else { None },
+                // Unfinished I/O (a descendant held a pipe past the deadline)
+                // is untrustworthy for the same reason.
+                launch_error: if overflow {
+                    Some(format!("hook output exceeded {} bytes", OUTPUT_CAP))
+                } else if io_unfinished {
+                    Some(
+                        "hook did not finish its I/O before the deadline; a descendant may still be running"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
                 stdout: String::from_utf8_lossy(&out_buf).into_owned(),
                 stderr: String::from_utf8_lossy(&err_buf).into_owned(),
             }
@@ -893,15 +943,17 @@ fn drain_bounded(stream: Option<impl std::io::Read>) -> (Vec<u8>, bool) {
 
 /// Join a drain thread, returning its buffer; on a blown deadline return what
 /// is available (empty) rather than blocking. The thread is detached and
-/// finishes once its stream closes.
+/// finishes once its stream closes. The third tuple element reports whether the
+/// reader actually finished (`true`) or was abandoned at the deadline (`false`)
+/// — callers must treat unfinished output as untrustworthy and fail closed.
 fn join_reader(
     handle: std::thread::JoinHandle<(Vec<u8>, bool)>,
     deadline: std::time::Instant,
     grace: Duration,
-) -> (Vec<u8>, bool) {
+) -> (Vec<u8>, bool, bool) {
     match join_thread(handle, deadline, grace) {
-        Some((buf, overflow)) => (buf, overflow),
-        None => (Vec::new(), false),
+        Some((buf, overflow)) => (buf, overflow, true),
+        None => (Vec::new(), false, false),
     }
 }
 
@@ -914,13 +966,18 @@ fn join_thread<T: Send + 'static>(
     grace: Duration,
 ) -> Option<T> {
     use std::sync::mpsc;
+    // `checked_add` keeps a near-overflow deadline from panicking; an
+    // unrepresentable limit simply means "wait effectively forever" here, which
+    // is safe because the caller already bounded the real work by `timeout`.
+    let Some(limit) = deadline.checked_add(grace) else {
+        return handle.join().ok();
+    };
     let (tx, rx) = mpsc::channel();
     // Move the join onto a helper so we can bound the wait; if it times out the
     // helper (and the not-yet-joined handle) are simply dropped/detached.
     std::thread::spawn(move || {
         let _ = tx.send(handle.join());
     });
-    let limit = deadline + grace;
     loop {
         let now = std::time::Instant::now();
         if now >= limit {
@@ -1608,5 +1665,70 @@ mod tests {
         let start = std::time::Instant::now();
         let _ = manager.run_pre_tool_use("bash", &json!({"command": "ls"}), "t1");
         assert!(start.elapsed() < Duration::from_secs(15), "a detached descendant cannot wedge the hook runner");
+    }
+
+    #[test]
+    fn unrepresentable_timeout_fails_closed_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `u64::MAX`-second timeout overflows `Instant::now() + timeout`. The
+        // hook must be rejected before spawning (fail closed for PreToolUse)
+        // rather than panicking the agent.
+        let mut hook = command_hook(Event::PreToolUse, "echo hi");
+        hook.timeout = Duration::from_secs(u64::MAX);
+        let manager = manager_with(vec![hook], dir.path());
+        let outcome = manager.run_pre_tool_use("bash", &json!({"command": "ls"}), "t1");
+        assert!(outcome.denies(), "an unrepresentable timeout is a hook failure, and PreToolUse fails closed");
+    }
+
+    #[test]
+    fn unfinished_hook_io_fails_closed_and_kills_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        // An exit-0 hook that writes a JSON denial but leaves a detached
+        // descendant holding its pipes open: the readers cannot finish, so the
+        // drained output is incomplete and must NOT be parsed as a (successful)
+        // decision. PreToolUse must fail closed (deny), and the surviving
+        // process group must be killed.
+        let hook = command_hook(
+            Event::PreToolUse,
+            "printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\"}}'; setsid sleep 30 & exit 0",
+        );
+        let mut hook = hook;
+        hook.timeout = Duration::from_millis(300);
+        let manager = manager_with(vec![hook], dir.path());
+        let start = std::time::Instant::now();
+        let outcome = manager.run_pre_tool_use("bash", &json!({"command": "ls"}), "t1");
+        assert!(start.elapsed() < Duration::from_secs(15), "unfinished I/O cannot wedge the hook runner");
+        assert!(outcome.denies(), "incomplete hook output is untrustworthy; PreToolUse fails closed");
+    }
+
+    #[test]
+    fn malformed_if_filter_is_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // `Bash(git push *` is missing its closing `)`: it must be rejected at
+        // load with a parse error, not silently loaded as a never-matching
+        // filter.
+        std::fs::write(
+            dir.path().join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"echo bad","if":"Bash(git push *"},
+                {"type":"command","command":"echo good","if":"Bash(git push *)"}
+            ]}]}}"#,
+        )
+        .unwrap();
+        let nano = NanoHooks::new();
+        let opts = LoadOptions {
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: false,
+            nano_hooks: &nano,
+            sandbox: SandboxConfig::default(),
+        };
+        let manager = HookManager::load(&opts, dir.path());
+        assert_eq!(manager.hooks().len(), 1, "only the well-formed filter loads");
+        assert_eq!(manager.hooks()[0].command, "echo good");
+        assert_eq!(manager.skipped.len(), 1, "the malformed filter is reported, not dropped silently");
+        assert!(manager.skipped[0].reason.contains("invalid `if` filter"), "the skip reason names the parse error");
     }
 }

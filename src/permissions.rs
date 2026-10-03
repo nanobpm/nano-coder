@@ -348,6 +348,16 @@ pub fn rule_matches(rule_src: &str, tool: &str, args: &Value) -> bool {
     }
 }
 
+/// Validate a permission-style rule string, returning the parse error when it
+/// is malformed. Hook `if` filters use this at load time so a broken filter
+/// (e.g. `Bash(git push *`, missing its closing `)`) is reported as a skipped
+/// handler instead of being silently treated as a non-match at call time
+/// (`rule_matches` returns `false` for it, so the guard would never run while
+/// `/hooks` still lists it as loaded).
+pub fn validate_rule(rule_src: &str) -> Result<(), String> {
+    Rule::parse(rule_src).map(|_| ())
+}
+
 fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {
     let Some(pattern) = &rule.pattern else { return true };
     if pattern.is_match(&absolute.to_string_lossy()) {
