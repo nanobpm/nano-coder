@@ -347,8 +347,12 @@ impl HookManager {
     /// part of the identity: two entries with the same command and matcher but
     /// different filters (e.g. `Bash(git push *)` vs `Bash(git commit *)`) are
     /// distinct, and collapsing them would drop the calls only the second
-    /// filter matches. `args` is kept optional: `None` means shell execution
-    /// while `Some([])` means direct execution, so they must not compare equal.
+    /// filter matches. `args` is kept as the whole optional vector so argument
+    /// identity is preserved exactly: `None` (shell execution) stays distinct
+    /// from `Some([])` (direct execution with no args), `Some([])` stays
+    /// distinct from `Some([""])` (one empty-string argument), and no join
+    /// separator can make distinct argument vectors (e.g. `["a", "b"]` vs
+    /// `["a\0b"]`) collide.
     fn dedup(&mut self) {
         let mut seen = std::collections::HashSet::new();
         self.hooks.retain(|hook| {
@@ -357,7 +361,7 @@ impl HookManager {
                 hook.matcher.clone().unwrap_or_default(),
                 hook.if_rule.clone().unwrap_or_default(),
                 hook.command.clone(),
-                hook.args.as_ref().map(|args| args.join("\u{0}")),
+                hook.args.clone(),
             );
             seen.insert(key)
         });
@@ -1704,6 +1708,32 @@ mod tests {
         let mut manager = manager_with(vec![shell, direct], dir.path());
         manager.dedup();
         assert_eq!(manager.hooks().len(), 2, "shell form and empty-args exec form are distinct");
+    }
+
+    #[test]
+    fn dedup_preserves_empty_argument_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        // `args: []` (no arguments) and `args: [""]` (one empty-string argument)
+        // invoke the command differently and must not collapse. A join-based key
+        // would map both to the empty string; keying on the vector keeps them
+        // distinct. The same guard stops distinct vectors colliding through a
+        // separator, so `["a", "b"]` and `["a\0b"]` also stay distinct.
+        let mut no_args = command_hook(Event::PreToolUse, "echo hi");
+        no_args.args = Some(Vec::new());
+        let mut empty_arg = command_hook(Event::PreToolUse, "echo hi");
+        empty_arg.args = Some(vec![String::new()]);
+        let mut two_args = command_hook(Event::PreToolUse, "echo hi");
+        two_args.args = Some(vec!["a".to_string(), "b".to_string()]);
+        let mut joined_arg = command_hook(Event::PreToolUse, "echo hi");
+        joined_arg.args = Some(vec!["a\u{0}b".to_string()]);
+        let mut manager =
+            manager_with(vec![no_args, empty_arg, two_args, joined_arg], dir.path());
+        manager.dedup();
+        assert_eq!(
+            manager.hooks().len(),
+            4,
+            "empty-vs-empty-string args and separator-colliding vectors stay distinct"
+        );
     }
 
     #[test]
