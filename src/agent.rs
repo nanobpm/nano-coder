@@ -1882,13 +1882,26 @@ impl Agent {
             // Reset per attempt, so the recorded duration is the request that
             // produced the response, not earlier overflowed attempts.
             let mut request_started;
-            // Resolve once per turn: the model/provider/config that decide the
-            // temperature do not change across overflow retries, and the
-            // trajectory records the same effective value that is sent.
-            let resolved_temperature = self.temperature();
-            let resolved_thinking = self.thinking();
+            // The values of the attempt that produced the response, carried
+            // out of the retry loop for the trajectory. Re-resolved per
+            // attempt (below), so these are what the successful request
+            // actually sent, not a stale pre-compaction resolution.
+            let mut sent_temperature = None;
+            let mut sent_thinking = None;
             let response = loop {
                 self.set_activity(Activity::Thinking);
+                // Re-resolved every retry iteration, not just once before the
+                // loop: an overflow retry compacts (below), which shrinks the
+                // estimated context and so grows `request_max_tokens()`, and
+                // thinking's budget feasibility and its coupled temperature
+                // depend on it. Resolving once would freeze a pre-compaction
+                // no-room `Default` (or a pre-compaction capped-budget
+                // warning) into the successful post-compaction retry, sending
+                // no level the request now has room for; resolving per attempt
+                // keeps the sent request and the trajectory's record of it in
+                // step with the attempt that produced the response.
+                let resolved_temperature = self.temperature();
+                let resolved_thinking = self.thinking();
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
                 // the history tools, so recomputing here lets the retried request
@@ -1997,6 +2010,10 @@ impl Agent {
                                 sink(session_id, &AgentEvent::Context);
                             }
                         }
+                        // Retain this attempt's resolution for the trajectory:
+                        // it is what the successful request actually sent.
+                        sent_temperature = Some(resolved_temperature);
+                        sent_thinking = Some(resolved_thinking);
                         break Some(response);
                     }
                     Some(Err(e)) => {
@@ -2028,6 +2045,10 @@ impl Agent {
                 cancelled = true;
                 break;
             };
+            // The loop only breaks `Some` after recording both, so these are
+            // the values the successful request actually sent.
+            let (sent_temperature, sent_thinking) =
+                (sent_temperature.expect("a response implies a sent request"), sent_thinking.expect("a response implies a sent request"));
             let duration_ms = u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.record_usage(&response, true);
             // Log-only trajectory data carried by the assistant message.
@@ -2036,12 +2057,12 @@ impl Agent {
                 thinking: response.thinking.clone(),
                 usage: response.usage.clone(),
                 duration_ms: Some(duration_ms),
-                temperature: Some(resolved_temperature.describe()),
+                temperature: Some(sent_temperature.describe()),
                 // Only when a level is sent or set for this model, provider or
                 // session, so logs without thinking levels stay unchanged.
-                thinking_level: (resolved_thinking.effective != crate::thinking::Thinking::Default
-                    || resolved_thinking.source != crate::thinking::Source::Global)
-                    .then(|| resolved_thinking.describe()),
+                thinking_level: (sent_thinking.effective != crate::thinking::Thinking::Default
+                    || sent_thinking.source != crate::thinking::Source::Global)
+                    .then(|| sent_thinking.describe()),
                 ..message
             };
 
@@ -4775,6 +4796,89 @@ mod tests {
             "retry after smart compaction must offer history tools: {:?}",
             seen[3]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn overflow_retry_reresolves_thinking_against_the_post_compaction_room() {
+        use crate::thinking::{Request, Thinking};
+        // The thinking field and max_tokens recorded for each request.
+        type SeenRequests = Arc<Mutex<Vec<(Option<Request>, Option<i64>)>>>;
+        // Records the thinking field and max_tokens of each request, replaying
+        // scripted results (one overflowing).
+        struct ThinkingSpy {
+            results: Mutex<Vec<std::result::Result<LLMResponse, String>>>,
+            seen: SeenRequests,
+        }
+        #[async_trait]
+        impl LLMClient for ThinkingSpy {
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.seen.lock().unwrap().push((request.thinking.clone(), request.max_tokens));
+                self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
+            }
+            fn model_name(&self) -> &str {
+                "claude-sonnet-4-5"
+            }
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Anthropic)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+        let overflow =
+            "HTTP 400: This model's maximum context length is 18000 tokens. However, you requested 19000 tokens."
+                .to_string();
+        let client = ThinkingSpy {
+            // 0: the turn request overflows (the prompt is near the window, so
+            // the output cap leaves no room for the thinking budget and the
+            // level is dropped); 1: the compaction summary; 2: the retried
+            // turn request, which after compaction has room for the budget
+            // again and must send the level.
+            results: Mutex::new(vec![Err(overflow), Ok(text("SUMMARY: done")), Ok(text("done"))]),
+            seen: seen.clone(),
+        };
+        // An 18k window with a 16k-token prompt: `max_tokens` is capped to the
+        // remaining room (18k − 16k − 360 margin ≈ 1.6k), below the 16k budget
+        // `high` asks for, so the first attempt drops the level. Compaction
+        // shrinks the prompt, the cap lifts past the budget, and the retry
+        // sends it.
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            context_window: Some(18_000),
+            max_tokens: 16_384,
+            // Off, so the big prompt reaches the turn request and overflows
+            // there instead of being auto-compacted beforehand.
+            auto_compact: false,
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        agent.new_session().unwrap();
+        agent.push(Message::user(&"x".repeat(64_000))).unwrap();
+        assert_eq!(agent.send_message("go").await.unwrap(), "done");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "overflow, summary, retry: {seen:?}");
+        // The overflowing attempt had no room for the budget, so it sent no
+        // thinking field.
+        assert_eq!(seen[0].0, None, "no room before compaction: {:?}", seen[0]);
+        let pre_cap = seen[0].1.unwrap();
+        assert!(pre_cap < 1025, "capped below the minimum budget before compaction: {pre_cap}");
+        // The summary request never thinks.
+        assert_eq!(seen[1].0, None);
+        // The retry re-resolved against the post-compaction room and sends the
+        // full budget — not the stale pre-compaction drop.
+        assert_eq!(seen[2].0, Some(Request::Budget(16_384)), "retry sends the level: {:?}", seen[2]);
+        assert!(seen[2].1.unwrap() >= 16_384, "room for the budget after compaction: {:?}", seen[2]);
+        // The trajectory records what the successful retry sent, not the
+        // pre-compaction drop.
+        let last = agent.conversation().iter().rev().find(|m| m.role == Role::Assistant).unwrap();
+        assert_eq!(last.thinking_level.as_deref(), Some("high (set for this session)"));
     }
 
     #[tokio::test]
