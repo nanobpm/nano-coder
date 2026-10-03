@@ -356,13 +356,16 @@ pub struct GithubCopilotClient {
     session: tokio::sync::Mutex<Option<SessionToken>>,
     /// The `/models` response the probes read (window, thinking levels), so
     /// they share one request.
-    models_cache: tokio::sync::Mutex<Option<Value>>,
+    /// The `/models` list, keyed by the `api_base` it was fetched from. A
+    /// session-token force-refresh (after a 401) can move us to a different
+    /// proxy endpoint; keying on `api_base` re-fetches then instead of serving
+    /// the previous endpoint's stale list, levels and window.
+    models_cache: tokio::sync::Mutex<Option<(String, Value)>>,
 }
 
 impl GithubCopilotClient {
-    async fn models_json(&self, timeout: Option<std::time::Duration>) -> Result<Value> {
-        let session = self.session_token(false).await?;
-        let url = format!("{}/models", self.api_base(&session));
+    async fn models_json(&self, session: &SessionToken, timeout: Option<std::time::Duration>) -> Result<Value> {
+        let url = format!("{}/models", self.api_base(session));
         let mut request = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
             .bearer_auth(&session.token)
             .header("Accept", "application/json")
@@ -380,15 +383,20 @@ impl GithubCopilotClient {
     }
 
     /// The current model's `/models` entry, from the cached list (fetched
-    /// with `timeout` the first time).
+    /// with `timeout` the first time). The cache is keyed on the session's
+    /// `api_base` — fetching and keying off the *same* session so a token
+    /// refresh that moves endpoints can never key the list under the wrong one.
     async fn model_entry(&self, timeout: std::time::Duration) -> Option<Value> {
+        let session = self.session_token(false).await.ok()?;
+        let api_base = self.api_base(&session);
         let mut cache = self.models_cache.lock().await;
-        if cache.is_none() {
-            *cache = Some(self.models_json(Some(timeout)).await.ok()?);
+        if cache.as_ref().map(|(base, _)| base.as_str()) != Some(api_base.as_str()) {
+            *cache = Some((api_base, self.models_json(&session, Some(timeout)).await.ok()?));
         }
         let model = &self.transport.provider().model;
         cache
             .as_ref()?
+            .1
             .get("data")?
             .as_array()?
             .iter()
@@ -590,7 +598,8 @@ impl LLMClient for GithubCopilotClient {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let value = self.models_json(None).await?;
+        let session = self.session_token(false).await?;
+        let value = self.models_json(&session, None).await?;
         let mut models: Vec<String> = value
             .get("data")
             .and_then(Value::as_array)
@@ -966,6 +975,44 @@ mod tests {
         let reported = client.detect_thinking_levels().await.unwrap();
         assert_eq!(reported.levels, ["off", "low", "high"]);
         assert_eq!(api_log.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn models_cache_refetches_when_the_endpoint_changes() {
+        // A 401 force-refresh can move the session to a different proxy endpoint.
+        // The `/models` cache is keyed on `api_base`, so the new endpoint's list
+        // (and its levels/window) is fetched instead of serving the old one.
+        let (api1, log1) = test_server::serve(vec![(
+            200,
+            "",
+            json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+                "limits": { "max_prompt_tokens": 111 } } }] })
+            .to_string(),
+        )])
+        .await;
+        let (api2, log2) = test_server::serve(vec![(
+            200,
+            "",
+            json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+                "limits": { "max_prompt_tokens": 222 } } }] })
+            .to_string(),
+        )])
+        .await;
+        // The first token is already past its refresh margin, so the next call
+        // re-exchanges and lands on `api2`.
+        let expired = json!({
+            "token": "sess-1",
+            "expires_at": Utc::now().timestamp() + REFRESH_MARGIN_SECS - 1,
+            "endpoints": { "api": api1 },
+        })
+        .to_string();
+        let (auth, _auth_log) =
+            test_server::serve(vec![(200, "", expired), (200, "", token_body(&api2, "sess-2"))]).await;
+        let client = client(&auth);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 111);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 222, "re-fetched from the new endpoint");
+        assert_eq!(log1.lock().unwrap().len(), 1);
+        assert_eq!(log2.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
