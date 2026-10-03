@@ -427,9 +427,17 @@ impl Resolved {
         // `extra_body` override owns it), so our resolution is not what asks
         // Anthropic to think; the user's `extra_body` and temperature settings
         // stand on their own.
-        self.extra_body_override.is_none()
-            && self.wire == Wire::AnthropicMessages
-            && matches!(self.effective, Thinking::Level(_))
+        if self.extra_body_override.is_some() || self.wire != Wire::AnthropicMessages {
+            return false;
+        }
+        match &self.effective {
+            Thinking::Level(_) => true,
+            // A model whose known levels omit `off` always thinks (Fable,
+            // Claude 5.5+); `Default` sends nothing, so the model still
+            // thinks and a custom temperature is invalid.
+            Thinking::Default => !self.levels.is_empty() && !self.levels.iter().any(|l| l == "off"),
+            Thinking::Off => false,
+        }
     }
 
     /// One line for `/context`, e.g. `high (set for this model)`. An
@@ -798,6 +806,35 @@ mod tests {
         assert!(r.warning.is_some());
         assert_eq!(r.request(), None, "generated thinking/output_config must be suppressed");
         assert!(!r.anthropic_thinking_on(), "a suppressed level does not lock Anthropic temperature");
+    }
+
+    #[test]
+    fn default_on_an_always_thinking_model_still_locks_the_temperature() {
+        let none = ProviderConfig::default();
+        let anthropic = Some(ProviderKind::Anthropic);
+        // Models whose known levels omit `off` always think (Fable, Claude
+        // 5.5+): `Default` sends nothing, so the model still thinks and a
+        // custom temperature is invalid.
+        for model in ["claude-fable-5", "claude-sonnet-5.5", "claude-opus-5.5"] {
+            let r = resolve(&Thinking::Default, None, anthropic, &none, model);
+            assert_eq!(r.effective, Thinking::Default, "{model}");
+            assert!(r.anthropic_thinking_on(), "{model} with the default setting still thinks");
+        }
+        // A model that can turn thinking off does not lock on `Default`.
+        let r = resolve(&Thinking::Default, None, anthropic, &none, "claude-sonnet-4-6");
+        assert!(!r.anthropic_thinking_on(), "a model with an off level thinks only when asked");
+        // Nothing known about the model: `Default` is not treated as thinking.
+        let r = resolve(&Thinking::Default, None, anthropic, &none, "some-unknown-model");
+        assert!(r.levels.is_empty());
+        assert!(!r.anthropic_thinking_on());
+        // An explicit level still locks, `off` still cannot be sent to an
+        // always-thinking model (it has no `off` level, so it falls back to
+        // the default — which thinks).
+        let r = resolve(&Thinking::Default, Some(&level("low")), anthropic, &none, "claude-fable-5");
+        assert!(r.anthropic_thinking_on());
+        let r = resolve(&Thinking::Off, None, anthropic, &none, "claude-fable-5");
+        assert_eq!(r.effective, Thinking::Default, "off is not in the profile, so it falls back to default");
+        assert!(r.anthropic_thinking_on(), "an unsendable off still leaves the model thinking");
     }
 
     #[test]
