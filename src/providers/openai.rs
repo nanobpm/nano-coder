@@ -579,11 +579,20 @@ pub(crate) async fn detect_capabilities(
 /// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from the
 /// model's parameters. The model's maximum (`model_info`) is not used: Ollama
 /// runs with a smaller default unless `num_ctx` says otherwise. Returns the
-/// window alongside the `/api/show` response (probed here once) so the caller
-/// can derive the thinking levels from it without a second fetch.
+/// window alongside the `/api/show` response so the caller can derive the
+/// thinking levels from it without a second fetch. `/api/ps` and `/api/show`
+/// are probed concurrently: the caller caps the combined detection, and a
+/// serial `/api/show` after a successful `/api/ps` could run past that cap and
+/// discard the window `/api/ps` already found.
 async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> (Option<DetectedWindow>, Option<Value>) {
     let same = |name: &str| name == model || name.strip_suffix(":latest") == Some(model);
-    if let Some(ps) = probe(transport, reqwest::Method::GET, &format!("{root}/api/ps"), None).await {
+    let ps_url = format!("{root}/api/ps");
+    let show_url = format!("{root}/api/show");
+    let (ps, show) = tokio::join!(
+        probe(transport, reqwest::Method::GET, &ps_url, None),
+        probe(transport, reqwest::Method::POST, &show_url, Some(json!({ "model": model }))),
+    );
+    if let Some(ps) = ps {
         let loaded = ps
             .get("models")
             .and_then(Value::as_array)
@@ -592,14 +601,9 @@ async fn ollama_window(transport: &HttpTransport, root: &str, model: &str) -> (O
             .find(|m| ["name", "model"].iter().any(|k| m.get(*k).and_then(Value::as_str).is_some_and(same)));
         if let Some(tokens) = loaded.and_then(|m| m.get("context_length")).and_then(as_tokens) {
             let window = DetectedWindow::total(tokens, "Ollama /api/ps context_length");
-            // Still probe /api/show so the caller can read the thinking levels.
-            let url = format!("{root}/api/show");
-            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
             return (Some(window), show);
         }
     }
-    let url = format!("{root}/api/show");
-    let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
     let window = show
         .as_ref()
         .and_then(|s| s.get("parameters"))
@@ -1365,5 +1369,34 @@ mod tests {
         assert_eq!(win, window(16384, "Ollama num_ctx"));
         assert_eq!(thinking.map(|r| r.format), Some(Format::Effort));
         assert_eq!(paths, ["/v1/models", "/api/ps", "/api/show"], "/api/show is shared, not repeated");
+    }
+
+    #[tokio::test]
+    async fn ollama_ps_window_survives_a_failed_show_probe() {
+        use crate::thinking::Format;
+        // /api/ps and /api/show are probed concurrently: a slow or failed
+        // /api/show must not discard the window /api/ps already reported (the
+        // agent caps the combined probe, so a serial /api/show could run past
+        // the cap and lose it).
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let ps = json!({"models": [{"name": "qwen3:8b", "context_length": 32768}]});
+        let (win, thinking, paths) = detect_both(
+            "ollama",
+            vec![(200, "", models.to_string()), (200, "", ps.to_string()), (500, "", "{}".into())],
+        )
+        .await;
+        assert_eq!(win, window(32768, "Ollama /api/ps context_length"), "the /api/ps window is kept");
+        assert_eq!(thinking, None, "no thinking levels without /api/show");
+        assert_eq!(paths.len(), 3, "/models, /api/ps and /api/show were each probed once: {paths:?}");
+
+        // A working /api/show still serves the thinking levels alongside.
+        let show = json!({"capabilities": ["completion", "thinking"]});
+        let (win, thinking, _) = detect_both(
+            "ollama",
+            vec![(200, "", models.to_string()), (200, "", ps.to_string()), (200, "", show.to_string())],
+        )
+        .await;
+        assert_eq!(win, window(32768, "Ollama /api/ps context_length"));
+        assert_eq!(thinking.map(|r| r.format), Some(Format::Effort));
     }
 }
