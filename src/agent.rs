@@ -723,9 +723,11 @@ impl Agent {
 
     /// Temperature resolution for a request whose Anthropic thinking state is
     /// `anthropic_thinking_on`. A normal turn passes the live thinking level;
-    /// a request that explicitly disables thinking (e.g. compaction) passes
-    /// `false` so a configured temperature is not dropped as if thinking were
-    /// on. Fixed-model and `extra_body` rules apply either way.
+    /// a request that sends no thinking field (e.g. compaction) passes whether
+    /// the model still thinks without one (see
+    /// [`crate::thinking::Resolved::always_anthropic_thinking`]), so a
+    /// configured temperature is dropped only for a model that really thinks.
+    /// Fixed-model and `extra_body` rules apply either way.
     fn temperature_for(&self, anthropic_thinking_on: bool) -> crate::temperature::Resolved {
         // Resolve against the live client, not `config.model`: a `/settings`
         // edit to the active provider (e.g. its `default_model`, kept when
@@ -2492,11 +2494,14 @@ impl Agent {
             // Compaction goes through the same resolution as a chat turn, so a
             // legacy `extra_body` temperature override still applies (the
             // transport no longer re-inserts it) and fixed-temperature models
-            // still send none. This request disables thinking (`thinking:
-            // None`), so resolve temperature as thinking-off — otherwise an
-            // Anthropic turn that normally thinks would drop a configured
-            // temperature that this request is actually allowed to send.
-            temperature: self.temperature_for(false).value(),
+            // still send none. This request sends no thinking field
+            // (`thinking: None`), which turns thinking off only for a model
+            // that supports an `off` level — so resolve temperature as
+            // thinking-off there, and a configured temperature is not dropped
+            // as if the configured level were sent. A model whose levels omit
+            // `off` (Fable, Claude 5.5+) always thinks, so it still gets no
+            // custom temperature.
+            temperature: self.temperature_for(self.thinking().always_anthropic_thinking()).value(),
             max_tokens: Some(output_budget),
             // A summary needs no extended reasoning; the model's own default
             // applies, as before thinking levels existed.
@@ -4145,11 +4150,61 @@ mod tests {
         agent.set_thinking(Some(Thinking::Level("high".into())));
         // A normal turn thinks, so Anthropic drops the custom temperature.
         assert!(agent.temperature().fixed.is_some());
-        // Compaction disables thinking for its request, so the configured
-        // temperature is resolved as thinking-off and still sent.
-        let compaction = agent.temperature_for(false);
+        // Compaction sends no thinking field, which disables thinking for a
+        // model with an `off` level, so the configured temperature is
+        // resolved as thinking-off and still sent.
+        let compaction = agent.temperature_for(agent.thinking().always_anthropic_thinking());
         assert!(compaction.fixed.is_none(), "compaction keeps the custom temperature");
         assert_eq!(compaction.value(), Some(0.5));
+        // Nothing is configured, so the same holds before any turn runs.
+        agent.set_thinking(None);
+        let compaction = agent.temperature_for(agent.thinking().always_anthropic_thinking());
+        assert!(compaction.fixed.is_none(), "compaction keeps the custom temperature by default too");
+        assert_eq!(compaction.value(), Some(0.5));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_sends_no_temperature_to_an_always_thinking_model() {
+        // A model whose known levels omit `off` (Fable, Claude 5.5+) always
+        // thinks, so the compaction request — which sends no thinking field —
+        // still thinks, and a configured custom temperature is invalid there.
+        struct Fable;
+        #[async_trait]
+        impl LLMClient for Fable {
+            async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!("no chat in this test")
+            }
+            fn model_name(&self) -> &str {
+                "claude-fable-5"
+            }
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Anthropic)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(Fable), config);
+        agent.new_session().unwrap();
+        // Nothing is configured, yet the model always thinks, so the
+        // compaction request — which sends no thinking field — still thinks,
+        // and a configured custom temperature is invalid there.
+        assert!(agent.thinking().always_anthropic_thinking());
+        let compaction = agent.temperature_for(agent.thinking().always_anthropic_thinking());
+        assert!(compaction.fixed.is_some(), "an always-thinking model gets no custom temperature, even for compaction");
+        assert_eq!(compaction.value(), None);
+        // A configured level that compaction does not send changes nothing:
+        // the model always thinks.
+        agent.set_thinking(Some(crate::thinking::Thinking::Level("high".into())));
+        let compaction = agent.temperature_for(agent.thinking().always_anthropic_thinking());
+        assert!(compaction.fixed.is_some(), "an unsent level does not unlock the temperature");
+        assert_eq!(compaction.value(), None);
     }
 
     #[test]
