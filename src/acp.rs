@@ -619,9 +619,12 @@ fn requeue_steers(deferred: &mut VecDeque<Value>, leftover: Vec<Steer>, marks: &
 }
 
 /// The thinking level sent, for ACP replies: the level name, `"off"`, or null
-/// when none is sent.
+/// when none is sent. An `extra_body` override sends its own value rather than
+/// the configured level, so null is reported then too — the generated level
+/// never reaches the wire.
 fn thinking_value(resolved: &crate::thinking::Resolved) -> serde_json::Value {
     match &resolved.effective {
+        _ if resolved.overridden => serde_json::Value::Null,
         crate::thinking::Thinking::Default => serde_json::Value::Null,
         other => json!(other.to_string()),
     }

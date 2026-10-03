@@ -977,7 +977,11 @@ impl Agent {
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
-            stats.thinking = match self.thinking().effective {
+            let thinking = self.thinking();
+            stats.thinking = match thinking.effective {
+                // An extra_body override sends its own value, not the
+                // configured level, so no generated level is shown.
+                _ if thinking.overridden => None,
                 crate::thinking::Thinking::Default => None,
                 level => Some(level.to_string()),
             };
