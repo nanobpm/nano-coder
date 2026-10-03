@@ -530,12 +530,15 @@ fn nearest<'a>(levels: &'a [String], wanted: &str) -> Option<&'a String> {
         return Some(exact);
     }
     let rank = |l: &str| ORDER.iter().position(|o| *o == l);
-    let wanted_rank = rank(wanted)?;
     let ranked: Vec<(usize, &String)> = levels.iter().filter_map(|l| rank(l).map(|r| (r, l))).collect();
-    // A model that only switches thinking on: any named level turns it on.
+    // A model that only switches thinking on: any named level turns it on. This
+    // must precede the `wanted` rank lookup below — an on/off-only model has no
+    // ranked levels, so a custom name outside `ORDER` (e.g. `/thinking deep`)
+    // must still turn it on rather than fall through to the model default.
     if ranked.is_empty() {
         return levels.iter().find(|l| *l == ON);
     }
+    let wanted_rank = rank(wanted)?;
     ranked
         .iter()
         .filter(|(r, _)| *r <= wanted_rank)
@@ -645,7 +648,16 @@ pub fn resolve_with(
         provider
             .extra_body
             .as_ref()
-            .and_then(|body| extra_body_keys(wire).iter().find(|k| body.contains_key(**k)))
+            .and_then(|body| {
+                extra_body_keys(wire).iter().find(|k| {
+                    // A key `finish_body` strips via `drop_params` never reaches
+                    // the wire, so it is no override at all — treating it as one
+                    // would claim a control is sent that was removed. Let the
+                    // generated-field drop logic below report the real outcome.
+                    body.contains_key(**k)
+                        && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k))
+                })
+            })
             .map(|key| key.to_string())
     } else {
         None
@@ -824,6 +836,11 @@ mod tests {
         assert_eq!(r.request(), Some(Request::Effort("on".into())));
         let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "qwen3");
         assert_eq!(r.effective, level("on"));
+        // A custom name outside `ORDER` still turns an on/off-only model on
+        // (regression: the `wanted` rank lookup must not short-circuit the
+        // on-only fallback).
+        let r = resolve(&Thinking::Default, Some(&level("deep")), kind, &p, "qwen3");
+        assert_eq!(r.request(), Some(Request::Effort("on".into())), "a custom name turns an on-only model on");
         // A custom level name matches only itself.
         let p = provider(r#"thinking_levels = ["fast", "deep"]"#);
         let r = resolve(&Thinking::Default, Some(&level("high")), kind, &p, "x");
@@ -969,6 +986,40 @@ mod tests {
         assert!(r.overridden);
         assert!(!r.dropped);
         assert!(r.warning.unwrap().contains("extra_body"));
+    }
+
+    #[test]
+    fn a_dropped_extra_body_control_is_not_an_override() {
+        // `finish_body` merges `extra_body` then strips `drop_params` keys, so an
+        // extra_body key that is also dropped reaches the wire no more than the
+        // generated field does. It must not be reported as a sent override; the
+        // generated-field drop logic reports the real outcome instead.
+
+        // extra_body + drop_params on the key the generated field also uses: the
+        // generated `reasoning_effort` is itself dropped, so report dropped, not
+        // overridden.
+        let p = provider("extra_body = { reasoning_effort = \"low\" }\ndrop_params = [\"reasoning_effort\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(!r.overridden, "a dropped extra_body key is no override");
+        assert!(r.dropped, "the generated reasoning_effort is dropped");
+        assert_eq!(r.request(), None, "nothing reaches the wire");
+        assert!(r.warning.unwrap().contains("drop_params"));
+
+        // extra_body control dropped, but the generated field uses a DIFFERENT,
+        // undropped key: the generated field still reaches the wire, so the
+        // level is genuinely sent — neither overridden nor dropped.
+        let p = provider("extra_body = { think = true }\ndrop_params = [\"think\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(!r.overridden, "the dropped `think` key is no override");
+        assert!(!r.dropped, "the generated reasoning_effort is not dropped");
+        assert_eq!(r.request(), Some(Request::Effort("high".into())), "the generated field is still sent");
+        assert_eq!(r.warning, None);
+
+        // An undropped extra_body key is still a real override.
+        let p = provider("extra_body = { reasoning_effort = \"low\" }\ndrop_params = [\"temperature\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.overridden, "an undropped extra_body key still overrides");
+        assert!(!r.dropped);
     }
 
     #[test]
