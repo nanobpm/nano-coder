@@ -894,13 +894,16 @@ fn execute(
     // above), so these joins return promptly in the common case; bound them so
     // a descendant holding a pipe cannot block shutdown. `join_reader` reports
     // whether the stream actually finished: a blown deadline means a descendant
-    // is still holding the pipe open and the drained bytes are incomplete.
-    let (out_buf, out_overflow, out_finished) = join_reader(out_reader, deadline, grace);
-    let (err_buf, err_overflow, err_finished) = join_reader(err_reader, deadline, grace);
+    // is still holding the pipe open and the drained bytes are incomplete. It
+    // also propagates a read error: an errored stream ends the drain loop
+    // early, which must not be mistaken for a clean EOF.
+    let (out_buf, out_overflow, out_finished, out_error) = join_reader(out_reader, deadline, grace);
+    let (err_buf, err_overflow, err_finished, err_error) = join_reader(err_reader, deadline, grace);
     // The stdin writer unblocks once the read end closes (kill) or the child
     // exits; bound its join for the same reason.
     let writer_finished = join_thread(writer, deadline, grace).is_some();
     let io_unfinished = !(out_finished && err_finished && writer_finished);
+    let read_error = out_error.or(err_error);
     if io_unfinished {
         // A descendant survived the child and still holds a pipe open, so the
         // drained output is incomplete. An exit-0 hook whose JSON denial (or
@@ -919,7 +922,10 @@ fn execute(
                 // Over-cap output is untrustworthy (truncated JSON would be
                 // misparsed), so report it as a failure and fail closed.
                 // Unfinished I/O (a descendant held a pipe past the deadline)
-                // is untrustworthy for the same reason.
+                // is untrustworthy for the same reason. So is a read error:
+                // the drain stopped before EOF, so a decision in the unread
+                // tail would be lost — fail closed rather than parse the
+                // partial buffer as "no decision".
                 launch_error: if overflow {
                     Some(format!("hook output exceeded {} bytes", OUTPUT_CAP))
                 } else if io_unfinished {
@@ -928,7 +934,7 @@ fn execute(
                             .to_string(),
                     )
                 } else {
-                    None
+                    read_error.map(|error| format!("could not read hook output: {error}"))
                 },
                 stdout: String::from_utf8_lossy(&out_buf).into_owned(),
                 stderr: String::from_utf8_lossy(&err_buf).into_owned(),
@@ -948,11 +954,15 @@ fn execute(
 }
 
 /// Read a stream to EOF, storing at most `OUTPUT_CAP` bytes. Returns the
-/// (possibly truncated) buffer and whether any bytes were dropped. Keeps
-/// draining after the cap so the child never blocks on a full pipe.
-fn drain_bounded(stream: Option<impl std::io::Read>) -> (Vec<u8>, bool) {
+/// (possibly truncated) buffer, whether any bytes were dropped, and the first
+/// read error if one stopped the drain. Keeps draining after the cap so the
+/// child never blocks on a full pipe. `ErrorKind::Interrupted` is retried; any
+/// other error is *not* EOF — the buffer is incomplete, so the error is
+/// returned for the caller to fail closed on.
+fn drain_bounded(stream: Option<impl std::io::Read>) -> (Vec<u8>, bool, Option<String>) {
     let mut buf = Vec::new();
     let mut overflow = false;
+    let mut error = None;
     if let Some(mut stream) = stream {
         let mut chunk = [0u8; 8192];
         loop {
@@ -967,26 +977,32 @@ fn drain_bounded(stream: Option<impl std::io::Read>) -> (Vec<u8>, bool) {
                         overflow = true;
                     }
                 }
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
             }
         }
     }
-    (buf, overflow)
+    (buf, overflow, error)
 }
 
 /// Join a drain thread, returning its buffer; on a blown deadline return what
 /// is available (empty) rather than blocking. The thread is detached and
 /// finishes once its stream closes. The third tuple element reports whether the
-/// reader actually finished (`true`) or was abandoned at the deadline (`false`)
-/// — callers must treat unfinished output as untrustworthy and fail closed.
+/// reader actually finished (`true`) or was abandoned at the deadline (`false`),
+/// and the fourth carries a read error if one stopped the drain — both mean the
+/// output is incomplete, so callers must treat it as untrustworthy and fail
+/// closed.
 fn join_reader(
-    handle: std::thread::JoinHandle<(Vec<u8>, bool)>,
+    handle: std::thread::JoinHandle<(Vec<u8>, bool, Option<String>)>,
     deadline: std::time::Instant,
     grace: Duration,
-) -> (Vec<u8>, bool, bool) {
+) -> (Vec<u8>, bool, bool, Option<String>) {
     match join_thread(handle, deadline, grace) {
-        Some((buf, overflow)) => (buf, overflow, true),
-        None => (Vec::new(), false, false),
+        Some((buf, overflow, error)) => (buf, overflow, true, error),
+        None => (Vec::new(), false, false, None),
     }
 }
 
@@ -1904,5 +1920,84 @@ mod tests {
         // Plain ASCII over the cap truncates the same way.
         let ascii = "x".repeat(FIELD_CAP + 1);
         assert_eq!(cap(&ascii).chars().count(), FIELD_CAP);
+    }
+
+    /// A reader that errors on the `fail_at`-th read (1-based) with the given
+    /// kind; earlier reads return the scripted chunks then EOF.
+    struct FlakyReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        reads: usize,
+        fail_at: usize,
+        kind: std::io::ErrorKind,
+    }
+
+    impl FlakyReader {
+        fn new(chunks: Vec<Vec<u8>>, fail_at: usize, kind: std::io::ErrorKind) -> Self {
+            Self { chunks: chunks.into(), reads: 0, fail_at, kind }
+        }
+    }
+
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads == self.fail_at {
+                return Err(std::io::Error::new(self.kind, "injected read failure"));
+            }
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    buf[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn drain_bounded_retries_interrupted_reads() {
+        // EINTR is a transient signal interruption, not EOF: the drain must
+        // retry it and still collect the full stream (Copilot finding,
+        // src/claude_hooks.rs).
+        let reader = FlakyReader::new(vec![b"hello".to_vec()], 2, std::io::ErrorKind::Interrupted);
+        let (buf, overflow, error) = drain_bounded(Some(reader));
+        assert_eq!(buf, b"hello");
+        assert!(!overflow);
+        assert!(error.is_none(), "Interrupted is retried, not reported: {error:?}");
+    }
+
+    #[test]
+    fn drain_bounded_reports_read_errors_instead_of_eof() {
+        // A hard read error mid-stream must surface as an error, not be
+        // swallowed as a clean EOF — the bytes after it are lost, so the
+        // buffer is incomplete and the caller must fail closed (Copilot
+        // finding, src/claude_hooks.rs).
+        let reader = FlakyReader::new(vec![b"partial".to_vec()], 2, std::io::ErrorKind::BrokenPipe);
+        let (buf, overflow, error) = drain_bounded(Some(reader));
+        assert_eq!(buf, b"partial", "bytes read before the error are kept");
+        assert!(!overflow);
+        assert!(error.is_some(), "a read error is reported, not treated as EOF");
+    }
+
+    #[test]
+    fn read_error_on_stdout_fails_pre_tool_use_closed() {
+        // Regression for the fail-open path: an exit-0 PreToolUse hook whose
+        // stdout read errors out must be treated as a hook failure (deny),
+        // never as "no decision" (allow). Simulate the errored drain directly
+        // through the same launch_error precedence `execute` uses.
+        let run = ProcessRun {
+            exit: Some(0),
+            timed_out: false,
+            launch_error: Some("could not read hook output: injected read failure".to_string()),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let hook = command_hook(Event::PreToolUse, "true");
+        let result = interpret(Event::PreToolUse, &hook, run);
+        assert!(
+            result.blocked && result.decision == Some(Decision::Deny),
+            "a read error fails closed: blocked={} decision={:?}",
+            result.blocked,
+            result.decision
+        );
     }
 }
