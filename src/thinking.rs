@@ -440,6 +440,21 @@ impl Resolved {
         }
     }
 
+    /// Whether the model thinks on Anthropic Messages even when the request
+    /// sends no thinking field — the basis for the temperature rule of a
+    /// request that omits one (e.g. compaction). Unlike
+    /// [`Resolved::anthropic_thinking_on`], which reports what the resolved
+    /// setting asks for, this is about the model itself: a configured level
+    /// that is not sent does not stop a model that can turn thinking off.
+    pub fn always_anthropic_thinking(&self) -> bool {
+        if self.extra_body_override.is_some() || self.wire != Wire::AnthropicMessages {
+            return false;
+        }
+        // A model whose known levels omit `off` always thinks (Fable, Claude
+        // 5.5+); any other model thinks only when the request asks it to.
+        !self.levels.is_empty() && !self.levels.iter().any(|l| l == "off")
+    }
+
     /// One line for `/context`, e.g. `high (set for this model)`. An
     /// `extra_body` override sends its own value instead of `effective`, so
     /// that is reported as overriding the configured level, not as sending it.
