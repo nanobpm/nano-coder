@@ -987,6 +987,9 @@ impl Agent {
                 // An extra_body override sends its own value, not the
                 // configured level, so no generated level is shown.
                 _ if thinking.overridden => None,
+                // `drop_params` strips the generated field after the body is
+                // built, so the level never reaches the wire either.
+                _ if thinking.dropped => None,
                 crate::thinking::Thinking::Default => None,
                 level => Some(level.to_string()),
             };
@@ -1286,6 +1289,11 @@ impl Agent {
         self.instructions = instructions;
         self.skills = skills;
         self.conversation = vec![system];
+        // `/thinking` is session-scoped, so the previous session's override
+        // must not leak into this one. Clear it here — after staging has
+        // succeeded — so a `SessionLog::create` / initial-append failure above
+        // still leaves the live session (and its override) untouched.
+        self.thinking_override = None;
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
@@ -1367,6 +1375,11 @@ impl Agent {
         self.plan = restored.plan.unwrap_or_default();
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::default();
+        // `/thinking` is session-scoped, so the previous session's override
+        // must not leak into the resumed one. Cleared here — after the staged
+        // conversation and its repairs have committed — so a failed load leaves
+        // the live session's override intact.
+        self.thinking_override = None;
         // `titles_requested` is deliberately not reset: it tracks which
         // sessions this process already asked to title, so switching
         // A → B → A does not launch a second (paid) title request for A.
@@ -4135,6 +4148,73 @@ mod tests {
         assert_eq!((agent.thinking().effective, agent.thinking().source), (Thinking::Default, Source::Global));
     }
 
+    #[test]
+    fn status_bar_reports_nothing_for_a_dropped_level() {
+        use crate::thinking::Thinking;
+        // `drop_params` strips the generated field after the body is built, so
+        // the level never reaches the wire. The status projection must show no
+        // level — like an extra_body override — not the configured one.
+        let mut config = Config::default();
+        config.providers.insert(
+            "mock".into(),
+            providers::ProviderConfig { drop_params: Some(vec!["reasoning_effort".into()]), ..Default::default() },
+        );
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-5")), config);
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        assert!(agent.thinking().dropped, "the reasoning_effort field is dropped");
+        assert_eq!(agent.context_stats().lock().unwrap().thinking, None, "a dropped level is not shown as sent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_transitions_clear_the_thinking_override() {
+        use crate::thinking::{Source, Thinking};
+        // `/thinking` is session-scoped, so the previous session's override must
+        // not leak into a new or resumed session.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            persist_sessions: true,
+            project_instructions: false,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), config);
+        agent.new_session().unwrap();
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        assert_eq!(agent.thinking().source, Source::Session);
+
+        // A new session drops the override back to the config default.
+        agent.new_session().unwrap();
+        assert_eq!((agent.thinking().effective, agent.thinking().source), (Thinking::Default, Source::Global));
+
+        // … and so does resuming a persisted session.
+        let resumed = agent.new_session().unwrap();
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        agent.load_session(&resumed).unwrap();
+        assert_eq!((agent.thinking().effective, agent.thinking().source), (Thinking::Default, Source::Global));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_new_session_keeps_the_thinking_override() {
+        use crate::thinking::{Source, Thinking};
+        // Failure-atomic staging: when `new_session` cannot persist, the live
+        // session — including its `/thinking` override — must stay untouched.
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the session directory must be makes
+        // `SessionLog::create` fail, so the switch cannot commit.
+        let blocker = dir.path().join("sessions");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let config = Config {
+            session_dir: Some(blocker),
+            persist_sessions: true,
+            project_instructions: false,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), config);
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        assert!(agent.new_session().is_err(), "the unwritable session dir fails the switch");
+        assert_eq!(agent.thinking().source, Source::Session, "the live session's override survives a failed switch");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn compaction_keeps_the_temperature_when_turns_think_on_anthropic() {
         use crate::thinking::Thinking;
@@ -4912,8 +4992,10 @@ mod tests {
             ..Config::default()
         };
         let mut agent = Agent::new(Box::new(client), config);
-        agent.set_thinking(Some(Thinking::Level("high".into())));
         agent.new_session().unwrap();
+        // `/thinking` is session-scoped, so set it after opening the session it
+        // applies to (a session transition clears the previous override).
+        agent.set_thinking(Some(Thinking::Level("high".into())));
         agent.push(Message::user(&"x".repeat(64_000))).unwrap();
         assert_eq!(agent.send_message("go").await.unwrap(), "done");
 

@@ -625,6 +625,9 @@ fn requeue_steers(deferred: &mut VecDeque<Value>, leftover: Vec<Steer>, marks: &
 fn thinking_value(resolved: &crate::thinking::Resolved) -> serde_json::Value {
     match &resolved.effective {
         _ if resolved.overridden => serde_json::Value::Null,
+        // `drop_params` strips the generated field after the body is built, so
+        // the level never reaches the wire either; report none then too.
+        _ if resolved.dropped => serde_json::Value::Null,
         crate::thinking::Thinking::Default => serde_json::Value::Null,
         other => json!(other.to_string()),
     }
@@ -674,6 +677,35 @@ mod tests {
         deferred.push_back(json!({"method": "cmd"}));
         requeue_steers(&mut deferred, vec![steer("b", 2), steer("c", 3)], &marks, None);
         assert_eq!(order(&deferred), ["b", "cmd", "c"]);
+    }
+
+    #[test]
+    fn thinking_value_reports_nothing_for_a_dropped_level() {
+        // `drop_params` strips the generated field after the body is built, so
+        // the level never reaches the wire. ACP must report null — like an
+        // extra_body override — not the configured level that was dropped.
+        let provider: crate::providers::ProviderConfig =
+            toml::from_str("drop_params = [\"reasoning_effort\"]").unwrap();
+        let dropped = crate::thinking::resolve(
+            &crate::thinking::Thinking::Default,
+            Some(&crate::thinking::Thinking::Level("high".into())),
+            Some(crate::providers::ProviderKind::Openai),
+            &provider,
+            "gpt-5",
+        );
+        assert!(dropped.dropped, "the reasoning_effort field is dropped");
+        assert_eq!(thinking_value(&dropped), serde_json::Value::Null, "a dropped level is reported as null");
+
+        // The same level with nothing dropped still reports its name.
+        let sent = crate::thinking::resolve(
+            &crate::thinking::Thinking::Default,
+            Some(&crate::thinking::Thinking::Level("high".into())),
+            Some(crate::providers::ProviderKind::Openai),
+            &crate::providers::ProviderConfig::default(),
+            "gpt-5",
+        );
+        assert!(!sent.dropped);
+        assert_eq!(thinking_value(&sent), json!("high"));
     }
 
     #[test]
