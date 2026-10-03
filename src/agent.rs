@@ -718,6 +718,15 @@ impl Agent {
 
     /// The temperature the current model is sent, and where it comes from.
     pub fn temperature(&self) -> crate::temperature::Resolved {
+        self.temperature_for(self.thinking().anthropic_thinking_on())
+    }
+
+    /// Temperature resolution for a request whose Anthropic thinking state is
+    /// `anthropic_thinking_on`. A normal turn passes the live thinking level;
+    /// a request that explicitly disables thinking (e.g. compaction) passes
+    /// `false` so a configured temperature is not dropped as if thinking were
+    /// on. Fixed-model and `extra_body` rules apply either way.
+    fn temperature_for(&self, anthropic_thinking_on: bool) -> crate::temperature::Resolved {
         // Resolve against the live client, not `config.model`: a `/settings`
         // edit to the active provider (e.g. its `default_model`, kept when
         // "Pick a model … now?" is declined) mutates the config without
@@ -737,7 +746,7 @@ impl Agent {
         let provider = entry.unwrap_or_default();
         let resolved = crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name());
         // Anthropic accepts no custom temperature while the model thinks.
-        if self.thinking().anthropic_thinking_on() {
+        if anthropic_thinking_on {
             return resolved.fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
         }
         resolved
@@ -757,26 +766,35 @@ impl Agent {
             self.model_name(),
             self.reported_thinking.as_ref(),
         );
-        // A fixed budget must stay below the output cap; say so when the cap
-        // shrinks the level's budget.
-        if resolved.warning.is_none()
-            && let Some(crate::thinking::Request::Budget(budget)) = resolved.request()
-        {
+        // A fixed budget must stay below the output cap. Always check, even
+        // when an earlier adjustment already warned: a level fitted down (e.g.
+        // `xhigh` → a known level) can still ask for a budget the cap can't
+        // fit, and the no-room case must drop the level everywhere — otherwise
+        // the Anthropic builder omits thinking while status, ACP, trajectory,
+        // and temperature resolution still treat it as active.
+        if let Some(crate::thinking::Request::Budget(budget)) = resolved.request() {
             let max_tokens = self.request_max_tokens();
-            match crate::thinking::capped_budget(budget, max_tokens) {
-                Some(sent) if sent < budget => {
-                    resolved.warning = Some(format!(
-                        "max_tokens {max_tokens} caps the {} thinking budget at {sent} of {budget} tokens; \
-                         raise max_tokens for the full budget",
-                        resolved.effective
-                    ))
-                }
+            let feasibility = match crate::thinking::capped_budget(budget, max_tokens) {
+                Some(sent) if sent < budget => Some(format!(
+                    "max_tokens {max_tokens} caps the {} thinking budget at {sent} of {budget} tokens; \
+                     raise max_tokens for the full budget",
+                    resolved.effective
+                )),
                 None => {
-                    resolved.warning = Some(format!(
+                    // No room for any budget: send no level so every surface
+                    // agrees thinking is off for this request.
+                    resolved.effective = crate::thinking::Thinking::Default;
+                    Some(format!(
                         "max_tokens {max_tokens} leaves no room for a thinking budget; thinking stays off"
                     ))
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(extra) = feasibility {
+                resolved.warning = Some(match resolved.warning.take() {
+                    Some(existing) => format!("{existing}\n{extra}"),
+                    None => extra,
+                });
             }
         }
         resolved
@@ -2446,8 +2464,11 @@ impl Agent {
             // Compaction goes through the same resolution as a chat turn, so a
             // legacy `extra_body` temperature override still applies (the
             // transport no longer re-inserts it) and fixed-temperature models
-            // still send none.
-            temperature: self.temperature().value(),
+            // still send none. This request disables thinking (`thinking:
+            // None`), so resolve temperature as thinking-off — otherwise an
+            // Anthropic turn that normally thinks would drop a configured
+            // temperature that this request is actually allowed to send.
+            temperature: self.temperature_for(false).value(),
             max_tokens: Some(output_budget),
             // A summary needs no extended reasoning; the model's own default
             // applies, as before thinking levels existed.
@@ -4081,6 +4102,28 @@ mod tests {
         assert_eq!((agent.thinking().effective, agent.thinking().source), (Thinking::Default, Source::Global));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_keeps_the_temperature_when_turns_think_on_anthropic() {
+        use crate::thinking::Thinking;
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(Claude { seen: seen.clone() }), config);
+        agent.new_session().unwrap();
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        // A normal turn thinks, so Anthropic drops the custom temperature.
+        assert!(agent.temperature().fixed.is_some());
+        // Compaction disables thinking for its request, so the configured
+        // temperature is resolved as thinking-off and still sent.
+        let compaction = agent.temperature_for(false);
+        assert!(compaction.fixed.is_none(), "compaction keeps the custom temperature");
+        assert_eq!(compaction.value(), Some(0.5));
+    }
+
     #[test]
     fn a_small_max_tokens_caps_the_thinking_budget_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
@@ -4105,6 +4148,59 @@ mod tests {
         agent.set_thinking(Some(crate::thinking::Thinking::Level("high".into())));
         let warning = agent.thinking().warning.unwrap();
         assert!(warning.contains("caps the high thinking budget"), "{warning}");
+    }
+
+    #[test]
+    fn no_room_for_a_budget_drops_the_level_everywhere() {
+        use crate::thinking::Thinking;
+        struct OldClaude;
+        #[async_trait]
+        impl LLMClient for OldClaude {
+            async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!("no chat in this test")
+            }
+            fn model_name(&self) -> &str {
+                "claude-sonnet-4-5"
+            }
+            fn provider_name(&self) -> &str {
+                "anthropic"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Anthropic)
+            }
+        }
+        // `max_tokens` below the minimum budget leaves no room at all.
+        let make = || {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                session_dir: Some(dir.path().to_path_buf()),
+                max_tokens: 1024,
+                temperature: crate::temperature::Temperature::Value(0.5),
+                ..Default::default()
+            };
+            (Agent::new(Box::new(OldClaude), config), dir)
+        };
+
+        // A known level with no room: effective drops to Default so the level
+        // is not reported active, no thinking request is sent, and the
+        // Anthropic temperature lock lifts (thinking is actually off).
+        let (mut agent, _dir) = make();
+        agent.set_thinking(Some(Thinking::Level("high".into())));
+        let resolved = agent.thinking();
+        assert_eq!(resolved.effective, Thinking::Default);
+        assert_eq!(resolved.request(), None);
+        assert!(resolved.warning.unwrap().contains("leaves no room"));
+        assert!(agent.temperature().fixed.is_none(), "no thinking means no temperature lock");
+
+        // An adjusted level (`xhigh` → `high`) is still checked even though the
+        // fit already warned; both warnings are kept.
+        let (mut agent, _dir) = make();
+        agent.set_thinking(Some(Thinking::Level("xhigh".into())));
+        let resolved = agent.thinking();
+        assert_eq!(resolved.effective, Thinking::Default);
+        let warning = resolved.warning.unwrap();
+        assert!(warning.contains("using"), "keeps the fit warning: {warning}");
+        assert!(warning.contains("leaves no room"), "adds the feasibility warning: {warning}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

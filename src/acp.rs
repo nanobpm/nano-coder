@@ -344,15 +344,20 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                 ));
             }
 
-            // `/thinking LEVEL` (or `reset`): the session thinking level.
-            if let Some(arg) = command.strip_prefix("/thinking ") {
-                let arg = arg.trim();
-                if arg.eq_ignore_ascii_case("reset") {
-                    agent.set_thinking(None);
-                } else {
-                    match arg.parse::<crate::thinking::Thinking>() {
-                        Ok(level) => agent.set_thinking(Some(level)),
-                        Err(e) => return Some(error(id, -32602, e)),
+            // `/thinking` reports the level; `/thinking LEVEL` (or `reset`)
+            // sets it. The bare command must be status-only — otherwise it
+            // falls through to `Action::Turn` and the literal slash command is
+            // sent to the model instead of reporting the current level.
+            if command == "/thinking" || command.starts_with("/thinking ") {
+                let arg = command.strip_prefix("/thinking").unwrap_or_default().trim();
+                if !arg.is_empty() {
+                    if arg.eq_ignore_ascii_case("reset") {
+                        agent.set_thinking(None);
+                    } else {
+                        match arg.parse::<crate::thinking::Thinking>() {
+                            Ok(level) => agent.set_thinking(Some(level)),
+                            Err(e) => return Some(error(id, -32602, e)),
+                        }
                     }
                 }
                 let thinking = agent.thinking();
