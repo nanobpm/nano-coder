@@ -133,6 +133,14 @@ pub struct Resolved {
     pub fixed: Option<String>,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
+    /// The self-naming portion of `warning` (a non-finite `extra_body` override,
+    /// e.g. "extra_body temperature NaN is not finite …") that stays true even
+    /// when the temperature is later dropped. Kept apart from the combined
+    /// `warning` so [`Resolved::fixed_by`] can restore exactly this part instead
+    /// of substring-matching a joined string — a combined warning also contains
+    /// `extra_body`, so a substring filter would leak its stale "sending N"
+    /// clause once the value is dropped.
+    extra_body_warning: Option<String>,
 }
 
 impl Resolved {
@@ -166,12 +174,18 @@ impl Resolved {
                 Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", self.source.label()))
             }
             // A global value, or one already `Default`: the "sending N" range
-            // warning no longer applies (nothing is sent), so only a warning
-            // unrelated to the sent value — a non-finite `extra_body` override,
-            // which names itself — is kept.
-            _ => self.warning.filter(|w| w.contains("extra_body")),
+            // warning no longer applies (nothing is sent), so only the
+            // self-naming part — a non-finite `extra_body` override, kept apart
+            // from the combined `warning` — survives.
+            _ => self.extra_body_warning,
         };
-        Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning }
+        Resolved {
+            effective: Temperature::Default,
+            source: Source::Required,
+            fixed: Some(reason),
+            warning,
+            extra_body_warning: None,
+        }
     }
 
     /// One line for `/context` and `/settings`, e.g. `0.3 (set for this model)`.
@@ -237,9 +251,19 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
             }
             _ => extra_body_warning,
         };
-        return Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning };
+        return Resolved {
+            effective: Temperature::Default,
+            source: Source::Required,
+            fixed: Some(reason),
+            warning,
+            extra_body_warning: None,
+        };
     }
 
+    // Keep the self-naming `extra_body` warning apart from the combined
+    // `warning` so a later `fixed_by` can restore just this part (the clamp
+    // "sending N" clause below is stale once the temperature is dropped).
+    let extra_body_only = extra_body_warning.clone();
     let mut warning = extra_body_warning;
     // Anthropic's Messages API takes 0..=1, and `anthropic::build_body` clamps
     // out-of-range values silently. That builder is used for Anthropic
@@ -268,7 +292,7 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
             effective = Temperature::Value(0.0);
         }
     }
-    Resolved { effective, source, fixed: None, warning }
+    Resolved { effective, source, fixed: None, warning, extra_body_warning: extra_body_only }
 }
 
 #[cfg(test)]
@@ -452,12 +476,19 @@ mod tests {
         assert!(!warning.contains("sending 1"), "{warning}");
 
         // A warning unrelated to the sent value — a non-finite `extra_body`
-        // override — survives the drop.
+        // override — survives the drop, WITHOUT the stale clamp clause. Here the
+        // non-finite override falls through to the out-of-range global 1.5,
+        // which `resolve` clamps and reports ("sending 1") combined with the
+        // "not finite" notice. Dropping the temperature must keep only the
+        // self-naming "not finite" part, never the stale "sending 1".
         let p = provider("extra_body = { temperature = nan }\n");
         let r = resolve(Temperature::Value(1.5), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
         assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
+        assert!(r.warning.as_deref().unwrap().contains("sending 1"), "combined before fixing: {:?}", r.warning);
         let r = r.fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
         assert_eq!(r.value(), None);
-        assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
+        let warning = r.warning.as_deref().unwrap();
+        assert!(warning.contains("not finite"), "{warning}");
+        assert!(!warning.contains("sending 1"), "the stale clamp clause must not leak: {warning}");
     }
 }
