@@ -236,14 +236,49 @@ pub fn builtin(model: &str) -> Option<Profile> {
     }
     // The last path segment: `openai/gpt-5` on OpenRouter is `gpt-5`.
     let id = id.rsplit('/').next().unwrap_or(&id);
-    let major = |rest: &str| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok();
-    if id.strip_prefix("gpt-").and_then(major).is_some_and(|m| m >= 5) {
-        return Some(Profile::new(&["low", "medium", "high"], None));
+    // The raw OpenAI `/v1/models` list reports no `reasoning_effort`
+    // capabilities (unlike Copilot/Ollama/llama.cpp, which `Reported` reads
+    // live), so this table is the only fallback there. The accepted levels
+    // differ by variant: GPT-5 (and `-mini`/`-nano`) take `minimal`; GPT-5.1
+    // replaced `minimal` with `none` (sent as `off`). A level the endpoint
+    // rejects is refused by the API, so failing closed to the documented set
+    // per variant avoids sending an unsupported effort.
+    if let Some((major, minor)) = id.strip_prefix("gpt-").and_then(gpt_version) {
+        // `gpt-5-chat-latest` is the non-reasoning chat model: it takes no
+        // `reasoning_effort` at all, so it has no thinking levels.
+        if id.contains("chat") {
+            return None;
+        }
+        if major == 5 && minor == 0 {
+            return Some(Profile::new(&["minimal", "low", "medium", "high"], None));
+        }
+        if major >= 5 {
+            // GPT-5.1 and later: `none` (off) in place of `minimal`.
+            return Some(Profile::new(&["off", "low", "medium", "high"], None));
+        }
     }
     if ["o1", "o3", "o4"].iter().any(|p| id == *p || id.starts_with(&format!("{p}-"))) {
         return Some(Profile::new(&["low", "medium", "high"], None));
     }
     None
+}
+
+/// `(major, minor)` of a `gpt-<major>[.<minor>]` id once the `gpt-` prefix is
+/// stripped: `5` → `(5, 0)`, `5.1` → `(5, 1)`, `5-mini` → `(5, 0)`,
+/// `5.1-codex` → `(5, 1)`. A `-` separates a variant name, not a version, so
+/// only a `.` introduces the minor. `None` when no leading number is present.
+fn gpt_version(rest: &str) -> Option<(u32, u32)> {
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let major: u32 = rest[..digits].parse().ok()?;
+    let minor = rest[digits..]
+        .strip_prefix('.')
+        .map(|tail| tail.chars().take_while(char::is_ascii_digit).collect::<String>())
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
 /// Thinking levels an endpoint reports for a model (GitHub Copilot's
@@ -836,9 +871,16 @@ mod tests {
         // No extended thinking.
         assert_eq!(builtin("claude-3-5-sonnet-latest"), None);
         assert_eq!(builtin("claude-3-5-haiku"), None);
-        // OpenAI reasoning models.
-        assert_eq!(levels("gpt-5").as_deref(), Some("low,medium,high"));
-        assert_eq!(levels("openai/gpt-5.6-sol").as_deref(), Some("low,medium,high"));
+        // OpenAI reasoning models. GPT-5 takes `minimal`; GPT-5.1+ replaces it
+        // with `none` (off). See <https://platform.openai.com/docs/models>.
+        assert_eq!(levels("gpt-5").as_deref(), Some("minimal,low,medium,high"));
+        assert_eq!(levels("gpt-5-mini").as_deref(), Some("minimal,low,medium,high"));
+        assert_eq!(levels("gpt-5-nano").as_deref(), Some("minimal,low,medium,high"));
+        assert_eq!(levels("gpt-5.1").as_deref(), Some("off,low,medium,high"));
+        assert_eq!(levels("gpt-5.1-codex").as_deref(), Some("off,low,medium,high"));
+        assert_eq!(levels("openai/gpt-5.6-sol").as_deref(), Some("off,low,medium,high"));
+        // The non-reasoning chat model takes no reasoning_effort.
+        assert_eq!(builtin("gpt-5-chat-latest"), None);
         assert_eq!(levels("o4-mini").as_deref(), Some("low,medium,high"));
         assert_eq!(builtin("gpt-4.1"), None);
         assert_eq!(builtin("llama3.3"), None);
@@ -899,6 +941,32 @@ mod tests {
         // A global level a model lacks is fitted silently.
         let r = resolve(&level("max"), None, Some(ProviderKind::Openai), &none, "gpt-5");
         assert_eq!((r.effective, r.warning), (level("high"), None));
+    }
+
+    #[test]
+    fn gpt_5_family_reasoning_levels_split_by_variant() {
+        let none = ProviderConfig::default();
+        let openai = Some(ProviderKind::Openai);
+        // GPT-5 takes `minimal`; it is sent as-is, not fitted up to `low`.
+        let r = resolve(&Thinking::Default, Some(&level("minimal")), openai, &none, "gpt-5");
+        assert_eq!(r.effective, level("minimal"));
+        assert_eq!(r.request(), Some(Request::Effort("minimal".into())));
+        assert_eq!(r.warning, None);
+        // GPT-5 has no `none`, so `off` falls back to the model default.
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), openai, &none, "gpt-5");
+        assert_eq!(r.effective, Thinking::Default);
+        assert!(r.warning.unwrap().contains("can't turn thinking off"));
+        // GPT-5.1 replaced `minimal` with `none`: `off` is sent, `minimal` fits to `low`.
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), openai, &none, "gpt-5.1");
+        assert_eq!(r.request(), Some(Request::Off));
+        let r = resolve(&Thinking::Default, Some(&level("minimal")), openai, &none, "gpt-5.1");
+        assert_eq!(r.effective, level("low"));
+        // `-mini`/`-codex` are GPT-5.0 variants (take `minimal`); the minor
+        // version, not the variant suffix, decides.
+        assert_eq!(builtin("gpt-5-mini").unwrap().levels, ["minimal", "low", "medium", "high"]);
+        assert_eq!(builtin("gpt-5.1-codex").unwrap().levels, ["off", "low", "medium", "high"]);
+        // The non-reasoning chat variant is not a reasoning model.
+        assert_eq!(builtin("gpt-5-chat-latest"), None);
     }
 
     #[test]
