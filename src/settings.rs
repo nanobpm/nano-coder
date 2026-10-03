@@ -250,6 +250,11 @@ pub async fn run(
                     Ok(value) => {
                         agent.config_mut().max_tokens = value;
                         changes.max_tokens = true;
+                        // `max_tokens` caps the Anthropic thinking budget, so
+                        // `thinking()` can drop or restore a fixed-budget level
+                        // here; refresh so the status bar's level matches what
+                        // the next request will actually send.
+                        agent.refresh_stats();
                     }
                     Err(e) => return (notices, Err(e.into())),
                 }
