@@ -1724,7 +1724,12 @@ mod tests {
         assert!(outcome.denies(), "incomplete hook output is untrustworthy; PreToolUse fails closed");
     }
 
-    #[cfg(unix)]
+    // Linux-only: the probe reads the hook's session id via `ps -o sid=`, a
+    // procps (GNU) keyword — BSD/macOS `ps` has no `sid` column (`sess`
+    // prints a session-struct address, not a pid-comparable sid), so the
+    // parse would panic there. The product code under test (`setsid` in
+    // `pre_exec`) is portable; only this probe is not.
+    #[cfg(all(unix, target_os = "linux"))]
     #[test]
     fn hook_runs_in_a_new_session_without_controlling_terminal() {
         let dir = tempfile::tempdir().unwrap();
