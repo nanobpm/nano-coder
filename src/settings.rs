@@ -958,8 +958,9 @@ type ThinkingChoice = (Option<crate::thinking::Thinking>, String);
 /// 0 (this model), 1 (provider), or 2 (global); `model_levels` are the levels
 /// the current model takes, offered for every scope (a provider or global
 /// level is still sent to this model, so it must be one it takes). When the
-/// model has no known levels the standard list is offered instead. The default
-/// lands on `existing`, and a custom `existing` value absent from the standard
+/// model has no known levels only `default`/`unset` are offered, since any
+/// level would be ignored until real choices are known. The default lands on
+/// `existing`, and a custom `existing` value absent from the standard
 /// choices is appended so merely confirming the editor preserves it instead of
 /// silently resetting the setting.
 fn thinking_choices(
@@ -967,12 +968,14 @@ fn thinking_choices(
     model_levels: &[String],
     existing: &Option<crate::thinking::Thinking>,
 ) -> Result<(Vec<ThinkingChoice>, usize)> {
-    use crate::thinking::{ORDER, Thinking};
-    let levels: Vec<String> = if !model_levels.is_empty() {
-        model_levels.to_vec()
-    } else {
-        std::iter::once("off").chain(ORDER).map(String::from).collect()
-    };
+    use crate::thinking::Thinking;
+    // With no known levels, `thinking::resolve` ignores any chosen level and
+    // sends nothing, so offering the standard effort names here would only set
+    // a value that does nothing — and contradicts picking only from the model's
+    // supported levels. Offer just `default`/`unset` until `thinking_levels` or
+    // endpoint data supplies real choices. A custom `existing` is still kept
+    // below.
+    let levels: Vec<String> = model_levels.to_vec();
     let mut choices: Vec<ThinkingChoice> = Vec::new();
     if scope < 2 {
         choices.push((None, "unset (use the broader setting)".into()));
@@ -1340,10 +1343,13 @@ mod tests {
             assert!(!labels.contains(&"high"), "scope {scope} must not offer unsupported effort names: {labels:?}");
         }
 
-        // A model with no known levels falls back to the standard list.
+        // A model with no known levels offers only default/unset: any level
+        // would be ignored until real choices (thinking_levels or endpoint
+        // data) are known, so the standard effort names are not offered.
         let (choices, _) = thinking_choices(1, &[], &None).unwrap();
         let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
-        assert!(labels.contains(&"high"), "empty model levels fall back to the standard list: {labels:?}");
+        assert!(!labels.contains(&"high"), "empty model levels must not offer standard effort names: {labels:?}");
+        assert!(labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")), "only default/unset: {labels:?}");
     }
 
     #[test]
