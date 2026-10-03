@@ -80,6 +80,21 @@ pub enum Record {
         plan: crate::plan::Plan,
         recorded_at: DateTime<FixedOffset>,
     },
+    /// The external hook configuration files loaded for this session (audit
+    /// trail: issue #92). Observational only — ignored when rebuilding state.
+    Hooks {
+        files: Vec<HookFile>,
+        recorded_at: DateTime<FixedOffset>,
+    },
+}
+
+/// One loaded hook configuration file, recorded for the audit trail: its path,
+/// source (`project`/`local`/`user`) and a content hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookFile {
+    pub path: String,
+    pub source: String,
+    pub hash: String,
 }
 
 /// An input that was accepted but whose turn has not ended.
@@ -429,6 +444,8 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 restored.history_hint_consumed = false;
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
+            // Audit-only: records the loaded hook config, not conversation state.
+            Record::Hooks { .. } => {}
         }
         index += 1;
     }
@@ -497,6 +514,41 @@ mod tests {
             history_calls: 0,
             recorded_at: now(),
         }
+    }
+
+    #[test]
+    fn hooks_record_is_audit_only_and_survives_replay() {
+        // The hook-config audit record (issue #92) is observational: it must
+        // round-trip through the log and the replay must ignore it entirely,
+        // never disturbing the reconstructed conversation.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
+        log.append(&Record::Hooks {
+            files: vec![HookFile {
+                path: "/repo/.claude/settings.json".into(),
+                source: "project".into(),
+                hash: "abc123".into(),
+            }],
+            recorded_at: now(),
+        })
+        .unwrap();
+        log.append(&input("in-1")).unwrap();
+        log.append(&Record::Message(Message::user("hi"))).unwrap();
+        log.append(&Record::Message(Message::assistant("hello"))).unwrap();
+        log.append(&turn_end("in-1")).unwrap();
+        drop(log);
+
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
+        assert_eq!(restored.conversation.len(), 2, "the audit record adds no conversation rows");
+        assert_eq!(restored.conversation[0].content, "hi");
+        assert_eq!(restored.completed.get("in-1").map(String::as_str), Some("hello"));
+
+        // The record itself is present on disk and deserializes back.
+        let records = read_records_at(&path_for(dir.path(), "s8"), Some("s8")).unwrap();
+        assert!(
+            records.iter().any(|r| matches!(r, Record::Hooks { files, .. } if files[0].hash == "abc123")),
+            "the hook audit record is persisted"
+        );
     }
 
     #[test]
@@ -676,7 +728,7 @@ mod tests {
     #[test]
     fn standard_replace_does_not_offer_history_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = SessionLog::create(dir.path(), "s7").unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
         log.append(&Record::Message(Message::system("sys"))).unwrap();
         log.append(&Record::Replace {
             messages: vec![Message::user("summary")],
@@ -688,7 +740,7 @@ mod tests {
         })
         .unwrap();
         drop(log);
-        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
         assert!(!restored.history_available, "a standard replace drops the history tools");
     }
 

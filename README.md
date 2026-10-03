@@ -18,7 +18,8 @@ cargo install nano-coder             # or build from source
 - **Providers**: OpenAI-compatible and Anthropic endpoints (remote or local), selected per model as `provider/model`, with retry/backoff
 - **Tool Calling**: Agent can invoke registered tools during conversation, including a real `bash` tool with timeouts and bounded output
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
-- **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
+- **Lifecycle Hooks**: 6 internal hook events for observing agent behavior, plus
+  Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
@@ -139,7 +140,8 @@ src/
 ├── main.rs      # Single binary entry point (interactive + ACP modes)
 ├── agent.rs     # Agent core: conversation management, tool execution loop
 ├── acp.rs       # ACP JSON-RPC protocol handler
-├── hooks.rs     # Lifecycle hook registry and event system
+├── hooks.rs     # Internal (observe-only) lifecycle hook registry and events
+├── claude_hooks.rs # External Claude Code–compatible user hooks engine
 ├── tools.rs     # Tool registration and dispatch system
 ├── llm.rs       # Provider-neutral messages and the async LLMClient trait
 ├── providers/   # Provider registry + presets, HTTP transport with retries
@@ -181,7 +183,14 @@ Mode selection: `--acp` flag enables ACP headless mode; default is interactive C
 
 ## Lifecycle Hooks
 
-The harness exposes 6 lifecycle hook events:
+nano-coder has two hook systems.
+
+### Internal hooks (observe-only)
+
+The harness exposes 6 internal lifecycle hook events for in-process Rust
+callbacks. These are **observe-only**: a callback can inspect the event payload
+(for logging, metrics, debugging) but cannot block, modify, or redirect the
+agent. They are registered programmatically against `agent.hooks()`.
 
 | Hook | When it fires |
 |------|---------------|
@@ -191,6 +200,36 @@ The harness exposes 6 lifecycle hook events:
 | `after_llm_response` | After receiving LLM response |
 | `before_tool_call` | Before executing a tool |
 | `after_tool_call` | After tool execution completes |
+
+### External user hooks (Claude Code–compatible)
+
+nano-coder also runs **external user hooks** that follow the
+[Claude Code hooks protocol](https://docs.claude.com/en/docs/claude-code/hooks),
+so existing Claude Code hook configurations work unchanged. These are loaded,
+in order, from:
+
+1. `[hooks]` in nano-coder's own user config (`config.toml`), in Claude's structure
+2. `~/.claude/settings.json` (your Claude Code user settings; disable with `claude_user_hooks = false`)
+3. `<project>/.claude/settings.json` (project settings, committed)
+4. `<project>/.claude/settings.local.json` (project-local, git-ignored)
+
+Each hook is a `command` that nano-coder runs as a subprocess, passing the
+event payload as JSON on stdin and interpreting its exit code and (optional)
+JSON stdout per Claude's protocol. Hooks can **block** a tool call or prompt,
+**modify** a tool's input, or **inject additional context**. nano-coder
+translates its tool names (`bash`→`Bash`, `read_file`→`Read`, `write_file`→
+`Write`, `edit_file`→`Edit`, `grep`→`Grep`, `glob`→`Glob`) and the `file_path`/
+`path` argument so Claude-authored matchers and scripts match correctly.
+
+Supported events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, and `Stop`. A `PreToolUse` hook that fails (crashes, times out,
+or exits non-zero) **fails closed** and blocks the tool call; failures in other
+events are non-blocking.
+
+Run `/hooks` at the prompt to list the loaded hooks, which files they came
+from, and any that were skipped (e.g. unsupported events reserved for later
+phases). Disable them with `--no-hooks`, or granularly via the
+`disable_hooks`, `disable_project_hooks`, and `claude_user_hooks` settings.
 
 ## Built-in Tools
 
@@ -333,6 +372,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
+- `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
@@ -940,7 +980,7 @@ agent.tools().register(tool_def, Box::new(|args| {
 
 The model sees a JSON string result as plain text and any other value as serialized JSON.
 
-### Adding Hooks
+### Adding internal (observe-only) hooks
 
 ```rust
 agent.hooks().register(HookEvent::BeforeToolCall, Box::new(|ctx| {
@@ -948,6 +988,10 @@ agent.hooks().register(HookEvent::BeforeToolCall, Box::new(|ctx| {
     println!("About to call tool: {}", tool_name);
 }));
 ```
+
+These callbacks observe only; to block, modify, or add context to a tool call
+or prompt, use the external Claude-compatible user hooks described under
+[Lifecycle Hooks](#lifecycle-hooks).
 
 ### Custom LLM Client
 
