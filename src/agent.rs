@@ -476,6 +476,9 @@ pub struct Agent {
     claude_hooks: Option<claude_hooks::HookManager>,
     /// Whether the `SessionStart` hooks have run for the active session.
     claude_session_started: bool,
+    /// Whether the active session was resumed (loaded) rather than created new,
+    /// so `SessionStart` reports `source: "resume"` instead of `"startup"`.
+    claude_session_resumed: bool,
     /// Number of times a `Stop` hook has blocked the turn end this turn, capped
     /// to avoid loops.
     claude_stop_blocks: u32,
@@ -558,6 +561,7 @@ impl Agent {
             hooks: HookRegistry::new(),
             claude_hooks: None,
             claude_session_started: false,
+            claude_session_resumed: false,
             claude_stop_blocks: 0,
             config,
             conversation,
@@ -754,6 +758,32 @@ impl Agent {
         }
     }
 
+    /// Record which hook configuration files were loaded (path, source and a
+    /// content hash) in the session log, so the transcript establishes what
+    /// hook config applied even after exit — the audit trail issue #92
+    /// requires. Best-effort: an audit-append failure never fails session
+    /// setup, and a session without a log (headless/no-persist) is a no-op.
+    fn persist_claude_hook_config(&mut self) {
+        let files: Vec<session::HookFile> = match &self.claude_hooks {
+            Some(hooks) => hooks
+                .files
+                .iter()
+                .map(|file| session::HookFile {
+                    path: file.path.display().to_string(),
+                    source: file.source.label().to_string(),
+                    hash: file.hash.clone(),
+                })
+                .collect(),
+            None => return,
+        };
+        if files.is_empty() {
+            return;
+        }
+        if let Some(log) = &mut self.session {
+            let _ = log.append(&Record::Hooks { files, recorded_at: session::now() });
+        }
+    }
+
     /// Run the `SessionStart` (once per session) and `UserPromptSubmit` hooks
     /// for a fresh prompt. Returns either any additional context to attach to
     /// the prompt, or a rejection reason.
@@ -763,10 +793,11 @@ impl Agent {
         }
         let run_session = !self.claude_session_started;
         self.claude_session_started = true;
+        let trigger = if self.claude_session_resumed { "resume" } else { "startup" };
         let hooks = self.claude_hooks.as_ref().expect("checked above");
         let mut contexts = Vec::new();
         if run_session {
-            let outcome = hooks.run_session_start("startup");
+            let outcome = hooks.run_session_start(trigger);
             if let Some(ctx) = outcome.context_block() {
                 contexts.push(ctx);
             }
@@ -1313,7 +1344,9 @@ impl Agent {
         self.session_id = Some(id.clone());
         self.set_spill_dir(&id);
         self.claude_session_started = false;
+        self.claude_session_resumed = false;
         self.sync_claude_hook_session();
+        self.persist_claude_hook_config();
         self.calibration = None;
         self.compact_floor = 0;
         self.history_available = false;
@@ -1410,7 +1443,9 @@ impl Agent {
         self.pre_compaction_transcript = None;
         self.pre_compaction_restated = None;
         self.claude_session_started = false;
+        self.claude_session_resumed = true;
         self.sync_claude_hook_session();
+        self.persist_claude_hook_config();
         {
             // History-tool usage is per-session live state: a resumed session
             // starts fresh so `/context` and the status line report only calls
@@ -2177,6 +2212,22 @@ impl Agent {
                         if outcome.denies() {
                             pre_hook_deny =
                                 Some(outcome.block_reason.unwrap_or_else(|| "blocked by a PreToolUse hook".to_string()));
+                        } else if outcome.decision == Some(claude_hooks::Decision::Ask) {
+                            // A hook asked for confirmation (`ask`), possibly
+                            // overriding another hook's `allow`. nano has no
+                            // interactive hook-approval step in Phase 1, so fail
+                            // closed and block the call rather than letting an
+                            // unapproved tool run — matching the fail-safe stance
+                            // nano takes elsewhere for PreToolUse.
+                            pre_hook_deny = Some(
+                                outcome
+                                    .block_reason
+                                    .filter(|r| !r.trim().is_empty())
+                                    .unwrap_or_else(|| {
+                                        "a PreToolUse hook requested confirmation (ask), which nano cannot prompt for yet; blocking the call"
+                                            .to_string()
+                                    }),
+                            );
                         } else {
                             if let Some(updated) = &outcome.updated_input {
                                 effective_arguments =
@@ -2211,6 +2262,13 @@ impl Agent {
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
                 let is_memory_tool = memory::is_memory_tool(&tool_call.name) && self.memory_enabled();
+                // Whether a tool handler actually ran. The pre-dispatch
+                // rejections below (malformed input, plan-mode, policy, a
+                // PreToolUse deny) never invoke a handler, so a PostToolUse hook
+                // with side effects must not fire for them — it runs only after
+                // a real dispatch (issue #92 scopes PostToolUse to tools that
+                // ran, including ones that then errored).
+                let mut dispatched = false;
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -2235,14 +2293,19 @@ impl Agent {
                     // A PreToolUse hook denied the call (or failed closed).
                     Err(anyhow::anyhow!(reason))
                 } else if is_plan_tool {
+                    dispatched = true;
                     self.run_plan_tool(effective_call)
                 } else if is_skill_tool {
+                    dispatched = true;
                     self.skills.load(&effective_call.arguments).map(Value::String)
                 } else if is_history_tool {
+                    dispatched = true;
                     self.run_history_tool(effective_call).map(Value::String)
                 } else if is_memory_tool {
+                    dispatched = true;
                     self.run_memory_tool(effective_call).map(Value::String)
                 } else if is_outcome_tool {
+                    dispatched = true;
                     Outcome::from_args(&effective_call.arguments).map(|outcome| {
                         let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
                         reported = Some(outcome);
@@ -2250,6 +2313,7 @@ impl Agent {
                     })
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
+                    dispatched = true;
                     self.tools.execute_blocking(&effective_call.name, effective_call.arguments.clone()).await
                 };
                 let ok = result.is_ok();
@@ -2285,7 +2349,10 @@ impl Agent {
                 }
                 // Claude Code PostToolUse hooks: add context for the model, or
                 // block with feedback. Combined with any PreToolUse context.
-                if let Some(hooks) = &self.claude_hooks {
+                // Only after a handler actually ran — a blocked/rejected call
+                // (policy, plan mode, malformed input, a PreToolUse deny) never
+                // reached a tool, so its PostToolUse side effects must not fire.
+                if dispatched && let Some(hooks) = &self.claude_hooks {
                     let outcome =
                         hooks.run_post_tool_use(&tool_call.name, &effective_arguments, &result_text, &tool_call.id);
                     if let Some(ctx) = outcome.context_block() {
@@ -2326,9 +2393,21 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &result_text });
             }
             self.refresh_stats();
-            if let Some(outcome) = &reported {
+            if reported.is_some() {
+                // A reported outcome ends the turn like a tool-free answer, so it
+                // must pass the same Stop gate: a Stop hook may ask the agent to
+                // keep going (capped). If it does, clear the reported outcome —
+                // the turn is no longer complete — and continue the loop.
+                if iteration < budget
+                    && !self.control.is_cancelled()
+                    && let Some(reason) = self.run_claude_stop_hooks()
+                {
+                    self.push(Message::user(&reminders::wrap(&reason)))?;
+                    last_content = reported.take().map(|outcome| outcome.response()).unwrap_or_default();
+                    continue;
+                }
                 // Every call in the batch has its result; the summary is the answer.
-                let response = outcome.response();
+                let response = reported.as_ref().expect("checked").response();
                 self.push(Message::assistant(&response))?;
                 self.emit_assistant_text(&response);
                 final_response = Some(response);

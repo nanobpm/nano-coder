@@ -335,6 +335,8 @@ impl Trajectory {
                 }
                 // The plan is surfaced by `/plan`; it is not a ledger row.
                 Record::Plan { .. } => {}
+                // Audit metadata, not a conversation row.
+                Record::Hooks { .. } => {}
             }
         }
         flush(&mut turns, current);

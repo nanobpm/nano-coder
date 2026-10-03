@@ -396,16 +396,26 @@ impl HookManager {
     }
 
     /// Hooks for `event` whose matcher and `if` rule select this call. For
-    /// non-tool events, `tool`/`args` are empty and only the matcher (usually
-    /// absent) applies.
-    fn selected(&self, event: Event, tool: Option<(&str, &str, &Value)>) -> Vec<&Hook> {
+    /// tool events, `tool` carries the Claude/nano names and arguments. For
+    /// `SessionStart`, `trigger` carries the source (`startup`/`resume`) that
+    /// the matcher (`startup`, `resume`, `*`, or an alternation) is tested
+    /// against. For the remaining non-tool events (`UserPromptSubmit`, `Stop`)
+    /// Claude ignores the matcher, so every hook for the event is selected.
+    fn selected(&self, event: Event, tool: Option<(&str, &str, &Value)>, trigger: Option<&str>) -> Vec<&Hook> {
         self.hooks
             .iter()
             .filter(|hook| hook.event == event)
             .filter(|hook| match tool {
                 Some((claude_name, nano_name, args)) => matcher_selects(hook.matcher.as_deref(), claude_name, nano_name)
                     && if_selects(hook.if_rule.as_deref(), nano_name, args),
-                None => hook.matcher.is_none(),
+                None => match trigger {
+                    // `SessionStart` groups select on their source trigger, so a
+                    // `startup`/`resume`/`*` matcher runs rather than being
+                    // excluded for having any matcher at all.
+                    Some(source) => source_matcher_selects(hook.matcher.as_deref(), source),
+                    // `UserPromptSubmit`/`Stop`: the matcher does not apply.
+                    None => true,
+                },
             })
             .collect()
     }
@@ -422,7 +432,7 @@ impl HookManager {
 
     /// Run the `SessionStart` hooks; returns context to add to the session.
     pub fn run_session_start(&self, trigger: &str) -> Outcome {
-        let hooks = self.selected(Event::SessionStart, None);
+        let hooks = self.selected(Event::SessionStart, None, Some(trigger));
         let mut input = self.common_input(Event::SessionStart);
         input.insert("source".into(), json!(trigger));
         self.run_all(&hooks, Event::SessionStart, &Value::Object(input))
@@ -430,7 +440,7 @@ impl HookManager {
 
     /// Run the `UserPromptSubmit` hooks; a block rejects the prompt.
     pub fn run_user_prompt_submit(&self, prompt: &str) -> Outcome {
-        let hooks = self.selected(Event::UserPromptSubmit, None);
+        let hooks = self.selected(Event::UserPromptSubmit, None, None);
         let mut input = self.common_input(Event::UserPromptSubmit);
         input.insert("prompt".into(), json!(prompt));
         self.run_all(&hooks, Event::UserPromptSubmit, &Value::Object(input))
@@ -440,7 +450,7 @@ impl HookManager {
     /// has allowed the call, before it runs).
     pub fn run_pre_tool_use(&self, nano_tool: &str, args: &Value, tool_use_id: &str) -> Outcome {
         let claude_name = claude_tool_name(nano_tool);
-        let hooks = self.selected(Event::PreToolUse, Some((&claude_name, nano_tool, args)));
+        let hooks = self.selected(Event::PreToolUse, Some((&claude_name, nano_tool, args)), None);
         let mut input = self.common_input(Event::PreToolUse);
         input.insert("tool_name".into(), json!(claude_name));
         input.insert("tool_input".into(), tool_input_for(nano_tool, args));
@@ -451,7 +461,7 @@ impl HookManager {
     /// Run the `PostToolUse` hooks after `nano_tool` ran.
     pub fn run_post_tool_use(&self, nano_tool: &str, args: &Value, response: &str, tool_use_id: &str) -> Outcome {
         let claude_name = claude_tool_name(nano_tool);
-        let hooks = self.selected(Event::PostToolUse, Some((&claude_name, nano_tool, args)));
+        let hooks = self.selected(Event::PostToolUse, Some((&claude_name, nano_tool, args)), None);
         let mut input = self.common_input(Event::PostToolUse);
         input.insert("tool_name".into(), json!(claude_name));
         input.insert("tool_input".into(), tool_input_for(nano_tool, args));
@@ -463,7 +473,7 @@ impl HookManager {
     /// Run the `Stop` hooks when the agent is about to end its turn. A block
     /// keeps it going with the reason as the next message.
     pub fn run_stop(&self, stop_hook_active: bool) -> Outcome {
-        let hooks = self.selected(Event::Stop, None);
+        let hooks = self.selected(Event::Stop, None, None);
         let mut input = self.common_input(Event::Stop);
         input.insert("stop_hook_active".into(), json!(stop_hook_active));
         self.run_all(&hooks, Event::Stop, &Value::Object(input))
@@ -502,6 +512,26 @@ fn matcher_selects(matcher: Option<&str>, claude_name: &str, nano_name: &str) ->
     // Fall back to a full-match regex (Claude supports regex matchers).
     if let Ok(re) = regex::Regex::new(&format!("^(?:{matcher})$")) {
         return re.is_match(claude_name) || re.is_match(nano_name);
+    }
+    false
+}
+
+/// A `SessionStart` matcher selects on the session's source trigger
+/// (`startup`/`resume`). An absent, empty or `*` matcher matches every source;
+/// otherwise the source is tested against the matcher's alternation or a
+/// full-match regex, so a group keyed `startup`, `resume` or `startup|resume`
+/// runs for the matching source instead of being excluded for having a matcher.
+fn source_matcher_selects(matcher: Option<&str>, source: &str) -> bool {
+    let Some(matcher) = matcher else { return true };
+    let matcher = matcher.trim();
+    if matcher.is_empty() || matcher == "*" {
+        return true;
+    }
+    if matcher.split('|').any(|pat| pat.trim() == source) {
+        return true;
+    }
+    if let Ok(re) = regex::Regex::new(&format!("^(?:{matcher})$")) {
+        return re.is_match(source);
     }
     false
 }
@@ -647,10 +677,17 @@ fn execute(
     // outside it.
     let use_sandbox = sandbox.active() && hook.source.is_project();
 
-    let mut command = if use_sandbox {
+    // The sandbox wrapper (`Sandboxed`) owns the Linux ruleset fd that must
+    // stay open until the child is spawned. Hold it in `sandboxed` and *borrow*
+    // its command rather than moving the command out (which would drop the
+    // wrapper, and with it the ruleset, before `spawn()` — leaving a project
+    // hook unsandboxed or failing to start). Mirrors `src/bash.rs`.
+    let mut sandboxed: Option<sandbox::Sandboxed> = None;
+    let mut plain: Command;
+    let command: &mut Command = if use_sandbox {
         let script = sandbox_script(hook, &dir);
         match sandbox::command(sandbox, "bash", &script, project_dir) {
-            Ok(sandboxed) => sandboxed.command,
+            Ok(wrapped) => &mut sandboxed.insert(wrapped).command,
             Err(e) => {
                 // The sandbox fails closed: a hook that can't be sandboxed
                 // counts as failed (so a PreToolUse hook blocks the call).
@@ -665,16 +702,16 @@ fn execute(
         }
     } else if let Some(args) = &hook.args {
         // Exec form: run the program directly, expanding ${CLAUDE_PROJECT_DIR}.
-        let mut command = Command::new(expand_project_dir(&hook.command, &dir));
+        plain = Command::new(expand_project_dir(&hook.command, &dir));
         for arg in args {
-            command.arg(expand_project_dir(arg, &dir));
+            plain.arg(expand_project_dir(arg, &dir));
         }
-        command
+        &mut plain
     } else {
         // Shell form: the shell expands $CLAUDE_PROJECT_DIR itself.
-        let mut command = Command::new("bash");
-        command.arg("-c").arg(&hook.command);
-        command
+        plain = Command::new("bash");
+        plain.arg("-c").arg(&hook.command);
+        &mut plain
     };
 
     command
@@ -702,11 +739,23 @@ fn execute(
             };
         }
     };
+    // The child has been spawned; the ruleset fd can now be released.
+    drop(sandboxed);
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input_json.as_bytes());
-        // Drop closes the pipe so the hook sees EOF.
-    }
+    // Write stdin on its own thread while `wait_with_output` drains stdout and
+    // stderr. A hook that does not read stdin (or a large prompt/Write payload)
+    // would otherwise fill the pipe and block this write forever — before the
+    // timeout thread below is even started, and with no one draining stdout —
+    // deadlocking the call. Killing the process group on timeout closes the
+    // read end, so a stuck write unblocks with EPIPE and the writer joins.
+    let stdin = child.stdin.take();
+    let input_bytes = input_json.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&input_bytes);
+            // Drop closes the pipe so the hook sees EOF.
+        }
+    });
 
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -717,12 +766,14 @@ fn execute(
     let output = match rx.recv_timeout(timeout) {
         Ok(result) => {
             let _ = handle.join();
+            let _ = writer.join();
             result.ok()
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             kill_process_group(pid);
             let _ = rx.recv();
             let _ = handle.join();
+            let _ = writer.join();
             return ProcessRun {
                 exit: None,
                 timed_out: true,
@@ -733,6 +784,7 @@ fn execute(
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             let _ = handle.join();
+            let _ = writer.join();
             None
         }
     };
@@ -1112,6 +1164,55 @@ mod tests {
         let manager = manager_with(vec![hook], dir.path());
         let outcome = manager.run_post_tool_use("bash", &json!({"command": "ls"}), "ok", "t1");
         assert!(!outcome.blocked, "a crashing PostToolUse hook does not block");
+    }
+
+    #[test]
+    fn session_start_matcher_selects_on_source_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        // A SessionStart hook keyed to `startup` must run on startup and be
+        // skipped on resume; a `resume`-keyed one the other way around; a
+        // matcher-less one must run for every source.
+        let mut startup_hook = command_hook(Event::SessionStart, "echo from-startup");
+        startup_hook.matcher = Some("startup".to_string());
+        let mut resume_hook = command_hook(Event::SessionStart, "echo from-resume");
+        resume_hook.matcher = Some("resume".to_string());
+        let always_hook = command_hook(Event::SessionStart, "echo always");
+
+        let manager = manager_with(vec![startup_hook, resume_hook, always_hook], dir.path());
+
+        let on_startup = manager.run_session_start("startup").context_block().unwrap_or_default();
+        assert!(on_startup.contains("from-startup"), "startup matcher runs on startup");
+        assert!(!on_startup.contains("from-resume"), "resume matcher skipped on startup");
+        assert!(on_startup.contains("always"), "matcher-less hook always runs");
+
+        let on_resume = manager.run_session_start("resume").context_block().unwrap_or_default();
+        assert!(on_resume.contains("from-resume"), "resume matcher runs on resume");
+        assert!(!on_resume.contains("from-startup"), "startup matcher skipped on resume");
+        assert!(on_resume.contains("always"), "matcher-less hook always runs");
+    }
+
+    #[test]
+    fn source_matcher_alternation_and_wildcard() {
+        assert!(source_matcher_selects(Some("startup|resume"), "startup"));
+        assert!(source_matcher_selects(Some("startup|resume"), "resume"));
+        assert!(!source_matcher_selects(Some("startup|resume"), "clear"));
+        assert!(source_matcher_selects(Some("*"), "clear"));
+        assert!(source_matcher_selects(None, "clear"));
+        assert!(!source_matcher_selects(Some("resume"), "startup"));
+    }
+
+    #[test]
+    fn hook_that_ignores_large_stdin_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hook that never reads stdin. With a large payload this would fill
+        // the OS pipe buffer and block the writer forever if stdin were written
+        // on the calling thread; the dedicated writer thread (and EOF on exit)
+        // must let it complete. Use a big input to exceed the pipe buffer.
+        let hook = command_hook(Event::PostToolUse, "echo done");
+        let manager = manager_with(vec![hook], dir.path());
+        let big = "x".repeat(1_000_000);
+        let outcome = manager.run_post_tool_use("bash", &json!({"command": big}), "ok", "t1");
+        assert!(!outcome.blocked, "a hook that ignores a large stdin still completes");
     }
 
     #[test]
