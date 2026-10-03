@@ -383,18 +383,35 @@ fn extra_body_keys(wire: Wire) -> &'static [&'static str] {
 /// temperature for anything else (an enabled/adaptive control, a raw budget)
 /// avoids sending a custom temperature into a thinking request, which Anthropic
 /// rejects.
-fn anthropic_extra_body_thinks(value: &toml::Value) -> bool {
+fn anthropic_extra_body_thinks(key: &str, value: &toml::Value) -> Option<bool> {
     fn is_off(s: &str) -> bool {
         matches!(s.trim().to_ascii_lowercase().as_str(), "disabled" | "off" | "none" | "false")
     }
-    match value {
-        toml::Value::Boolean(b) => *b,
-        toml::Value::String(s) => !is_off(s),
+    fn enables(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Boolean(b) => *b,
+            toml::Value::String(s) => !is_off(s),
+            _ => true,
+        }
+    }
+    // `output_config` is an Anthropic thinking control only through its
+    // `effort` field; other fields (e.g. `format` for structured outputs) are
+    // unrelated and must not affect the thinking/temperature state. `None`
+    // here means "not a thinking control", so the caller keeps looking.
+    if key == "output_config" {
+        return match value {
+            toml::Value::Table(t) => t.get("effort").map(enables),
+            _ => None,
+        };
+    }
+    // The `thinking` control: a bare boolean/string, or a table whose `type`
+    // or `effort` may explicitly disable it.
+    Some(match value {
         toml::Value::Table(t) => {
             !["type", "effort"].iter().any(|k| t.get(*k).and_then(|v| v.as_str()).is_some_and(is_off))
         }
-        _ => true,
-    }
+        other => enables(other),
+    })
 }
 
 /// The generated thinking control for `effective` on `wire`/`anthropic`/`format`,
@@ -686,6 +703,7 @@ pub fn resolve_with(
     // with a `thinking = "none"` setting, which parses to `Thinking::Off`.
     let mut invalid_levels: Vec<String> = Vec::new();
     let mut alias_levels: Vec<String> = Vec::new();
+    let mut reserved_levels: Vec<String> = Vec::new();
     let levels: Vec<String> = model_settings
         .and_then(|m| m.thinking_levels.clone())
         .or_else(|| provider.thinking_levels.clone())
@@ -698,6 +716,16 @@ pub fn resolve_with(
                     // (e.g. "very high") is no usable level.
                     Ok(Thinking::Off) if l != "off" => {
                         alias_levels.push(l);
+                        None
+                    }
+                    // "default"/"auto"/"model default" all parse to the model
+                    // default, which is always offered separately (never a
+                    // selectable level). Keeping one yields a nonempty profile
+                    // with no `off`, which on Anthropic wrongly locks the
+                    // temperature (`model_always_thinks`) and shows a duplicate
+                    // default in `/settings` — reject them like the off aliases.
+                    Ok(Thinking::Default) => {
+                        reserved_levels.push(l);
                         None
                     }
                     Ok(_) => Some(l),
@@ -803,12 +831,11 @@ pub fn resolve_with(
         provider.extra_body.as_ref().and_then(|body| {
             extra_body_keys(wire)
                 .iter()
-                .find(|k| {
+                .filter(|k| {
                     body.contains_key(**k)
                         && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k))
                 })
-                .and_then(|k| body.get(*k))
-                .map(anthropic_extra_body_thinks)
+                .find_map(|k| body.get(*k).and_then(|v| anthropic_extra_body_thinks(k, v)))
         })
     } else {
         None
@@ -852,6 +879,12 @@ pub fn resolve_with(
         notices.push(format!(
             "ignoring thinking_levels {} for {model}: an off alias is not a level — use \"off\"",
             alias_levels.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !reserved_levels.is_empty() {
+        notices.push(format!(
+            "ignoring thinking_levels {} for {model}: the model default is always available and is not a selectable level",
+            reserved_levels.iter().map(|l| format!("{l:?}")).collect::<Vec<_>>().join(", ")
         ));
     }
     if !notices.is_empty() {
@@ -1125,6 +1158,59 @@ mod tests {
         let warning = r.warning.unwrap();
         assert!(warning.contains("an off alias is not a level"), "{warning}");
         assert!(warning.contains("\"disabled\""), "{warning}");
+    }
+
+    #[test]
+    fn default_aliases_in_configured_levels_are_rejected() {
+        // "default"/"auto"/"model default" all parse to `Thinking::Default`,
+        // which is always offered separately and is never a selectable level.
+        // A list keeping one would be a nonempty profile with no `off`, which
+        // on Anthropic reads as an always-thinking model (and locks a custom
+        // temperature) and shows a duplicate default in `/settings`.
+        let kind = Some(ProviderKind::Openai);
+        for alias in ["default", "auto", "Model Default", " DEFAULT "] {
+            let p = provider(&format!(r#"thinking_levels = ["{alias}", "low"]"#));
+            let r = resolve(&Thinking::Default, Some(&level("low")), kind, &p, "x");
+            assert_eq!(r.levels, ["low"], "{alias}: the reserved alias is dropped");
+            let warning = r.warning.unwrap();
+            assert!(warning.contains("the model default is always available"), "{alias}: {warning}");
+        }
+        // A list left with only reserved aliases is empty, so an Anthropic
+        // model is not treated as always-thinking and a custom temperature
+        // stays valid — the pre-fix nonempty no-`off` profile locked it.
+        let p = provider(r#"thinking_levels = ["default"]"#);
+        let r = resolve(&Thinking::Default, None, Some(ProviderKind::Anthropic), &p, "some-claude");
+        assert_eq!(r.levels, Vec::<String>::new());
+        assert!(!r.always_anthropic_thinking(), "an empty profile is not always-thinking");
+    }
+
+    #[test]
+    fn unrelated_output_config_fields_do_not_enable_thinking() {
+        // `output_config` is an Anthropic thinking control only through its
+        // `effort` field. `output_config = { format = ... }` is structured
+        // output configuration, not a thinking control, so it must not lock a
+        // custom temperature on an off-capable model.
+        let anthropic = Some(ProviderKind::Anthropic);
+        let p = provider(r#"extra_body = { output_config = { format = "json" } }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
+        assert_eq!(r.extra_body_thinking_on, None, "a format-only output_config is not a thinking control");
+        assert!(!r.anthropic_thinking_on(), "it does not lock the temperature");
+        assert!(!r.always_anthropic_thinking());
+        // An `effort` field still enables or disables thinking as before, even
+        // alongside an unrelated `format`.
+        let p = provider(r#"extra_body = { output_config = { effort = "high", format = "json" } }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
+        assert_eq!(r.extra_body_thinking_on, Some(true));
+        assert!(r.anthropic_thinking_on(), "an effort field still locks the temperature");
+        let p = provider(r#"extra_body = { output_config = { effort = "none" } }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
+        assert_eq!(r.extra_body_thinking_on, Some(false), "an off effort disables thinking");
+        assert!(!r.anthropic_thinking_on());
+        // A `thinking` control is still found past a non-thinking output_config.
+        let p = provider(r#"extra_body = { output_config = { format = "json" }, thinking = true }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
+        assert_eq!(r.extra_body_thinking_on, Some(true), "the thinking control still enables thinking");
+        assert!(r.anthropic_thinking_on());
     }
 
     #[test]
