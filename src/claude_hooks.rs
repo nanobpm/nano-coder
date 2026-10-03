@@ -25,6 +25,11 @@ use crate::sandbox::{self, SandboxConfig};
 
 /// Per-field cap on hook output, matching Claude Code.
 const FIELD_CAP: usize = 10_000;
+/// Cap on the raw stdout/stderr a hook may emit before the result is treated as
+/// a failure. Generous (well above `FIELD_CAP`, so legitimately large but valid
+/// JSON still parses) yet bounded, so a noisy hook cannot exhaust the agent's
+/// memory while it runs.
+const OUTPUT_CAP: usize = 1_000_000;
 /// Default per-hook timeout when none is given, in seconds (Claude's default).
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Blocking `Stop` hooks are capped per turn to avoid loops.
@@ -235,7 +240,22 @@ impl HookManager {
     }
 
     fn ingest_file(&mut self, path: &Path, source: Source) {
-        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // A missing file is normal (most settings files are optional); say
+            // nothing. Any *other* read failure (permissions, invalid UTF-8, …)
+            // means a present file's hooks silently never load, so report it as
+            // a skipped entry — as the parser already does for invalid JSON.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.skipped.push(Skipped {
+                    event_name: path.display().to_string(),
+                    reason: format!("could not read settings file: {e}"),
+                    source,
+                });
+                return;
+            }
+        };
         let hash = content_hash(&text);
         let settings: SettingsFile = match serde_json::from_str(&text) {
             Ok(settings) => settings,
@@ -300,16 +320,22 @@ impl HookManager {
         }
     }
 
-    /// Drop duplicate handlers (same event, matcher and command/args), keeping
-    /// the first — as Claude Code does.
+    /// Drop duplicate handlers (same event, matcher, `if` rule and
+    /// command/args), keeping the first — as Claude Code does. The `if` rule is
+    /// part of the identity: two entries with the same command and matcher but
+    /// different filters (e.g. `Bash(git push *)` vs `Bash(git commit *)`) are
+    /// distinct, and collapsing them would drop the calls only the second
+    /// filter matches. `args` is kept optional: `None` means shell execution
+    /// while `Some([])` means direct execution, so they must not compare equal.
     fn dedup(&mut self) {
         let mut seen = std::collections::HashSet::new();
         self.hooks.retain(|hook| {
             let key = (
                 hook.event.claude_name(),
                 hook.matcher.clone().unwrap_or_default(),
+                hook.if_rule.clone().unwrap_or_default(),
                 hook.command.clone(),
-                hook.args.clone().unwrap_or_default().join("\u{0}"),
+                hook.args.as_ref().map(|args| args.join("\u{0}")),
             );
             seen.insert(key)
         });
@@ -384,12 +410,7 @@ impl HookManager {
         if !self.files.is_empty() {
             out.push_str("Loaded from:\n");
             for file in &self.files {
-                out.push_str(&format!(
-                    "  [{}] {} ({})\n",
-                    file.source.label(),
-                    file.path.display(),
-                    file.hash
-                ));
+                out.push_str(&format!("  [{}] {} ({})\n", file.source.label(), file.path.display(), file.hash));
             }
         }
         out
@@ -406,8 +427,10 @@ impl HookManager {
             .iter()
             .filter(|hook| hook.event == event)
             .filter(|hook| match tool {
-                Some((claude_name, nano_name, args)) => matcher_selects(hook.matcher.as_deref(), claude_name, nano_name)
-                    && if_selects(hook.if_rule.as_deref(), nano_name, args),
+                Some((claude_name, nano_name, args)) => {
+                    matcher_selects(hook.matcher.as_deref(), claude_name, nano_name)
+                        && if_selects(hook.if_rule.as_deref(), nano_name, args)
+                }
                 None => match trigger {
                     // `SessionStart` groups select on their source trigger, so a
                     // `startup`/`resume`/`*` matcher runs rather than being
@@ -424,7 +447,13 @@ impl HookManager {
         let mut map = serde_json::Map::new();
         map.insert("session_id".into(), json!(self.session_id));
         map.insert("transcript_path".into(), json!(self.transcript_path));
-        map.insert("cwd".into(), json!(self.project_dir.display().to_string()));
+        // Report the directory tools actually resolve relative paths against
+        // (the process working directory), not the repository root: a hook that
+        // combines `cwd` with a tool's relative `file_path` must land on the
+        // file the tool touched. `CLAUDE_PROJECT_DIR` still carries the project
+        // root, so project-level hooks keep their anchor.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.project_dir.clone());
+        map.insert("cwd".into(), json!(cwd.display().to_string()));
         map.insert("permission_mode".into(), json!(self.permission_mode));
         map.insert("hook_event_name".into(), json!(event.claude_name()));
         map
@@ -742,12 +771,10 @@ fn execute(
     // The child has been spawned; the ruleset fd can now be released.
     drop(sandboxed);
 
-    // Write stdin on its own thread while `wait_with_output` drains stdout and
-    // stderr. A hook that does not read stdin (or a large prompt/Write payload)
-    // would otherwise fill the pipe and block this write forever — before the
-    // timeout thread below is even started, and with no one draining stdout —
-    // deadlocking the call. Killing the process group on timeout closes the
-    // read end, so a stuck write unblocks with EPIPE and the writer joins.
+    // Write stdin on its own thread so a hook that does not read stdin (or a
+    // large prompt/Write payload) cannot fill the pipe and block the write
+    // forever. Killing the process group on timeout closes the read end, so a
+    // stuck write unblocks with EPIPE and the writer joins.
     let stdin = child.stdin.take();
     let input_bytes = input_json.as_bytes().to_vec();
     let writer = std::thread::spawn(move || {
@@ -757,53 +784,154 @@ fn execute(
         }
     });
 
+    // Drain stdout and stderr concurrently into *bounded* buffers. A noisy hook
+    // can otherwise exhaust the agent's memory during its timeout, because
+    // `wait_with_output` accumulates both streams unbounded before any field cap
+    // is applied. Each reader stops storing past `OUTPUT_CAP` but keeps draining
+    // (so the child never blocks on a full pipe); an over-cap stream is flagged
+    // so the result fails closed rather than being parsed as truncated JSON.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_reader = std::thread::spawn(move || drain_bounded(stdout));
+    let err_reader = std::thread::spawn(move || drain_bounded(stderr));
+
+    // Wait for the child on its own thread so the timeout below can fire while
+    // a detached descendant still holds the pipes open.
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+    let wait_handle = std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
     });
 
-    let output = match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            let _ = handle.join();
-            let _ = writer.join();
-            result.ok()
-        }
+    // `recv()`/`join()` have no deadline, and a detached descendant that
+    // inherits the pipes can keep them (and the readers/writer) blocked after
+    // the group is killed. Bound every wait on the same timeout plus a grace
+    // period for the kill to take effect, so a stuck descendant cannot wedge
+    // the agent.
+    let deadline = std::time::Instant::now() + timeout;
+    let grace = Duration::from_secs(2);
+    let wait_result = match rx.recv_timeout(timeout) {
+        Ok(result) => Some(result.ok()),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             kill_process_group(pid);
-            let _ = rx.recv();
-            let _ = handle.join();
-            let _ = writer.join();
-            return ProcessRun {
-                exit: None,
-                timed_out: true,
-                launch_error: None,
-                stdout: String::new(),
-                stderr: String::new(),
-            };
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = handle.join();
-            let _ = writer.join();
+            // Give the killed group a bounded grace period to reap; if a
+            // detached descendant keeps the wait blocked past that, abandon it
+            // (the thread is detached and finishes on its own once the pipes
+            // close) rather than hanging the agent.
+            let _ = rx.recv_timeout(grace);
             None
         }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
     };
+    // The wait thread is detached (not joined): on a timeout a detached
+    // descendant can keep it blocked, so it finishes on its own once the pipes
+    // close.
+    drop(wait_handle);
 
-    match output {
-        Some(output) => ProcessRun {
-            exit: output.status.code(),
-            timed_out: false,
-            launch_error: None,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        },
-        None => ProcessRun {
+    // Collect the drained streams with the same deadline awareness. The readers
+    // finish as soon as the child closes its ends (normal exit or the kill
+    // above), so these joins return promptly in the common case; bound them so
+    // a descendant holding a pipe cannot block shutdown.
+    let (out_buf, out_overflow) = join_reader(out_reader, deadline, grace);
+    let (err_buf, err_overflow) = join_reader(err_reader, deadline, grace);
+    // The stdin writer unblocks once the read end closes (kill) or the child
+    // exits; bound its join for the same reason.
+    let _ = join_thread(writer, deadline, grace);
+
+    match wait_result {
+        Some(Some(status)) => {
+            let overflow = out_overflow || err_overflow;
+            ProcessRun {
+                exit: status.code(),
+                timed_out: false,
+                // Over-cap output is untrustworthy (truncated JSON would be
+                // misparsed), so report it as a failure and fail closed.
+                launch_error: if overflow { Some(format!("hook output exceeded {} bytes", OUTPUT_CAP)) } else { None },
+                stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+                stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+            }
+        }
+        Some(None) => ProcessRun {
             exit: None,
             timed_out: false,
             launch_error: Some("hook did not complete".to_string()),
             stdout: String::new(),
             stderr: String::new(),
         },
+        None => {
+            ProcessRun { exit: None, timed_out: true, launch_error: None, stdout: String::new(), stderr: String::new() }
+        }
+    }
+}
+
+/// Read a stream to EOF, storing at most `OUTPUT_CAP` bytes. Returns the
+/// (possibly truncated) buffer and whether any bytes were dropped. Keeps
+/// draining after the cap so the child never blocks on a full pipe.
+fn drain_bounded(stream: Option<impl std::io::Read>) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut overflow = false;
+    if let Some(mut stream) = stream {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = OUTPUT_CAP.saturating_sub(buf.len());
+                    if room > 0 {
+                        buf.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                    if n > room {
+                        overflow = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    (buf, overflow)
+}
+
+/// Join a drain thread, returning its buffer; on a blown deadline return what
+/// is available (empty) rather than blocking. The thread is detached and
+/// finishes once its stream closes.
+fn join_reader(
+    handle: std::thread::JoinHandle<(Vec<u8>, bool)>,
+    deadline: std::time::Instant,
+    grace: Duration,
+) -> (Vec<u8>, bool) {
+    match join_thread(handle, deadline, grace) {
+        Some((buf, overflow)) => (buf, overflow),
+        None => (Vec::new(), false),
+    }
+}
+
+/// Join a thread with a bounded wait: poll briefly until it finishes or the
+/// deadline (plus grace) passes, then detach it if still running. Returns
+/// `None` when the thread did not finish in time.
+fn join_thread<T: Send + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    deadline: std::time::Instant,
+    grace: Duration,
+) -> Option<T> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    // Move the join onto a helper so we can bound the wait; if it times out the
+    // helper (and the not-yet-joined handle) are simply dropped/detached.
+    std::thread::spawn(move || {
+        let _ = tx.send(handle.join());
+    });
+    let limit = deadline + grace;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= limit {
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_millis(10).min(limit - now)) {
+            Ok(Ok(value)) => return Some(value),
+            Ok(Err(_)) => return None, // the thread panicked
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -1012,11 +1140,7 @@ impl Outcome {
 
     /// The combined additional context, if any, as one block.
     pub fn context_block(&self) -> Option<String> {
-        if self.context.is_empty() {
-            None
-        } else {
-            Some(self.context.join("\n\n"))
-        }
+        if self.context.is_empty() { None } else { Some(self.context.join("\n\n")) }
     }
 
     /// Whether this (tool) outcome denies the call outright.
@@ -1362,5 +1486,127 @@ mod tests {
         let manager = HookManager::load(&opts, dir.path());
         assert!(manager.is_empty());
         assert_eq!(manager.files.len(), 1, "the file is still recorded for the audit log");
+    }
+
+    #[test]
+    fn unreadable_settings_file_is_reported_not_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::write(&settings, r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#)
+            .unwrap();
+        // Make the present file unreadable: its hooks must not silently vanish.
+        let mut perms = std::fs::metadata(&settings).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&settings, perms).unwrap();
+
+        let nano = NanoHooks::new();
+        let opts = LoadOptions {
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: false,
+            nano_hooks: &nano,
+            sandbox: SandboxConfig::default(),
+        };
+        let manager = HookManager::load(&opts, dir.path());
+        // Restore permissions so the tempdir can be cleaned up.
+        let mut perms = std::fs::metadata(&settings).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&settings, perms).unwrap();
+
+        assert!(manager.is_empty(), "the unreadable file's hooks do not load");
+        assert_eq!(manager.skipped.len(), 1, "the read failure is reported as a skipped entry");
+        assert!(manager.skipped[0].reason.contains("could not read settings file"), "{}", manager.skipped[0].reason);
+    }
+
+    #[test]
+    fn missing_settings_file_is_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let nano = NanoHooks::new();
+        let opts = LoadOptions {
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: false,
+            nano_hooks: &nano,
+            sandbox: SandboxConfig::default(),
+        };
+        let manager = HookManager::load(&opts, dir.path());
+        assert!(manager.is_empty());
+        assert!(manager.skipped.is_empty(), "an absent optional file is not reported");
+    }
+
+    #[test]
+    fn dedup_keeps_entries_with_distinct_if_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same event, matcher and command, but different `if` filters: these are
+        // distinct handlers and must not collapse to the first.
+        let mut push = command_hook(Event::PreToolUse, "echo hi");
+        push.matcher = Some("Bash".to_string());
+        push.if_rule = Some("Bash(git push *)".to_string());
+        let mut commit = command_hook(Event::PreToolUse, "echo hi");
+        commit.matcher = Some("Bash".to_string());
+        commit.if_rule = Some("Bash(git commit *)".to_string());
+        let mut no_rule = command_hook(Event::PreToolUse, "echo hi");
+        no_rule.matcher = Some("Bash".to_string());
+        // An exact duplicate of `push` (same if_rule) must still be dropped.
+        let dup_push = push.clone();
+
+        let mut manager = manager_with(vec![push, commit, no_rule, dup_push], dir.path());
+        manager.dedup();
+        assert_eq!(manager.hooks().len(), 3, "distinct if_rules survive; only the exact duplicate is dropped");
+    }
+
+    #[test]
+    fn dedup_distinguishes_shell_from_direct_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        // `args: None` (shell execution) and `args: Some([])` (direct execution)
+        // are different identities and must not collapse.
+        let shell = command_hook(Event::PreToolUse, "echo hi");
+        let mut direct = command_hook(Event::PreToolUse, "echo hi");
+        direct.args = Some(Vec::new());
+        let mut manager = manager_with(vec![shell, direct], dir.path());
+        manager.dedup();
+        assert_eq!(manager.hooks().len(), 2, "shell form and empty-args exec form are distinct");
+    }
+
+    #[test]
+    fn over_cap_hook_output_fails_closed_for_pre_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hook that floods stdout past OUTPUT_CAP must not have its truncated
+        // output misparsed as a decision; for PreToolUse it fails closed.
+        let hook = command_hook(Event::PreToolUse, "head -c 2000000 /dev/zero | tr '\\0' 'a'");
+        let manager = manager_with(vec![hook], dir.path());
+        let outcome = manager.run_pre_tool_use("bash", &json!({"command": "ls"}), "t1");
+        assert!(outcome.denies(), "over-cap output is a failure, and PreToolUse fails closed");
+    }
+
+    #[test]
+    fn over_cap_hook_output_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // A noisy non-PreToolUse hook is drained to a bounded buffer rather than
+        // exhausting memory; the run completes (non-blocking) without the agent
+        // holding the full stream.
+        let hook = command_hook(Event::PostToolUse, "head -c 5000000 /dev/zero | tr '\\0' 'b'");
+        let manager = manager_with(vec![hook], dir.path());
+        let outcome = manager.run_post_tool_use("bash", &json!({"command": "ls"}), "ok", "t1");
+        assert!(!outcome.blocked, "a noisy PostToolUse hook does not block");
+    }
+
+    #[test]
+    fn detached_descendant_does_not_hang_past_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hook that spawns a detached descendant inheriting its pipes, then
+        // exits. The descendant survives the group kill and holds the pipes
+        // open; the drain/wait must still finish within the timeout + grace
+        // rather than hanging the agent.
+        let hook = command_hook(Event::PreToolUse, "setsid sleep 30 & exit 0");
+        let mut hook = hook;
+        hook.timeout = Duration::from_millis(300);
+        let manager = manager_with(vec![hook], dir.path());
+        let start = std::time::Instant::now();
+        let _ = manager.run_pre_tool_use("bash", &json!({"command": "ls"}), "t1");
+        assert!(start.elapsed() < Duration::from_secs(15), "a detached descendant cannot wedge the hook runner");
     }
 }

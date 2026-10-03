@@ -7,8 +7,8 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-use crate::config::{CompactionMode, Config};
 use crate::claude_hooks;
+use crate::config::{CompactionMode, Config};
 use crate::context::{self, Activity, SharedStats};
 use crate::goal::{self, Outcome};
 use crate::history;
@@ -784,6 +784,20 @@ impl Agent {
         }
     }
 
+    /// Run the once-per-session `SessionStart` hooks if they have not run yet.
+    /// Returns any context to attach. Separate from `UserPromptSubmit` so the
+    /// resume path (which must not re-validate an already-accepted prompt) can
+    /// still deliver `SessionStart` context when a restored session continues.
+    fn run_claude_session_start(&mut self) -> Option<String> {
+        if self.claude_hooks.is_none() || self.claude_session_started {
+            return None;
+        }
+        self.claude_session_started = true;
+        let trigger = if self.claude_session_resumed { "resume" } else { "startup" };
+        let outcome = self.claude_hooks.as_ref().expect("checked above").run_session_start(trigger);
+        outcome.context_block()
+    }
+
     /// Run the `SessionStart` (once per session) and `UserPromptSubmit` hooks
     /// for a fresh prompt. Returns either any additional context to attach to
     /// the prompt, or a rejection reason.
@@ -791,25 +805,22 @@ impl Agent {
         if self.claude_hooks.is_none() {
             return ClaudePromptHook::Proceed(None);
         }
-        let run_session = !self.claude_session_started;
-        self.claude_session_started = true;
-        let trigger = if self.claude_session_resumed { "resume" } else { "startup" };
-        let hooks = self.claude_hooks.as_ref().expect("checked above");
         let mut contexts = Vec::new();
-        if run_session {
-            let outcome = hooks.run_session_start(trigger);
-            if let Some(ctx) = outcome.context_block() {
-                contexts.push(ctx);
-            }
+        if let Some(ctx) = self.run_claude_session_start() {
+            contexts.push(ctx);
         }
-        let outcome = hooks.run_user_prompt_submit(user_input);
+        let outcome = self.claude_hooks.as_ref().expect("checked above").run_user_prompt_submit(user_input);
         if outcome.blocked {
             return ClaudePromptHook::Reject(outcome.block_reason.unwrap_or_default());
         }
         if let Some(ctx) = outcome.context_block() {
             contexts.push(ctx);
         }
-        if contexts.is_empty() { ClaudePromptHook::Proceed(None) } else { ClaudePromptHook::Proceed(Some(contexts.join("\n\n"))) }
+        if contexts.is_empty() {
+            ClaudePromptHook::Proceed(None)
+        } else {
+            ClaudePromptHook::Proceed(Some(contexts.join("\n\n")))
+        }
     }
 
     /// Run the `Stop` hooks when the turn is about to end. Returns a reason to
@@ -1817,6 +1828,14 @@ impl Agent {
 
         match resuming {
             Some(pending) => {
+                // A restored session still gets its once-per-session
+                // `SessionStart` hooks (with the `resume` trigger) before the
+                // model continues the pending turn. `UserPromptSubmit` is *not*
+                // re-run: the prompt was already accepted before the interrupt,
+                // so validating it again could reject input the user already
+                // sent. Any SessionStart context is appended as a user message
+                // so the model sees it on the continued turn.
+                let session_ctx = self.run_claude_session_start();
                 let recorded = self.conversation.get(pending.position);
                 if !recorded.is_some_and(|m| m.role == Role::User) {
                     // The input was logged but its user message was not.
@@ -1839,6 +1858,9 @@ impl Agent {
                     let response = outcome.response();
                     self.push(Message::assistant(&response))?;
                     return self.finish_turn(input_id, response, Some(outcome)).map(end_turn);
+                }
+                if let Some(ctx) = session_ctx {
+                    self.push(Message::user(&reminders::wrap(&ctx)))?;
                 }
             }
             None => {
@@ -2209,9 +2231,18 @@ impl Agent {
                             &tool_call.arguments,
                             &tool_call.id,
                         );
+                        // A hook's `additionalContext` applies whatever the
+                        // decision: a deny/ask hook can still have useful context
+                        // for the model (e.g. why the call is risky), so collect
+                        // it independently of the decision. Input rewrites, by
+                        // contrast, only apply to a call that is allowed to run.
+                        if let Some(ctx) = outcome.context_block() {
+                            hook_context.push(ctx);
+                        }
                         if outcome.denies() {
-                            pre_hook_deny =
-                                Some(outcome.block_reason.unwrap_or_else(|| "blocked by a PreToolUse hook".to_string()));
+                            pre_hook_deny = Some(
+                                outcome.block_reason.unwrap_or_else(|| "blocked by a PreToolUse hook".to_string()),
+                            );
                         } else if outcome.decision == Some(claude_hooks::Decision::Ask) {
                             // A hook asked for confirmation (`ask`), possibly
                             // overriding another hook's `allow`. nano has no
@@ -2228,14 +2259,9 @@ impl Agent {
                                             .to_string()
                                     }),
                             );
-                        } else {
-                            if let Some(updated) = &outcome.updated_input {
-                                effective_arguments =
-                                    claude_hooks::apply_updated_input(&tool_call.name, &tool_call.arguments, updated);
-                            }
-                            if let Some(ctx) = outcome.context_block() {
-                                hook_context.push(ctx);
-                            }
+                        } else if let Some(updated) = &outcome.updated_input {
+                            effective_arguments =
+                                claude_hooks::apply_updated_input(&tool_call.name, &tool_call.arguments, updated);
                         }
                     }
                 }
@@ -5230,6 +5256,67 @@ mod tests {
             Some(goal::Status::Blocked),
             "a PreToolUse rewrite of a special tool's arguments must reach its handler, not be dropped"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_context_survives_a_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        // A PreToolUse hook that both denies the call *and* returns
+        // `additionalContext`: the context must still reach the model (it often
+        // explains the risk), even though the call itself is blocked.
+        let command = "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"not allowed\",\"additionalContext\":\"ctx-explains-why\"}}'";
+        let settings = json!({
+            "hooks": { "PreToolUse": [ { "matcher": "echo", "hooks": [ { "type": "command", "command": command } ] } ] }
+        });
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), serde_json::to_string(&settings).unwrap()).unwrap();
+
+        let (mut agent, _seen) = agent(vec![tool_call("e1"), text("done")], dir.path());
+        agent.load_claude_hooks(dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("go").await.unwrap();
+        let conversation = agent.conversation();
+        let result = conversation.iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(result.is_error, "the denied call is blocked: {}", result.content);
+        assert!(result.content.contains("not allowed"), "the deny reason surfaces: {}", result.content);
+        assert!(
+            result.content.contains("ctx-explains-why"),
+            "the deny hook's additionalContext still reaches the model: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_runs_session_start_hooks_for_the_continued_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `resume`-matched SessionStart hook. A restored session that
+        // redelivers a pending input must still run its once-per-session
+        // SessionStart hooks before the model continues — without re-validating
+        // the already-accepted prompt via UserPromptSubmit.
+        let settings = json!({
+            "hooks": {
+                "SessionStart": [ { "matcher": "resume", "hooks": [ { "type": "command", "command": "echo resumed-context" } ] } ],
+                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "echo should-not-run-on-resume" } ] } ]
+            }
+        });
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.json"), serde_json::to_string(&settings).unwrap()).unwrap();
+
+        // A crashed session whose turn never finished: the input was accepted
+        // but no answer was recorded, so the resume path continues the turn.
+        crashed_session(dir.path(), "resume-start", vec![Record::Message(Message::user("run it"))]);
+        let (mut agent, seen) = agent(vec![text("continued")], dir.path());
+        agent.load_claude_hooks(dir.path());
+        agent.load_session("resume-start").unwrap();
+        let response = agent.send_input(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(response, "continued");
+        let request = &seen.lock().unwrap()[0];
+        let resumed = request.iter().any(|m| m.role == Role::User && m.content.contains("resumed-context"));
+        assert!(resumed, "SessionStart resume context is delivered on the continued turn: {request:?}");
+        let revalidated = request.iter().any(|m| m.content.contains("should-not-run-on-resume"));
+        assert!(!revalidated, "UserPromptSubmit is not re-run for an already-accepted prompt: {request:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
