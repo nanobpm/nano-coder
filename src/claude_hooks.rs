@@ -418,21 +418,31 @@ impl HookManager {
                     "  [{}] {} {} -> {}\n",
                     hook.source.label(),
                     hook.event.claude_name(),
-                    matcher,
-                    hook.command
+                    listing_field(matcher),
+                    listing_field(&hook.command)
                 ));
             }
         }
         if !self.skipped.is_empty() {
             out.push_str("Skipped:\n");
             for skipped in &self.skipped {
-                out.push_str(&format!("  [{}] {}: {}\n", skipped.source.label(), skipped.event_name, skipped.reason));
+                out.push_str(&format!(
+                    "  [{}] {}: {}\n",
+                    skipped.source.label(),
+                    listing_field(&skipped.event_name),
+                    listing_field(&skipped.reason)
+                ));
             }
         }
         if !self.files.is_empty() {
             out.push_str("Loaded from:\n");
             for file in &self.files {
-                out.push_str(&format!("  [{}] {} ({})\n", file.source.label(), file.path.display(), file.hash));
+                out.push_str(&format!(
+                    "  [{}] {} ({})\n",
+                    file.source.label(),
+                    listing_field(&file.path.display().to_string()),
+                    file.hash
+                ));
             }
         }
         out
@@ -1163,16 +1173,45 @@ fn apply_json_output(event: Event, json: Value, result: &mut HookResult) {
     }
 }
 
+/// Single-line sanitiser for config-derived text rendered in the `/hooks`
+/// listing. A hook command or matcher containing a line break would otherwise
+/// forge an apparent extra listing row (e.g. a `[user]` line inside the
+/// project section), misleading users about a hook's source. Every control
+/// character, `\n` included, becomes a visible `␍`-style marker (U+240x) so
+/// the attempt stays evident rather than silently concatenating into a
+/// convincing row, and the Unicode line/paragraph separators U+2028/U+2029
+/// that a terminal folds into an extra row become a visible ␤ marker. This is a
+/// local helper — `claude_hooks` is a library module that must not depend on the
+/// binary crate's `main::sanitize_terminal_line`.
+fn listing_field(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c == '\u{2028}' || c == '\u{2029}' {
+                '\u{2424}' // ␤: visible "newline was here" marker.
+            } else if (c as u32) <= 0x1f {
+                char::from_u32(0x2400 + c as u32).unwrap() // ␀…␟ control pictures.
+            } else if c == '\u{7f}' {
+                '\u{2421}' // ␡
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn cap(text: &str) -> String {
-    if text.len() <= FIELD_CAP {
-        text.to_string()
-    } else {
-        let mut end = FIELD_CAP;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &text[..end])
+    // The documented limit is FIELD_CAP *characters* (matching Claude Code's
+    // 10,000-character field cap), so count Unicode scalar values rather than
+    // UTF-8 bytes: 4,000 emoji are 4,000 characters (16,000 bytes) and must
+    // not be truncated.
+    let mut chars = text.chars();
+    if chars.by_ref().take(FIELD_CAP + 1).count() <= FIELD_CAP {
+        return text.to_string();
     }
+    // Over the cap: keep FIELD_CAP - 1 characters so the ellipsis stays within
+    // the character limit.
+    let kept: String = text.chars().take(FIELD_CAP - 1).collect();
+    format!("{kept}…")
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,5 +1848,61 @@ mod tests {
         // And it selects a call rather than being silently disabled.
         let selected = manager.selected(Event::PreToolUse, Some(("Bash", "bash", &json!({"command":"ls"}))), None);
         assert_eq!(selected.len(), 1, "a blank-filtered hook is not silently disabled");
+    }
+
+    #[test]
+    fn listing_neutralises_line_breaks_in_config_fields() {
+        // A project hook command/matcher containing a line break would render
+        // an apparent extra row in `/hooks` — e.g. a forged `[user]` line
+        // inside the project section — misleading users about a hook's source
+        // (Copilot finding, src/claude_hooks.rs). Config-derived fields are
+        // sanitised to a single line before rendering.
+        let dir = tempfile::tempdir().unwrap();
+        let mut hook = command_hook(Event::Stop, "evil\n  [user] Stop * -> forged");
+        hook.matcher = Some("Stop\n  [user] forged".to_string());
+        hook.source = Source::Project;
+        let mut manager = manager_with(vec![hook], dir.path());
+        manager.skipped.push(Skipped {
+            event_name: "Bad\n  [user] forged".to_string(),
+            reason: "broken\n  [user] forged".to_string(),
+            source: Source::Project,
+        });
+        manager.files.push(LoadedFile {
+            path: dir.path().join(".claude/settings.json\n  [user] forged"),
+            source: Source::Project,
+            hash: "abc123".to_string(),
+        });
+        let listing = manager.listing();
+        // No injected line break survives: every row is one the listing itself
+        // emitted, so no config field can forge an apparent `[user]` row.
+        for line in listing.lines().filter(|l| l.starts_with("  [")) {
+            assert!(line.starts_with("  [project]"), "only the real source label remains: {line}");
+        }
+        // The attempt stays visible: the newline renders as its control
+        // picture (␊) inside the field's own row instead of breaking it.
+        assert!(listing.contains("evil␊  [user] Stop * -> forged"), "content kept, flattened:\n{listing}");
+    }
+
+    #[test]
+    fn cap_counts_characters_not_bytes() {
+        // The documented limit is 10,000 *characters* (Claude Code's field
+        // cap), so multi-byte text below the character limit is kept whole
+        // even when it exceeds 10,000 UTF-8 bytes (Copilot finding,
+        // src/claude_hooks.rs).
+        let emoji = "🦀".repeat(4_000); // 4,000 chars, 16,000 bytes.
+        assert_eq!(cap(&emoji), emoji, "4,000 emoji are under the character cap");
+        // Exactly at the cap: unchanged, no ellipsis.
+        let at_cap = "a".repeat(FIELD_CAP);
+        assert_eq!(cap(&at_cap), at_cap);
+        // Over the cap: truncated at a character boundary, and the ellipsis
+        // stays within the character limit.
+        let over = "🦀".repeat(FIELD_CAP + 10);
+        let capped = cap(&over);
+        assert!(capped.ends_with('…'));
+        assert_eq!(capped.chars().count(), FIELD_CAP, "ellipsis included within the cap");
+        assert!(capped.chars().take(FIELD_CAP - 1).all(|c| c == '🦀'));
+        // Plain ASCII over the cap truncates the same way.
+        let ascii = "x".repeat(FIELD_CAP + 1);
+        assert_eq!(cap(&ascii).chars().count(), FIELD_CAP);
     }
 }
