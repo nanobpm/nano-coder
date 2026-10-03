@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 mod acp;
 mod agent;
 mod bash;
+mod claude_hooks;
 mod commands;
 mod config;
 mod context;
@@ -1561,6 +1562,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             terminal.renderer.print_block(&memory_command(agent, cmd.strip_prefix("/memory").unwrap_or("").trim()));
             Ok(true)
         }
+        "/hooks" => {
+            terminal.renderer.print_block(agent.claude_hooks_listing().trim_end());
+            Ok(true)
+        }
         _ if let Some(op) = queue_command(cmd) => {
             // List is the read-only form; the edits (remove/edit/clear) were
             // already applied mid-turn when typed then, and apply here at the
@@ -1802,6 +1807,7 @@ struct Args {
     sandbox: Option<sandbox::SandboxMode>,
     allow: Vec<String>,
     deny: Vec<String>,
+    no_hooks: bool,
     trajectory: Option<String>,
     json: bool,
     markdown: bool,
@@ -1816,7 +1822,7 @@ fn print_help() {
         "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
     );
     println!("                  [--verbosity quiet|normal|verbose|debug]");
-    println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot");
@@ -1859,6 +1865,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         sandbox: None,
         allow: Vec::new(),
         deny: Vec::new(),
+        no_hooks: false,
         trajectory: None,
         json: false,
         markdown: false,
@@ -1890,6 +1897,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             "--sandbox" => args.sandbox = Some(value("--sandbox")?.parse().map_err(|e: String| anyhow::anyhow!(e))?),
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
+            "--no-hooks" => args.no_hooks = true,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -2051,6 +2059,9 @@ async fn main() -> Result<()> {
     }
     config.permissions.allow.extend(args.allow.iter().cloned());
     config.permissions.deny.extend(args.deny.iter().cloned());
+    if args.no_hooks {
+        config.disable_hooks = true;
+    }
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
@@ -2062,6 +2073,7 @@ async fn main() -> Result<()> {
     // Register tools and hooks
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
+    agent.load_claude_hooks(std::path::Path::new(&cwd));
 
     if args.acp {
         // ACP headless mode; sessions start with session/new or session/load.
@@ -2126,6 +2138,9 @@ async fn main() -> Result<()> {
         }
         for warning in &skills.warnings {
             banner.push(format!("Skills warning: {warning}"));
+        }
+        if let Some(notice) = agent.claude_hooks_notice() {
+            banner.push(notice);
         }
         if let Some(warning) = agent.temperature().warning {
             banner.push(format!("Warning: {warning}"));

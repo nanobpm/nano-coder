@@ -235,7 +235,10 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                 "agentCapabilities": {
                     "loadSession": agent.config().persist_sessions,
                     "tools": true,
-                    "hooks": true,
+                    // Hooks are not yet exposed over ACP (they run from the
+                    // user's own Claude/nano settings, server-side); don't
+                    // advertise a client-configurable hook capability.
+                    "hooks": false,
                     "compact": true,
                     // Extension: `session/new` accepts `_meta.plan` (see new_session).
                     "_meta": { "planSeed": agent.config().plan_tools }

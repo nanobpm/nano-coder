@@ -314,6 +314,40 @@ impl Policy {
     }
 }
 
+/// Whether a permission-style rule string (e.g. `Bash(git push *)`,
+/// `Read(**/.env)`, `Edit(src/**)`) matches a tool call. Used by hook `if`
+/// filters, so a hook can target the same calls an allow/deny rule would. The
+/// rule grammar and matching are exactly those of the allow/deny rules,
+/// including testing each command of a compound shell line. Returns `false`
+/// when the rule fails to parse or does not apply to `tool`.
+pub fn rule_matches(rule_src: &str, tool: &str, args: &Value) -> bool {
+    let Ok(rule) = Rule::parse(rule_src) else { return false };
+    if !rule.applies_to(tool) {
+        return false;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    match rule.subject {
+        Subject::Command => {
+            let Some(command) = args.get("command").and_then(Value::as_str) else { return false };
+            if rule.matches(command.trim()) {
+                return true;
+            }
+            match shell::parse(command).and_then(|parsed| expand_all(&parsed)) {
+                Ok(commands) => commands.iter().any(|cmd| rule.matches(&command_text(cmd))),
+                Err(_) => false,
+            }
+        }
+        Subject::Path => {
+            let Some(path) = args.get("path").and_then(Value::as_str) else { return false };
+            let joined = cwd.join(expand_tilde(path));
+            let absolute = normalize(&joined);
+            let resolved = resolve_symlinks(&joined);
+            path_rule_matches(&rule, &absolute, &cwd) || path_rule_matches(&rule, &resolved, &cwd)
+        }
+        Subject::Arguments => rule.matches(&args.to_string()),
+    }
+}
+
 fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {
     let Some(pattern) = &rule.pattern else { return true };
     if pattern.is_match(&absolute.to_string_lossy()) {

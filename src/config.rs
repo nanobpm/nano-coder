@@ -79,6 +79,15 @@ pub struct Config {
     /// Days a memory survives without being used before it expires; `0` never
     /// expires.
     pub memory_expiry_days: u64,
+    /// Turn off all user hooks (same as `--no-hooks`). See `claude_hooks.rs`.
+    pub disable_hooks: bool,
+    /// Turn off project hooks only (`.claude/settings.json` and `.local.json`),
+    /// keeping the user's own hooks.
+    pub disable_project_hooks: bool,
+    /// Load hooks from `~/.claude/settings.json`. On by default.
+    pub claude_user_hooks: bool,
+    /// nano's own hooks, in Claude's structure: event name -> matcher groups.
+    pub hooks: crate::claude_hooks::NanoHooks,
 }
 
 /// Whether cross-session memory is available, and whether the model may write
@@ -149,6 +158,10 @@ impl Default for Config {
             memory: MemoryMode::default(),
             memory_dir: None,
             memory_expiry_days: crate::memory::DEFAULT_EXPIRY_DAYS,
+            disable_hooks: false,
+            disable_project_hooks: false,
+            claude_user_hooks: true,
+            hooks: crate::claude_hooks::NanoHooks::new(),
         }
     }
 }
