@@ -335,6 +335,27 @@ fn extra_body_keys(wire: Wire) -> &'static [&'static str] {
     }
 }
 
+/// The top-level request keys a thinking level is sent under for `wire`/`format`
+/// — the fields `drop_params` can strip after the body is built.
+///
+/// Every generated level lives under one top-level key per wire
+/// (`reasoning_effort` for Chat Completions effort, `reasoning` for Responses,
+/// `thinking` for Anthropic Messages) except an Anthropic *adaptive* effort,
+/// which also sets `output_config`. The Chat Completions chat-template formats
+/// (`chat_template_kwargs`) and an Anthropic `off` share their wire's single
+/// key. Dropping any one key removes the whole level, so these are the keys to
+/// check, not every key a variant may set.
+fn request_field_keys(wire: Wire, format: Format) -> &'static [&'static str] {
+    match wire {
+        Wire::ChatCompletions => match format {
+            Format::TemplateSwitch | Format::TemplateEffort => &["chat_template_kwargs"],
+            Format::Effort => &["reasoning_effort"],
+        },
+        Wire::Responses => &["reasoning"],
+        Wire::AnthropicMessages => &["thinking", "output_config"],
+    }
+}
+
 /// Where the thinking level in effect came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -387,6 +408,11 @@ pub struct Resolved {
     /// Status, ACP and the trajectory report no generated level then rather
     /// than `effective`, which never reaches the wire.
     pub overridden: bool,
+    /// The provider's `drop_params` strips the generated thinking field after
+    /// the body is built, so no level reaches the wire. Like `overridden`,
+    /// status, ACP and the trajectory report no generated level then rather
+    /// than `effective`.
+    pub dropped: bool,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
 }
@@ -401,6 +427,11 @@ impl Resolved {
         // Completions `think` alongside the generated `reasoning_effort`, or an
         // Anthropic `thinking` alongside the generated `output_config`).
         if self.extra_body_override.is_some() {
+            return None;
+        }
+        // `drop_params` strips the generated field after the body is built, so
+        // emitting it would report a level the wire never carries.
+        if self.dropped {
             return None;
         }
         match &self.effective {
@@ -427,7 +458,7 @@ impl Resolved {
         // `extra_body` override owns it), so our resolution is not what asks
         // Anthropic to think; the user's `extra_body` and temperature settings
         // stand on their own.
-        if self.extra_body_override.is_some() || self.wire != Wire::AnthropicMessages {
+        if self.extra_body_override.is_some() || self.dropped || self.wire != Wire::AnthropicMessages {
             return false;
         }
         match &self.effective {
@@ -447,7 +478,7 @@ impl Resolved {
     /// setting asks for, this is about the model itself: a configured level
     /// that is not sent does not stop a model that can turn thinking off.
     pub fn always_anthropic_thinking(&self) -> bool {
-        if self.extra_body_override.is_some() || self.wire != Wire::AnthropicMessages {
+        if self.extra_body_override.is_some() || self.dropped || self.wire != Wire::AnthropicMessages {
             return false;
         }
         // A model whose known levels omit `off` always thinks (Fable, Claude
@@ -465,6 +496,9 @@ impl Resolved {
         }
         if self.overridden {
             text.push_str(", overridden by extra_body");
+        }
+        if self.dropped {
+            text.push_str(", dropped by drop_params");
         }
         text
     }
@@ -612,7 +646,31 @@ pub fn resolve_with(
         ));
     }
     let overridden = extra_body_override.is_some();
-    Resolved { requested, effective, source, levels, wire, anthropic, format, extra_body_override, overridden, warning }
+    // `finish_body` removes the provider's `drop_params` keys after the body is
+    // built, so a generated thinking field under one of them never reaches the
+    // wire — yet resolution would still report and log `effective` as sent.
+    // Detect a dropped thinking field for this wire/format and report the level
+    // as unsent instead. (The `extra_body` override already suppresses the
+    // generated field, so there is nothing left to drop then.)
+    let dropped_key = if effective != Thinking::Default && !overridden {
+        provider
+            .drop_params
+            .as_ref()
+            .and_then(|dropped| {
+                request_field_keys(wire, format).iter().find(|k| dropped.iter().any(|d| d == **k))
+            })
+            .map(|key| key.to_string())
+    } else {
+        None
+    };
+    if let Some(key) = &dropped_key {
+        warning = Some(format!(
+            "the provider drops {key:?} (drop_params), so thinking {effective} is not sent; \
+             remove it from drop_params to use the thinking setting"
+        ));
+    }
+    let dropped = dropped_key.is_some();
+    Resolved { requested, effective, source, levels, wire, anthropic, format, extra_body_override, overridden, dropped, warning }
 }
 
 #[cfg(test)]
@@ -821,6 +879,59 @@ mod tests {
         assert!(r.warning.is_some());
         assert_eq!(r.request(), None, "generated thinking/output_config must be suppressed");
         assert!(!r.anthropic_thinking_on(), "a suppressed level does not lock Anthropic temperature");
+    }
+
+    #[test]
+    fn drop_params_suppresses_the_generated_field() {
+        // `finish_body` removes `drop_params` keys after the body is built, so a
+        // generated thinking field under one of them never reaches the wire.
+        // Resolution must report it as dropped, not sent.
+        // Chat Completions effort: `reasoning_effort`.
+        let p = provider("drop_params = [\"reasoning_effort\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.dropped);
+        assert_eq!(r.request(), None, "a dropped reasoning_effort is not emitted");
+        assert!(r.describe().contains("dropped by drop_params"), "{}", r.describe());
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("reasoning_effort") && warning.contains("drop_params"), "{warning}");
+
+        // Responses: `reasoning`.
+        let p = provider("drop_params = [\"reasoning\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::GithubCopilot), &p, "gpt-5.6-sol");
+        assert_eq!(r.wire, Wire::Responses);
+        assert!(r.dropped);
+        assert_eq!(r.request(), None);
+
+        // Anthropic adaptive effort sets `thinking` + `output_config`; dropping
+        // either removes the level, and a dropped level does not lock the
+        // temperature (the request sends no thinking field).
+        for key in ["thinking", "output_config"] {
+            let p = provider(&format!("drop_params = [\"{key}\"]"));
+            let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-5.5");
+            assert!(r.dropped, "{key}");
+            assert_eq!(r.request(), None, "{key}");
+            assert!(!r.anthropic_thinking_on(), "{key}: a dropped level does not lock the temperature");
+        }
+
+        // A drop_params key for another wire does not suppress the field.
+        let p = provider("drop_params = [\"reasoning\"]");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-5.5");
+        assert!(!r.dropped);
+        assert!(r.request().is_some(), "reasoning is not an Anthropic Messages field");
+
+        // Nothing is sent for `Default`, so there is no field to drop.
+        let p = provider("drop_params = [\"reasoning_effort\"]");
+        let r = resolve(&Thinking::Default, None, Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(!r.dropped);
+        assert_eq!(r.warning, None);
+
+        // An extra_body override already suppresses the generated field, so
+        // drop_params has nothing to drop and the override warning stands.
+        let p = provider("drop_params = [\"reasoning_effort\"]\nextra_body = { think = true }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Openai), &p, "gpt-5");
+        assert!(r.overridden);
+        assert!(!r.dropped);
+        assert!(r.warning.unwrap().contains("extra_body"));
     }
 
     #[test]
