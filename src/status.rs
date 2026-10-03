@@ -567,6 +567,10 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     if let Some((text, color)) = mode_segment {
         segments.push(Segment { text: text.to_string(), color: Some(color), priority: 10 });
     }
+    // The thinking level, when one is sent (none: the model decides).
+    if let Some(level) = &stats.thinking {
+        segments.push(Segment { text: format!(" think {level} "), color: Some("\x1b[38;5;147m"), priority: 4 });
+    }
     if stats.session_input_tokens + stats.session_output_tokens > 0 {
         segments.push(Segment {
             text: format!(
@@ -715,7 +719,18 @@ mod tests {
             cwd: "/tmp/project".into(),
             tokens_per_sec: None,
             mode: crate::mode::AgentMode::Normal,
+            thinking: None,
         }
+    }
+
+    #[test]
+    fn shows_the_thinking_level_only_when_one_is_sent() {
+        assert!(!visible(&render(&stats(), 160)).contains("think "));
+        let line = visible(&render(&ContextStats { thinking: Some("high".into()), ..stats() }, 160));
+        assert!(line.contains("think high"), "{line:?}");
+        // Dropped before the model and context on a narrow terminal.
+        let line = visible(&render(&ContextStats { thinking: Some("high".into()), ..stats() }, 50));
+        assert!(!line.contains("think high") && line.contains("work/llama-b"), "{line:?}");
     }
 
     #[test]

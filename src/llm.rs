@@ -352,6 +352,10 @@ pub trait LLMClient: Send + Sync {
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         None
     }
+    /// The thinking levels the endpoint reports for the current model, if any.
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        None
+    }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
     /// The provider API kind this client speaks. `None` for test doubles that

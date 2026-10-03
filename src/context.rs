@@ -125,6 +125,9 @@ pub struct ContextStats {
     pub tokens_per_sec: Option<f64>,
     /// The operating mode (normal/plan/auto), shown on the status line.
     pub mode: crate::mode::AgentMode,
+    /// The thinking level sent with requests (`high`, `off`, …); `None` when
+    /// none is sent and the model decides.
+    pub thinking: Option<String>,
 }
 
 impl ContextStats {

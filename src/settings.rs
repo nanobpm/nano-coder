@@ -25,6 +25,11 @@ struct Changes {
     provider_temperatures: BTreeSet<String>,
     /// `(provider, model)` pairs whose `temperature` changed.
     model_temperatures: BTreeSet<(String, String)>,
+    thinking: bool,
+    /// Providers whose `thinking` changed.
+    provider_thinking: BTreeSet<String>,
+    /// `(provider, model)` pairs whose `thinking` changed.
+    model_thinking: BTreeSet<(String, String)>,
     max_tokens: bool,
     max_iterations: bool,
     system_prompt: bool,
@@ -40,6 +45,9 @@ impl Changes {
             || self.temperature
             || !self.provider_temperatures.is_empty()
             || !self.model_temperatures.is_empty()
+            || self.thinking
+            || !self.provider_thinking.is_empty()
+            || !self.model_thinking.is_empty()
             || self.max_tokens
             || self.max_iterations
             || self.system_prompt
@@ -108,6 +116,7 @@ pub async fn run(
             format!("Model            {} (provider {})", config.model, agent.provider_name()),
             "Add or edit a provider".to_string(),
             format!("Temperature      {}", agent.temperature().describe()),
+            format!("Thinking         {}", agent.thinking().describe()),
             format!("Max tokens       {}", config.max_tokens),
             format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
@@ -228,6 +237,11 @@ pub async fn run(
                 }
             }
             3 => {
+                if let Err(e) = edit_thinking(agent, &mut changes) {
+                    return (notices, Err(e));
+                }
+            }
+            4 => {
                 match Input::<i32>::new()
                     .with_prompt("Max tokens")
                     .default(agent.config().max_tokens)
@@ -240,7 +254,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            4 => {
+            5 => {
                 match Input::<usize>::new()
                     .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
                     .default(agent.config().max_iterations)
@@ -253,7 +267,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            5 => {
+            6 => {
                 match Input::<String>::new()
                     .with_prompt("System prompt")
                     .default(agent.config().system_prompt.clone())
@@ -277,13 +291,13 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            6 => {
+            7 => {
                 match edit_context(agent) {
                     Ok(()) => changes.compaction = true,
                     Err(e) => return (notices, Err(e)),
                 }
             }
-            7 => {
+            8 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
@@ -299,7 +313,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            8 => {
+            9 => {
                 let modes = crate::frame::RendererMode::ALL;
                 let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
                 let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
@@ -321,7 +335,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
+            10 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
             // `Done` and Esc share the one completion path (`finish!`), so both
             // offer to save when `changes.any()` before returning.
             _ => finish!(),
@@ -356,6 +370,9 @@ async fn switch_model(
             notices.retain(|n| !n.starts_with("Could not switch model:"));
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
             if let Some(warning) = agent.temperature().warning {
+                println!("Warning: {warning}");
+            }
+            if let Some(warning) = agent.thinking().warning {
                 println!("Warning: {warning}");
             }
         }
@@ -925,6 +942,102 @@ fn edit_temperature(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
     Ok(())
 }
 
+/// A thinking level as a TOML value: `"default"`, `"off"` or the level name.
+fn thinking_item(t: &crate::thinking::Thinking) -> toml_edit::Item {
+    match t {
+        crate::thinking::Thinking::Default => toml_edit::value("default"),
+        other => toml_edit::value(other.to_string()),
+    }
+}
+
+/// Set the thinking level for the current model, its provider, or every
+/// model, picked from the levels the model supports.
+fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
+    use crate::thinking::{ORDER, Thinking};
+    // The live client's provider/model, as for the temperature.
+    let provider = agent.provider_name().to_string();
+    let model = agent.model_name().to_string();
+    let current = agent.thinking();
+    let scopes = [
+        format!("This model ({provider}/{model})"),
+        format!("All {provider} models"),
+        "All models (global)".to_string(),
+    ];
+    let Some(scope) =
+        Select::new().with_prompt("Set the thinking level for").items(&scopes).default(0).interact_opt()?
+    else {
+        return Ok(());
+    };
+    // This model: the levels it takes. A provider or every model: all named
+    // levels, each fitted to the model in use when it is sent.
+    let levels: Vec<String> = if scope == 0 && !current.levels.is_empty() {
+        current.levels.clone()
+    } else {
+        std::iter::once("off").chain(ORDER).map(String::from).collect()
+    };
+    let mut choices: Vec<(Option<Thinking>, String)> = Vec::new();
+    if scope < 2 {
+        choices.push((None, "unset (use the broader setting)".into()));
+    }
+    choices.push((Some(Thinking::Default), "default (send no level; the model decides)".into()));
+    for level in &levels {
+        let value: Thinking = level.parse().map_err(anyhow::Error::msg)?;
+        choices.push((Some(value), level.clone()));
+    }
+    let config = agent.config();
+    let entry = config.providers.get(&provider);
+    let existing = match scope {
+        0 => entry.and_then(|p| p.models.get(&model)).and_then(|m| m.thinking.clone()),
+        1 => entry.and_then(|p| p.thinking.clone()),
+        _ => Some(config.thinking.clone()),
+    };
+    let default = choices.iter().position(|(value, _)| *value == existing).unwrap_or(0);
+    let labels: Vec<&str> = choices.iter().map(|(_, label)| label.as_str()).collect();
+    let Some(pick) = Select::new().with_prompt("Thinking level").items(&labels).default(default).interact_opt()? else {
+        return Ok(());
+    };
+    let value = choices.swap_remove(pick).0;
+    let config = agent.config_mut();
+    match scope {
+        0 => {
+            let entry = config.providers.entry(provider.clone()).or_default();
+            match value {
+                Some(t) => entry.models.entry(model.clone()).or_default().thinking = Some(t),
+                None => {
+                    if let Some(settings) = entry.models.get_mut(&model) {
+                        settings.thinking = None;
+                    }
+                    if entry.models.get(&model).is_some_and(|m| *m == Default::default()) {
+                        entry.models.remove(&model);
+                    }
+                }
+            }
+            changes.model_thinking.insert((provider, model));
+        }
+        1 => {
+            config.providers.entry(provider.clone()).or_default().thinking = value;
+            changes.provider_thinking.insert(provider);
+        }
+        _ => {
+            if let Some(t) = value {
+                config.thinking = t;
+                changes.thinking = true;
+            }
+        }
+    }
+    // The status bar shows the level.
+    agent.refresh_stats();
+    let now = agent.thinking();
+    println!("Thinking for this model: {}", now.describe());
+    if now.source == crate::thinking::Source::Session {
+        println!("Note: /thinking set a level for this session, which wins until /thinking reset.");
+    }
+    if let Some(warning) = now.warning {
+        println!("Note: {warning}");
+    }
+    Ok(())
+}
+
 /// A temperature as a TOML value: a number, or the string `"default"`.
 fn temperature_item(t: crate::temperature::Temperature) -> toml_edit::Item {
     match t {
@@ -936,12 +1049,7 @@ fn temperature_item(t: crate::temperature::Temperature) -> toml_edit::Item {
 /// Set (or with `None`, remove) `key` in the table at `path`, creating the
 /// tables on the way as implicit ones (so `[providers.x.models."m"]` doesn't
 /// also write empty `[providers]` headers).
-fn set_nested(
-    doc: &mut toml_edit::DocumentMut,
-    path: &[&str],
-    key: &str,
-    value: Option<crate::temperature::Temperature>,
-) {
+fn set_nested(doc: &mut toml_edit::DocumentMut, path: &[&str], key: &str, value: Option<toml_edit::Item>) {
     let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
     // Inside an inline table (`models = { … }`) new tables must be inline too.
     let mut inline = false;
@@ -964,8 +1072,7 @@ fn set_nested(
         table = item.as_table_like_mut().expect("checked above");
     }
     match value {
-        Some(t) => {
-            let mut item = temperature_item(t);
+        Some(mut item) => {
             // `TableLike::insert` replaces the whole item, including its
             // decoration, so editing an existing temperature would drop an
             // attached comment (`temperature = 0.3 # tuned for this model`).
@@ -1000,15 +1107,26 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         // Reuse the decoration-preserving helper so editing the global
         // temperature keeps an attached comment (`temperature = 0.2 # tuned`),
         // matching the provider/model path.
-        set_nested(&mut doc, &[], "temperature", Some(config.temperature));
+        set_nested(&mut doc, &[], "temperature", Some(temperature_item(config.temperature)));
     }
     for name in &changes.provider_temperatures {
         let value = config.providers.get(name).and_then(|p| p.temperature);
-        set_nested(&mut doc, &["providers", name], "temperature", value);
+        set_nested(&mut doc, &["providers", name], "temperature", value.map(temperature_item));
     }
     for (name, model) in &changes.model_temperatures {
         let value = config.providers.get(name).and_then(|p| p.models.get(model)).and_then(|m| m.temperature);
-        set_nested(&mut doc, &["providers", name, "models", model], "temperature", value);
+        set_nested(&mut doc, &["providers", name, "models", model], "temperature", value.map(temperature_item));
+    }
+    if changes.thinking {
+        set_nested(&mut doc, &[], "thinking", Some(thinking_item(&config.thinking)));
+    }
+    for name in &changes.provider_thinking {
+        let value = config.providers.get(name).and_then(|p| p.thinking.as_ref());
+        set_nested(&mut doc, &["providers", name], "thinking", value.map(thinking_item));
+    }
+    for (name, model) in &changes.model_thinking {
+        let value = config.providers.get(name).and_then(|p| p.models.get(model)).and_then(|m| m.thinking.as_ref());
+        set_nested(&mut doc, &["providers", name, "models", model], "thinking", value.map(thinking_item));
     }
     if changes.max_tokens {
         doc["max_tokens"] = toml_edit::value(i64::from(config.max_tokens));
@@ -1054,22 +1172,28 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
             // would be discarded. Snapshot those temperature items' decorations
             // first and reapply them after the replacement so their comments
             // survive overlapping provider + temperature edits.
-            let mut saved: Vec<(Vec<&str>, toml_edit::Decor)> = Vec::new();
-            if changes.provider_temperatures.contains(name)
-                && let Some(d) = temperature_decor(&doc, &["providers", name])
-            {
-                saved.push((vec!["providers", name], d));
-            }
-            for (p, model) in &changes.model_temperatures {
-                if p == name
-                    && let Some(d) = temperature_decor(&doc, &["providers", name, "models", model])
+            let mut saved: Vec<(Vec<&str>, &str, toml_edit::Decor)> = Vec::new();
+            let edits = [
+                ("temperature", &changes.provider_temperatures, &changes.model_temperatures),
+                ("thinking", &changes.provider_thinking, &changes.model_thinking),
+            ];
+            for (key, provider_edits, model_edits) in edits {
+                if provider_edits.contains(name)
+                    && let Some(d) = value_decor(&doc, &["providers", name], key)
                 {
-                    saved.push((vec!["providers", name, "models", model], d));
+                    saved.push((vec!["providers", name], key, d));
+                }
+                for (p, model) in model_edits {
+                    if p == name
+                        && let Some(d) = value_decor(&doc, &["providers", name, "models", model], key)
+                    {
+                        saved.push((vec!["providers", name, "models", model], key, d));
+                    }
                 }
             }
             doc["providers"][name.as_str()] = toml_edit::Item::Table(provider_table(provider)?);
-            for (path, decor) in saved {
-                set_temperature_decor(&mut doc, &path, decor);
+            for (path, key, decor) in saved {
+                set_value_decor(&mut doc, &path, key, decor);
             }
         }
     }
@@ -1091,12 +1215,12 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
 
 /// The decoration (prefix/suffix, i.e. any attached comment) of the
 /// `temperature` value at `path`, if it is present as a plain value.
-fn temperature_decor(doc: &toml_edit::DocumentMut, path: &[&str]) -> Option<toml_edit::Decor> {
+fn value_decor(doc: &toml_edit::DocumentMut, path: &[&str], key: &str) -> Option<toml_edit::Decor> {
     let mut table: &dyn toml_edit::TableLike = doc.as_table();
     for segment in path {
         table = table.get(segment)?.as_table_like()?;
     }
-    match table.get("temperature")? {
+    match table.get(key)? {
         toml_edit::Item::Value(v) => Some(v.decor().clone()),
         _ => None,
     }
@@ -1104,7 +1228,7 @@ fn temperature_decor(doc: &toml_edit::DocumentMut, path: &[&str]) -> Option<toml
 
 /// Reapply a previously captured decoration to the `temperature` value at
 /// `path`, so a comment survives a whole-provider table replacement.
-fn set_temperature_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], decor: toml_edit::Decor) {
+fn set_value_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], key: &str, decor: toml_edit::Decor) {
     let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
     for segment in path {
         let Some(next) = table.get_mut(segment).and_then(toml_edit::Item::as_table_like_mut) else {
@@ -1112,7 +1236,7 @@ fn set_temperature_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], decor:
         };
         table = next;
     }
-    if let Some(toml_edit::Item::Value(v)) = table.get_mut("temperature") {
+    if let Some(toml_edit::Item::Value(v)) = table.get_mut(key) {
         *v.decor_mut() = decor;
     }
 }
@@ -1290,6 +1414,46 @@ mod tests {
         assert_eq!(reloaded.providers["anthropic"].models["claude"].temperature, Some(Temperature::Value(0.3)));
         assert_eq!(reloaded.providers["kimi"].models["k3"].temperature, None);
         assert_eq!(reloaded.providers["groq"].max_retries, Some(2));
+    }
+
+    #[test]
+    fn save_writes_thinking_levels_in_place() {
+        use crate::thinking::Thinking;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "thinking = \"low\" # global\n\n[providers.groq]\nmax_retries = 2\nthinking = \"high\" # tuned\n\n[providers.groq.models.\"k3\"]\nthinking = \"max\"\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config.thinking = Thinking::Default;
+        // A provider edit in the same session must keep the thinking comment.
+        let groq = config.providers.get_mut("groq").unwrap();
+        groq.max_retries = Some(5);
+        groq.thinking = Some(Thinking::Off);
+        groq.models.get_mut("k3").unwrap().thinking = None;
+        config.providers.entry("anthropic".into()).or_default().models.entry("claude".into()).or_default().thinking =
+            Some(Thinking::Level("xhigh".into()));
+        let changes = Changes {
+            thinking: true,
+            providers: ["groq".to_string()].into(),
+            provider_thinking: ["groq".to_string()].into(),
+            model_thinking: [("groq".to_string(), "k3".to_string()), ("anthropic".into(), "claude".into())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("thinking = \"default\" # global"), "{text}");
+        assert!(text.contains("thinking = \"off\" # tuned"), "{text}");
+        assert!(text.contains("[providers.anthropic.models.claude]\nthinking = \"xhigh\""), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.thinking, Thinking::Default);
+        assert_eq!(reloaded.providers["groq"].thinking, Some(Thinking::Off));
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(5));
+        assert!(reloaded.providers["groq"].models.get("k3").is_none_or(|m| m.thinking.is_none()), "{text}");
+        assert_eq!(reloaded.providers["anthropic"].models["claude"].thinking, Some(Thinking::Level("xhigh".into())));
     }
 
     #[test]

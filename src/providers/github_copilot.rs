@@ -354,6 +354,9 @@ pub struct GithubCopilotClient {
     oauth: String,
     endpoints: Endpoints,
     session: tokio::sync::Mutex<Option<SessionToken>>,
+    /// The `/models` response the probes read (window, thinking levels), so
+    /// they share one request.
+    models_cache: tokio::sync::Mutex<Option<Value>>,
 }
 
 impl GithubCopilotClient {
@@ -376,6 +379,23 @@ impl GithubCopilotClient {
         Ok(value)
     }
 
+    /// The current model's `/models` entry, from the cached list (fetched
+    /// with `timeout` the first time).
+    async fn model_entry(&self, timeout: std::time::Duration) -> Option<Value> {
+        let mut cache = self.models_cache.lock().await;
+        if cache.is_none() {
+            *cache = Some(self.models_json(Some(timeout)).await.ok()?);
+        }
+        let model = &self.transport.provider().model;
+        cache
+            .as_ref()?
+            .get("data")?
+            .as_array()?
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+            .cloned()
+    }
+
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let domain = domain();
         let oauth = provider
@@ -392,7 +412,13 @@ impl GithubCopilotClient {
     }
 
     pub fn with_endpoints(provider: ResolvedProvider, oauth: String, endpoints: Endpoints) -> Result<Self> {
-        Ok(Self { transport: HttpTransport::new(provider)?, oauth, endpoints, session: tokio::sync::Mutex::new(None) })
+        Ok(Self {
+            transport: HttpTransport::new(provider)?,
+            oauth,
+            endpoints,
+            session: tokio::sync::Mutex::new(None),
+            models_cache: tokio::sync::Mutex::new(None),
+        })
     }
 
     async fn session_token(&self, force: bool) -> Result<SessionToken> {
@@ -519,10 +545,7 @@ impl LLMClient for GithubCopilotClient {
         // exchange could otherwise blow past the probe budget even though the
         // `/models` call itself is capped at `PROBE_TIMEOUT`.
         tokio::time::timeout(PROBE_TIMEOUT, async {
-            let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
-            let model = &self.transport.provider().model;
-            let entry =
-                models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
             // Copilot enforces the prompt budget, which is below the full window.
             let limit = |field: &str| {
                 entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
@@ -550,6 +573,16 @@ impl LLMClient for GithubCopilotClient {
                 }),
                 (None, None) => None,
             }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        // Bounded like the window probe.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            crate::thinking::Reported::from_model_entry(&self.model_entry(PROBE_TIMEOUT).await?)
         })
         .await
         .ok()
@@ -918,6 +951,21 @@ mod tests {
         let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         client(&auth).detect_context_window().await
+    }
+
+    #[tokio::test]
+    async fn reads_thinking_levels_and_window_from_one_models_request() {
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111 },
+            "supports": { "reasoning_effort": ["none", "low", "high"] } } }] });
+        // One `/models` response serves both probes.
+        let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 111);
+        let reported = client.detect_thinking_levels().await.unwrap();
+        assert_eq!(reported.levels, ["off", "low", "high"]);
+        assert_eq!(api_log.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

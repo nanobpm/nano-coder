@@ -224,6 +224,40 @@ pub fn builtin(model: &str) -> Option<Profile> {
     None
 }
 
+/// Thinking levels an endpoint reports for a model (GitHub Copilot's
+/// `/models` lists them as `capabilities.supports.reasoning_effort`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    /// Levels it accepts; `"off"` when the endpoint lists `"none"`.
+    pub levels: Vec<String>,
+    /// The endpoint says the model uses adaptive thinking
+    /// (`capabilities.supports.adaptive_thinking`).
+    pub adaptive: bool,
+}
+
+impl Reported {
+    /// Read the levels from one `/models` entry; `None` when it lists none.
+    pub fn from_model_entry(entry: &serde_json::Value) -> Option<Reported> {
+        let supports = entry.pointer("/capabilities/supports")?;
+        let levels: Vec<String> = supports
+            .get("reasoning_effort")?
+            .as_array()?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(|level| match level.trim().to_ascii_lowercase().as_str() {
+                "none" => "off".to_string(),
+                other => other.to_string(),
+            })
+            .filter(|level| !level.is_empty())
+            .collect();
+        if levels.is_empty() {
+            return None;
+        }
+        let adaptive = supports.get("adaptive_thinking").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        Some(Reported { levels, adaptive })
+    }
+}
+
 /// Which request format `model` is sent in by a client of `kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
@@ -347,15 +381,30 @@ fn nearest<'a>(levels: &'a [String], wanted: &str) -> Option<&'a String> {
         .map(|(_, l)| *l)
 }
 
-/// The thinking level for `model` on `provider` (the merged provider entry):
-/// the session override, else the model's setting, else the provider's, else
-/// `global`, fitted to the levels the model supports.
+/// [`resolve_with`] for a model whose endpoint reports no levels.
+#[cfg(test)]
 pub fn resolve(
     global: &Thinking,
     session: Option<&Thinking>,
     kind: Option<ProviderKind>,
     provider: &ProviderConfig,
     model: &str,
+) -> Resolved {
+    resolve_with(global, session, kind, provider, model, None)
+}
+
+/// The thinking level for `model` on `provider` (the merged provider entry):
+/// the session override, else the model's setting, else the provider's, else
+/// `global`, fitted to the levels the model supports. Those come from
+/// `thinking_levels` in the config, else what the endpoint `reported`, else
+/// the built-in table.
+pub fn resolve_with(
+    global: &Thinking,
+    session: Option<&Thinking>,
+    kind: Option<ProviderKind>,
+    provider: &ProviderConfig,
+    model: &str,
+    reported: Option<&Reported>,
 ) -> Resolved {
     let model_settings = provider.models.get(model);
     let (requested, source) = if let Some(t) = session {
@@ -372,11 +421,17 @@ pub fn resolve(
         .and_then(|m| m.thinking_levels.clone())
         .or_else(|| provider.thinking_levels.clone())
         .map(|levels| levels.iter().map(|l| l.trim().to_ascii_lowercase()).collect())
+        .or_else(|| reported.map(|r| r.levels.clone()))
         .or_else(|| profile.as_ref().map(|p| p.levels.clone()))
         .unwrap_or_default();
     let wire = wire(kind, model);
     // A Claude model the table doesn't know: assume the current (adaptive) API.
-    let anthropic = profile.and_then(|p| p.anthropic).unwrap_or(AnthropicStyle::Adaptive);
+    // The endpoint saying "adaptive" wins over the table.
+    let anthropic = if reported.is_some_and(|r| r.adaptive) {
+        AnthropicStyle::Adaptive
+    } else {
+        profile.and_then(|p| p.anthropic).unwrap_or(AnthropicStyle::Adaptive)
+    };
     // The global setting applies to every model, so a level that one model
     // can't take is not worth a warning; one set for it (or the session) is.
     let explicit = source != Source::Global;
@@ -608,6 +663,46 @@ mod tests {
         let p = provider("extra_body = { reasoning_effort = \"low\" }");
         let r = resolve(&Thinking::Default, None, Some(ProviderKind::Openai), &p, "gpt-5");
         assert_eq!(r.warning, None);
+    }
+
+    #[test]
+    fn reads_levels_from_a_model_list_entry() {
+        let entry = serde_json::json!({ "id": "gpt-5.4", "capabilities": { "supports": {
+            "reasoning_effort": ["none", "low", "medium", "high", "xhigh"], "tool_calls": true } } });
+        let reported = Reported::from_model_entry(&entry).unwrap();
+        assert_eq!(reported.levels, ["off", "low", "medium", "high", "xhigh"]);
+        assert!(!reported.adaptive);
+        let none = serde_json::json!({ "id": "gpt-4o", "capabilities": { "supports": { "tool_calls": true } } });
+        assert_eq!(Reported::from_model_entry(&none), None);
+        let empty = serde_json::json!({ "capabilities": { "supports": { "reasoning_effort": [] } } });
+        assert_eq!(Reported::from_model_entry(&empty), None);
+
+        // Reported levels beat the table (gpt-5 has no xhigh there) …
+        let copilot = Some(ProviderKind::GithubCopilot);
+        let none_cfg = ProviderConfig::default();
+        let r = resolve_with(&Thinking::Default, Some(&level("xhigh")), copilot, &none_cfg, "gpt-5.4", Some(&reported));
+        assert_eq!((r.effective, r.warning), (level("xhigh"), None));
+        let r = resolve_with(&Thinking::Default, Some(&Thinking::Off), copilot, &none_cfg, "gpt-5.4", Some(&reported));
+        assert_eq!(r.request(), Some(Request::Off));
+        // … and cover models the table doesn't know.
+        let kimi = Reported { levels: vec!["low".into(), "high".into(), "max".into()], adaptive: false };
+        let r = resolve_with(&Thinking::Default, Some(&level("medium")), copilot, &none_cfg, "kimi-k3", Some(&kimi));
+        assert_eq!(r.effective, level("low"));
+        // Config levels still win.
+        let p = provider("thinking_levels = [\"high\"]");
+        let r = resolve_with(&Thinking::Default, Some(&level("low")), copilot, &p, "gpt-5.4", Some(&reported));
+        assert_eq!(r.effective, level("high"));
+        // An adaptive report switches an old-table Claude to effort.
+        let adaptive = Reported { levels: vec!["low".into(), "high".into()], adaptive: true };
+        let r = resolve_with(
+            &Thinking::Default,
+            Some(&level("high")),
+            copilot,
+            &none_cfg,
+            "claude-sonnet-4.5",
+            Some(&adaptive),
+        );
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
     }
 
     #[test]

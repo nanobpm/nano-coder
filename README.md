@@ -557,9 +557,11 @@ thinking = "medium"                     # all models that support it
 thinking = "xhigh"                      # this model only
 ```
 
-A model only gets levels it supports. nano-coder knows the levels of Claude (3.7 Sonnet and
-later) and OpenAI reasoning models (GPT-5 and later, o1/o3/o4); for others, list them
-with `thinking_levels` on the provider or model:
+A model only gets levels it supports. They come from, in order: `thinking_levels` on the
+model or provider; the endpoint's model list (GitHub Copilot's `/models` reports each
+model's levels, read with the same request as its context window); and a built-in table
+of Claude (3.7 Sonnet and later) and OpenAI reasoning models (GPT-5 and later, o1/o3/o4).
+For other models, list them yourself:
 
 ```toml
 [providers.together.models."deepseek-r1"]
@@ -577,8 +579,10 @@ How the level is sent depends on the API: `reasoning_effort` (Chat Completions),
 2048, 8192, 16384, 32768, 65536 up to max). The budget has to stay below `max_tokens`, so raise
 `max_tokens` to use a large one. Anthropic takes no custom temperature while thinking, so
 none is sent then. A matching key in the provider's `extra_body` (`reasoning_effort`, `reasoning`,
-`thinking`, `output_config`) is sent instead, with a warning. `/context` shows the level in use, and the session log
-records it for each reply.
+`thinking`, `output_config`) is sent instead, with a warning. The status bar shows
+`think LEVEL` while a level is sent, `/context` shows it with where it comes from,
+`/settings` sets it for the current model, its provider or all models (picking from the
+levels the model supports), and the session log records it for each reply.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and

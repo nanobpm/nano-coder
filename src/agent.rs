@@ -447,6 +447,8 @@ pub struct Agent {
     learned_window: Option<usize>,
     /// Window reported by the endpoint (see `detect_context_window`).
     detected_window: Option<DetectedWindow>,
+    /// Thinking levels reported by the endpoint (see `detect_context_window`).
+    reported_thinking: Option<crate::thinking::Reported>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -557,6 +559,7 @@ impl Agent {
             calibration: None,
             learned_window: None,
             detected_window: None,
+            reported_thinking: None,
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -746,12 +749,13 @@ impl Agent {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
         let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
-        let mut resolved = crate::thinking::resolve(
+        let mut resolved = crate::thinking::resolve_with(
             &self.config.thinking,
             self.thinking_override.as_ref(),
             self.client.kind(),
             &provider,
             self.model_name(),
+            self.reported_thinking.as_ref(),
         );
         // A fixed budget must stay below the output cap; say so when the cap
         // shrinks the level's budget.
@@ -781,6 +785,7 @@ impl Agent {
     /// Set (or with `None`, clear) the thinking level for this session.
     pub fn set_thinking(&mut self, thinking: Option<crate::thinking::Thinking>) {
         self.thinking_override = thinking;
+        self.refresh_stats();
     }
 
     /// Switch to another `provider/model`, keeping the conversation.
@@ -809,18 +814,22 @@ impl Agent {
         self.calibration = None;
         self.learned_window = None;
         self.detected_window = None;
+        self.reported_thinking = None;
         self.compact_floor = 0;
         self.detect_context_window().await;
         Ok(())
     }
 
-    /// Ask the endpoint for the model's context window, unless config sets it.
+    /// Ask the endpoint for the model's context window (unless config sets
+    /// it) and the thinking levels it supports.
     pub async fn detect_context_window(&mut self) {
         self.detected_window = None;
         if self.configured_window().is_none() {
             let probe = self.client.detect_context_window();
             self.detected_window = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
         }
+        let probe = self.client.detect_thinking_levels();
+        self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
         self.refresh_stats();
     }
 
@@ -950,6 +959,10 @@ impl Agent {
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
+            stats.thinking = match self.thinking().effective {
+                crate::thinking::Thinking::Default => None,
+                level => Some(level.to_string()),
+            };
         }
         self.emit(AgentEvent::Context);
     }
