@@ -597,6 +597,55 @@ impl LLMClient for GithubCopilotClient {
         .flatten()
     }
 
+    /// The window and thinking levels read from one shared `/models` fetch.
+    /// Both detections need the current model's `/models` entry, and
+    /// `model_entry` caches only a successful response, so probing each on its
+    /// own (the default) would re-fetch — and re-wait out the timeout — when
+    /// the first probe failed. Fetching the entry once and deriving both halves
+    /// keeps a slow or unavailable endpoint from being probed twice serially.
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+        // Bound the whole probe: `models_json` first does a token exchange whose
+        // request carries the transport's normal (long) timeout, so a stalled
+        // exchange could otherwise blow past the probe budget even though the
+        // `/models` call itself is capped at `PROBE_TIMEOUT`.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            // Copilot enforces the prompt budget, which is below the full window.
+            let limit = |field: &str| {
+                entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
+            };
+            let prompt = limit("max_prompt_tokens");
+            let combined = limit("max_context_window_tokens");
+            let window = match (prompt, combined) {
+                // `max_prompt_tokens` caps the prompt alone: output tokens do not
+                // consume it. Keep the larger `max_context_window_tokens` too —
+                // leaving `max_tokens` unchanged against the prompt cap can still
+                // push prompt + output past the full window, so it is enforced as
+                // a second limit.
+                (Some(tokens), combined) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_prompt_tokens".to_string(),
+                    cap: ContextCap::Prompt,
+                    total_tokens: combined,
+                }),
+                // `max_context_window_tokens` alone is the full window.
+                (None, Some(tokens)) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_context_window_tokens".to_string(),
+                    cap: ContextCap::Total,
+                    total_tokens: None,
+                }),
+                (None, None) => None,
+            };
+            let thinking = crate::thinking::Reported::from_model_entry(&entry);
+            Some((window, thinking))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let session = self.session_token(false).await?;
         let value = self.models_json(&session, None).await?;
@@ -975,6 +1024,35 @@ mod tests {
         let reported = client.detect_thinking_levels().await.unwrap();
         assert_eq!(reported.levels, ["off", "low", "high"]);
         assert_eq!(api_log.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_reads_both_from_one_models_request() {
+        // The agent probes via `detect_capabilities`, so the window and thinking
+        // levels must come from a single `/models` fetch — not one each.
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111 },
+            "supports": { "reasoning_effort": ["none", "low", "high"] } } }] });
+        let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, thinking) = client.detect_capabilities().await;
+        assert_eq!(window.unwrap().tokens, 111);
+        assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
+        assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_makes_one_failed_models_request() {
+        // `model_entry` caches only a successful `/models` response, so probing
+        // the window and thinking separately would re-fetch on failure — two
+        // requests and two waits. The shared probe fails once.
+        let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, thinking) = client.detect_capabilities().await;
+        assert_eq!((window, thinking), (None, None));
+        assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the second probe");
     }
 
     #[tokio::test]
