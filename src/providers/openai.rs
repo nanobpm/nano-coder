@@ -62,8 +62,9 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         // variables switch thinking.
         Some(Request::TemplateSwitch(on)) => body["chat_template_kwargs"] = json!({ "enable_thinking": on }),
         Some(Request::TemplateEffort(level)) => body["chat_template_kwargs"] = json!({ "reasoning_effort": level }),
-        // Budgets are only resolved for Anthropic Messages.
-        Some(Request::Budget(_)) | None => {}
+        // Budgets and the Anthropic adaptive enable-half are only resolved for
+        // Anthropic Messages.
+        Some(Request::Budget(_) | Request::AdaptiveOn) | None => {}
     }
     transport.finish_body(body)
 }

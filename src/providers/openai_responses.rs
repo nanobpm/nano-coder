@@ -105,9 +105,9 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     match &request.thinking {
         Some(Request::Effort(level)) => body["reasoning"] = json!({ "effort": level }),
         Some(Request::Off) => body["reasoning"] = json!({ "effort": "none" }),
-        // Budgets (Anthropic) and template variables (llama.cpp) are not
-        // resolved for this API.
-        Some(Request::Budget(_) | Request::TemplateSwitch(_) | Request::TemplateEffort(_)) | None => {}
+        // Budgets, the Anthropic adaptive enable-half, and template variables
+        // (llama.cpp) are not resolved for this API.
+        Some(Request::Budget(_) | Request::AdaptiveOn | Request::TemplateSwitch(_) | Request::TemplateEffort(_)) | None => {}
     }
     transport.finish_body(body)
 }
