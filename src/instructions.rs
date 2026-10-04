@@ -306,10 +306,40 @@ fn rule_front_matter(text: &str) -> (Option<Vec<String>>, &str) {
             continue;
         }
         let inner = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')).unwrap_or(value);
-        paths = Some(inner.split(',').map(unquote).collect());
+        paths = Some(split_top_level(inner).into_iter().map(unquote).collect());
     }
     let paths = paths.map(|p| p.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>()).filter(|p| !p.is_empty());
     (paths, &text[offset.min(text.len())..])
+}
+
+/// Split a front-matter value on top-level commas only: commas inside a `{a,b}`
+/// brace group or inside quotes belong to a single pattern, not a list boundary.
+fn split_top_level(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (i, c) in value.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    out.push(&value[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&value[start..]);
+    out
 }
 
 /// Expand `{a,b}` groups; past `budget` patterns, keep the rest unexpanded.
@@ -841,5 +871,42 @@ mod tests {
         assert_eq!(rule_front_matter("no front matter").0, None);
         let mut budget = MAX_RULE_PATTERNS;
         assert_eq!(expand_braces("{a,b}/*.{c,d}", &mut budget).len(), 4);
+    }
+
+    #[test]
+    fn inline_paths_keep_brace_groups() {
+        // A comma inside a `{a,b}` brace group (or inside quotes) is not a list
+        // separator: the inline form must split only on top-level commas.
+        assert_eq!(
+            rule_front_matter("---\npaths: \"src/**/*.{ts,tsx}\"\n---\nx").0,
+            Some(vec!["src/**/*.{ts,tsx}".into()])
+        );
+        assert_eq!(
+            rule_front_matter("---\npaths: [src/**/*.{ts,tsx}, \"docs/*.md\"]\n---\nx").0,
+            Some(vec!["src/**/*.{ts,tsx}".into(), "docs/*.md".into()])
+        );
+        assert_eq!(rule_front_matter("---\npaths: \"a,b\", c\n---\nx").0, Some(vec!["a,b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn inline_paths_with_braces_match() {
+        // Regression: the inline `paths:` form used to split on every comma, so a
+        // brace group was shattered and the compiled rule matched nothing.
+        let (paths, _) = rule_front_matter("---\npaths: \"src/**/*.{ts,tsx}\"\n---\nx");
+        let compiled = compile_patterns(&paths.unwrap());
+        assert!(compiled.iter().any(|r| r.is_match("src/a/b.ts")));
+        assert!(compiled.iter().any(|r| r.is_match("src/a/b.tsx")));
+        assert!(!compiled.iter().any(|r| r.is_match("src/a/b.js")));
+    }
+
+    #[test]
+    fn split_top_level_adversarial() {
+        // No panics on unbalanced braces/quotes; nested braces and empty entries behave.
+        for v in ["}", "{", "a}", "{a", "\"a,b", "a,\"b", "'x,y',z", "{a,{b,c}},d", "a,,b", "", ","] {
+            let _ = split_top_level(v);
+        }
+        assert_eq!(split_top_level("{a,{b,c}},d"), vec!["{a,{b,c}}", "d"]);
+        assert_eq!(split_top_level("a,,b"), vec!["a", "", "b"]); // empty filtered later
+        assert_eq!(split_top_level(""), vec![""]);
     }
 }
