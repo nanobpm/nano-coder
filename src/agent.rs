@@ -794,9 +794,7 @@ impl Agent {
                     // No room for any budget: send no level so every surface
                     // agrees thinking is off for this request.
                     resolved.effective = crate::thinking::Thinking::Default;
-                    Some(format!(
-                        "max_tokens {max_tokens} leaves no room for a thinking budget; thinking stays off"
-                    ))
+                    Some(format!("max_tokens {max_tokens} leaves no room for a thinking budget; thinking stays off"))
                 }
                 _ => None,
             };
@@ -855,12 +853,31 @@ impl Agent {
     /// is not queried twice serially.
     pub async fn detect_context_window(&mut self) {
         self.detected_window = None;
+        if self.configured_window().is_some() {
+            // The configured window wins, so the window half of the combined
+            // probe is discarded — running it anyway can only hurt: a
+            // configured LM Studio provider would make the unnecessary
+            // `/api/v0/models` follow-up, adding the full probe timeout at
+            // startup/model switches when the endpoint is slow. Probe only
+            // the thinking levels (`resolve_with` still consumes their
+            // adaptive/format data even when the level list is configured).
+            self.detect_thinking().await;
+            return;
+        }
         let probe = self.client.detect_capabilities();
         let (window, thinking) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
-        if self.configured_window().is_none() {
-            self.detected_window = window;
-        }
+        self.detected_window = window;
         self.reported_thinking = thinking;
+        self.refresh_stats();
+    }
+
+    /// Probe only the thinking levels the endpoint reports, leaving the
+    /// (already cleared) detected window alone. Used when the window comes
+    /// from config and the window half of the combined probe would be
+    /// discarded anyway.
+    async fn detect_thinking(&mut self) {
+        let probe = self.client.detect_thinking_levels();
+        self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
         self.refresh_stats();
     }
 
@@ -2070,8 +2087,10 @@ impl Agent {
             };
             // The loop only breaks `Some` after recording both, so these are
             // the values the successful request actually sent.
-            let (sent_temperature, sent_thinking) =
-                (sent_temperature.expect("a response implies a sent request"), sent_thinking.expect("a response implies a sent request"));
+            let (sent_temperature, sent_thinking) = (
+                sent_temperature.expect("a response implies a sent request"),
+                sent_thinking.expect("a response implies a sent request"),
+            );
             let duration_ms = u64::try_from(request_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             self.record_usage(&response, true);
             // Log-only trajectory data carried by the assistant message.
@@ -5091,6 +5110,54 @@ mod tests {
         agent.detect_context_window().await;
         assert_eq!(agent.context_window_with_source(), (32_000, "context_window in config".into()));
         assert!(agent.detected_window.is_none(), "no probe when config sets the window");
+    }
+
+    #[tokio::test]
+    async fn a_configured_window_probes_only_the_thinking_levels() {
+        // With the window set in config, the window half of the combined probe
+        // is discarded — so it is not run at all (a configured LM Studio
+        // provider would otherwise make the unnecessary `/api/v0/models`
+        // follow-up). The thinking half still runs: `resolve_with` consumes the
+        // reported adaptive/format data even when the level list is configured.
+        use std::sync::{Arc, Mutex};
+        struct Probes {
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        #[async_trait]
+        impl LLMClient for Probes {
+            async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
+                unreachable!()
+            }
+            async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+                self.calls.lock().unwrap().push("capabilities");
+                (Some(DetectedWindow::total(65_536, "test")), None)
+            }
+            async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+                self.calls.lock().unwrap().push("thinking");
+                Some(crate::thinking::Reported {
+                    levels: vec!["off".into(), "on".into()],
+                    adaptive: false,
+                    format: crate::thinking::Format::Effort,
+                })
+            }
+            fn model_name(&self) -> &str {
+                "claude-test"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let config = Config { context_window: Some(32_000), ..Default::default() };
+        let mut agent = Agent::new(Box::new(Probes { calls: calls.clone() }), config);
+        agent.detect_context_window().await;
+        assert_eq!(*calls.lock().unwrap(), ["thinking"], "the discarded window half is not probed");
+        assert_eq!(
+            agent.reported_thinking.as_ref().map(|r| r.levels.as_slice()),
+            Some(["off".to_string(), "on".to_string()].as_slice()),
+            "the thinking levels are still probed"
+        );
+        assert!(agent.detected_window.is_none(), "the configured window stands");
     }
 
     #[test]
