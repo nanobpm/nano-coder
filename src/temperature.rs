@@ -86,6 +86,13 @@ impl<'de> Deserialize<'de> for Temperature {
 pub struct ModelSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<Temperature>,
+    /// Thinking level for this model (see `crate::thinking`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::thinking::Thinking>,
+    /// Thinking levels this model accepts, overriding the provider's list and
+    /// the built-in table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_levels: Option<Vec<String>>,
 }
 
 /// Where the temperature in effect came from.
@@ -126,6 +133,14 @@ pub struct Resolved {
     pub fixed: Option<String>,
     /// A setting that is ignored or adjusted, worth telling the user about.
     pub warning: Option<String>,
+    /// The self-naming portion of `warning` (a non-finite `extra_body` override,
+    /// e.g. "extra_body temperature NaN is not finite …") that stays true even
+    /// when the temperature is later dropped. Kept apart from the combined
+    /// `warning` so [`Resolved::fixed_by`] can restore exactly this part instead
+    /// of substring-matching a joined string — a combined warning also contains
+    /// `extra_body`, so a substring filter would leak its stale "sending N"
+    /// clause once the value is dropped.
+    extra_body_warning: Option<String>,
 }
 
 impl Resolved {
@@ -134,6 +149,53 @@ impl Resolved {
         match self.effective {
             Temperature::Default => None,
             Temperature::Value(v) => Some(v),
+        }
+    }
+
+    /// This resolution with the temperature dropped for `reason` (the model
+    /// takes only its default, e.g. while Anthropic thinking is on). A value
+    /// set for this provider, model or `extra_body` is reported as ignored.
+    ///
+    /// The warning is recomputed, not carried over: the resolution being fixed
+    /// may warn that an out-of-range value is sent clamped (e.g. "sending 1"),
+    /// but once the temperature is dropped for `reason` the request omits the
+    /// field, so that warning is stale — the user would be told a value is sent
+    /// that never is. As in [`resolve`]'s fixed-model arm, a value set for this
+    /// provider, model or `extra_body` is reported as ignored; the global
+    /// setting applies to every model, so a number there is not a mistake for
+    /// this one and only an unrelated warning (e.g. a non-finite `extra_body`
+    /// value) survives.
+    pub fn fixed_by(self, reason: String) -> Resolved {
+        if self.fixed.is_some() {
+            return self;
+        }
+        let warning = match (self.effective, self.source) {
+            (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
+                let ignored = format!(
+                    "temperature {v} ({}) is ignored: {reason}; using the model default",
+                    self.source.label()
+                );
+                // An unrelated non-finite `extra_body` diagnostic (the value
+                // came from the model/provider, not extra_body) stays true once
+                // the temperature is dropped, so keep it alongside the ignored
+                // warning rather than silently losing it.
+                Some(match self.extra_body_warning {
+                    Some(eb) => format!("{eb}; {ignored}"),
+                    None => ignored,
+                })
+            }
+            // A global value, or one already `Default`: the "sending N" range
+            // warning no longer applies (nothing is sent), so only the
+            // self-naming part — a non-finite `extra_body` override, kept apart
+            // from the combined `warning` — survives.
+            _ => self.extra_body_warning,
+        };
+        Resolved {
+            effective: Temperature::Default,
+            source: Source::Required,
+            fixed: Some(reason),
+            warning,
+            extra_body_warning: None,
         }
     }
 
@@ -196,13 +258,32 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
         // must survive this early return rather than be silently dropped.
         let warning = match (effective, source) {
             (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
-                Some(format!("temperature {v} ({}) is ignored: {reason}; using the model default", source.label()))
+                let ignored =
+                    format!("temperature {v} ({}) is ignored: {reason}; using the model default", source.label());
+                // A non-finite `extra_body` override carries its own warning
+                // (the chosen value came from the model/provider, so the value
+                // ignored here is unrelated); keep both rather than dropping the
+                // non-finite diagnostic.
+                Some(match extra_body_warning {
+                    Some(eb) => format!("{eb}; {ignored}"),
+                    None => ignored,
+                })
             }
             _ => extra_body_warning,
         };
-        return Resolved { effective: Temperature::Default, source: Source::Required, fixed: Some(reason), warning };
+        return Resolved {
+            effective: Temperature::Default,
+            source: Source::Required,
+            fixed: Some(reason),
+            warning,
+            extra_body_warning: None,
+        };
     }
 
+    // Keep the self-naming `extra_body` warning apart from the combined
+    // `warning` so a later `fixed_by` can restore just this part (the clamp
+    // "sending N" clause below is stale once the temperature is dropped).
+    let extra_body_only = extra_body_warning.clone();
     let mut warning = extra_body_warning;
     // Anthropic's Messages API takes 0..=1, and `anthropic::build_body` clamps
     // out-of-range values silently. That builder is used for Anthropic
@@ -214,15 +295,24 @@ pub fn resolve(global: Temperature, kind: Option<ProviderKind>, provider: &Provi
         || (kind == Some(ProviderKind::GithubCopilot)
             && crate::providers::github_copilot::uses_anthropic_messages(model));
     if anthropic_messages && let Temperature::Value(v) = effective {
+        // A non-finite `extra_body` override was already ignored with a warning
+        // and the value fell through to `chosen`, which is what is clamped here
+        // — keep that earlier warning alongside the clamp warning rather than
+        // dropping it.
+        let prior = warning.take();
+        let combine = |w: String| match prior {
+            Some(p) => format!("{p}; {w}"),
+            None => w,
+        };
         if v > 1.0 {
-            warning = Some(format!("temperature {v} is above Anthropic's maximum of 1; sending 1"));
+            warning = Some(combine(format!("temperature {v} is above Anthropic's maximum of 1; sending 1")));
             effective = Temperature::Value(1.0);
         } else if v < 0.0 {
-            warning = Some(format!("temperature {v} is below Anthropic's minimum of 0; sending 0"));
+            warning = Some(combine(format!("temperature {v} is below Anthropic's minimum of 0; sending 0")));
             effective = Temperature::Value(0.0);
         }
     }
-    Resolved { effective, source, fixed: None, warning }
+    Resolved { effective, source, fixed: None, warning, extra_body_warning: extra_body_only }
 }
 
 #[cfg(test)]
@@ -320,6 +410,14 @@ mod tests {
         let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
         assert_eq!((r.value(), r.source), (None, Source::Required));
         assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
+        // The chosen value coming from the provider/model (not global) must not
+        // swallow the non-finite diagnostic: both warnings survive the drop.
+        let p = provider("temperature = 0.5\ndrop_params = [\"temperature\"]\nextra_body = { temperature = nan }\n");
+        let r = resolve(global, Some(ProviderKind::Openai), &p, "k3");
+        assert_eq!((r.value(), r.source), (None, Source::Required));
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
+        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
     }
 
     #[test]
@@ -378,5 +476,58 @@ mod tests {
         assert_eq!(merged.temperature, Some(Temperature::Value(0.2)));
         assert_eq!(merged.models["a"].temperature, Some(Temperature::Value(0.1)));
         assert_eq!(merged.models["b"].temperature, Some(Temperature::Default));
+    }
+
+    #[test]
+    fn fixed_by_clears_the_stale_range_warning() {
+        // A global temperature outside Anthropic's 0..=1 range resolves with a
+        // "sending N" warning. When thinking then forces the default
+        // temperature, the request omits the field — so the warning that a
+        // value is sent is stale and must be cleared, not carried over.
+        let p = ProviderConfig::default();
+        let r = resolve(Temperature::Value(1.5), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
+        assert_eq!(r.value(), Some(1.0));
+        assert!(r.warning.as_deref().unwrap().contains("sending 1"), "{:?}", r.warning);
+        let r = r.fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        assert_eq!(r.value(), None, "thinking drops the temperature");
+        assert_eq!(r.warning, None, "the stale \"sending 1\" warning is cleared: nothing is sent");
+
+        // A value set for this provider or model is reported as ignored (not
+        // left warning that it is sent). `resolve` already clamped the
+        // out-of-range 1.5 to 1, so the ignored warning names the clamped 1.
+        let p = provider("temperature = 1.5\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6")
+            .fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        assert_eq!(r.value(), None);
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("ignored") && warning.contains("temperature 1 "), "{warning}");
+        assert!(!warning.contains("sending 1"), "{warning}");
+
+        // A warning unrelated to the sent value — a non-finite `extra_body`
+        // override — survives the drop, WITHOUT the stale clamp clause. Here the
+        // non-finite override falls through to the out-of-range global 1.5,
+        // which `resolve` clamps and reports ("sending 1") combined with the
+        // "not finite" notice. Dropping the temperature must keep only the
+        // self-naming "not finite" part, never the stale "sending 1".
+        let p = provider("extra_body = { temperature = nan }\n");
+        let r = resolve(Temperature::Value(1.5), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
+        assert!(r.warning.as_deref().unwrap().contains("not finite"), "{:?}", r.warning);
+        assert!(r.warning.as_deref().unwrap().contains("sending 1"), "combined before fixing: {:?}", r.warning);
+        let r = r.fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        assert_eq!(r.value(), None);
+        let warning = r.warning.as_deref().unwrap();
+        assert!(warning.contains("not finite"), "{warning}");
+        assert!(!warning.contains("sending 1"), "the stale clamp clause must not leak: {warning}");
+
+        // When the chosen value comes from the provider/model, dropping it
+        // reports it as ignored AND keeps the unrelated non-finite diagnostic —
+        // the first match arm must not swallow the extra_body warning.
+        let p = provider("temperature = 0.5\nextra_body = { temperature = nan }\n");
+        let r = resolve(Temperature::Value(0.7), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6")
+            .fixed_by("thinking is on, and Anthropic then requires the default temperature".into());
+        assert_eq!(r.value(), None);
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
+        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
     }
 }

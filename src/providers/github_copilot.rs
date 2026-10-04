@@ -98,6 +98,15 @@ fn copilot_api_for_model(model_id: &str) -> CopilotApi {
     CopilotApi::Completions
 }
 
+/// The request format Copilot uses for `model_id`, for thinking-level fields.
+pub(crate) fn wire_for_model(model_id: &str) -> crate::thinking::Wire {
+    match copilot_api_for_model(model_id) {
+        CopilotApi::Completions => crate::thinking::Wire::ChatCompletions,
+        CopilotApi::Responses => crate::thinking::Wire::Responses,
+        CopilotApi::Messages => crate::thinking::Wire::AnthropicMessages,
+    }
+}
+
 /// Whether Copilot serves `model_id` through the Anthropic Messages endpoint
 /// (`/v1/messages`): Claude 4.x/5.x models. Older Claude (3.x) and everything
 /// else keep the legacy Chat Completions path. Temperature resolution uses this
@@ -345,12 +354,18 @@ pub struct GithubCopilotClient {
     oauth: String,
     endpoints: Endpoints,
     session: tokio::sync::Mutex<Option<SessionToken>>,
+    /// The `/models` response the probes read (window, thinking levels), so
+    /// they share one request.
+    /// The `/models` list, keyed by the `api_base` it was fetched from. A
+    /// session-token force-refresh (after a 401) can move us to a different
+    /// proxy endpoint; keying on `api_base` re-fetches then instead of serving
+    /// the previous endpoint's stale list, levels and window.
+    models_cache: tokio::sync::Mutex<Option<(String, Value)>>,
 }
 
 impl GithubCopilotClient {
-    async fn models_json(&self, timeout: Option<std::time::Duration>) -> Result<Value> {
-        let session = self.session_token(false).await?;
-        let url = format!("{}/models", self.api_base(&session));
+    async fn models_json(&self, session: &SessionToken, timeout: Option<std::time::Duration>) -> Result<Value> {
+        let url = format!("{}/models", self.api_base(session));
         let mut request = with_editor_headers(self.transport.http().get(&url), &self.transport.provider().headers)
             .bearer_auth(&session.token)
             .header("Accept", "application/json")
@@ -365,6 +380,28 @@ impl GithubCopilotClient {
             bail!("listing Copilot models failed (HTTP {status}): {value}");
         }
         Ok(value)
+    }
+
+    /// The current model's `/models` entry, from the cached list (fetched
+    /// with `timeout` the first time). The cache is keyed on the session's
+    /// `api_base` — fetching and keying off the *same* session so a token
+    /// refresh that moves endpoints can never key the list under the wrong one.
+    async fn model_entry(&self, timeout: std::time::Duration) -> Option<Value> {
+        let session = self.session_token(false).await.ok()?;
+        let api_base = self.api_base(&session);
+        let mut cache = self.models_cache.lock().await;
+        if cache.as_ref().map(|(base, _)| base.as_str()) != Some(api_base.as_str()) {
+            *cache = Some((api_base, self.models_json(&session, Some(timeout)).await.ok()?));
+        }
+        let model = &self.transport.provider().model;
+        cache
+            .as_ref()?
+            .1
+            .get("data")?
+            .as_array()?
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(model))
+            .cloned()
     }
 
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
@@ -383,7 +420,13 @@ impl GithubCopilotClient {
     }
 
     pub fn with_endpoints(provider: ResolvedProvider, oauth: String, endpoints: Endpoints) -> Result<Self> {
-        Ok(Self { transport: HttpTransport::new(provider)?, oauth, endpoints, session: tokio::sync::Mutex::new(None) })
+        Ok(Self {
+            transport: HttpTransport::new(provider)?,
+            oauth,
+            endpoints,
+            session: tokio::sync::Mutex::new(None),
+            models_cache: tokio::sync::Mutex::new(None),
+        })
     }
 
     async fn session_token(&self, force: bool) -> Result<SessionToken> {
@@ -510,10 +553,7 @@ impl LLMClient for GithubCopilotClient {
         // exchange could otherwise blow past the probe budget even though the
         // `/models` call itself is capped at `PROBE_TIMEOUT`.
         tokio::time::timeout(PROBE_TIMEOUT, async {
-            let models = self.models_json(Some(PROBE_TIMEOUT)).await.ok()?;
-            let model = &self.transport.provider().model;
-            let entry =
-                models.get("data")?.as_array()?.iter().find(|m| m.get("id").and_then(Value::as_str) == Some(model))?;
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
             // Copilot enforces the prompt budget, which is below the full window.
             let limit = |field: &str| {
                 entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
@@ -547,8 +587,68 @@ impl LLMClient for GithubCopilotClient {
         .flatten()
     }
 
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        // Bounded like the window probe.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            crate::thinking::Reported::from_model_entry(&self.model_entry(PROBE_TIMEOUT).await?)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// The window and thinking levels read from one shared `/models` fetch.
+    /// Both detections need the current model's `/models` entry, and
+    /// `model_entry` caches only a successful response, so probing each on its
+    /// own (the default) would re-fetch — and re-wait out the timeout — when
+    /// the first probe failed. Fetching the entry once and deriving both halves
+    /// keeps a slow or unavailable endpoint from being probed twice serially.
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+        // Bound the whole probe: `models_json` first does a token exchange whose
+        // request carries the transport's normal (long) timeout, so a stalled
+        // exchange could otherwise blow past the probe budget even though the
+        // `/models` call itself is capped at `PROBE_TIMEOUT`.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            // Copilot enforces the prompt budget, which is below the full window.
+            let limit = |field: &str| {
+                entry.pointer(&format!("/capabilities/limits/{field}"))?.as_u64().filter(|&n| n > 0).map(|n| n as usize)
+            };
+            let prompt = limit("max_prompt_tokens");
+            let combined = limit("max_context_window_tokens");
+            let window = match (prompt, combined) {
+                // `max_prompt_tokens` caps the prompt alone: output tokens do not
+                // consume it. Keep the larger `max_context_window_tokens` too —
+                // leaving `max_tokens` unchanged against the prompt cap can still
+                // push prompt + output past the full window, so it is enforced as
+                // a second limit.
+                (Some(tokens), combined) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_prompt_tokens".to_string(),
+                    cap: ContextCap::Prompt,
+                    total_tokens: combined,
+                }),
+                // `max_context_window_tokens` alone is the full window.
+                (None, Some(tokens)) => Some(DetectedWindow {
+                    tokens,
+                    source: "Copilot /models max_context_window_tokens".to_string(),
+                    cap: ContextCap::Total,
+                    total_tokens: None,
+                }),
+                (None, None) => None,
+            };
+            let thinking = crate::thinking::Reported::from_model_entry(&entry);
+            Some((window, thinking))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
-        let value = self.models_json(None).await?;
+        let session = self.session_token(false).await?;
+        let value = self.models_json(&session, None).await?;
         let mut models: Vec<String> = value
             .get("data")
             .and_then(Value::as_array)
@@ -676,7 +776,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/chat/completions");
@@ -691,7 +792,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "pong");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/responses");
@@ -715,7 +817,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "bonjour");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/v1/messages");
@@ -737,7 +840,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -765,7 +869,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -798,7 +903,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64), thinking: None };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -834,7 +940,8 @@ mod tests {
         let client = client(&auth);
 
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
@@ -850,7 +957,8 @@ mod tests {
             ),
             Message::tool_result("c", "t", "ok"),
         ];
-        let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None, thinking: None };
         client.chat(&request).await.unwrap();
 
         let auth_log = auth_log.lock().unwrap();
@@ -879,7 +987,8 @@ mod tests {
                 .await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         assert_eq!(auth_log.lock().unwrap().len(), 2);
         assert!(api_log.lock().unwrap()[1].headers.to_lowercase().contains("bearer sess-2"));
@@ -890,7 +999,8 @@ mod tests {
         let (auth, _) = test_server::serve(vec![(404, "", r#"{"message":"Not Found"}"#.into())]).await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
         let err = format!("{:#}", client.chat(&request).await.unwrap_err());
         assert!(err.contains("--login github-copilot"), "{err}");
     }
@@ -899,6 +1009,88 @@ mod tests {
         let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         client(&auth).detect_context_window().await
+    }
+
+    #[tokio::test]
+    async fn reads_thinking_levels_and_window_from_one_models_request() {
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111 },
+            "supports": { "reasoning_effort": ["none", "low", "high"] } } }] });
+        // One `/models` response serves both probes.
+        let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 111);
+        let reported = client.detect_thinking_levels().await.unwrap();
+        assert_eq!(reported.levels, ["off", "low", "high"]);
+        assert_eq!(api_log.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_reads_both_from_one_models_request() {
+        // The agent probes via `detect_capabilities`, so the window and thinking
+        // levels must come from a single `/models` fetch — not one each.
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111 },
+            "supports": { "reasoning_effort": ["none", "low", "high"] } } }] });
+        let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, thinking) = client.detect_capabilities().await;
+        assert_eq!(window.unwrap().tokens, 111);
+        assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
+        assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_makes_one_failed_models_request() {
+        // `model_entry` caches only a successful `/models` response, so probing
+        // the window and thinking separately would re-fetch on failure — two
+        // requests and two waits. The shared probe fails once.
+        let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, thinking) = client.detect_capabilities().await;
+        assert_eq!((window, thinking), (None, None));
+        assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the second probe");
+    }
+
+    #[tokio::test]
+    async fn models_cache_refetches_when_the_endpoint_changes() {
+        // A 401 force-refresh can move the session to a different proxy endpoint.
+        // The `/models` cache is keyed on `api_base`, so the new endpoint's list
+        // (and its levels/window) is fetched instead of serving the old one.
+        let (api1, log1) = test_server::serve(vec![(
+            200,
+            "",
+            json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+                "limits": { "max_prompt_tokens": 111 } } }] })
+            .to_string(),
+        )])
+        .await;
+        let (api2, log2) = test_server::serve(vec![(
+            200,
+            "",
+            json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+                "limits": { "max_prompt_tokens": 222 } } }] })
+            .to_string(),
+        )])
+        .await;
+        // The first token is already past its refresh margin, so the next call
+        // re-exchanges and lands on `api2`.
+        let expired = json!({
+            "token": "sess-1",
+            "expires_at": Utc::now().timestamp() + REFRESH_MARGIN_SECS - 1,
+            "endpoints": { "api": api1 },
+        })
+        .to_string();
+        let (auth, _auth_log) =
+            test_server::serve(vec![(200, "", expired), (200, "", token_body(&api2, "sess-2"))]).await;
+        let client = client(&auth);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 111);
+        assert_eq!(client.detect_context_window().await.unwrap().tokens, 222, "re-fetched from the new endpoint");
+        assert_eq!(log1.lock().unwrap().len(), 1);
+        assert_eq!(log2.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

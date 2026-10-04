@@ -44,6 +44,7 @@ mod shell;
 mod skills;
 mod status;
 mod temperature;
+mod thinking;
 mod tools;
 mod trajectory;
 mod ui;
@@ -173,6 +174,48 @@ enum TermInput {
 fn model_set_text(agent: &Agent) -> String {
     let mut text = format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
     if let Some(warning) = agent.temperature().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    if let Some(warning) = agent.thinking().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    text
+}
+
+/// `/thinking`: the level in effect, the levels the model takes, and how to
+/// change it.
+fn thinking_status_text(agent: &Agent) -> String {
+    let resolved = agent.thinking();
+    let mut out = vec![format!("Thinking: {}", resolved.describe())];
+    if resolved.levels.is_empty() {
+        out.push(format!(
+            "No thinking levels are known for {}; list them with thinking_levels in its provider or model settings.",
+            agent.model_name()
+        ));
+    } else {
+        out.push(format!("Levels for {}: {}", agent.model_name(), resolved.choices()));
+    }
+    if let Some(warning) = &resolved.warning {
+        out.push(format!("Warning: {warning}"));
+    }
+    out.push("(/thinking LEVEL sets it for this session; /thinking reset uses the config again)".to_string());
+    out.join("\n")
+}
+
+/// `/thinking ARG`: set or clear the session level; the reply says what
+/// the model will actually be sent.
+fn set_thinking_text(agent: &mut Agent, arg: &str) -> String {
+    if arg.trim().eq_ignore_ascii_case("reset") {
+        agent.set_thinking(None);
+    } else {
+        match arg.parse::<thinking::Thinking>() {
+            Ok(level) => agent.set_thinking(Some(level)),
+            Err(e) => return e,
+        }
+    }
+    let resolved = agent.thinking();
+    let mut text = format!("Thinking set to {}", resolved.describe());
+    if let Some(warning) = resolved.warning {
         text.push_str(&format!("\nWarning: {warning}"));
     }
     text
@@ -1412,6 +1455,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let mut out: Vec<String> = Vec::new();
             out.push(format!("Model:        {}/{}", stats.provider, stats.model));
             out.push(format!("Temperature:  {}", agent.temperature().describe()));
+            out.push(format!("Thinking:     {}", agent.thinking().describe()));
             out.push(format!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
                 if stats.calibrated { "" } else { "~" },
@@ -1742,6 +1786,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             out.push("(Shift+Tab cycles; /mode NAME sets it directly)".to_string());
             terminal.renderer.print_block(&out.join("\n"));
+            Ok(true)
+        }
+        "/thinking" => {
+            terminal.renderer.print_block(&thinking_status_text(agent));
+            Ok(true)
+        }
+        _ if cmd.starts_with("/thinking ") => {
+            let text = set_thinking_text(agent, &cmd["/thinking ".len()..]);
+            terminal.renderer.print_block(&text);
             Ok(true)
         }
         _ if cmd.starts_with("/mode ") => {
@@ -2149,6 +2202,11 @@ async fn main() -> Result<()> {
             banner.push(notice);
         }
         if let Some(warning) = agent.temperature().warning {
+            banner.push(format!("Warning: {warning}"));
+        }
+        // A preconfigured thinking level that is adjusted or ignored warns too,
+        // not only when /thinking or a model switch surfaces it later.
+        if let Some(warning) = agent.thinking().warning {
             banner.push(format!("Warning: {warning}"));
         }
         banner.push("Type /help for commands".to_string());

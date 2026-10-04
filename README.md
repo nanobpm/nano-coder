@@ -345,7 +345,7 @@ model where it may write.
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
 list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
-argument set (`/model`, `/mode`, `/verbosity`) get the same treatment for their first
+argument set (`/model`, `/mode`, `/verbosity`, `/thinking`) get the same treatment for their first
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
@@ -379,6 +379,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
   - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
+- `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt with the frame renderer: invoked mid-turn (while a turn runs) or under the legacy renderer it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
@@ -581,6 +582,63 @@ provider or model is ignored with a warning at startup and when you switch to it
 top-level `temperature` just doesn't apply to them. Anthropic accepts 0 to 1, so a higher
 value is sent as 1, with a warning. `/context` shows the temperature in use and where it
 comes from, and `/settings` edits it for the current model, its provider, or all models.
+
+### Thinking
+
+`thinking` sets how much the model reasons before it answers: `"default"` sends nothing
+(the model decides), `"off"` turns thinking off, and a level such as `"low"`, `"medium"`,
+`"high"`, `"xhigh"` or `"max"` asks for that much. Like `temperature`, it can be set for all
+models, one provider or one model, and `/thinking LEVEL` overrides them for the session:
+
+```toml
+thinking = "medium"                     # all models that support it
+
+[providers.anthropic.models."claude-opus-4-7"]
+thinking = "xhigh"                      # this model only
+```
+
+A model only gets levels it supports. They come from, in order: `thinking_levels` on the
+model or provider; what the endpoint reports for the model; and a built-in table
+of Claude (3.7 Sonnet and later) and OpenAI reasoning models (GPT-5 and later, o1/o3/o4).
+Endpoints that report levels:
+
+- **GitHub Copilot:** `/models` lists each model's levels, read with the same request as its
+  context window.
+- **Ollama:** a model with the `thinking` capability (`/api/show`) gets `off`, `low`,
+  `medium` and `high`. Ollama refuses a level for a model without it, so none is sent then.
+- **llama.cpp:** the loaded model's chat template (`/props`) decides. A template with an
+  `enable_thinking` switch (Qwen 3 and the like) gets `off` and `on`, and any named level
+  turns thinking on; a template that takes `reasoning_effort` (gpt-oss) gets `low`, `medium`
+  and `high`.
+
+Ollama and llama.cpp are recognized however the provider is named, the same way as for the
+context window. For other models, list the levels yourself:
+
+```toml
+[providers.together.models."deepseek-r1"]
+thinking_levels = ["low", "medium", "high"]   # add "off" if thinking can be turned off
+```
+
+A level the model lacks is moved to the nearest one it has (the highest below it, else the
+lowest), and a model with no known levels is sent nothing. A setting for the provider, the
+model or the session warns when it is adjusted or ignored; the top-level `thinking` doesn't
+warn, since it applies to every model.
+
+How the level is sent depends on the API: `reasoning_effort` (Chat Completions, Ollama
+included; Ollama ignores its native `think` flag on `/v1`), `chat_template_kwargs` for
+llama.cpp (`enable_thinking`, or `reasoning_effort` for templates that take a level; it
+ignores the top-level `reasoning_effort`),
+`reasoning.effort` (Responses), and for Anthropic Messages adaptive thinking with
+`output_config.effort`, or on Claude 3.7 to 4.5 a fixed `budget_tokens` (1024 for minimal, then
+2048, 8192, 16384, 32768, 65536 up to max). The budget has to stay below `max_tokens`, so raise
+`max_tokens` to use a large one. Anthropic takes no custom temperature while thinking, so
+none is sent then. A matching key in the provider's `extra_body` (`reasoning_effort`, `reasoning`,
+`think`, `chat_template_kwargs`, `thinking`, `output_config`) is sent instead, with a warning; the
+configured level is then reported as overridden (not as sent), since the override's value is what
+reaches the wire. The status bar shows
+`think LEVEL` while a level is sent, `/context` shows it with where it comes from,
+`/settings` sets it for the current model, its provider or all models (picking from the
+levels the model supports), and the session log records it for each reply.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and

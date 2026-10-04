@@ -40,6 +40,11 @@ pub const COMMANDS: &[Command] = &[
         description: "Show the model and pick a new one (or switch directly)",
     },
     Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
+    Command {
+        name: "/thinking",
+        args: "[level|default|off|reset]",
+        description: "Show or set the thinking level for this session",
+    },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
     Command {
@@ -123,6 +128,7 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
             .iter()
             .map(|v| Suggestion { value: v.to_string(), note: v.describe().to_string() })
             .collect(),
+        "/thinking" => thinking_suggestions(),
         _ => Vec::new(),
     };
     all.into_iter().filter(|s| s.value.starts_with(prefix)).collect()
@@ -132,7 +138,23 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
 /// set, so its argument type-ahead should be drawn (even when the typed
 /// prefix matches nothing, to say so).
 pub fn has_argument_menu(line: &str) -> bool {
-    matches!(split_command(line), Some(("/model" | "/mode" | "/verbosity", _)))
+    matches!(split_command(line), Some(("/model" | "/mode" | "/verbosity" | "/thinking", _)))
+}
+
+/// `/thinking` candidates: the special values, then the named levels. Which
+/// levels the current model takes shows in `/thinking`; another one is
+/// fitted to the nearest it has.
+fn thinking_suggestions() -> Vec<Suggestion> {
+    let special = [
+        ("default", "send no level; the model decides"),
+        ("off", "turn thinking off, where the model allows it"),
+        ("reset", "drop the session level; use the configured one"),
+    ];
+    special
+        .iter()
+        .map(|(value, note)| Suggestion { value: value.to_string(), note: note.to_string() })
+        .chain(crate::thinking::ORDER.iter().map(|level| Suggestion { value: level.to_string(), note: String::new() }))
+        .collect()
 }
 
 /// `/model` candidates, most-taken pathways first: the current model, then
