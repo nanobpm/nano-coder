@@ -223,6 +223,9 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// `/thinking LEVEL` for this session; wins over the config. Shared so a
+    /// level set mid-turn applies from the agent's next model call.
+    thinking: Mutex<Option<crate::thinking::Thinking>>,
 }
 
 /// Steering and cancellation for the running turn. Cheap to clone and safe to
@@ -241,6 +244,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                thinking: Mutex::new(None),
             }),
         }
     }
@@ -282,6 +286,17 @@ impl TurnControl {
 
     pub fn set_mode(&self, mode: crate::mode::AgentMode) {
         *self.inner.mode.lock().unwrap() = mode;
+    }
+
+    /// The session's `/thinking` level, if one is set.
+    pub fn thinking(&self) -> Option<crate::thinking::Thinking> {
+        self.inner.thinking.lock().unwrap().clone()
+    }
+
+    /// Set (or with `None`, clear) the session's `/thinking` level. A running
+    /// turn sends it from its next model call.
+    pub fn set_thinking(&self, thinking: Option<crate::thinking::Thinking>) {
+        *self.inner.thinking.lock().unwrap() = thinking;
     }
 
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
@@ -426,11 +441,23 @@ enum ClaudePromptHook {
     Reject(String),
 }
 
+/// The thinking level the status line shows: the one actually sent, if any.
+fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
+    match &thinking.effective {
+        // An extra_body override sends its own value, not the configured
+        // level, so no generated level is shown.
+        _ if thinking.overridden => None,
+        // `drop_params` strips the generated field after the body is built, so
+        // the level never reaches the wire either.
+        _ if thinking.dropped => None,
+        crate::thinking::Thinking::Default => None,
+        level => Some(level.to_string()),
+    }
+}
+
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
     client: Box<dyn LLMClient>,
-    /// `/thinking LEVEL` for this session; wins over the config.
-    thinking_override: Option<crate::thinking::Thinking>,
     tools: ToolRegistry,
     hooks: HookRegistry,
     config: Config,
@@ -573,7 +600,6 @@ impl Agent {
         let policy = Policy::new(&config.permissions, &config.sandbox);
         let memory = Self::build_memory(&config);
         Self {
-            thinking_override: None,
             policy,
             client,
             tools: ToolRegistry::new(),
@@ -959,7 +985,7 @@ impl Agent {
         let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
         let mut resolved = crate::thinking::resolve_with(
             &self.config.thinking,
-            self.thinking_override.as_ref(),
+            self.control.thinking().as_ref(),
             self.client.kind(),
             &provider,
             self.model_name(),
@@ -999,7 +1025,7 @@ impl Agent {
 
     /// Set (or with `None`, clear) the thinking level for this session.
     pub fn set_thinking(&mut self, thinking: Option<crate::thinking::Thinking>) {
-        self.thinking_override = thinking;
+        self.control.set_thinking(thinking);
         self.refresh_stats();
     }
 
@@ -1196,17 +1222,7 @@ impl Agent {
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
-            let thinking = self.thinking();
-            stats.thinking = match thinking.effective {
-                // An extra_body override sends its own value, not the
-                // configured level, so no generated level is shown.
-                _ if thinking.overridden => None,
-                // `drop_params` strips the generated field after the body is
-                // built, so the level never reaches the wire either.
-                _ if thinking.dropped => None,
-                crate::thinking::Thinking::Default => None,
-                level => Some(level.to_string()),
-            };
+            stats.thinking = status_thinking(&self.thinking());
         }
         self.emit(AgentEvent::Context);
     }
@@ -1507,7 +1523,7 @@ impl Agent {
         // must not leak into this one. Clear it here — after staging has
         // succeeded — so a `SessionLog::create` / initial-append failure above
         // still leaves the live session (and its override) untouched.
-        self.thinking_override = None;
+        self.control.set_thinking(None);
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
@@ -1598,7 +1614,7 @@ impl Agent {
         // must not leak into the resumed one. Cleared here — after the staged
         // conversation and its repairs have committed — so a failed load leaves
         // the live session's override intact.
-        self.thinking_override = None;
+        self.control.set_thinking(None);
         // `titles_requested` is deliberately not reset: it tracks which
         // sessions this process already asked to title, so switching
         // A → B → A does not launch a second (paid) title request for A.
@@ -2189,6 +2205,11 @@ impl Agent {
                 // step with the attempt that produced the response.
                 let resolved_temperature = self.temperature();
                 let resolved_thinking = self.thinking();
+                // A `/thinking` typed mid-turn changes the level between
+                // steps: keep the status line in step with what is sent.
+                if self.stats.lock().unwrap().thinking != status_thinking(&resolved_thinking) {
+                    self.refresh_stats();
+                }
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
                 // the history tools, so recomputing here lets the retried request
@@ -4513,6 +4534,55 @@ mod tests {
         fn kind(&self) -> Option<providers::ProviderKind> {
             Some(providers::ProviderKind::Anthropic)
         }
+    }
+
+    /// An Anthropic double that calls a tool once, then answers.
+    struct ClaudeWithTool {
+        seen: SeenSettings,
+        responses: Mutex<Vec<LLMResponse>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for ClaudeWithTool {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.seen.lock().unwrap().push((request.temperature, request.thinking.clone()));
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+        fn model_name(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Anthropic)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thinking_level_set_mid_turn_applies_from_the_next_step() {
+        use crate::thinking::{Request, Source, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // `/thinking high` typed while the turn runs: the CLI sets it on the
+        // shared control, here from inside the tool, between the two steps.
+        let control = agent.control();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                control.set_thinking(Some(Thinking::Level("high".into())));
+                Ok(json!("pong"))
+            }),
+        );
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let sent: Vec<_> = seen.lock().unwrap().iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(sent, vec![None, Some(Request::Effort("high".into()))]);
+        assert_eq!(agent.thinking().source, Source::Session);
+        assert_eq!(agent.context_stats().lock().unwrap().thinking.as_deref(), Some("high"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
