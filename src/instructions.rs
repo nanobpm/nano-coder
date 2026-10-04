@@ -144,25 +144,48 @@ fn read_capped(path: &Path) -> Option<String> {
     Some(format!("{}\n\n[... truncated: {} of {} bytes shown]", &text[..end], end, text.len()))
 }
 
+/// Leading spaces before a fence marker. CommonMark allows 0–3 spaces of
+/// indentation; a tab or 4+ leading spaces makes the line an indented code
+/// block, not a fence.
+fn fence_indent(line: &str) -> Option<usize> {
+    let spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if spaces > 3 || line[spaces..].starts_with('\t') {
+        return None;
+    }
+    Some(spaces)
+}
+
 /// The opening fence of a Markdown code block on this line: its character
 /// and the length of its backtick/tilde run. CommonMark closes a fence only
 /// on a run of the same character at least as long, so the length matters.
 fn fence(line: &str) -> Option<(char, usize)> {
-    let t = line.trim_start();
+    let indent = fence_indent(line)?;
+    let t = &line[indent..];
     let ch = match t.chars().next() {
         Some(c @ ('`' | '~')) => c,
         _ => return None,
     };
     let run = t.chars().take_while(|&c| c == ch).count();
-    (run >= 3).then_some((ch, run))
+    if run < 3 {
+        return None;
+    }
+    // A backtick fence's info string may not contain a backtick (CommonMark),
+    // so a line like ``` ```rust ``` opens but ``` ``` ` ``` does not.
+    if ch == '`' && t[run..].contains('`') {
+        return None;
+    }
+    Some((ch, run))
 }
 
-/// Whether this line closes a fence opened as `open`: a run of the same
-/// character at least as long as the opening run.
+/// Whether this line closes a fence opened as `open`: 0–3 spaces of indent, a
+/// run of the same character at least as long as the opening run, and only
+/// whitespace after it. A closing fence may not carry an info string, so a line
+/// like ``` ```not-a-close ``` inside the block does **not** close it.
 fn closes_fence(line: &str, open: (char, usize)) -> bool {
-    let t = line.trim_start();
+    let Some(indent) = fence_indent(line) else { return false };
+    let t = &line[indent..];
     let run = t.chars().take_while(|&c| c == open.0).count();
-    run >= open.1
+    run >= open.1 && t[run..].trim().is_empty()
 }
 
 /// Remove block-level `<!-- ... -->` comments (outside code blocks), as
@@ -511,12 +534,17 @@ impl ProjectInstructions {
     /// that are actually rendered. Resolution still shares the `seen` dedup,
     /// import depth, and outside-repository safety checks used for every other
     /// instruction file.
-    fn resolve_scoped_rule(&mut self, path: &Path, body: &str, user: bool) -> String {
+    fn resolve_scoped_rule(&mut self, path: &Path, body: &str, user: bool) -> Option<String> {
         let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.seen.insert(real);
+        // Canonical "each file once": if this rule's file was already rendered
+        // (an explicit @import, or an earlier matching rule), skip re-emitting
+        // its body. `forget_nested` resets `seen`, so it attaches again later.
+        if !self.seen.insert(real) {
+            return None;
+        }
         let mut out = body.to_string();
         self.append_rule_imports(path, body, user, 0, &mut out);
-        out
+        Some(out)
     }
 
     fn append_rule_imports(&mut self, from: &Path, text: &str, user: bool, depth: usize, out: &mut String) {
@@ -743,7 +771,7 @@ impl ProjectInstructions {
                 }
             }
             for (rule_path, body, user) in matched {
-                let text = self.resolve_scoped_rule(&rule_path, &body, user);
+                let Some(text) = self.resolve_scoped_rule(&rule_path, &body, user) else { continue };
                 let section = format!(
                     "\n\n[Rule {} applies to {rel}. Follow it for changes to matching files:]\n{text}",
                     self.display(&rule_path)
@@ -1006,6 +1034,24 @@ mod tests {
     }
 
     #[test]
+    fn fence_close_requires_a_bare_marker_and_small_indent() {
+        // A run with trailing non-whitespace is NOT a closing fence, so an
+        // @import on the next line stays inside the code block.
+        let text = "```\n@secret.md\n```not-a-close\n@still.md\n```\n@after.md";
+        assert_eq!(import_refs(text), vec!["after.md".to_string()]);
+        assert!(strip_html_comments("```\n<!-- a -->\n```x\n<!-- b -->\n```").contains("<!-- a -->"));
+        // A 4-space-indented run is indented code, not a fence marker, so it
+        // does not CLOSE an open fence: the @import after it stays inside until
+        // a bare marker closes the block.
+        assert_eq!(import_refs("```\n@secret.md\n    ```\n@still.md\n```\n@after.md"), vec!["after.md".to_string()]);
+        // Up to 3 spaces of indent is still a valid fence.
+        assert_eq!(import_refs("   ```\n@in.md\n   ```\n@out.md"), vec!["out.md".to_string()]);
+        // A backtick fence's info string may not contain a backtick, so this
+        // line is not an opening fence and the @import is extracted.
+        assert_eq!(import_refs("``` `x\n@live.md"), vec!["live.md".to_string()]);
+    }
+
+    #[test]
     fn render_cap_bounds_total_with_header_and_single_marker() {
         let (_dir, root) = repo();
         // Many nested files, each near the per-file cap, well past the total cap.
@@ -1093,6 +1139,19 @@ mod tests {
         assert_eq!(instructions.nested_for(&root.join("sub/README.md")), None);
         instructions.forget_nested();
         assert!(instructions.nested_for(&root.join("src/api/y.ts")).is_some());
+    }
+
+    #[test]
+    fn a_scoped_rule_already_imported_is_not_re_emitted() {
+        let (_dir, root) = repo();
+        // dup.md is both explicitly imported by CLAUDE.md and a path-scoped rule.
+        write(&root.join(".claude/rules/dup.md"), "---\npaths: docs/**\n---\ndup body");
+        write(&root.join("CLAUDE.md"), "@.claude/rules/dup.md");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        // Imported once at the top level.
+        assert_eq!(instructions.render().matches("dup body").count(), 1);
+        // Matching a docs file must not attach the rule body again (already seen).
+        assert_eq!(instructions.nested_for(&root.join("docs/x.md")), None);
     }
 
     #[test]

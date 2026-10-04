@@ -2619,7 +2619,7 @@ impl Agent {
                     if ok && tool_call.name == memory::SAVE_TOOL {
                         self.reminders.memory_saved();
                     }
-                    let memory_writable = self.config.memory.enabled() && self.memory_writable();
+                    let memory_writable = self.memory_enabled() && self.memory_writable();
                     for note in self.reminders.after_tool_call(&self.plan, memory_writable) {
                         result_text.push_str("\n\n");
                         result_text.push_str(&reminders::wrap(&note));
