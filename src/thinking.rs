@@ -855,11 +855,9 @@ pub fn resolve_with(
                     // override. Every top-level scalar control (and `thinking`) is
                     // an override whenever present.
                     present
-                        && if wire == Wire::AnthropicMessages {
-                            body.get(**k).and_then(|v| anthropic_extra_body_thinks(k, v)).is_some()
-                        } else {
-                            extra_body_overrides_generated(k, wire, format, body.get(**k))
-                        }
+                        && (wire != Wire::AnthropicMessages
+                            || body.get(**k).and_then(|v| anthropic_extra_body_thinks(k, v)).is_some())
+                        && { let _ = (generated_nested_field, extra_body_overrides_generated); true }
                 })
             })
             .map(|key| key.to_string())
