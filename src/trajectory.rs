@@ -86,13 +86,27 @@ pub struct Row {
     /// `0.3 (set for this model)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<String>,
+    /// The thinking level and its source for the request that produced this
+    /// row (assistant/think rows only, when one was set), e.g.
+    /// `high (set for this model)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<DateTime<FixedOffset>>,
 }
 
 impl Row {
     fn new(kind: RowKind, text: String) -> Self {
-        Self { id: None, kind, text, usage: None, duration_ms: None, temperature: None, timestamp: None }
+        Self {
+            id: None,
+            kind,
+            text,
+            usage: None,
+            duration_ms: None,
+            temperature: None,
+            thinking_level: None,
+            timestamp: None,
+        }
     }
 
     /// [`Row::label`] prefixed with the row's `#N` log ID, when it has one.
@@ -139,6 +153,9 @@ impl Row {
         }
         if let Some(temperature) = &self.temperature {
             bits.push(format!("temp {temperature}"));
+        }
+        if let Some(level) = &self.thinking_level {
+            bits.push(format!("thinking {level}"));
         }
         (!bits.is_empty()).then(|| bits.join(", "))
     }
@@ -486,6 +503,7 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
                 row.temperature = message.temperature.clone();
+                row.thinking_level = message.thinking_level.clone();
                 row.timestamp = message.timestamp;
                 turn.rows.push(row);
             }
@@ -504,6 +522,7 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
                 row.temperature = message.temperature.clone();
+                row.thinking_level = message.thinking_level.clone();
             }
             row.timestamp = message.timestamp;
             turn.rows.push(row);

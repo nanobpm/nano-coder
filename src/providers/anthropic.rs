@@ -9,6 +9,7 @@ use super::{HttpTransport, ProviderKind, ResolvedProvider, StreamAction};
 use crate::llm::{
     ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
 };
+use crate::thinking::Request;
 
 const API_VERSION: &str = "2023-06-01";
 /// The Messages API requires `max_tokens`.
@@ -61,6 +62,41 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     if let Some(temperature) = request.temperature {
         // Anthropic's range is 0..=1.
         body["temperature"] = json!(temperature.clamp(0.0, 1.0));
+    }
+    let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let thinking_on = match &request.thinking {
+        Some(Request::Effort(level)) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"] = json!({ "effort": level });
+            true
+        }
+        // Only the enable half: the provider's `extra_body.output_config.effort`
+        // overrides the effort value and is deep-merged in by `finish_body`, but
+        // adaptive thinking still needs this `thinking` control on the wire.
+        Some(Request::AdaptiveOn) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+            true
+        }
+        // The budget must stay below `max_tokens`; with no room for the
+        // minimum, thinking stays off (the agent warns about this).
+        Some(Request::Budget(budget)) => match crate::thinking::capped_budget(*budget, max_tokens) {
+            Some(budget) => {
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                true
+            }
+            None => false,
+        },
+        Some(Request::Off) => {
+            body["thinking"] = json!({ "type": "disabled" });
+            false
+        }
+        // Chat Completions (llama.cpp) forms; not resolved for this API.
+        Some(Request::TemplateSwitch(_) | Request::TemplateEffort(_)) | None => false,
+    };
+    if thinking_on && let Some(object) = body.as_object_mut() {
+        // Thinking rules out a custom temperature; the agent already sends
+        // none then, so this only guards other callers.
+        object.remove("temperature");
     }
     transport.finish_body(body)
 }
@@ -426,6 +462,55 @@ mod tests {
     }
 
     #[test]
+    fn encodes_thinking_levels() {
+        let messages = vec![Message::user("hi")];
+        let body = |thinking: Request, max_tokens: Option<i64>| {
+            client("http://x").build_body(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: Some(0.5),
+                max_tokens,
+                thinking: Some(thinking),
+            })
+        };
+        // Adaptive models: the level is an effort.
+        let b = body(Request::Effort("high".into()), None);
+        assert_eq!(b["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(b["output_config"], json!({ "effort": "high" }));
+        assert!(b.get("temperature").is_none(), "{b}");
+        // Older models: a budget, kept below max_tokens.
+        let b = body(Request::Budget(16384), Some(4096));
+        assert_eq!(b["thinking"], json!({ "type": "enabled", "budget_tokens": 4095 }));
+        assert!(b.get("temperature").is_none(), "{b}");
+        // No room for the minimum: no thinking, temperature kept.
+        let b = body(Request::Budget(16384), Some(1000));
+        assert!(b.get("thinking").is_none(), "{b}");
+        assert_eq!(b["temperature"], 0.5);
+        let b = body(Request::Off, None);
+        assert_eq!(b["thinking"], json!({ "type": "disabled" }));
+        assert_eq!(b["temperature"], 0.5);
+    }
+
+    #[test]
+    fn encodes_adaptive_on_without_output_config() {
+        // `AdaptiveOn` emits only the enable half (`thinking.type = "adaptive"`)
+        // and no `output_config`: the provider's `extra_body.output_config.effort`
+        // supplies the effort via `finish_body`'s deep-merge. Thinking is on, so
+        // a custom temperature is still dropped.
+        let messages = vec![Message::user("hi")];
+        let b = client("http://x").build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: Some(0.5),
+            max_tokens: None,
+            thinking: Some(Request::AdaptiveOn),
+        });
+        assert_eq!(b["thinking"], json!({ "type": "adaptive" }));
+        assert!(b.get("output_config").is_none(), "the override owns output_config: {b}");
+        assert!(b.get("temperature").is_none(), "thinking rules out a custom temperature: {b}");
+    }
+
+    #[test]
     fn encodes_system_tools_and_grouped_tool_results() {
         let messages = vec![
             Message::system("be brief"),
@@ -453,6 +538,7 @@ mod tests {
             tools: &tools,
             temperature: Some(1.5),
             max_tokens: None,
+            thinking: None,
         });
         assert_eq!(body["system"], "be brief");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -491,7 +577,13 @@ mod tests {
         .await;
         let messages = [Message::user("date?")];
         let response = client(&url)
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: Some(64),
+                thinking: None,
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "Let me check.");
@@ -556,7 +648,13 @@ mod tests {
         };
         let response = client(&url)
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: Some(64),
+                    thinking: None,
+                },
                 &sink,
             )
             .await
@@ -659,7 +757,13 @@ mod tests {
         };
         let response = client(&url)
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: Some(64),
+                    thinking: None,
+                },
                 &sink,
             )
             .await

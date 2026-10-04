@@ -73,6 +73,11 @@ pub struct Message {
     /// so runs can be compared. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<String>,
+    /// Assistant messages: the thinking level sent for the request that
+    /// produced this message and where it came from, e.g. `high (set for this
+    /// model)`. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 impl Message {
@@ -91,6 +96,7 @@ impl Message {
             usage: None,
             duration_ms: None,
             temperature: None,
+            thinking_level: None,
         }
     }
 
@@ -292,6 +298,8 @@ pub struct ChatRequest<'a> {
     pub tools: &'a [ToolDefinition],
     pub temperature: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// Thinking level to ask for; `None` sends nothing.
+    pub thinking: Option<crate::thinking::Request>,
 }
 
 /// Incremental output while a response streams in.
@@ -343,6 +351,20 @@ pub trait LLMClient: Send + Sync {
     /// The context window the endpoint reports for the current model, if any.
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         None
+    }
+    /// The thinking levels the endpoint reports for the current model, if any.
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        None
+    }
+    /// The window and thinking levels the endpoint reports, probed together.
+    ///
+    /// The default probes each on its own; a provider whose two detections
+    /// would fetch the same endpoint response (OpenAI-compatible servers probe
+    /// `/models`, then llama.cpp `/props` or Ollama `/api/show` for both)
+    /// overrides this to share one fetch, so a slow or unavailable endpoint is
+    /// not probed twice serially.
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+        (self.detect_context_window().await, self.detect_thinking_levels().await)
     }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;

@@ -87,6 +87,12 @@ pub struct ProviderConfig {
     /// Temperature for this provider's models: a number, or `"default"` to
     /// send none. Overrides the top-level `temperature`.
     pub temperature: Option<crate::temperature::Temperature>,
+    /// Thinking level for this provider's models: `"default"`, `"off"` or a
+    /// level name. Overrides the top-level `thinking`.
+    pub thinking: Option<crate::thinking::Thinking>,
+    /// Thinking levels this provider's models accept, overriding the built-in
+    /// table (e.g. `["low", "high"]`; add `"off"` if thinking can be turned off).
+    pub thinking_levels: Option<Vec<String>>,
     /// Per-model settings (`[providers.NAME.models."MODEL"]`), which win over
     /// the provider's.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -126,13 +132,21 @@ impl ProviderConfig {
             retry_max_backoff_ms,
             retryable_statuses,
             replay_reasoning,
-            temperature
+            temperature,
+            thinking,
+            thinking_levels
         );
         self.headers.extend(other.headers.clone());
         for (model, settings) in &other.models {
             let entry = self.models.entry(model.clone()).or_default();
             if settings.temperature.is_some() {
                 entry.temperature = settings.temperature;
+            }
+            if settings.thinking.is_some() {
+                entry.thinking = settings.thinking.clone();
+            }
+            if settings.thinking_levels.is_some() {
+                entry.thinking_levels = settings.thinking_levels.clone();
             }
         }
         self
@@ -407,6 +421,25 @@ pub(crate) enum StreamAction<'a> {
     Reset,
 }
 
+/// Recursively merge `source` into `target`, both JSON objects. A key present
+/// in both is merged when both values are objects (so nested fields coexist),
+/// otherwise `source` wins. Non-object arguments are left untouched. Used by
+/// `finish_body` so an `extra_body` nested option does not clobber an unrelated
+/// generated sibling field (e.g. `output_config.format` vs the generated
+/// `output_config.effort`).
+fn merge_object(target: &mut Value, source: &Value) {
+    if let (Value::Object(target), Value::Object(source)) = (target, source) {
+        for (key, value) in source {
+            match target.get_mut(key) {
+                Some(existing @ Value::Object(_)) if value.is_object() => merge_object(existing, value),
+                _ => {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+}
+
 impl HttpTransport {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -440,7 +473,19 @@ impl HttpTransport {
                 if key == "temperature" {
                     continue;
                 }
-                object.insert(key.clone(), value.clone());
+                match object.get_mut(key) {
+                    // Merge nested objects field-by-field so an unrelated
+                    // `extra_body` option (e.g. `output_config.format`) does not
+                    // clobber a generated sibling field (e.g. the adaptive
+                    // `output_config.effort`). `extra_body` still wins per field,
+                    // so a control it does set replaces the generated one.
+                    Some(existing @ Value::Object(_)) if value.is_object() => {
+                        merge_object(existing, value);
+                    }
+                    _ => {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
             }
             for key in &self.provider.drop_params {
                 object.remove(key);
@@ -865,6 +910,58 @@ mod tests {
         let finished = transport.finish_body(serde_json::json!({"temperature": 0.3}));
         assert_eq!(finished["temperature"], serde_json::json!(0.3));
         assert_eq!(finished["think"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn finish_body_deep_merges_nested_extra_body_objects() {
+        // A generated nested field (e.g. the adaptive `output_config.effort`)
+        // and an unrelated `extra_body` sibling (`output_config.format`) must
+        // coexist: `finish_body` deep-merges object-valued keys instead of
+        // clobbering the whole object. Regression: a shallow insert replaced the
+        // generated `output_config` wholesale, dropping the requested thinking
+        // effort while keeping only `format`.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = { format = "json" }"#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(
+            finished["output_config"],
+            serde_json::json!({"effort": "high", "format": "json"}),
+            "nested objects merge field-by-field"
+        );
+        // A field the extra_body DOES set still wins (per-field override).
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = { effort = "low" }"#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(finished["output_config"], serde_json::json!({"effort": "low"}), "extra_body wins per field");
+        // A non-object extra_body value replaces wholesale, as before.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = "scalar""#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(finished["output_config"], serde_json::json!("scalar"), "a scalar override replaces the object");
     }
 
     #[test]
