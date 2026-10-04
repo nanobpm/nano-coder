@@ -7,7 +7,8 @@
 //! the session.
 //!
 //! Only levels the model supports can be sent. They come from a
-//! `thinking_levels` list in the config (model, then provider), else a
+//! `thinking_levels` list in the config (model, then provider), else what the
+//! endpoint reports (Copilot, Ollama, and llama.cpp capability data), else a
 //! built-in table of well-known model families. A level the model doesn't
 //! support is moved to the nearest one it does, with a warning.
 //!
@@ -105,6 +106,14 @@ pub enum Request {
     /// Anthropic fixed thinking budget in tokens; the builder caps it below
     /// `max_tokens`.
     Budget(u32),
+    /// Anthropic adaptive thinking with only its enable half,
+    /// `thinking = { type = "adaptive" }` — emitted when the provider's
+    /// `extra_body.output_config.effort` overrides the effort value. The
+    /// override owns `output_config` (deep-merged in by `finish_body`), but
+    /// adaptive thinking still requires the `thinking` control to reach the
+    /// wire; emitting the full [`Request::Effort`] would have `request()`
+    /// suppress it and drop this required half.
+    AdaptiveOn,
     /// llama.cpp, chat templates with an on/off switch (Qwen 3 and the
     /// like): `chat_template_kwargs.enable_thinking`.
     TemplateSwitch(bool),
@@ -137,7 +146,15 @@ pub fn budget_tokens(level: &str) -> u32 {
         "medium" => 8192,
         "high" => 16384,
         "xhigh" => 32768,
-        _ => 65536,
+        "max" => 65536,
+        // A custom `thinking_levels` name is not on the standard scale, so it
+        // has no meaningful budget mapping. Mapping it to the maximum (65,536)
+        // would silently send the largest, most expensive budget for an
+        // unrecognized name; use the `high` budget as a conservative ceiling
+        // instead. (`resolve_with` fits a requested level to the model's known
+        // levels, so an unranked name only reaches here when the user
+        // explicitly configured it for a Budget-style model.)
+        _ => 16384,
     }
 }
 
@@ -574,7 +591,32 @@ impl Resolved {
         // (one of which `finish_body` may not even overwrite, e.g. a Chat
         // Completions `think` alongside the generated `reasoning_effort`, or an
         // Anthropic `thinking` alongside the generated `output_config`).
-        if self.extra_body_override.is_some() {
+        if let Some(key) = &self.extra_body_override {
+            // An `output_config.effort` override on an Anthropic *adaptive*
+            // model is only a field-level override: it owns the effort value
+            // (deep-merged into `output_config` by `finish_body`) but never the
+            // `thinking` half, which is a separate top-level key. Suppressing
+            // the whole generated control would drop that required half, so
+            // emit it and let the override own only `output_config`:
+            // - a requested *level* still needs `thinking = { type = "adaptive"
+            //   }` for the override's effort to take effect — but only when the
+            //   effort *enables* thinking (`extra_body_thinking_on == Some(true)`).
+            //   A *disabling* effort (`effort = "none"`) must not emit it: that
+            //   would re-enable thinking the override turned off.
+            // - a requested `off` still needs its `thinking = { type =
+            //   "disabled" }` disable control, or an enabling effort override
+            //   would silently turn thinking on against the explicit `off`.
+            // Every other override owns the whole control, so the generated
+            // field stays suppressed.
+            if key == "output_config" && self.wire == Wire::AnthropicMessages && self.anthropic == AnthropicStyle::Adaptive {
+                match &self.effective {
+                    Thinking::Level(_) if self.extra_body_thinking_on == Some(true) => {
+                        return Some(Request::AdaptiveOn);
+                    }
+                    Thinking::Off => return Some(Request::Off),
+                    _ => {}
+                }
+            }
             return None;
         }
         // `drop_params` strips the generated field after the body is built, so
@@ -1285,13 +1327,64 @@ mod tests {
         assert_eq!(r.request(), Some(Request::Effort("high".into())), "the requested level is still emitted");
         assert_eq!(r.warning, None, "no override warning for a non-thinking output_config");
 
-        // An `effort` field IS a thinking override and still suppresses the
-        // generated control (the override owns the thinking decision).
+        // An `effort` field IS a thinking override, but only a *field-level*
+        // one: it owns the effort value while the generated `thinking = { type
+        // = "adaptive" }` half must still reach the wire (adaptive thinking is
+        // incomplete without it). So `request()` emits the enable half
+        // (`AdaptiveOn`) and lets `finish_body` merge the override's
+        // `output_config.effort` alongside it. Regression: this returned `None`,
+        // sending `output_config.effort` with no `thinking` control.
         let p = provider(r#"extra_body = { output_config = { effort = "low", format = "json" } }"#);
         let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-7");
         assert!(r.overridden, "an effort-bearing output_config overrides the generated level");
         assert_eq!(r.extra_body_override.as_deref(), Some("output_config"));
-        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+        assert_eq!(
+            r.request(),
+            Some(Request::AdaptiveOn),
+            "the generated thinking half is preserved; the override owns only the effort"
+        );
+    }
+
+    #[test]
+    fn adaptive_output_config_effort_override_keeps_the_thinking_control() {
+        // End-to-end at the body builder: with `thinking = "high"` and
+        // `extra_body.output_config.effort = "low"`, the wire must carry BOTH
+        // the generated `thinking = { type = "adaptive" }` (required for
+        // adaptive thinking) AND the override's `output_config.effort = "low"`
+        // (deep-merged by `finish_body`, winning the effort field).
+        let anthropic = Some(ProviderKind::Anthropic);
+        let p = provider(r#"extra_body = { output_config = { effort = "low" } }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-7");
+        assert_eq!(r.request(), Some(Request::AdaptiveOn));
+        // The reported level is the override's, not the requested "high".
+        assert!(r.overridden);
+
+        // A Budget-style model has no `output_config` half, so an
+        // `output_config.effort` there is a full override that suppresses the
+        // generated `thinking` budget (the override owns the whole control).
+        let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-5");
+        assert_eq!(r.anthropic, AnthropicStyle::Budget);
+        assert!(r.overridden);
+        assert_eq!(r.request(), None, "a Budget model has no adaptive half to preserve");
+    }
+
+    #[test]
+    fn adaptive_off_request_keeps_its_disable_control_under_an_effort_override() {
+        // With `thinking = "off"` and an enabling `extra_body.output_config.effort`,
+        // the override owns only the effort — NOT the `thinking` half. The
+        // generated disable control `thinking = { type = "disabled" }` must still
+        // reach the wire, or the effort would silently turn thinking on against
+        // the explicit `off`. (claude-sonnet-4-7 is adaptive and off-capable.)
+        let anthropic = Some(ProviderKind::Anthropic);
+        let p = provider(r#"extra_body = { output_config = { effort = "low" } }"#);
+        let r = resolve(&Thinking::Default, Some(&Thinking::Off), anthropic, &p, "claude-sonnet-4-7");
+        assert_eq!(r.effective, Thinking::Off);
+        assert_eq!(r.extra_body_override.as_deref(), Some("output_config"));
+        assert_eq!(
+            r.request(),
+            Some(Request::Off),
+            "the generated disable control is preserved; the override owns only the effort"
+        );
     }
 
     #[test]
@@ -1512,6 +1605,22 @@ mod tests {
     }
 
     #[test]
+    fn budget_tokens_maps_custom_names_to_a_conservative_ceiling() {
+        // Every standard level maps to its documented budget, `max` included.
+        assert_eq!(budget_tokens("minimal"), 1024);
+        assert_eq!(budget_tokens("low"), 2048);
+        assert_eq!(budget_tokens("medium"), 8192);
+        assert_eq!(budget_tokens("high"), 16384);
+        assert_eq!(budget_tokens("xhigh"), 32768);
+        assert_eq!(budget_tokens("max"), 65536);
+        // A custom `thinking_levels` name is off the standard scale: it must NOT
+        // silently request the maximum budget. Regression: the `_` wildcard
+        // mapped every unrecognized name to 65,536.
+        assert_eq!(budget_tokens("fast"), 16384, "an unrecognized name caps at the high budget, not the max");
+        assert_eq!(budget_tokens("deep"), 16384);
+    }
+
+    #[test]
     fn dropped_or_overridden_field_still_locks_an_always_thinking_model() {
         // A no-`off` model (Claude 5.5+) thinks by default, so even when the
         // generated thinking field is stripped by `drop_params` (or suppressed
@@ -1526,10 +1635,13 @@ mod tests {
         assert!(r.always_anthropic_thinking(), "the model still thinks with no field sent");
 
         // Same for a fully suppressing `extra_body` override on a no-off model.
+        // An enabling `output_config.effort` override is only a field-level
+        // override on an adaptive model: it owns the effort, but the generated
+        // `thinking` enable half still reaches the wire (`AdaptiveOn`).
         let p = provider("extra_body = { output_config = { effort = \"high\" } }");
         let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-opus-5.5");
         assert!(r.overridden);
-        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+        assert_eq!(r.request(), Some(Request::AdaptiveOn), "the override owns the effort; the thinking half is preserved");
         assert!(r.anthropic_thinking_on(), "an overridden field does not stop a no-off model thinking");
     }
 
@@ -1538,11 +1650,11 @@ mod tests {
         // On an OFF-capable Anthropic model the generated field is suppressed by
         // the override, so the lock depends on the override's own value — the
         // model does not think on its own. claude-sonnet-4-6 can turn off.
-        // An explicitly enabling override locks the temperature...
+        // An explicitly enabling override locks the temperature. A `thinking`
+        // control is a full override (suppresses the whole generated field)...
         for body in [
             "extra_body = { thinking = { type = \"enabled\" } }",
             "extra_body = { thinking = true }",
-            "extra_body = { output_config = { effort = \"high\" } }",
         ] {
             let p = provider(body);
             let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
@@ -1551,6 +1663,16 @@ mod tests {
             assert!(r.anthropic_thinking_on(), "{body}: an enabling override locks the temperature");
             assert!(r.always_anthropic_thinking(), "{body}: enabling override thinks with no generated field");
         }
+        // ...while an enabling `output_config.effort` is only a field-level
+        // override: it owns the effort but the generated `thinking` enable half
+        // still reaches the wire (`AdaptiveOn`), and the temperature stays
+        // locked because the model is asked to think.
+        let p = provider("extra_body = { output_config = { effort = \"high\" } }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
+        assert!(r.overridden);
+        assert_eq!(r.request(), Some(Request::AdaptiveOn), "the effort override preserves the generated thinking half");
+        assert!(r.anthropic_thinking_on(), "an enabling override locks the temperature");
+        assert!(r.always_anthropic_thinking(), "enabling override thinks with the thinking half sent");
         // ...but an explicitly disabling override leaves a custom temperature
         // valid on an off-capable model (nothing asks it to think).
         for body in [
@@ -1564,6 +1686,12 @@ mod tests {
             assert!(!r.anthropic_thinking_on(), "{body}: a disabling override does not lock the temperature");
             assert!(!r.always_anthropic_thinking(), "{body}: a disabling override does not think");
         }
+        // A disabling `output_config.effort` must NOT emit the adaptive enable
+        // half: that would re-enable the thinking the override turned off.
+        let p = provider("extra_body = { output_config = { effort = \"none\" } }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), Some(ProviderKind::Anthropic), &p, "claude-sonnet-4-6");
+        assert_eq!(r.extra_body_thinking_on, Some(false));
+        assert_eq!(r.request(), None, "a disabling effort override emits no thinking control");
         // An enabling extra_body control locks the temperature even with NO
         // thinking level requested (the override gate is not taken, yet the
         // control still reaches the wire and the model thinks).

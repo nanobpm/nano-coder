@@ -70,6 +70,13 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
             body["output_config"] = json!({ "effort": level });
             true
         }
+        // Only the enable half: the provider's `extra_body.output_config.effort`
+        // overrides the effort value and is deep-merged in by `finish_body`, but
+        // adaptive thinking still needs this `thinking` control on the wire.
+        Some(Request::AdaptiveOn) => {
+            body["thinking"] = json!({ "type": "adaptive" });
+            true
+        }
         // The budget must stay below `max_tokens`; with no room for the
         // minimum, thinking stays off (the agent warns about this).
         Some(Request::Budget(budget)) => match crate::thinking::capped_budget(*budget, max_tokens) {
@@ -482,6 +489,25 @@ mod tests {
         let b = body(Request::Off, None);
         assert_eq!(b["thinking"], json!({ "type": "disabled" }));
         assert_eq!(b["temperature"], 0.5);
+    }
+
+    #[test]
+    fn encodes_adaptive_on_without_output_config() {
+        // `AdaptiveOn` emits only the enable half (`thinking.type = "adaptive"`)
+        // and no `output_config`: the provider's `extra_body.output_config.effort`
+        // supplies the effort via `finish_body`'s deep-merge. Thinking is on, so
+        // a custom temperature is still dropped.
+        let messages = vec![Message::user("hi")];
+        let b = client("http://x").build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: Some(0.5),
+            max_tokens: None,
+            thinking: Some(Request::AdaptiveOn),
+        });
+        assert_eq!(b["thinking"], json!({ "type": "adaptive" }));
+        assert!(b.get("output_config").is_none(), "the override owns output_config: {b}");
+        assert!(b.get("temperature").is_none(), "thinking rules out a custom temperature: {b}");
     }
 
     #[test]
