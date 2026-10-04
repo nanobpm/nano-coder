@@ -469,8 +469,11 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     let filled = ((percent / 10.0).round() as usize).min(10);
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
     let approx = if stats.calibrated { "" } else { "~" };
-    let model =
+    let mut model =
         if stats.model.is_empty() { stats.provider.clone() } else { format!("{}/{}", stats.provider, stats.model) };
+    if let Some(level) = stats.thinking {
+        model.push_str(&format!(" · think {level}"));
+    }
 
     let mut segments = vec![
         Segment { text: format!(" {model} "), color: Some("\x1b[1;38;5;255m"), priority: 9 },
@@ -648,7 +651,15 @@ mod tests {
             cwd: "/tmp/project".into(),
             tokens_per_sec: None,
             mode: crate::mode::AgentMode::Normal,
+            thinking: None,
         }
+    }
+
+    #[test]
+    fn shows_the_thinking_level_next_to_the_model() {
+        let line = visible(&render(&ContextStats { thinking: Some(crate::thinking::Thinking::High), ..stats() }, 160));
+        assert!(line.contains("work/llama-b · think high"), "{line}");
+        assert!(!visible(&render(&stats(), 160)).contains("think"));
     }
 
     #[test]

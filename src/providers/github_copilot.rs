@@ -676,7 +676,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/chat/completions");
@@ -691,7 +692,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "pong");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/responses");
@@ -715,7 +717,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "bonjour");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/v1/messages");
@@ -737,7 +740,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -765,7 +769,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -798,7 +803,8 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: Some(64) };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -834,7 +840,8 @@ mod tests {
         let client = client(&auth);
 
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
@@ -850,7 +857,8 @@ mod tests {
             ),
             Message::tool_result("c", "t", "ok"),
         ];
-        let request = ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &followup, tools: &[], temperature: None, thinking: None, max_tokens: None };
         client.chat(&request).await.unwrap();
 
         let auth_log = auth_log.lock().unwrap();
@@ -879,7 +887,8 @@ mod tests {
                 .await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         assert_eq!(auth_log.lock().unwrap().len(), 2);
         assert!(api_log.lock().unwrap()[1].headers.to_lowercase().contains("bearer sess-2"));
@@ -890,7 +899,8 @@ mod tests {
         let (auth, _) = test_server::serve(vec![(404, "", r#"{"message":"Not Found"}"#.into())]).await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         let err = format!("{:#}", client.chat(&request).await.unwrap_err());
         assert!(err.contains("--login github-copilot"), "{err}");
     }

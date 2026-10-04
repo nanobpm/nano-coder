@@ -86,6 +86,8 @@ impl<'de> Deserialize<'de> for Temperature {
 pub struct ModelSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<Temperature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::thinking::Thinking>,
 }
 
 /// Where the temperature in effect came from.

@@ -221,6 +221,8 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// Thinking level set with `/thinking` for this session, over the config.
+    thinking: Mutex<Option<crate::thinking::Thinking>>,
 }
 
 /// Steering and cancellation for the running turn. Cheap to clone and safe to
@@ -239,6 +241,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                thinking: Mutex::new(None),
             }),
         }
     }
@@ -280,6 +283,17 @@ impl TurnControl {
 
     pub fn set_mode(&self, mode: crate::mode::AgentMode) {
         *self.inner.mode.lock().unwrap() = mode;
+    }
+
+    /// The session's thinking level from `/thinking`, if set.
+    pub fn thinking(&self) -> Option<crate::thinking::Thinking> {
+        *self.inner.thinking.lock().unwrap()
+    }
+
+    /// Set the session's thinking level; a running turn uses it from its
+    /// next model call.
+    pub fn set_thinking(&self, level: Option<crate::thinking::Thinking>) {
+        *self.inner.thinking.lock().unwrap() = level;
     }
 
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
@@ -563,6 +577,43 @@ impl Agent {
         crate::temperature::resolve(self.config.temperature, kind, &provider, self.model_name())
     }
 
+    /// The thinking level the current model is sent, and where it comes from:
+    /// the session's `/thinking` level, else model > provider > global config.
+    pub fn thinking(&self) -> crate::thinking::Resolved {
+        // Like `temperature()`: resolve against the live client, whose API
+        // kind decides the field (a kindless test double sends none).
+        let (user, _default_provider) = self.config.effective_providers();
+        let provider = providers::effective_providers(&user).get(self.provider_name()).cloned().unwrap_or_default();
+        let kind = self.client.kind().unwrap_or(providers::ProviderKind::Mock);
+        let mut resolved = crate::thinking::resolve(self.config.thinking, kind, &provider, self.model_name());
+        if let Some(level) = self.control.thinking()
+            && resolved.fixed.is_none()
+            && resolved.source != crate::thinking::Source::ExtraBody
+        {
+            resolved.effective = level;
+            resolved.source = crate::thinking::Source::Session;
+            resolved.warning = None;
+        }
+        resolved
+    }
+
+    /// The thinking levels the current model accepts.
+    pub fn thinking_levels(&self) -> &'static [crate::thinking::Thinking] {
+        // The same live-client view as `thinking()`.
+        if self.thinking().fixed.is_some() {
+            &[crate::thinking::Thinking::Default]
+        } else {
+            crate::thinking::Thinking::ALL
+        }
+    }
+
+    /// Set the thinking level for this session (`None` returns to config);
+    /// refreshes the status line.
+    pub fn set_thinking(&self, level: Option<crate::thinking::Thinking>) {
+        self.control.set_thinking(level);
+        self.refresh_stats();
+    }
+
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         self.client = Self::client_for(&self.config, spec)?;
@@ -711,6 +762,7 @@ impl Agent {
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
+            stats.thinking = self.thinking().value();
         }
         self.emit(AgentEvent::Context);
     }
@@ -1368,6 +1420,7 @@ impl Agent {
             // temperature do not change across overflow retries, and the
             // trajectory records the same effective value that is sent.
             let resolved_temperature = self.temperature();
+            let resolved_thinking = self.thinking();
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Rebuilt every retry iteration, not just once before the loop:
@@ -1380,6 +1433,7 @@ impl Agent {
                     messages: &self.conversation,
                     tools: &tools,
                     temperature: resolved_temperature.value(),
+                    thinking: resolved_thinking.value(),
                     max_tokens: Some(self.request_max_tokens()),
                 };
                 let control = self.control.clone();
@@ -1517,6 +1571,7 @@ impl Agent {
                 usage: response.usage.clone(),
                 duration_ms: Some(duration_ms),
                 temperature: Some(resolved_temperature.describe()),
+                thinking_level: Some(resolved_thinking.describe()),
                 ..message
             };
 
@@ -1895,6 +1950,8 @@ impl Agent {
             // transport no longer re-inserts it) and fixed-temperature models
             // still send none.
             temperature: self.temperature().value(),
+            // The summary needs no reasoning; the model default applies.
+            thinking: None,
             max_tokens: Some(context::SUMMARY_MAX_TOKENS.min(self.config.max_tokens as i64)),
         };
         let control = self.control.clone();
@@ -2195,7 +2252,14 @@ mod tests {
     /// `message` without its timestamp (or other timing), for comparing with a
     /// constructed one.
     fn unstamped(message: &Message) -> Message {
-        Message { timestamp: None, log_line: None, duration_ms: None, temperature: None, ..message.clone() }
+        Message {
+            timestamp: None,
+            log_line: None,
+            duration_ms: None,
+            temperature: None,
+            thinking_level: None,
+            ..message.clone()
+        }
     }
 
     fn agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
@@ -2333,6 +2397,68 @@ mod tests {
         // … and the temperature lookup resolves against `demo`, not `mock`.
         let resolved = agent.temperature();
         assert_eq!((resolved.value(), resolved.source), (Some(0.2), crate::temperature::Source::Provider));
+    }
+
+    /// Records the thinking level of each request.
+    struct ThinkingSeen {
+        responses: Mutex<Vec<LLMResponse>>,
+        levels: Arc<Mutex<Vec<Option<crate::thinking::Thinking>>>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for ThinkingSeen {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.levels.lock().unwrap().push(request.thinking);
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_level_is_sent_recorded_and_changes_from_the_next_step() {
+        use crate::thinking::{Source, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let client = ThinkingSeen {
+            responses: Mutex::new(vec![tool_call("c1"), text("done"), text("again")]),
+            levels: levels.clone(),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            thinking: Thinking::Low,
+            ..Config::default()
+        };
+        let agent = Agent::new(Box::new(client), config);
+        assert_eq!((agent.thinking().value(), agent.thinking().source), (Some(Thinking::Low), Source::Global));
+        // `/thinking high` typed mid-turn: the tool runs between two requests.
+        let control = agent.control();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                control.set_thinking(Some(Thinking::High));
+                Ok(json!("ok"))
+            }),
+        );
+        let mut agent = agent;
+        assert_eq!(agent.send_message("ping").await.unwrap(), "done");
+        assert_eq!(*levels.lock().unwrap(), vec![Some(Thinking::Low), Some(Thinking::High)]);
+        assert_eq!(agent.thinking().source, Source::Session);
+        // Each assistant message records the settings its request used.
+        let recorded: Vec<_> = agent.conversation().iter().filter_map(|m| m.thinking_level.clone()).collect();
+        assert_eq!(recorded, ["low (global setting)", "high (set for this session)"]);
+        assert!(agent.conversation().iter().any(|m| m.temperature.is_some()));
+        assert_eq!(agent.context_stats().lock().unwrap().thinking, Some(Thinking::High));
+
+        // Back to the config: `default` sends nothing.
+        agent.set_thinking(Some(Thinking::Default));
+        agent.send_message("again").await.unwrap();
+        assert_eq!(levels.lock().unwrap().last(), Some(&None));
     }
 
     #[tokio::test(flavor = "multi_thread")]

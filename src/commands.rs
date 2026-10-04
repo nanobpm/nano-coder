@@ -37,6 +37,11 @@ pub const COMMANDS: &[Command] = &[
         args: "[provider/model]",
         description: "Show the model and pick a new one (or switch directly)",
     },
+    Command {
+        name: "/thinking",
+        args: "[default|off|low|medium|high]",
+        description: "Show the thinking level and the model's levels, or set it for the session",
+    },
     Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
@@ -116,6 +121,10 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
             .iter()
             .map(|m| Suggestion { value: m.as_str().to_string(), note: m.describe().to_string() })
             .collect(),
+        "/thinking" => crate::thinking::levels_for(config)
+            .iter()
+            .map(|t| Suggestion { value: t.as_str().to_string(), note: t.describe().to_string() })
+            .collect(),
         "/verbosity" => crate::ui::Verbosity::ALL
             .iter()
             .map(|v| Suggestion { value: v.to_string(), note: v.describe().to_string() })
@@ -129,7 +138,7 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
 /// set, so its argument type-ahead should be drawn (even when the typed
 /// prefix matches nothing, to say so).
 pub fn has_argument_menu(line: &str) -> bool {
-    matches!(split_command(line), Some(("/model" | "/mode" | "/verbosity", _)))
+    matches!(split_command(line), Some(("/model" | "/mode" | "/thinking" | "/verbosity", _)))
 }
 
 /// `/model` candidates, most-taken pathways first: the current model, then
@@ -426,6 +435,27 @@ mod tests {
         assert_eq!(narrowed, ["plan"]);
         let levels: Vec<String> = suggestions(&config, &[], "/verbosity v").iter().map(|s| s.value.clone()).collect();
         assert_eq!(levels, ["verbose"]);
+    }
+
+    #[test]
+    fn thinking_offers_only_the_models_levels() {
+        let all: Vec<String> =
+            suggestions(&Config::default(), &[], "/thinking ").iter().map(|s| s.value.clone()).collect();
+        assert_eq!(all, ["default", "off", "low", "medium", "high"]);
+        // A provider that drops the thinking field only has the model default.
+        let fixed_config = config(
+            r#"
+            model = "work/m"
+            [providers.work]
+            kind = "openai"
+            base_url = "http://x/v1"
+            drop_params = ["reasoning_effort"]
+        "#,
+        );
+        let fixed: Vec<String> =
+            suggestions(&fixed_config, &[], "/thinking ").iter().map(|s| s.value.clone()).collect();
+        assert_eq!(fixed, ["default"]);
+        assert!(has_argument_menu("/thinking "));
     }
 
     #[test]

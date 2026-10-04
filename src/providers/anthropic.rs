@@ -62,6 +62,23 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         // Anthropic's range is 0..=1.
         body["temperature"] = json!(temperature.clamp(0.0, 1.0));
     }
+    match request.thinking {
+        Some(crate::thinking::Thinking::Off) => body["thinking"] = json!({ "type": "disabled" }),
+        Some(level) => {
+            // The budget must stay below `max_tokens`, and extended thinking
+            // accepts no custom temperature.
+            let max_tokens = body["max_tokens"].as_i64().unwrap_or(DEFAULT_MAX_TOKENS);
+            let budget = crate::thinking::budget(level).min(max_tokens - 1024).max(1024);
+            if budget >= max_tokens {
+                body["max_tokens"] = json!(budget + 1024);
+            }
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            if let Some(object) = body.as_object_mut() {
+                object.remove("temperature");
+            }
+        }
+        None => {}
+    }
     transport.finish_body(body)
 }
 
@@ -426,6 +443,33 @@ mod tests {
     }
 
     #[test]
+    fn sends_a_thinking_budget_and_drops_temperature() {
+        use crate::thinking::Thinking;
+        let messages = [Message::user("hi")];
+        let client = client("http://x");
+        let body = |t, max| {
+            client.build_body(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: Some(0.5),
+                thinking: t,
+                max_tokens: max,
+            })
+        };
+        let high = body(Some(Thinking::High), Some(32000));
+        assert_eq!(high["thinking"], json!({ "type": "enabled", "budget_tokens": 16384 }));
+        assert!(high.get("temperature").is_none(), "{high}");
+        // The budget stays below max_tokens.
+        let small = body(Some(Thinking::High), Some(4096));
+        assert_eq!(small["thinking"]["budget_tokens"], 3072);
+        assert_eq!(small["max_tokens"], 4096);
+        let off = body(Some(Thinking::Off), None);
+        assert_eq!(off["thinking"], json!({ "type": "disabled" }));
+        assert_eq!(off["temperature"], 0.5);
+        assert!(body(None, None).get("thinking").is_none());
+    }
+
+    #[test]
     fn encodes_system_tools_and_grouped_tool_results() {
         let messages = vec![
             Message::system("be brief"),
@@ -452,6 +496,7 @@ mod tests {
             messages: &messages,
             tools: &tools,
             temperature: Some(1.5),
+            thinking: None,
             max_tokens: None,
         });
         assert_eq!(body["system"], "be brief");
@@ -491,7 +536,13 @@ mod tests {
         .await;
         let messages = [Message::user("date?")];
         let response = client(&url)
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                thinking: None,
+                max_tokens: Some(64),
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "Let me check.");
@@ -556,7 +607,13 @@ mod tests {
         };
         let response = client(&url)
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    thinking: None,
+                    max_tokens: Some(64),
+                },
                 &sink,
             )
             .await
@@ -659,7 +716,13 @@ mod tests {
         };
         let response = client(&url)
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64) },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    thinking: None,
+                    max_tokens: Some(64),
+                },
                 &sink,
             )
             .await

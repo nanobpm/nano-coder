@@ -40,6 +40,7 @@ mod shell;
 mod skills;
 mod status;
 mod temperature;
+mod thinking;
 mod tools;
 mod trajectory;
 mod ui;
@@ -171,7 +172,27 @@ fn model_set_text(agent: &Agent) -> String {
     if let Some(warning) = agent.temperature().warning {
         text.push_str(&format!("\nWarning: {warning}"));
     }
+    text.push_str(&format!("\nThinking: {}; available: {}", agent.thinking().describe(), thinking_levels(agent)));
+    if let Some(warning) = agent.thinking().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
     text
+}
+
+/// The current model's thinking levels, comma-separated.
+fn thinking_levels(agent: &Agent) -> String {
+    agent.thinking_levels().iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// Parse a `/thinking LEVEL` argument against the model's levels.
+fn parse_thinking(arg: &str, levels: &[thinking::Thinking]) -> Result<thinking::Thinking, String> {
+    let level = arg.parse::<thinking::Thinking>()?;
+    if levels.contains(&level) {
+        Ok(level)
+    } else {
+        let names = levels.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ");
+        Err(format!("this model accepts thinking: {names}"))
+    }
 }
 
 /// Esc twice within this window cancels the running turn.
@@ -497,6 +518,8 @@ impl Terminal {
 async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Terminal) -> Result<agent::TurnOutcome> {
     let control = agent.control();
     let stats = agent.context_stats();
+    // Checked before the turn borrows the agent; the model can't change mid-turn.
+    let thinking_levels_now = agent.thinking_levels();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
         renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
@@ -617,6 +640,20 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 match op {
                                     Ok(op) => renderer.note(&terminal.edit_queue(&op)),
                                     Err(usage) => renderer.note(&format!("[{usage}]")),
+                                }
+                            }
+                            SteerRoute::Thinking(arg) => {
+                                // Like Shift+Tab for the mode: the shared control
+                                // carries it to the running turn's next request.
+                                match parse_thinking(&arg, thinking_levels_now) {
+                                    Ok(level) => {
+                                        control.set_thinking(Some(level));
+                                        stats.lock().unwrap().thinking =
+                                            (level != thinking::Thinking::Default).then_some(level);
+                                        renderer.event(&agent::AgentEvent::Context);
+                                        renderer.note(&format!("[thinking: {level} — from the agent's next step]"));
+                                    }
+                                    Err(e) => renderer.note(&format!("[{e}]")),
                                 }
                             }
                             SteerRoute::DeferCommand => {
@@ -896,6 +933,8 @@ enum SteerRoute {
     QueueCommand(std::result::Result<queue::QueueOp, String>),
     /// A non-`/queue` slash command: deferred until the turn finishes.
     DeferCommand,
+    /// `/thinking LEVEL` — applied from the agent's next model call.
+    Thinking(String),
     /// Plain Enter: steer the running turn.
     Steer,
     /// Ctrl-Enter: append to the message queue for a later turn.
@@ -910,6 +949,8 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::Ignore
     } else if let Some(op) = queue_command(text) {
         SteerRoute::QueueCommand(op)
+    } else if let Some(arg) = text.strip_prefix("/thinking ") {
+        SteerRoute::Thinking(arg.trim().to_string())
     } else if text.starts_with('/') {
         SteerRoute::DeferCommand
     } else if steer {
@@ -1025,6 +1066,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let mut out: Vec<String> = Vec::new();
             out.push(format!("Model:        {}/{}", stats.provider, stats.model));
             out.push(format!("Temperature:  {}", agent.temperature().describe()));
+            out.push(format!("Thinking:     {}", agent.thinking().describe()));
             out.push(format!(
                 "Context:      {}{} of {} tokens ({:.1}%){}",
                 if stats.calibrated { "" } else { "~" },
@@ -1086,9 +1128,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // interactive editor would race it for keystrokes.
             let config = agent.config();
             terminal.renderer.print_block(&format!(
-                "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
+                "model: {}\ntemperature: {}\nthinking: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
                 config.model,
                 agent.temperature().describe(),
+                agent.thinking().describe(),
                 config.max_tokens
             ));
             Ok(true)
@@ -1297,6 +1340,35 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 out.push(format!("  {:<8} {}", level.to_string(), level.describe()));
             }
             terminal.renderer.print_block(&out.join("\n"));
+            Ok(true)
+        }
+        "/thinking" => {
+            let mut out = vec![format!("Thinking: {}", agent.thinking().describe())];
+            for level in agent.thinking_levels() {
+                out.push(format!("  {:<8} {}", level.as_str(), level.describe()));
+            }
+            if let Some(reason) = agent.thinking().fixed {
+                out.push(format!("(only the model default: {reason})"));
+            }
+            if let Some(warning) = agent.thinking().warning {
+                out.push(format!("Warning: {warning}"));
+            }
+            out.push("(/thinking LEVEL sets it for this session; /settings saves it)".to_string());
+            terminal.renderer.print_block(&out.join("\n"));
+            Ok(true)
+        }
+        _ if cmd.starts_with("/thinking ") => {
+            match parse_thinking(cmd["/thinking ".len()..].trim(), agent.thinking_levels()) {
+                Ok(level) => {
+                    agent.set_thinking(Some(level));
+                    let mut text = format!("Thinking set to {} for this session", agent.thinking().describe());
+                    if let Some(warning) = agent.thinking().warning {
+                        text.push_str(&format!("\nWarning: {warning}"));
+                    }
+                    terminal.renderer.print_block(&text);
+                }
+                Err(e) => terminal.renderer.print_block(&e),
+            }
             Ok(true)
         }
         "/mode" => {
@@ -1600,6 +1672,9 @@ async fn main() -> Result<()> {
             banner.push(format!("Skills warning: {warning}"));
         }
         if let Some(warning) = agent.temperature().warning {
+            banner.push(format!("Warning: {warning}"));
+        }
+        if let Some(warning) = agent.thinking().warning {
             banner.push(format!("Warning: {warning}"));
         }
         banner.push("Type /help for commands".to_string());

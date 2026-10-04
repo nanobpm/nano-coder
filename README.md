@@ -20,7 +20,7 @@ cargo install nano-coder             # or build from source
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
 - **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
+- **Commands**: `/help`, `/compact`, `/context`, `/thinking`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
 - **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -299,7 +299,7 @@ model where it may write.
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
 list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
-argument set (`/model`, `/mode`, `/verbosity`) get the same treatment for their first
+argument set (`/model`, `/mode`, `/thinking`, `/verbosity`) get the same treatment for their first
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
@@ -315,7 +315,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
   - **Add or edit a provider**: name, API kind (OpenAI-compatible, Anthropic, Copilot),
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
-  - temperature, max tokens, system prompt
+  - temperature, thinking level (only the levels the model accepts), max tokens, system prompt
   - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
@@ -327,6 +327,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/plan` - Show the agent's task plan with all notes
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
+- `/thinking [default|off|low|medium|high]` - With no argument, show the thinking level in use, where it comes from, and the levels the current model accepts. With a level, set it for this session (`/settings` saves it). Typed while a turn runs, it applies from the agent's next step. See [Thinking level](#thinking-level)
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
@@ -369,6 +370,7 @@ Create `~/.config/nano-coder/config.toml` (every field is optional). Directories
 model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
 temperature = 0.7                       # or "default" to send none (see Temperature below)
+thinking = "default"                    # or off/low/medium/high (see Thinking level below)
 max_tokens = 4096
 max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
@@ -504,6 +506,41 @@ provider or model is ignored with a warning at startup and when you switch to it
 top-level `temperature` just doesn't apply to them. Anthropic accepts 0 to 1, so a higher
 value is sent as 1, with a warning. `/context` shows the temperature in use and where it
 comes from, and `/settings` edits it for the current model, its provider, or all models.
+
+### Thinking level
+
+`thinking` is `"default"` (send nothing; the model decides), `"off"`, `"low"`,
+`"medium"` or `"high"`. Like temperature it can be set for all models, one provider or
+one model, and the most specific setting wins; `/thinking LEVEL` overrides all of them
+for the session:
+
+```toml
+thinking = "low"                        # all models
+
+[providers.anthropic]
+thinking = "medium"
+
+[providers.openai.models."gpt-5"]
+thinking = "high"
+```
+
+How it is sent depends on the API:
+
+| API | field | `off` |
+|-----|-------|-------|
+| OpenAI Chat Completions (OpenAI, Ollama, OpenRouter, vLLM, …) | `reasoning_effort` | `"none"` |
+| OpenAI Responses (Copilot GPT-5+, Grok, …) | `reasoning.effort` | `"minimal"` (the API has no off) |
+| Anthropic Messages | `thinking` with `budget_tokens` 2048 / 8192 / 16384 (kept below `max_tokens`; temperature is then not sent) | `{ type = "disabled" }` |
+
+A provider that drops the field (`drop_params = ["reasoning_effort"]`, or `"thinking"`
+for Anthropic) only has the model default, so `/thinking`, the `/thinking ` type-ahead and
+`/settings` offer just `default` for its models. If a provider's `extra_body` already sets
+the field (`reasoning_effort`, Ollama's `think`, `reasoning`, `thinking`), `extra_body`
+wins because it is merged into the request last, and a warning says so. The level is
+shown next to the model on the status line (`· think high`) and in `/context`. Each
+request's temperature and thinking level are recorded on the assistant message in the
+session log, and `/trajectory` shows them with the request metrics, so runs can be
+compared.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and

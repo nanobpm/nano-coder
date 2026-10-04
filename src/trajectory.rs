@@ -86,13 +86,26 @@ pub struct Row {
     /// `0.3 (set for this model)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<String>,
+    /// The thinking level and its source for the request that produced this
+    /// row (assistant/think rows only), e.g. `high (set for this model)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<DateTime<FixedOffset>>,
 }
 
 impl Row {
     fn new(kind: RowKind, text: String) -> Self {
-        Self { id: None, kind, text, usage: None, duration_ms: None, temperature: None, timestamp: None }
+        Self {
+            id: None,
+            kind,
+            text,
+            usage: None,
+            duration_ms: None,
+            temperature: None,
+            thinking_level: None,
+            timestamp: None,
+        }
     }
 
     /// [`Row::label`] prefixed with the row's `#N` log ID, when it has one.
@@ -139,6 +152,9 @@ impl Row {
         }
         if let Some(temperature) = &self.temperature {
             bits.push(format!("temp {temperature}"));
+        }
+        if let Some(level) = &self.thinking_level {
+            bits.push(format!("think {level}"));
         }
         (!bits.is_empty()).then(|| bits.join(", "))
     }
@@ -484,6 +500,7 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
                 row.temperature = message.temperature.clone();
+                row.thinking_level = message.thinking_level.clone();
                 row.timestamp = message.timestamp;
                 turn.rows.push(row);
             }
@@ -502,6 +519,7 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
                 row.usage = message.usage.clone();
                 row.duration_ms = message.duration_ms;
                 row.temperature = message.temperature.clone();
+                row.thinking_level = message.thinking_level.clone();
             }
             row.timestamp = message.timestamp;
             turn.rows.push(row);
@@ -1101,6 +1119,28 @@ mod tests {
         assert!(matches!(last.kind, RowKind::Compact { .. }));
         assert!(last.label().contains("smart"));
         assert!(last.text.contains("folded log lines 2–6"));
+    }
+
+    #[test]
+    fn requests_record_their_temperature_and_thinking_level() {
+        let msg = Message {
+            temperature: Some("0.2 (set for this model)".into()),
+            thinking_level: Some("high (set for this session)".into()),
+            ..assistant("answer", "")
+        };
+        let recs = vec![
+            Record::Session { version: 1, id: "s".into(), created_at: now() },
+            Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
+            Record::Message(msg),
+        ];
+        let traj = Trajectory::from_records(&recs);
+        let row = traj.turns[0].rows.iter().find(|r| matches!(r.kind, RowKind::Assistant)).unwrap();
+        assert_eq!(
+            row.metric().unwrap(),
+            "120 tok, 1.5s, temp 0.2 (set for this model), think high (set for this session)"
+        );
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["thinking_level"], "high (set for this session)");
     }
 
     #[test]

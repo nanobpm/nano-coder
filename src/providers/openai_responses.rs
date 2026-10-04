@@ -101,6 +101,12 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     if let Some(max_tokens) = request.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
     }
+    if let Some(level) = request.thinking {
+        // The Responses API has no "off": `minimal` is the least reasoning
+        // GPT-5-class models accept.
+        let effort = if level == crate::thinking::Thinking::Off { "minimal" } else { level.as_str() };
+        body["reasoning"] = json!({ "effort": effort });
+    }
     transport.finish_body(body)
 }
 
@@ -393,7 +399,7 @@ mod tests {
             let messages = [Message::user("q"), assistant];
             build_body(
                 &transport(),
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
+                &ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None },
             )
         };
         assert_eq!(
@@ -443,7 +449,13 @@ mod tests {
         let tools = [ToolDefinition::new("get_time", "time", json!({"type": "object"}))];
         let body = build_body(
             &transport(),
-            &ChatRequest { messages: &messages, tools: &tools, temperature: Some(0.5), max_tokens: Some(64) },
+            &ChatRequest {
+                messages: &messages,
+                tools: &tools,
+                temperature: Some(0.5),
+                thinking: None,
+                max_tokens: Some(64),
+            },
         );
         assert_eq!(body["instructions"], "be brief");
         assert_eq!(body["max_output_tokens"], 64);
@@ -610,7 +622,7 @@ mod tests {
         ];
         let body = build_body(
             &replay_transport(),
-            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
+            &ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None },
         );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], json!(false));
@@ -647,7 +659,8 @@ mod tests {
     #[test]
     fn omits_temperature_for_reasoning_models_only() {
         let messages = vec![Message::user("hi")];
-        let request = |t| ChatRequest { messages: &messages, tools: &[], temperature: Some(t), max_tokens: None };
+        let request =
+            |t| ChatRequest { messages: &messages, tools: &[], temperature: Some(t), thinking: None, max_tokens: None };
         // gpt-6-astra is a reasoning model: temperature is dropped so the
         // Responses endpoint does not reject the request before generating.
         let body = build_body(&copilot_transport("gpt-6-astra"), &request(0.7));
@@ -655,6 +668,21 @@ mod tests {
         // A non-reasoning model (gpt-4.1) keeps a custom temperature.
         let body = build_body(&copilot_transport("gpt-4.1"), &request(0.7));
         assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn sends_the_thinking_level_as_reasoning_effort() {
+        use crate::thinking::Thinking;
+        let messages = vec![Message::user("hi")];
+        let request =
+            |t| ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: t, max_tokens: None };
+        let body = build_body(&copilot_transport("gpt-5"), &request(Some(Thinking::High)));
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        // No "off" on the Responses API: the least reasoning is `minimal`.
+        let body = build_body(&copilot_transport("gpt-5"), &request(Some(Thinking::Off)));
+        assert_eq!(body["reasoning"], json!({ "effort": "minimal" }));
+        let body = build_body(&copilot_transport("gpt-5"), &request(None));
+        assert!(body.get("reasoning").is_none(), "{body}");
     }
 
     #[test]
@@ -679,7 +707,7 @@ mod tests {
         ];
         let body = build_body(
             &transport(),
-            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None },
+            &ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None },
         );
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
@@ -692,7 +720,8 @@ mod tests {
     #[test]
     fn copilot_reasoning_model_replays_reasoning_by_default() {
         let messages = vec![Message::user("hi")];
-        let request = ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None };
+        let request =
+            ChatRequest { messages: &messages, tools: &[], temperature: None, thinking: None, max_tokens: None };
         // A reasoning Copilot model opts into replayable reasoning items by
         // default (no user config needed).
         let body = build_body(&copilot_transport("gpt-6-astra"), &request);
