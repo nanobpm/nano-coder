@@ -141,7 +141,12 @@ fn read_capped(path: &Path) -> Option<String> {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    Some(format!("{}\n\n[... truncated: {} of {} bytes shown]", &text[..end], end, text.len()))
+    Some(format!(
+        "{}\n\n[... truncated: {} of {} bytes shown; read the full file with read_file]",
+        &text[..end],
+        end,
+        text.len()
+    ))
 }
 
 /// Leading spaces before a fence marker. CommonMark allows 0–3 spaces of
@@ -188,6 +193,27 @@ fn closes_fence(line: &str, open: (char, usize)) -> bool {
     run >= open.1 && t[run..].trim().is_empty()
 }
 
+/// Whether this line is an indented code block (4+ spaces, or a leading tab):
+/// its content is code, not Markdown, so HTML comments are not stripped from
+/// it and `@path` imports are not expanded out of it — mirroring how fenced
+/// code content is preserved.
+fn is_indented_code(line: &str) -> bool {
+    let mut spaces = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => {
+                spaces += 1;
+                if spaces >= 4 {
+                    return true;
+                }
+            }
+            b'\t' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Remove block-level `<!-- ... -->` comments (outside code blocks), as
 /// Claude Code does before a CLAUDE.md reaches the model.
 fn strip_html_comments(text: &str) -> String {
@@ -214,6 +240,10 @@ fn strip_html_comments(text: &str) -> String {
         }
         if let Some(open) = fence(line) {
             in_fence = Some(open);
+            out.push_str(line);
+            continue;
+        }
+        if is_indented_code(line) {
             out.push_str(line);
             continue;
         }
@@ -249,6 +279,9 @@ fn import_refs(text: &str) -> Vec<String> {
         }
         if let Some(open) = fence(line) {
             in_fence = Some(open);
+            continue;
+        }
+        if is_indented_code(line) {
             continue;
         }
         let chars: Vec<char> = line.chars().collect();
@@ -487,11 +520,15 @@ impl ProjectInstructions {
     /// Load one file (if it exists and is new) and, for Claude-format files,
     /// its imports after it.
     fn load(&mut self, path: PathBuf, kind: Kind, user: bool) {
-        self.load_at(path, kind, user, 0);
+        self.load_at(path, kind, user, 0, None);
     }
 
-    fn load_at(&mut self, path: PathBuf, kind: Kind, user: bool, depth: usize) {
-        let Some(text) = read_capped(&path) else { return };
+    /// Load one file (if it exists and is new) and, for Claude-format files,
+    /// its imports. `body`, when given, replaces the file's on-disk text for
+    /// both the stored content and import scanning — used when front matter is
+    /// dropped, so `@path` references in that front matter are not expanded.
+    fn load_at(&mut self, path: PathBuf, kind: Kind, user: bool, depth: usize, body: Option<String>) {
+        let Some(disk) = read_capped(&path) else { return };
         // A committed file may itself be a symlink out of the repository
         // (`.claude/CLAUDE.md -> ~/.ssh/...`), so apply the same canonical
         // containment check rules get before its contents reach the prompt.
@@ -514,6 +551,7 @@ impl ProjectInstructions {
         if !self.seen.insert(real) {
             return;
         }
+        let text = body.unwrap_or(disk);
         let refs = if expands_imports(&path, &kind) { import_refs(&text) } else { Vec::new() };
         self.loaded.push(InstructionFile { path: path.clone(), text, kind, user });
         if depth >= MAX_IMPORT_DEPTH {
@@ -521,7 +559,7 @@ impl ProjectInstructions {
         }
         for reference in refs {
             if let Some(target) = self.resolve_import(&path, &reference, user) {
-                self.load_at(target, Kind::Import(path.clone()), user, depth + 1);
+                self.load_at(target, Kind::Import(path.clone()), user, depth + 1, None);
             }
         }
     }
@@ -630,12 +668,10 @@ impl ProjectInstructions {
                     if body.is_empty() {
                         continue;
                     }
-                    // Front matter without `paths` is dropped, as Claude Code does.
-                    let start = self.loaded.len();
-                    self.load(path, Kind::Rule, user);
-                    if let Some(file) = self.loaded.get_mut(start) {
-                        file.text = body.to_string();
-                    }
+                    // Front matter without `paths` is dropped, as Claude Code
+                    // does. Expand imports from the parsed body only, so an
+                    // `@path` in the dropped front matter is not pulled in.
+                    self.load_at(path, Kind::Rule, user, 0, Some(body.to_string()));
                 }
             }
         }
@@ -733,9 +769,18 @@ impl ProjectInstructions {
         let mut budget = MAX_TOTAL_BYTES.saturating_sub(MARKER.len());
         let mut truncated = false;
         'outer: for d in &dirs {
+            // Render this directory's files atomically: if any section overflows
+            // the budget, roll the whole directory back — output, budget, and the
+            // searched/seen state `search` just committed — so its files stay
+            // pending and a later call (e.g. after compaction frees budget) can
+            // render them, rather than dropping them from `loaded` permanently.
+            let out_checkpoint = out.len();
+            let budget_checkpoint = budget;
+            let seen_checkpoint = self.seen.clone();
             let range = self.search(d);
             let files = self.loaded.drain(range).collect::<Vec<_>>();
-            for file in files {
+            let mut overflow = false;
+            for file in &files {
                 let note = match &file.kind {
                     Kind::Import(by) => {
                         format!("[{} (imported by {}) applies with it:]", self.display(&file.path), self.display(by))
@@ -752,36 +797,60 @@ impl ProjectInstructions {
                 };
                 let section = format!("\n\n{note}\n{}", file.text);
                 if section.len() > budget {
-                    truncated = true;
-                    break 'outer;
+                    overflow = true;
+                    break;
                 }
                 budget -= section.len();
                 out.push_str(&section);
+            }
+            if overflow {
+                out.truncate(out_checkpoint);
+                budget = budget_checkpoint;
+                self.seen = seen_checkpoint;
+                self.searched.remove(d);
+                truncated = true;
+                break 'outer;
             }
         }
         if !truncated
             && let Ok(rel) = absolute.strip_prefix(&self.root)
         {
             let rel = rel.to_string_lossy().replace('\\', "/");
-            let mut matched = Vec::new();
-            for rule in self.scoped.iter_mut().filter(|r| !r.attached) {
-                if rule.patterns.iter().any(|re| re.is_match(&rel)) {
-                    rule.attached = true;
-                    matched.push((rule.path.clone(), rule.body.clone(), rule.user));
-                }
-            }
-            for (rule_path, body, user) in matched {
-                let Some(text) = self.resolve_scoped_rule(&rule_path, &body, user) else { continue };
+            let matched: Vec<usize> = self
+                .scoped
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| !r.attached && r.patterns.iter().any(|re| re.is_match(&rel)))
+                .map(|(i, _)| i)
+                .collect();
+            for i in matched {
+                let (rule_path, body, user) = {
+                    let r = &self.scoped[i];
+                    (r.path.clone(), r.body.clone(), r.user)
+                };
+                // Commit `attached`/`seen` only once the rule's whole section
+                // fits: an overflow rule (and every later match) must stay
+                // pending so a later call can still attach it, instead of being
+                // marked attached yet never rendered.
+                let seen_checkpoint = self.seen.clone();
+                let Some(text) = self.resolve_scoped_rule(&rule_path, &body, user) else {
+                    // Produced nothing (its file was already rendered elsewhere);
+                    // it is handled, so mark it attached and move on.
+                    self.scoped[i].attached = true;
+                    continue;
+                };
                 let section = format!(
                     "\n\n[Rule {} applies to {rel}. Follow it for changes to matching files:]\n{text}",
                     self.display(&rule_path)
                 );
                 if section.len() > budget {
+                    self.seen = seen_checkpoint;
                     truncated = true;
                     break;
                 }
                 budget -= section.len();
                 out.push_str(&section);
+                self.scoped[i].attached = true;
             }
         }
         if truncated {
@@ -1208,5 +1277,79 @@ mod tests {
         assert_eq!(split_top_level("{a,{b,c}},d"), vec!["{a,{b,c}}", "d"]);
         assert_eq!(split_top_level("a,,b"), vec!["a", "", "b"]); // empty filtered later
         assert_eq!(split_top_level(""), vec![""]);
+    }
+
+    #[test]
+    fn overflow_directory_stays_pending_for_a_later_call() {
+        let (_dir, root) = repo();
+        // Two near-cap files in nested dirs: together past the 64 KiB budget.
+        let big = "x".repeat(MAX_FILE_BYTES - 16);
+        write(&root.join("AGENTS.md"), "root file");
+        write(&root.join("a/AGENTS.md"), &format!("{big} file_a"));
+        write(&root.join("a/b/AGENTS.md"), &format!("{big} file_b"));
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        // First call renders a/ but a/b overflows the budget and is rolled back.
+        let first = instructions.nested_for(&root.join("a/b/x.rs")).unwrap();
+        assert!(first.contains("file_a"));
+        assert!(!first.contains("file_b"));
+        assert!(first.contains("[omitted: instruction size limit reached"));
+        // The overflowed directory stayed pending (searched/seen rolled back),
+        // so a later call still renders it instead of dropping it permanently.
+        let second = instructions.nested_for(&root.join("a/b/y.rs")).unwrap();
+        assert!(second.contains("file_b"));
+    }
+
+    #[test]
+    fn overflow_scoped_rule_stays_pending_for_a_later_call() {
+        let (_dir, root) = repo();
+        // Two near-cap rules both matching src/**: together past the budget.
+        let big = "x".repeat(MAX_FILE_BYTES - 64);
+        write(&root.join(".claude/rules/a.md"), &format!("---\npaths:\n  - \"src/**\"\n---\n{big} rule_a"));
+        write(&root.join(".claude/rules/b.md"), &format!("---\npaths:\n  - \"src/**\"\n---\n{big} rule_b"));
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let first = instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        assert!(first.contains("[omitted: instruction size limit reached"));
+        let a_first = first.contains("rule_a");
+        let b_first = first.contains("rule_b");
+        assert!(a_first ^ b_first, "exactly one rule should fit the budget");
+        // The overflowed rule was NOT marked attached, so a later call attaches
+        // it (previously it was marked attached yet never rendered).
+        let second = instructions.nested_for(&root.join("src/y.rs")).unwrap();
+        assert!(second.contains(if a_first { "rule_b" } else { "rule_a" }));
+    }
+
+    #[test]
+    fn indented_code_blocks_preserve_comments_and_imports() {
+        // A 4-space-indented line is an indented code block: its HTML comment is
+        // not stripped and its `@import` is not expanded (it is code, not Markdown).
+        assert!(strip_html_comments("text\n\n    <!-- example -->\n").contains("<!-- example -->"));
+        assert_eq!(import_refs("text\n\n    @code.md\n@live.md"), vec!["live.md".to_string()]);
+        // A leading tab counts as indented code as well.
+        assert!(strip_html_comments("text\n\n\t<!-- tabbed -->\n").contains("<!-- tabbed -->"));
+        // Up to 3 spaces is still prose: a shallow-indented comment is stripped.
+        assert_eq!(strip_html_comments("   <!-- shallow -->\nkeep\n"), "keep\n");
+    }
+
+    #[test]
+    fn front_matter_imports_are_not_expanded_when_front_matter_is_dropped() {
+        let (_dir, root) = repo();
+        write(&root.join("secret.md"), "SECRET BODY");
+        // A rule with front matter but no `paths`: the front matter is dropped,
+        // so its `@secret.md` reference must NOT be imported — only the body shows.
+        write(&root.join(".claude/rules/x.md"), "---\ndescription: see @secret.md\n---\nrule body");
+        let instructions = ProjectInstructions::discover(&root, &names());
+        let rendered = instructions.render();
+        assert!(rendered.contains("rule body"));
+        assert!(!rendered.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn per_file_truncation_marker_mentions_read_file() {
+        let (_dir, root) = repo();
+        write(&root.join("AGENTS.md"), &"x".repeat(MAX_FILE_BYTES + 10));
+        let instructions = ProjectInstructions::discover(&root, &names());
+        let text = &instructions.loaded[0].text;
+        assert!(text.contains("[... truncated"));
+        assert!(text.contains("read_file"), "per-file marker should direct to read_file");
     }
 }
