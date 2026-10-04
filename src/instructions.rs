@@ -81,9 +81,14 @@ impl Options {
 #[derive(Debug, Clone)]
 struct ScopedRule {
     path: PathBuf,
-    text: String,
+    /// The body alone; `@path` imports resolve when the rule attaches, so an
+    /// import of a rule that never matches cannot suppress the same import in
+    /// a file that is actually rendered.
+    body: String,
     patterns: Vec<Regex>,
     attached: bool,
+    /// From the user's own configuration rather than the repository.
+    user: bool,
 }
 
 #[derive(Debug, Default)]
@@ -139,23 +144,32 @@ fn read_capped(path: &Path) -> Option<String> {
     Some(format!("{}\n\n[... truncated: {} of {} bytes shown]", &text[..end], end, text.len()))
 }
 
-/// The opening fence (``` or ~~~) of a Markdown code block on this line.
-fn fence(line: &str) -> Option<&'static str> {
+/// The opening fence of a Markdown code block on this line: its character
+/// and the length of its backtick/tilde run. CommonMark closes a fence only
+/// on a run of the same character at least as long, so the length matters.
+fn fence(line: &str) -> Option<(char, usize)> {
     let t = line.trim_start();
-    if t.starts_with("```") {
-        Some("```")
-    } else if t.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
-    }
+    let ch = match t.chars().next() {
+        Some(c @ ('`' | '~')) => c,
+        _ => return None,
+    };
+    let run = t.chars().take_while(|&c| c == ch).count();
+    (run >= 3).then_some((ch, run))
+}
+
+/// Whether this line closes a fence opened as `open`: a run of the same
+/// character at least as long as the opening run.
+fn closes_fence(line: &str, open: (char, usize)) -> bool {
+    let t = line.trim_start();
+    let run = t.chars().take_while(|&c| c == open.0).count();
+    run >= open.1
 }
 
 /// Remove block-level `<!-- ... -->` comments (outside code blocks), as
 /// Claude Code does before a CLAUDE.md reaches the model.
 fn strip_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_fence: Option<&str> = None;
+    let mut in_fence: Option<(char, usize)> = None;
     let mut in_comment = false;
     for line in text.split_inclusive('\n') {
         if in_comment {
@@ -169,7 +183,7 @@ fn strip_html_comments(text: &str) -> String {
             continue;
         }
         if let Some(open) = in_fence {
-            if line.trim_start().starts_with(open) {
+            if closes_fence(line, open) {
                 in_fence = None;
             }
             out.push_str(line);
@@ -202,10 +216,10 @@ fn strip_html_comments(text: &str) -> String {
 /// so e-mail addresses don't count; `\ ` continues a path past a space.
 fn import_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let mut in_fence: Option<&str> = None;
+    let mut in_fence: Option<(char, usize)> = None;
     for line in text.lines() {
         if let Some(open) = in_fence {
-            if line.trim_start().starts_with(open) {
+            if closes_fence(line, open) {
                 in_fence = None;
             }
             continue;
@@ -455,6 +469,24 @@ impl ProjectInstructions {
 
     fn load_at(&mut self, path: PathBuf, kind: Kind, user: bool, depth: usize) {
         let Some(text) = read_capped(&path) else { return };
+        // A committed file may itself be a symlink out of the repository
+        // (`.claude/CLAUDE.md -> ~/.ssh/...`), so apply the same canonical
+        // containment check rules get before its contents reach the prompt.
+        // Done only after the file is known to exist, so a missing optional
+        // file (whose `canonicalize` fails) is not mistaken for an escape.
+        if !user && !self.options.imports_outside_project {
+            let inside = path.canonicalize().is_ok_and(|real| {
+                let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+                real.starts_with(&root)
+            });
+            if !inside {
+                self.warnings.push(format!(
+                    "skipped {}: links outside the repository (set instruction_imports_outside_project = true to allow)",
+                    self.display(&path)
+                ));
+                return;
+            }
+        }
         let real = path.canonicalize().unwrap_or_else(|_| path.clone());
         if !self.seen.insert(real) {
             return;
@@ -472,10 +504,13 @@ impl ProjectInstructions {
     }
 
     /// Resolve a scoped rule's body together with its `@path` imports into one
-    /// block. Scoped rules are Claude-format, so their imports must be expanded
-    /// rather than emitted literally, and they share the canonical `seen`
-    /// deduplication, import depth, and outside-repository safety checks used
-    /// for every other instruction file.
+    /// block, at attachment time. Scoped rules are Claude-format, so their
+    /// imports must be expanded rather than emitted literally; doing it on
+    /// attachment (not at discovery) keeps a dormant rule's imports out of the
+    /// shared canonical `seen` set, so they cannot suppress imports in files
+    /// that are actually rendered. Resolution still shares the `seen` dedup,
+    /// import depth, and outside-repository safety checks used for every other
+    /// instruction file.
     fn resolve_scoped_rule(&mut self, path: &Path, body: &str, user: bool) -> String {
         let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.seen.insert(real);
@@ -560,8 +595,7 @@ impl ProjectInstructions {
                         self.warnings.push(format!("rule {} has no usable paths patterns", self.display(&path)));
                         continue;
                     }
-                    let text = self.resolve_scoped_rule(&path, body, user);
-                    self.scoped.push(ScopedRule { path, text, patterns: compiled, attached: false });
+                    self.scoped.push(ScopedRule { path, body: body.to_string(), patterns: compiled, attached: false, user });
                 }
                 (None, body) => {
                     let body = body.trim();
@@ -663,8 +697,14 @@ impl ProjectInstructions {
             return None;
         }
         dirs.reverse();
+        // This text lands in a tool result (read_file skips its own bound for
+        // it), so bound it here: one reserved marker keeps the total within
+        // `MAX_TOTAL_BYTES` however many files or rules match.
+        const MARKER: &str = "\n\n[omitted: instruction size limit reached; read the remaining files with read_file]";
         let mut out = String::new();
-        for d in &dirs {
+        let mut budget = MAX_TOTAL_BYTES.saturating_sub(MARKER.len());
+        let mut truncated = false;
+        'outer: for d in &dirs {
             let range = self.search(d);
             let files = self.loaded.drain(range).collect::<Vec<_>>();
             for file in files {
@@ -682,24 +722,42 @@ impl ProjectInstructions {
                         )
                     }
                 };
-                out.push_str(&format!("\n\n{note}\n{}", file.text));
+                let section = format!("\n\n{note}\n{}", file.text);
+                if section.len() > budget {
+                    truncated = true;
+                    break 'outer;
+                }
+                budget -= section.len();
+                out.push_str(&section);
             }
         }
-        if let Ok(rel) = absolute.strip_prefix(&self.root) {
+        if !truncated
+            && let Ok(rel) = absolute.strip_prefix(&self.root)
+        {
             let rel = rel.to_string_lossy().replace('\\', "/");
             let mut matched = Vec::new();
             for rule in self.scoped.iter_mut().filter(|r| !r.attached) {
                 if rule.patterns.iter().any(|re| re.is_match(&rel)) {
                     rule.attached = true;
-                    matched.push((rule.path.clone(), rule.text.clone()));
+                    matched.push((rule.path.clone(), rule.body.clone(), rule.user));
                 }
             }
-            for (rule_path, text) in matched {
-                out.push_str(&format!(
+            for (rule_path, body, user) in matched {
+                let text = self.resolve_scoped_rule(&rule_path, &body, user);
+                let section = format!(
                     "\n\n[Rule {} applies to {rel}. Follow it for changes to matching files:]\n{text}",
                     self.display(&rule_path)
-                ));
+                );
+                if section.len() > budget {
+                    truncated = true;
+                    break;
+                }
+                budget -= section.len();
+                out.push_str(&section);
             }
+        }
+        if truncated {
+            out.push_str(MARKER);
         }
         (!out.is_empty()).then_some(out)
     }
@@ -855,11 +913,13 @@ mod tests {
     #[test]
     fn scoped_rule_imports_are_expanded_and_deduplicated() {
         let (_dir, root) = repo();
-        write(&root.join(".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\nrule body, see @shared.md");
-        write(&root.join(".claude/rules/shared.md"), "shared detail");
+        // The import target lives outside the rules dir, so it is reachable
+        // only through the rule's `@import`, not as a standalone rule.
+        write(&root.join(".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\nrule body, see @../shared.md");
+        write(&root.join(".claude/shared.md"), "shared detail");
         let mut instructions = ProjectInstructions::discover(&root, &names());
         let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
-        assert!(out.contains("rule body, see @shared.md"), "{out}");
+        assert!(out.contains("rule body, see @../shared.md"), "{out}");
         // The import is expanded inline, not emitted literally.
         assert!(out.contains("shared detail"), "{out}");
         assert!(out.contains("imported by"), "{out}");
@@ -876,6 +936,73 @@ mod tests {
         let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
         // Already loaded via CLAUDE.md, so the rule does not re-expand it.
         assert!(!out.contains("shared once"), "{out}");
+    }
+
+    #[test]
+    fn a_dormant_scoped_rules_import_does_not_suppress_a_rendered_file() {
+        let (_dir, root) = repo();
+        // Reachable only via import, never auto-loaded as a standalone rule.
+        write(&root.join(".claude/shared-detail.md"), "shared detail");
+        // Sorts first; scoped, so it is never attached at startup. It imports
+        // the shared file but must not mark it seen while dormant.
+        write(&root.join(".claude/rules/a-scoped.md"), "---\npaths:\n  - \"src/**\"\n---\nscoped, see @../shared-detail.md");
+        // Sorts later; a plain rule rendered at startup that imports the same file.
+        write(&root.join(".claude/rules/b-plain.md"), "plain rule, see @../shared-detail.md");
+        let instructions = ProjectInstructions::discover(&root, &names());
+        let rendered = instructions.render();
+        // Deferred resolution keeps the dormant rule from suppressing the import.
+        assert!(rendered.contains("shared detail"), "{rendered}");
+    }
+
+    #[test]
+    fn on_demand_scoped_rules_are_bounded_with_a_single_marker() {
+        let (_dir, root) = repo();
+        // Several near-cap scoped rules all match src/**, together far past the
+        // total cap; the tool result this feeds skips its own post-bounding.
+        let big = "x".repeat(MAX_FILE_BYTES - 64);
+        for i in 0..8 {
+            write(
+                &root.join(format!(".claude/rules/r{i}.md")),
+                &format!("---\npaths:\n  - \"src/**\"\n---\n{big} rule{i}"),
+            );
+        }
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        assert!(out.len() <= MAX_TOTAL_BYTES, "on-demand output {} > cap", out.len());
+        // Exactly one omission marker, however many rules were dropped.
+        assert_eq!(out.matches("[omitted: instruction size limit reached").count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_committed_instruction_file_symlinked_outside_the_repo_is_skipped() {
+        let (dir, root) = repo();
+        let outside = dir.path().canonicalize().unwrap().join("id_ed25519");
+        write(&outside, "SECRET KEY");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".claude/CLAUDE.md")).unwrap();
+
+        let blocked = ProjectInstructions::discover(&root, &names());
+        assert!(!blocked.render().contains("SECRET KEY"));
+        assert_eq!(blocked.warnings.len(), 1);
+        assert!(blocked.warnings[0].contains("outside the repository"));
+
+        let allowed = ProjectInstructions::discover_with(
+            &root,
+            Options { names: names(), imports_outside_project: true, ..Default::default() },
+        );
+        assert!(allowed.render().contains("SECRET KEY"));
+    }
+
+    #[test]
+    fn longer_fences_are_not_closed_by_shorter_inner_runs() {
+        // A four-backtick fence stays open across an inner ``` line, so an
+        // @import and an HTML comment inside it are left untouched.
+        let text = "````\n@secret.md\n```\nstill inside\n<!-- keep -->\n````\n@after.md";
+        assert_eq!(import_refs(text), vec!["after.md".to_string()]);
+        assert!(strip_html_comments(text).contains("<!-- keep -->"));
+        // A tilde fence is independent of a backtick run of any length.
+        assert_eq!(import_refs("~~~\n@a.md\n```\n@b.md\n~~~\n@c.md"), vec!["c.md".to_string()]);
     }
 
     #[test]
