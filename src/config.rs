@@ -62,6 +62,14 @@ pub struct Config {
     pub project_instructions: bool,
     /// Instruction file names tried in each directory; the first found is used.
     pub project_instruction_files: Vec<String>,
+    /// The user's own instruction files (`~` allowed); every one found loads,
+    /// before the project's.
+    pub user_instruction_files: Vec<String>,
+    /// The user's rules directories (`*.md`, optional `paths:` front matter).
+    pub user_rules_dirs: Vec<String>,
+    /// Let `@path` imports and rule symlinks in project files reach outside
+    /// the repository (off: a committed CLAUDE.md can't pull in `~/.ssh/...`).
+    pub instruction_imports_outside_project: bool,
     /// Offer the `plan_*` tools and restate the plan after compaction.
     pub plan_tools: bool,
     /// Offer the `report_outcome` tool (an explicit completed/blocked signal).
@@ -153,6 +161,9 @@ impl Default for Config {
             timestamps: true,
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
+            user_instruction_files: crate::instructions::DEFAULT_USER_FILES.iter().map(|s| s.to_string()).collect(),
+            user_rules_dirs: crate::instructions::DEFAULT_USER_RULES_DIRS.iter().map(|s| s.to_string()).collect(),
+            instruction_imports_outside_project: false,
             plan_tools: true,
             outcome_tool: true,
             reminders: true,

@@ -1845,13 +1845,23 @@ impl Agent {
         let instructions = enabled
             .then(|| cwd.clone())
             .flatten()
-            .map(|cwd| ProjectInstructions::discover(&cwd, &self.config.project_instruction_files));
+            .map(|cwd| ProjectInstructions::discover_with(&cwd, self.instruction_options()));
         let skills_enabled = self.config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
         let skills = match cwd.filter(|_| skills_enabled) {
             Some(cwd) => Skills::discover(&cwd, &self.config.skills),
             None => Skills::default(),
         };
         (instructions, skills)
+    }
+
+    fn instruction_options(&self) -> crate::instructions::Options {
+        use crate::instructions::expand_home;
+        crate::instructions::Options {
+            names: self.config.project_instruction_files.clone(),
+            user_files: self.config.user_instruction_files.iter().map(|p| expand_home(p)).collect(),
+            user_rules_dirs: self.config.user_rules_dirs.iter().map(|p| expand_home(p)).collect(),
+            imports_outside_project: self.config.instruction_imports_outside_project,
+        }
     }
 
     /// Discover instruction files and skills, committing them to `self`.
@@ -1937,6 +1947,16 @@ impl Agent {
     /// Paths of the instruction files in the system prompt.
     pub fn project_instruction_files(&self) -> Vec<String> {
         self.instructions.as_ref().map(ProjectInstructions::loaded_paths).unwrap_or_default()
+    }
+
+    /// Rules attached only when a file they cover is touched.
+    pub fn on_demand_instruction_files(&self) -> Vec<String> {
+        self.instructions.as_ref().map(ProjectInstructions::on_demand_paths).unwrap_or_default()
+    }
+
+    /// Instruction files or imports that were skipped, with the reason.
+    pub fn instruction_warnings(&self) -> Vec<String> {
+        self.instructions.as_ref().map(|i| i.warnings.clone()).unwrap_or_default()
     }
 
     /// Send a user message and get agent response (with tool execution)
@@ -2596,7 +2616,11 @@ impl Agent {
                     result_text.push_str(&reminders::wrap(ctx));
                 }
                 if self.config.reminders && !is_plan_tool && !is_outcome_tool {
-                    for note in self.reminders.after_tool_call(&self.plan) {
+                    if ok && tool_call.name == memory::SAVE_TOOL {
+                        self.reminders.memory_saved();
+                    }
+                    let memory_writable = self.config.memory.enabled() && self.memory_writable();
+                    for note in self.reminders.after_tool_call(&self.plan, memory_writable) {
                         result_text.push_str("\n\n");
                         result_text.push_str(&reminders::wrap(&note));
                     }
@@ -5436,6 +5460,8 @@ mod tests {
             skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
             context_window: Some(18_000),
             max_tokens: 16_384,
+            // The window arithmetic below leaves no room for the memory section.
+            memory: crate::config::MemoryMode::Off,
             // Off, so the big prompt reaches the turn request and overflows
             // there instead of being auto-compacted beforehand.
             auto_compact: false,

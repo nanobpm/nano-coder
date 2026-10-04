@@ -458,7 +458,10 @@ verbosity = "normal"                    # quiet | normal | verbose | debug (or -
 renderer = "frame"                      # frame (default: app-owned redraw on resize) | legacy
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
-project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
+project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"]
+user_instruction_files = ["~/.claude/CLAUDE.md", "~/.agents/AGENTS.md"]   # yours, for every project
+user_rules_dirs = ["~/.claude/rules"]
+instruction_imports_outside_project = false   # let project @imports / rule links leave the repo
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
@@ -841,24 +844,61 @@ providers and models on synthetic or forked real sessions (see its README). See 
 
 ## Project Instructions
 
-When a session starts, the harness looks for instruction files in every directory from the
-git root (the nearest ancestor containing `.git`) down to the working directory. Outside a
-repository only the working directory is checked. In each directory the first file found from
-`project_instruction_files` is used, so `AGENTS.md` wins over `CLAUDE.md`, which wins over
-`.github/copilot-instructions.md`. The files are appended to the system prompt, root first,
-under a "Repository instructions" heading that tells the model to follow them. So the model
-has them before it makes any change, without having to decide to read them. Each file is
-capped at 32 KiB and the total at 64 KiB.
+nano-coder reads the instruction files you already have for other tools, including Claude
+Code's, so there is nothing to duplicate.
 
-Instruction files deeper in the tree than the working directory, such as `pkg/AGENTS.md`,
-are loaded lazily. The first time `read_file`, `write_file` or `edit_file` touches a path
-under such a directory, its instructions are appended to that tool result, once per
-directory. After a compaction they are attached again the next time they apply. Files that
-the `bash` tool touches don't trigger this.
+**Your files.** Each file in `user_instruction_files` that exists (default `~/.claude/CLAUDE.md`
+and `~/.agents/AGENTS.md`) is loaded first, under a "Your instructions" heading, followed by
+the rules in `user_rules_dirs` (default `~/.claude/rules`).
 
-Instructions are read again when a session is resumed, so edits to `AGENTS.md` take effect.
-`/context` lists the loaded files. To turn loading off, set `project_instructions = false`,
-or set `AGENTIC_NO_PROJECT_INSTRUCTIONS`.
+**The repository's files.** When a session starts, the harness looks in every directory from
+the git root (the nearest ancestor containing `.git`) down to the working directory. Outside
+a repository only the working directory is checked. In each directory:
+
+- the first file found from `project_instruction_files` is used, so `AGENTS.md` wins over
+  `CLAUDE.md`, then `.claude/CLAUDE.md`, then `.github/copilot-instructions.md`;
+- `CLAUDE.local.md` (personal, not committed) is loaded as well, after it.
+
+Rules in `.claude/rules/**/*.md` at the git root are loaded after the root directory's
+files. These files are appended to the system prompt, root first, under a "Repository
+instructions" heading that tells the model to follow them. So the model has them before it
+makes any change, without having to decide to read them. Block-level `<!-- ... -->` comments
+are removed first. Each file is capped at 32 KiB and the total at 64 KiB; a file over the
+limit is named, with a note to read it with `read_file`.
+
+**Imports.** `CLAUDE.md`, `CLAUDE.local.md`, rules and imported files can pull in other files
+with `@path`, as in Claude Code: relative to the importing file, `~/` allowed, up to four
+levels deep, each file once. Code spans and fenced code blocks are skipped, `\ ` escapes a
+space, and a path that doesn't exist is treated as a mention. `AGENTS.md` has no import
+syntax, so `@` there is never expanded. **Imports in repository files may not leave the
+repository**: a committed `CLAUDE.md` could otherwise send `~/.ssh/...` to the model provider.
+They are skipped with a warning in the banner and `/context`, and so are rules that are
+symlinks to files outside it. Set `instruction_imports_outside_project = true` to allow them.
+Your own files can import from anywhere.
+
+**Rules for some paths.** A rule with `paths` front matter loads only when it is needed:
+
+```markdown
+---
+paths:
+  - "src/api/**/*.{ts,tsx}"
+---
+All API endpoints must validate their input.
+```
+
+Patterns are relative to the git root (`**` crosses directories, `*` and `?` don't, `{a,b}`
+alternatives).
+
+**Deeper directories and path rules load lazily.** Instruction files deeper than the working
+directory, such as `pkg/AGENTS.md`, and rules whose `paths` match are attached to the result
+of the first `read_file`, `write_file` or `edit_file` call that touches a matching path, once
+each. After a compaction they are attached again the next time they apply. Files that the
+`bash` tool touches don't trigger this.
+
+Instructions are read again when a session is resumed, so edits take effect. `/context` lists
+the loaded files, the rules waiting for a matching path, and anything skipped. To turn loading
+off (yours and the repository's), set `project_instructions = false`, or set
+`AGENTIC_NO_PROJECT_INSTRUCTIONS`.
 
 ## Skills
 
@@ -974,9 +1014,23 @@ store.
 **Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
 `memory_search(pattern, scope?)`, `memory_forget(id)`.
 
-**Prompt.** A capped, dated index (most-recently-used first, ~3 KB) is appended to the system
-prompt at session start, framed as "notes from earlier sessions; may be out of date; verify
-before relying on them". The rest is reachable with `memory_search`.
+**Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
+appended to the system prompt at session start, framed as "notes from earlier sessions; may be
+out of date; verify before relying on them". The rest is reachable with `memory_search`.
+
+**What gets saved.** When saving is possible, the prompt says what is worth saving, even
+before anything has been saved (adapted from Claude Code's auto memory):
+
+- **Save:** corrections you give and approaches you confirm; your preferences; decisions and
+  context the code and git history don't record; where to find things outside the repository;
+  setup that was costly to work out.
+- **Skip:** what the code, git history or instruction files already say, one-off debugging,
+  session logs, and secrets.
+
+Asking the model to remember something saves it. Asking for it to go in `AGENTS.md` or
+`CLAUDE.md` edits that file instead. Once per session, after 30 tool calls without a save,
+a reminder asks whether anything durable is worth saving (`reminders = false` turns
+reminders off).
 
 **Control and hygiene.**
 
