@@ -1358,7 +1358,8 @@ mod tests {
         // llama.cpp: one /models and one /props serve both the window and the
         // thinking levels — no second serial round-trip.
         let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp"}]});
-        let props = json!({"default_generation_settings": {"n_ctx": 65536}, "chat_template": "{% if enable_thinking %}"});
+        let props =
+            json!({"default_generation_settings": {"n_ctx": 65536}, "chat_template": "{% if enable_thinking %}"});
         let (win, thinking, paths) =
             detect_both("box", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
         assert_eq!(win, window(65536, "llama.cpp /props n_ctx"));

@@ -107,7 +107,8 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         Some(Request::Off) => body["reasoning"] = json!({ "effort": "none" }),
         // Budgets, the Anthropic adaptive enable-half, and template variables
         // (llama.cpp) are not resolved for this API.
-        Some(Request::Budget(_) | Request::AdaptiveOn | Request::TemplateSwitch(_) | Request::TemplateEffort(_)) | None => {}
+        Some(Request::Budget(_) | Request::AdaptiveOn | Request::TemplateSwitch(_) | Request::TemplateEffort(_))
+        | None => {}
     }
     transport.finish_body(body)
 }

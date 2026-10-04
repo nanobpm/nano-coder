@@ -1355,7 +1355,10 @@ mod tests {
         let (choices, _) = thinking_choices(1, &[], &None).unwrap();
         let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
         assert!(!labels.contains(&"high"), "empty model levels must not offer standard effort names: {labels:?}");
-        assert!(labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")), "only default/unset: {labels:?}");
+        assert!(
+            labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")),
+            "only default/unset: {labels:?}"
+        );
     }
 
     #[test]

@@ -171,10 +171,8 @@ impl Resolved {
         }
         let warning = match (self.effective, self.source) {
             (Temperature::Value(v), Source::Model | Source::Provider | Source::ExtraBody) => {
-                let ignored = format!(
-                    "temperature {v} ({}) is ignored: {reason}; using the model default",
-                    self.source.label()
-                );
+                let ignored =
+                    format!("temperature {v} ({}) is ignored: {reason}; using the model default", self.source.label());
                 // An unrelated non-finite `extra_body` diagnostic (the value
                 // came from the model/provider, not extra_body) stays true once
                 // the temperature is dropped, so keep it alongside the ignored
@@ -417,7 +415,10 @@ mod tests {
         assert_eq!((r.value(), r.source), (None, Source::Required));
         let warning = r.warning.unwrap();
         assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
-        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
+        assert!(
+            warning.contains("0.5") && warning.contains("ignored"),
+            "the ignored provider value is reported: {warning}"
+        );
     }
 
     #[test]
@@ -528,6 +529,9 @@ mod tests {
         assert_eq!(r.value(), None);
         let warning = r.warning.unwrap();
         assert!(warning.contains("not finite"), "the non-finite diagnostic is preserved: {warning}");
-        assert!(warning.contains("0.5") && warning.contains("ignored"), "the ignored provider value is reported: {warning}");
+        assert!(
+            warning.contains("0.5") && warning.contains("ignored"),
+            "the ignored provider value is reported: {warning}"
+        );
     }
 }
