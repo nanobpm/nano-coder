@@ -567,6 +567,16 @@ pub struct Resolved {
     /// temperature lock on its own — the control's value, not the generated
     /// level, is what the model sees — even when no thinking level is requested.
     pub extra_body_thinking_on: Option<bool>,
+    /// For Anthropic Messages, the `extra_body` key the enabling/disabling
+    /// control above was found under (`thinking` or `output_config`). `Some`
+    /// exactly when `extra_body_thinking_on` is. An effort-only
+    /// `output_config.effort` control is only a *field-level* override — it
+    /// owns the effort value but is no complete thinking control on its own:
+    /// adaptive thinking still needs the generated `thinking = { type =
+    /// "adaptive" }` half on the wire. This records which key carried the
+    /// control so the temperature lock can tell a complete `thinking` override
+    /// from a bare effort.
+    pub extra_body_thinking_key: Option<String>,
     /// `extra_body_override` suppressed the generated field, so `effective` is
     /// the configured level, not what the wire carries: the override's value
     /// (which may be a switch or a budget, not a level name) is sent instead.
@@ -652,8 +662,16 @@ impl Resolved {
         // that preserved half (`dropped`): `request()` then emits nothing and
         // only the bare effort reaches the wire, which is no complete control
         // — the requested `off` is not sent, so it cannot lock the
-        // temperature either.
-        if self.extra_body_enables_thinking() && self.request() != Some(Request::Off) && !self.dropped {
+        // temperature either. And an effort-only `output_config.effort`
+        // override that emits no adaptive enable half (a `Default` effective
+        // setting) is no complete control either: the bare effort sits on the
+        // wire without the `thinking = { type = "adaptive" }` it needs, so it
+        // does not turn thinking on and must not lock the temperature.
+        if self.extra_body_enables_thinking()
+            && self.request() != Some(Request::Off)
+            && !self.dropped
+            && self.extra_body_control_is_complete()
+        {
             return true;
         }
         // Otherwise the request thinks only when we actually emit a thinking-on
@@ -680,6 +698,21 @@ impl Resolved {
         self.extra_body_thinking_on == Some(true)
     }
 
+    /// Whether an enabling `extra_body` control is a *complete* thinking
+    /// control that turns thinking on by itself on the wire. A `thinking`
+    /// override is complete: it carries the `type` field Anthropic's adaptive
+    /// thinking needs. An effort-only `output_config.effort` override is only a
+    /// *field-level* override — it owns the effort value but is no complete
+    /// control on its own: adaptive thinking still requires the generated
+    /// `thinking = { type = "adaptive" }` half ([`Request::AdaptiveOn`]) to
+    /// reach the wire. When `request()` emits no such half (the effective
+    /// setting is `Default`, or `drop_params` strips it), the bare
+    /// `output_config.effort` sits on the wire without enabling thinking, so it
+    /// must not lock the temperature.
+    fn extra_body_control_is_complete(&self) -> bool {
+        self.extra_body_thinking_key.as_deref() != Some("output_config") || self.request() == Some(Request::AdaptiveOn)
+    }
+
     /// Whether the model thinks on Anthropic Messages even when the request
     /// sends no thinking field — the basis for the temperature rule of a
     /// request that omits one (e.g. compaction). Unlike
@@ -694,8 +727,11 @@ impl Resolved {
         // overriding the generated field cannot stop a no-`off` model from
         // thinking, and an `extra_body` control that enables thinking (merged
         // into every request, compaction included) keeps it on even when no
-        // generated field is sent.
-        self.model_always_thinks() || self.extra_body_enables_thinking()
+        // generated field is sent. An effort-only `output_config.effort`
+        // override, though, is no complete control on its own: it keeps the
+        // model thinking only when the generated `thinking = { type =
+        // "adaptive" }` half is emitted alongside it.
+        self.model_always_thinks() || (self.extra_body_enables_thinking() && self.extra_body_control_is_complete())
     }
 
     /// One line for `/context`, e.g. `high (set for this model)`. An
@@ -940,19 +976,25 @@ pub fn resolve_with(
     // independent of whether it also overrides a generated field: its value —
     // not the generated level — is what the model sees, and a control that
     // enables thinking makes a custom temperature invalid even with no thinking
-    // level requested.
-    let extra_body_thinking_on = if wire == Wire::AnthropicMessages {
+    // level requested. Record the key it was found under too: a `thinking`
+    // control is complete on its own, while an effort-only `output_config`
+    // control needs the generated adaptive half to actually turn thinking on.
+    let extra_body_thinking = if wire == Wire::AnthropicMessages {
         provider.extra_body.as_ref().and_then(|body| {
             extra_body_keys(wire)
                 .iter()
                 .filter(|k| {
                     body.contains_key(**k) && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k))
                 })
-                .find_map(|k| body.get(*k).and_then(|v| anthropic_extra_body_thinks(k, v)))
+                .find_map(|k| {
+                    body.get(*k).and_then(|v| anthropic_extra_body_thinks(k, v)).map(|on| (k.to_string(), on))
+                })
         })
     } else {
         None
     };
+    let (extra_body_thinking_key, extra_body_thinking_on) =
+        extra_body_thinking.map_or((None, None), |(k, on)| (Some(k), Some(on)));
     let overridden = extra_body_override.is_some();
     // `finish_body` removes the provider's `drop_params` keys after the body is
     // built, so a generated thinking field under one of them never reaches the
@@ -990,6 +1032,7 @@ pub fn resolve_with(
             // it sits under the same key the plain generated request uses.
             extra_body_override: None,
             extra_body_thinking_on: None,
+            extra_body_thinking_key: None,
             overridden: false,
             dropped: false,
             warning: None,
@@ -1045,6 +1088,7 @@ pub fn resolve_with(
         format,
         extra_body_override,
         extra_body_thinking_on,
+        extra_body_thinking_key,
         overridden,
         dropped,
         warning,
@@ -1341,11 +1385,18 @@ mod tests {
         assert!(!r.anthropic_thinking_on(), "it does not lock the temperature");
         assert!(!r.always_anthropic_thinking());
         // An `effort` field still enables or disables thinking as before, even
-        // alongside an unrelated `format`.
+        // alongside an unrelated `format` — but an effort-only override with a
+        // `Default` effective setting emits no `thinking = { type = "adaptive"
+        // }` half, so the bare `output_config.effort` is no complete control
+        // and must not lock the temperature.
         let p = provider(r#"extra_body = { output_config = { effort = "high", format = "json" } }"#);
         let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
         assert_eq!(r.extra_body_thinking_on, Some(true));
-        assert!(r.anthropic_thinking_on(), "an effort field still locks the temperature");
+        assert_eq!(r.request(), None, "a Default effective setting emits no adaptive enable half");
+        assert!(
+            !r.anthropic_thinking_on(),
+            "a bare output_config.effort without its thinking half does not lock the temperature"
+        );
         let p = provider(r#"extra_body = { output_config = { effort = "none" } }"#);
         let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-6");
         assert_eq!(r.extra_body_thinking_on, Some(false), "an off effort disables thinking");
@@ -1750,6 +1801,43 @@ mod tests {
         let r = resolve(&Thinking::Default, Some(&Thinking::Off), anthropic, &p, "claude-sonnet-5.5");
         assert!(r.model_always_thinks());
         assert!(r.anthropic_thinking_on(), "an always-thinking model locks the temperature regardless");
+    }
+
+    #[test]
+    fn effort_only_override_with_default_effective_is_no_complete_control() {
+        // Regression: an effort-only `extra_body.output_config.effort` was
+        // treated as enabling thinking even when the effective setting is
+        // `Default`, for which `request()` emits no `AdaptiveOn`. The wire then
+        // carries `output_config.effort` but no `thinking = { type = "adaptive"
+        // }` — no complete adaptive-thinking control — yet a custom temperature
+        // was still dropped. The lock must follow the emitted control: a bare
+        // effort without its adaptive enable half does not turn thinking on.
+        // (claude-sonnet-4-7 is adaptive and off-capable.)
+        let anthropic = Some(ProviderKind::Anthropic);
+        let p = provider(r#"extra_body = { output_config = { effort = "low" } }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-7");
+        assert_eq!(r.request(), None, "a Default effective setting emits no adaptive enable half");
+        assert_eq!(r.extra_body_thinking_on, Some(true), "the effort override reads as enabling");
+        assert!(
+            !r.anthropic_thinking_on(),
+            "a bare output_config.effort without its thinking half does not lock the temperature"
+        );
+        assert!(!r.always_anthropic_thinking(), "nor does it think with no generated field");
+
+        // A requested level DOES emit the adaptive enable half, so the same
+        // override is a complete control and locks the temperature.
+        let r = resolve(&Thinking::Default, Some(&level("high")), anthropic, &p, "claude-sonnet-4-7");
+        assert_eq!(r.request(), Some(Request::AdaptiveOn), "the level preserves the adaptive enable half");
+        assert!(r.anthropic_thinking_on(), "a complete adaptive control locks the temperature");
+        assert!(r.always_anthropic_thinking());
+
+        // A complete `thinking` override (not effort-only) locks the
+        // temperature even with a `Default` effective setting.
+        let p = provider(r#"extra_body = { thinking = { type = "enabled" } }"#);
+        let r = resolve(&Thinking::Default, None, anthropic, &p, "claude-sonnet-4-7");
+        assert_eq!(r.request(), None);
+        assert!(r.anthropic_thinking_on(), "a complete thinking override locks the temperature");
+        assert!(r.always_anthropic_thinking());
     }
 
     #[test]
