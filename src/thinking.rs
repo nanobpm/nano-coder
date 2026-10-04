@@ -414,6 +414,40 @@ fn anthropic_extra_body_thinks(key: &str, value: &toml::Value) -> Option<bool> {
     })
 }
 
+/// The generated thinking control's `(top-level key, nested field)` for a
+/// non-Anthropic wire whose control is written into a *nested* object
+/// (`reasoning.effort` on Responses, `chat_template_kwargs`'s `enable_thinking`
+/// or `reasoning_effort` on llama.cpp, by format). `None` when the control is a
+/// top-level scalar (`reasoning_effort` on Chat Completions), where presence of
+/// the key is itself the override. Must track the fields `build_body` emits in
+/// each provider so the override check matches what actually reaches the wire.
+fn generated_nested_field(wire: Wire, format: Format) -> Option<(&'static str, &'static str)> {
+    match (wire, format) {
+        (Wire::Responses, _) => Some(("reasoning", "effort")),
+        (Wire::ChatCompletions, Format::TemplateSwitch) => Some(("chat_template_kwargs", "enable_thinking")),
+        (Wire::ChatCompletions, Format::TemplateEffort) => Some(("chat_template_kwargs", "reasoning_effort")),
+        _ => None,
+    }
+}
+
+/// For a non-Anthropic wire, whether an `extra_body` key actually displaces the
+/// generated thinking control, as opposed to an unrelated sibling that
+/// `finish_body` merges alongside it. When the generated control lives in a
+/// nested object (see [`generated_nested_field`]), an `extra_body` object under
+/// that key overrides only if it carries the generated field; an object that
+/// sets only other fields coexists with the generated control. A non-object
+/// value (it replaces the control wholesale) and any key that is not the
+/// generated control's key override on presence, as before.
+fn extra_body_overrides_generated(key: &str, wire: Wire, format: Format, value: Option<&toml::Value>) -> bool {
+    match generated_nested_field(wire, format) {
+        Some((nested_key, field)) if nested_key == key => match value {
+            Some(toml::Value::Table(t)) => t.contains_key(field),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
 /// The generated thinking control for `effective` on `wire`/`anthropic`/`format`,
 /// or `None` when nothing is sent (`Thinking::Default`). This is the single
 /// source of truth for which [`Request`] a level maps to; both [`Resolved::request`]
@@ -805,17 +839,27 @@ pub fn resolve_with(
                     // generated-field drop logic below report the real outcome.
                     let present = body.contains_key(**k)
                         && !provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == **k));
-                    // On Anthropic Messages a key overrides the generated
-                    // thinking control only when it actually carries one: a
-                    // format-only `output_config` (no `effort`) is a
-                    // structured-output setting, not a thinking override, so it
-                    // must not suppress the requested level. `finish_body` then
-                    // deep-merges it with the generated `output_config.effort`
-                    // so both coexist. Every other key (and `thinking`) is a
-                    // thinking control whenever present.
+                    // A key overrides the generated thinking control only when
+                    // it actually carries one; `finish_body` deep-merges an
+                    // unrelated sibling field alongside the generated control, so
+                    // an option that does not touch the thinking field must not
+                    // suppress it. On Anthropic Messages a format-only
+                    // `output_config` (no `effort`) is a structured-output
+                    // setting, not a thinking override. On other wires the
+                    // generated control for some formats lives in a nested object
+                    // (`reasoning.effort` on Responses,
+                    // `chat_template_kwargs.enable_thinking`/`reasoning_effort` on
+                    // llama.cpp); an `extra_body` object there that sets only
+                    // unrelated siblings (e.g. `reasoning = { summary = "auto" }`
+                    // or an unrelated template variable) is merged in, not an
+                    // override. Every top-level scalar control (and `thinking`) is
+                    // an override whenever present.
                     present
-                        && (wire != Wire::AnthropicMessages
-                            || body.get(**k).and_then(|v| anthropic_extra_body_thinks(k, v)).is_some())
+                        && if wire == Wire::AnthropicMessages {
+                            body.get(**k).and_then(|v| anthropic_extra_body_thinks(k, v)).is_some()
+                        } else {
+                            extra_body_overrides_generated(k, wire, format, body.get(**k))
+                        }
                 })
             })
             .map(|key| key.to_string())
@@ -1248,6 +1292,73 @@ mod tests {
         assert!(r.overridden, "an effort-bearing output_config overrides the generated level");
         assert_eq!(r.extra_body_override.as_deref(), Some("output_config"));
         assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+    }
+
+    #[test]
+    fn unrelated_nested_extra_body_options_do_not_suppress_the_generated_control() {
+        // The same class as the Anthropic `output_config` fix, on other wires:
+        // the generated control for some wires/formats lives in a nested object,
+        // and `finish_body` merges an unrelated `extra_body` sibling alongside
+        // it. So an `extra_body` object that sets only unrelated fields must NOT
+        // be classified as an override — it would wrongly suppress the requested
+        // level. An object that DOES carry the generated field still overrides.
+        let copilot = Some(ProviderKind::GithubCopilot);
+
+        // Responses: `reasoning.effort` is the generated field. A
+        // `reasoning = { summary = "auto" }` sets only `summary`, so the
+        // requested effort must still be emitted and coexist (merged).
+        let p = provider(r#"extra_body = { reasoning = { summary = "auto" } }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), copilot, &p, "gpt-5.6-sol");
+        assert_eq!(r.wire, Wire::Responses);
+        assert!(!r.overridden, "a summary-only reasoning option is not a thinking override");
+        assert_eq!(r.extra_body_override, None);
+        assert_eq!(r.request(), Some(Request::Effort("high".into())), "the requested effort is still emitted");
+        assert_eq!(r.warning, None, "no override warning for an unrelated nested option");
+        // A `reasoning` that carries `effort` IS an override (it displaces the
+        // generated effort), and a non-object value replaces it wholesale.
+        let p = provider(r#"extra_body = { reasoning = { effort = "low", summary = "auto" } }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), copilot, &p, "gpt-5.6-sol");
+        assert!(r.overridden, "an effort-bearing reasoning overrides the generated effort");
+        assert_eq!(r.extra_body_override.as_deref(), Some("reasoning"));
+        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+        let p = provider(r#"extra_body = { reasoning = "high" }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), copilot, &p, "gpt-5.6-sol");
+        assert!(r.overridden, "a non-object reasoning replaces the control wholesale");
+
+        // llama.cpp switch template: the generated field is
+        // `chat_template_kwargs.enable_thinking`. An unrelated template variable
+        // there must not suppress the switch; one that sets `enable_thinking`
+        // does override.
+        let openai = Some(ProviderKind::Openai);
+        let switch =
+            Reported { levels: vec!["off".into(), ON.into()], adaptive: false, format: Format::TemplateSwitch };
+        let p = provider(r#"extra_body = { chat_template_kwargs = { foo = true } }"#);
+        let r = resolve_with(&Thinking::Default, Some(&level("high")), openai, &p, "local", Some(&switch));
+        assert!(!r.overridden, "an unrelated template variable is not a thinking override");
+        assert_eq!(r.request(), Some(Request::TemplateSwitch(true)), "the generated switch is still emitted");
+        let p = provider(r#"extra_body = { chat_template_kwargs = { enable_thinking = false } }"#);
+        let r = resolve_with(&Thinking::Default, Some(&level("high")), openai, &p, "local", Some(&switch));
+        assert!(r.overridden, "setting enable_thinking overrides the generated switch");
+        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+
+        // llama.cpp effort template: the generated field is
+        // `chat_template_kwargs.reasoning_effort`.
+        let effort =
+            Reported { levels: vec!["low".into(), "high".into()], adaptive: false, format: Format::TemplateEffort };
+        let p = provider(r#"extra_body = { chat_template_kwargs = { foo = true } }"#);
+        let r = resolve_with(&Thinking::Default, Some(&level("high")), openai, &p, "local", Some(&effort));
+        assert!(!r.overridden, "an unrelated template variable is not a thinking override");
+        assert_eq!(r.request(), Some(Request::TemplateEffort("high".into())), "the generated effort is still emitted");
+        let p = provider(r#"extra_body = { chat_template_kwargs = { reasoning_effort = "low" } }"#);
+        let r = resolve_with(&Thinking::Default, Some(&level("high")), openai, &p, "local", Some(&effort));
+        assert!(r.overridden, "setting reasoning_effort overrides the generated effort");
+        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+
+        // Chat Completions scalar `reasoning_effort`: still an override on
+        // presence (no nested field to merge).
+        let p = provider(r#"extra_body = { reasoning_effort = "low" }"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), openai, &p, "gpt-5");
+        assert!(r.overridden, "a scalar reasoning_effort overrides on presence");
     }
 
     #[test]
