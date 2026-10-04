@@ -157,10 +157,15 @@ fn new_session(agent: &mut Agent, params: &Value) -> anyhow::Result<String> {
 }
 
 /// Make `params.cwd` the working directory for tools (one session per process).
-/// `_meta` for session/new and session/load: loaded instruction files and skills.
+/// `_meta` for session/new and session/load: loaded instruction files,
+/// on-demand (path-scoped) rules, and skills.
 fn session_meta(agent: &Agent) -> Value {
     let mut meta =
         json!({ "projectInstructions": agent.project_instruction_files(), "skills": agent.skills().names() });
+    let on_demand = agent.on_demand_instruction_files();
+    if !on_demand.is_empty() {
+        meta["projectInstructionsOnDemand"] = json!(on_demand);
+    }
     if !agent.skills().warnings.is_empty() {
         meta["skillWarnings"] = json!(agent.skills().warnings);
     }

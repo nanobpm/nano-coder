@@ -216,16 +216,27 @@ fn import_refs(text: &str) -> Vec<String> {
         }
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
-        let mut in_span = false;
+        // A code span opens with a run of N backticks and closes only on a
+        // run of exactly N (CommonMark). Track the open run so multi-backtick
+        // spans skip their contents instead of toggling on every backtick.
+        let mut span_ticks: Option<usize> = None;
         while i < chars.len() {
             let c = chars[i];
             if c == '`' {
-                in_span = !in_span;
-                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] == '`' {
+                    i += 1;
+                }
+                let run = i - start;
+                match span_ticks {
+                    None => span_ticks = Some(run),
+                    Some(open) if open == run => span_ticks = None,
+                    Some(_) => {}
+                }
                 continue;
             }
             let starts = i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == '(';
-            if in_span || c != '@' || !starts {
+            if span_ticks.is_some() || c != '@' || !starts {
                 i += 1;
                 continue;
             }
@@ -460,6 +471,40 @@ impl ProjectInstructions {
         }
     }
 
+    /// Resolve a scoped rule's body together with its `@path` imports into one
+    /// block. Scoped rules are Claude-format, so their imports must be expanded
+    /// rather than emitted literally, and they share the canonical `seen`
+    /// deduplication, import depth, and outside-repository safety checks used
+    /// for every other instruction file.
+    fn resolve_scoped_rule(&mut self, path: &Path, body: &str, user: bool) -> String {
+        let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.seen.insert(real);
+        let mut out = body.to_string();
+        self.append_rule_imports(path, body, user, 0, &mut out);
+        out
+    }
+
+    fn append_rule_imports(&mut self, from: &Path, text: &str, user: bool, depth: usize, out: &mut String) {
+        if depth >= MAX_IMPORT_DEPTH {
+            return;
+        }
+        for reference in import_refs(text) {
+            let Some(target) = self.resolve_import(from, &reference, user) else { continue };
+            let real = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if !self.seen.insert(real) {
+                continue;
+            }
+            let Some(imported) = read_capped(&target) else { continue };
+            out.push_str(&format!(
+                "\n\n## {} (imported by {})\n\n{}",
+                self.display(&target),
+                self.display(from),
+                imported
+            ));
+            self.append_rule_imports(&target, &imported, user, depth + 1, out);
+        }
+    }
+
     /// Resolve `@reference` in `from`. Missing files are mentions, not
     /// imports, and are ignored; project imports outside the repository are
     /// skipped with a warning unless allowed.
@@ -515,7 +560,8 @@ impl ProjectInstructions {
                         self.warnings.push(format!("rule {} has no usable paths patterns", self.display(&path)));
                         continue;
                     }
-                    self.scoped.push(ScopedRule { path, text: body.to_string(), patterns: compiled, attached: false });
+                    let text = self.resolve_scoped_rule(&path, body, user);
+                    self.scoped.push(ScopedRule { path, text, patterns: compiled, attached: false });
                 }
                 (None, body) => {
                     let body = body.trim();
@@ -556,8 +602,14 @@ impl ProjectInstructions {
 
     /// Text appended to the system prompt (empty when nothing was found).
     pub fn render(&self) -> String {
+        // One bounded marker is reserved up front so the total never exceeds
+        // `MAX_TOTAL_BYTES`, however many files are omitted. Group headers and
+        // the marker are charged against the budget too, so a rules directory
+        // with many files cannot grow the prompt past the cap.
+        const MARKER: &str = "\n\n[omitted: instruction size limit reached; read the remaining files with read_file]";
         let mut out = String::new();
-        let mut budget = MAX_TOTAL_BYTES;
+        let mut budget = MAX_TOTAL_BYTES.saturating_sub(MARKER.len());
+        let mut truncated = false;
         let groups = [
             (
                 true,
@@ -571,24 +623,29 @@ impl ProjectInstructions {
                  refine the ones above them.",
             ),
         ];
-        for (user, header) in groups {
+        'groups: for (user, header) in groups {
             let files: Vec<&InstructionFile> = self.loaded.iter().filter(|f| f.user == user).collect();
             if files.is_empty() {
                 continue;
             }
+            if header.len() > budget {
+                truncated = true;
+                break;
+            }
+            budget -= header.len();
             out.push_str(header);
             for file in files {
                 let section = format!("\n\n## {}\n\n{}", self.heading(file), file.text);
                 if section.len() > budget {
-                    out.push_str(&format!(
-                        "\n\n## {}\n\n[omitted: instruction size limit reached; read it with read_file]",
-                        self.heading(file)
-                    ));
-                    continue;
+                    truncated = true;
+                    break 'groups;
                 }
                 budget -= section.len();
                 out.push_str(&section);
             }
+        }
+        if truncated {
+            out.push_str(MARKER);
         }
         out
     }
@@ -779,6 +836,63 @@ mod tests {
         assert!(user_at < rendered.find("user rule").unwrap() && rendered.find("user rule").unwrap() < repo_at);
         assert!(rendered.contains("## CLAUDE.local.md (personal, not committed)"));
         assert!(rendered.contains("style.md (rule)"));
+    }
+
+    #[test]
+    fn multi_backtick_code_spans_skip_their_contents() {
+        // A double-backtick span must stay open across inner single backticks,
+        // so the reference inside it is not imported.
+        assert_eq!(import_refs("See `` @a.md `` and @b.md"), vec!["b.md".to_string()]);
+        assert!(import_refs("`` @secret.md ``").is_empty());
+        // A single-backtick span still skips its one reference.
+        assert!(import_refs("`@secret.md`").is_empty());
+        // An unterminated span keeps the rest of the line protected.
+        assert!(import_refs("`` @secret.md").is_empty());
+        // Outside any span, references are imported as before.
+        assert_eq!(import_refs("@a.md and `code` @b.md"), vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn scoped_rule_imports_are_expanded_and_deduplicated() {
+        let (_dir, root) = repo();
+        write(&root.join(".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\nrule body, see @shared.md");
+        write(&root.join(".claude/rules/shared.md"), "shared detail");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        assert!(out.contains("rule body, see @shared.md"), "{out}");
+        // The import is expanded inline, not emitted literally.
+        assert!(out.contains("shared detail"), "{out}");
+        assert!(out.contains("imported by"), "{out}");
+    }
+
+    #[test]
+    fn scoped_rule_import_shared_with_loaded_file_is_not_duplicated() {
+        let (_dir, root) = repo();
+        // The main file imports shared.md; a scoped rule also references it.
+        write(&root.join("CLAUDE.md"), "root, see @shared.md");
+        write(&root.join("shared.md"), "shared once");
+        write(&root.join(".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\nrule, see @shared.md");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        // Already loaded via CLAUDE.md, so the rule does not re-expand it.
+        assert!(!out.contains("shared once"), "{out}");
+    }
+
+    #[test]
+    fn render_cap_bounds_total_with_header_and_single_marker() {
+        let (_dir, root) = repo();
+        // Many nested files, each near the per-file cap, well past the total cap.
+        let big = "x".repeat(MAX_FILE_BYTES - 16);
+        let mut dir = root.clone();
+        for i in 0..8 {
+            dir = dir.join(format!("d{i}"));
+            write(&dir.join("AGENTS.md"), &format!("{big} file{i}"));
+        }
+        let instructions = ProjectInstructions::discover(&dir, &names());
+        let rendered = instructions.render();
+        assert!(rendered.len() <= MAX_TOTAL_BYTES, "rendered {} > cap", rendered.len());
+        // Exactly one omission marker, however many files were dropped.
+        assert_eq!(rendered.matches("[omitted: instruction size limit reached").count(), 1);
     }
 
     #[test]
