@@ -818,7 +818,18 @@ impl ProjectInstructions {
             ),
         ];
         'groups: for (user, header) in groups {
-            let files: Vec<&InstructionFile> = self.loaded.iter().filter(|f| f.user == user).collect();
+            // Skip files a nested `search()` loaded for a directory outside the
+            // session-start set: they attach to a tool result via
+            // `nested_for`, not to the repository-wide system prompt. This
+            // matters most for a file deferred by a budget overflow: it stays
+            // pending in `loaded`, and rendering it here would leak it into the
+            // system prompt immediately instead of leaving it deferred and
+            // directory-scoped.
+            let files: Vec<&InstructionFile> = self
+                .loaded
+                .iter()
+                .filter(|f| f.user == user && f.search_dir.as_ref().is_none_or(|d| self.initial.contains(d)))
+                .collect();
             if files.is_empty() {
                 continue;
             }
@@ -969,6 +980,14 @@ impl ProjectInstructions {
     pub fn forget_nested(&mut self) {
         self.searched = self.initial.clone();
         self.seen = self.initial_seen.clone();
+        // Drop nested files still pending in `loaded` (deferred by a budget
+        // overflow): `seen` no longer covers them, so keeping them would make
+        // the next `search()` re-surface the stale entry AND reload the
+        // directory's files — reversing main/local order and emitting the
+        // deferred file twice. Post-compaction discovery rebuilds the complete
+        // nested set in order instead. Session-start (`initial`) files stay:
+        // `initial_seen` still covers them, so they are not re-added.
+        self.loaded.retain(|f| f.search_dir.as_ref().is_none_or(|d| self.initial.contains(d)));
         for rule in &mut self.scoped {
             rule.attached = false;
         }
@@ -976,7 +995,17 @@ impl ProjectInstructions {
 
     /// Files in the system prompt, for the banner, `/context` and ACP.
     pub fn loaded_paths(&self) -> Vec<String> {
-        self.loaded.iter().map(|f| f.path.display().to_string()).collect()
+        // Attached scoped rules are in the prompt too (rendered into a tool
+        // result by `nested_for`), but they are not stored in `loaded` — list
+        // them so `/context` does not lose all record of a rule the moment it
+        // attaches. (`render()` skips deferred non-initial files, so a pending
+        // overflow file may be listed here while not yet in the prompt; it is
+        // named by its deferral warning until it attaches.)
+        self.loaded
+            .iter()
+            .map(|f| f.path.display().to_string())
+            .chain(self.scoped.iter().filter(|r| r.attached).map(|r| r.path.display().to_string()))
+            .collect()
     }
 
     /// Rules attached only when a matching file is touched.
@@ -1619,6 +1648,10 @@ mod tests {
         assert!(first.contains("[omitted: instruction size limit reached"));
         assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("foo.md")),
             "warnings: {:?}", instructions.warnings);
+        // The deferred import must NOT leak into the repository-wide system
+        // prompt while it is pending: it attaches to a tool result, deferred
+        // and directory-scoped, once budget frees.
+        assert!(!instructions.render().contains("import_file"), "render: {:?}", instructions.render());
         // The deferred import stayed pending in `loaded`, so a later call renders
         // it instead of dropping it permanently.
         let second = instructions.nested_for(&root.join("a/y.rs")).unwrap();
@@ -1642,6 +1675,64 @@ mod tests {
         // it (previously it was marked attached yet never rendered).
         let second = instructions.nested_for(&root.join("src/y.rs")).unwrap();
         assert!(second.contains(if a_first { "rule_b" } else { "rule_a" }));
+    }
+
+    #[test]
+    fn compaction_while_a_file_is_deferred_reloads_without_duplicates() {
+        let (_dir, root) = repo();
+        // `a/CLAUDE.md` imports `a/shared/foo.md` and `a/shared/bar.md`. The main
+        // file and foo are near-cap (their sections just fill the 64 KiB budget),
+        // so the small bar overflows the first call and stays deferred in
+        // `loaded`. After compaction the budget is fresh, so foo + bar fit
+        // together and the directory reloads in order. (main + foo are sized so
+        // main+foo fit call 1 but main+foo+bar overflow it, deferring bar.)
+        let pad = MAX_FILE_BYTES - 168; // main/foo text just under the 32 KiB cap
+        write(&root.join("a/CLAUDE.md"), &format!("@shared/foo.md\n@shared/bar.md\n{} main_file", "x".repeat(pad)));
+        write(&root.join("a/shared/foo.md"), &format!("{} foo_file", "x".repeat(pad)));
+        write(&root.join("a/shared/bar.md"), "bar_file");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let first = instructions.nested_for(&root.join("a/x.rs")).unwrap();
+        assert!(first.contains("main_file") && first.contains("foo_file"), "first: {first:?}");
+        assert!(!first.contains("bar_file"), "first: {first:?}");
+        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("bar.md")),
+            "warnings: {:?}", instructions.warnings);
+        // Compaction with bar still pending: the stale pending entry must be
+        // dropped, or the next search re-surfaces it AND reloads the directory —
+        // rendering the deferred bar ahead of the freshly reloaded main file and
+        // leaving a duplicate pending in `loaded`.
+        instructions.forget_nested();
+        // The budget is fresh after compaction, so the whole directory reloads in
+        // order: main and foo (committed in call 1 but no longer `seen`) render
+        // first, and bar — still deferred, not duplicated — stays pending.
+        let second = instructions.nested_for(&root.join("a/y.rs")).unwrap();
+        assert!(second.contains("main_file") && second.contains("foo_file"), "second: {second:?}");
+        assert_eq!(second.matches("main_file").count(), 1, "second: {second:?}");
+        assert_eq!(second.matches("foo_file").count(), 1, "second: {second:?}");
+        assert_eq!(second.matches("bar_file").count(), 0, "bar stays pending, not duplicated: {second:?}");
+        // A later call attaches the deferred bar exactly once, after its
+        // directory's files — never ahead of them, and never twice.
+        let third = instructions.nested_for(&root.join("a/z.rs")).unwrap();
+        assert_eq!(third.matches("bar_file").count(), 1, "third: {third:?}");
+        assert!(!third.contains("main_file") && !third.contains("foo_file"), "third: {third:?}");
+        // Nothing left pending: a later call for the same directory is empty.
+        assert_eq!(instructions.nested_for(&root.join("a/w.rs")), None);
+    }
+
+    #[test]
+    fn loaded_paths_keeps_a_scoped_rule_after_it_attaches() {
+        let (_dir, root) = repo();
+        write(&root.join(".claude/rules/style.md"), "---\npaths:\n  - \"src/**\"\n---\nrule body");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        // Before any match the rule is on-demand only, not loaded.
+        assert!(instructions.on_demand_paths().iter().any(|p| p.contains("style.md")));
+        assert!(!instructions.loaded_paths().iter().any(|p| p.contains("style.md")));
+        // After it attaches to a matching file it must stay listed as loaded —
+        // `/context` must not lose all record of a rule once it enters the
+        // conversation.
+        assert!(instructions.nested_for(&root.join("src/x.rs")).unwrap().contains("rule body"));
+        assert!(instructions.loaded_paths().iter().any(|p| p.contains("style.md")),
+            "loaded_paths: {:?}", instructions.loaded_paths());
+        assert!(!instructions.on_demand_paths().iter().any(|p| p.contains("style.md")));
     }
 
     #[test]
