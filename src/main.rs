@@ -202,16 +202,17 @@ fn thinking_status_text(agent: &Agent) -> String {
     out.join("\n")
 }
 
+/// A `/thinking` argument: `reset` clears the session level (`None`).
+fn thinking_arg(arg: &str) -> std::result::Result<Option<thinking::Thinking>, String> {
+    if arg.trim().eq_ignore_ascii_case("reset") { Ok(None) } else { arg.trim().parse().map(Some) }
+}
+
 /// `/thinking ARG`: set or clear the session level; the reply says what
 /// the model will actually be sent.
 fn set_thinking_text(agent: &mut Agent, arg: &str) -> String {
-    if arg.trim().eq_ignore_ascii_case("reset") {
-        agent.set_thinking(None);
-    } else {
-        match arg.parse::<thinking::Thinking>() {
-            Ok(level) => agent.set_thinking(Some(level)),
-            Err(e) => return e,
-        }
+    match thinking_arg(arg) {
+        Ok(level) => agent.set_thinking(level),
+        Err(e) => return e,
     }
     let resolved = agent.thinking();
     let mut text = format!("Thinking set to {}", resolved.describe());
@@ -829,6 +830,14 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     Err(usage) => renderer.note(&format!("[{usage}]")),
                                 }
                             }
+                            SteerRoute::Thinking(Ok(level)) => {
+                                // The running turn sends it from its next model
+                                // call; `/thinking` afterwards shows what applies.
+                                let shown = level.as_ref().map_or("the config level".to_string(), |l| l.to_string());
+                                control.set_thinking(level);
+                                renderer.note(&format!("[thinking: {shown} — from the agent's next step]"));
+                            }
+                            SteerRoute::Thinking(Err(e)) => renderer.note(&format!("[thinking: {e}]")),
                             SteerRoute::DeferCommand => {
                                 renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
                                 terminal.queued.push_back(TermInput::Line(line));
@@ -1131,6 +1140,9 @@ enum SteerRoute {
     Ignore,
     /// A `/queue` edit — applied to the message queue even mid-turn.
     QueueCommand(std::result::Result<queue::QueueOp, String>),
+    /// `/thinking LEVEL` (or `reset`): applied from the agent's next step;
+    /// `None` clears the session level. An unknown level is the error.
+    Thinking(std::result::Result<Option<thinking::Thinking>, String>),
     /// A non-`/queue` slash command: deferred until the turn finishes.
     DeferCommand,
     /// Plain Enter: steer the running turn.
@@ -1147,6 +1159,8 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::Ignore
     } else if let Some(op) = queue_command(text) {
         SteerRoute::QueueCommand(op)
+    } else if let Some(arg) = text.strip_prefix("/thinking ").map(str::trim).filter(|a| !a.is_empty()) {
+        SteerRoute::Thinking(thinking_arg(arg))
     } else if text.starts_with('/') {
         SteerRoute::DeferCommand
     } else if steer {
@@ -2671,6 +2685,12 @@ mod tests {
         assert!(matches!(classify_steer_input("keep going", false), SteerRoute::Enqueue));
         // A regression that swapped these two would flip the feature's core
         // behaviour while still routing the same text — the pair above catches it.
+
+        // `/thinking LEVEL` applies from the agent's next step; `reset`
+        // clears the session level; a bare `/thinking` (show) waits.
+        assert!(matches!(classify_steer_input("/thinking off", true), SteerRoute::Thinking(Ok(Some(_)))));
+        assert!(matches!(classify_steer_input("/thinking reset", false), SteerRoute::Thinking(Ok(None))));
+        assert!(matches!(classify_steer_input("/thinking", true), SteerRoute::DeferCommand));
 
         // `/queue` edits run live regardless of the Enter vs Ctrl-Enter flag.
         assert!(matches!(classify_steer_input("/queue add hello", true), SteerRoute::QueueCommand(_)));

@@ -223,6 +223,9 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// `/thinking LEVEL` for this session; wins over the config. Shared so a
+    /// level set mid-turn applies from the agent's next model call.
+    thinking: Mutex<Option<crate::thinking::Thinking>>,
 }
 
 /// Steering and cancellation for the running turn. Cheap to clone and safe to
@@ -241,6 +244,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                thinking: Mutex::new(None),
             }),
         }
     }
@@ -282,6 +286,17 @@ impl TurnControl {
 
     pub fn set_mode(&self, mode: crate::mode::AgentMode) {
         *self.inner.mode.lock().unwrap() = mode;
+    }
+
+    /// The session's `/thinking` level, if one is set.
+    pub fn thinking(&self) -> Option<crate::thinking::Thinking> {
+        self.inner.thinking.lock().unwrap().clone()
+    }
+
+    /// Set (or with `None`, clear) the session's `/thinking` level. A running
+    /// turn sends it from its next model call.
+    pub fn set_thinking(&self, thinking: Option<crate::thinking::Thinking>) {
+        *self.inner.thinking.lock().unwrap() = thinking;
     }
 
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
@@ -426,11 +441,23 @@ enum ClaudePromptHook {
     Reject(String),
 }
 
+/// The thinking level the status line shows: the one actually sent, if any.
+fn status_thinking(thinking: &crate::thinking::Resolved) -> Option<String> {
+    match &thinking.effective {
+        // An extra_body override sends its own value, not the configured
+        // level, so no generated level is shown.
+        _ if thinking.overridden => None,
+        // `drop_params` strips the generated field after the body is built, so
+        // the level never reaches the wire either.
+        _ if thinking.dropped => None,
+        crate::thinking::Thinking::Default => None,
+        level => Some(level.to_string()),
+    }
+}
+
 /// Agent manages the conversation loop, tool execution, and hooks
 pub struct Agent {
     client: Box<dyn LLMClient>,
-    /// `/thinking LEVEL` for this session; wins over the config.
-    thinking_override: Option<crate::thinking::Thinking>,
     tools: ToolRegistry,
     hooks: HookRegistry,
     config: Config,
@@ -446,6 +473,10 @@ pub struct Agent {
     pending_input: Option<PendingInput>,
     input_counter: u64,
     event_sink: Option<EventSink>,
+    /// Test-only hook fired between a request's thinking snapshot and its
+    /// status-line update, to interleave a mid-update `/thinking` change.
+    #[cfg(test)]
+    after_thinking_snapshot: Option<Box<dyn Fn() + Send + Sync>>,
     message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
@@ -573,7 +604,6 @@ impl Agent {
         let policy = Policy::new(&config.permissions, &config.sandbox);
         let memory = Self::build_memory(&config);
         Self {
-            thinking_override: None,
             policy,
             client,
             tools: ToolRegistry::new(),
@@ -592,6 +622,8 @@ impl Agent {
             pending_input: None,
             input_counter: 0,
             event_sink: None,
+            #[cfg(test)]
+            after_thinking_snapshot: None,
             message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
@@ -951,15 +983,45 @@ impl Agent {
         resolved
     }
 
+    /// The thinking, temperature and output-cap settings for one model call,
+    /// all derived from a single snapshot of the session's `/thinking` level.
+    ///
+    /// The level arrives by value: the caller snapshots the shared control
+    /// once and this helper never re-reads it, so a `/thinking` typed while
+    /// the request is being built cannot make temperature observe a different
+    /// level than the one sent. Temperature is derived from the same
+    /// resolution the request sends, never a second read that could observe a
+    /// different level (see
+    /// `request_settings_derives_temperature_from_the_snapshot_not_a_reread`).
+    fn request_settings_for(
+        &self,
+        level: Option<crate::thinking::Thinking>,
+    ) -> (crate::thinking::Resolved, crate::temperature::Resolved, i64) {
+        let thinking = self.thinking_for(level.as_ref());
+        let temperature = self.temperature_for(thinking.anthropic_thinking_on());
+        let max_tokens = self.request_max_tokens();
+        (thinking, temperature, max_tokens)
+    }
+
     /// The thinking level the current model is sent, and where it comes from.
     /// Resolved against the live client, like [`Agent::temperature`].
     pub fn thinking(&self) -> crate::thinking::Resolved {
+        self.thinking_for(self.control.thinking().as_ref())
+    }
+
+    /// Thinking resolution for a request carrying `session` as its
+    /// session-level `/thinking` setting. Split from [`Agent::thinking`] so a
+    /// request resolves its level, temperature and output cap from one
+    /// snapshot: re-reading the shared control between them would let a
+    /// `/thinking` typed mid-read make temperature observe a different level
+    /// than the one sent (see [`Agent::request_settings_for`]).
+    fn thinking_for(&self, session: Option<&crate::thinking::Thinking>) -> crate::thinking::Resolved {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
         let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
         let mut resolved = crate::thinking::resolve_with(
             &self.config.thinking,
-            self.thinking_override.as_ref(),
+            session,
             self.client.kind(),
             &provider,
             self.model_name(),
@@ -999,7 +1061,7 @@ impl Agent {
 
     /// Set (or with `None`, clear) the thinking level for this session.
     pub fn set_thinking(&mut self, thinking: Option<crate::thinking::Thinking>) {
-        self.thinking_override = thinking;
+        self.control.set_thinking(thinking);
         self.refresh_stats();
     }
 
@@ -1196,17 +1258,7 @@ impl Agent {
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
-            let thinking = self.thinking();
-            stats.thinking = match thinking.effective {
-                // An extra_body override sends its own value, not the
-                // configured level, so no generated level is shown.
-                _ if thinking.overridden => None,
-                // `drop_params` strips the generated field after the body is
-                // built, so the level never reaches the wire either.
-                _ if thinking.dropped => None,
-                crate::thinking::Thinking::Default => None,
-                level => Some(level.to_string()),
-            };
+            stats.thinking = status_thinking(&self.thinking());
         }
         self.emit(AgentEvent::Context);
     }
@@ -1507,7 +1559,7 @@ impl Agent {
         // must not leak into this one. Clear it here — after staging has
         // succeeded — so a `SessionLog::create` / initial-append failure above
         // still leaves the live session (and its override) untouched.
-        self.thinking_override = None;
+        self.control.set_thinking(None);
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
         self.pending_input = None;
@@ -1598,7 +1650,7 @@ impl Agent {
         // must not leak into the resumed one. Cleared here — after the staged
         // conversation and its repairs have committed — so a failed load leaves
         // the live session's override intact.
-        self.thinking_override = None;
+        self.control.set_thinking(None);
         // `titles_requested` is deliberately not reset: it tracks which
         // sessions this process already asked to title, so switching
         // A → B → A does not launch a second (paid) title request for A.
@@ -2187,8 +2239,45 @@ impl Agent {
                 // no level the request now has room for; resolving per attempt
                 // keeps the sent request and the trajectory's record of it in
                 // step with the attempt that produced the response.
-                let resolved_temperature = self.temperature();
-                let resolved_thinking = self.thinking();
+                // Snapshot thinking once, then derive temperature from that
+                // same resolution: `temperature()` would re-read the shared
+                // control's level internally, so resolving the two
+                // independently lets a `/thinking` typed between the reads
+                // make temperature observe a different level than the one
+                // actually sent (e.g. omitting a configured temperature while
+                // sending `off`, or reporting a temperature the provider drops
+                // once thinking is on). One snapshot, passed by value, keeps
+                // the request internally consistent — the helper has no second
+                // read a mid-build `/thinking` change could land on.
+                let (resolved_thinking, resolved_temperature, request_max_tokens) =
+                    self.request_settings_for(self.control.thinking());
+                // Test-only interleave point: a `/thinking` change landing here,
+                // between the snapshot and the status update, must not leak the
+                // newer level into the status this request shows.
+                #[cfg(test)]
+                if let Some(hook) = &self.after_thinking_snapshot {
+                    hook();
+                }
+                // A `/thinking` typed mid-turn changes the level between
+                // steps: keep the status line in step with what is sent. Set it
+                // from this request's `resolved_thinking` snapshot rather than
+                // re-resolving through `refresh_stats()`: a `/thinking` landing
+                // between `request_settings_for` and that refresh would
+                // otherwise show the newer level while this request still sends
+                // the snapshot, desynchronizing status from the request.
+                let status = status_thinking(&resolved_thinking);
+                let status_changed = {
+                    let mut stats = self.stats.lock().unwrap();
+                    if stats.thinking != status {
+                        stats.thinking = status;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if status_changed {
+                    self.emit(AgentEvent::Context);
+                }
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
                 // the history tools, so recomputing here lets the retried request
@@ -2199,7 +2288,7 @@ impl Agent {
                     messages: &self.conversation,
                     tools: &tools,
                     temperature: resolved_temperature.value(),
-                    max_tokens: Some(self.request_max_tokens()),
+                    max_tokens: Some(request_max_tokens),
                     thinking: resolved_thinking.request(),
                 };
                 let control = self.control.clone();
@@ -4513,6 +4602,209 @@ mod tests {
         fn kind(&self) -> Option<providers::ProviderKind> {
             Some(providers::ProviderKind::Anthropic)
         }
+    }
+
+    /// An Anthropic double that calls a tool once, then answers.
+    struct ClaudeWithTool {
+        seen: SeenSettings,
+        responses: Mutex<Vec<LLMResponse>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for ClaudeWithTool {
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.seen.lock().unwrap().push((request.temperature, request.thinking.clone()));
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+        fn model_name(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+        fn provider_name(&self) -> &str {
+            "anthropic"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Anthropic)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thinking_level_set_mid_turn_applies_from_the_next_step() {
+        use crate::thinking::{Request, Source, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // `/thinking high` typed while the turn runs: the CLI sets it on the
+        // shared control, here from inside the tool, between the two steps.
+        let control = agent.control();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                control.set_thinking(Some(Thinking::Level("high".into())));
+                Ok(json!("pong"))
+            }),
+        );
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let sent: Vec<_> = seen.lock().unwrap().iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(sent, vec![None, Some(Request::Effort("high".into()))]);
+        assert_eq!(agent.thinking().source, Source::Session);
+        assert_eq!(agent.context_stats().lock().unwrap().thinking.as_deref(), Some("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature() {
+        use crate::thinking::{Request, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        // A custom temperature is configured, so the two steps differ only in
+        // whether thinking drops it: step 1 (no level) sends it, step 2
+        // (thinking on) must not.
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // `/thinking high` typed mid-turn from inside the tool, between steps.
+        // This exercises the BETWEEN-steps path (the next step picks the level
+        // up); the WITHIN-one-request race — a change landing between the
+        // snapshot and the temperature read of a single call — is covered by
+        // `request_settings_derives_temperature_from_the_snapshot_not_a_reread`,
+        // which a between-steps tool mutation cannot reproduce.
+        let control = agent.control();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                control.set_thinking(Some(Thinking::Level("high".into())));
+                Ok(json!("pong"))
+            }),
+        );
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        // Temperature and thinking come from one snapshot per step, so the
+        // step that turns thinking on drops the temperature in the SAME
+        // request — never sends `high` with a stale custom temperature.
+        let sent: Vec<_> = seen.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            sent,
+            vec![(Some(0.5), None), (None, Some(Request::Effort("high".into())))],
+            "the thinking-on step must drop the temperature in its own request"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_line_reflects_the_level_the_request_sends_not_a_reread() {
+        use crate::thinking::{Request, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // Record `stats.thinking` at every `Context` emission, so the test can
+        // see the value the status line showed at each step's status update.
+        let stats = agent.context_stats();
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let (shown_sink, shown_stats) = (shown.clone(), stats.clone());
+        agent.set_event_sink(Box::new(move |_, event| {
+            if matches!(event, AgentEvent::Context) {
+                shown_sink.lock().unwrap().push(shown_stats.lock().unwrap().thinking.clone());
+            }
+        }));
+        // The session level is `low` from before the turn, so step 1 snapshots
+        // and sends `low`. `stats.thinking` starts `None`, so step 1's
+        // status-change branch fires (None → low) — the moment under test.
+        let control = agent.control();
+        control.set_thinking(Some(Thinking::Level("low".into())));
+        // The tool only keeps the turn going into a second step; it does not
+        // touch the level.
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| Ok(json!("pong"))),
+        );
+        // A `/thinking high` lands between step 1's snapshot and its status
+        // update (the `after_thinking_snapshot` window). The status step 1
+        // shows must be the level step 1 SENT (`low`), not the `high` a re-read
+        // of the shared control would observe. The hook fires once, in that
+        // window, while the control still reads `low`.
+        let flipped = Arc::new(AtomicBool::new(false));
+        let hook_flipped = flipped.clone();
+        let hook_control = agent.control();
+        let probe = agent.control();
+        agent.after_thinking_snapshot = Some(Box::new(move || {
+            let at_step1 = matches!(probe.thinking(), Some(Thinking::Level(ref l)) if l == "low");
+            if at_step1 && !hook_flipped.swap(true, Ordering::SeqCst) {
+                hook_control.set_thinking(Some(Thinking::Level("high".into())));
+            }
+        }));
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+
+        let sent: Vec<_> = seen.lock().unwrap().iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(
+            sent,
+            vec![Some(Request::Effort("low".into())), Some(Request::Effort("high".into()))],
+            "step 1 sends the pre-flip `low`; step 2 picks up the flipped `high`"
+        );
+        assert!(flipped.load(Ordering::SeqCst), "the interleave fired at step 1");
+        // The first status line that shows a level is step 1's update. It must
+        // show `low` — the level step 1's request sent. The OLD code re-resolved
+        // the (now `high`) control via `refresh_stats()`, showing `high` while
+        // the request sent `low`: this assertion is red against that code.
+        let first_shown = shown.lock().unwrap().iter().find_map(|t| t.clone());
+        assert_eq!(
+            first_shown.as_deref(),
+            Some("low"),
+            "step 1's status must show the level its request sent (`low`), not the mid-step re-read (`high`)"
+        );
+    }
+
+    #[test]
+    fn request_settings_derives_temperature_from_the_snapshot_not_a_reread() {
+        // `request_settings_for` takes the session level by value, so it has
+        // no shared-control read a mid-build `/thinking` change could land on:
+        // temperature is derived from the same snapshot the request sends.
+        // This pins that contract: a level resolved from the snapshot must
+        // drive the temperature even when the live control disagrees.
+        use crate::thinking::{Request, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        // A custom temperature is configured, so a stale thinking read shows
+        // up as a temperature the thinking-on request must not send.
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let agent = Agent::new(Box::new(Claude { seen: Arc::new(Mutex::new(Vec::new())) }), config);
+        // The live control says `high` (thinking on, which on Anthropic drops
+        // the temperature), but the request's snapshot — taken before a
+        // mid-build `/thinking high` landed — carries no level.
+        agent.control().set_thinking(Some(Thinking::Level("high".into())));
+
+        let (thinking, temperature, _) = agent.request_settings_for(None);
+
+        // The snapshot wins: the request sends no level AND keeps the
+        // temperature. Deriving temperature from the live control instead
+        // would drop it for a `high` the request never carries — the
+        // within-one-request inconsistency the by-value snapshot removes.
+        assert_eq!(thinking.request(), None);
+        assert_eq!(
+            temperature.value(),
+            Some(0.5),
+            "temperature must come from the snapshot the request sends, not a second read of the control"
+        );
+        // And the converse: a snapshot carrying the level drives the
+        // temperature drop even when the control has since been cleared.
+        agent.control().set_thinking(None);
+        let (thinking, temperature, _) = agent.request_settings_for(Some(Thinking::Level("high".into())));
+        assert_eq!(thinking.request(), Some(Request::Effort("high".into())));
+        assert_eq!(
+            temperature.value(),
+            None,
+            "a thinking-on snapshot must drop the temperature even if the control was cleared mid-build"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
