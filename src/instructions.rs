@@ -52,6 +52,13 @@ pub struct InstructionFile {
     pub kind: Kind,
     /// From the user's own configuration rather than the repository.
     pub user: bool,
+    /// The directory whose `search()` loaded this file (including via an
+    /// import chain), or `None` for user files loaded outside any directory
+    /// search. Deferred files are re-surfaced by this, not by `path.parent()`:
+    /// an imported file lives in a subdirectory of the directory that loaded
+    /// it (e.g. `a/shared/foo.md` imported from `a/AGENTS.md`), so a
+    /// parent-match would never re-queue it and it would be dropped forever.
+    search_dir: Option<PathBuf>,
 }
 
 /// What to load besides the per-directory project files.
@@ -106,6 +113,10 @@ pub struct ProjectInstructions {
     seen: HashSet<PathBuf>,
     /// `seen` at session start (kept across compaction).
     initial_seen: HashSet<PathBuf>,
+    /// The directory of the `search()` in progress, stamped onto every file it
+    /// loads (directly or via imports) so deferred files can be re-surfaced by
+    /// the search that owns them rather than by their immediate parent.
+    current_search_dir: Option<PathBuf>,
     scoped: Vec<ScopedRule>,
 }
 
@@ -562,7 +573,7 @@ impl ProjectInstructions {
         // (e.g. after compaction freed budget) attaches them.
         let mut pending: Vec<InstructionFile> = Vec::new();
         self.loaded.retain(|f| {
-            if f.path.parent() == Some(dir) {
+            if f.search_dir.as_deref() == Some(dir) {
                 pending.push(f.clone());
                 false
             } else {
@@ -575,12 +586,14 @@ impl ProjectInstructions {
             return start..start;
         }
         let names = self.options.names.clone();
+        self.current_search_dir = Some(dir.to_path_buf());
         if let Some(path) = names.iter().map(|name| dir.join(name)).find(|p| read_capped(p).is_some()) {
             self.load(path, Kind::Project, false);
         }
         for name in LOCAL_FILES {
             self.load(dir.join(name), Kind::Local, false);
         }
+        self.current_search_dir = None;
         start..self.loaded.len()
     }
 
@@ -620,7 +633,13 @@ impl ProjectInstructions {
         }
         let text = body.unwrap_or(disk);
         let refs = if expands_imports(&path, &kind) { import_refs(&text) } else { Vec::new() };
-        self.loaded.push(InstructionFile { path: path.clone(), text, kind, user });
+        self.loaded.push(InstructionFile {
+            path: path.clone(),
+            text,
+            kind,
+            user,
+            search_dir: self.current_search_dir.clone(),
+        });
         if depth >= MAX_IMPORT_DEPTH {
             return;
         }
@@ -1579,6 +1598,31 @@ mod tests {
         let deferred = if first.contains("main_file") { "local_file" } else { "main_file" };
         assert!(second.contains(deferred), "second: {second:?}");
         assert!(!second.contains("[omitted: instruction size limit reached"), "second: {second:?}");
+    }
+
+    #[test]
+    fn overflow_imported_file_in_subdir_stays_pending_for_a_later_call() {
+        let (_dir, root) = repo();
+        // `a/CLAUDE.md` imports `a/shared/foo.md`: the import lives in a
+        // SUBDIRECTORY of the directory that loaded it. Two near-cap files, so
+        // the import overflows the budget and is deferred. Re-surfacing it must
+        // key on the search that owns it (dir `a`), not on its immediate parent
+        // (`a/shared`) — a parent-match would orphan it in `loaded` forever.
+        let big = "x".repeat(MAX_FILE_BYTES - 64);
+        write(&root.join("a/CLAUDE.md"), &format!("@shared/foo.md\n{big} main_file"));
+        write(&root.join("a/shared/foo.md"), &format!("{big} import_file"));
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        // First call renders the main file; the imported file overflows and defers.
+        let first = instructions.nested_for(&root.join("a/x.rs")).unwrap();
+        assert!(first.contains("main_file"), "first: {first:?}");
+        assert!(!first.contains("import_file"), "first: {first:?}");
+        assert!(first.contains("[omitted: instruction size limit reached"));
+        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("foo.md")),
+            "warnings: {:?}", instructions.warnings);
+        // The deferred import stayed pending in `loaded`, so a later call renders
+        // it instead of dropping it permanently.
+        let second = instructions.nested_for(&root.join("a/y.rs")).unwrap();
+        assert!(second.contains("import_file"), "second: {second:?}");
     }
 
     #[test]
