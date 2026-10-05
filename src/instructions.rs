@@ -25,8 +25,6 @@ const MAX_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_IMPORT_DEPTH: usize = 4;
 /// Patterns one rule's `paths` may expand to (brace expansion).
 const MAX_RULE_PATTERNS: usize = 1_000;
-/// Directory depth searched under a rules directory.
-const MAX_RULES_DEPTH: usize = 8;
 
 pub const DEFAULT_FILES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"];
 /// Personal per-directory files, loaded after the main file (not committed).
@@ -270,6 +268,11 @@ fn strip_html_comments(text: &str) -> String {
 fn import_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut in_fence: Option<(char, usize)> = None;
+    // A code span opens with a run of N backticks and closes only on a run of
+    // exactly N (CommonMark). The state lives across lines: a span may span a
+    // line break, so resetting per line would parse the continuation as prose
+    // and import a `@path` that is still inside the span.
+    let mut span_ticks: Option<usize> = None;
     for line in text.lines() {
         if let Some(open) = in_fence {
             if closes_fence(line, open) {
@@ -286,10 +289,19 @@ fn import_refs(text: &str) -> Vec<String> {
         }
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
-        // A code span opens with a run of N backticks and closes only on a
-        // run of exactly N (CommonMark). Track the open run so multi-backtick
-        // spans skip their contents instead of toggling on every backtick.
-        let mut span_ticks: Option<usize> = None;
+        // A line that opens with a backtick/tilde run of three or more is a
+        // fence candidate. When `fence()` rejects it (a backtick in the info
+        // string, so it is prose per CommonMark), that leading run is fence
+        // syntax, not a code-span opener: drop any span state carried across
+        // the line break and skip the run, so it is not misread as opening or
+        // closing a multiline span. A genuine multiline span is not opened by
+        // a fence-length run at line start.
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            span_ticks = None;
+            let fc = t.chars().next().unwrap();
+            i = line.chars().take_while(|&c| c == ' ').count() + t.chars().take_while(|&c| c == fc).count();
+        }
         while i < chars.len() {
             let c = chars[i];
             if c == '`' {
@@ -447,9 +459,14 @@ fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
 
 /// `.md` files under `dir`, sorted, following symlinks without looping.
 fn markdown_files(dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, depth: usize, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
         let Ok(real) = dir.canonicalize() else { return };
-        if depth > MAX_RULES_DEPTH || !visited.insert(real) {
+        // The canonical path is the loop guard: a directory already visited
+        // (directly or through a symlink) is not entered again, so recursion
+        // terminates even with symlink cycles. There is no depth cap — the
+        // `**` lookup is advertised as recursive and must not silently drop
+        // rules nested deeper than an arbitrary limit.
+        if !visited.insert(real) {
             return;
         }
         let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -457,14 +474,14 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
         paths.sort();
         for path in paths {
             if path.is_dir() {
-                walk(&path, depth + 1, visited, out);
+                walk(&path, visited, out);
             } else if path.extension().is_some_and(|e| e == "md") && path.is_file() {
                 out.push(path);
             }
         }
     }
     let mut out = Vec::new();
-    walk(dir, 0, &mut HashSet::new(), &mut out);
+    walk(dir, &mut HashSet::new(), &mut out);
     out
 }
 
@@ -1008,6 +1025,24 @@ mod tests {
     }
 
     #[test]
+    fn code_span_state_is_preserved_across_line_breaks() {
+        // A code span may cross a line break, so the open backtick-run state
+        // must persist across lines. Resetting it per line parses the second
+        // line as prose and imports a `@path` that is still inside the span.
+        assert!(import_refs("See ``code\n@secret.md`` done").is_empty());
+        assert!(import_refs("`code\n@secret.md`").is_empty());
+        // The closing run must match the opening run length even across lines:
+        // a single backtick does not close a double-backtick span.
+        assert!(import_refs("``code\n` @secret.md\n``").is_empty());
+        // Once the span closes, later references import as before.
+        assert_eq!(import_refs("``code\n@secret.md``\n@real.md"), vec!["real.md".to_string()]);
+        // A line that opens with a fence-length run rejected as a fence (a
+        // backtick in its info string) does not open a multiline span: its
+        // leading ``` run is skipped, so the next line's reference is imported.
+        assert_eq!(import_refs("``` `code`\n@live.md"), vec!["live.md".to_string()]);
+    }
+
+    #[test]
     fn scoped_rule_imports_are_expanded_and_deduplicated() {
         let (_dir, root) = repo();
         // The import target lives outside the rules dir, so it is reachable
@@ -1116,8 +1151,11 @@ mod tests {
         // Up to 3 spaces of indent is still a valid fence.
         assert_eq!(import_refs("   ```\n@in.md\n   ```\n@out.md"), vec!["out.md".to_string()]);
         // A backtick fence's info string may not contain a backtick, so this
-        // line is not an opening fence and the @import is extracted.
-        assert_eq!(import_refs("``` `x\n@live.md"), vec!["live.md".to_string()]);
+        // line is not an opening fence; its leading ``` run is skipped as a
+        // rejected fence candidate rather than parsed as a code-span opener,
+        // so the inline `code` span on the same line still closes and the
+        // @import on the next line is extracted.
+        assert_eq!(import_refs("``` `code`\n@live.md"), vec!["live.md".to_string()]);
     }
 
     #[test]
@@ -1208,6 +1246,34 @@ mod tests {
         assert_eq!(instructions.nested_for(&root.join("sub/README.md")), None);
         instructions.forget_nested();
         assert!(instructions.nested_for(&root.join("src/api/y.ts")).is_some());
+    }
+
+    #[test]
+    fn rules_nested_deeper_than_eight_directories_are_still_loaded() {
+        let (_dir, root) = repo();
+        // The `.claude/rules/**/*.md` lookup is advertised as recursive with no
+        // documented depth limit, so a rule nested well past the old eight-level
+        // cap must still be discovered (the canonical visited-set guards loops).
+        let deep = root.join(".claude/rules/a/b/c/d/e/f/g/h/i/j/k");
+        write(&deep.join("deep.md"), "---\npaths:\n  - \"src/**\"\n---\ndeep rule");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let out = instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        assert!(out.contains("deep rule"), "{out}");
+    }
+
+    #[test]
+    fn a_symlink_cycle_in_rules_does_not_loop_forever() {
+        let (_dir, root) = repo();
+        // With no depth cap, the canonical visited-set is the only guard against
+        // a symlink cycle: a directory linked back into the tree must be entered
+        // once, then skipped on the cyclic revisit, so discovery terminates.
+        let rules = root.join(".claude/rules");
+        write(&rules.join("top.md"), "top rule");
+        std::fs::create_dir_all(rules.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&rules, rules.join("sub/loop")).unwrap();
+        let files = markdown_files(&rules);
+        // Terminates, and each canonical file appears once despite the cycle.
+        assert_eq!(files.iter().filter(|p| p.ends_with("top.md")).count(), 1, "{files:?}");
     }
 
     #[test]
