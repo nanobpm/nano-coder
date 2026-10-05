@@ -341,7 +341,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("\n  {:width$}  {}", synopsis(c), c.description));
     }
     out.push_str("\nType / to list commands as you type; Tab completes commands and /model, /mode, /verbosity arguments; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.");
-    out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
+    out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Esc Esc also clears the input at the prompt, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
     out
 }
 

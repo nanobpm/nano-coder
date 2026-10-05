@@ -224,9 +224,6 @@ fn set_thinking_text(agent: &mut Agent, arg: &str) -> String {
     text
 }
 
-/// Esc twice within this window cancels the running turn.
-const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
-
 /// Ctrl-C twice within this window exits the interactive CLI. Time-based (not
 /// "next line" based) so an interleaved keystroke or a queued/empty line
 /// between the two presses cannot silently disarm the exit.
@@ -273,24 +270,11 @@ impl DoublePress {
     }
 }
 
-/// Detects a double Esc press.
-#[derive(Default)]
-struct DoubleEscape {
-    last: Option<std::time::Instant>,
-}
-
-impl DoubleEscape {
-    /// Record a press at `now`; true when it completes a double press.
-    fn press(&mut self, now: std::time::Instant) -> bool {
-        match self.last.take() {
-            Some(last) if now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => true,
-            _ => {
-                self.last = Some(now);
-                false
-            }
-        }
-    }
-}
+/// Detects a double Esc press (the window lives in `lineedit` alongside the
+/// type). Shared with the idle prompt's clear gesture so the two cannot drift;
+/// `DoublePress` (Ctrl-C) has an extra deadline/disarm lifecycle, which the Esc
+/// gesture does not need.
+type DoubleEscape = lineedit::DoubleEscape;
 
 /// The terminal-owning state shared between the SIGWINCH resize task and a live
 /// renderer switch (`Terminal::renderer_switched`). Both must serialise against
@@ -2514,7 +2498,13 @@ async fn main() -> Result<()> {
                     terminal.renderer.transient_note("(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_) => {
+                TermInput::Escape => {
+                    // The input-clearing half of the gesture happens in
+                    // `lineedit::LineReader` (see `escape_press`), which is the
+                    // only place that sees every Esc; nothing to do here.
+                    continue;
+                }
+                TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
                     continue;
                 }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
