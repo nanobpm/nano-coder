@@ -4714,44 +4714,61 @@ mod tests {
         let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Default::default() };
         let mut agent = Agent::new(Box::new(client), config);
         agent.new_session().unwrap();
-        // Step 1's tool sets `high`, so step 2 resolves and sends `high`.
+        // Record `stats.thinking` at every `Context` emission, so the test can
+        // see the value the status line showed at each step's status update.
+        let stats = agent.context_stats();
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let (shown_sink, shown_stats) = (shown.clone(), stats.clone());
+        agent.set_event_sink(Box::new(move |_, event| {
+            if matches!(event, AgentEvent::Context) {
+                shown_sink.lock().unwrap().push(shown_stats.lock().unwrap().thinking.clone());
+            }
+        }));
+        // The session level is `low` from before the turn, so step 1 snapshots
+        // and sends `low`. `stats.thinking` starts `None`, so step 1's
+        // status-change branch fires (None → low) — the moment under test.
         let control = agent.control();
-        let tool_control = control.clone();
+        control.set_thinking(Some(Thinking::Level("low".into())));
+        // The tool only keeps the turn going into a second step; it does not
+        // touch the level.
         agent.tools().register(
             ToolDefinition::new("echo", "echo", json!({"type": "object"})),
-            Box::new(move |_| {
-                tool_control.set_thinking(Some(Thinking::Level("high".into())));
-                Ok(json!("pong"))
-            }),
+            Box::new(move |_| Ok(json!("pong"))),
         );
-        // A second `/thinking` lands between step 2's snapshot and its status
-        // update. The status must show the level step 2 SENT (`high`), not the
-        // newer value a re-read of the shared control would observe. The hook
-        // fires once, in that window: it waits until the control holds `high`
-        // (true only at step 2, after the tool set it) and then flips to `low`.
-        // The fixed code stores the `high` snapshot directly; the OLD code
-        // re-resolved the (now `low`) control via `refresh_stats()`.
+        // A `/thinking high` lands between step 1's snapshot and its status
+        // update (the `after_thinking_snapshot` window). The status step 1
+        // shows must be the level step 1 SENT (`low`), not the `high` a re-read
+        // of the shared control would observe. The hook fires once, in that
+        // window, while the control still reads `low`.
         let flipped = Arc::new(AtomicBool::new(false));
         let hook_flipped = flipped.clone();
         let hook_control = agent.control();
         let probe = agent.control();
         agent.after_thinking_snapshot = Some(Box::new(move || {
-            let at_step2 = matches!(probe.thinking(), Some(Thinking::Level(ref l)) if l == "high");
-            if at_step2 && !hook_flipped.swap(true, Ordering::SeqCst) {
-                hook_control.set_thinking(Some(Thinking::Level("low".into())));
+            let at_step1 = matches!(probe.thinking(), Some(Thinking::Level(ref l)) if l == "low");
+            if at_step1 && !hook_flipped.swap(true, Ordering::SeqCst) {
+                hook_control.set_thinking(Some(Thinking::Level("high".into())));
             }
         }));
         agent.run_turn(Some("in-1"), "go").await.unwrap();
 
-        let sent: Vec<_> = seen.lock().unwrap().iter().cloned().collect();
-        assert_eq!(sent.len(), 2, "tool call then final answer");
-        assert_eq!(sent[1].1, Some(Request::Effort("high".into())), "step 2 sends the snapshotted level");
-        assert!(flipped.load(Ordering::SeqCst), "the interleave fired at step 2");
-        // The interleave flipped the live control to `low` after step 2 snapshotted
-        // `high`. The status line must show what step 2 SENT (`high`), so the update
-        // stores the `resolved_thinking` snapshot — not a re-read of the control.
-        // That snapshot path is what the assertions above exercise: the seam ran
-        // between the snapshot and the status write, and step 2 still sent `high`.
+        let sent: Vec<_> = seen.lock().unwrap().iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(
+            sent,
+            vec![Some(Request::Effort("low".into())), Some(Request::Effort("high".into()))],
+            "step 1 sends the pre-flip `low`; step 2 picks up the flipped `high`"
+        );
+        assert!(flipped.load(Ordering::SeqCst), "the interleave fired at step 1");
+        // The first status line that shows a level is step 1's update. It must
+        // show `low` — the level step 1's request sent. The OLD code re-resolved
+        // the (now `high`) control via `refresh_stats()`, showing `high` while
+        // the request sent `low`: this assertion is red against that code.
+        let first_shown = shown.lock().unwrap().iter().find_map(|t| t.clone());
+        assert_eq!(
+            first_shown.as_deref(),
+            Some("low"),
+            "step 1's status must show the level its request sent (`low`), not the mid-step re-read (`high`)"
+        );
     }
 
     /// A `/thinking` level source that flips the level to `high` between its
