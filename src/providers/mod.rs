@@ -11,6 +11,7 @@ pub mod github_copilot;
 pub mod mock;
 pub mod openai;
 pub mod openai_responses;
+pub mod qwen;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
@@ -207,10 +208,13 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add(
         "qwen",
+        // The endpoint (host and API-key variable) is derived from the Qwen
+        // plan/region table in `qwen`, so a new Model Studio region appears
+        // here and in the `/settings` endpoint picker at once.
         ProviderConfig::preset(
             Openai,
-            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            Some("DASHSCOPE_API_KEY"),
+            qwen::default_endpoint().base_url,
+            Some(qwen::default_endpoint().plan.api_key_env()),
         ),
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
@@ -1000,7 +1004,8 @@ mod tests {
     fn qwen_and_kimi_presets() {
         let user = HashMap::new();
         let qwen = resolve("qwen/qwen3.8-max", &user, "mock").unwrap();
-        assert_eq!(qwen.base_url, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1");
+        // Derived, not hardcoded: the preset's host is the endpoint table's default.
+        assert_eq!(qwen.base_url, super::qwen::default_endpoint().base_url);
         assert!(!qwen.replay_reasoning);
         let kimi = resolve("kimi/kimi-k3", &user, "mock").unwrap();
         assert_eq!((kimi.base_url.as_str(), kimi.model.as_str()), ("https://api.moonshot.ai/v1", "kimi-k3"));
@@ -1009,6 +1014,20 @@ mod tests {
         assert_eq!(kimi.max_tokens_param, "max_completion_tokens");
         assert_eq!(presets()["kimi"].api_key_env.as_deref(), Some("MOONSHOT_API_KEY"));
         assert_eq!(presets()["qwen"].api_key_env.as_deref(), Some("DASHSCOPE_API_KEY"));
+    }
+
+    #[test]
+    fn the_qwen_preset_is_derived_from_the_endpoint_table() {
+        // The preset's host and key variable come from the single endpoint table,
+        // so they cannot drift from the `/settings` picker.
+        let preset = presets().remove("qwen").unwrap();
+        assert_eq!(preset.base_url.as_deref(), Some(qwen::default_endpoint().base_url));
+        assert_eq!(preset.api_key_env.as_deref(), Some(qwen::default_endpoint().plan.api_key_env()));
+        // Every plan's host resolves to that plan's API-key variable.
+        for endpoint in qwen::ENDPOINTS {
+            assert_eq!(qwen::endpoint_for_url(endpoint.base_url), Some(endpoint));
+            assert!(endpoint.plan.api_key_env().ends_with("_API_KEY"), "{:?}", endpoint.plan);
+        }
     }
 
     #[test]

@@ -509,7 +509,7 @@ Built-in presets:
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
 | `mistral` | openai | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
-| `qwen` | openai | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `qwen` | openai | Model Studio (default: Standard, Singapore — all plans/regions below) | `DASHSCOPE_API_KEY` / `BAILIAN_*_PLAN_API_KEY` |
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
@@ -547,11 +547,40 @@ timeout_secs = 300                      # idle timeout: max silence between stre
 max_retries = 3
 ```
 
-`qwen` is Qwen Cloud (Alibaba Cloud Model Studio), e.g. `--model qwen/qwen3.8-max`. The
-preset uses the Singapore endpoint. API keys are bound to a region, so for another region
-or your workspace domain override `base_url`, e.g.
-`https://dashscope-us.aliyuncs.com/compatible-mode/v1` or
-`https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`.
+`qwen` is Qwen Cloud (Alibaba Cloud Model Studio), e.g. `--model qwen/qwen3.8-max`.
+Model Studio serves the same models through three plans, each with its own hostnames and
+API-key variable. All of them speak OpenAI Chat Completions, so each is just a `base_url`
++ `api_key_env`:
+
+| Plan | Region | Base URL | API key env |
+|---|---|---|---|
+| Standard API key | Singapore (International) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | China (Beijing) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | US (Virginia) | `https://dashscope-us.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | China (Hong Kong) | `https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Token Plan | Singapore (International) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `BAILIAN_TOKEN_PLAN_API_KEY` |
+| Token Plan | China (Beijing) | `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` | `BAILIAN_TOKEN_PLAN_API_KEY` |
+| Coding Plan | Singapore (International) | `https://coding-intl.dashscope.aliyuncs.com/v1` | `BAILIAN_CODING_PLAN_API_KEY` |
+| Coding Plan | China (Beijing) | `https://coding.dashscope.aliyuncs.com/v1` | `BAILIAN_CODING_PLAN_API_KEY` |
+
+The `qwen` preset defaults to **Standard API key, Singapore** (the first row). In
+`/settings` → *Add or edit a provider* → `qwen` these eight endpoints are offered as a
+*Qwen / Model Studio endpoint* picker (plus a custom URL), so you can switch plan and
+region without retyping a URL. Picking a plan also points the provider at that plan's
+API-key variable — the preset's `DASHSCOPE_API_KEY` becomes `BAILIAN_TOKEN_PLAN_API_KEY`
+for Token Plan, and `BAILIAN_CODING_PLAN_API_KEY` for Coding Plan. Set the variable (or a
+key command / literal key) at the key prompt that follows. API keys are also bound to a
+*region*, so a key issued for another region still needs the matching endpoint row.
+
+To configure an endpoint in the config file directly, override `base_url` and
+`api_key_env` (append `/compatible-mode/v1` to a workspace domain, e.g.
+`https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`):
+
+```toml
+[providers.qwen]                        # Token Plan, China
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "BAILIAN_TOKEN_PLAN_API_KEY"
+```
 
 `kimi` is the Kimi API from platform.kimi.ai, e.g. `--model kimi/kimi-k3` or
 `kimi/kimi-k2.7-code`. The preset drops `temperature` (K3 fixes it) and sets
