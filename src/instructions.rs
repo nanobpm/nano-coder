@@ -557,7 +557,20 @@ impl ProjectInstructions {
     /// Load the files for one directory: the first of `names`, then the
     /// local files. Returns what was added to `loaded`.
     fn search(&mut self, dir: &Path) -> std::ops::Range<usize> {
+        // Files already loaded for this directory but deferred by an earlier
+        // budget overflow stay pending: surface them again first so a later call
+        // (e.g. after compaction freed budget) attaches them.
+        let mut pending: Vec<InstructionFile> = Vec::new();
+        self.loaded.retain(|f| {
+            if f.path.parent() == Some(dir) {
+                pending.push(f.clone());
+                false
+            } else {
+                true
+            }
+        });
         let start = self.loaded.len();
+        self.loaded.extend(pending);
         if !self.searched.insert(dir.to_path_buf()) {
             return start..start;
         }
@@ -732,6 +745,15 @@ impl ProjectInstructions {
         }
     }
 
+    /// Record a load diagnostic, ignoring exact duplicates: a deferred file is
+    /// re-attempted (and re-reported) on every matching call until the budget
+    /// frees, and the banner/`/context`/ACP would otherwise list it each time.
+    fn warn(&mut self, message: String) {
+        if !self.warnings.contains(&message) {
+            self.warnings.push(message);
+        }
+    }
+
     fn display(&self, path: &Path) -> String {
         if let Ok(rel) = path.strip_prefix(&self.root) {
             return rel.display().to_string();
@@ -824,17 +846,19 @@ impl ProjectInstructions {
         let mut budget = MAX_TOTAL_BYTES.saturating_sub(MARKER.len());
         let mut truncated = false;
         'outer: for d in &dirs {
-            // Render this directory's files atomically: if any section overflows
-            // the budget, roll the whole directory back — output, budget, and the
-            // searched/seen state `search` just committed — so its files stay
-            // pending and a later call (e.g. after compaction frees budget) can
-            // render them, rather than dropping them from `loaded` permanently.
-            let out_checkpoint = out.len();
-            let budget_checkpoint = budget;
-            let seen_checkpoint = self.seen.clone();
+            // Partial progress, not an atomic directory: files in directories
+            // already rendered above stay committed, so a valid instruction set
+            // is never rolled back wholesale. Within this directory, render each
+            // file that fits and drain only those; the first file whose section
+            // overflows the budget — and everything after it — stays pending in
+            // `loaded` (still `seen`, so the files just committed are not
+            // re-rendered ahead of it). Un-mark the directory as searched so a
+            // later call re-runs `search`: the committed files are `seen` and
+            // skipped, the pending ones render and attach (e.g. after compaction
+            // frees budget). The deferral is surfaced as a diagnostic.
             let range = self.search(d);
             let files = self.loaded.drain(range).collect::<Vec<_>>();
-            let mut overflow = false;
+            let mut rendered = 0;
             for file in &files {
                 let note = match &file.kind {
                     Kind::Import(by) => {
@@ -852,18 +876,21 @@ impl ProjectInstructions {
                 };
                 let section = format!("\n\n{note}\n{}", file.text);
                 if section.len() > budget {
-                    overflow = true;
+                    self.searched.remove(d);
+                    self.warn(format!(
+                        "deferred {}: instruction size limit reached; it stays pending and attaches once budget frees (e.g. after compaction)",
+                        self.display(&file.path)
+                    ));
+                    truncated = true;
                     break;
                 }
                 budget -= section.len();
                 out.push_str(&section);
+                rendered += 1;
             }
-            if overflow {
-                out.truncate(out_checkpoint);
-                budget = budget_checkpoint;
-                self.seen = seen_checkpoint;
-                self.searched.remove(d);
-                truncated = true;
+            // Keep the deferred file and everything after it pending in `loaded`.
+            self.loaded.extend(files.into_iter().skip(rendered));
+            if truncated {
                 break 'outer;
             }
         }
@@ -900,6 +927,10 @@ impl ProjectInstructions {
                 );
                 if section.len() > budget {
                     self.seen = seen_checkpoint;
+                    self.warn(format!(
+                        "deferred rule {}: instruction size limit reached; it stays pending and attaches once budget frees (e.g. after compaction)",
+                        self.display(&rule_path)
+                    ));
                     truncated = true;
                     break;
                 }
@@ -1512,15 +1543,42 @@ mod tests {
         write(&root.join("a/AGENTS.md"), &format!("{big} file_a"));
         write(&root.join("a/b/AGENTS.md"), &format!("{big} file_b"));
         let mut instructions = ProjectInstructions::discover(&root, &names());
-        // First call renders a/ but a/b overflows the budget and is rolled back.
+        // First call renders a/ but a/b overflows the budget and is deferred.
         let first = instructions.nested_for(&root.join("a/b/x.rs")).unwrap();
         assert!(first.contains("file_a"));
         assert!(!first.contains("file_b"));
         assert!(first.contains("[omitted: instruction size limit reached"));
-        // The overflowed directory stayed pending (searched/seen rolled back),
-        // so a later call still renders it instead of dropping it permanently.
+        // The deferral is visible as a load diagnostic (banner/`/context`/ACP).
+        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("a/b/AGENTS.md")),
+            "warnings: {:?}", instructions.warnings);
+        // The deferred file stayed pending in `loaded`, so a later call renders
+        // it instead of dropping it permanently.
         let second = instructions.nested_for(&root.join("a/b/y.rs")).unwrap();
-        assert!(second.contains("file_b"));
+        assert!(second.contains("file_b"), "second: {second:?}");
+    }
+
+    #[test]
+    fn oversized_group_commits_what_fits_and_defers_the_first_unrendered_file() {
+        let (_dir, root) = repo();
+        // Two near-cap files in the SAME directory: their sections necessarily
+        // exceed the 64 KiB budget together. Partial progress must keep the one
+        // that fits and defer only the other — never roll back the whole group.
+        let big = "x".repeat(MAX_FILE_BYTES - 16);
+        write(&root.join("a/AGENTS.md"), &format!("{big} main_file"));
+        write(&root.join("a/CLAUDE.local.md"), &format!("{big} local_file"));
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let first = instructions.nested_for(&root.join("a/x.rs")).unwrap();
+        // Exactly one section attached; the other was deferred (not dropped).
+        assert!(first.contains("main_file") ^ first.contains("local_file"), "first: {first:?}");
+        assert!(first.contains("[omitted: instruction size limit reached"));
+        // The truncation is visible: the deferred file is named in diagnostics.
+        assert!(instructions.warnings.iter().any(|w| w.contains("deferred")), "warnings: {:?}", instructions.warnings);
+        // No infinite retry: the deferred file stayed pending in `loaded`, so the
+        // next matching call attaches it (not the already-committed sibling).
+        let second = instructions.nested_for(&root.join("a/y.rs")).unwrap();
+        let deferred = if first.contains("main_file") { "local_file" } else { "main_file" };
+        assert!(second.contains(deferred), "second: {second:?}");
+        assert!(!second.contains("[omitted: instruction size limit reached"), "second: {second:?}");
     }
 
     #[test]
