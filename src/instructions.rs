@@ -622,6 +622,18 @@ impl ProjectInstructions {
     /// Load the files for one directory: the first of `names`, then the
     /// local files. Returns what was added to `loaded`.
     fn search(&mut self, dir: &Path) -> std::ops::Range<usize> {
+        // A directory already in `searched` keeps its files exactly where they
+        // sit in `loaded`; do not disturb their order. `nested_for` re-walks
+        // the startup ancestors on the first tool call, and moving an
+        // already-searched directory's files to the end would, for example,
+        // push a root `CLAUDE.md` after the root's unscoped `.claude/rules`,
+        // even though rules must follow the main file. Only a directory
+        // deferred by a budget overflow (which removed itself from `searched`)
+        // falls through to re-surface its pending files and reload below.
+        if !self.searched.insert(dir.to_path_buf()) {
+            let start = self.loaded.len();
+            return start..start;
+        }
         // Files already loaded for this directory but deferred by an earlier
         // budget overflow stay pending: surface them again first so a later call
         // (e.g. after compaction freed budget) attaches them.
@@ -636,9 +648,6 @@ impl ProjectInstructions {
         });
         let start = self.loaded.len();
         self.loaded.extend(pending);
-        if !self.searched.insert(dir.to_path_buf()) {
-            return start..start;
-        }
         let names = self.options.names.clone();
         self.current_search_dir = Some(dir.to_path_buf());
         if let Some(path) = names.iter().map(|name| dir.join(name)).find(|p| read_capped(p).is_some()) {
@@ -1331,6 +1340,28 @@ mod tests {
         let rendered = instructions.render();
         // Deferred resolution keeps the dormant rule from suppressing the import.
         assert!(rendered.contains("shared detail"), "{rendered}");
+    }
+
+    #[test]
+    fn nested_for_does_not_reorder_already_searched_startup_directories() {
+        let (_dir, root) = repo();
+        // A root main file and a root unscoped rule: in the system prompt the
+        // rule must follow the main file of its directory.
+        write(&root.join("CLAUDE.md"), "root main body");
+        write(&root.join(".claude/rules/zzz.md"), "unscoped rule body");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let before = instructions.render();
+        let main_pos = before.find("root main body").expect("main file rendered");
+        let rule_pos = before.find("unscoped rule body").expect("rule rendered");
+        assert!(main_pos < rule_pos, "main file must precede its directory's rule:\n{before}");
+        // The first file-tool call re-walks the startup ancestors via
+        // `nested_for`, which calls `search` on the already-searched root. That
+        // must not move the root's files to the end of `loaded` (which would
+        // push the main file after the rule) — the rendered prompt is unchanged.
+        instructions.nested_for(&root.join("x.rs"));
+        instructions.nested_for(&root.join("sub/y.rs"));
+        let after = instructions.render();
+        assert_eq!(after, before, "nested_for must not reorder already-searched startup directories");
     }
 
     #[test]
