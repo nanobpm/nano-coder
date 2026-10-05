@@ -118,6 +118,12 @@ pub struct ProjectInstructions {
     /// the search that owns them rather than by their immediate parent.
     current_search_dir: Option<PathBuf>,
     scoped: Vec<ScopedRule>,
+    /// Nested instruction files already attached to a tool result by
+    /// `nested_for` (and thus drained from `loaded`). Kept so `/context` and
+    /// ACP still list a loaded `pkg/AGENTS.md`, nested `CLAUDE.local.md` or
+    /// import after it attaches, the same way attached scoped rules are listed.
+    /// Reset by `forget_nested`, which lets those files attach again.
+    nested_attached: Vec<PathBuf>,
 }
 
 pub(crate) fn git_root(start: &Path) -> Option<PathBuf> {
@@ -158,10 +164,35 @@ fn read_capped(path: &Path) -> Option<String> {
     ))
 }
 
+/// Strip leading Markdown blockquote markers (`>` with up to 3 spaces of
+/// indent and an optional following space), returning the inner content. A
+/// fenced code block, HTML comment or `@path` import inside a blockquote (or a
+/// nested blockquote, `> > `) is the same block structure as at top level, so
+/// the scanners that recognize fences and skip code must see the un-prefixed
+/// content — otherwise `> ``` ` is parsed as prose and a `> @secret.md` line
+/// inside the quoted code block is expanded even though it is code. List-item
+/// containers need no special handling: their content is indented 0–3 spaces,
+/// which `fence_indent`/`fence` already accept.
+fn strip_blockquote(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        let spaces = rest.bytes().take_while(|&b| b == b' ').count();
+        if spaces > 3 {
+            break;
+        }
+        let Some(after) = rest[spaces..].strip_prefix('>') else { break };
+        // A blockquote marker consumes at most one following space.
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    rest
+}
+
 /// Leading spaces before a fence marker. CommonMark allows 0–3 spaces of
 /// indentation; a tab or 4+ leading spaces makes the line an indented code
-/// block, not a fence.
+/// block, not a fence. Blockquote container prefixes are stripped first so a
+/// fence inside a quote is recognized.
 fn fence_indent(line: &str) -> Option<usize> {
+    let line = strip_blockquote(line);
     let spaces = line.bytes().take_while(|&b| b == b' ').count();
     if spaces > 3 || line[spaces..].starts_with('\t') {
         return None;
@@ -173,6 +204,7 @@ fn fence_indent(line: &str) -> Option<usize> {
 /// and the length of its backtick/tilde run. CommonMark closes a fence only
 /// on a run of the same character at least as long, so the length matters.
 fn fence(line: &str) -> Option<(char, usize)> {
+    let line = strip_blockquote(line);
     let indent = fence_indent(line)?;
     let t = &line[indent..];
     let ch = match t.chars().next() {
@@ -196,6 +228,7 @@ fn fence(line: &str) -> Option<(char, usize)> {
 /// whitespace after it. A closing fence may not carry an info string, so a line
 /// like ``` ```not-a-close ``` inside the block does **not** close it.
 fn closes_fence(line: &str, open: (char, usize)) -> bool {
+    let line = strip_blockquote(line);
     let Some(indent) = fence_indent(line) else { return false };
     let t = &line[indent..];
     let run = t.chars().take_while(|&c| c == open.0).count();
@@ -205,8 +238,9 @@ fn closes_fence(line: &str, open: (char, usize)) -> bool {
 /// Whether this line is an indented code block (4+ spaces, or a leading tab):
 /// its content is code, not Markdown, so HTML comments are not stripped from
 /// it and `@path` imports are not expanded out of it — mirroring how fenced
-/// code content is preserved.
+/// code content is preserved. A blockquote container prefix is stripped first.
 fn is_indented_code(line: &str) -> bool {
+    let line = strip_blockquote(line);
     let mut spaces = 0usize;
     for b in line.bytes() {
         match b {
@@ -939,7 +973,10 @@ impl ProjectInstructions {
                 out.push_str(&section);
                 rendered += 1;
             }
-            // Keep the deferred file and everything after it pending in `loaded`.
+            // Record the files just attached so `/context` and ACP keep listing
+            // them after they leave `loaded`, then keep the deferred file and
+            // everything after it pending in `loaded`.
+            self.nested_attached.extend(files.iter().take(rendered).map(|f| f.path.clone()));
             self.loaded.extend(files.into_iter().skip(rendered));
             if truncated {
                 break 'outer;
@@ -1009,6 +1046,9 @@ impl ProjectInstructions {
         // nested set in order instead. Session-start (`initial`) files stay:
         // `initial_seen` still covers them, so they are not re-added.
         self.loaded.retain(|f| f.search_dir.as_ref().is_none_or(|d| self.initial.contains(d)));
+        // Nested files attach again from scratch after compaction, so clear the
+        // record of previously-attached ones to avoid stale/duplicate listings.
+        self.nested_attached.clear();
         for rule in &mut self.scoped {
             rule.attached = false;
         }
@@ -1016,15 +1056,17 @@ impl ProjectInstructions {
 
     /// Files in the system prompt, for the banner, `/context` and ACP.
     pub fn loaded_paths(&self) -> Vec<String> {
-        // Attached scoped rules are in the prompt too (rendered into a tool
-        // result by `nested_for`), but they are not stored in `loaded` — list
-        // them so `/context` does not lose all record of a rule the moment it
+        // Nested files attached to a tool result by `nested_for` and attached
+        // scoped rules are in the prompt too, but neither stays in `loaded`
+        // (nested files are drained from it, rules are never in it) — list both
+        // so `/context` does not lose all record of a file or rule the moment it
         // attaches. (`render()` skips deferred non-initial files, so a pending
         // overflow file may be listed here while not yet in the prompt; it is
         // named by its deferral warning until it attaches.)
         self.loaded
             .iter()
             .map(|f| f.path.display().to_string())
+            .chain(self.nested_attached.iter().map(|p| p.display().to_string()))
             .chain(self.scoped.iter().filter(|r| r.attached).map(|r| r.path.display().to_string()))
             .collect()
     }
@@ -1347,6 +1389,29 @@ mod tests {
         // so the inline `code` span on the same line still closes and the
         // @import on the next line is extracted.
         assert_eq!(import_refs("``` `code`\n@live.md"), vec!["live.md".to_string()]);
+    }
+
+    #[test]
+    fn imports_inside_blockquote_containers_are_skipped_like_top_level() {
+        // A fenced code block inside a blockquote is still code: the `> ``` `
+        // opener is recognized despite the container prefix, so a `> @secret.md`
+        // line inside it is NOT expanded.
+        assert!(import_refs("> ```\n> @secret.md\n> ```").is_empty());
+        // The quoted fence closes properly, so a real import after it is still
+        // extracted (the fence does not swallow the rest of the file).
+        assert_eq!(
+            import_refs("> ```\n> @hidden.md\n> ```\n@real.md"),
+            vec!["real.md".to_string()]
+        );
+        // Nested blockquote (`> > `) is handled too.
+        assert!(import_refs("> > ```\n> > @secret.md\n> > ```").is_empty());
+        // An indented (4-space) code block inside a blockquote is code as well.
+        assert!(import_refs(">     @secret.md").is_empty());
+        // A non-code `@import` in a blockquote still expands (prose, not code).
+        assert_eq!(import_refs("> @real.md"), vec!["real.md".to_string()]);
+        // HTML comments: a comment-looking line inside a quoted fenced block is
+        // code and must be preserved, not stripped.
+        assert!(strip_html_comments("> ```\n> <!-- kept -->\n> ```").contains("<!-- kept -->"));
     }
 
     #[test]
@@ -1759,6 +1824,35 @@ mod tests {
         // it (previously it was marked attached yet never rendered).
         let second = instructions.nested_for(&root.join("src/y.rs")).unwrap();
         assert!(second.contains(if a_first { "rule_b" } else { "rule_a" }));
+    }
+
+    #[test]
+    fn nested_attached_files_stay_listed_in_loaded_paths() {
+        let (_dir, root) = repo();
+        // A nested directory's AGENTS.md attaches to a tool result via
+        // `nested_for`, which drains it from `loaded`. `/context` (loaded_paths)
+        // must still list it, like an attached scoped rule — otherwise an
+        // applied nested file silently vanishes from the context report.
+        write(&root.join("a/AGENTS.md"), "nested agents");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        assert!(!instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "not attached yet: {:?}", instructions.loaded_paths());
+        let out = instructions.nested_for(&root.join("a/x.rs")).unwrap();
+        assert!(out.contains("nested agents"), "out: {out:?}");
+        assert!(instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "attached nested file missing from loaded_paths: {:?}", instructions.loaded_paths());
+        // After compaction the record resets so the file can attach again
+        // without a duplicate listing.
+        instructions.forget_nested();
+        assert!(!instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "stale after forget_nested: {:?}", instructions.loaded_paths());
+        instructions.nested_for(&root.join("a/x.rs")).unwrap();
+        assert_eq!(
+            instructions.loaded_paths().iter().filter(|p| p.contains("a/AGENTS.md")).count(),
+            1,
+            "re-attached nested file should be listed exactly once: {:?}",
+            instructions.loaded_paths()
+        );
     }
 
     #[test]
