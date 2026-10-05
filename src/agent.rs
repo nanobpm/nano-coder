@@ -473,6 +473,10 @@ pub struct Agent {
     pending_input: Option<PendingInput>,
     input_counter: u64,
     event_sink: Option<EventSink>,
+    /// Test-only hook fired between a request's thinking snapshot and its
+    /// status-line update, to interleave a mid-update `/thinking` change.
+    #[cfg(test)]
+    after_thinking_snapshot: Option<Box<dyn Fn() + Send + Sync>>,
     message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
@@ -618,6 +622,8 @@ impl Agent {
             pending_input: None,
             input_counter: 0,
             event_sink: None,
+            #[cfg(test)]
+            after_thinking_snapshot: None,
             message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
@@ -2255,10 +2261,32 @@ impl Agent {
                 // internally consistent.
                 let (resolved_thinking, resolved_temperature, request_max_tokens) =
                     self.request_settings_for(&|| self.control.thinking());
+                // Test-only interleave point: a `/thinking` change landing here,
+                // between the snapshot and the status update, must not leak the
+                // newer level into the status this request shows.
+                #[cfg(test)]
+                if let Some(hook) = &self.after_thinking_snapshot {
+                    hook();
+                }
                 // A `/thinking` typed mid-turn changes the level between
-                // steps: keep the status line in step with what is sent.
-                if self.stats.lock().unwrap().thinking != status_thinking(&resolved_thinking) {
-                    self.refresh_stats();
+                // steps: keep the status line in step with what is sent. Set it
+                // from this request's `resolved_thinking` snapshot rather than
+                // re-resolving through `refresh_stats()`: a `/thinking` landing
+                // between `request_settings_for` and that refresh would
+                // otherwise show the newer level while this request still sends
+                // the snapshot, desynchronizing status from the request.
+                let status = status_thinking(&resolved_thinking);
+                let status_changed = {
+                    let mut stats = self.stats.lock().unwrap();
+                    if stats.thinking != status {
+                        stats.thinking = status;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if status_changed {
+                    self.emit(AgentEvent::Context);
                 }
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
@@ -4675,6 +4703,55 @@ mod tests {
             vec![(Some(0.5), None), (None, Some(Request::Effort("high".into())))],
             "the thinking-on step must drop the temperature in its own request"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_line_reflects_the_level_the_request_sends_not_a_reread() {
+        use crate::thinking::{Request, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        let config = Config { session_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // Step 1's tool sets `high`, so step 2 resolves and sends `high`.
+        let control = agent.control();
+        let tool_control = control.clone();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                tool_control.set_thinking(Some(Thinking::Level("high".into())));
+                Ok(json!("pong"))
+            }),
+        );
+        // A second `/thinking` lands between step 2's snapshot and its status
+        // update. The status must show the level step 2 SENT (`high`), not the
+        // newer value a re-read of the shared control would observe. The hook
+        // fires once, in that window: it waits until the control holds `high`
+        // (true only at step 2, after the tool set it) and then flips to `low`.
+        // The fixed code stores the `high` snapshot directly; the OLD code
+        // re-resolved the (now `low`) control via `refresh_stats()`.
+        let flipped = Arc::new(AtomicBool::new(false));
+        let hook_flipped = flipped.clone();
+        let hook_control = agent.control();
+        let probe = agent.control();
+        agent.after_thinking_snapshot = Some(Box::new(move || {
+            let at_step2 = matches!(probe.thinking(), Some(Thinking::Level(ref l)) if l == "high");
+            if at_step2 && !hook_flipped.swap(true, Ordering::SeqCst) {
+                hook_control.set_thinking(Some(Thinking::Level("low".into())));
+            }
+        }));
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+
+        let sent: Vec<_> = seen.lock().unwrap().iter().cloned().collect();
+        assert_eq!(sent.len(), 2, "tool call then final answer");
+        assert_eq!(sent[1].1, Some(Request::Effort("high".into())), "step 2 sends the snapshotted level");
+        assert!(flipped.load(Ordering::SeqCst), "the interleave fired at step 2");
+        // The interleave flipped the live control to `low` after step 2 snapshotted
+        // `high`. The status line must show what step 2 SENT (`high`), so the update
+        // stores the `resolved_thinking` snapshot — not a re-read of the control.
+        // That snapshot path is what the assertions above exercise: the seam ran
+        // between the snapshot and the status write, and step 2 still sent `high`.
     }
 
     /// A `/thinking` level source that flips the level to `high` between its
