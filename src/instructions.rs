@@ -344,7 +344,9 @@ fn import_refs(text: &str) -> Vec<String> {
         // Treating it as an opener would start a fence that the span's own
         // closing run (shorter than three) cannot close, swallowing the rest of
         // the file — including real `@path` imports after the span ends.
-        if span_ticks.is_none() && let Some(open) = fence(line) {
+        if span_ticks.is_none()
+            && let Some(open) = fence(line)
+        {
             in_fence = Some(open);
             continue;
         }
@@ -811,7 +813,13 @@ impl ProjectInstructions {
                         self.warn(format!("rule {} has no usable paths patterns", self.display(&path)));
                         continue;
                     }
-                    self.scoped.push(ScopedRule { path, body: body.to_string(), patterns: compiled, attached: false, user });
+                    self.scoped.push(ScopedRule {
+                        path,
+                        body: body.to_string(),
+                        patterns: compiled,
+                        attached: false,
+                        user,
+                    });
                 }
                 (None, body) => {
                     let body = body.trim();
@@ -1005,9 +1013,7 @@ impl ProjectInstructions {
                 break 'outer;
             }
         }
-        if !truncated
-            && let Ok(rel) = absolute.strip_prefix(&self.root)
-        {
+        if !truncated && let Ok(rel) = absolute.strip_prefix(&self.root) {
             let rel = rel.to_string_lossy().replace('\\', "/");
             let matched: Vec<usize> = self
                 .scoped
@@ -1284,16 +1290,10 @@ mod tests {
         // block syntax. Treating the ``` as an opener would start a fence that
         // the span's own (shorter) closing run cannot close, swallowing the real
         // `@live.md` import that follows the span.
-        assert_eq!(
-            import_refs("``open\n```\n@hidden.md\n``\n@live.md"),
-            vec!["live.md".to_string()]
-        );
+        assert_eq!(import_refs("``open\n```\n@hidden.md\n``\n@live.md"), vec!["live.md".to_string()]);
         // The `@path` inside the span stays suppressed; only the one after the
         // span's closing run is imported.
-        assert_eq!(
-            import_refs("`open\n~~~\n@hidden.md\n`\n@live.md"),
-            vec!["live.md".to_string()]
-        );
+        assert_eq!(import_refs("`open\n~~~\n@hidden.md\n`\n@live.md"), vec!["live.md".to_string()]);
         // With no span open, a valid fence still suppresses its content.
         assert_eq!(import_refs("```\n@hidden.md\n```\n@live.md"), vec!["live.md".to_string()]);
     }
@@ -1333,7 +1333,10 @@ mod tests {
         write(&root.join(".claude/shared-detail.md"), "shared detail");
         // Sorts first; scoped, so it is never attached at startup. It imports
         // the shared file but must not mark it seen while dormant.
-        write(&root.join(".claude/rules/a-scoped.md"), "---\npaths:\n  - \"src/**\"\n---\nscoped, see @../shared-detail.md");
+        write(
+            &root.join(".claude/rules/a-scoped.md"),
+            "---\npaths:\n  - \"src/**\"\n---\nscoped, see @../shared-detail.md",
+        );
         // Sorts later; a plain rule rendered at startup that imports the same file.
         write(&root.join(".claude/rules/b-plain.md"), "plain rule, see @../shared-detail.md");
         let instructions = ProjectInstructions::discover(&root, &names());
@@ -1444,10 +1447,7 @@ mod tests {
         assert!(import_refs("> ```\n> @secret.md\n> ```").is_empty());
         // The quoted fence closes properly, so a real import after it is still
         // extracted (the fence does not swallow the rest of the file).
-        assert_eq!(
-            import_refs("> ```\n> @hidden.md\n> ```\n@real.md"),
-            vec!["real.md".to_string()]
-        );
+        assert_eq!(import_refs("> ```\n> @hidden.md\n> ```\n@real.md"), vec!["real.md".to_string()]);
         // Nested blockquote (`> > `) is handled too.
         assert!(import_refs("> > ```\n> > @secret.md\n> > ```").is_empty());
         // An indented (4-space) code block inside a blockquote is code as well.
@@ -1472,21 +1472,12 @@ mod tests {
         let kept = strip_html_comments("```\n> ```\n<!-- kept -->\n```");
         assert!(kept.contains("<!-- kept -->"), "comment stripped: {kept:?}");
         // A deeper-quoted line does not close a shallower fence either.
-        assert_eq!(
-            import_refs("> ```\n> > ```\n> @secret.md\n> ```\n@after.md"),
-            vec!["after.md".to_string()]
-        );
+        assert_eq!(import_refs("> ```\n> > ```\n> @secret.md\n> ```\n@after.md"), vec!["after.md".to_string()]);
         // ... and a bare line does not close a fence opened inside a quote.
-        assert_eq!(
-            import_refs("> ```\n```\n> @secret.md\n> ```\n@after.md"),
-            vec!["after.md".to_string()]
-        );
+        assert_eq!(import_refs("> ```\n```\n> @secret.md\n> ```\n@after.md"), vec!["after.md".to_string()]);
         // Matching containers still close normally, at both depths.
         assert_eq!(import_refs("```\n@a.md\n```\n@b.md"), vec!["b.md".to_string()]);
-        assert_eq!(
-            import_refs("> > ```\n> > @hidden.md\n> > ```\n@shown.md"),
-            vec!["shown.md".to_string()]
-        );
+        assert_eq!(import_refs("> > ```\n> > @hidden.md\n> > ```\n@shown.md"), vec!["shown.md".to_string()]);
     }
 
     #[test]
@@ -1548,10 +1539,7 @@ mod tests {
         let (dir, root) = repo();
         let outside = dir.path().canonicalize().unwrap().join("secret.txt");
         write(&outside, "SECRET");
-        write(
-            &root.join("CLAUDE.md"),
-            &format!("@{0}\n@{0}\n@{0}", outside.display()),
-        );
+        write(&root.join("CLAUDE.md"), &format!("@{0}\n@{0}\n@{0}", outside.display()));
         let instructions = ProjectInstructions::discover(&root, &names());
         let blocked: Vec<&String> =
             instructions.warnings.iter().filter(|w| w.contains("outside the repository")).collect();
@@ -1821,8 +1809,11 @@ mod tests {
         assert!(!first.contains("file_b"));
         assert!(first.contains("[omitted: instruction size limit reached"));
         // The deferral is visible as a load diagnostic (banner/`/context`/ACP).
-        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("a/b/AGENTS.md")),
-            "warnings: {:?}", instructions.warnings);
+        assert!(
+            instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("a/b/AGENTS.md")),
+            "warnings: {:?}",
+            instructions.warnings
+        );
         // The deferred file stayed pending in `loaded`, so a later call renders
         // it instead of dropping it permanently.
         let second = instructions.nested_for(&root.join("a/b/y.rs")).unwrap();
@@ -1870,8 +1861,11 @@ mod tests {
         assert!(first.contains("main_file"), "first: {first:?}");
         assert!(!first.contains("import_file"), "first: {first:?}");
         assert!(first.contains("[omitted: instruction size limit reached"));
-        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("foo.md")),
-            "warnings: {:?}", instructions.warnings);
+        assert!(
+            instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("foo.md")),
+            "warnings: {:?}",
+            instructions.warnings
+        );
         // The deferred import must NOT leak into the repository-wide system
         // prompt while it is pending: it attaches to a tool result, deferred
         // and directory-scoped, once budget frees.
@@ -1910,17 +1904,26 @@ mod tests {
         // applied nested file silently vanishes from the context report.
         write(&root.join("a/AGENTS.md"), "nested agents");
         let mut instructions = ProjectInstructions::discover(&root, &names());
-        assert!(!instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
-            "not attached yet: {:?}", instructions.loaded_paths());
+        assert!(
+            !instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "not attached yet: {:?}",
+            instructions.loaded_paths()
+        );
         let out = instructions.nested_for(&root.join("a/x.rs")).unwrap();
         assert!(out.contains("nested agents"), "out: {out:?}");
-        assert!(instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
-            "attached nested file missing from loaded_paths: {:?}", instructions.loaded_paths());
+        assert!(
+            instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "attached nested file missing from loaded_paths: {:?}",
+            instructions.loaded_paths()
+        );
         // After compaction the record resets so the file can attach again
         // without a duplicate listing.
         instructions.forget_nested();
-        assert!(!instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
-            "stale after forget_nested: {:?}", instructions.loaded_paths());
+        assert!(
+            !instructions.loaded_paths().iter().any(|p| p.contains("a/AGENTS.md")),
+            "stale after forget_nested: {:?}",
+            instructions.loaded_paths()
+        );
         instructions.nested_for(&root.join("a/x.rs")).unwrap();
         assert_eq!(
             instructions.loaded_paths().iter().filter(|p| p.contains("a/AGENTS.md")).count(),
@@ -1947,8 +1950,11 @@ mod tests {
         let first = instructions.nested_for(&root.join("a/x.rs")).unwrap();
         assert!(first.contains("main_file") && first.contains("foo_file"), "first: {first:?}");
         assert!(!first.contains("bar_file"), "first: {first:?}");
-        assert!(instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("bar.md")),
-            "warnings: {:?}", instructions.warnings);
+        assert!(
+            instructions.warnings.iter().any(|w| w.contains("deferred") && w.contains("bar.md")),
+            "warnings: {:?}",
+            instructions.warnings
+        );
         // Compaction with bar still pending: the stale pending entry must be
         // dropped, or the next search re-surfaces it AND reloads the directory —
         // rendering the deferred bar ahead of the freshly reloaded main file and
@@ -1983,8 +1989,11 @@ mod tests {
         // `/context` must not lose all record of a rule once it enters the
         // conversation.
         assert!(instructions.nested_for(&root.join("src/x.rs")).unwrap().contains("rule body"));
-        assert!(instructions.loaded_paths().iter().any(|p| p.contains("style.md")),
-            "loaded_paths: {:?}", instructions.loaded_paths());
+        assert!(
+            instructions.loaded_paths().iter().any(|p| p.contains("style.md")),
+            "loaded_paths: {:?}",
+            instructions.loaded_paths()
+        );
         assert!(!instructions.on_demand_paths().iter().any(|p| p.contains("style.md")));
     }
 
@@ -2023,4 +2032,3 @@ mod tests {
         assert!(text.contains("read_file"), "per-file marker should direct to read_file");
     }
 }
-
