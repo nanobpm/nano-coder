@@ -595,20 +595,31 @@ fn qwen_endpoint_pick(choice: Option<usize>, rows: &[(String, QwenEndpointChoice
 }
 
 /// Fold a chosen Model Studio endpoint into a provider edit: set its base URL,
-/// and — when the endpoint's plan differs from the one the key variable names —
-/// switch to that plan's variable, so a Token Plan user is not left with the
-/// Standard `DASHSCOPE_API_KEY` (or vice versa). The retarget applies even when
-/// a literal key or command is the active source: a stale built-in plan
-/// variable sitting alongside it would otherwise be resurrected the moment the
-/// user switches the key source back to "Environment variable". A custom
-/// variable name is the user's own choice and is kept, and the literal/command
-/// fields themselves are never touched.
+/// and — when the endpoint's plan differs from the one an existing built-in
+/// plan variable names — switch that variable to the chosen plan's, so a Token
+/// Plan user is not left with the Standard `DASHSCOPE_API_KEY` (or vice versa).
+/// The retarget applies even when a literal key or command is the active
+/// source: a stale built-in plan variable sitting alongside it would otherwise
+/// be resurrected the moment the user switches the key source back to
+/// "Environment variable".
+///
+/// It only ever *rewrites an already-present* variable; it never *introduces*
+/// one where `api_key_env` was absent. Planting a plan variable alongside an
+/// active `api_key_command` would silently shadow that command at runtime,
+/// since [`providers::resolve`] ranks the environment variable above the
+/// command. A custom variable name is the user's own choice and is kept, and
+/// the literal/command fields themselves are never touched. (The endpoint
+/// picker separately seeds the "Environment variable" prompt from the chosen
+/// plan, so a user who switches to that source still lands on the right
+/// variable without one being persisted here.)
 fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::QwenEndpoint) {
     config.base_url = Some(endpoint.base_url.to_string());
-    match &config.api_key_env {
-        // A custom variable is the user's own choice: keep it.
-        Some(var) if !providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) => {}
-        _ => config.api_key_env = Some(endpoint.plan.api_key_env().to_string()),
+    if let Some(var) = &config.api_key_env {
+        // Retarget only a built-in plan variable; a custom name is the user's
+        // own choice. An absent variable is left absent (see above).
+        if providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) {
+            config.api_key_env = Some(endpoint.plan.api_key_env().to_string());
+        }
     }
 }
 
@@ -895,11 +906,16 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             let mut input = Input::<String>::new().with_prompt("Variable name");
             // Seed from the (possibly retargeted) variable so accepting the
             // default keeps the endpoint's plan variable rather than a stale
-            // `<NAME>_API_KEY` guess.
+            // `<NAME>_API_KEY` guess. When no variable is present yet, fall back
+            // to the chosen endpoint's plan variable (if any) before the
+            // `<NAME>_API_KEY` guess, so switching to this source still lands on
+            // the right plan without one being persisted alongside another key
+            // source (see `apply_qwen_endpoint`).
             let suggested = updated
                 .api_key_env
                 .clone()
                 .filter(|v| !v.is_empty())
+                .or_else(|| chosen_endpoint.map(|e| e.plan.api_key_env().to_string()))
                 .unwrap_or_else(|| format!("{}_API_KEY", name.to_uppercase().replace('-', "_")));
             input = input.default(suggested);
             updated.api_key_env = Some(input.interact_text()?.trim().to_string());
@@ -1850,18 +1866,18 @@ mod tests {
         let coding_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::CodingPlan).unwrap();
         apply_qwen_endpoint(&mut config, coding_plan);
         assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
-        // A literal key, or a key command, is itself left alone — but the
-        // endpoint's plan variable is still installed alongside it, so a later
-        // switch of the key source to "Environment variable" lands on the
-        // right plan rather than resurrecting a stale one.
+        // A literal key, or a key command, is itself left alone — and no plan
+        // variable is *introduced* alongside it. Planting an `api_key_env`
+        // where none existed would persist a second key source that shadows an
+        // active command at runtime (`resolve()` ranks env above command).
         let mut literal = ProviderConfig { api_key: Some("sk-sp-x".into()), ..Default::default() };
         apply_qwen_endpoint(&mut literal, coding_plan);
         assert_eq!(literal.api_key.as_deref(), Some("sk-sp-x"));
-        assert_eq!(literal.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
+        assert_eq!(literal.api_key_env, None);
         let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
         apply_qwen_endpoint(&mut command, token_plan);
         assert_eq!(command.api_key_command.as_deref(), Some("op read op://x"));
-        assert_eq!(command.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        assert_eq!(command.api_key_env, None);
         // A user's own variable name is respected, not clobbered — even when a
         // literal key or command is the active source.
         let mut custom = ProviderConfig { api_key_env: Some("MY_QWEN_KEY".into()), ..Default::default() };
@@ -1905,6 +1921,30 @@ mod tests {
         apply_qwen_endpoint(&mut config, token_plan);
         assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
         assert_eq!(config.api_key_command.as_deref(), Some("op read op://x"));
+    }
+
+    #[test]
+    fn applying_an_endpoint_never_introduces_a_variable_that_would_shadow_a_command() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A command-only provider (no `api_key_env` at all) must not gain a plan
+        // variable: `resolve()` ranks `api_key_env` above `api_key_command`, so
+        // a persisted-but-unused plan variable whose env happens to be set in
+        // the shell would silently shadow the command the user actually chose.
+        let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut command, token_plan);
+        assert_eq!(command.api_key_command.as_deref(), Some("op read op://x"));
+        assert_eq!(command.api_key_env, None, "no env variable may be planted alongside the command");
+        assert_eq!(command.base_url.as_deref(), Some(token_plan.base_url));
+        // An explicitly-cleared variable (empty-string sentinel) is preserved as
+        // cleared — it, too, must not be resurrected into a shadowing variable.
+        let mut cleared = ProviderConfig {
+            api_key_command: Some("op read op://x".into()),
+            api_key_env: Some(String::new()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut cleared, token_plan);
+        assert_eq!(cleared.api_key_env.as_deref(), Some(""), "a cleared variable stays cleared");
     }
 
     #[test]
@@ -1983,17 +2023,26 @@ mod tests {
     fn applying_an_endpoint_seeds_the_key_prompt_with_the_plan_variable() {
         use providers::qwen::{ENDPOINTS, QwenPlan};
         let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
-        // A custom-named provider with no key yet: after retargeting, the
-        // env-var prompt default is the plan variable (not a `<NAME>_API_KEY`
-        // guess), so accepting the default lands on the right variable.
+        // A custom-named provider with no key yet: `apply_qwen_endpoint` plants
+        // nothing (it never introduces a variable), but the env-var prompt
+        // default still falls back to the chosen endpoint's plan variable (not a
+        // `<NAME>_API_KEY` guess), so accepting the default lands on the right
+        // variable — without one being persisted alongside another key source.
         let mut updated = ProviderConfig {
             base_url: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()),
             ..Default::default()
         };
+        let chosen_endpoint = Some(token_plan);
         apply_qwen_endpoint(&mut updated, token_plan);
-        let suggested =
-            updated.api_key_env.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| "MYPROVIDER_API_KEY".to_string());
-        assert_eq!(suggested, "BAILIAN_TOKEN_PLAN_API_KEY", "the prompt is seeded from the retargeted variable");
+        assert_eq!(updated.api_key_env, None, "nothing is planted into the config");
+        // This mirrors the prompt's seed computation in `configure_provider`.
+        let suggested = updated
+            .api_key_env
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| chosen_endpoint.map(|e| e.plan.api_key_env().to_string()))
+            .unwrap_or_else(|| "MYPROVIDER_API_KEY".to_string());
+        assert_eq!(suggested, "BAILIAN_TOKEN_PLAN_API_KEY", "the prompt is seeded from the chosen plan variable");
     }
 
     #[test]
