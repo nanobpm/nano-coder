@@ -165,16 +165,21 @@ fn read_capped(path: &Path) -> Option<String> {
 }
 
 /// Strip leading Markdown blockquote markers (`>` with up to 3 spaces of
-/// indent and an optional following space), returning the inner content. A
-/// fenced code block, HTML comment or `@path` import inside a blockquote (or a
+/// indent and an optional following space), returning the inner content and
+/// the number of markers stripped (the line's blockquote depth). A fenced
+/// code block, HTML comment or `@path` import inside a blockquote (or a
 /// nested blockquote, `> > `) is the same block structure as at top level, so
 /// the scanners that recognize fences and skip code must see the un-prefixed
 /// content — otherwise `> ``` ` is parsed as prose and a `> @secret.md` line
-/// inside the quoted code block is expanded even though it is code. List-item
-/// containers need no special handling: their content is indented 0–3 spaces,
-/// which `fence_indent`/`fence` already accept.
-fn strip_blockquote(line: &str) -> &str {
+/// inside the quoted code block is expanded even though it is code. The depth
+/// matters for closing: a closing fence must sit in the same container as its
+/// opener, so a `> ``` ` line inside a top-level code block is literal
+/// content, not a close.
+/// List-item containers need no special handling: their content is indented
+/// 0–3 spaces, which `fence_indent`/`fence` already accept.
+fn strip_blockquote(line: &str) -> (&str, usize) {
     let mut rest = line;
+    let mut depth = 0usize;
     loop {
         let spaces = rest.bytes().take_while(|&b| b == b' ').count();
         if spaces > 3 {
@@ -183,16 +188,16 @@ fn strip_blockquote(line: &str) -> &str {
         let Some(after) = rest[spaces..].strip_prefix('>') else { break };
         // A blockquote marker consumes at most one following space.
         rest = after.strip_prefix(' ').unwrap_or(after);
+        depth += 1;
     }
-    rest
+    (rest, depth)
 }
 
 /// Leading spaces before a fence marker. CommonMark allows 0–3 spaces of
 /// indentation; a tab or 4+ leading spaces makes the line an indented code
-/// block, not a fence. Blockquote container prefixes are stripped first so a
-/// fence inside a quote is recognized.
+/// block, not a fence. The line must already have any blockquote container
+/// prefix stripped (`strip_blockquote`).
 fn fence_indent(line: &str) -> Option<usize> {
-    let line = strip_blockquote(line);
     let spaces = line.bytes().take_while(|&b| b == b' ').count();
     if spaces > 3 || line[spaces..].starts_with('\t') {
         return None;
@@ -200,11 +205,13 @@ fn fence_indent(line: &str) -> Option<usize> {
     Some(spaces)
 }
 
-/// The opening fence of a Markdown code block on this line: its character
-/// and the length of its backtick/tilde run. CommonMark closes a fence only
-/// on a run of the same character at least as long, so the length matters.
-fn fence(line: &str) -> Option<(char, usize)> {
-    let line = strip_blockquote(line);
+/// The opening fence of a Markdown code block on this line: its character,
+/// the length of its backtick/tilde run, and the blockquote depth of the
+/// container it sits in. CommonMark closes a fence only on a run of the same
+/// character at least as long, so the length matters; the depth matters
+/// because a closing fence must sit in that same container.
+fn fence(line: &str) -> Option<(char, usize, usize)> {
+    let (line, depth) = strip_blockquote(line);
     let indent = fence_indent(line)?;
     let t = &line[indent..];
     let ch = match t.chars().next() {
@@ -220,15 +227,22 @@ fn fence(line: &str) -> Option<(char, usize)> {
     if ch == '`' && t[run..].contains('`') {
         return None;
     }
-    Some((ch, run))
+    Some((ch, run, depth))
 }
 
 /// Whether this line closes a fence opened as `open`: 0–3 spaces of indent, a
-/// run of the same character at least as long as the opening run, and only
-/// whitespace after it. A closing fence may not carry an info string, so a line
-/// like ``` ```not-a-close ``` inside the block does **not** close it.
-fn closes_fence(line: &str, open: (char, usize)) -> bool {
-    let line = strip_blockquote(line);
+/// run of the same character at least as long as the opening run, only
+/// whitespace after it — and the same blockquote container as the opener. A
+/// closing fence may not carry an info string, so a line
+/// like ``` ```not-a-close ``` inside the block does **not** close it; nor
+/// does a `> ``` ` line, which is literal content of a top-level code block
+/// (CommonMark), not a close — treating it as one would expand the `@path`
+/// imports that follow it out of code.
+fn closes_fence(line: &str, open: (char, usize, usize)) -> bool {
+    let (line, depth) = strip_blockquote(line);
+    if depth != open.2 {
+        return false;
+    }
     let Some(indent) = fence_indent(line) else { return false };
     let t = &line[indent..];
     let run = t.chars().take_while(|&c| c == open.0).count();
@@ -240,7 +254,7 @@ fn closes_fence(line: &str, open: (char, usize)) -> bool {
 /// it and `@path` imports are not expanded out of it — mirroring how fenced
 /// code content is preserved. A blockquote container prefix is stripped first.
 fn is_indented_code(line: &str) -> bool {
-    let line = strip_blockquote(line);
+    let (line, _) = strip_blockquote(line);
     let mut spaces = 0usize;
     for b in line.bytes() {
         match b {
@@ -261,7 +275,7 @@ fn is_indented_code(line: &str) -> bool {
 /// Claude Code does before a CLAUDE.md reaches the model.
 fn strip_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_fence: Option<(char, usize)> = None;
+    let mut in_fence: Option<(char, usize, usize)> = None;
     let mut in_comment = false;
     for line in text.split_inclusive('\n') {
         if in_comment {
@@ -312,7 +326,7 @@ fn strip_html_comments(text: &str) -> String {
 /// so e-mail addresses don't count; `\ ` continues a path past a space.
 fn import_refs(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let mut in_fence: Option<(char, usize)> = None;
+    let mut in_fence: Option<(char, usize, usize)> = None;
     // A code span opens with a run of N backticks and closes only on a run of
     // exactly N (CommonMark). The state lives across lines: a span may span a
     // line break, so resetting per line would parse the continuation as prose
@@ -1415,6 +1429,36 @@ mod tests {
     }
 
     #[test]
+    fn a_closing_fence_must_match_the_openers_blockquote_container() {
+        // A `> ``` ` line inside a TOP-LEVEL fenced block is literal content
+        // (CommonMark: a closing fence sits in the same container as its
+        // opener), so it must NOT close the block — the @imports after it stay
+        // inside the code until a bare marker closes it.
+        let text = "```\n> ```\n@secret.md\n```\n@after.md";
+        assert_eq!(import_refs(text), vec!["after.md".to_string()]);
+        // strip_html_comments shares the fence scanner: the comment after the
+        // quoted marker is code and must be preserved, not stripped.
+        let kept = strip_html_comments("```\n> ```\n<!-- kept -->\n```");
+        assert!(kept.contains("<!-- kept -->"), "comment stripped: {kept:?}");
+        // A deeper-quoted line does not close a shallower fence either.
+        assert_eq!(
+            import_refs("> ```\n> > ```\n> @secret.md\n> ```\n@after.md"),
+            vec!["after.md".to_string()]
+        );
+        // ... and a bare line does not close a fence opened inside a quote.
+        assert_eq!(
+            import_refs("> ```\n```\n> @secret.md\n> ```\n@after.md"),
+            vec!["after.md".to_string()]
+        );
+        // Matching containers still close normally, at both depths.
+        assert_eq!(import_refs("```\n@a.md\n```\n@b.md"), vec!["b.md".to_string()]);
+        assert_eq!(
+            import_refs("> > ```\n> > @hidden.md\n> > ```\n@shown.md"),
+            vec!["shown.md".to_string()]
+        );
+    }
+
+    #[test]
     fn render_cap_bounds_total_with_header_and_single_marker() {
         let (_dir, root) = repo();
         // Many nested files, each near the per-file cap, well past the total cap.
@@ -1948,3 +1992,4 @@ mod tests {
         assert!(text.contains("read_file"), "per-file marker should direct to read_file");
     }
 }
+
