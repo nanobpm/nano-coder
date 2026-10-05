@@ -122,6 +122,43 @@ pub fn endpoint_for_url(url: &str) -> Option<&'static QwenEndpoint> {
     ENDPOINTS.iter().find(|endpoint| endpoint.base_url == url)
 }
 
+/// Whether `url` points at an Alibaba Cloud Model Studio host — one of the
+/// known plan endpoints, or a workspace domain under `*.maas.aliyuncs.com` /
+/// `*.dashscope.aliyuncs.com` (Model Studio issues per-workspace hosts such as
+/// `<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com`). This is the gate for
+/// offering the endpoint picker: it is deliberately broader than
+/// [`endpoint_for_url`], which stays exact so only a real plan row is
+/// *identified* (and its key variable retargeted). A workspace host gets the
+/// picker but no pre-selected plan row.
+pub fn is_model_studio_url(url: &str) -> bool {
+    if endpoint_for_url(url).is_some() {
+        return true;
+    }
+    let host = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))
+        .unwrap_or_else(|| url.trim())
+        // Drop any path/query: only the authority decides.
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        // Drop any userinfo (`user@host`): the host is after the last `@`.
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        // Drop any port.
+        .split(':')
+        .next()
+        .unwrap_or("")
+        // A trailing dot is a DNS no-op (`host.` == `host`).
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    // Require a dot boundary so a look-alike such as `notmaas.aliyuncs.com.evil.example`
+    // (or `evilmaas.aliyuncs.com`) does not match.
+    host.ends_with(".maas.aliyuncs.com") || host.ends_with(".dashscope.aliyuncs.com")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +230,36 @@ mod tests {
         assert_eq!(endpoint_for_url("https://example.com/v1"), None);
         // A host that merely *contains* a plan base URL is not that plan.
         assert_eq!(endpoint_for_url("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/extra"), None);
+    }
+
+    #[test]
+    fn model_studio_hosts_are_recognised_beyond_the_exact_matrix() {
+        // Every known plan endpoint is a Model Studio host.
+        for endpoint in ENDPOINTS {
+            assert!(is_model_studio_url(endpoint.base_url), "{} should be recognised", endpoint.base_url);
+        }
+        // A per-workspace Model Studio domain (README documents these) is a
+        // Model Studio host even though it is not one of the eight matrix URLs.
+        assert!(is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"));
+        assert!(is_model_studio_url("https://ws-42.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"));
+        // Case, scheme, path, query and port are all irrelevant to the host.
+        assert!(is_model_studio_url("https://ABC123.AP-SOUTHEAST-1.MAAS.ALIYUNCS.COM/compatible-mode/v1"));
+        assert!(is_model_studio_url("http://abc123.ap-southeast-1.maas.aliyuncs.com:8443/v1?x=1"));
+        // A bare host (no path) still counts.
+        assert!(is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com"));
+        // ...but a look-alike host that merely *ends* in the suffix without a
+        // dot boundary, or an unrelated host, is NOT Model Studio.
+        assert!(!is_model_studio_url("https://notmaas.aliyuncs.com.evil.example/v1"));
+        assert!(!is_model_studio_url("https://evilmaas.aliyuncs.com/v1"));
+        assert!(!is_model_studio_url("https://example.com/v1"));
+        assert!(!is_model_studio_url("https://api.openai.com/v1"));
+        // A userinfo prefix does not smuggle a foreign host past the check...
+        assert!(is_model_studio_url("https://user@abc123.ap-southeast-1.maas.aliyuncs.com/v1"));
+        assert!(!is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com@evil.example/v1"));
+        // ...and a trailing-dot FQDN is the same host.
+        assert!(is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com./v1"));
+        // Identifying a plan row stays exact: a workspace host is recognised as
+        // Model Studio but maps to no specific endpoint row.
+        assert_eq!(endpoint_for_url("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"), None);
     }
 }

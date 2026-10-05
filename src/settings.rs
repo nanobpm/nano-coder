@@ -528,14 +528,17 @@ fn model_spec(provider: &str, model: &str) -> Step {
 }
 
 /// Whether the endpoint picker applies to a provider: the `qwen` family and
-/// any provider explicitly configured for the Model Studio host. A provider
+/// any provider explicitly configured for a Model Studio host. A provider
 /// named `qwen` always qualifies, so a user who renamed or re-pointed the
-/// preset still gets the picker.
+/// preset still gets the picker. Detection is host-aware (not limited to the
+/// eight exact matrix URLs) so a renamed provider on a Model Studio *workspace*
+/// domain — e.g. `<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/...` — is
+/// recognised too.
 fn is_qwen_provider(name: &str, config: &ProviderConfig) -> bool {
     if name == "qwen" {
         return true;
     }
-    config.base_url.as_deref().is_some_and(|url| providers::qwen::endpoint_for_url(url).is_some())
+    config.base_url.as_deref().is_some_and(providers::qwen::is_model_studio_url)
 }
 
 /// Who a picker row is: a known Model Studio endpoint, the row that keeps a
@@ -872,17 +875,29 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
         };
     let mut updated =
         ProviderConfig { kind: Some(kind), base_url: Some(base_url).filter(|u| !u.is_empty()), ..current.clone() };
+    // Picking a known endpoint also retargets the API-key variable to its plan
+    // (overriding the preset's Standard `DASHSCOPE_API_KEY` for Token/Coding
+    // Plan). This happens BEFORE the key-source prompt so the prompt is seeded
+    // from the retargeted variable — and so a later explicit key-source choice
+    // (in particular "No key") stays authoritative instead of being overwritten.
+    if let Some(endpoint) = chosen_endpoint {
+        apply_qwen_endpoint(&mut updated, endpoint);
+    }
     match Select::new()
-        .with_prompt(format!("API key ({})", key_status(&current)))
+        .with_prompt(format!("API key ({})", key_status(&updated)))
         .items(&sources)
         .default(source_default)
         .interact()?
     {
         0 => {
             let mut input = Input::<String>::new().with_prompt("Variable name");
-            let suggested = current
+            // Seed from the (possibly retargeted) variable so accepting the
+            // default keeps the endpoint's plan variable rather than a stale
+            // `<NAME>_API_KEY` guess.
+            let suggested = updated
                 .api_key_env
                 .clone()
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| format!("{}_API_KEY", name.to_uppercase().replace('-', "_")));
             input = input.default(suggested);
             updated.api_key_env = Some(input.interact_text()?.trim().to_string());
@@ -910,12 +925,6 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             updated.api_key_command = None;
         }
         _ => {}
-    }
-    // Picking a known endpoint also retargets the API-key variable to its plan
-    // (overriding the preset's Standard `DASHSCOPE_API_KEY` for Token/Coding
-    // Plan), unless the user just chose a key source or a custom variable.
-    if let Some(endpoint) = chosen_endpoint {
-        apply_qwen_endpoint(&mut updated, endpoint);
     }
 
     let mut default_model = Input::<String>::new().with_prompt("Default model (optional)").allow_empty(true);
@@ -1862,6 +1871,13 @@ mod tests {
             ..Default::default()
         };
         assert!(is_qwen_provider("my-dashscope", &on_model_studio), "a configured Model Studio URL qualifies");
+        // A renamed provider on a Model Studio *workspace* host (not one of the
+        // eight exact matrix URLs) is recognised too.
+        let on_workspace = ProviderConfig {
+            base_url: Some("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1".into()),
+            ..Default::default()
+        };
+        assert!(is_qwen_provider("my-workspace", &on_workspace), "a Model Studio workspace host qualifies");
         let elsewhere = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
         assert!(!is_qwen_provider("work", &elsewhere));
         assert!(!is_qwen_provider("work", &ProviderConfig::default()), "a new unrelated provider is not qwen");
@@ -1891,6 +1907,49 @@ mod tests {
             Some("BAILIAN_TOKEN_PLAN_API_KEY"),
             "the stored override names the token-plan variable"
         );
+    }
+
+    #[test]
+    fn applying_an_endpoint_before_the_key_prompt_keeps_no_key_authoritative() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The edit flow retargets the endpoint's plan variable BEFORE the
+        // key-source prompt. A subsequent "No key" selection clears all three
+        // key fields and must NOT have the plan variable restored afterwards.
+        let mut updated = ProviderConfig {
+            base_url: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()),
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut updated, token_plan);
+        assert_eq!(updated.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // ... then the user picks "No key" (the dialog clears all key fields):
+        updated.api_key = None;
+        updated.api_key_env = None;
+        updated.api_key_command = None;
+        // Nothing re-applies the endpoint after this, so "No key" wins.
+        assert_eq!(updated.api_key_env, None, "No key must stay authoritative");
+        assert_eq!(updated.api_key, None);
+        assert_eq!(updated.api_key_command, None);
+        // The endpoint's URL is still applied (only the key was cleared).
+        assert_eq!(updated.base_url.as_deref(), Some(token_plan.base_url));
+    }
+
+    #[test]
+    fn applying_an_endpoint_seeds_the_key_prompt_with_the_plan_variable() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A custom-named provider with no key yet: after retargeting, the
+        // env-var prompt default is the plan variable (not a `<NAME>_API_KEY`
+        // guess), so accepting the default lands on the right variable.
+        let mut updated = ProviderConfig {
+            base_url: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut updated, token_plan);
+        let suggested =
+            updated.api_key_env.clone().filter(|v| !v.is_empty()).unwrap_or_else(|| "MYPROVIDER_API_KEY".to_string());
+        assert_eq!(suggested, "BAILIAN_TOKEN_PLAN_API_KEY", "the prompt is seeded from the retargeted variable");
     }
 
     #[test]
