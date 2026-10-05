@@ -126,7 +126,7 @@ fn command_glob(pattern: &str) -> Result<Regex, String> {
 }
 
 /// `**` crosses directories, `*` and `?` do not. `~/` is the home directory.
-fn path_glob(pattern: &str) -> Result<Regex, String> {
+pub(crate) fn path_glob(pattern: &str) -> Result<Regex, String> {
     let pattern = match (pattern.strip_prefix("~/"), dirs::home_dir()) {
         (Some(rest), Some(home)) => format!("{}/{rest}", home.display()),
         _ => pattern.to_string(),

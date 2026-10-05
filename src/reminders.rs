@@ -7,6 +7,8 @@ use crate::plan::{Plan, Status};
 pub const PLAN_STALE_AFTER: usize = 12;
 /// Suggest a plan after this many tool calls in one turn without one.
 pub const SUGGEST_PLAN_AFTER: usize = 10;
+/// Suggest saving a memory after this many tool calls without a save.
+pub const SUGGEST_MEMORY_AFTER: usize = 30;
 
 /// Wrap reminder text in `<system-reminder>` tags.
 pub fn wrap(text: &str) -> String {
@@ -19,6 +21,8 @@ pub struct Reminders {
     since_plan_change: usize,
     this_turn: usize,
     suggested_plan: bool,
+    since_memory_save: usize,
+    suggested_memory: bool,
 }
 
 impl Reminders {
@@ -30,11 +34,27 @@ impl Reminders {
         self.since_plan_change = 0;
     }
 
+    pub fn memory_saved(&mut self) {
+        self.since_memory_save = 0;
+        self.suggested_memory = true;
+    }
+
     /// Count a (non-plan) tool call and return any reminders for its result.
-    pub fn after_tool_call(&mut self, plan: &Plan) -> Vec<String> {
+    /// `memory_writable`: `memory_save` is offered, so suggesting it is useful.
+    pub fn after_tool_call(&mut self, plan: &Plan, memory_writable: bool) -> Vec<String> {
         self.since_plan_change += 1;
         self.this_turn += 1;
+        self.since_memory_save += 1;
         let mut notes = Vec::new();
+        if memory_writable && !self.suggested_memory && self.since_memory_save >= SUGGEST_MEMORY_AFTER {
+            self.suggested_memory = true;
+            notes.push(format!(
+                "{} tool calls without a memory save. If this work taught you something durable that a future \
+                 session would have to rediscover (a correction from the user, a preference, a decision, costly \
+                 setup), save it with memory_save. If not, carry on.",
+                self.since_memory_save
+            ));
+        }
         if plan.is_empty() {
             if !self.suggested_plan && self.this_turn >= SUGGEST_PLAN_AFTER {
                 self.suggested_plan = true;
@@ -72,11 +92,27 @@ mod tests {
     fn suggests_a_plan_once_per_session() {
         let mut reminders = Reminders::default();
         let plan = Plan::default();
-        let notes: Vec<_> = (0..SUGGEST_PLAN_AFTER).flat_map(|_| reminders.after_tool_call(&plan)).collect();
+        let notes: Vec<_> = (0..SUGGEST_PLAN_AFTER).flat_map(|_| reminders.after_tool_call(&plan, false)).collect();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("plan_add"));
         reminders.start_turn();
-        assert!((0..SUGGEST_PLAN_AFTER * 2).all(|_| reminders.after_tool_call(&plan).is_empty()));
+        assert!((0..SUGGEST_PLAN_AFTER * 2).all(|_| reminders.after_tool_call(&plan, false).is_empty()));
+    }
+
+    #[test]
+    fn suggests_saving_a_memory_once_unless_one_was_saved() {
+        let plan = Plan::default();
+        let memory_notes = |r: &mut Reminders, writable| {
+            (0..SUGGEST_MEMORY_AFTER * 2)
+                .flat_map(|_| r.after_tool_call(&plan, writable))
+                .filter(|n| n.contains("memory_save"))
+                .count()
+        };
+        assert_eq!(memory_notes(&mut Reminders::default(), true), 1);
+        assert_eq!(memory_notes(&mut Reminders::default(), false), 0);
+        let mut saved = Reminders::default();
+        saved.memory_saved();
+        assert_eq!(memory_notes(&mut saved, true), 0);
     }
 
     #[test]
@@ -86,15 +122,15 @@ mod tests {
         plan.apply("plan_update", &json!({"id": 1, "status": "in_progress"})).unwrap();
         let mut reminders = Reminders::default();
         let fired: Vec<usize> =
-            (1..=PLAN_STALE_AFTER * 2).filter(|_| !reminders.after_tool_call(&plan).is_empty()).collect();
+            (1..=PLAN_STALE_AFTER * 2).filter(|_| !reminders.after_tool_call(&plan, false).is_empty()).collect();
         assert_eq!(fired, [PLAN_STALE_AFTER, PLAN_STALE_AFTER * 2]);
 
         reminders.plan_changed();
         plan.apply("plan_update", &json!({"id": 1, "status": "done"})).unwrap();
-        let note = (0..PLAN_STALE_AFTER).flat_map(|_| reminders.after_tool_call(&plan)).next().unwrap();
+        let note = (0..PLAN_STALE_AFTER).flat_map(|_| reminders.after_tool_call(&plan, false)).next().unwrap();
         assert!(note.contains("next is #2 \"fix\""), "{note}");
 
         plan.apply("plan_update", &json!({"id": 2, "status": "done"})).unwrap();
-        assert!((0..PLAN_STALE_AFTER * 2).all(|_| reminders.after_tool_call(&plan).is_empty()));
+        assert!((0..PLAN_STALE_AFTER * 2).all(|_| reminders.after_tool_call(&plan, false).is_empty()));
     }
 }

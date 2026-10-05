@@ -1489,6 +1489,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 out.push(format!("Instructions: {}", files.join(", ")));
             }
+            let on_demand = agent.on_demand_instruction_files();
+            if !on_demand.is_empty() {
+                out.push(format!("Rules (on demand): {}", on_demand.join(", ")));
+            }
+            for warning in agent.instruction_warnings() {
+                out.push(format!("Instructions warning: {warning}"));
+            }
             let skills = agent.skills();
             if !skills.is_empty() || !skills.warnings.is_empty() {
                 out.push(format!("Skills:       {} (/skills to list them)", skills.skills.len()));
@@ -2204,6 +2211,9 @@ async fn main() -> Result<()> {
         }
         for file in agent.project_instruction_files() {
             banner.push(format!("Instructions: {file}"));
+        }
+        for warning in agent.instruction_warnings() {
+            banner.push(format!("Instructions warning: {warning}"));
         }
         let skills = agent.skills();
         if !skills.is_empty() {
