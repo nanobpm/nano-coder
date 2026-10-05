@@ -423,7 +423,13 @@ fn rule_front_matter(text: &str) -> (Option<Vec<String>>, &str) {
         let inner = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')).unwrap_or(value);
         paths = Some(split_top_level(inner).into_iter().map(unquote).collect());
     }
-    let paths = paths.map(|p| p.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>()).filter(|p| !p.is_empty());
+    // Preserve an explicit-but-empty `paths` (`paths: []`, `paths:` with no
+    // entries, or entries that all trim to empty) as `Some(empty)` rather than
+    // collapsing it to `None`: `None` means "no `paths:` field" and loads the
+    // rule globally, whereas an empty scope must reach `load_rules`'s existing
+    // "no usable paths patterns" warning and be skipped, not broadened to every
+    // file.
+    let paths = paths.map(|p| p.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>());
     (paths, &text[offset.min(text.len())..])
 }
 
@@ -620,7 +626,7 @@ impl ProjectInstructions {
                 real.starts_with(&root)
             });
             if !inside {
-                self.warnings.push(format!(
+                self.warn(format!(
                     "skipped {}: links outside the repository (set instruction_imports_outside_project = true to allow)",
                     self.display(&path)
                 ));
@@ -711,7 +717,7 @@ impl ProjectInstructions {
             let real = target.canonicalize().ok()?;
             let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
             if !real.starts_with(&root) {
-                self.warnings.push(format!(
+                self.warn(format!(
                     "skipped import @{reference} in {}: outside the repository (set instruction_imports_outside_project = true to allow)",
                     self.display(from)
                 ));
@@ -729,7 +735,7 @@ impl ProjectInstructions {
             if !user && !self.options.imports_outside_project {
                 let inside = path.canonicalize().is_ok_and(|real| real.starts_with(&root));
                 if !inside {
-                    self.warnings.push(format!(
+                    self.warn(format!(
                         "skipped rule {}: links outside the repository (set instruction_imports_outside_project = true to allow)",
                         self.display(&path)
                     ));
@@ -745,7 +751,7 @@ impl ProjectInstructions {
                     }
                     let compiled = compile_patterns(&patterns);
                     if compiled.is_empty() {
-                        self.warnings.push(format!("rule {} has no usable paths patterns", self.display(&path)));
+                        self.warn(format!("rule {} has no usable paths patterns", self.display(&path)));
                         continue;
                     }
                     self.scoped.push(ScopedRule { path, body: body.to_string(), patterns: compiled, attached: false, user });
@@ -764,9 +770,12 @@ impl ProjectInstructions {
         }
     }
 
-    /// Record a load diagnostic, ignoring exact duplicates: a deferred file is
-    /// re-attempted (and re-reported) on every matching call until the budget
-    /// frees, and the banner/`/context`/ACP would otherwise list it each time.
+    /// Record a load diagnostic, ignoring exact duplicates. Several diagnostics
+    /// can otherwise repeat without bound: a deferred file is re-attempted (and
+    /// re-reported) on every matching call until the budget frees, and a blocked
+    /// outside-the-repository import that never enters `seen` is re-reported for
+    /// each occurrence in a committed file — the banner/`/context`/ACP would
+    /// list each copy. Routing every diagnostic here keeps them bounded.
     fn warn(&mut self, message: String) {
         if !self.warnings.contains(&message) {
             self.warnings.push(message);
@@ -895,8 +904,20 @@ impl ProjectInstructions {
                         format!("[{} (imported by {}) applies with it:]", self.display(&file.path), self.display(by))
                     }
                     _ => {
-                        let scope = file.path.parent().map(|p| self.display(p)).unwrap_or_default();
-                        let scope = scope.trim_end_matches("/.claude").trim_end_matches(".claude").to_string();
+                        // Scope the heading to the directory whose search owns
+                        // this file (`search_dir`), not `path.parent()`: the
+                        // latter needs a fragile `.claude` suffix trim that
+                        // mislabels ordinary directories (e.g.
+                        // `packages/foo.claude/CLAUDE.local.md`) and broadens an
+                        // `AGENTS.md` found inside a real `.claude` directory.
+                        // `search_dir` already records the owning directory,
+                        // including for the `.claude/CLAUDE.md` candidate.
+                        let scope = file
+                            .search_dir
+                            .as_deref()
+                            .or_else(|| file.path.parent())
+                            .map(|p| self.display(p))
+                            .unwrap_or_default();
                         format!(
                             "[Instructions from {} apply to files under {}/. Follow them for changes there:]",
                             self.display(&file.path),
@@ -1375,6 +1396,69 @@ mod tests {
             Options { names: names(), imports_outside_project: true, ..Default::default() },
         );
         assert!(allowed.render().contains("SECRET"));
+    }
+
+    #[test]
+    fn repeated_blocked_outside_import_warns_only_once() {
+        // Class: a diagnostic pushed straight to `self.warnings` instead of the
+        // deduplicating `warn` helper can repeat without bound — a committed
+        // file importing the same blocked target many times would inflate the
+        // banner/`/context`/ACP. Route it through `warn`, so N copies collapse
+        // to one.
+        let (dir, root) = repo();
+        let outside = dir.path().canonicalize().unwrap().join("secret.txt");
+        write(&outside, "SECRET");
+        write(
+            &root.join("CLAUDE.md"),
+            &format!("@{0}\n@{0}\n@{0}", outside.display()),
+        );
+        let instructions = ProjectInstructions::discover(&root, &names());
+        let blocked: Vec<&String> =
+            instructions.warnings.iter().filter(|w| w.contains("outside the repository")).collect();
+        assert_eq!(blocked.len(), 1, "blocked-import warning must be deduplicated: {:?}", instructions.warnings);
+        assert!(!instructions.render().contains("SECRET"));
+    }
+
+    #[test]
+    fn rule_with_explicit_empty_paths_is_skipped_not_loaded_globally() {
+        // Class: an explicit-but-empty `paths:` scope collapsing to `None` and
+        // broadening to every file. Every empty shape must reach the "no usable
+        // paths patterns" warning and be skipped, not loaded globally.
+        let (_dir, root) = repo();
+        write(&root.join("AGENTS.md"), "root");
+        write(&root.join(".claude/rules/bracket.md"), "---\npaths: []\n---\nBRACKET_BODY");
+        write(&root.join(".claude/rules/bare.md"), "---\npaths:\n---\nBARE_BODY");
+        write(&root.join(".claude/rules/blank.md"), "---\npaths:\n  - \"\"\n---\nBLANK_BODY");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let rendered = instructions.render();
+        for body in ["BRACKET_BODY", "BARE_BODY", "BLANK_BODY"] {
+            assert!(!rendered.contains(body), "empty-scope rule broadened to global ({body}): {rendered}");
+        }
+        // Not attachable as a scoped rule for any path either.
+        assert!(instructions.nested_for(&root.join("src/x.rs")).is_none());
+        assert_eq!(
+            instructions.warnings.iter().filter(|w| w.contains("no usable paths patterns")).count(),
+            3,
+            "each empty-scope rule is warned about and skipped: {:?}",
+            instructions.warnings
+        );
+    }
+
+    #[test]
+    fn nested_scope_heading_uses_search_dir_not_a_dot_claude_trim() {
+        // Class: deriving the scope heading from `path.parent()` and trimming a
+        // `.claude` suffix mislabels an ordinary directory that merely ends in
+        // `.claude`. Use `search_dir`, the directory whose search owns the file.
+        let (_dir, root) = repo();
+        write(&root.join("AGENTS.md"), "root");
+        write(&root.join("pkg.claude/AGENTS.md"), "scoped body");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        let nested = instructions.nested_for(&root.join("pkg.claude/src/main.rs")).unwrap();
+        assert!(
+            nested.contains("apply to files under pkg.claude/"),
+            "heading must keep the real directory name, not trim .claude: {nested}"
+        );
+        assert!(!nested.contains("under pkg/"), "the .claude suffix must not be stripped: {nested}");
     }
 
     #[test]

@@ -514,9 +514,16 @@ impl Store {
     /// offers no `memory_save` tool, so telling the model to use it would waste
     /// an iteration on an unavailable call.
     pub fn index(&self, writable: bool) -> String {
-        // Best-effort for the prompt: an unreadable scope yields no index rather
-        // than failing session start (the read error surfaces via `/memory`).
-        let all = self.read_all_scopes().unwrap_or_default();
+        // Best-effort for the prompt: a *successful* read of an empty store
+        // yields no index (writable sessions still get save guidance below),
+        // but a *read failure* must not masquerade as an empty store — doing so
+        // would print "No memories saved yet" plus save guidance even when
+        // memories exist, contradicting the best-effort contract and risking
+        // duplicate saves. Surface nothing on failure (the error shows via
+        // `/memory`), so the guidance is reserved for a genuinely empty read.
+        let Ok(all) = self.read_all_scopes() else {
+            return String::new();
+        };
         // A writable session hears about memory even with an empty store:
         // otherwise the model is never told what is worth saving, and the
         // store never gets started. Read-only sessions can't save, so an
@@ -2599,6 +2606,22 @@ mod tests {
         assert!(index.contains("python comes from uv"), "{index}");
         assert!(index.contains("check: Cargo.toml"), "{index}");
         assert!(index.contains(&crate::session::now().format("%Y-%m-%d").to_string()), "dated: {index}");
+    }
+
+    #[test]
+    fn index_on_read_failure_is_empty_not_misreported_as_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        // An existing but unreadable scope must not be mistaken for an empty
+        // store: `std::fs::read` of a directory fails with a non-NotFound error,
+        // which propagates. The index must then surface nothing (the error is
+        // reported via `/memory`) rather than the writable "No memories saved
+        // yet" guidance, which would prompt duplicate saves over real memories.
+        let user_path = store.path(Scope::User).unwrap();
+        std::fs::create_dir_all(&user_path).unwrap();
+        assert!(store.read_all_scopes().is_err(), "an unreadable scope must surface a read error");
+        assert!(store.index(true).is_empty(), "a read failure must not masquerade as an empty store");
+        assert!(store.index(false).is_empty(), "a read failure yields no index in read-only sessions either");
     }
 
     #[test]
