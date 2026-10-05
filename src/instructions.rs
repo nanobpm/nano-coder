@@ -291,14 +291,16 @@ fn import_refs(text: &str) -> Vec<String> {
         let mut i = 0;
         // A line that opens with a backtick/tilde run of three or more is a
         // fence candidate. When `fence()` rejects it (a backtick in the info
-        // string, so it is prose per CommonMark), that leading run is fence
-        // syntax, not a code-span opener: drop any span state carried across
-        // the line break and skip the run, so it is not misread as opening or
-        // closing a multiline span. A genuine multiline span is not opened by
-        // a fence-length run at line start.
+        // string, so it is prose per CommonMark) AND no code span is open,
+        // that leading run is fence syntax, not a code-span opener: skip the
+        // run, so it is not misread as opening or closing a multiline span.
+        // But when a span IS open (carried across a line break), the line is
+        // span content, not fence syntax: leave `span_ticks` alone and parse
+        // the line normally, so the run can only close the span if its length
+        // matches. Resetting an open span here would leak a `@path` that is
+        // still inside it.
         let t = line.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            span_ticks = None;
+        if span_ticks.is_none() && (t.starts_with("```") || t.starts_with("~~~")) {
             let fc = t.chars().next().unwrap();
             i = line.chars().take_while(|&c| c == ' ').count() + t.chars().take_while(|&c| c == fc).count();
         }
@@ -1040,6 +1042,20 @@ mod tests {
         // backtick in its info string) does not open a multiline span: its
         // leading ``` run is skipped, so the next line's reference is imported.
         assert_eq!(import_refs("``` `code`\n@live.md"), vec!["live.md".to_string()]);
+    }
+
+    #[test]
+    fn rejected_fence_candidate_does_not_break_an_open_span() {
+        // A rejected fence candidate (a backtick in its info string) must not
+        // reset a code span that is still open across a line break: the line
+        // is span content, not fence syntax, so a `@path` after it stays
+        // suppressed. Resetting the open span here would leak the import.
+        assert!(import_refs("``open\n``` `x`\n@secret.md").is_empty());
+        assert!(import_refs("`open\n``` `x`\n@secret.md").is_empty());
+        // A tilde candidate never closes a backtick span either.
+        assert!(import_refs("``open\n~~~ `x`\n@secret.md").is_empty());
+        // But a fence run matching the open span's length still closes it.
+        assert_eq!(import_refs("``open\n`` `x`\n@after.md"), vec!["after.md".to_string()]);
     }
 
     #[test]
