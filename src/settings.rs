@@ -527,6 +527,86 @@ fn model_spec(provider: &str, model: &str) -> Step {
     if model.is_empty() { Step::Back } else { Step::Done(format!("{provider}/{model}")) }
 }
 
+/// Whether the endpoint picker applies to a provider: the `qwen` family and
+/// any provider explicitly configured for the Model Studio host. A provider
+/// named `qwen` always qualifies, so a user who renamed or re-pointed the
+/// preset still gets the picker.
+fn is_qwen_provider(name: &str, config: &ProviderConfig) -> bool {
+    if name == "qwen" {
+        return true;
+    }
+    config.base_url.as_deref().is_some_and(|url| providers::qwen::endpoint_for_url(url).is_some())
+}
+
+/// Who a picker row is: a known Model Studio endpoint, the row that keeps a
+/// custom URL, or `Keep`, which leaves the provider's current URL untouched.
+#[derive(Debug, PartialEq)]
+enum QwenEndpointChoice {
+    Known(&'static providers::qwen::QwenEndpoint),
+    Custom,
+    Keep,
+}
+
+/// The rows of the Qwen endpoint picker, in `ENDPOINTS` order with the current
+/// endpoint first (so Enter keeps it) followed by the custom/keep rows.
+/// `current` is the provider's configured URL (any value).
+fn qwen_endpoint_rows(current: &str) -> Vec<(String, QwenEndpointChoice)> {
+    let matches: Option<&'static providers::qwen::QwenEndpoint> = providers::qwen::endpoint_for_url(current);
+    let mut rows: Vec<(String, QwenEndpointChoice)> = Vec::new();
+    if let Some(endpoint) = matches {
+        rows.push((format!("{}  (current)", endpoint.label()), QwenEndpointChoice::Known(endpoint)));
+    }
+    for endpoint in providers::qwen::ENDPOINTS {
+        if Some(endpoint) != matches {
+            rows.push((endpoint.label(), QwenEndpointChoice::Known(endpoint)));
+        }
+    }
+    rows.push(("Custom URL (e.g. your workspace domain, a proxy)".to_string(), QwenEndpointChoice::Custom));
+    if matches.is_none() {
+        rows.push((format!("Keep {current}"), QwenEndpointChoice::Keep));
+    } else {
+        rows.push((format!("Keep current URL ({current})"), QwenEndpointChoice::Keep));
+    }
+    rows
+}
+
+/// The outcome of the endpoint picker.
+#[derive(Debug, PartialEq)]
+enum QwenEndpointPick {
+    /// A known Model Studio endpoint: its URL and API-key variable win.
+    Known(&'static providers::qwen::QwenEndpoint),
+    /// The user will type their own URL (the plain URL prompt that follows).
+    Custom,
+    /// Leave the provider's current URL as-is.
+    Keep,
+}
+
+/// What a selection in the endpoint picker means. Esc or a stale index is
+/// [`QwenEndpointPick::Keep`].
+fn qwen_endpoint_pick(choice: Option<usize>, rows: &[(String, QwenEndpointChoice)]) -> QwenEndpointPick {
+    match choice.and_then(|i| rows.get(i)).map(|(_, kind)| kind) {
+        Some(QwenEndpointChoice::Known(endpoint)) => QwenEndpointPick::Known(endpoint),
+        Some(QwenEndpointChoice::Custom) => QwenEndpointPick::Custom,
+        Some(QwenEndpointChoice::Keep) | None => QwenEndpointPick::Keep,
+    }
+}
+
+/// Fold a chosen Model Studio endpoint into a provider edit: set its base URL,
+/// and — when the endpoint's plan differs from the one the key variable names —
+/// switch to that plan's variable, so a Token Plan user is not left with the
+/// Standard `DASHSCOPE_API_KEY` (or vice versa). A key the user set as a literal
+/// or via a command is left alone: it has no variable to retarget.
+fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::QwenEndpoint) {
+    config.base_url = Some(endpoint.base_url.to_string());
+    if config.api_key.is_none() && config.api_key_command.is_none() {
+        match &config.api_key_env {
+            // A custom variable is the user's own choice: keep it.
+            Some(var) if !providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) => {}
+            _ => config.api_key_env = Some(endpoint.plan.api_key_env().to_string()),
+        }
+    }
+}
+
 /// The recently used specs to offer, most recent first: at most
 /// [`RECENT_MODELS_SHOWN`], skipping any whose provider is no longer
 /// configured. Recents are stored canonicalized (see [`recents::canonical`]),
@@ -713,25 +793,69 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
         _ => return Ok(None),
     };
     let current = all.get(&name).cloned().unwrap_or_default();
+    // Whether this provider can be pointed at Alibaba Cloud Model Studio: by
+    // its name (`qwen`) or by an already-configured Model Studio URL. A
+    // brand-new `qwen` entry has no URL of its own yet, so the picker's
+    // "current" row falls back to the preset's default endpoint.
+    let qwen_provider = is_qwen_provider(&name, &current);
+    let preset_url =
+        if name == "qwen" { providers::presets().remove(&name).and_then(|preset| preset.base_url) } else { None };
+    let current_url = current.base_url.clone().or(preset_url).unwrap_or_default();
 
     let kinds = [ProviderKind::Openai, ProviderKind::Anthropic, ProviderKind::GithubCopilot];
     let kind_labels = ["OpenAI-compatible (/chat/completions)", "Anthropic (/messages)", "GitHub Copilot (unofficial)"];
     let kind_default = kinds.iter().position(|k| Some(*k) == current.kind).unwrap_or(0);
     let kind = kinds[Select::new().with_prompt("API kind").items(&kind_labels).default(kind_default).interact()?];
 
+    // Model Studio exposes the same models through several plans and regions
+    // with different hostnames and API-key variables, so for a Qwen provider
+    // offer the whole plan × region matrix as a picker (still allowing a custom
+    // URL) instead of a bare URL prompt.
+    let mut chosen_endpoint: Option<&'static providers::qwen::QwenEndpoint> = None;
+    let mut force_url_prompt = false;
+    if qwen_provider {
+        let rows = qwen_endpoint_rows(&current_url);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        // Default to "Keep current", the last row, so Enter (or Esc) leaves the
+        // endpoint untouched — matching the plain URL prompt's "keep" behavior.
+        let default = labels.len() - 1;
+        let picked = Select::new()
+            .with_prompt("Qwen / Model Studio endpoint")
+            .items(&labels)
+            .default(default)
+            .max_length(12)
+            .interact_opt()?;
+        match qwen_endpoint_pick(picked, &rows) {
+            QwenEndpointPick::Known(endpoint) => chosen_endpoint = Some(endpoint),
+            QwenEndpointPick::Custom => force_url_prompt = true,
+            QwenEndpointPick::Keep => {}
+        }
+    }
+
     let mut base_url = Input::<String>::new()
         .with_prompt("Base URL (e.g. http://merlin.local:8000/v1)")
         .allow_empty(kind == ProviderKind::GithubCopilot);
-    if let Some(url) = &current.base_url {
-        base_url = base_url.default(url.clone());
-    } else if kind == ProviderKind::GithubCopilot
-        && is_new
-        && !all.contains_key(&name)
-        && providers::github_copilot::domain() == "github.com"
-    {
-        base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
+    // A known endpoint sets the URL outright. A custom pick leaves the prompt
+    // empty so the typed URL wins instead of silently keeping the old one; any
+    // other pick falls back to the current/preset URL as a default.
+    if let Some(endpoint) = chosen_endpoint {
+        base_url = base_url.default(endpoint.base_url.to_string());
+    } else if !force_url_prompt {
+        if let Some(url) = &current.base_url {
+            base_url = base_url.default(url.clone());
+        } else if kind == ProviderKind::GithubCopilot
+            && is_new
+            && !all.contains_key(&name)
+            && providers::github_copilot::domain() == "github.com"
+        {
+            base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
+        }
     }
-    let base_url = base_url.interact_text()?.trim().trim_end_matches('/').to_string();
+    let base_url = if let Some(endpoint) = chosen_endpoint {
+        endpoint.base_url.to_string()
+    } else {
+        base_url.interact_text()?.trim().trim_end_matches('/').to_string()
+    };
 
     let sources = [
         "Environment variable (recommended)",
@@ -786,6 +910,12 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             updated.api_key_command = None;
         }
         _ => {}
+    }
+    // Picking a known endpoint also retargets the API-key variable to its plan
+    // (overriding the preset's Standard `DASHSCOPE_API_KEY` for Token/Coding
+    // Plan), unless the user just chose a key source or a custom variable.
+    if let Some(endpoint) = chosen_endpoint {
+        apply_qwen_endpoint(&mut updated, endpoint);
     }
 
     let mut default_model = Input::<String>::new().with_prompt("Default model (optional)").allow_empty(true);
@@ -1651,6 +1781,116 @@ mod tests {
         let resolved = providers::resolve("openai/gpt", &[("openai".to_string(), entry)].into(), "openai").unwrap();
         assert_eq!(merged.api_key_env.as_deref(), Some(""));
         assert_eq!(resolved.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn qwen_endpoint_rows_offer_every_plan_region_plus_custom_and_keep() {
+        // A provider already on a known endpoint: that endpoint is the first row
+        // (so Enter keeps it) and is offered exactly once.
+        let rows = qwen_endpoint_rows(providers::qwen::default_endpoint().base_url);
+        assert_eq!(rows[0].1, QwenEndpointChoice::Known(providers::qwen::default_endpoint()));
+        assert!(rows[0].0.ends_with("(current)"), "current endpoint first: {:?}", rows[0].0);
+        assert_eq!(
+            rows.iter().filter(|(_, k)| matches!(k, QwenEndpointChoice::Known(_))).count(),
+            providers::qwen::ENDPOINTS.len(),
+            "every endpoint offered exactly once"
+        );
+        assert_eq!(rows.last().unwrap().1, QwenEndpointChoice::Keep);
+        assert!(rows.iter().any(|(_, k)| *k == QwenEndpointChoice::Custom));
+        // Every plan is offered, by label.
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+        for plan in [
+            providers::qwen::QwenPlan::Standard,
+            providers::qwen::QwenPlan::TokenPlan,
+            providers::qwen::QwenPlan::CodingPlan,
+        ] {
+            assert!(labels.iter().any(|l| l.contains(plan.label())), "{plan:?} missing from {labels:?}");
+        }
+        // A custom URL has no "(current)" known row; Keep names the URL instead.
+        let rows = qwen_endpoint_rows("https://my-gateway.example.com/v1");
+        assert_eq!(
+            rows.iter().filter(|(_, k)| matches!(k, QwenEndpointChoice::Known(_))).count(),
+            providers::qwen::ENDPOINTS.len()
+        );
+        assert!(rows.last().unwrap().0.contains("https://my-gateway.example.com/v1"));
+    }
+
+    #[test]
+    fn qwen_endpoint_pick_maps_rows_to_actions() {
+        let rows = qwen_endpoint_rows(providers::qwen::default_endpoint().base_url);
+        assert_eq!(qwen_endpoint_pick(None, &rows), QwenEndpointPick::Keep, "Esc keeps the endpoint");
+        assert_eq!(qwen_endpoint_pick(Some(0), &rows), QwenEndpointPick::Known(providers::qwen::default_endpoint()));
+        let custom = rows.iter().position(|(_, k)| *k == QwenEndpointChoice::Custom).unwrap();
+        assert_eq!(qwen_endpoint_pick(Some(custom), &rows), QwenEndpointPick::Custom);
+        assert_eq!(qwen_endpoint_pick(Some(rows.len() - 1), &rows), QwenEndpointPick::Keep);
+        assert_eq!(qwen_endpoint_pick(Some(999), &rows), QwenEndpointPick::Keep, "a stale index never panics");
+    }
+
+    #[test]
+    fn applying_an_endpoint_retargets_the_api_key_variable_to_its_plan() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A Standard variable is retargeted when the plan changes...
+        let mut config = ProviderConfig { api_key_env: Some("DASHSCOPE_API_KEY".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.base_url.as_deref(), Some(token_plan.base_url));
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // ...and a second switch moves it again, with no drift.
+        let coding_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::CodingPlan).unwrap();
+        apply_qwen_endpoint(&mut config, coding_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
+        // A literal key, or a key command, has no variable to retarget.
+        let mut literal = ProviderConfig { api_key: Some("sk-sp-x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut literal, coding_plan);
+        assert_eq!(literal.api_key_env, None);
+        assert_eq!(literal.api_key.as_deref(), Some("sk-sp-x"));
+        let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut command, token_plan);
+        assert_eq!(command.api_key_env, None);
+        // A user's own variable name is respected, not clobbered.
+        let mut custom = ProviderConfig { api_key_env: Some("MY_QWEN_KEY".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut custom, token_plan);
+        assert_eq!(custom.api_key_env.as_deref(), Some("MY_QWEN_KEY"));
+        assert_eq!(custom.base_url.as_deref(), Some(token_plan.base_url));
+    }
+
+    #[test]
+    fn the_picker_is_offered_for_qwen_providers_only() {
+        assert!(is_qwen_provider("qwen", &ProviderConfig::default()), "the named preset always qualifies");
+        let on_model_studio = ProviderConfig {
+            base_url: Some(providers::qwen::default_endpoint().base_url.into()),
+            ..Default::default()
+        };
+        assert!(is_qwen_provider("my-dashscope", &on_model_studio), "a configured Model Studio URL qualifies");
+        let elsewhere = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
+        assert!(!is_qwen_provider("work", &elsewhere));
+        assert!(!is_qwen_provider("work", &ProviderConfig::default()), "a new unrelated provider is not qwen");
+    }
+
+    #[test]
+    fn editing_qwen_to_the_token_plan_stores_the_endpoint_and_key_variable() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let preset = providers::presets().remove("qwen").unwrap();
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The picker folds the endpoint into the edit, then `diff_from` records
+        // only what differs from the preset — both fields, in this case.
+        let mut updated = ProviderConfig {
+            base_url: preset.base_url.clone(),
+            api_key_env: preset.api_key_env.clone(),
+            ..preset.clone()
+        };
+        apply_qwen_endpoint(&mut updated, token_plan);
+        let entry = diff_from(&preset, &ProviderConfig::default(), &updated);
+        let user: std::collections::HashMap<String, ProviderConfig> =
+            [("qwen".to_string(), entry)].into_iter().collect();
+        let resolved = providers::resolve("qwen/qwen3.8-max", &user, "mock").unwrap();
+        assert_eq!(resolved.base_url, token_plan.base_url);
+        // The Token Plan variable is stored, NOT the preset's `DASHSCOPE_API_KEY`.
+        assert_eq!(
+            user.get("qwen").unwrap().api_key_env.as_deref(),
+            Some("BAILIAN_TOKEN_PLAN_API_KEY"),
+            "the stored override names the token-plan variable"
+        );
     }
 
     #[test]
