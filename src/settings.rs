@@ -597,16 +597,18 @@ fn qwen_endpoint_pick(choice: Option<usize>, rows: &[(String, QwenEndpointChoice
 /// Fold a chosen Model Studio endpoint into a provider edit: set its base URL,
 /// and — when the endpoint's plan differs from the one the key variable names —
 /// switch to that plan's variable, so a Token Plan user is not left with the
-/// Standard `DASHSCOPE_API_KEY` (or vice versa). A key the user set as a literal
-/// or via a command is left alone: it has no variable to retarget.
+/// Standard `DASHSCOPE_API_KEY` (or vice versa). The retarget applies even when
+/// a literal key or command is the active source: a stale built-in plan
+/// variable sitting alongside it would otherwise be resurrected the moment the
+/// user switches the key source back to "Environment variable". A custom
+/// variable name is the user's own choice and is kept, and the literal/command
+/// fields themselves are never touched.
 fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::QwenEndpoint) {
     config.base_url = Some(endpoint.base_url.to_string());
-    if config.api_key.is_none() && config.api_key_command.is_none() {
-        match &config.api_key_env {
-            // A custom variable is the user's own choice: keep it.
-            Some(var) if !providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) => {}
-            _ => config.api_key_env = Some(endpoint.plan.api_key_env().to_string()),
-        }
+    match &config.api_key_env {
+        // A custom variable is the user's own choice: keep it.
+        Some(var) if !providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) => {}
+        _ => config.api_key_env = Some(endpoint.plan.api_key_env().to_string()),
     }
 }
 
@@ -1848,19 +1850,61 @@ mod tests {
         let coding_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::CodingPlan).unwrap();
         apply_qwen_endpoint(&mut config, coding_plan);
         assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
-        // A literal key, or a key command, has no variable to retarget.
+        // A literal key, or a key command, is itself left alone — but the
+        // endpoint's plan variable is still installed alongside it, so a later
+        // switch of the key source to "Environment variable" lands on the
+        // right plan rather than resurrecting a stale one.
         let mut literal = ProviderConfig { api_key: Some("sk-sp-x".into()), ..Default::default() };
         apply_qwen_endpoint(&mut literal, coding_plan);
-        assert_eq!(literal.api_key_env, None);
         assert_eq!(literal.api_key.as_deref(), Some("sk-sp-x"));
+        assert_eq!(literal.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
         let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
         apply_qwen_endpoint(&mut command, token_plan);
-        assert_eq!(command.api_key_env, None);
-        // A user's own variable name is respected, not clobbered.
+        assert_eq!(command.api_key_command.as_deref(), Some("op read op://x"));
+        assert_eq!(command.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // A user's own variable name is respected, not clobbered — even when a
+        // literal key or command is the active source.
         let mut custom = ProviderConfig { api_key_env: Some("MY_QWEN_KEY".into()), ..Default::default() };
         apply_qwen_endpoint(&mut custom, token_plan);
         assert_eq!(custom.api_key_env.as_deref(), Some("MY_QWEN_KEY"));
         assert_eq!(custom.base_url.as_deref(), Some(token_plan.base_url));
+        let mut custom_with_literal = ProviderConfig {
+            api_key: Some("sk-sp-y".into()),
+            api_key_env: Some("MY_QWEN_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut custom_with_literal, coding_plan);
+        assert_eq!(custom_with_literal.api_key_env.as_deref(), Some("MY_QWEN_KEY"));
+        assert_eq!(custom_with_literal.api_key.as_deref(), Some("sk-sp-y"));
+    }
+
+    #[test]
+    fn applying_an_endpoint_retargets_a_stale_plan_variable_behind_another_key_source() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The cited scenario: a literal-key override coexists with the preset's
+        // Standard `DASHSCOPE_API_KEY`. Picking Token Plan must retarget that
+        // stale built-in variable even though the literal key is the active
+        // source — otherwise switching the key source to "Environment
+        // variable" afterwards would seed the wrong plan's variable.
+        let mut config = ProviderConfig {
+            api_key: Some("sk-literal".into()),
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // The literal key itself is untouched: it stays the active source.
+        assert_eq!(config.api_key.as_deref(), Some("sk-literal"));
+        // Same for a command coexisting with another plan's variable.
+        let mut config = ProviderConfig {
+            api_key_command: Some("op read op://x".into()),
+            api_key_env: Some("BAILIAN_CODING_PLAN_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        assert_eq!(config.api_key_command.as_deref(), Some("op read op://x"));
     }
 
     #[test]

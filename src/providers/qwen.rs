@@ -123,7 +123,8 @@ pub fn endpoint_for_url(url: &str) -> Option<&'static QwenEndpoint> {
 }
 
 /// Whether `url` points at an Alibaba Cloud Model Studio host — one of the
-/// known plan endpoints, or a workspace domain under `*.maas.aliyuncs.com` /
+/// known plan endpoints, an apex `dashscope.aliyuncs.com` / `maas.aliyuncs.com`
+/// host, or a workspace domain under `*.maas.aliyuncs.com` /
 /// `*.dashscope.aliyuncs.com` (Model Studio issues per-workspace hosts such as
 /// `<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com`). This is the gate for
 /// offering the endpoint picker: it is deliberately broader than
@@ -163,9 +164,12 @@ pub fn is_model_studio_url(url: &str) -> bool {
         // A trailing dot is a DNS no-op (`host.` == `host`).
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    // Require a dot boundary so a look-alike such as `notmaas.aliyuncs.com.evil.example`
+    // The apex is a Model Studio host too; the dotted suffix needs the dot
+    // boundary so a look-alike such as `notmaas.aliyuncs.com.evil.example`
     // (or `evilmaas.aliyuncs.com`) does not match.
-    host.ends_with(".maas.aliyuncs.com") || host.ends_with(".dashscope.aliyuncs.com")
+    ["maas.aliyuncs.com", "dashscope.aliyuncs.com"]
+        .iter()
+        .any(|apex| host == *apex || host.strip_suffix(apex).is_some_and(|rest| rest.ends_with('.')))
 }
 
 #[cfg(test)]
@@ -278,8 +282,17 @@ mod tests {
         assert!(!is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com@evil.example/v1"));
         // ...and a trailing-dot FQDN is the same host.
         assert!(is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com./v1"));
+        // The apex domains themselves are Model Studio hosts too (a renamed
+        // provider pointed at `dashscope.aliyuncs.com/<custom path>`), not only
+        // their subdomains — with or without a path, port, or trailing dot.
+        assert!(is_model_studio_url("https://dashscope.aliyuncs.com/custom"));
+        assert!(is_model_studio_url("https://dashscope.aliyuncs.com"));
+        assert!(is_model_studio_url("https://maas.aliyuncs.com/v1"));
+        assert!(is_model_studio_url("http://DASHSCOPE.ALIYUNCS.COM:8080/custom?x=1"));
+        assert!(is_model_studio_url("https://maas.aliyuncs.com./v1"));
         // Identifying a plan row stays exact: a workspace host is recognised as
         // Model Studio but maps to no specific endpoint row.
         assert_eq!(endpoint_for_url("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"), None);
+        assert_eq!(endpoint_for_url("https://dashscope.aliyuncs.com/custom"), None);
     }
 }
