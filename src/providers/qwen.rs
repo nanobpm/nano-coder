@@ -134,11 +134,20 @@ pub fn is_model_studio_url(url: &str) -> bool {
     if endpoint_for_url(url).is_some() {
         return true;
     }
-    let host = url
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| url.trim().strip_prefix("http://"))
-        .unwrap_or_else(|| url.trim())
+    let trimmed = url.trim();
+    // URL schemes are case-insensitive (`HTTPS://host` is the same scheme as
+    // `https://host`), so match the prefix case-insensitively — the host is
+    // lowercased below, but that happens too late to fix a missed strip here.
+    // `get(..n)` (not `[..n]`) so a multi-byte UTF-8 char straddling the
+    // boundary yields None instead of panicking.
+    let scheme_len = if trimmed.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+        8
+    } else if trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+        7
+    } else {
+        0
+    };
+    let host = trimmed[scheme_len..]
         // Drop any path/query: only the authority decides.
         .split(['/', '?', '#'])
         .next()
@@ -245,6 +254,17 @@ mod tests {
         // Case, scheme, path, query and port are all irrelevant to the host.
         assert!(is_model_studio_url("https://ABC123.AP-SOUTHEAST-1.MAAS.ALIYUNCS.COM/compatible-mode/v1"));
         assert!(is_model_studio_url("http://abc123.ap-southeast-1.maas.aliyuncs.com:8443/v1?x=1"));
+        // ...and the scheme itself is case-insensitive too (`HTTPS://host` is
+        // the same scheme as `https://host`).
+        assert!(is_model_studio_url("HTTPS://abc123.ap-southeast-1.maas.aliyuncs.com/v1"));
+        assert!(is_model_studio_url("Https://abc123.ap-southeast-1.maas.aliyuncs.com/v1"));
+        assert!(is_model_studio_url("HTTP://abc123.ap-southeast-1.maas.aliyuncs.com/v1"));
+        // An upper-case scheme must not let a look-alike host through either.
+        assert!(!is_model_studio_url("HTTPS://evilmaas.aliyuncs.com/v1"));
+        assert!(!is_model_studio_url("HTTPS://example.com/v1"));
+        // A multi-byte UTF-8 char straddling the scheme-length boundary is not
+        // a scheme — and must not panic the prefix probe.
+        assert!(!is_model_studio_url("ＨＴＴＰＳ://abc123.ap-southeast-1.maas.aliyuncs.com/v1"));
         // A bare host (no path) still counts.
         assert!(is_model_studio_url("https://abc123.ap-southeast-1.maas.aliyuncs.com"));
         // ...but a look-alike host that merely *ends* in the suffix without a
