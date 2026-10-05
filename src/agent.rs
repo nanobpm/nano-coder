@@ -986,29 +986,18 @@ impl Agent {
     /// The thinking, temperature and output-cap settings for one model call,
     /// all derived from a single snapshot of the session's `/thinking` level.
     ///
-    /// The level source is a parameter (not `self.control`) only so a test can
-    /// interleave a `/thinking` change between the snapshot and the point a
-    /// second read would happen — the race the snapshot exists to prevent (see
-    /// `a_thinking_change_between_the_reads_stays_consistent_within_a_request`).
-    /// The source is read twice to mirror that: `snapshot` is what the request
-    /// uses; `reread` is discarded, existing only so the test's interleaved
-    /// change has a second read to land on. Production passes a closure over
-    /// `&self.control`, whose two reads are back-to-back, so both observe the
-    /// same level and the request stays internally consistent: temperature is
-    /// derived from the same resolution the request sends, never a second read
-    /// that could observe a different level.
+    /// The level arrives by value: the caller snapshots the shared control
+    /// once and this helper never re-reads it, so a `/thinking` typed while
+    /// the request is being built cannot make temperature observe a different
+    /// level than the one sent. Temperature is derived from the same
+    /// resolution the request sends, never a second read that could observe a
+    /// different level (see
+    /// `request_settings_derives_temperature_from_the_snapshot_not_a_reread`).
     fn request_settings_for(
         &self,
-        level: &impl Fn() -> Option<crate::thinking::Thinking>,
+        level: Option<crate::thinking::Thinking>,
     ) -> (crate::thinking::Resolved, crate::temperature::Resolved, i64) {
-        let snapshot = level();
-        let thinking = self.thinking_for(snapshot.as_ref());
-        // The temperature must come from `thinking` (the snapshot), not a
-        // fresh read. This second read stands in for the old code's live
-        // re-read inside `temperature()`: its result is discarded, but a test
-        // source uses it to interleave a `/thinking` change and prove the
-        // request is immune.
-        let _reread = level();
+        let thinking = self.thinking_for(level.as_ref());
         let temperature = self.temperature_for(thinking.anthropic_thinking_on());
         let max_tokens = self.request_max_tokens();
         (thinking, temperature, max_tokens)
@@ -2257,10 +2246,11 @@ impl Agent {
                 // make temperature observe a different level than the one
                 // actually sent (e.g. omitting a configured temperature while
                 // sending `off`, or reporting a temperature the provider drops
-                // once thinking is on). One resolution keeps the request
-                // internally consistent.
+                // once thinking is on). One snapshot, passed by value, keeps
+                // the request internally consistent — the helper has no second
+                // read a mid-build `/thinking` change could land on.
                 let (resolved_thinking, resolved_temperature, request_max_tokens) =
-                    self.request_settings_for(&|| self.control.thinking());
+                    self.request_settings_for(self.control.thinking());
                 // Test-only interleave point: a `/thinking` change landing here,
                 // between the snapshot and the status update, must not leak the
                 // newer level into the status this request shows.
@@ -4682,8 +4672,8 @@ mod tests {
         // `/thinking high` typed mid-turn from inside the tool, between steps.
         // This exercises the BETWEEN-steps path (the next step picks the level
         // up); the WITHIN-one-request race — a change landing between the
-        // thinking and temperature reads of a single call — is covered by
-        // `a_thinking_change_between_the_reads_stays_consistent_within_a_request`,
+        // snapshot and the temperature read of a single call — is covered by
+        // `request_settings_derives_temperature_from_the_snapshot_not_a_reread`,
         // which a between-steps tool mutation cannot reproduce.
         let control = agent.control();
         agent.tools().register(
@@ -4771,66 +4761,49 @@ mod tests {
         );
     }
 
-    /// A `/thinking` level source that flips the level to `high` between its
-    /// first and second reads, interleaving the change between the thinking
-    /// snapshot and the temperature read of a single
-    /// [`Agent::request_settings_for`] — the within-one-request race a
-    /// between-steps tool mutation cannot produce.
-    struct FlipBetweenReads {
-        inner: TurnControl,
-        reads: Mutex<u32>,
-    }
-
-    impl FlipBetweenReads {
-        /// The level as of this read. The first call observes nothing set; the
-        /// change is then applied, so the second call observes `high`.
-        fn read(&self) -> Option<crate::thinking::Thinking> {
-            let observed = self.inner.thinking();
-            let mut reads = self.reads.lock().unwrap();
-            *reads += 1;
-            if *reads == 1 {
-                self.inner.set_thinking(Some(crate::thinking::Thinking::Level("high".into())));
-            }
-            observed
-        }
-    }
-
     #[test]
-    fn a_thinking_change_between_the_reads_stays_consistent_within_a_request() {
+    fn request_settings_derives_temperature_from_the_snapshot_not_a_reread() {
+        // `request_settings_for` takes the session level by value, so it has
+        // no shared-control read a mid-build `/thinking` change could land on:
+        // temperature is derived from the same snapshot the request sends.
+        // This pins that contract: a level resolved from the snapshot must
+        // drive the temperature even when the live control disagrees.
+        use crate::thinking::{Request, Thinking};
         let dir = tempfile::tempdir().unwrap();
-        // A custom temperature is configured, so a stale thinking read shows up
-        // as a temperature the thinking-on request must not send.
+        // A custom temperature is configured, so a stale thinking read shows
+        // up as a temperature the thinking-on request must not send.
         let config = Config {
             session_dir: Some(dir.path().to_path_buf()),
             temperature: crate::temperature::Temperature::Value(0.5),
             ..Default::default()
         };
         let agent = Agent::new(Box::new(Claude { seen: Arc::new(Mutex::new(Vec::new())) }), config);
-        let control = FlipBetweenReads { inner: agent.control(), reads: Mutex::new(0) };
+        // The live control says `high` (thinking on, which on Anthropic drops
+        // the temperature), but the request's snapshot — taken before a
+        // mid-build `/thinking high` landed — carries no level.
+        agent.control().set_thinking(Some(Thinking::Level("high".into())));
 
-        let (thinking, temperature, _) = agent.request_settings_for(&|| control.read());
+        let (thinking, temperature, _) = agent.request_settings_for(None);
 
-        // The interleave must actually have happened: the source was read twice
-        // and the shared control now holds `high`. Without this the assertions
-        // below could pass vacuously (e.g. if the discarded second read were
-        // ever optimized away), proving nothing about the race.
-        assert_eq!(*control.reads.lock().unwrap(), 2, "the seam reads the level twice");
-        assert_eq!(
-            control.inner.thinking(),
-            Some(crate::thinking::Thinking::Level("high".into())),
-            "the change landed between the two reads"
-        );
-
-        // The level flipped to `high` between the snapshot and the second read.
-        // The snapshot must win both: the request sends no level AND keeps the
-        // temperature. The old code resolved temperature from the second, live
-        // read — it would send no level while dropping the temperature for a
-        // `high` the request never carries, an inconsistency this test fails on.
+        // The snapshot wins: the request sends no level AND keeps the
+        // temperature. Deriving temperature from the live control instead
+        // would drop it for a `high` the request never carries — the
+        // within-one-request inconsistency the by-value snapshot removes.
         assert_eq!(thinking.request(), None);
         assert_eq!(
             temperature.value(),
             Some(0.5),
-            "temperature must come from the same thinking snapshot the request sends, not a second read"
+            "temperature must come from the snapshot the request sends, not a second read of the control"
+        );
+        // And the converse: a snapshot carrying the level drives the
+        // temperature drop even when the control has since been cleared.
+        agent.control().set_thinking(None);
+        let (thinking, temperature, _) = agent.request_settings_for(Some(Thinking::Level("high".into())));
+        assert_eq!(thinking.request(), Some(Request::Effort("high".into())));
+        assert_eq!(
+            temperature.value(),
+            None,
+            "a thinking-on snapshot must drop the temperature even if the control was cleared mid-build"
         );
     }
 
