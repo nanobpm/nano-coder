@@ -2203,8 +2203,17 @@ impl Agent {
                 // no level the request now has room for; resolving per attempt
                 // keeps the sent request and the trajectory's record of it in
                 // step with the attempt that produced the response.
-                let resolved_temperature = self.temperature();
+                // Snapshot thinking once, then derive temperature from that
+                // same resolution: `temperature()` would re-read the shared
+                // control's level internally, so resolving the two
+                // independently lets a `/thinking` typed between the reads
+                // make temperature observe a different level than the one
+                // actually sent (e.g. omitting a configured temperature while
+                // sending `off`, or reporting a temperature the provider drops
+                // once thinking is on). One resolution keeps the request
+                // internally consistent.
                 let resolved_thinking = self.thinking();
+                let resolved_temperature = self.temperature_for(resolved_thinking.anthropic_thinking_on());
                 // A `/thinking` typed mid-turn changes the level between
                 // steps: keep the status line in step with what is sent.
                 if self.stats.lock().unwrap().thinking != status_thinking(&resolved_thinking) {
@@ -4583,6 +4592,43 @@ mod tests {
         assert_eq!(sent, vec![None, Some(Request::Effort("high".into()))]);
         assert_eq!(agent.thinking().source, Source::Session);
         assert_eq!(agent.context_stats().lock().unwrap().thinking.as_deref(), Some("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_turn_thinking_change_keeps_temperature_consistent_within_a_step() {
+        use crate::thinking::{Request, Thinking};
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ClaudeWithTool { seen: seen.clone(), responses: Mutex::new(vec![tool_call("c1"), text("done")]) };
+        // A custom temperature is configured, so the two steps differ only in
+        // whether thinking drops it: step 1 (no level) sends it, step 2
+        // (thinking on) must not.
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            temperature: crate::temperature::Temperature::Value(0.5),
+            ..Default::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        // `/thinking high` typed mid-turn from inside the tool, between steps.
+        let control = agent.control();
+        agent.tools().register(
+            ToolDefinition::new("echo", "echo", json!({"type": "object"})),
+            Box::new(move |_| {
+                control.set_thinking(Some(Thinking::Level("high".into())));
+                Ok(json!("pong"))
+            }),
+        );
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        // Temperature and thinking come from one snapshot per step, so the
+        // step that turns thinking on drops the temperature in the SAME
+        // request — never sends `high` with a stale custom temperature.
+        let sent: Vec<_> = seen.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            sent,
+            vec![(Some(0.5), None), (None, Some(Request::Effort("high".into())))],
+            "the thinking-on step must drop the temperature in its own request"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
