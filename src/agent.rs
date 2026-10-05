@@ -5748,11 +5748,12 @@ mod tests {
         // sends it.
         let config = Config {
             session_dir: Some(dir.path().to_path_buf()),
-            // Isolate memory in the temp dir: this test asserts exact token
-            // arithmetic against an 18k window, and the post-compaction room the
-            // retry re-resolves must not depend on the developer's real,
-            // ever-growing memory index (which is injected into the system
-            // prompt and would shift the count under the 16k budget).
+            // Keep the token arithmetic hermetic: an unset `memory_dir` falls
+            // back to the developer's real memory store (`memory_dir()` ->
+            // `memory::default_dir()`), whose index is injected into the system
+            // prompt and shrinks the post-compaction room below this test's
+            // budget expectation. Point it at the temp dir so the numbers hold
+            // on any machine, with or without a populated store.
             memory_dir: Some(dir.path().join("memory")),
             project_instructions: false,
             skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
