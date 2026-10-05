@@ -280,7 +280,12 @@ fn import_refs(text: &str) -> Vec<String> {
             }
             continue;
         }
-        if let Some(open) = fence(line) {
+        // Only recognize an opening fence when no code span is active: inside a
+        // multiline span a fence-looking line is span content, not block syntax.
+        // Treating it as an opener would start a fence that the span's own
+        // closing run (shorter than three) cannot close, swallowing the rest of
+        // the file — including real `@path` imports after the span ends.
+        if span_ticks.is_none() && let Some(open) = fence(line) {
             in_fence = Some(open);
             continue;
         }
@@ -460,8 +465,16 @@ fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
 }
 
 /// `.md` files under `dir`, sorted, following symlinks without looping.
-fn markdown_files(dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+///
+/// `root`/`allow_outside` mirror the containment policy `load_rules` applies
+/// per file: when outside-repository links are disabled (`allow_outside` false,
+/// the project-rules default), a directory symlink whose target escapes `root`
+/// is **not** followed during traversal. Without this the walker would recurse
+/// the external tree and surface one "links outside the repository" warning per
+/// Markdown file in it; rejecting the symlink at the walk keeps it to none.
+/// User rules directories pass `allow_outside` true and are unaffected.
+fn markdown_files(dir: &Path, root: &Path, allow_outside: bool) -> Vec<PathBuf> {
+    fn walk(dir: &Path, root: &Path, allow_outside: bool, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
         let Ok(real) = dir.canonicalize() else { return };
         // The canonical path is the loop guard: a directory already visited
         // (directly or through a symlink) is not entered again, so recursion
@@ -476,14 +489,23 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
         paths.sort();
         for path in paths {
             if path.is_dir() {
-                walk(&path, visited, out);
+                // Reject a directory symlink that escapes the repository before
+                // recursing into it (unless outside links are allowed). A real
+                // subdirectory is always inside; only a symlink can point out.
+                if !allow_outside
+                    && path.is_symlink()
+                    && path.canonicalize().is_ok_and(|target| !target.starts_with(root))
+                {
+                    continue;
+                }
+                walk(&path, root, allow_outside, visited, out);
             } else if path.extension().is_some_and(|e| e == "md") && path.is_file() {
                 out.push(path);
             }
         }
     }
     let mut out = Vec::new();
-    walk(dir, &mut HashSet::new(), &mut out);
+    walk(dir, root, allow_outside, &mut HashSet::new(), &mut out);
     out
 }
 
@@ -657,7 +679,8 @@ impl ProjectInstructions {
     /// Rules under `dir`: unscoped ones load now, `paths:` ones on demand.
     fn load_rules(&mut self, dir: &Path, user: bool) {
         let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
-        for path in markdown_files(dir) {
+        let allow_outside = user || self.options.imports_outside_project;
+        for path in markdown_files(dir, &root, allow_outside) {
             if !user && !self.options.imports_outside_project {
                 let inside = path.canonicalize().is_ok_and(|real| real.starts_with(&root));
                 if !inside {
@@ -1059,6 +1082,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_looking_line_inside_an_open_span_does_not_open_a_fence() {
+        // Inside a multiline code span a fence-looking line is span content, not
+        // block syntax. Treating the ``` as an opener would start a fence that
+        // the span's own (shorter) closing run cannot close, swallowing the real
+        // `@live.md` import that follows the span.
+        assert_eq!(
+            import_refs("``open\n```\n@hidden.md\n``\n@live.md"),
+            vec!["live.md".to_string()]
+        );
+        // The `@path` inside the span stays suppressed; only the one after the
+        // span's closing run is imported.
+        assert_eq!(
+            import_refs("`open\n~~~\n@hidden.md\n`\n@live.md"),
+            vec!["live.md".to_string()]
+        );
+        // With no span open, a valid fence still suppresses its content.
+        assert_eq!(import_refs("```\n@hidden.md\n```\n@live.md"), vec!["live.md".to_string()]);
+    }
+
+    #[test]
     fn scoped_rule_imports_are_expanded_and_deduplicated() {
         let (_dir, root) = repo();
         // The import target lives outside the rules dir, so it is reachable
@@ -1287,9 +1330,37 @@ mod tests {
         write(&rules.join("top.md"), "top rule");
         std::fs::create_dir_all(rules.join("sub")).unwrap();
         std::os::unix::fs::symlink(&rules, rules.join("sub/loop")).unwrap();
-        let files = markdown_files(&rules);
+        let files = markdown_files(&rules, &root, false);
         // Terminates, and each canonical file appears once despite the cycle.
         assert_eq!(files.iter().filter(|p| p.ends_with("top.md")).count(), 1, "{files:?}");
+    }
+
+    #[test]
+    fn an_out_of_root_directory_symlink_in_rules_is_not_walked() {
+        let (_dir, root) = repo();
+        // A committed `.claude/rules/link` pointing at an external tree must not
+        // be traversed: the walker rejects the out-of-root symlink up front, so
+        // the external Markdown files are never scanned and produce no per-file
+        // "links outside the repository" warnings.
+        let ext = tempfile::tempdir().unwrap();
+        let ext_dir = ext.path().canonicalize().unwrap();
+        for i in 0..3 {
+            write(&ext_dir.join(format!("sub/f{i}.md")), &format!("external rule {i}"));
+        }
+        write(&root.join(".claude/rules/real.md"), "real rule body");
+        std::os::unix::fs::symlink(&ext_dir, root.join(".claude/rules/link")).unwrap();
+
+        let instructions = ProjectInstructions::discover(&root, &names());
+        assert!(instructions.warnings.is_empty(), "{:?}", instructions.warnings);
+        let texts: Vec<&str> = instructions.loaded.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, ["real rule body"]);
+
+        // An in-root directory symlink is still followed.
+        let (_d2, root2) = repo();
+        write(&root2.join(".claude/rules/actual/inner.md"), "inner rule body");
+        std::os::unix::fs::symlink(root2.join(".claude/rules/actual"), root2.join(".claude/rules/alias")).unwrap();
+        let files = markdown_files(&root2.join(".claude/rules"), &root2, false);
+        assert!(files.iter().any(|p| p.ends_with("inner.md")), "{files:?}");
     }
 
     #[test]
