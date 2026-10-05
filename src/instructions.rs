@@ -289,7 +289,11 @@ fn import_refs(text: &str) -> Vec<String> {
             in_fence = Some(open);
             continue;
         }
-        if is_indented_code(line) {
+        // Only treat indentation as a code block when no inline span is open:
+        // a multiline code span can close on an indented continuation line, and
+        // skipping that line unconditionally would leave `span_ticks` set and
+        // suppress a real `@path` import after the span.
+        if span_ticks.is_none() && is_indented_code(line) {
             continue;
         }
         let chars: Vec<char> = line.chars().collect();
@@ -476,6 +480,15 @@ fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
 fn markdown_files(dir: &Path, root: &Path, allow_outside: bool) -> Vec<PathBuf> {
     fn walk(dir: &Path, root: &Path, allow_outside: bool, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
         let Ok(real) = dir.canonicalize() else { return };
+        // Fail closed: never scan a directory whose canonical path escapes the
+        // repository (unless outside links are allowed). This rejects the dir
+        // passed in too — e.g. `.claude/rules` itself being a symlink to an
+        // external tree, whose real children are not symlinks and so slip past
+        // the per-child check below — preventing an unbounded startup traversal
+        // and a per-file "links outside the repository" warning flood.
+        if !allow_outside && !real.starts_with(root) {
+            return;
+        }
         // The canonical path is the loop guard: a directory already visited
         // (directly or through a symlink) is not entered again, so recursion
         // terminates even with symlink cycles. There is no depth cap — the
@@ -918,7 +931,10 @@ impl ProjectInstructions {
 
     /// Rules attached only when a matching file is touched.
     pub fn on_demand_paths(&self) -> Vec<String> {
-        self.scoped.iter().map(|r| r.path.display().to_string()).collect()
+        // Only rules still waiting for a matching path: once attached, a rule is
+        // already in the prompt, so `/context` must not keep labeling it as
+        // on-demand (`forget_nested` resets the flag after compaction).
+        self.scoped.iter().filter(|r| !r.attached).map(|r| r.path.display().to_string()).collect()
     }
 }
 
@@ -1047,6 +1063,22 @@ mod tests {
         assert!(import_refs("`` @secret.md").is_empty());
         // Outside any span, references are imported as before.
         assert_eq!(import_refs("@a.md and `code` @b.md"), vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn an_indented_continuation_line_can_close_an_open_span() {
+        // A code span may close on an indented continuation line. Skipping
+        // indented lines unconditionally would leave the span open and suppress
+        // the real `@live.md` import that follows its (indented) closing run.
+        assert_eq!(import_refs("`open\n    `\n@live.md"), vec!["live.md".to_string()]);
+        // A matching multi-backtick run also closes from an indented line.
+        assert_eq!(import_refs("``open\n    ``\n@live.md"), vec!["live.md".to_string()]);
+        // While the span is still open, an indented line is span content: a
+        // non-matching run does not close it, so the import stays suppressed.
+        assert!(import_refs("``open\n    `\n@secret.md").is_empty());
+        // With no span open, a genuinely indented code block still suppresses
+        // its own `@path` (unchanged behavior).
+        assert!(import_refs("text\n\n    @secret.md").is_empty());
     }
 
     #[test]
@@ -1361,6 +1393,45 @@ mod tests {
         std::os::unix::fs::symlink(root2.join(".claude/rules/actual"), root2.join(".claude/rules/alias")).unwrap();
         let files = markdown_files(&root2.join(".claude/rules"), &root2, false);
         assert!(files.iter().any(|p| p.ends_with("inner.md")), "{files:?}");
+    }
+
+    #[test]
+    fn a_rules_root_that_is_itself_an_out_of_root_symlink_is_not_walked() {
+        // The dir passed to the walker — `.claude/rules` itself — can be a
+        // symlink to an external tree. Its real children are ordinary dirs, not
+        // symlinks, so the per-child check never fires; the walk-entry guard
+        // must reject the out-of-root canonical root before `read_dir`, or the
+        // external tree is scanned (an unbounded startup traversal / warning
+        // flood).
+        let ext = tempfile::tempdir().unwrap();
+        let ext_dir = ext.path().canonicalize().unwrap();
+        for i in 0..3 {
+            write(&ext_dir.join(format!("sub/f{i}.md")), &format!("external rule {i}"));
+        }
+        let (_dir, root) = repo();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&ext_dir, root.join(".claude/rules")).unwrap();
+        let files = markdown_files(&root.join(".claude/rules"), &root, false);
+        assert!(files.is_empty(), "{files:?}");
+        // User rules dirs (allow_outside true) are still followed out of root.
+        let files = markdown_files(&root.join(".claude/rules"), &root, true);
+        assert_eq!(files.len(), 3, "{files:?}");
+    }
+
+    #[test]
+    fn on_demand_paths_excludes_already_attached_rules() {
+        let (_dir, root) = repo();
+        write(&root.join(".claude/rules/api.md"), "---\npaths:\n  - \"src/**\"\n---\napi rule");
+        let mut instructions = ProjectInstructions::discover(&root, &names());
+        // Before any match the scoped rule is waiting, so `/context` lists it.
+        assert_eq!(instructions.on_demand_paths().len(), 1);
+        // Touching a matching file attaches it; it is now in the prompt and must
+        // drop off the on-demand list rather than be labeled "on demand".
+        instructions.nested_for(&root.join("src/x.rs")).unwrap();
+        assert!(instructions.on_demand_paths().is_empty(), "{:?}", instructions.on_demand_paths());
+        // After compaction `forget_nested` resets the flag, so it is pending again.
+        instructions.forget_nested();
+        assert_eq!(instructions.on_demand_paths().len(), 1);
     }
 
     #[test]

@@ -158,7 +158,7 @@ fn new_session(agent: &mut Agent, params: &Value) -> anyhow::Result<String> {
 
 /// Make `params.cwd` the working directory for tools (one session per process).
 /// `_meta` for session/new and session/load: loaded instruction files,
-/// on-demand (path-scoped) rules, and skills.
+/// on-demand (path-scoped) rules, skills, and any skill/instruction warnings.
 fn session_meta(agent: &Agent) -> Value {
     let mut meta =
         json!({ "projectInstructions": agent.project_instruction_files(), "skills": agent.skills().names() });
@@ -168,6 +168,13 @@ fn session_meta(agent: &Agent) -> Value {
     }
     if !agent.skills().warnings.is_empty() {
         meta["skillWarnings"] = json!(agent.skills().warnings);
+    }
+    // Surface skipped imports/rules (e.g. left the repository) at session start,
+    // analogous to skillWarnings, so an ACP client sees the same safety notices
+    // the interactive banner and `/context` show.
+    let instruction_warnings = agent.instruction_warnings();
+    if !instruction_warnings.is_empty() {
+        meta["instructionWarnings"] = json!(instruction_warnings);
     }
     meta
 }
