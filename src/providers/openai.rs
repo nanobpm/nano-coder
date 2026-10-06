@@ -846,6 +846,16 @@ mod tests {
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
 
+    /// A real, decodable 10×10 PNG. `read_for_limits` reads the dimensions from
+    /// the stored bytes, so an attachment's file must be a valid image — magic
+    /// bytes alone no longer resolve to a sendable image.
+    fn real_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
     fn provider(base_url: &str, extra: &str) -> ResolvedProvider {
         let mut user = HashMap::new();
         user.insert(
@@ -894,7 +904,9 @@ mod tests {
     #[test]
     fn tool_result_image_goes_in_a_followup_user_message() {
         let dir = tempfile::tempdir().unwrap();
-        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        // A real, decodable PNG: `read_for_limits` reads the dimensions from the
+        // bytes, so the stored file must be a valid image, not magic-byte filler.
+        let bytes = real_png();
         let attachment = crate::llm::Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from("/tmp/plot.png"),
@@ -959,7 +971,7 @@ mod tests {
         // tool must NOT say "[image attached after the tool results]" — that image
         // belongs to the first tool, not it.
         let dir = tempfile::tempdir().unwrap();
-        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let bytes = real_png();
         let present = crate::llm::Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from("/tmp/present.png"),

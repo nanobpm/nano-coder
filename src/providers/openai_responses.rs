@@ -419,6 +419,16 @@ mod tests {
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
 
+    /// A real, decodable 10×10 PNG. `read_for_limits` reads the dimensions from
+    /// the stored bytes, so an attachment's file must be a valid image — magic
+    /// bytes alone no longer resolve to a sendable image.
+    fn real_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
     fn transport() -> HttpTransport {
         let user: HashMap<String, ProviderConfig> = HashMap::new();
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
@@ -538,7 +548,7 @@ mod tests {
     #[test]
     fn tool_result_image_becomes_an_input_image_part() {
         let dir = tempfile::tempdir().unwrap();
-        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let bytes = real_png();
         let attachment = crate::llm::Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from("/tmp/chart.png"),

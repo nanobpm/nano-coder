@@ -666,6 +666,26 @@ impl LLMClient for GithubCopilotClient {
         .unwrap_or_default()
     }
 
+    /// Thinking levels and vision derived from one shared `/models` fetch, for
+    /// the configured-context-window path (the window half is already known, so
+    /// only these two are probed). The trait default would run
+    /// `detect_thinking_levels` then `detect_vision` serially; because
+    /// `model_entry` caches only a successful response, a failed `/models` probe
+    /// would then be fetched — and waited out — twice. Deriving both from one
+    /// bounded `model_entry` call matches `detect_capabilities`.
+    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            let thinking = crate::thinking::Reported::from_model_entry(&entry);
+            let vision = crate::vision::Vision::from_model_entry(&entry);
+            Some((thinking, vision))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let session = self.session_token(false).await?;
         let value = self.models_json(&session, None).await?;
@@ -734,6 +754,16 @@ mod tests {
             "endpoints": { "api": base },
         })
         .to_string()
+    }
+
+    /// A real, decodable 10×10 PNG. `read_for_limits` reads the dimensions from
+    /// the stored bytes, so an attachment's file must be a valid image — magic
+    /// bytes alone no longer resolve to a sendable image.
+    fn real_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
     }
 
     // `gpt-5-mini` routes to the Responses endpoint, so its non-streamed reply is an
@@ -882,9 +912,11 @@ mod tests {
         let (api, api_log) = test_server::serve(vec![(200, "", ok)]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
-        // A tool result carrying a stored image attachment.
+        // A tool result carrying a stored image attachment. A real, decodable
+        // PNG: `read_for_limits` reads dimensions from the bytes, so the stored
+        // file must be a valid image, not magic-byte filler.
         let dir = tempfile::tempdir().unwrap();
-        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let bytes = real_png();
         let attachment = crate::llm::Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from("/tmp/d.png"),
@@ -1218,6 +1250,36 @@ mod tests {
         let (window, thinking, _vision) = client.detect_capabilities().await;
         assert_eq!((window, thinking), (None, None));
         assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the second probe");
+    }
+
+    #[tokio::test]
+    async fn detect_thinking_and_vision_reads_both_from_one_models_request() {
+        // The configured-context-window path probes thinking and vision via
+        // `detect_thinking_and_vision`; both must come from a single `/models`
+        // fetch, not one serial probe each.
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111 },
+            "supports": { "reasoning_effort": ["none", "low", "high"], "vision": true } } }] });
+        let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (thinking, vision) = client.detect_thinking_and_vision().await;
+        assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
+        assert!(vision.is_some(), "vision derived from the same shared /models entry");
+        assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
+    }
+
+    #[tokio::test]
+    async fn detect_thinking_and_vision_makes_one_failed_models_request() {
+        // `model_entry` caches only a successful response, so the trait default's
+        // two serial probes would each re-fetch — and re-wait out — a failed
+        // `/models`. The combined override fails once.
+        let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (thinking, vision) = client.detect_thinking_and_vision().await;
+        assert_eq!((thinking, vision), (None, None));
+        assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the vision probe");
     }
 
     #[tokio::test]

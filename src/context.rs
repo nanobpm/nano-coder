@@ -174,13 +174,16 @@ pub fn message_tokens(message: &Message) -> usize {
     text_tokens(&message.content) + calls + images + 4
 }
 
-/// Fixed token cost estimate for one image, from its pixel dimensions
-/// (Anthropic's ~`w*h/750`, capped at ~1,600 tokens after the downscale
-/// `read_file` applies). Keeps the status bar and auto-compaction honest about
-/// what an image costs.
+/// Token cost estimate for one image, from its pixel dimensions (Anthropic's
+/// ~`w*h/750`). `read_file` downscales each dimension to at most
+/// [`crate::attachment::MAX_DIMENSION`], so the largest image that can be sent
+/// is a `MAX_DIMENSION`×`MAX_DIMENSION` square — the estimate is capped at that
+/// maximum rather than the historical ~1,600, which undercounted a full square
+/// (1,568×1,568 ⇒ 3,279 tokens) and could delay auto-compaction past the window.
 pub fn image_tokens(attachment: &crate::llm::Attachment) -> usize {
     let estimate = (attachment.width as usize * attachment.height as usize).div_ceil(750);
-    estimate.clamp(1, 1_600)
+    let max = (crate::attachment::MAX_DIMENSION as usize * crate::attachment::MAX_DIMENSION as usize).div_ceil(750);
+    estimate.clamp(1, max)
 }
 
 pub fn messages_tokens(messages: &[Message]) -> usize {
@@ -337,6 +340,27 @@ mod tests {
         // ...but never below the previous cap.
         assert_eq!(summary_output_budget(8_000, 16_384), SUMMARY_MAX_TOKENS);
         assert_eq!(summary_output_budget(8_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn image_tokens_counts_a_max_dimension_square_fully() {
+        let attachment = |w, h| crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: w,
+            height: h,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        // A full MAX_DIMENSION square is the largest image `read_file` can send;
+        // it must be charged its real w*h/750 cost (3,279), not clamped to the
+        // historical 1,600 cap that undercounted it.
+        let max = crate::attachment::MAX_DIMENSION;
+        assert_eq!(image_tokens(&attachment(max, max)), 3_279);
+        // Smaller images keep the plain w*h/750 estimate (floored at 1).
+        assert_eq!(image_tokens(&attachment(100, 100)), 14);
+        assert_eq!(image_tokens(&attachment(1, 1)), 1);
     }
 
     #[test]
