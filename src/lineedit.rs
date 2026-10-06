@@ -1371,7 +1371,15 @@ impl LineReader {
                                             None => return Key::Line(view.take() + "\n"),
                                         }
                                     }
-                                    Esc::Escape if menu => shared.lock().unwrap().hide_menu(),
+                                    Esc::Escape if menu => {
+                                        // Closing the menu is the first Esc of
+                                        // the idle clear gesture: record it
+                                        // before hiding the menu so a `/` line
+                                        // clears in two presses, not three
+                                        // (hide, then arm, then clear).
+                                        self.escape_press(shared, std::time::Instant::now());
+                                        shared.lock().unwrap().hide_menu();
+                                    }
                                     Esc::Escape => {
                                         // With the command menu already closed
                                         // (above), Esc is the idle prompt's
@@ -1386,7 +1394,13 @@ impl LineReader {
                                 }
                             }
                         }
-                        None if menu => shared.lock().unwrap().hide_menu(),
+                        None if menu => {
+                            // Same as the kitty Esc above: the menu-closing
+                            // press is the first half of the clear gesture,
+                            // not a wasted press.
+                            self.escape_press(shared, std::time::Instant::now());
+                            shared.lock().unwrap().hide_menu();
+                        }
                         None => {
                             // A lone Esc (no continuation): the idle clear
                             // gesture, and the turn loop's cancel.
@@ -2291,7 +2305,9 @@ mod tests {
             // Ctrl-A / Ctrl-U / Ctrl-W edit the line.
             assert_eq!(keys_sent(view, b"one two\x1b[119;5u\x1b[97;5uX\r"), ["-> line \"Xone \\n\""]);
         }
-        // At the prompt with the command menu open, Esc closes the menu first.
+        // At the prompt with the command menu open, Esc closes the menu and
+        // counts as the first half of the clear gesture, so the second Esc
+        // clears the line (Ctrl-U here is then a no-op).
         frame.lock().unwrap().mode = EditMode::Prompt;
         assert_eq!(keys_sent(&frame, b"/he\x1b[27u\x1b[27u\x1b[117;5u\r"), ["escape", "-> line \"\\n\""]);
     }
@@ -2571,6 +2587,39 @@ mod tests {
         assert!(matches!(reader.read_line(&view, &send), Key::Eof));
         assert!(view.lock().unwrap().line.is_empty(), "two Esc in one read clear the input");
         assert_eq!(sent.into_inner().unwrap(), ["escape", "escape", "escape", "escape"]);
+    }
+
+    #[test]
+    fn double_escape_clears_a_command_menu_line_in_two_presses() {
+        // The menu-closing Esc is the first half of the idle clear gesture, so
+        // a `/command` line (menu open) clears in two Esc presses, not three.
+        // This holds for the kitty-encoded Esc (`Esc::Escape if menu`) and the
+        // legacy bare Esc (`None if menu`) alike, in both render paths.
+        let context = Arc::new(Mutex::new(EditContext::default()));
+        for frame in [false, true] {
+            // Kitty Esc: two `CSI 27 u` close the menu then clear the line.
+            let view = EditView::shared(None, context.clone());
+            if frame {
+                view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+            }
+            view.lock().unwrap().mode = EditMode::Prompt;
+            assert_eq!(
+                keys_sent(&view, b"/he\x1b[27u\x1b[27u\r"),
+                ["escape", "-> line \"\\n\""],
+                "kitty Esc Esc clears the `/` line (frame={frame})"
+            );
+            assert!(view.lock().unwrap().line.is_empty(), "kitty clear (frame={frame})");
+
+            // Legacy bare Esc bytes: the same gesture via the `None if menu`
+            // path (the trailing Esc is lone, so it reaches that branch).
+            let view = EditView::shared(None, context.clone());
+            if frame {
+                view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+            }
+            view.lock().unwrap().mode = EditMode::Prompt;
+            keys_sent(&view, b"/he\x1b\x1b");
+            assert!(view.lock().unwrap().line.is_empty(), "legacy clear (frame={frame})");
+        }
     }
 
     #[test]
