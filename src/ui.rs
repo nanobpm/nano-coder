@@ -1250,7 +1250,7 @@ fn strip_ansi(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1276,7 +1276,7 @@ mod tests {
     /// A reentrant guard for [`VERBOSITY_LOCK`]: the owning thread may hold
     /// several at once (each acquisition increments a thread-local depth); the
     /// inner mutex is released only when the last guard for that thread drops.
-    pub(super) struct VerbosityGuard {
+    pub(crate) struct VerbosityGuard {
         inner: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
@@ -1300,7 +1300,7 @@ mod tests {
         }
     }
 
-    pub(super) fn verbosity_lock() -> VerbosityGuard {
+    pub(crate) fn verbosity_lock() -> VerbosityGuard {
         let tid = current_thread_id();
         if VERBOSITY_OWNER.load(Ordering::SeqCst) == tid && tid != 0 {
             // Already owned by this thread: recurse without touching the mutex.
@@ -1384,7 +1384,7 @@ mod tests {
         /// path in tests. The truncation guard is a legacy-renderer concern:
         /// the frame renderer reconciles the final `AssistantMessage` in place
         /// and never consults `touched_quiet`.
-        fn legacy_for_test() -> Arc<Self> {
+        pub(crate) fn legacy_for_test() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(State { at_line_start: true, ..Default::default() }),
                 status: None,
