@@ -76,7 +76,6 @@ pub struct Snapshot {
     instruction_files: Vec<String>,
     skills_count: Option<usize>,
     compaction_mode: String,
-    window_source: String,
 }
 
 impl Snapshot {
@@ -125,7 +124,6 @@ impl Snapshot {
             instruction_files: agent.project_instruction_files(),
             skills_count: (!found.is_empty() || !found.warnings.is_empty()).then_some(found.skills.len()),
             compaction_mode: agent.config().compaction_mode.as_str().to_string(),
-            window_source: agent.context_window_with_source().1,
         }
     }
 
@@ -256,7 +254,7 @@ impl Snapshot {
                 stats.history_searches, stats.history_reads
             ));
         }
-        out.push(format!("(context window {})", self.window_source));
+        out.push(format!("(context window {})", stats.window_source));
         out.join("\n")
     }
 
@@ -318,9 +316,14 @@ mod tests {
 
     #[test]
     fn output_uses_the_live_stats_and_plan() {
-        let snapshot =
-            Snapshot { compaction_mode: "smart".into(), window_source: "from config".into(), ..Default::default() };
-        let stats = ContextStats { mode: AgentMode::Plan, tokens: 500, window: 1000, ..Default::default() };
+        let snapshot = Snapshot { compaction_mode: "smart".into(), ..Default::default() };
+        let stats = ContextStats {
+            mode: AgentMode::Plan,
+            tokens: 500,
+            window: 1000,
+            window_source: "from config".into(),
+            ..Default::default()
+        };
         let Some(Output::Block(mode)) = snapshot.output("/mode", &stats, &Plan::default()) else { panic!() };
         assert!(mode.starts_with("Mode: plan"), "{mode}");
         let Some(Output::Block(context)) = snapshot.output("/context", &stats, &Plan::default()) else { panic!() };
@@ -337,6 +340,26 @@ mod tests {
 
         assert_eq!(snapshot.output("/compact", &stats, &plan), None);
         assert_eq!(snapshot.output("hello", &stats, &plan), None);
+    }
+
+    #[test]
+    fn context_window_source_follows_live_stats() {
+        // The window source is published with the live context stats, not
+        // frozen in the snapshot: a mid-turn context-overflow that lowers the
+        // window via `learned_window` must relabel the source alongside the
+        // number, so `/context` never pairs a fresh window with a stale source.
+        let snapshot = Snapshot::default();
+        let fresh = ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
+        let Some(Output::Block(before)) = snapshot.output("/context", &fresh, &Plan::default()) else { panic!() };
+        assert!(before.ends_with("(context window known for the model name)"), "{before}");
+
+        let learned = ContextStats {
+            window: 8_000,
+            window_source: "learned from a context-overflow error".into(),
+            ..Default::default()
+        };
+        let Some(Output::Block(after)) = snapshot.output("/context", &learned, &Plan::default()) else { panic!() };
+        assert!(after.ends_with("(context window learned from a context-overflow error)"), "{after}");
     }
 
     #[test]
