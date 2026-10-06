@@ -62,15 +62,29 @@ fn enforce_slash_invariant(text: String) -> Result<String, String> {
     let trimmed = text.trim();
     if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
         return Err(crate::commands::rejection(trimmed).unwrap_or_else(|| {
-            // `rejection` returns None here only for a *known* command, which
-            // reached this fallback because ACP doesn't implement it. Name that
-            // reason rather than blaming arguments it was never given.
+            // `rejection` returns None only for a *known* command that reached
+            // this fallback because `handle_inner` didn't service it. Two very
+            // different reasons land here, so don't conflate them: a command
+            // ACP *does* implement (see ACP_COMMAND_ROOTS) only falls through
+            // when its arguments weren't accepted — saying it "is not available
+            // over ACP" would be false — whereas a command ACP simply doesn't
+            // implement is genuinely unavailable.
             let word = trimmed.split_whitespace().next().unwrap_or(trimmed);
-            format!("Can't run {word}: this command is not available over ACP")
+            if ACP_COMMAND_ROOTS.contains(&word) {
+                format!("Can't run {trimmed:?} over ACP")
+            } else {
+                format!("Can't run {word}: this command is not available over ACP")
+            }
         }));
     }
     Ok(crate::commands::unescape_prompt(trimmed).map(str::to_string).unwrap_or(text))
 }
+
+/// Command roots `handle_inner` services over ACP. Reaching the slash-invariant
+/// fallback with one of these means only its *arguments* weren't accepted (an
+/// unknown subcommand, or a `/model` with no spec), not that the command is
+/// unavailable. Keep in sync with the `session/prompt` arm of `handle_inner`.
+const ACP_COMMAND_ROOTS: &[&str] = &["/compact", "/settings", "/tools", "/plan", "/providers", "/model"];
 
 /// A message arriving while a turn runs.
 enum DuringTurn {
@@ -253,11 +267,7 @@ pub async fn handle_message(agent: &mut Agent, msg: Value) -> Action {
                         }
                         None => Action::Nothing,
                     },
-                    Ok(text) => Action::Turn {
-                        id: id.cloned(),
-                        input_id: input_id(&params).map(str::to_string),
-                        text,
-                    },
+                    Ok(text) => Action::Turn { id: id.cloned(), input_id: input_id(&params).map(str::to_string), text },
                 },
             }
         }
@@ -785,6 +795,14 @@ mod tests {
             enforce_slash_invariant("/help me".to_string()).unwrap_err(),
             "Can't run /help: this command is not available over ACP"
         );
+        // A command ACP *does* implement, given arguments its handler doesn't
+        // accept, falls through to the same fallback — but must NOT be reported
+        // as unavailable over ACP, since it plainly is available.
+        for cmd in ["/settings foo", "/plan foo", "/tools foo", "/providers foo", "/model"] {
+            let note = enforce_slash_invariant(cmd.to_string()).unwrap_err();
+            assert_eq!(note, format!("Can't run {cmd:?} over ACP"), "{cmd}");
+            assert!(!note.contains("not available over ACP"), "{cmd}");
+        }
         // A path-like slash line is rejected with the `//` escape hint.
         assert!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap_err().contains("type //usr/lib"));
         // Leading whitespace doesn't smuggle a slash line past the check.
