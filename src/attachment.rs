@@ -592,9 +592,19 @@ mod tests {
         let bytes = out.into_inner();
         let prepared = prepare(&bytes, ImageFormat::Png, MAX_DIMENSION, 4_000, &[]).unwrap();
         assert!(prepared.bytes.len() <= 4_000, "{} bytes", prepared.bytes.len());
+        // Discriminator: the old per-axis `.max(16)` floor pinned the short
+        // side at exactly 16 while the long side kept shrinking. The fixed
+        // aspect-preserving shrink derives the short side from the ratio, so it
+        // drops *below* 16 here. Asserting `height < 16` is red on the old code
+        // (stuck at 16) and green on the fix — a weaker `ratio > 60` bound
+        // passed against both, guarding nothing.
+        assert!(
+            prepared.height < 16,
+            "short side not scaled below the old per-axis floor: {}×{}",
+            prepared.width,
+            prepared.height
+        );
         // The source is 100:1; an aspect-preserving shrink keeps it near that.
-        // The old per-axis floor pinned the short side at 16 and dropped the
-        // ratio far below this bound.
         let ratio = prepared.width as f64 / prepared.height as f64;
         assert!(
             ratio > 60.0,
