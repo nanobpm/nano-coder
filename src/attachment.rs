@@ -149,6 +149,20 @@ pub fn prepare(
     accepted_media_types: &[String],
 ) -> Result<PreparedImage> {
     let (mut width, mut height) = dimensions(bytes)?;
+    // Read the display orientation once, up front, and report display
+    // dimensions on *every* path. `dimensions()` returns the raw stored matrix;
+    // a quarter-turn orientation means the displayed image is transposed. The
+    // passthrough path (accepted type, within `max_dim`, under `max_bytes`)
+    // returns these dimensions verbatim without decoding, so the swap must
+    // happen here rather than only inside the re-encode branch below —
+    // otherwise two visually identical photos straddling the byte cap would
+    // report transposed dimensions to the model. The byte-cap/downscale checks
+    // that follow also then compare against display dimensions, which is what
+    // the model sees.
+    let orientation = exif_orientation(bytes, format);
+    if orientation.swaps_axes() {
+        std::mem::swap(&mut width, &mut height);
+    }
     let accepts = |mt: &str| accepted_media_types.is_empty() || accepted_media_types.iter().any(|t| t == mt);
     let accepts_source = accepts(format.media_type());
     // The codec to re-encode into when the bytes must change (unaccepted source
@@ -180,18 +194,13 @@ pub fn prepare(
     let needs_downscale = width > max_dim || height > max_dim;
     let needs_reencode = !accepts_source;
     if needs_downscale || needs_reencode || out_bytes.len() > max_bytes {
-        // Decode the raw pixels, then apply any JPEG/WebP orientation metadata
-        // to them: re-encoding strips that metadata, so without this a phone
-        // photo shot in portrait would be sent (and its prepared dimensions
-        // reported) rotated or mirrored. `dimensions()` above reads the raw
-        // stored matrix, so swap the reported width/height when the transform
-        // is a quarter turn.
+        // Decode the raw pixels, then apply the orientation read above to them:
+        // re-encoding strips the EXIF metadata, so without this a phone photo
+        // shot in portrait would be sent rotated or mirrored. `width`/`height`
+        // already hold the display dimensions (swapped above for quarter-turn
+        // orientations), matching the pixels `apply_orientation` produces.
         let mut img = image::load_from_memory_with_format(bytes, format.image_format())
             .with_context(|| format!("decode {}", format.media_type()))?;
-        let orientation = exif_orientation(bytes, format);
-        if orientation.swaps_axes() {
-            std::mem::swap(&mut width, &mut height);
-        }
         img.apply_orientation(orientation);
         // Downscale to the longest-side cap, preserving aspect ratio.
         let mut img = if width > max_dim || height > max_dim {
@@ -715,6 +724,29 @@ mod tests {
         // The re-encoded bytes carry no EXIF, so their decoded dimensions are
         // exactly what the model sees — they must already be the oriented ones.
         assert_eq!(dimensions(&prepared.bytes).unwrap(), (32, 64), "sent pixels must be pre-rotated");
+    }
+
+    #[test]
+    fn prepare_reports_oriented_dimensions_on_passthrough_path() {
+        // Regression: an oriented image that fits every limit (accepted type,
+        // within `max_dim`, under `max_bytes`) is passed through untouched —
+        // the branch that decodes and swaps the reported dimensions never runs.
+        // Its prepared dimensions must still describe the *displayed* pixels,
+        // not the raw stored matrix, so they agree with the re-encode path and
+        // with what the model is told. A 64×32 matrix tagged orientation 6
+        // displays as 32×64; a generous byte cap keeps it on the passthrough
+        // path (bytes returned verbatim, EXIF intact for the viewer).
+        let jpeg = make_oriented_jpeg(64, 32, 6);
+        let prepared = prepare(&jpeg, ImageFormat::Jpeg, MAX_DIMENSION, 1_000_000, &[]).unwrap();
+        assert_eq!(
+            prepared.bytes, jpeg,
+            "an image within all limits must be passed through unchanged (EXIF preserved)"
+        );
+        assert_eq!(
+            (prepared.width, prepared.height),
+            (32, 64),
+            "passthrough dimensions must describe the oriented pixels, not the raw stored matrix"
+        );
     }
 
     #[test]
