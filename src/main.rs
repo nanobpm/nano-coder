@@ -1320,27 +1320,61 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // `//…` is a prompt that starts with `/`.
             let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
-            // In frame mode the turn's response is already rendered from its
-            // events; re-printing it here would duplicate the answer and
-            // corrupt the owned frame.
-            if !terminal.renderer.is_frame() {
-                if ui::verbosity() == ui::Verbosity::Quiet {
-                    println!("{}", ui::stamp_block(&outcome.response));
-                } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                    println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
-                } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                    let last = outcome.response.lines().last().unwrap_or_default();
-                    println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
-                } else if terminal.renderer.answer_may_be_truncated() {
-                    // The turn was quiet for part of its streamed answer but
-                    // ended at a louder level, so the live stream dropped the
-                    // deltas emitted while quiet. Reprint the authoritative
-                    // full response (the quiet end path above already does this
-                    // when the turn ends quiet).
-                    println!("{}", ui::stamp_block(&outcome.response));
-                }
-            }
+            print_turn_outcome(&outcome, &terminal.renderer);
             Ok(true)
+        }
+    }
+}
+
+/// What the legacy turn-end print should emit for a finished turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnPrint {
+    /// Frame mode: the response is already rendered from its events; print
+    /// nothing (re-printing would duplicate the answer and corrupt the frame).
+    Nothing,
+    /// Reprint the full response.
+    Full { dim: bool },
+    /// Max-turn fallback: print only the stop-note line, dimmed.
+    LastLineDim,
+}
+
+/// Chooses what the legacy turn-end print emits. The truncation repair runs
+/// before the max-turn fallback: a response stopped at the request cap still
+/// carries its full final content in `outcome.response`, so when part of it was
+/// quiet-suppressed the authoritative full text must be reprinted — printing
+/// only the stop-note line would leave the answer truncated.
+fn turn_print(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) -> TurnPrint {
+    if renderer.is_frame() {
+        TurnPrint::Nothing
+    } else if ui::verbosity() == ui::Verbosity::Quiet {
+        TurnPrint::Full { dim: false }
+    } else if outcome.stop_reason == agent::StopReason::Cancelled {
+        TurnPrint::Full { dim: true }
+    } else if renderer.answer_may_be_truncated() {
+        // The turn was quiet for part of its streamed answer but ended at a
+        // louder level, so the live stream dropped the deltas emitted while
+        // quiet. Reprint the authoritative full response (the quiet end path
+        // above already does this when the turn ends quiet).
+        TurnPrint::Full { dim: false }
+    } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
+        TurnPrint::LastLineDim
+    } else {
+        TurnPrint::Nothing
+    }
+}
+
+/// Prints a finished turn's response in legacy (non-frame) mode per
+/// [`turn_print`].
+fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
+    match turn_print(outcome, renderer) {
+        TurnPrint::Nothing => {}
+        TurnPrint::Full { dim: false } => println!("{}", ui::stamp_block(&outcome.response)),
+        TurnPrint::Full { dim: true } => {
+            println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
+        }
+        TurnPrint::LastLineDim => {
+            let last = outcome.response.lines().last().unwrap_or_default();
+            println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
         }
     }
 }
@@ -1953,5 +1987,44 @@ mod tests {
         // Blank input is a no-op on both paths.
         assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
+    }
+
+    /// A max-turn response whose streamed answer was quiet-suppressed must be
+    /// reprinted in full (the truncation repair), not reduced to its dimmed
+    /// stop-note line by the max-turn fallback.
+    #[test]
+    fn turn_print_repairs_truncation_before_the_max_turn_fallback() {
+        let _lock = ui::tests::verbosity_lock();
+        let r = ui::Renderer::legacy_for_test();
+        let outcome = agent::TurnOutcome {
+            response: "full final answer\n[stopped after 3 LLM calls without a final answer]".into(),
+            stop_reason: agent::StopReason::MaxTurnRequests,
+            outcome: None,
+        };
+
+        // A non-empty answer delta suppressed while quiet flags truncation.
+        ui::set_verbosity(ui::Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&agent::AgentEvent::TextDelta { text: "full final answer" });
+        assert!(r.answer_may_be_truncated());
+        // The user switches back before the cap is enforced on the next loop.
+        ui::set_verbosity(ui::Verbosity::Normal);
+
+        assert_eq!(
+            turn_print(&outcome, &r),
+            TurnPrint::Full { dim: false },
+            "a quiet-suppressed max-turn answer must be reprinted in full, not truncated to its stop-note line"
+        );
+
+        // Without the truncation flag the max-turn fallback still prints only
+        // the dimmed stop-note line.
+        let r2 = ui::Renderer::legacy_for_test();
+        r2.begin_turn();
+        assert_eq!(
+            turn_print(&outcome, &r2),
+            TurnPrint::LastLineDim,
+            "an untruncated max-turn response keeps the dimmed stop-note fallback"
+        );
+        ui::set_verbosity(ui::Verbosity::Normal);
     }
 }
