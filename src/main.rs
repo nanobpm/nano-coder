@@ -830,6 +830,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             TermInput::Queue(line) => (line, false),
                             _ => unreachable!(),
                         };
+                        // An accepted line supersedes any refusal hint still
+                        // showing from a rejected `/command`.
+                        renderer.clear_transient();
                         let text = line.trim();
                         match classify_steer_input(text, steer) {
                             SteerRoute::QueueCommand(op) => {
@@ -1254,6 +1257,9 @@ async fn run_compaction(
                     if let TermInput::Line(line) = &other
                         && let Some(op) = queue_command(line.trim())
                     {
+                        // An accepted edit supersedes any refusal hint still
+                        // showing from a rejected `/command`.
+                        terminal.renderer.clear_transient();
                         match op {
                             Ok(op) => {
                                 let result = terminal.edit_queue(&op);

@@ -71,7 +71,6 @@ pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>,
     (mode, Some(focus).filter(|f| !f.is_empty()))
 }
 
-/// Commands whose name starts with `prefix`.
 /// Why a submitted `/…` line can't be sent: its first word is not a command.
 /// `None` for anything else (not a `/` line, a known command, or a `//`
 /// escaped prompt). Such a line is never sent to the model, since a mistyped
