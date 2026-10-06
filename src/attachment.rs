@@ -185,7 +185,13 @@ pub fn prepare(
                      the model's image size limit is too small for this image"
                 );
             }
-            let (nw, nh) = ((w * 3 / 4).max(16), (h * 3 / 4).max(16));
+            // Shrink the longest side by a quarter (floored at 16) and derive
+            // the other side from the aspect ratio, rather than flooring each
+            // axis independently: a per-axis `.max(16)` would pin a narrow
+            // image's short side at 16 while the long side kept shrinking,
+            // distorting panoramas (e.g. 100×1 → 75×16).
+            let target = (w.max(h) * 3 / 4).max(16);
+            let (nw, nh) = scaled_dimensions(w, h, target);
             img = img.resize(nw, nh, image::imageops::FilterType::Triangle);
         }
     }
@@ -338,7 +344,14 @@ fn write_atomically(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
         nanos,
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    // A partial write (e.g. `ENOSPC`) can create the temp file and still fail,
+    // so remove it on the write-error path too — every exit that has touched
+    // `tmp` must clean it up, not just the rename failure below (mirrors
+    // `src/files.rs`).
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {}", tmp.display()));
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
@@ -561,6 +574,34 @@ mod tests {
         // extension must report JPEG.
         assert_eq!(prepared.media_type, "image/jpeg");
         assert_eq!(prepared.extension, "jpg");
+    }
+
+    #[test]
+    fn prepare_preserves_narrow_aspect_ratio_while_shrinking() {
+        // Regression: the byte-cap shrink must scale the longest side and derive
+        // the short side from the aspect ratio, not floor each axis to 16
+        // independently. A per-axis `.max(16)` floor pinned a narrow image's
+        // short side at 16 while the long side kept shrinking, badly distorting
+        // panoramas (the short side could even grow during the shrink).
+        let mut img = image::RgbImage::new(2400, 24);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 251) as u8, (y % 239) as u8, ((x * y) % 233) as u8]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
+        let prepared = prepare(&bytes, ImageFormat::Png, MAX_DIMENSION, 4_000, &[]).unwrap();
+        assert!(prepared.bytes.len() <= 4_000, "{} bytes", prepared.bytes.len());
+        // The source is 100:1; an aspect-preserving shrink keeps it near that.
+        // The old per-axis floor pinned the short side at 16 and dropped the
+        // ratio far below this bound.
+        let ratio = prepared.width as f64 / prepared.height as f64;
+        assert!(
+            ratio > 60.0,
+            "aspect ratio distorted: {}×{} (ratio {ratio:.1})",
+            prepared.width,
+            prepared.height
+        );
     }
 
     #[test]

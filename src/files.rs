@@ -170,6 +170,12 @@ pub fn read_file(args: &Value) -> Result<Value> {
 /// only decode dimensions.
 fn read_image(path: &Path, bytes: &[u8], format: crate::attachment::ImageFormat) -> Result<Value> {
     let (width, height) = image_dimensions(bytes)?;
+    // Persist an absolute source path so the advertised re-`read_file` workflow
+    // survives a session resume under a different working directory (ACP
+    // `session/load` accepts a new cwd, and CLI resume does not restore the
+    // recorded one). Resolve it against the still-active cwd now; `absolute` is
+    // lexical (no filesystem access), so it never fails for a path we just read.
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     Ok(json!({
         "image": {
             "media_type": format.media_type(),
@@ -1006,6 +1012,23 @@ mod tests {
             assert!(image["bytes"].as_u64().is_some_and(|b| b > 0), "{name}");
             assert!(image.get("data_base64").is_none(), "{name}: metadata must not carry the pixels");
         }
+    }
+
+    #[test]
+    fn read_image_stores_absolute_source_path() {
+        // Regression: the persisted source path must be absolute so the
+        // re-`read_file` workflow survives a session resume under a different
+        // working directory. `read_image` is lexical here (it never touches the
+        // filesystem for the path), so a relative input must come back absolute.
+        let bytes = make_image(8, 8, image::ImageFormat::Png);
+        let format = crate::attachment::ImageFormat::sniff(&bytes).unwrap();
+        let result = read_image(Path::new("sub/rel.png"), &bytes, format).unwrap();
+        let stored = result["image"]["path"].as_str().unwrap();
+        assert!(Path::new(stored).is_absolute(), "stored path should be absolute: {stored}");
+        assert!(
+            stored.ends_with("sub/rel.png") || stored.ends_with("sub\\rel.png"),
+            "stored path should retain the source tail: {stored}"
+        );
     }
 
     #[test]

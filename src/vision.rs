@@ -223,21 +223,24 @@ fn assumes_anthropic_vision(model: &str) -> bool {
 /// returns no endpoint report, so without it they would be misclassified as
 /// blind — while a digit continuation (`gpt-50`) stays blind.
 ///
-/// The text-only `o3-mini` subfamily is carved out: the bare `o3` prefix would
-/// otherwise classify `o3-mini` (and dated `o3-mini-*` aliases) as
-/// vision-capable, but `o3-mini` cannot see images, so on the direct OpenAI
-/// provider — where detection returns no report and `resolve` falls back here —
-/// it would be sent images the API rejects.
+/// The text-only `o3-mini` and `o1-mini`/`o1-preview` subfamilies are carved
+/// out: the bare `o3`/`o1` prefixes would otherwise classify them (and their
+/// dated aliases) as vision-capable, but those models cannot see images, so on
+/// the direct OpenAI provider — where detection returns no report and `resolve`
+/// falls back here — they would be sent images the API rejects. Full `o1`
+/// accepts image inputs and stays vision-capable.
 fn assumes_openai_vision(model: &str) -> bool {
     let m = model.to_lowercase();
     // `ft:<base>:<org>::<id>` → `<base>`; a plain name is its own base.
     let base = m.strip_prefix("ft:").map_or(m.as_str(), |rest| rest.split(':').next().unwrap_or(rest));
-    // `o3-mini` is text-only; exclude it (and `o3-mini-*` aliases) before the
-    // family-prefix match below claims it via `o3`.
-    if base == "o3-mini" || base.starts_with("o3-mini-") {
-        return false;
+    // Text-only subfamilies: exclude them before the family-prefix match below
+    // claims them via the bare `o3`/`o1` family token.
+    for text_only in ["o3-mini", "o1-mini", "o1-preview"] {
+        if base == text_only || base.strip_prefix(text_only).is_some_and(|rest| rest.starts_with('-')) {
+            return false;
+        }
     }
-    const FAMILIES: [&str; 5] = ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4"];
+    const FAMILIES: [&str; 6] = ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4", "o1"];
     FAMILIES.iter().any(|family| match base.strip_prefix(family) {
         Some(rest) => rest.is_empty() || rest.starts_with('-') || rest.starts_with('.'),
         None => false,
@@ -444,6 +447,24 @@ mod tests {
             assert!(!assumes_openai_vision(model), "{model} should be blind");
         }
         assert!(assumes_openai_vision("o3"), "full o3 keeps vision");
+    }
+
+    #[test]
+    fn o1_family_is_vision_except_mini_and_preview() {
+        // The direct OpenAI provider returns no endpoint report, so `resolve`
+        // falls back here; full `o1` accepts image inputs and must stay vision.
+        for model in ["o1", "o1-2024-12-17", "ft:o1:org::id"] {
+            assert!(assumes_openai_vision(model), "{model} should be a vision family");
+        }
+        // The text-only `o1-mini`/`o1-preview` subfamilies (and dated aliases /
+        // fine-tune wrappers) stay blind, like `o3-mini`.
+        for model in
+            ["o1-mini", "o1-mini-2024-09-12", "o1-preview", "o1-preview-2024-09-12", "ft:o1-mini:org::id"]
+        {
+            assert!(!assumes_openai_vision(model), "{model} should be blind");
+        }
+        // A name that merely contains `o1` is not the family.
+        assert!(!assumes_openai_vision("o10"), "a digit continuation is not o1");
     }
 
     #[test]
