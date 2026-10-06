@@ -101,8 +101,14 @@ fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
 /// Prepare `bytes` (an image of `format`) for sending to a model: downscale so
 /// the longest side is at most `max_dim` and re-encode until it fits
 /// `max_bytes`. Returns the (possibly unchanged) bytes, their media type and
-/// dimensions. Re-encodes to JPEG when the source type is not in
-/// `accepted_media_types` (empty = accept all).
+/// dimensions.
+///
+/// The output type is always one the endpoint accepts: the source type when it
+/// is in `accepted_media_types` (empty = accept any of ours), else a re-encode
+/// into an accepted codec this build can emit (JPEG, then PNG). Fails clearly
+/// when none of those is accepted, rather than sending a type the model
+/// rejects. Also fails when the image still exceeds `max_bytes` at the minimum
+/// dimensions, rather than returning oversized bytes the request would reject.
 pub fn prepare(
     bytes: &[u8],
     format: ImageFormat,
@@ -111,8 +117,28 @@ pub fn prepare(
     accepted_media_types: &[String],
 ) -> Result<PreparedImage> {
     let (mut width, mut height) = dimensions(bytes)?;
-    let accepts_source =
-        accepted_media_types.is_empty() || accepted_media_types.iter().any(|t| t == format.media_type());
+    let accepts = |mt: &str| accepted_media_types.is_empty() || accepted_media_types.iter().any(|t| t == mt);
+    let accepts_source = accepts(format.media_type());
+    // The codec to re-encode into when the bytes must change (unaccepted source
+    // type, or too large to keep). JPEG compresses photos best; PNG is the
+    // lossless fallback; otherwise keep an accepted source type. If none of
+    // those is accepted there is no codec we can emit, so fail clearly rather
+    // than send a rejected type.
+    let shrink_codec = if accepts(ImageFormat::Jpeg.media_type()) {
+        ImageFormat::Jpeg
+    } else if accepts(ImageFormat::Png.media_type()) {
+        ImageFormat::Png
+    } else if accepts_source {
+        format
+    } else {
+        bail!(
+            "image is {}, but the model accepts only {:?} and this build can re-encode \
+             only to PNG or JPEG",
+            format.media_type(),
+            accepted_media_types
+        );
+    };
+
     let mut out_bytes = bytes.to_vec();
     // The format the prepared bytes are actually encoded as — media type and
     // file extension are both derived from this, so they never disagree with
@@ -131,27 +157,36 @@ pub fn prepare(
         } else {
             img
         };
-        // Encode, shrinking further until under the byte cap. JPEG has no alpha
-        // and compresses photos well, so it is the fallback when the source type
-        // is not accepted or the PNG stays too large.
-        let mut use_jpeg = !accepts_source;
+        // Start from the source type when the model accepts it (avoids a
+        // needless recompression), else go straight to the accepted re-encode
+        // codec. Encode, shrinking until under the byte cap.
+        let mut codec = if accepts_source { format } else { shrink_codec };
         loop {
             let (w, h) = (img.width(), img.height());
-            let encoded = if use_jpeg { encode_jpeg(&img)? } else { encode_format(&img, format)? };
-            if encoded.len() <= max_bytes || (w <= 16 && h <= 16) {
+            let encoded = encode_as(&img, codec)?;
+            if encoded.len() <= max_bytes {
                 out_bytes = encoded;
-                out_format = if use_jpeg { ImageFormat::Jpeg } else { format };
+                out_format = codec;
                 width = w;
                 height = h;
                 break;
             }
-            // Too big: switch to JPEG if we have not, else shrink and retry.
-            if !use_jpeg {
-                use_jpeg = true;
-            } else {
-                let (nw, nh) = ((w * 3 / 4).max(16), (h * 3 / 4).max(16));
-                img = img.resize(nw, nh, image::imageops::FilterType::Triangle);
+            // Too big: switch to the size-reducing codec first, before shrinking.
+            if codec != shrink_codec {
+                codec = shrink_codec;
+                continue;
             }
+            // Already the smallest codec and still over the cap at the minimum
+            // dimensions: the cap cannot be met, so fail instead of returning
+            // oversized bytes the provider would reject.
+            if w <= 16 && h <= 16 {
+                bail!(
+                    "image cannot be reduced under the {max_bytes}-byte limit even at {w}×{h}; \
+                     the model's image size limit is too small for this image"
+                );
+            }
+            let (nw, nh) = ((w * 3 / 4).max(16), (h * 3 / 4).max(16));
+            img = img.resize(nw, nh, image::imageops::FilterType::Triangle);
         }
     }
     Ok(PreparedImage {
@@ -166,6 +201,7 @@ pub fn prepare(
 /// An image ready to send: its (possibly downscaled / re-encoded) bytes, the
 /// media type of those bytes, the file extension matching that media type, and
 /// their pixel dimensions.
+#[derive(Debug)]
 pub struct PreparedImage {
     pub bytes: Vec<u8>,
     pub media_type: String,
@@ -190,6 +226,11 @@ fn encode_format(img: &image::DynamicImage, format: ImageFormat) -> Result<Vec<u
     let mut out = std::io::Cursor::new(Vec::new());
     img.write_to(&mut out, format.image_format()).context("encode image")?;
     Ok(out.into_inner())
+}
+
+/// Encode `img` as `codec`, flattening alpha for the alpha-less JPEG codec.
+fn encode_as(img: &image::DynamicImage, codec: ImageFormat) -> Result<Vec<u8>> {
+    if codec == ImageFormat::Jpeg { encode_jpeg(img) } else { encode_format(img, codec) }
 }
 
 fn encode_jpeg(img: &image::DynamicImage) -> Result<Vec<u8>> {
@@ -333,6 +374,62 @@ mod tests {
         // extension must report JPEG.
         assert_eq!(prepared.media_type, "image/jpeg");
         assert_eq!(prepared.extension, "jpg");
+    }
+
+    #[test]
+    fn prepare_errors_when_minimum_size_still_exceeds_byte_cap() {
+        // A byte cap so small that even the 16×16 floor cannot satisfy it must
+        // fail, not return oversized bytes the provider would then reject.
+        let bytes = make_png(64, 64);
+        let err = prepare(&bytes, ImageFormat::Png, MAX_DIMENSION, 10, &[]).unwrap_err();
+        assert!(err.to_string().contains("cannot be reduced"), "{err}");
+    }
+
+    #[test]
+    fn prepare_respects_accepted_types_when_shrinking() {
+        // A model accepting only PNG must not receive a JPEG re-encode when the
+        // source (an oversized PNG) is shrunk — the output stays PNG.
+        let mut img = image::RgbImage::new(2000, 2000);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 251) as u8, (y % 239) as u8, ((x * y) % 233) as u8]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
+        let png_only = vec!["image/png".to_string()];
+        let prepared = prepare(&bytes, ImageFormat::Png, MAX_DIMENSION, 50_000, &png_only).unwrap();
+        assert!(prepared.bytes.len() <= 50_000, "{} bytes", prepared.bytes.len());
+        assert_eq!(prepared.media_type, "image/png");
+        assert_eq!(prepared.extension, "png");
+        assert_eq!(ImageFormat::sniff(&prepared.bytes), Some(ImageFormat::Png));
+    }
+
+    #[test]
+    fn prepare_reencodes_unaccepted_source_into_an_accepted_codec() {
+        // A GIF where only PNG is accepted re-encodes to PNG (not JPEG).
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([1, 2, 3])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Gif).unwrap();
+        let bytes = out.into_inner();
+        let png_only = vec!["image/png".to_string()];
+        let prepared = prepare(&bytes, ImageFormat::Gif, MAX_DIMENSION, DEFAULT_MAX_BYTES, &png_only).unwrap();
+        assert_eq!(prepared.media_type, "image/png");
+        assert_eq!(prepared.extension, "png");
+        assert_eq!(ImageFormat::sniff(&prepared.bytes), Some(ImageFormat::Png));
+    }
+
+    #[test]
+    fn prepare_errors_when_no_implemented_codec_is_accepted() {
+        // A GIF where the model accepts only WebP: we cannot re-encode to an
+        // accepted type (we emit only PNG/JPEG), so fail rather than send a GIF
+        // or an unsupported JPEG.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(20, 20, image::Rgb([1, 2, 3])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Gif).unwrap();
+        let bytes = out.into_inner();
+        let webp_only = vec!["image/webp".to_string()];
+        let err = prepare(&bytes, ImageFormat::Gif, MAX_DIMENSION, DEFAULT_MAX_BYTES, &webp_only).unwrap_err();
+        assert!(err.to_string().contains("re-encode"), "{err}");
     }
 
     #[test]

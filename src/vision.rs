@@ -48,12 +48,14 @@ impl Vision {
             return None;
         }
         let limits = capabilities.get("limits").and_then(|l| l.get("vision"));
-        let max_images = limits
-            .and_then(|v| v.get("max_prompt_images"))
-            .and_then(serde_json::Value::as_u64)
-            .filter(|&n| n > 0)
-            .map(|n| n as usize)
-            .unwrap_or(1);
+        // An explicit `max_prompt_images: 0` reports the model as blind even
+        // though `supports.vision` is true — honour the stricter limit and
+        // grant no vision, distinct from an absent limit (which defaults to 1).
+        let reported_max = limits.and_then(|v| v.get("max_prompt_images")).and_then(serde_json::Value::as_u64);
+        if reported_max == Some(0) {
+            return None;
+        }
+        let max_images = reported_max.map(|n| n as usize).unwrap_or(1);
         let max_image_bytes = limits
             .and_then(|v| v.get("max_prompt_image_size"))
             .and_then(serde_json::Value::as_u64)
@@ -134,12 +136,37 @@ pub fn resolve(
     if let Some(reported) = reported {
         return Some(reported.clone());
     }
-    // Anthropic and OpenAI direct: assume current model families see images.
+    // Built-in family assumptions apply only to the first-party direct
+    // providers whose model families we actually know. `ProviderKind::Openai`
+    // is shared by every OpenAI-compatible endpoint (Ollama, llama.cpp,
+    // OpenRouter, Groq, …); a local model merely *named* `gpt-5` there is not an
+    // OpenAI model and must not inherit OpenAI's vision support — especially
+    // when its own endpoint probe reported no vision.
     match kind {
         Some(ProviderKind::Anthropic) => Some(Vision::capable()),
-        Some(ProviderKind::Openai) if assumes_openai_vision(model) => Some(Vision::capable()),
+        Some(ProviderKind::Openai) if is_openai_direct(provider) && assumes_openai_vision(model) => {
+            Some(Vision::capable())
+        }
         _ => None,
     }
+}
+
+/// The host of a provider's `base_url`, lowercased (for first-party endpoint
+/// checks). `None` when no base URL is configured or it has no host.
+fn base_url_host(provider: &ProviderConfig) -> Option<String> {
+    let url = provider.base_url.as_deref()?;
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip any userinfo and port.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.rsplit(':').next_back().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether this provider is the first-party OpenAI API (`api.openai.com`),
+/// rather than some other OpenAI-compatible endpoint sharing the kind.
+fn is_openai_direct(provider: &ProviderConfig) -> bool {
+    base_url_host(provider).is_some_and(|h| h == "api.openai.com" || h.ends_with(".api.openai.com"))
 }
 
 /// Whether an OpenAI-direct model name is a current vision-capable family.
@@ -189,15 +216,14 @@ mod tests {
         assert_eq!(vision.max_image_bytes, crate::attachment::DEFAULT_MAX_BYTES);
         assert!(vision.media_types.is_empty());
 
-        // No vision support, or a zero image count, means blind.
+        // No vision support means blind; an explicit zero image count is also
+        // blind (distinct from an absent limit, which defaults to 1).
         assert_eq!(Vision::from_model_entry(&json!({ "capabilities": { "supports": {} } })), None);
         assert_eq!(
             Vision::from_model_entry(
                 &json!({ "capabilities": { "supports": { "vision": true }, "limits": { "vision": { "max_prompt_images": 0 } } } })
-            )
-            .unwrap()
-            .max_images,
-            1
+            ),
+            None
         );
     }
 
@@ -213,15 +239,37 @@ mod tests {
     #[test]
     fn override_wins_over_detection() {
         let provider = ProviderConfig::default();
+        let openai_direct = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
         // Configured false blinds even an Anthropic model.
         assert_eq!(resolve(Some(false), Some(ProviderKind::Anthropic), &provider, "claude-sonnet-4-5", None), None);
         // Configured true enables a model the endpoint said nothing about.
         assert!(resolve(Some(true), Some(ProviderKind::Openai), &provider, "some-local", None).is_some());
-        // No override: Anthropic assumed capable, unknown OpenAI-compatible not.
+        // No override: Anthropic assumed capable, the OpenAI family on the
+        // first-party OpenAI API assumed capable, a non-family OpenAI model not.
         assert!(resolve(None, Some(ProviderKind::Anthropic), &provider, "claude-sonnet-4-5", None).is_some());
-        assert!(resolve(None, Some(ProviderKind::Openai), &provider, "gpt-5-mini", None).is_some());
-        assert_eq!(resolve(None, Some(ProviderKind::Openai), &provider, "text-embedding-3", None), None);
+        assert!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "gpt-5-mini", None).is_some());
+        assert_eq!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "text-embedding-3", None), None);
         assert_eq!(resolve(None, None, &provider, "m", None), None);
+    }
+
+    #[test]
+    fn built_in_openai_assumption_is_scoped_to_the_first_party_api() {
+        // `ProviderKind::Openai` is shared by every OpenAI-compatible endpoint.
+        // A local Ollama/OpenRouter model merely *named* like an OpenAI family
+        // must not inherit OpenAI's vision support from the built-in assumption.
+        let ollama = ProviderConfig { base_url: Some("http://localhost:11434/v1".into()), ..Default::default() };
+        let openrouter = ProviderConfig { base_url: Some("https://openrouter.ai/api/v1".into()), ..Default::default() };
+        assert_eq!(resolve(None, Some(ProviderKind::Openai), &ollama, "gpt-5", None), None);
+        assert_eq!(resolve(None, Some(ProviderKind::Openai), &openrouter, "gpt-4o", None), None);
+        // A reported negative from the endpoint probe is preserved: no probe
+        // result (`None`) on a non-first-party endpoint falls through to blind,
+        // never re-enabled by the OpenAI family assumption.
+        assert_eq!(resolve(None, Some(ProviderKind::Openai), &ollama, "gpt-4o", None), None);
+        // The genuine OpenAI API still gets the assumption.
+        let openai = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
+        assert!(resolve(None, Some(ProviderKind::Openai), &openai, "gpt-4o", None).is_some());
+        // A report (vision true) still wins everywhere, regardless of host.
+        assert!(resolve(None, Some(ProviderKind::Openai), &ollama, "gpt-5", Some(&Vision::capable())).is_some());
     }
 
     #[test]

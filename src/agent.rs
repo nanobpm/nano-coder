@@ -1163,6 +1163,20 @@ impl Agent {
         )
     }
 
+    /// Capability context appended to a non-image binary-file error: whether
+    /// the current model can view images at all. The generic binary error in
+    /// `read_file` cannot add this itself, so it is appended at dispatch where
+    /// the resolved vision capability is known.
+    fn binary_vision_hint(&self) -> String {
+        if self.vision().is_some() {
+            " (the current model can view images, but this is not a supported image type: \
+             PNG, JPEG, GIF or WebP)"
+                .to_string()
+        } else {
+            " (the current model can't view images; switch to a vision model or set `vision = true`)".to_string()
+        }
+    }
+
     /// Turn a `read_file` image result (`{"image": {…, data_base64}}`) into the
     /// tool-result text and its attachment. Returns `Ok(None)` when `result` is
     /// not an image result. When the model cannot view images, returns `Err`
@@ -2793,6 +2807,14 @@ impl Agent {
                         }
                     },
                 };
+                // A non-image binary file takes read_file's generic "looks
+                // like a binary file" error, which cannot name the model's
+                // image capability itself. Append that context here so the
+                // message says whether this model could have viewed an image
+                // (README "Vision").
+                if !ok && tool_call.name == "read_file" && result_text.contains("looks like a binary file") {
+                    result_text.push_str(&self.binary_vision_hint());
+                }
                 if ok
                     && matches!(tool_call.name.as_str(), "read_file" | "write_file" | "edit_file")
                     && let Some(path) = effective_call.arguments.get("path").and_then(Value::as_str)
@@ -3831,6 +3853,33 @@ mod tests {
         assert!(tool.attachments.is_empty());
         assert!(tool.content.contains("can't view images"), "hint: {}", tool.content);
         assert!(tool.content.contains("vision = true"), "names the fix: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_binary_error_notes_vision_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-image binary file (contains NUL bytes, no image magic).
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 3, 255, 0, 42]).unwrap();
+
+        // A vision-capable model: the binary error still says it can view images
+        // (so the model knows the failure is the file type, not its capability).
+        let (mut agent, _) =
+            file_agent(vec![read_call("c1", bin.to_str().unwrap()), text("ok")], dir.path(), Some(true));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "read").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.is_error, "binary read failed");
+        assert!(tool.content.contains("looks like a binary file"), "binary error: {}", tool.content);
+        assert!(tool.content.contains("can view images"), "capability hint: {}", tool.content);
+
+        // A non-vision model: the same error names the missing capability.
+        let (mut agent, _) =
+            file_agent(vec![read_call("c1", bin.to_str().unwrap()), text("ok")], dir.path(), Some(false));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "read").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.content.contains("can't view images"), "capability hint: {}", tool.content);
     }
 
     #[tokio::test(flavor = "multi_thread")]

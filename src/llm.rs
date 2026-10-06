@@ -355,19 +355,21 @@ pub struct ChatRequest<'a> {
 }
 
 impl ChatRequest<'_> {
-    /// The set of attachment `sha256` hashes this request sends as images: the
-    /// newest `vision.max_images` across the conversation (every older one is
-    /// omitted, its message showing a placeholder instead). Without this a
-    /// second image on a model capped at one image would fail the request. An
-    /// empty set (no vision, or `max_images == 0`) sends none.
-    fn sendable(&self) -> std::collections::HashSet<&str> {
+    /// The attachment *occurrences* this request sends as images: the newest
+    /// `vision.max_images` across the conversation (every older one is omitted,
+    /// its message showing a placeholder instead). Identified by occurrence, not
+    /// content hash, so reading the same image twice does not make *both* copies
+    /// sendable and overflow a model's image limit — a model capped at one image
+    /// keeps only the newest occurrence even when an older message repeats its
+    /// SHA. An empty set (no vision, or `max_images == 0`) sends none.
+    fn sendable(&self) -> std::collections::HashSet<*const crate::llm::Attachment> {
         let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
         let mut all: Vec<&crate::llm::Attachment> = self.messages.iter().flat_map(|m| m.attachments.iter()).collect();
         // Keep the newest `max`: drop the oldest excess from the front.
         let keep = max.min(all.len());
         let drop = all.len() - keep;
         all.drain(..drop);
-        all.into_iter().map(|a| a.sha256.as_str()).collect()
+        all.into_iter().map(|a| a as *const crate::llm::Attachment).collect()
     }
 
     /// Resolve each of `message`'s attachments for the wire, in order: either
@@ -382,7 +384,7 @@ impl ChatRequest<'_> {
             .attachments
             .iter()
             .map(|attachment| {
-                if !sendable.contains(attachment.sha256.as_str()) {
+                if !sendable.contains(&(attachment as *const crate::llm::Attachment)) {
                     return ResolvedAttachment::Omitted(format!(
                         "[image omitted: {} (sent earlier)]",
                         attachment.path.display()
@@ -419,7 +421,7 @@ impl ChatRequest<'_> {
         self.messages
             .iter()
             .flat_map(|m| m.attachments.iter())
-            .any(|a| sendable.contains(a.sha256.as_str()) && crate::attachment::exists(dir, a))
+            .any(|a| sendable.contains(&(a as *const crate::llm::Attachment)) && crate::attachment::exists(dir, a))
     }
 }
 
@@ -719,6 +721,28 @@ mod tests {
         assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
         assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
         assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn repeated_same_image_counts_each_occurrence_not_unique_hashes() {
+        // Reading the same image twice: a model capped at one image must send
+        // only the newest occurrence, not both copies of the shared SHA.
+        let dir = tempfile::tempdir().unwrap();
+        let shared = attachment("dup", Some(dir.path()));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "first read").with_attachments(vec![shared.clone()]),
+            Message::tool_result("t2", "read_file", "second read").with_attachments(vec![shared.clone()]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)),
+            "the older occurrence of a repeated image must be omitted"
+        );
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
     }
 
     #[test]
