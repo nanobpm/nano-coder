@@ -56,6 +56,8 @@ drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites o
 asking for input (the `question` tool's picker owns the terminal until you answer).
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
+At the idle prompt, **Esc Esc** instead clears the input, so a half-typed or pasted prompt
+can be discarded without deleting it character by character.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 
@@ -772,7 +774,8 @@ editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the sta
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
 the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
-input and Ctrl-W deletes the word before the cursor. At the prompt between turns,
+input, Ctrl-W deletes the word before the cursor, and Esc Esc (twice within a second)
+clears the whole input at the prompt. At the prompt between turns,
 Ctrl-Enter (or Cmd-Enter) inserts a newline without sending, and pasted text keeps its line breaks as a single multi-line input
 instead of sending line by line. Ctrl-D exits on an empty line.
 

@@ -224,9 +224,6 @@ fn set_thinking_text(agent: &mut Agent, arg: &str) -> String {
     text
 }
 
-/// Esc twice within this window cancels the running turn.
-const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
-
 /// Ctrl-C twice within this window exits the interactive CLI. Time-based (not
 /// "next line" based) so an interleaved keystroke or a queued/empty line
 /// between the two presses cannot silently disarm the exit.
@@ -273,24 +270,11 @@ impl DoublePress {
     }
 }
 
-/// Detects a double Esc press.
-#[derive(Default)]
-struct DoubleEscape {
-    last: Option<std::time::Instant>,
-}
-
-impl DoubleEscape {
-    /// Record a press at `now`; true when it completes a double press.
-    fn press(&mut self, now: std::time::Instant) -> bool {
-        match self.last.take() {
-            Some(last) if now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => true,
-            _ => {
-                self.last = Some(now);
-                false
-            }
-        }
-    }
-}
+/// Detects a double Esc press (the window lives in `lineedit` alongside the
+/// type). Shared with the idle prompt's clear gesture so the two cannot drift;
+/// `DoublePress` (Ctrl-C) has an extra deadline/disarm lifecycle, which the Esc
+/// gesture does not need.
+type DoubleEscape = lineedit::DoubleEscape;
 
 /// The terminal-owning state shared between the SIGWINCH resize task and a live
 /// renderer switch (`Terminal::renderer_switched`). Both must serialise against
@@ -727,9 +711,16 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         println!();
     }
     renderer.begin_turn();
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
-    let mut escape = DoubleEscape::default();
-    let outcome = async {
+    let outcome = {
+        // The turn is a non-idle phase: the guard restores the idle `Prompt`
+        // mode on *every* exit path (including a future early `return`, `?`,
+        // or a panic unwinding the loop), not just the single explicit
+        // restore a hand-placed pair offers. It drops at the end of this
+        // block — after `end_turn`, before the steer drain below — preserving
+        // the exact ordering the manual `set_mode` pair had.
+        let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
+        let mut escape = DoubleEscape::default();
+        let outcome = async {
         // Grab the broker before the turn future borrows `agent` mutably.
         let questions = agent.questions();
         let turn = agent.run_turn(None, text);
@@ -885,8 +876,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         }
     }
     .await;
-    renderer.end_turn();
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
+        renderer.end_turn();
+        outcome
+    };
     // A steer typed as the turn finished queues behind what is already
     // waiting, unless the turn was cancelled. Drain it before propagating any
     // turn error too: `start_turn` does not clear pending steers, so a steer
@@ -1216,13 +1208,28 @@ async fn run_compaction(
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
     let stats = agent.context_stats();
+    // Compaction is a non-idle phase: a `/compact` deferred from a turn runs
+    // here *after* the turn loop already restored `EditMode::Prompt` (see
+    // `run_interactive_turn`), while the persistent line reader stays
+    // outstanding. Left in `Prompt`, the idle "Esc Esc clears the input"
+    // gesture would erase a partially typed next message with the same presses
+    // that cancel the compaction — the destructive behaviour that guard exists
+    // to prevent. The `NonIdlePhase` guard marks the phase `Turn` so
+    // `escape_press` neither clears nor arms, and restores `Prompt` on *every*
+    // exit path when it drops (the Prompt→Turn→Prompt transitions bump the edit
+    // generation, so a stale pre-compaction arm cannot complete afterwards
+    // either).
+    let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
     let compaction = agent.compact(mode, instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
-    loop {
+    // The loop only exits by resolving the compaction future; the guard above
+    // restores the idle `Prompt` mode when it drops at function exit, so there
+    // is no explicit restore to skip even if a future edit adds an early return.
+    let report = loop {
         tokio::select! {
             biased;
-            report = &mut compaction => return report,
+            report = &mut compaction => break report,
             input = terminal.recv() => match input {
                 TermInput::Interrupt => {
                     control.cancel();
@@ -1282,7 +1289,10 @@ async fn run_compaction(
                 }
             },
         }
-    }
+    };
+    // The `NonIdlePhase` guard restores the idle prompt when it drops here, so
+    // the next read's Esc Esc gesture is live again.
+    report
 }
 
 /// Parse the id from `/memory forget <id>` args, requiring a token boundary
@@ -2498,6 +2508,19 @@ async fn main() -> Result<()> {
                         }
                         prompt(&terminal, false);
                     }
+                    TermInput::Escape => {
+                        // The input-clearing half of the gesture happens in
+                        // `lineedit::LineReader` (see `escape_press`), the only
+                        // place that sees every Esc. An Escape that surfaces
+                        // here means the buffer was already empty, so there is
+                        // nothing to clear. Consume it in place like the other
+                        // mid-line events (ToggleThinking/CycleMode) rather than
+                        // breaking out to the outer loop's `continue`, which
+                        // would restart the loop and re-emit `prompt()` — a
+                        // spurious redraw that contradicts the inert-empty
+                        // no-op contract. Staying in the inner loop keeps the
+                        // empty-buffer Esc a true zero-redraw no-op.
+                    }
                     other => break other,
                 }
             };
@@ -2514,7 +2537,14 @@ async fn main() -> Result<()> {
                     terminal.renderer.transient_note("(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_) => {
+                TermInput::Escape => {
+                    // Escape is now consumed in the inner event loop above (a
+                    // true no-op on an empty buffer), so it never breaks out to
+                    // here. This arm is retained only for match exhaustiveness,
+                    // mirroring the ToggleThinking/CycleMode/Rejected arm below.
+                    continue;
+                }
+                TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
                     continue;
                 }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),

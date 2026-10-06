@@ -2535,8 +2535,8 @@ impl Agent {
                 let mut pre_hook_deny: Option<String> = None;
                 if let Some(claude_hooks) = self.claude_hooks.as_ref() {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
-                        && !(self.control.mode() == crate::mode::AgentMode::Plan
-                            && !crate::mode::plan_allows(&tool_call.name))
+                        && (self.control.mode() != crate::mode::AgentMode::Plan
+                            || crate::mode::plan_allows(&tool_call.name))
                         && self.policy.check(&tool_call.name, &tool_call.arguments).is_ok();
                     if runnable {
                         let outcome =
@@ -5748,12 +5748,6 @@ mod tests {
         // sends it.
         let config = Config {
             session_dir: Some(dir.path().to_path_buf()),
-            // Isolate memory in the temp dir: this test asserts exact token
-            // arithmetic against an 18k window, and the post-compaction room the
-            // retry re-resolves must not depend on the developer's real,
-            // ever-growing memory index (which is injected into the system
-            // prompt and would shift the count under the 16k budget).
-            memory_dir: Some(dir.path().join("memory")),
             project_instructions: false,
             skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
             context_window: Some(18_000),
