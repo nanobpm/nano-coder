@@ -109,7 +109,13 @@ fn closest(word: &str) -> Option<&'static str> {
     let len = word.chars().count();
     COMMANDS
         .iter()
-        .map(|c| (edit_distance(word, c.name), len.abs_diff(c.name.chars().count()), c.name))
+        .map(|c| (len.abs_diff(c.name.chars().count()), c.name))
+        // A distance of at most two is impossible when the lengths differ by
+        // more than two, so skip `edit_distance` (which allocates an
+        // O(word x name) matrix) for those: `word` can be an arbitrarily long
+        // paste or path, and every command is a short name.
+        .filter(|(len_diff, _)| *len_diff <= 2)
+        .map(|(len_diff, name)| (edit_distance(word, name), len_diff, name))
         .filter(|(d, _, _)| *d <= 2)
         // Fewest edits; on a tie, the same length (`/modle` -> `/model`, not `/mode`).
         .min_by_key(|(d, len_diff, _)| (*d, *len_diff))
@@ -437,6 +443,18 @@ mod tests {
         assert_eq!(unescape_prompt("  //x"), Some("/x"));
         assert_eq!(unescape_prompt("/exit"), None);
         assert_eq!(unescape_prompt("hello"), None);
+    }
+
+    #[test]
+    fn oversized_words_skip_edit_distance_and_suggest_nothing() {
+        // A word far longer than any command can't be within two edits, so
+        // `closest` returns nothing and no suggestion is appended — without
+        // computing an O(word x name) matrix per command for the long input.
+        let long = format!("/{}", "x".repeat(10_000));
+        assert_eq!(closest(&long), None);
+        let note = rejection(&long).unwrap();
+        assert!(note.starts_with("Unknown command /"), "{note}");
+        assert!(!note.contains("Did you mean"), "{note}");
     }
 
     #[test]

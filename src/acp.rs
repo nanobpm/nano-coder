@@ -54,6 +54,20 @@ fn prompt_text(params: &Value) -> String {
         .collect()
 }
 
+/// Enforce the terminal's `/…` invariant on an ACP prompt that no command
+/// handled: `Err(note)` to reject a slash line instead of sending it to the
+/// model, `Ok(text)` for the turn text (a `//…` prompt unescaped to a single
+/// leading `/`, anything else passed through unchanged).
+fn enforce_slash_invariant(text: String) -> Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+        return Err(crate::commands::rejection(trimmed).unwrap_or_else(|| {
+            format!("Can't run {trimmed:?}: unexpected arguments (/help lists commands and their arguments)")
+        }));
+    }
+    Ok(crate::commands::unescape_prompt(trimmed).map(str::to_string).unwrap_or(text))
+}
+
 /// A message arriving while a turn runs.
 enum DuringTurn {
     Cancel,
@@ -212,10 +226,24 @@ pub async fn handle_message(agent: &mut Agent, msg: Value) -> Action {
             }
             match handle_inner(agent, &msg).await {
                 Some(response) => Action::Respond(response),
-                None => Action::Turn {
-                    id: id.cloned(),
-                    input_id: input_id(&params).map(str::to_string),
-                    text: prompt_text(&params),
+                // Any `/…` prompt that no ACP command handled gets the same
+                // treatment as terminal input: a `//…` prompt is unescaped
+                // (one leading `/` removed), and every other slash line is
+                // rejected here instead of being sent to the model as a turn.
+                // This covers deferred prompts too, since they are re-run
+                // through `handle_message` from the turn loop.
+                None => match enforce_slash_invariant(prompt_text(&params)) {
+                    Err(note) => match id {
+                        Some(id) => {
+                            Action::Respond(result(Some(id), json!({ "stopReason": "end_turn", "response": note })))
+                        }
+                        None => Action::Nothing,
+                    },
+                    Ok(text) => Action::Turn {
+                        id: id.cloned(),
+                        input_id: input_id(&params).map(str::to_string),
+                        text,
+                    },
                 },
             }
         }
@@ -721,6 +749,23 @@ mod tests {
         );
         assert!(!sent.dropped);
         assert_eq!(thinking_value(&sent), json!("high"));
+    }
+
+    #[test]
+    fn slash_prompts_never_reach_the_model_over_acp() {
+        // Unknown command: rejected with a suggestion, not sent as a turn.
+        let note = enforce_slash_invariant("/exin".to_string()).unwrap_err();
+        assert!(note.starts_with("Unknown command /exin. Did you mean /exit?"), "{note}");
+        // A known command ACP doesn't implement is still never sent to the model.
+        assert!(enforce_slash_invariant("/help".to_string()).is_err());
+        // A path-like slash line is rejected with the `//` escape hint.
+        assert!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap_err().contains("type //usr/lib"));
+        // Leading whitespace doesn't smuggle a slash line past the check.
+        assert!(enforce_slash_invariant("  /exin".to_string()).is_err());
+        // `//…` is an escaped prompt: the turn sees it with one `/` removed.
+        assert_eq!(enforce_slash_invariant("//usr/lib is big".to_string()).unwrap(), "/usr/lib is big");
+        // Plain prompts pass through untouched (verbatim, including whitespace).
+        assert_eq!(enforce_slash_invariant("hello world\n".to_string()).unwrap(), "hello world\n");
     }
 
     #[test]
