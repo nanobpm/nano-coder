@@ -402,13 +402,18 @@ pub fn read_for_limits(attachments_dir: &Path, attachment: &Attachment, limits: 
     let accepts = limits.accepted_media_types.is_empty()
         || limits.accepted_media_types.iter().any(|t| t == media_type);
     // Fast path: the stored bytes already satisfy the active limits (accepted
-    // type, within the byte cap, within the dimension cap). The recorded
-    // dimensions describe exactly these hash-verified bytes, so trusting them
-    // here avoids re-decoding a compliant image on every request.
+    // type, within the byte cap, within the dimension cap). The dimensions are
+    // read from the hash-verified bytes themselves via a cheap header-only
+    // decode, not taken from the stored `width`/`height` metadata: those fields
+    // are not covered by the sha256 hash, so a tampered session log could
+    // under-report them and slip an over-dimension image past this gate. This
+    // mirrors sniffing the media type from the bytes rather than trusting the
+    // stored label.
     if accepts
         && bytes.len() <= limits.max_bytes
-        && attachment.width <= limits.max_dimension
-        && attachment.height <= limits.max_dimension
+        && let Ok((width, height)) = dimensions(&bytes)
+        && width <= limits.max_dimension
+        && height <= limits.max_dimension
     {
         return Some(ReadyImage {
             data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
@@ -819,6 +824,29 @@ mod tests {
         assert_eq!(ready.media_type, "image/png", "GIF re-encoded into the accepted PNG codec");
         let reencoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &ready.data_base64).unwrap();
         assert_eq!(ImageFormat::sniff(&reencoded), Some(ImageFormat::Png));
+    }
+
+    /// The fast path must gate on the *actual* bytes' dimensions, not the
+    /// stored `width`/`height` metadata. Those fields are not covered by the
+    /// sha256 hash, so a tampered session log that under-reports them must not
+    /// let an over-dimension image slip through unchanged — it is downscaled
+    /// just like any oversized image.
+    #[test]
+    fn read_for_limits_ignores_lying_stored_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        // A solid-colour 2000×2000 PNG: over the 1568 cap but highly
+        // compressible, so it stays well under the byte cap.
+        let bytes = make_png(2000, 2000);
+        assert!(bytes.len() <= DEFAULT_MAX_BYTES, "test image must fit the byte cap");
+        let mut attachment = store_bytes(dir.path(), &bytes, "png", "image/png");
+        // The log lies that the image is tiny.
+        attachment.width = 10;
+        attachment.height = 10;
+        let ready = read_for_limits(dir.path(), &attachment, &ImageLimits::default()).unwrap();
+        let sent = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &ready.data_base64).unwrap();
+        let (w, h) = dimensions(&sent).unwrap();
+        assert!(w <= MAX_DIMENSION && h <= MAX_DIMENSION, "oversized image downscaled despite the lying metadata");
+        assert!(w == MAX_DIMENSION || h == MAX_DIMENSION, "downscaled to the cap, not sent unchanged");
     }
 
     /// When the stored bytes cannot be made to satisfy the active model's
