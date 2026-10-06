@@ -102,7 +102,17 @@ fn closest(word: &str) -> Option<&'static str> {
     let len = word.chars().count();
     COMMANDS
         .iter()
-        .map(|c| (edit_distance(word, c.name), len.abs_diff(c.name.chars().count()), c.name))
+        .filter_map(|c| {
+            // Edit distance is never smaller than the length difference, so a
+            // candidate more than two chars longer or shorter than `word` can
+            // never be within two edits. Check that first: it keeps
+            // `edit_distance` — which allocates an O(word·name) matrix — from
+            // running on unbounded editor input. A long `/…` token would
+            // otherwise allocate one row per input char for every command,
+            // which can hang or exhaust memory.
+            let len_diff = len.abs_diff(c.name.chars().count());
+            (len_diff <= 2).then(|| (edit_distance(word, c.name), len_diff, c.name))
+        })
         .filter(|(d, _, _)| *d <= 2)
         // Fewest edits; on a tie, the same length (`/modle` -> `/model`, not `/mode`).
         .min_by_key(|(d, len_diff, _)| (*d, *len_diff))
@@ -422,6 +432,23 @@ mod tests {
         assert_eq!(edit_distance("/modle", "/mode"), 1);
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    #[test]
+    fn closest_skips_the_matrix_for_oversized_input() {
+        // A near-miss still resolves (the length guard must not drop real
+        // candidates whose length is within two of a command).
+        assert_eq!(closest("/exin"), Some("/exit"));
+        assert_eq!(closest("/modle"), Some("/model"));
+        // A token far longer than any command never builds the O(word·name)
+        // edit-distance matrix (the length guard skips every candidate first),
+        // so unbounded editor input cannot hang or exhaust memory here.
+        let huge = format!("/{}", "x".repeat(100_000));
+        assert_eq!(closest(&huge), None);
+        // Rejection still works (and suggests nothing) for the oversized token.
+        let note = rejection(&huge).unwrap();
+        assert!(note.starts_with("Unknown command"), "{note:.40}");
+        assert!(!note.contains("Did you mean"), "{note:.40}");
     }
 
     fn plain(row: &str) -> String {
