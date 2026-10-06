@@ -1268,6 +1268,15 @@ async fn run_compaction(
                             Err(usage) => terminal.renderer.note(&format!("[{usage}]")),
                         }
                     } else {
+                        // A non-empty accepted `Line`/`Queue` deferred until
+                        // compaction finishes still supersedes a refusal hint
+                        // from a rejected `/command`, matching the mid-turn
+                        // behaviour; a blank Enter leaves the hint untouched.
+                        if let TermInput::Line(line) | TermInput::Queue(line) = &other
+                            && !line.trim().is_empty()
+                        {
+                            terminal.renderer.clear_transient();
+                        }
                         terminal.queued.push_back(other);
                     }
                 }
