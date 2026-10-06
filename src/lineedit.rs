@@ -46,6 +46,13 @@ impl DoubleEscape {
             }
         }
     }
+
+    /// Forget any armed press, so the next one starts a fresh pair. Used at a
+    /// read/mode boundary: a pair is two presses at the same idle prompt, so a
+    /// press recorded before the boundary must never complete one after it.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
 }
 
 /// Advance a wrap position by one input grapheme cluster, measured in terminal
@@ -1207,25 +1214,33 @@ impl LineReader {
     /// arms the detector and leaves the text alone, so an Esc used alone for
     /// line editing does not discard the buffer.
     ///
-    /// The clear is scoped to the idle prompt (`EditMode::Prompt`): during a
-    /// turn the input lives on the status line as the *next* message, and an Esc
-    /// there cancels or steers — clearing it would destroy text the user is
-    /// about to send.
+    /// The gesture is scoped to the idle prompt (`EditMode::Prompt`) in both
+    /// directions: during a turn the input lives on the status line as the
+    /// *next* message, and an Esc there cancels or steers — so a Turn-mode
+    /// press must neither clear the text nor *arm* the detector. Arming on a
+    /// turn-time press would let one Esc at the next idle prompt complete the
+    /// pair and clear the buffer, when the gesture requires two presses there.
     pub fn escape_press(&mut self, view: &SharedView, now: std::time::Instant) -> bool {
+        let mut view = view.lock().unwrap();
+        if view.mode != EditMode::Prompt {
+            return false;
+        }
         if !self.escape.press(now) {
             return false;
         }
-        let mut view = view.lock().unwrap();
-        if view.mode == EditMode::Prompt && view.clear_input_if_any() {
-            return true;
-        }
-        false
+        view.clear_input_if_any()
     }
 
     /// Read one line. Ctrl-C, Ctrl-O and Esc go to `send` straight away; the
     /// return value is a `Key::Line` or `Key::Eof`.
     pub fn read_line(&mut self, view: &SharedView, send: &dyn Fn(Key)) -> Key {
         let _mode = KeyMode::enter();
+        // A double press is two Esc presses at the same idle prompt, so the
+        // detector must not carry an arm across a read boundary: this reader
+        // is persistent, and without the reset an Esc pressed in a previous
+        // read (e.g. mid-turn) could pair with a single Esc here and clear
+        // the buffer.
+        self.escape.reset();
         {
             // The inline menu writes escape sequences (IND scrolls, cursor
             // save/restore) straight to the terminal. Under the frame renderer
@@ -2511,6 +2526,51 @@ mod tests {
         assert!(!reader.escape_press(&view, t));
         assert!(!reader.escape_press(&view, t + std::time::Duration::from_millis(100)));
         assert_eq!(view.lock().unwrap().line, "steer this", "Esc during a turn keeps the next message");
+    }
+
+    #[test]
+    fn escape_during_a_turn_does_not_arm_the_prompt_clear() {
+        // The reader is persistent, so a Turn-mode Esc must not arm the
+        // detector: otherwise one Esc at the next idle prompt would complete
+        // the pair and clear the buffer, when the gesture requires two
+        // presses at that prompt.
+        let (mut reader, view) = prompt_reader("next message");
+        let t = std::time::Instant::now();
+        view.lock().unwrap().mode = EditMode::Turn;
+        assert!(!reader.escape_press(&view, t), "a turn-time Esc is not the gesture's");
+        view.lock().unwrap().mode = EditMode::Prompt;
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "the first Esc at the idle prompt only arms; the turn-time press must not count"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "one idle Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two idle Esc presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn a_new_read_starts_a_fresh_escape_pair() {
+        // `read_line` resets the detector, so an Esc that ended one read
+        // cannot pair with the first Esc of the next: two Esc bytes split
+        // across reads leave the buffer alone, while two inside one read
+        // clear it.
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        view.lock().unwrap().mode = EditMode::Prompt;
+        view.lock().unwrap().line = "draft".into();
+        view.lock().unwrap().cursor = 5;
+        let sent = Mutex::new(Vec::new());
+        let send = |key: Key| sent.lock().unwrap().push(key_name(&key));
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof), "the pending buffer ends");
+        view.lock().unwrap().line = "draft".into();
+        reader.pending.extend(b"\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof));
+        assert_eq!(view.lock().unwrap().line, "draft", "Esc presses split across reads never pair");
+        reader.pending.extend(b"\x1b\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof));
+        assert!(view.lock().unwrap().line.is_empty(), "two Esc in one read clear the input");
+        assert_eq!(sent.into_inner().unwrap(), ["escape", "escape", "escape", "escape"]);
     }
 
     #[test]
