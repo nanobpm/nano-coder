@@ -1138,6 +1138,39 @@ enum Esc {
     Ignored,
 }
 
+/// Marks the view as a non-idle (`EditMode::Turn`) phase for the guard's
+/// lifetime, restoring `EditMode::Prompt` when it is dropped. Compaction runs
+/// on the still-outstanding prompt read (a `/compact` deferred from a turn
+/// executes after the turn loop already restored `Prompt`), so without this the
+/// idle "Esc Esc clears the input" gesture would erase a partially typed next
+/// message with the same presses that cancel the compaction. Bracketing the
+/// phase with a guard — rather than a hand-placed `set_mode(Turn)` / trailing
+/// `set_mode(Prompt)` pair — restores the idle prompt on *every* exit path
+/// (including a future early `return`, `?`, or panic that unwinds the loop),
+/// not just the single explicit one, and makes the transition directly
+/// testable without driving a whole async compaction.
+#[must_use = "dropping the guard immediately restores EditMode::Prompt"]
+pub struct NonIdlePhase {
+    view: SharedView,
+}
+
+impl NonIdlePhase {
+    /// Enter the non-idle phase: mark the view `Turn` now, restore `Prompt` on
+    /// drop. Each transition bumps the view's edit generation (see
+    /// [`EditView::set_mode`]), so a double-Esc arm made before the phase cannot
+    /// complete with a single press after it.
+    pub fn enter(view: &SharedView) -> Self {
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        Self { view: view.clone() }
+    }
+}
+
+impl Drop for NonIdlePhase {
+    fn drop(&mut self) {
+        self.view.lock().unwrap().set_mode(EditMode::Prompt);
+    }
+}
+
 /// Reads keys, carrying bytes that arrived past the end of a line (pastes)
 /// into the next read.
 #[derive(Default)]
@@ -2693,6 +2726,49 @@ mod tests {
         );
         assert_eq!(view.lock().unwrap().line, "next message", "one post-compaction Esc keeps the text");
         assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(400)), "two idle presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn non_idle_phase_marks_turn_and_restores_prompt_on_drop() {
+        // The guard that brackets a compaction (`run_compaction`) must mark the
+        // view `Turn` for its lifetime and restore `Prompt` when it drops — and
+        // it must bump the edit generation on *both* transitions so a double-Esc
+        // arm made before the phase cannot complete with one press after it.
+        let (mut reader, view) = prompt_reader("draft");
+        assert_eq!(view.lock().unwrap().mode, EditMode::Prompt);
+        let gen_before = view.lock().unwrap().edit_generation;
+        // Arm the idle gesture, then enter the non-idle phase.
+        let t = std::time::Instant::now();
+        assert!(!reader.escape_press(&view, t), "the first idle Esc only arms");
+        {
+            let _phase = NonIdlePhase::enter(&view);
+            assert_eq!(view.lock().unwrap().mode, EditMode::Turn, "the phase marks Turn");
+            assert_ne!(
+                view.lock().unwrap().edit_generation,
+                gen_before,
+                "entering the phase bumps the edit generation"
+            );
+            // A press during the phase neither clears nor arms (Turn-mode early
+            // return), and the pre-phase arm is now stale.
+            assert!(
+                !reader.escape_press(&view, t + std::time::Duration::from_millis(50)),
+                "a phase-time Esc neither clears nor completes the stale arm"
+            );
+            assert_eq!(view.lock().unwrap().line, "draft", "the draft survives the phase");
+        }
+        // Dropping the guard restores the idle prompt, bumping the generation
+        // again so the stale arm still cannot complete.
+        assert_eq!(view.lock().unwrap().mode, EditMode::Prompt, "drop restores Prompt");
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "the first idle Esc after the phase only re-arms; the pre-phase arm did not survive"
+        );
+        assert_eq!(view.lock().unwrap().line, "draft", "one post-phase Esc keeps the text");
+        assert!(
+            reader.escape_press(&view, t + std::time::Duration::from_millis(150)),
+            "two fresh idle presses clear"
+        );
         assert!(view.lock().unwrap().line.is_empty());
     }
 

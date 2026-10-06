@@ -1206,16 +1206,18 @@ async fn run_compaction(
     // outstanding. Left in `Prompt`, the idle "Esc Esc clears the input"
     // gesture would erase a partially typed next message with the same presses
     // that cancel the compaction — the destructive behaviour that guard exists
-    // to prevent. Mark the phase `Turn` so `escape_press` neither clears nor
-    // arms; the Prompt→Turn→Prompt transitions bump the edit generation, so a
-    // stale pre-compaction arm cannot complete afterwards either.
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
+    // to prevent. The `NonIdlePhase` guard marks the phase `Turn` so
+    // `escape_press` neither clears nor arms, and restores `Prompt` on *every*
+    // exit path when it drops (the Prompt→Turn→Prompt transitions bump the edit
+    // generation, so a stale pre-compaction arm cannot complete afterwards
+    // either).
+    let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
     let compaction = agent.compact(mode, instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
-    // The loop only exits by resolving the compaction future; capture the
-    // report so the idle `Prompt` mode is restored on that single path before
-    // returning (there is no early `return` that could skip the restore).
+    // The loop only exits by resolving the compaction future; the guard above
+    // restores the idle `Prompt` mode when it drops at function exit, so there
+    // is no explicit restore to skip even if a future edit adds an early return.
     let report = loop {
         tokio::select! {
             biased;
@@ -1280,8 +1282,8 @@ async fn run_compaction(
             },
         }
     };
-    // Restore the idle prompt so the next read's Esc Esc gesture is live again.
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
+    // The `NonIdlePhase` guard restores the idle prompt when it drops here, so
+    // the next read's Esc Esc gesture is live again.
     report
 }
 
