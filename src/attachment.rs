@@ -98,6 +98,38 @@ fn dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     reader.into_dimensions().context("read image dimensions")
 }
 
+/// The display orientation recorded in `bytes`' EXIF metadata, if any.
+///
+/// Only JPEG and WebP carry EXIF orientation; PNG/GIF decoders report
+/// [`Orientation::NoTransforms`]. A missing or unparsable chunk is also
+/// `NoTransforms` — the pixels are then used exactly as stored.
+fn exif_orientation(bytes: &[u8], format: ImageFormat) -> image::metadata::Orientation {
+    use image::ImageDecoder as _;
+    let cursor = std::io::Cursor::new(bytes);
+    let orientation = match format {
+        ImageFormat::Jpeg => image::codecs::jpeg::JpegDecoder::new(cursor)
+            .and_then(|mut d| d.orientation()),
+        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(cursor)
+            .and_then(|mut d| d.orientation()),
+        ImageFormat::Png | ImageFormat::Gif => return image::metadata::Orientation::NoTransforms,
+    };
+    orientation.unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// Whether applying this orientation swaps the image's width and height
+/// (the quarter-turn transforms), so reported dimensions match the
+/// transformed pixels.
+trait OrientationExt {
+    fn swaps_axes(self) -> bool;
+}
+
+impl OrientationExt for image::metadata::Orientation {
+    fn swaps_axes(self) -> bool {
+        use image::metadata::Orientation as O;
+        matches!(self, O::Rotate90 | O::Rotate270 | O::Rotate90FlipH | O::Rotate270FlipH)
+    }
+}
+
 /// Prepare `bytes` (an image of `format`) for sending to a model: downscale so
 /// the longest side is at most `max_dim` and re-encode until it fits
 /// `max_bytes`. Returns the (possibly unchanged) bytes, their media type and
@@ -148,8 +180,19 @@ pub fn prepare(
     let needs_downscale = width > max_dim || height > max_dim;
     let needs_reencode = !accepts_source;
     if needs_downscale || needs_reencode || out_bytes.len() > max_bytes {
-        let img = image::load_from_memory_with_format(bytes, format.image_format())
+        // Decode the raw pixels, then apply any JPEG/WebP orientation metadata
+        // to them: re-encoding strips that metadata, so without this a phone
+        // photo shot in portrait would be sent (and its prepared dimensions
+        // reported) rotated or mirrored. `dimensions()` above reads the raw
+        // stored matrix, so swap the reported width/height when the transform
+        // is a quarter turn.
+        let mut img = image::load_from_memory_with_format(bytes, format.image_format())
             .with_context(|| format!("decode {}", format.media_type()))?;
+        let orientation = exif_orientation(bytes, format);
+        if orientation.swaps_axes() {
+            std::mem::swap(&mut width, &mut height);
+        }
+        img.apply_orientation(orientation);
         // Downscale to the longest-side cap, preserving aspect ratio.
         let mut img = if width > max_dim || height > max_dim {
             let (nw, nh) = scaled_dimensions(width, height, max_dim);
@@ -612,6 +655,66 @@ mod tests {
             prepared.width,
             prepared.height
         );
+    }
+
+    /// A JPEG whose EXIF orientation says "rotate 90° clockwise": the stored
+    /// pixel matrix is `w`×`h`, but the photo is meant to be viewed `h`×`w`.
+    /// Builds the APP1 EXIF segment by hand (little-endian TIFF, one
+    /// orientation entry) and splices it after the SOI marker.
+    fn make_oriented_jpeg(w: u32, h: u32, exif_orientation: u8) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([200, 100, 50])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Jpeg).unwrap();
+        let jpeg = out.into_inner();
+        assert!(jpeg.starts_with(b"\xff\xd8"), "test JPEG must start with SOI");
+
+        // TIFF header: little-endian, magic 42, IFD0 at offset 8, one entry.
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II"); // little-endian
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // type: SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count: 1
+        tiff.extend_from_slice(&(exif_orientation as u16).to_le_bytes()); // value (2 bytes + pad)
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+        let mut app1_payload = Vec::new();
+        app1_payload.extend_from_slice(b"Exif\0\0");
+        app1_payload.extend_from_slice(&tiff);
+
+        let mut oriented = Vec::new();
+        oriented.extend_from_slice(&jpeg[..2]); // SOI
+        oriented.extend_from_slice(b"\xff\xe1"); // APP1 marker
+        oriented.extend_from_slice(&((app1_payload.len() + 2) as u16).to_be_bytes());
+        oriented.extend_from_slice(&app1_payload);
+        oriented.extend_from_slice(&jpeg[2..]);
+        oriented
+    }
+
+    #[test]
+    fn prepare_applies_exif_orientation_before_reencoding() {
+        // Regression: re-encoding strips EXIF orientation metadata, so the raw
+        // pixel matrix must be rotated/flipped *before* resizing and encoding —
+        // otherwise a phone photo shot in portrait is sent lying on its side
+        // and its prepared dimensions are reported swapped.
+        //
+        // A 64×32 stored matrix tagged orientation 6 (rotate 90° CW) displays
+        // as 32×64. It needs no downscale, so a byte cap just under the source
+        // size (720 bytes with the EXIF segment; a re-encode is 685) forces
+        // exactly one re-encode — the path where the orientation used to be lost.
+        let jpeg = make_oriented_jpeg(64, 32, 6);
+        let prepared = prepare(&jpeg, ImageFormat::Jpeg, MAX_DIMENSION, 700, &[]).unwrap();
+        assert_eq!(
+            (prepared.width, prepared.height),
+            (32, 64),
+            "prepared dimensions must describe the oriented pixels, not the raw stored matrix"
+        );
+        // The re-encoded bytes carry no EXIF, so their decoded dimensions are
+        // exactly what the model sees — they must already be the oriented ones.
+        assert_eq!(dimensions(&prepared.bytes).unwrap(), (32, 64), "sent pixels must be pre-rotated");
     }
 
     #[test]
