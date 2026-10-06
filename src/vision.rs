@@ -120,8 +120,8 @@ pub fn configured_override(
 /// The vision capability for `model` on a provider of `kind`: a configured
 /// override wins (`true` → capable with default limits, `false` → blind); else
 /// the endpoint `reported` value; else a built-in assumption for the current
-/// Anthropic / OpenAI model families. Returns `None` when the model cannot see
-/// images.
+/// first-party Anthropic / OpenAI model families. Returns `None` when the model
+/// cannot see images.
 pub fn resolve(
     global: Option<Override>,
     kind: Option<ProviderKind>,
@@ -137,13 +137,18 @@ pub fn resolve(
         return Some(reported.clone());
     }
     // Built-in family assumptions apply only to the first-party direct
-    // providers whose model families we actually know. `ProviderKind::Openai`
-    // is shared by every OpenAI-compatible endpoint (Ollama, llama.cpp,
-    // OpenRouter, Groq, …); a local model merely *named* `gpt-5` there is not an
-    // OpenAI model and must not inherit OpenAI's vision support — especially
-    // when its own endpoint probe reported no vision.
+    // providers whose model families we actually know. Both `ProviderKind`s are
+    // shared by every wire-compatible endpoint: `Openai` by Ollama, llama.cpp,
+    // OpenRouter, Groq, …; `Anthropic` by any Anthropic-compatible gateway
+    // (README documents custom endpoints). A local model merely *named* `gpt-5`
+    // or served by a non-vision custom Anthropic gateway is not a first-party
+    // model and must not inherit built-in vision support — especially when its
+    // own endpoint probe reported no vision. Custom endpoints use the explicit
+    // `vision` override instead.
     match kind {
-        Some(ProviderKind::Anthropic) => Some(Vision::capable()),
+        Some(ProviderKind::Anthropic) if is_anthropic_direct(provider) && assumes_anthropic_vision(model) => {
+            Some(Vision::capable())
+        }
         Some(ProviderKind::Openai) if is_openai_direct(provider) && assumes_openai_vision(model) => {
             Some(Vision::capable())
         }
@@ -167,6 +172,33 @@ fn base_url_host(provider: &ProviderConfig) -> Option<String> {
 /// rather than some other OpenAI-compatible endpoint sharing the kind.
 fn is_openai_direct(provider: &ProviderConfig) -> bool {
     base_url_host(provider).is_some_and(|h| h == "api.openai.com" || h.ends_with(".api.openai.com"))
+}
+
+/// Whether this provider is the first-party Anthropic API (`api.anthropic.com`),
+/// rather than some other Anthropic-compatible gateway sharing the kind.
+fn is_anthropic_direct(provider: &ProviderConfig) -> bool {
+    base_url_host(provider).is_some_and(|h| h == "api.anthropic.com" || h.ends_with(".api.anthropic.com"))
+}
+
+/// Whether a model served by the first-party Anthropic API is vision-capable.
+///
+/// The first-party API serves only Claude chat models, and every current Claude
+/// family (3, 3.5, 3.7, 4, …) accepts images; only the retired `claude-2` /
+/// `claude-instant` families are blind. So assume capable *except* those known
+/// legacy families — new Claude families keep working without an allowlist to
+/// maintain. Legacy tokens are matched as whole, delimited name segments (after
+/// stripping an optional `ft:<base>:…` fine-tune wrapper) so that e.g.
+/// `claude-2`, `claude-2.1`, and `claude-instant-1.2` are blind while a
+/// `claude-3`/`claude-sonnet-4-5` name is not mistaken for them.
+fn assumes_anthropic_vision(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // `ft:<base>:<org>::<id>` → `<base>`; a plain name is its own base.
+    let base = m.strip_prefix("ft:").map_or(m.as_str(), |rest| rest.split(':').next().unwrap_or(rest));
+    const BLIND: [&str; 2] = ["claude-2", "claude-instant"];
+    !BLIND.iter().any(|family| match base.strip_prefix(family) {
+        Some(rest) => rest.is_empty() || rest.starts_with('-') || rest.starts_with('.'),
+        None => false,
+    })
 }
 
 /// Whether an OpenAI-direct model name is a current vision-capable family.
@@ -240,16 +272,61 @@ mod tests {
     fn override_wins_over_detection() {
         let provider = ProviderConfig::default();
         let openai_direct = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
+        let anthropic_direct =
+            ProviderConfig { base_url: Some("https://api.anthropic.com/v1".into()), ..Default::default() };
         // Configured false blinds even an Anthropic model.
         assert_eq!(resolve(Some(false), Some(ProviderKind::Anthropic), &provider, "claude-sonnet-4-5", None), None);
         // Configured true enables a model the endpoint said nothing about.
         assert!(resolve(Some(true), Some(ProviderKind::Openai), &provider, "some-local", None).is_some());
-        // No override: Anthropic assumed capable, the OpenAI family on the
-        // first-party OpenAI API assumed capable, a non-family OpenAI model not.
-        assert!(resolve(None, Some(ProviderKind::Anthropic), &provider, "claude-sonnet-4-5", None).is_some());
+        // No override: a first-party Anthropic/OpenAI family model is assumed
+        // capable, a non-family OpenAI model is not.
+        assert!(resolve(None, Some(ProviderKind::Anthropic), &anthropic_direct, "claude-sonnet-4-5", None).is_some());
         assert!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "gpt-5-mini", None).is_some());
         assert_eq!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "text-embedding-3", None), None);
         assert_eq!(resolve(None, None, &provider, "m", None), None);
+    }
+
+    #[test]
+    fn built_in_anthropic_assumption_is_scoped_to_the_first_party_api() {
+        // `ProviderKind::Anthropic` is shared by every Anthropic-compatible
+        // gateway. A non-vision model served by a custom gateway must not
+        // inherit vision from the built-in assumption; only the first-party
+        // Anthropic API does.
+        let gateway =
+            ProviderConfig { base_url: Some("https://anthropic.mycorp.internal/v1".into()), ..Default::default() };
+        let anthropic = ProviderConfig { base_url: Some("https://api.anthropic.com/v1".into()), ..Default::default() };
+        assert_eq!(resolve(None, Some(ProviderKind::Anthropic), &gateway, "claude-sonnet-4-5", None), None);
+        assert!(resolve(None, Some(ProviderKind::Anthropic), &anthropic, "claude-sonnet-4-5", None).is_some());
+        // Retired non-vision Claude families stay blind even first-party.
+        assert_eq!(resolve(None, Some(ProviderKind::Anthropic), &anthropic, "claude-2.1", None), None);
+        assert_eq!(resolve(None, Some(ProviderKind::Anthropic), &anthropic, "claude-instant-1.2", None), None);
+        // A report (vision true) still wins everywhere, regardless of host.
+        assert!(resolve(None, Some(ProviderKind::Anthropic), &gateway, "claude-2", Some(&Vision::capable())).is_some());
+    }
+
+    #[test]
+    fn anthropic_vision_families_match_whole_segments() {
+        // Current vision-capable Claude families, including dated snapshots and
+        // fine-tune wrappers, are assumed capable on the first-party host.
+        for model in [
+            "claude-3-opus-20240229",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-7-sonnet",
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
+            "claude-haiku-4-5",
+            "ft:claude-3-5-sonnet:org::id",
+        ] {
+            assert!(assumes_anthropic_vision(model), "{model} should be a vision family");
+        }
+        // Retired non-vision families are blind; a name that merely contains a
+        // legacy token as a longer segment is not mistaken for it.
+        for model in ["claude-2", "claude-2.1", "claude-instant", "claude-instant-1.2"] {
+            assert!(!assumes_anthropic_vision(model), "{model} should be blind");
+        }
+        for model in ["claude-20-future", "claude-instantish"] {
+            assert!(assumes_anthropic_vision(model), "{model} should not be mistaken for a legacy family");
+        }
     }
 
     #[test]

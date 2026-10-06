@@ -877,13 +877,15 @@ pub fn register(tools: &ToolRegistry) {
     tools.register(
         ToolDefinition::new(
             "read_file",
-            "Read a text file, returning numbered lines. Use offset/limit to page through large files.",
+            "Read a file. Text files return numbered lines; use offset/limit to page through large \
+             ones (pagination applies to text only). Image files (PNG, JPEG, GIF, WebP) are returned \
+             to vision-capable models as viewable images.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path, absolute or relative to the working directory" },
-                    "offset": { "type": "integer", "description": "1-based first line to return (default 1)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines (default 2000)" }
+                    "offset": { "type": "integer", "description": "1-based first line to return (text files only, default 1)" },
+                    "limit": { "type": "integer", "description": "Maximum number of lines (text files only, default 2000)" }
                 },
                 "required": ["path"]
             }),
