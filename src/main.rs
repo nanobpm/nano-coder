@@ -686,10 +686,13 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                         });
                                     match out {
                                         Some(turn_commands::Output::Block(out)) => renderer.turn_block(&out),
-                                        Some(turn_commands::Output::Raw(out)) if renderer.is_frame() => {
-                                            renderer.print_raw(&out)
-                                        }
-                                        Some(turn_commands::Output::Raw(out)) => renderer.turn_block(&out),
+                                        // Raw exports must stay byte-exact: route
+                                        // them through `turn_raw`, which prints
+                                        // verbatim in frame mode and defers a
+                                        // stamp/DIM-free write in legacy mode
+                                        // (routing via `turn_block` would decorate
+                                        // the payload and corrupt JSON/Markdown).
+                                        Some(turn_commands::Output::Raw(out)) => renderer.turn_raw(&out),
                                         None => renderer.note(&format!("[{text}: not available during a turn]")),
                                     }
                                 }
@@ -1114,6 +1117,26 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                         terminal.renderer.print_block(&text);
                     }
                 }
+            }
+            Ok(true)
+        }
+        // Any other `/trajectory` form (an export, or an unsupported option):
+        // run it through the snapshot's option parser so a bad option gets the
+        // specific "Unknown option" message rather than the generic
+        // "unexpected arguments" backstop. Between turns there is no need to
+        // restrict which forms run — that restriction (see `timing`) exists
+        // only to decide what is safe *mid-turn*.
+        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
+            let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
+            match turn_commands::Snapshot::capture(agent)
+                .output(cmd, &stats, agent.plan())
+                .expect("/trajectory always produces an output")
+            {
+                turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
+                // Export modes bypass the transcript renderer (`print_raw`, not
+                // `print_block`): the frame would wrap long lines and prefix a
+                // timestamp, making the JSON unparseable and mangling Markdown.
+                turn_commands::Output::Raw(text) => terminal.renderer.print_raw(&text),
             }
             Ok(true)
         }
