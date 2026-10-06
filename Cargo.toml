@@ -44,6 +44,9 @@ libc = "0.2.189"
 toml_edit = "0.22"
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.27.0"

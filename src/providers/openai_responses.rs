@@ -19,11 +19,25 @@ use crate::llm::{ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenU
 use crate::thinking::Request;
 
 /// Responses API request body for `request`, with provider overrides applied.
+/// The Copilot client (the only caller) builds the plan once and uses
+/// [`build_body_with_plan`]; this plan-building convenience is for tests.
+#[cfg(test)]
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+    build_body_with_plan(transport, request, &request.attachment_plan())
+}
+
+/// As [`build_body`], but reusing a caller-supplied attachment plan so a client
+/// that already resolved one does not rescan and rehash every stored sidecar.
+pub(crate) fn build_body_with_plan(
+    transport: &HttpTransport,
+    request: &ChatRequest<'_>,
+    plan: &crate::llm::AttachmentPlan,
+) -> Value {
     let provider = transport.provider();
     let replay = provider.replay_reasoning;
     let mut instructions: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
+    // The image quota is resolved once per request by the caller and shared.
     for message in request.messages {
         match message.role {
             Role::System => {
@@ -59,11 +73,37 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
                     input.push(function_call);
                 }
             }
-            Role::Tool => input.push(json!({
-                "type": "function_call_output",
-                "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
-                "output": message.content,
-            })),
+            Role::Tool => {
+                // A tool result with image attachments carries them after the
+                // text: `{type:"input_image", image_url:"data:…;base64,…"}`.
+                // Omitted/missing attachments become a text placeholder.
+                let resolved = request.resolve_attachments_with(message, plan);
+                if resolved.is_empty() {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+                        "output": message.content,
+                    }));
+                } else {
+                    let mut output = vec![json!({"type": "input_text", "text": message.content})];
+                    for item in resolved {
+                        match item {
+                            crate::llm::ResolvedAttachment::Image(image) => output.push(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{};base64,{}", image.media_type, image.data_base64),
+                            })),
+                            crate::llm::ResolvedAttachment::Omitted(text) => {
+                                output.push(json!({"type": "input_text", "text": text}))
+                            }
+                        }
+                    }
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+                        "output": output,
+                    }));
+                }
+            }
         }
     }
     let mut body = json!({ "model": provider.model, "input": input });
@@ -391,6 +431,16 @@ mod tests {
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
 
+    /// A real, decodable 10×10 PNG. `read_for_limits` reads the dimensions from
+    /// the stored bytes, so an attachment's file must be a valid image — magic
+    /// bytes alone no longer resolve to a sendable image.
+    fn real_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
     fn transport() -> HttpTransport {
         let user: HashMap<String, ProviderConfig> = HashMap::new();
         HttpTransport::new(resolve("openai/gpt-test", &user, "mock").unwrap()).unwrap()
@@ -402,7 +452,15 @@ mod tests {
         let body = |thinking| {
             build_body(
                 &transport(),
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking,
+                    vision: None,
+                    attachments_dir: None,
+                },
             )
         };
         assert_eq!(body(Some(Request::Effort("high".into())))["reasoning"], json!({ "effort": "high" }));
@@ -416,7 +474,15 @@ mod tests {
             let messages = [Message::user("q"), assistant];
             build_body(
                 &transport(),
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
             )
         };
         assert_eq!(
@@ -472,6 +538,8 @@ mod tests {
                 temperature: Some(0.5),
                 max_tokens: Some(64),
                 thinking: None,
+                vision: None,
+                attachments_dir: None,
             },
         );
         assert_eq!(body["instructions"], "be brief");
@@ -487,6 +555,53 @@ mod tests {
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
         assert_eq!(input[3]["output"], "noon");
+    }
+
+    #[test]
+    fn tool_result_image_becomes_an_input_image_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = real_png();
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/chart.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 1024,
+            height: 768,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &attachment, &bytes).unwrap();
+        let messages = vec![
+            Message::user("read the chart"),
+            Message::tool_result("call_1", "read_file", "image/png, 1024×768, 90 KB")
+                .with_attachments(vec![attachment]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let body = build_body(
+            &transport(),
+            &ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: Some(vision),
+                attachments_dir: Some(dir.path()),
+            },
+        );
+        let input = body["input"].as_array().unwrap();
+        let output = input[1]["output"].as_array().unwrap();
+        assert_eq!(output[0], json!({"type": "input_text", "text": "image/png, 1024×768, 90 KB"}));
+        assert_eq!(output[1]["type"], "input_image");
+        let expected = format!(
+            "data:image/png;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+        );
+        assert_eq!(output[1]["image_url"], json!(expected));
     }
 
     #[test]
@@ -639,7 +754,15 @@ mod tests {
         ];
         let body = build_body(
             &replay_transport(),
-            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+            &ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            },
         );
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], json!(false));
@@ -676,8 +799,15 @@ mod tests {
     #[test]
     fn omits_temperature_for_reasoning_models_only() {
         let messages = vec![Message::user("hi")];
-        let request =
-            |t| ChatRequest { messages: &messages, tools: &[], temperature: Some(t), max_tokens: None, thinking: None };
+        let request = |t| ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: Some(t),
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         // gpt-6-astra is a reasoning model: temperature is dropped so the
         // Responses endpoint does not reject the request before generating.
         let body = build_body(&copilot_transport("gpt-6-astra"), &request(0.7));
@@ -709,7 +839,15 @@ mod tests {
         ];
         let body = build_body(
             &transport(),
-            &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+            &ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            },
         );
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call");
@@ -722,8 +860,15 @@ mod tests {
     #[test]
     fn copilot_reasoning_model_replays_reasoning_by_default() {
         let messages = vec![Message::user("hi")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         // A reasoning Copilot model opts into replayable reasoning items by
         // default (no user config needed).
         let body = build_body(&copilot_transport("gpt-6-astra"), &request);

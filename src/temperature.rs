@@ -89,6 +89,10 @@ pub struct ModelSettings {
     /// Thinking level for this model (see `crate::thinking`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::thinking::Thinking>,
+    /// Whether this model can view images (`read_file` image attachments).
+    /// Overrides the provider's `vision` and endpoint detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     /// Thinking levels this model accepts, overriding the provider's list and
     /// the built-in table.
     #[serde(skip_serializing_if = "Option::is_none")]

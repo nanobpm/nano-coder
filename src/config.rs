@@ -20,6 +20,10 @@ pub struct Config {
     /// Thinking level for every model, unless a provider or model sets its
     /// own: `"default"` (send nothing), `"off"`, or a level such as `"high"`.
     pub thinking: crate::thinking::Thinking,
+    /// Whether models can view images (`read_file` image attachments), unless a
+    /// provider or model sets its own. Unset: endpoint detection, then a
+    /// built-in assumption for current Anthropic / OpenAI families.
+    pub vision: Option<bool>,
     pub max_tokens: i32,
     pub system_prompt: String,
     /// Legacy: applied to `default_provider` (which becomes `openai` if it was `mock`).
@@ -141,6 +145,7 @@ impl Default for Config {
             default_provider: "mock".to_string(),
             temperature: crate::temperature::Temperature::Value(0.7),
             thinking: crate::thinking::Thinking::Default,
+            vision: None,
             max_tokens: 4096,
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             api_key: None,

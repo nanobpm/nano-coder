@@ -28,10 +28,21 @@ impl OpenAiClient {
 
 /// Chat Completions request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+    build_body_with_plan(transport, request, &request.attachment_plan())
+}
+
+/// As [`build_body`], but reusing a caller-supplied attachment plan so a client
+/// that already resolved one (e.g. to set a vision header) does not rescan and
+/// rehash every stored sidecar a second time.
+pub(crate) fn build_body_with_plan(
+    transport: &HttpTransport,
+    request: &ChatRequest<'_>,
+    plan: &crate::llm::AttachmentPlan,
+) -> Value {
     let provider = transport.provider();
     let mut body = json!({
         "model": provider.model,
-        "messages": request.messages.iter().map(|m| encode_message(m, provider.replay_reasoning)).collect::<Vec<_>>(),
+        "messages": encode_messages(request, provider.replay_reasoning, plan),
     });
     if !request.tools.is_empty() {
         body["tools"] = request
@@ -67,6 +78,74 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         Some(Request::Budget(_) | Request::AdaptiveOn) | None => {}
     }
     transport.finish_body(body)
+}
+
+/// Encode the conversation as Chat Completions messages. `tool` messages carry
+/// only text, so a tool result's images are sent in a `user` message right
+/// after the run of tool results they belong to (as `{type:"image_url"}`
+/// parts); the tool message notes the attachment follows. Omitted or missing
+/// attachments become a text placeholder appended to the tool message.
+fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool, plan: &crate::llm::AttachmentPlan) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    // Image parts collected from the current run of tool messages, flushed into
+    // one user message when the run ends.
+    let mut pending_images: Vec<crate::llm::ImageData> = Vec::new();
+    let flush = |out: &mut Vec<Value>, pending: &mut Vec<crate::llm::ImageData>| {
+        if pending.is_empty() {
+            return;
+        }
+        let mut content: Vec<Value> = vec![json!({"type": "text", "text": "[attached image]"})];
+        for image in pending.drain(..) {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", image.media_type, image.data_base64) },
+            }));
+        }
+        out.push(json!({ "role": "user", "content": content }));
+    };
+    // The image quota is resolved once per request by the caller and shared.
+    for message in request.messages {
+        if message.role != Role::Tool {
+            flush(&mut out, &mut pending_images);
+        }
+        if message.role == Role::Tool && !message.attachments.is_empty() {
+            let mut content = message.content.clone();
+            let mut added_image = false;
+            for item in request.resolve_attachments_with(message, plan) {
+                match item {
+                    crate::llm::ResolvedAttachment::Image(image) => {
+                        pending_images.push(image);
+                        added_image = true;
+                    }
+                    crate::llm::ResolvedAttachment::Omitted(text) => {
+                        content.push('\n');
+                        content.push_str(&text);
+                    }
+                }
+            }
+            let mut encoded = json!({
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": content,
+            });
+            if added_image {
+                // Note on the tool message that *its own* image follows, so the
+                // text alone still reads coherently. Gated on this message adding
+                // an image — not on `pending_images` (which may hold an earlier
+                // tool's image) — so a tool with only a missing/omitted
+                // attachment does not falsely claim an image follows. The image
+                // is flushed only after the whole consecutive run of tool
+                // results, so say "after the tool results", not "in the next
+                // message" (another `tool` message may come next).
+                encoded["content"] = json!(format!("{content}\n[image attached after the tool results]"));
+            }
+            out.push(encoded);
+            continue;
+        }
+        out.push(encode_message(message, replay_reasoning));
+    }
+    flush(&mut out, &mut pending_images);
+    out
 }
 
 fn encode_message(message: &Message, replay_reasoning: bool) -> Value {
@@ -386,8 +465,18 @@ impl LLMClient for OpenAiClient {
         detect_thinking(&self.transport).await
     }
 
-    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
+        detect_vision(&self.transport).await
+    }
+
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         detect_capabilities(&self.transport).await
+    }
+
+    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        detect_thinking_and_vision(&self.transport).await
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
@@ -423,6 +512,10 @@ impl LLMClient for OpenAiClient {
 
     fn kind(&self) -> Option<ProviderKind> {
         Some(ProviderKind::Openai)
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.transport.provider().base_url)
     }
 }
 
@@ -532,7 +625,7 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
 /// serially at startup or on a model switch.
 pub(crate) async fn detect_capabilities(
     transport: &HttpTransport,
-) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
     let provider = transport.provider();
     let base = provider.base_url.as_str();
     let root = base.strip_suffix("/v1").unwrap_or(base);
@@ -552,7 +645,9 @@ pub(crate) async fn detect_capabilities(
             // A window listed directly on the `/models` entry wins over /props.
             let window = entry.and_then(window_in_entry).or(window);
             let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
-            (window, thinking)
+            // Vision comes from the same `/props` response — no second probe.
+            let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
+            (window, thinking, vision)
         }
         Server::Ollama => {
             let (window, show) = match entry.and_then(window_in_entry) {
@@ -565,7 +660,9 @@ pub(crate) async fn detect_capabilities(
                 None => ollama_window(transport, root, model).await,
             };
             let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
-            (window, thinking)
+            // Vision comes from the same `/api/show` response — no second probe.
+            let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
+            (window, thinking, vision)
         }
         Server::LmStudio => {
             let window = match entry.and_then(window_in_entry) {
@@ -578,9 +675,74 @@ pub(crate) async fn detect_capabilities(
                     .and_then(as_tokens)
                     .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length")),
             };
-            (window, None)
+            (window, None, None)
         }
-        Server::Other => (entry.and_then(window_in_entry), None),
+        Server::Other => (entry.and_then(window_in_entry), None, None),
+    }
+}
+
+/// Probe the endpoint for the thinking levels and vision capability in one
+/// pass, **without** the context-window follow-ups. Used on the
+/// configured-window path, where the window is already known: both detections
+/// share the same `/models` list to identify the server and the same
+/// server-specific response (llama.cpp `/props`, Ollama `/api/show`), so
+/// fetching it once keeps a slow or unavailable endpoint from being probed
+/// twice serially (and from waiting through two probe budgets). The
+/// window-only follow-ups (Ollama `/api/ps`, LM Studio `/api/v0/models`) are
+/// skipped since the window is discarded here.
+pub(crate) async fn detect_thinking_and_vision(
+    transport: &HttpTransport,
+) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    match identify(&provider.name, root, entry) {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            let props = probe(transport, reqwest::Method::GET, &url, None).await;
+            let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
+            let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
+            (thinking, vision)
+        }
+        Server::Ollama => {
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
+            let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
+            let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
+            (thinking, vision)
+        }
+        // These servers report neither thinking nor vision from their own
+        // endpoints; the built-in assumption or a config override decides.
+        Server::LmStudio | Server::Other => (None, None),
+    }
+}
+
+/// Probe the endpoint for the loaded model's vision capability: llama.cpp
+/// `/props` (`modalities.vision`) or Ollama `/api/show` (the `vision`
+/// capability). Other OpenAI-compatible servers report nothing here; the
+/// built-in assumption or a config override decides for them.
+pub(crate) async fn detect_vision(transport: &HttpTransport) -> Option<crate::vision::Vision> {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    match identify(&provider.name, root, entry) {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            let props = probe(transport, reqwest::Method::GET, &url, None).await?;
+            crate::vision::Vision::from_llamacpp_props(&props)
+        }
+        Server::Ollama => {
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await?;
+            crate::vision::Vision::from_ollama_show(&show)
+        }
+        Server::LmStudio | Server::Other => None,
     }
 }
 
@@ -696,6 +858,16 @@ mod tests {
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
 
+    /// A real, decodable 10×10 PNG. `read_for_limits` reads the dimensions from
+    /// the stored bytes, so an attachment's file must be a valid image — magic
+    /// bytes alone no longer resolve to a sendable image.
+    fn real_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([7, 8, 9])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
     fn provider(base_url: &str, extra: &str) -> ResolvedProvider {
         let mut user = HashMap::new();
         user.insert(
@@ -716,8 +888,15 @@ mod tests {
     #[test]
     fn encodes_thinking_levels_and_lets_extra_body_win() {
         let messages = [Message::user("q")];
-        let request =
-            |thinking| ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking };
+        let request = |thinking| ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking,
+            vision: None,
+            attachments_dir: None,
+        };
         let client = OpenAiClient::new(provider("http://x", "")).unwrap();
         assert_eq!(client.build_body(&request(Some(Request::Effort("high".into()))))["reasoning_effort"], "high");
         assert_eq!(client.build_body(&request(Some(Request::Off)))["reasoning_effort"], "none");
@@ -732,6 +911,155 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
         let body = client.build_body(&request(Some(Request::TemplateEffort("high".into()))));
         assert_eq!(body["chat_template_kwargs"], json!({ "reasoning_effort": "high" }));
+    }
+
+    #[test]
+    fn tool_result_image_goes_in_a_followup_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real, decodable PNG: `read_for_limits` reads the dimensions from the
+        // bytes, so the stored file must be a valid image, not magic-byte filler.
+        let bytes = real_png();
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/plot.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 800,
+            height: 600,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &attachment, &bytes).unwrap();
+        let messages = vec![
+            Message::user("look at the plot"),
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/tmp/plot.png"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
+            ),
+            Message::tool_result("c1", "read_file", "image/png, 800×600, 50 KB").with_attachments(vec![attachment]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        let body = client.build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        });
+        let encoded = body["messages"].as_array().unwrap();
+        // user, assistant, tool (text + a note), then a user message with the image.
+        assert_eq!(encoded.len(), 4);
+        assert_eq!(encoded[2]["role"], "tool");
+        assert!(encoded[2]["content"].as_str().unwrap().contains("[image attached after the tool results]"));
+        assert_eq!(encoded[3]["role"], "user");
+        let parts = encoded[3]["content"].as_array().unwrap();
+        // The carrying user message uses a distinct, non-self-referential label —
+        // not the tool message's forward-pointing note repeated here.
+        assert_eq!(parts[0]["text"], "[attached image]");
+        assert_eq!(parts[1]["type"], "image_url");
+        let expected = format!(
+            "data:image/png;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+        );
+        assert_eq!(parts[1]["image_url"]["url"], json!(expected));
+    }
+
+    #[test]
+    fn tool_without_its_own_image_does_not_claim_one_follows() {
+        // Two consecutive tool results flushed into one user message: the first
+        // carries an image, the second only a missing attachment. The second
+        // tool must NOT say "[image attached after the tool results]" — that image
+        // belongs to the first tool, not it.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = real_png();
+        let present = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/present.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &present, &bytes).unwrap();
+        // A second attachment whose file was never written (missing on resume).
+        let missing = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/missing.png"),
+            sha256: crate::attachment::sha256_hex(b"missing-bytes"),
+            width: 10,
+            height: 10,
+            bytes: 13,
+            extension: "png".into(),
+        };
+        let messages = vec![
+            Message::assistant_with_tools(
+                "",
+                vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "/tmp/present.png"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "/tmp/missing.png"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+            ),
+            Message::tool_result("c1", "read_file", "present").with_attachments(vec![present]),
+            Message::tool_result("c2", "read_file", "missing").with_attachments(vec![missing]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 4,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        let body = client.build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        });
+        let encoded = body["messages"].as_array().unwrap();
+        // assistant, tool c1 (adds image + note), tool c2 (no image), user (image).
+        let c1 = &encoded[1];
+        let c2 = &encoded[2];
+        assert_eq!(c1["tool_call_id"], "c1");
+        assert!(
+            c1["content"].as_str().unwrap().contains("[image attached after the tool results]"),
+            "the tool that actually added an image should note it: {c1}"
+        );
+        assert_eq!(c2["tool_call_id"], "c2");
+        assert!(
+            !c2["content"].as_str().unwrap().contains("[image attached after the tool results]"),
+            "a tool with no image of its own must not claim one follows: {c2}"
+        );
+        assert!(
+            c2["content"].as_str().unwrap().contains("no longer available"),
+            "the missing attachment should resolve to a placeholder: {c2}"
+        );
     }
 
     #[test]
@@ -781,6 +1109,8 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(100),
             thinking: None,
+            vision: None,
+            attachments_dir: None,
         });
         assert_eq!(body["model"], "some-model");
         assert_eq!(body["think"], false);
@@ -861,7 +1191,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "hi");
@@ -880,7 +1218,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "whole");
@@ -929,7 +1275,15 @@ mod tests {
         let sink = |_e: StreamEvent<'_>| {};
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -967,7 +1321,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1002,7 +1364,15 @@ mod tests {
         };
         let result = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await;
@@ -1047,7 +1417,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1074,7 +1452,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let err = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("invalid_api_key"), "{err:#}");
@@ -1105,7 +1491,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1144,8 +1538,15 @@ mod tests {
         resolved.replay_reasoning = true;
         let client = OpenAiClient::new(resolved.clone()).unwrap();
         let messages = [Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let response = client.chat_stream(&request, &|_| {}).await.unwrap();
         // Only the provider's reasoning field is replayed, not inline <think> text.
         assert_eq!(response.thinking_blocks, vec![json!({"type": "reasoning_content", "text": "Need ls."})]);
@@ -1163,8 +1564,15 @@ mod tests {
                 ..Message::assistant("done")
             },
         ];
-        let request =
-            ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &history,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let body = client.build_body(&request);
         assert_eq!(body["messages"][1]["reasoning_content"], "Need ls.");
         assert!(body["messages"][2].get("reasoning_content").is_none(), "Anthropic blocks are not replayed");
@@ -1182,7 +1590,15 @@ mod tests {
         let messages = [Message::user("hello")];
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &|_| {},
             )
             .await
@@ -1347,7 +1763,7 @@ mod tests {
             },
         )]);
         let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
-        let (window, thinking) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
+        let (window, thinking, _vision) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
         let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
         (window, thinking, paths)
     }
@@ -1378,6 +1794,51 @@ mod tests {
         assert_eq!(win, window(16384, "Ollama num_ctx"));
         assert_eq!(thinking.map(|r| r.format), Some(Format::Effort));
         assert_eq!(paths, ["/v1/models", "/api/ps", "/api/show"], "/api/show is shared, not repeated");
+    }
+
+    async fn detect_tv(
+        provider_name: &str,
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Vec<String>) {
+        let (url, captured) = test_server::serve(responses).await;
+        let user = HashMap::from([(
+            provider_name.to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
+        let (thinking, vision) = OpenAiClient::new(resolved).unwrap().detect_thinking_and_vision().await;
+        let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        (thinking, vision, paths)
+    }
+
+    #[tokio::test]
+    async fn thinking_and_vision_probe_shares_one_fetch() {
+        // On the configured-window path the window probe is skipped, but
+        // thinking and vision must still come from a single shared endpoint
+        // fetch — not two serial probes that re-fetch /models and /props or
+        // /api/show.
+
+        // llama.cpp: one /models and one /props serve both thinking and vision.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp"}]});
+        let props = json!({"modalities": {"vision": true}, "chat_template": "{% if enable_thinking %}"});
+        let (thinking, vision, paths) =
+            detect_tv("box", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(thinking.map(|r| r.levels), Some(vec!["off".to_string(), "on".to_string()]));
+        assert!(vision.is_some(), "vision derived from the shared /props");
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"], "each endpoint probed once, no /api/ps");
+
+        // Ollama: one /models and one /api/show — and no window-only /api/ps.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let show = json!({"capabilities": ["completion", "thinking", "vision"]});
+        let (thinking, vision, paths) =
+            detect_tv("ollama", vec![(200, "", models.to_string()), (200, "", show.to_string())]).await;
+        assert!(thinking.is_some(), "thinking derived from the shared /api/show");
+        assert!(vision.is_some(), "vision derived from the same /api/show");
+        assert_eq!(paths, ["/v1/models", "/api/show"], "/api/show fetched once, no /api/ps window probe");
     }
 
     #[tokio::test]

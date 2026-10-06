@@ -46,6 +46,21 @@ fn output_margin(window: usize) -> usize {
     window / 50
 }
 
+/// The display form of a tool result: the model-facing `text` with each
+/// attached image noted as `[image: path, WxH]` on its own line. Shared by the
+/// live tool-result event and ACP / trajectory replay so a resumed session
+/// shows the same image markers it showed live, instead of the bare text.
+fn tool_result_display(text: &str, attachments: &[crate::llm::Attachment]) -> String {
+    let mut out = text.to_string();
+    for attachment in attachments {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&attachment.placeholder());
+    }
+    out
+}
+
 /// Accumulates streamed output to estimate a live output rate (completion
 /// tokens per second), throttled so the status line does not redraw on every
 /// delta. Tokens are estimated from streamed bytes (~4 bytes/token) and
@@ -489,6 +504,8 @@ pub struct Agent {
     detected_window: Option<DetectedWindow>,
     /// Thinking levels reported by the endpoint (see `detect_context_window`).
     reported_thinking: Option<crate::thinking::Reported>,
+    /// Vision capability reported by the endpoint (see `detect_context_window`).
+    reported_vision: Option<crate::vision::Vision>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -631,6 +648,7 @@ impl Agent {
             learned_window: None,
             detected_window: None,
             reported_thinking: None,
+            reported_vision: None,
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -747,6 +765,8 @@ impl Agent {
                 temperature: None,
                 max_tokens: Some(400),
                 thinking: None,
+                vision: None,
+                attachments_dir: None,
             };
             let reply = tokio::time::timeout(Duration::from_secs(60), client.chat(&request)).await;
             if let Ok(Ok(response)) = reply
@@ -1116,20 +1136,172 @@ impl Agent {
             return;
         }
         let probe = self.client.detect_capabilities();
-        let (window, thinking) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         self.detected_window = window;
         self.reported_thinking = thinking;
+        // Vision is derived from the same probe responses `detect_capabilities`
+        // already fetched, so it costs no extra round trip. Storing the report
+        // is always the right move: a `vision = false` override discards it at
+        // resolution time, but `true`/none keep it (`true` forces the capability
+        // on yet preserves the endpoint's reported limits), so keeping it here
+        // lets `resolve` apply those limits on the default path too.
+        self.reported_vision = vision;
         self.refresh_stats();
     }
 
-    /// Probe only the thinking levels the endpoint reports, leaving the
-    /// (already cleared) detected window alone. Used when the window comes
-    /// from config and the window half of the combined probe would be
-    /// discarded anyway.
+    /// Probe the thinking levels *and* vision capability together, leaving the
+    /// (already cleared) detected window alone. Used when the window comes from
+    /// config and the window half of the combined probe would be discarded
+    /// anyway.
+    ///
+    /// Thinking and vision are derived from one shared endpoint response
+    /// (llama.cpp `/props`, Ollama `/api/show`, Copilot `/models`), so probing
+    /// them together fetches it once instead of running two serial probes — and
+    /// waiting through two probe budgets — at startup or on a model switch.
+    /// Storing the vision report unconditionally is correct: a `vision = false`
+    /// override discards it at resolution time, while `true`/none keep it
+    /// (`true` forces the capability on yet preserves the endpoint's reported
+    /// limits), mirroring `detect_context_window` on the default path.
     async fn detect_thinking(&mut self) {
-        let probe = self.client.detect_thinking_levels();
-        self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+        let probe = self.client.detect_thinking_and_vision();
+        let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        self.reported_thinking = thinking;
+        self.reported_vision = vision;
         self.refresh_stats();
+    }
+
+    /// The effective vision capability for the current model: a configured
+    /// `vision` override wins, else the endpoint report, else the built-in
+    /// assumption for current Anthropic / OpenAI families. `None` = the model
+    /// cannot view images.
+    pub fn vision(&self) -> Option<crate::vision::Vision> {
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let mut provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        // First-party host detection must track the client actually in use, not
+        // the possibly-edited config: after a provider edit whose client
+        // rebuild fails, the saved config holds the new `base_url` while the
+        // session keeps the old client. Mirror how `kind`/`model_name` already
+        // come from the live client by overriding `base_url` with its captured
+        // endpoint when it exposes one (`None` only for test doubles, where the
+        // configured `base_url` is the right fallback).
+        if let Some(endpoint) = self.client.endpoint() {
+            provider.base_url = Some(endpoint.to_string());
+        }
+        crate::vision::resolve(
+            self.config.vision,
+            self.client.kind(),
+            &provider,
+            self.model_name(),
+            self.reported_vision.as_ref(),
+        )
+    }
+
+    /// Capability context appended to a non-image binary-file error: whether
+    /// the current model can view images at all. The generic binary error in
+    /// `read_file` cannot add this itself, so it is appended at dispatch where
+    /// the resolved vision capability is known.
+    fn binary_vision_hint(&self) -> String {
+        if self.vision().is_some() {
+            " (the current model can view images, but this is not a supported image type: \
+             PNG, JPEG, GIF or WebP)"
+                .to_string()
+        } else {
+            " (the current model can't view images; switch to a vision model or set `vision = true`)".to_string()
+        }
+    }
+
+    /// Turn a `read_file` image result (`{"image": {…, path}}`, metadata only)
+    /// into the tool-result text and its attachment. The caller gates this on
+    /// `tool_call.name == "read_file"`, since only that tool owns this private
+    /// `{"image": …}` protocol. Returns `Ok(None)` when `result` is not an
+    /// image result. When the model cannot view images, returns `Err` with the
+    /// text error (a hint naming the fix). When it can, the file is re-read by
+    /// `path`, downscaled to the model's limits, stored under the session's
+    /// attachments directory, and returned as `(text, attachments)` — the
+    /// decode/resize/encode span runs on a blocking thread (see
+    /// [`Self::prepare_image_attachment`]) so it never stalls the async runtime.
+    async fn image_result(&self, result: &Value) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
+        let Some(image) = result.get("image") else { return Ok(None) };
+        let path_str = image.get("path").and_then(Value::as_str).unwrap_or_default();
+        let path = std::path::PathBuf::from(path_str);
+        let Some(vision) = self.vision() else {
+            return Err(format!(
+                "{} is an image ({}), but the current model can't view images; \
+                 switch to a vision model or set `vision = true`",
+                path.display(),
+                image.get("media_type").and_then(Value::as_str).unwrap_or("unknown type")
+            ));
+        };
+        if path_str.is_empty() {
+            return Err("image result had no path".to_string());
+        }
+        let limits = vision.image_limits();
+        let attachments_dir = self.attachments_dir();
+        // Reading the source, decoding/resizing/re-encoding it to the model's
+        // limits, hashing, and storing it are CPU- and I/O-heavy — precisely the
+        // large-image path. Running them inline on the Tokio worker would block
+        // the runtime for a substantial period, stalling every other session,
+        // cancellation, and I/O task, even though ordinary tool handlers already
+        // go through `execute_blocking`. Offload the whole span to a blocking
+        // thread; only the cheap capability gating above stays on the runtime.
+        tokio::task::spawn_blocking(move || Self::prepare_image_attachment(path, &limits, &attachments_dir))
+            .await
+            .map_err(|e| format!("image processing task failed: {e}"))?
+    }
+
+    /// The blocking span of [`Self::image_result`], run on a blocking thread:
+    /// re-read the source by `path` (rather than carrying its base64 through the
+    /// tool result, which would cost several times its file size before
+    /// `prepare` reduces it), downscale/re-encode it to `limits`, store the
+    /// prepared bytes by hash under `attachments_dir`, record the source as read
+    /// (so a later `write_file`/`edit_file` on this path passes the freshness
+    /// gate, exactly as a successful text read does), and return the tool-result
+    /// text plus the attachment. Reached only once vision is on, so it never
+    /// authorizes a write for a model that cannot view the image.
+    fn prepare_image_attachment(
+        path: std::path::PathBuf,
+        limits: &crate::attachment::ImageLimits,
+        attachments_dir: &std::path::Path,
+    ) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => return Err(format!("{}: could not read image: {e}", path.display())),
+        };
+        let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) else {
+            return Err(format!("{}: unrecognised image data", path.display()));
+        };
+        let prepared = match crate::attachment::prepare(
+            &bytes,
+            format,
+            limits.max_dimension,
+            limits.max_bytes,
+            &limits.accepted_media_types,
+        ) {
+            Ok(prepared) => prepared,
+            Err(e) => return Err(format!("{}: could not process image: {e}", path.display())),
+        };
+        let attachment = crate::llm::Attachment {
+            media_type: prepared.media_type,
+            path: path.clone(),
+            sha256: crate::attachment::sha256_hex(&prepared.bytes),
+            width: prepared.width,
+            height: prepared.height,
+            bytes: prepared.bytes.len(),
+            extension: prepared.extension,
+        };
+        if let Err(e) = crate::attachment::store(attachments_dir, &attachment, &prepared.bytes) {
+            return Err(format!("{}: could not store image: {e}", path.display()));
+        }
+        crate::files::mark_image_read(&path, &bytes);
+        let text = format!(
+            "{}, {}×{}, {}",
+            attachment.media_type,
+            attachment.width,
+            attachment.height,
+            crate::context::format_bytes(attachment.bytes)
+        );
+        Ok(Some((text, vec![attachment])))
     }
 
     /// `context_window` from config or the provider entry.
@@ -1222,10 +1394,48 @@ impl Agent {
     /// Estimated tokens the next request would send, anchored to the last
     /// reported usage when available.
     pub fn estimate_context_tokens(&self) -> (usize, bool) {
+        // Mirror the vision wire plan: only the newest `max_images` attachments
+        // are sent as images, older ones as text placeholders. Charging every
+        // historical image its full token cost overcounts the real payload and
+        // can trip auto-compaction before the window is actually full.
+        let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
+        // Which stored attachments are still intact on disk, hashed once and
+        // shared across the slices below. The wire plan sends only *available*
+        // images, so the estimate must charge availability the same way: a
+        // missing/tampered newest reference is a placeholder, not an image slot,
+        // and the older image the wire backfills in its place carries the full
+        // image cost. Ignoring availability undercounts a resumed, image-heavy
+        // request by thousands of tokens and delays compaction past the limit.
+        let available = context::available_attachments(&self.conversation, Some(&self.attachments_dir()));
         if let Some((len, tokens)) = self.calibration
             && len <= self.conversation.len()
         {
-            return (tokens + context::messages_tokens(&self.conversation[len..]), true);
+            let (prefix, suffix) = self.conversation.split_at(len);
+            // The calibrated `tokens` baked in the prefix's newest `max_images`
+            // *available* attachments at full image cost. A post-anchor (suffix)
+            // available attachment claims a newest-`max_images` slot and displaces
+            // an older prefix image into a text placeholder on the wire — but the
+            // anchor still carries that stale full-image cost while the suffix adds
+            // the new image on top, double-charging past the quota. That
+            // overestimate can trip auto-compaction early and shrink `max_tokens`.
+            // The anchor is only valid while no prefix image is displaced;
+            // otherwise fall through to a full recompute that mirrors the current
+            // wire plan. Only *available* attachments claim image slots, so the
+            // displacement check counts availability, not raw occurrences — a
+            // missing suffix reference cannot displace a prefix image.
+            let count_available = |msgs: &[Message]| {
+                msgs.iter()
+                    .flat_map(|m| m.attachments.iter())
+                    .filter(|a| available.contains(&(*a as *const crate::llm::Attachment)))
+                    .count()
+            };
+            let prefix_attachments = count_available(prefix);
+            let suffix_attachments = count_available(suffix);
+            let prefix_images = prefix_attachments.min(max_images);
+            let prefix_images_after = prefix_attachments.min(max_images.saturating_sub(suffix_attachments));
+            if prefix_images == prefix_images_after {
+                return (tokens + context::messages_tokens_with_vision(suffix, max_images, &available), true);
+            }
         }
         let tools: usize = self
             .tool_definitions()
@@ -1236,7 +1446,7 @@ impl Agent {
                     + context::text_tokens(&d.parameters.to_string())
             })
             .sum();
-        (context::messages_tokens(&self.conversation) + tools, false)
+        (context::messages_tokens_with_vision(&self.conversation, max_images, &available) + tools, false)
     }
 
     /// Recompute the shared statistics and notify the event sink.
@@ -1453,7 +1663,11 @@ impl Agent {
                     return;
                 };
                 let ok = !message.is_error;
-                self.emit(AgentEvent::ToolResult { call, ok, output: &message.content });
+                // Mirror the live path's display output so a resumed ACP /
+                // trajectory client still sees each persisted attachment's
+                // `[image: path, WxH]` marker, not the bare model-facing text.
+                let output = tool_result_display(&message.content, &message.attachments);
+                self.emit(AgentEvent::ToolResult { call, ok, output: &output });
             }
         }
     }
@@ -1474,6 +1688,18 @@ impl Agent {
 
     fn spill_dir(&self) -> std::path::PathBuf {
         self.spill_dir.read().unwrap().clone()
+    }
+
+    /// Directory this session's image attachments are stored in. Persisted
+    /// sessions keep them beside their log so the references in the log stay
+    /// valid after the process exits; an ephemeral session uses a
+    /// process-local temp dir.
+    fn attachments_dir(&self) -> std::path::PathBuf {
+        if let (Some(id), true) = (self.session_id.as_deref(), self.session.is_some()) {
+            session::attachments_dir_for(&self.config.session_dir(), id)
+        } else {
+            std::env::temp_dir().join(format!("nano-coder-attachments-{}", std::process::id()))
+        }
     }
 
     /// Persisted sessions keep spilled output beside their log, so the paths
@@ -1540,7 +1766,7 @@ impl Agent {
             let cwd = std::env::current_dir().ok().map(|d| d.display().to_string());
             let model = Some(format!("{}/{}", self.client.provider_name(), self.client.model_name()));
             let mut log = SessionLog::create_with(&self.config.session_dir(), &id, cwd, model)?;
-            log.append(&Record::Message(system.clone()))?;
+            log.append(&Record::Message(Box::new(system.clone())))?;
             Some(log)
         } else {
             None
@@ -1616,7 +1842,7 @@ impl Agent {
             // repaired result keeps its event time (for `/trajectory`) and its
             // persisted `#N` (for citations) without waiting for a reload.
             message.timestamp.get_or_insert_with(session::now);
-            let line = log.append(&Record::Message(message.clone()))?;
+            let line = log.append(&Record::Message(Box::new(message.clone())))?;
             message.log_line.get_or_insert(line);
         }
         staged.extend(repairs);
@@ -1723,7 +1949,7 @@ impl Agent {
     fn push(&mut self, mut message: Message) -> Result<()> {
         message.timestamp.get_or_insert_with(session::now);
         if let Some(log) = &mut self.session {
-            let line = log.append(&Record::Message(message.clone()))?;
+            let line = log.append(&Record::Message(Box::new(message.clone())))?;
             message.log_line.get_or_insert(line);
         }
         self.conversation.push(message);
@@ -2304,12 +2530,15 @@ impl Agent {
                 // actually offer `history_search`/`history_read` for the folded
                 // history instead of reusing the pre-compaction tool set.
                 let tools = self.tool_definitions();
+                let attachments_dir = self.attachments_dir();
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
                     temperature: resolved_temperature.value(),
                     max_tokens: Some(request_max_tokens),
                     thinking: resolved_thinking.request(),
+                    vision: self.vision(),
+                    attachments_dir: Some(attachments_dir.as_path()),
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
@@ -2652,7 +2881,7 @@ impl Agent {
                     dispatched = true;
                     self.tools.execute_blocking(&effective_call.name, effective_call.arguments.clone()).await
                 };
-                let ok = result.is_ok();
+                let mut ok = result.is_ok();
                 let result = match result {
                     Ok(value) => value,
                     Err(e) => json!({ "error": e.to_string() }),
@@ -2665,10 +2894,40 @@ impl Agent {
                     .with_data("result", result.clone());
                 self.hooks.trigger(&ctx);
 
+                // A `read_file` image result carries the source bytes; turn it
+                // into a message attachment (downscaled to the model's limits)
+                // when the model can view images, else a text error with a hint.
+                let mut attachments: Vec<crate::llm::Attachment> = Vec::new();
                 let mut result_text = match result {
                     Value::String(text) => text,
+                    // Only `read_file` owns the private `{"image": …}` result
+                    // protocol. Any other tool that returns a structured value
+                    // (even one with a top-level `image` field) is stringified
+                    // unchanged, so it is never misread as an attachment or a
+                    // spurious "image result had no data" error.
+                    other if tool_call.name == "read_file" => match self.image_result(&other).await {
+                        Ok(Some((text, found))) => {
+                            attachments = found;
+                            text
+                        }
+                        Ok(None) => other.to_string(),
+                        // The image read fine but the model can't view it: surface
+                        // it as a tool error so the model treats it as a failure.
+                        Err(text) => {
+                            ok = false;
+                            text
+                        }
+                    },
                     other => other.to_string(),
                 };
+                // A non-image binary file takes read_file's generic "looks
+                // like a binary file" error, which cannot name the model's
+                // image capability itself. Append that context here so the
+                // message says whether this model could have viewed an image
+                // (README "Vision").
+                if !ok && tool_call.name == "read_file" && result_text.contains("looks like a binary file") {
+                    result_text.push_str(&self.binary_vision_hint());
+                }
                 if ok
                     && matches!(tool_call.name.as_str(), "read_file" | "write_file" | "edit_file")
                     && let Some(path) = effective_call.arguments.get("path").and_then(Value::as_str)
@@ -2724,13 +2983,18 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
+                // The display output (trajectory event, ACP) notes each attached
+                // image as `[image: path, WxH]`; the model-facing `result_text`
+                // stays the short text part.
+                let display_output = tool_result_display(&result_text, &attachments);
                 let message = if ok {
                     Message::tool_result(&tool_call.id, &tool_call.name, &result_text)
                 } else {
                     Message::tool_error(&tool_call.id, &tool_call.name, &result_text)
-                };
+                }
+                .with_attachments(attachments);
                 self.push(message)?;
-                self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &result_text });
+                self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &display_output });
             }
             self.refresh_stats();
             if reported.is_some() {
@@ -2951,13 +3215,26 @@ impl Agent {
             .filter(|&i| matches!(self.conversation[i].role, Role::User | Role::Assistant))
             .collect();
         let Some(&last_boundary) = boundaries.last() else { return Ok(None) };
+        // Budget the kept tail against the wire plan, not the full image cost:
+        // the request sends only the newest `max_images` attachments as images
+        // and serializes every older one as a short text placeholder. The cost
+        // of a candidate tail `conversation[k..]` is therefore the wire cost of
+        // that whole span (which charges only its newest `max_images` as
+        // images), *not* a sum of per-message full image costs — the latter
+        // would overcount an image-heavy tail and discard far more recent
+        // history than `KEEP_RECENT_TOKENS` intends. Grow the tail one boundary
+        // at a time and keep the largest span whose wire cost fits the budget.
+        let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
+        // Hash the stored attachment set once and reuse it for every candidate
+        // tail below, so availability costs O(N) file I/O, not O(N²). The budget
+        // must charge availability the way the wire does: a missing/tampered
+        // reference is a placeholder, and the older image the wire backfills in
+        // its place carries the full image cost.
+        let available = context::available_attachments(&self.conversation, Some(&self.attachments_dir()));
         let mut split = last_boundary;
-        let mut tail_tokens = 0;
-        let mut next = len;
         for &boundary in boundaries.iter().rev() {
-            tail_tokens += context::messages_tokens(&self.conversation[boundary..next]);
-            next = boundary;
-            if tail_tokens > keep_budget {
+            let tail = context::messages_tokens_with_vision(&self.conversation[boundary..], max_images, &available);
+            if tail > keep_budget {
                 break;
             }
             split = boundary;
@@ -3043,6 +3320,11 @@ impl Agent {
             // A summary needs no extended reasoning; the model's own default
             // applies, as before thinking levels existed.
             thinking: None,
+            // The summary request never includes images: the transcript renders
+            // them as text placeholders, and the freshly built summary messages
+            // carry no attachments.
+            vision: None,
+            attachments_dir: None,
         };
         let control = self.control.clone();
         // Stream the summary even though its text is used only once complete.
@@ -3600,8 +3882,231 @@ mod tests {
         }
     }
 
+    /// A scripted response calling `read_file` on `path`.
+    fn read_call(id: &str, path: &str) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({"path": path}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// An agent with the real file tools and a scripted client; `vision` sets
+    /// the global `vision` override (the scripted client's "scripted" model is
+    /// not a known vision family, so detection alone would report blind).
+    fn file_agent(responses: Vec<LLMResponse>, dir: &std::path::Path, vision: Option<bool>) -> (Agent, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = Scripted { responses: Mutex::new(responses), seen: seen.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            vision,
+            ..Config::default()
+        };
+        let agent = Agent::new(Box::new(client), config);
+        crate::files::register(agent.tools());
+        (agent, seen)
+    }
+
+    /// Write a small PNG and return its path.
+    fn write_png(dir: &std::path::Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([5, 50, 250])));
+        let path = dir.join(name);
+        img.save(&path).unwrap();
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_attaches_an_image_for_a_vision_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        let (mut agent, seen) =
+            file_agent(vec![read_call("c1", png.to_str().unwrap()), text("a blue board")], dir.path(), Some(true));
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "look").await.unwrap();
+        assert_eq!(outcome.response, "a blue board");
+
+        // The tool-result message carries the image attachment and a text part.
+        let image_message = agent
+            .conversation()
+            .iter()
+            .find(|m| m.role == Role::Tool && !m.attachments.is_empty())
+            .expect("a tool result with an attachment");
+        assert!(
+            image_message.content.starts_with("image/png, 64×32, ") && image_message.content.ends_with('B'),
+            "text part: {}",
+            image_message.content
+        );
+        let attachment = &image_message.attachments[0];
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!((attachment.width, attachment.height), (64, 32));
+        assert_eq!(attachment.path, png);
+
+        // The bytes are stored once under the session's attachments directory.
+        let stored = session::attachments_dir_for(&agent.config().session_dir(), agent.session_id().unwrap())
+            .join(format!("{}.png", attachment.sha256));
+        assert!(stored.exists(), "stored at {}", stored.display());
+
+        // The next request sends the image (the scripted client saw it).
+        let requests = seen.lock().unwrap();
+        let second = &requests[1];
+        let tool = second.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert_eq!(tool.attachments.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_image_errors_with_a_hint_when_the_model_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        // No vision override and a non-vision model: the read returns a text error.
+        let (mut agent, _seen) = file_agent(vec![read_call("c1", png.to_str().unwrap()), text("ok")], dir.path(), None);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "look").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.is_error, "the read failed");
+        assert!(tool.attachments.is_empty());
+        assert!(tool.content.contains("can't view images"), "hint: {}", tool.content);
+        assert!(tool.content.contains("vision = true"), "names the fix: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_binary_error_notes_vision_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-image binary file (contains NUL bytes, no image magic).
+        let bin = dir.path().join("blob.bin");
+        std::fs::write(&bin, [0u8, 1, 2, 3, 255, 0, 42]).unwrap();
+
+        // A vision-capable model: the binary error still says it can view images
+        // (so the model knows the failure is the file type, not its capability).
+        let (mut agent, _) =
+            file_agent(vec![read_call("c1", bin.to_str().unwrap()), text("ok")], dir.path(), Some(true));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "read").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.is_error, "binary read failed");
+        assert!(tool.content.contains("looks like a binary file"), "binary error: {}", tool.content);
+        assert!(tool.content.contains("can view images"), "capability hint: {}", tool.content);
+
+        // A non-vision model: the same error names the missing capability.
+        let (mut agent, _) =
+            file_agent(vec![read_call("c1", bin.to_str().unwrap()), text("ok")], dir.path(), Some(false));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "read").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.content.contains("can't view images"), "capability hint: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_read_file_decodes_image_results() {
+        let dir = tempfile::tempdir().unwrap();
+        // A vision-capable model, so the `{"image": …}` shape WOULD be decoded
+        // into an attachment (or an "image result had no data" error) if the
+        // decoding were gated on the result shape rather than the tool name.
+        let (mut agent, _) = file_agent(
+            vec![
+                LLMResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "shot".into(),
+                        arguments: json!({}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    }],
+                    ..Default::default()
+                },
+                text("ok"),
+            ],
+            dir.path(),
+            Some(true),
+        );
+        // A non-`read_file` tool that legitimately returns a structured object
+        // with a top-level `image` field.
+        agent.tools().register(
+            ToolDefinition::new("shot", "shot", json!({"type": "object"})),
+            Box::new(|_| {
+                Ok(json!({ "image": { "media_type": "image/png", "path": "/nope.png",
+                    "width": 1, "height": 1, "bytes": 3 } }))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(!tool.is_error, "a non-read_file image-shaped result is not an image error: {}", tool.content);
+        assert!(tool.attachments.is_empty(), "no attachment is created for a non-read_file tool");
+        assert!(tool.content.contains("\"image\""), "the structured result is stringified unchanged: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_session_keeps_attachments_and_survives_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        let session_id;
+        let sha;
+        {
+            let (mut agent, _) =
+                file_agent(vec![read_call("c1", png.to_str().unwrap()), text("done")], dir.path(), Some(true));
+            agent.new_session().unwrap();
+            agent.run_turn(Some("in-1"), "look").await.unwrap();
+            session_id = agent.session_id().unwrap().to_string();
+            sha =
+                agent.conversation().iter().find(|m| !m.attachments.is_empty()).unwrap().attachments[0].sha256.clone();
+        }
+        // Resume: the attachment reference survives in the log.
+        let (mut agent, _) = file_agent(vec![text("again")], dir.path(), Some(true));
+        agent.load_session(&session_id).unwrap();
+        let tool = agent.conversation().iter().find(|m| !m.attachments.is_empty()).expect("attachment kept");
+        assert_eq!(tool.attachments[0].sha256, sha);
+
+        // Delete the stored image; the request builder falls back to a
+        // placeholder instead of failing.
+        let stored =
+            session::attachments_dir_for(&agent.config().session_dir(), &session_id).join(format!("{sha}.png"));
+        std::fs::remove_file(&stored).unwrap();
+        let attachments_dir = agent.attachments_dir();
+        let request = crate::llm::ChatRequest {
+            messages: agent.conversation(),
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: agent.vision(),
+            attachments_dir: Some(attachments_dir.as_path()),
+        };
+        match &request.resolve_attachments(tool)[0] {
+            crate::llm::ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+            }
+            other => panic!("missing file should be a placeholder, got {other:?}"),
+        }
+    }
+
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
+    }
+
+    /// Store `bytes` as an attachment in `dir` and return the matching reference,
+    /// so the wire plan's availability gate (`attachment::exists`) sees it as
+    /// present and intact. The stored bytes need not decode — `exists` only
+    /// hash-matches — and the `width`/`height` are the logical dimensions the
+    /// token estimator charges, independent of the bytes.
+    fn stored_image(dir: &std::path::Path, bytes: &[u8], w: u32, h: u32) -> crate::llm::Attachment {
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: crate::attachment::sha256_hex(bytes),
+            width: w,
+            height: h,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir, &attachment, bytes).unwrap();
+        attachment
     }
 
     #[test]
@@ -4140,10 +4645,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = "sess-crash";
         let mut log = SessionLog::create(dir.path(), id).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
-        log.append(&Record::Message(Message::user("run it"))).unwrap();
-        log.append(&Record::Message(Message::assistant_with_tools(
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
             "",
             vec![ToolCall {
                 id: "c9".into(),
@@ -4152,7 +4657,7 @@ mod tests {
                 item_id: None,
                 malformed_arguments: None,
             }],
-        )))
+        ))))
         .unwrap();
         drop(log);
 
@@ -4183,10 +4688,10 @@ mod tests {
         // A crashed session on disk whose resume needs a (fallible) repair append.
         let crashed = "sess-readonly";
         let mut log = SessionLog::create(dir.path(), crashed).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "m1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
-        log.append(&Record::Message(Message::user("run it"))).unwrap();
-        log.append(&Record::Message(Message::assistant_with_tools(
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
             "",
             vec![ToolCall {
                 id: "c9".into(),
@@ -4195,7 +4700,7 @@ mod tests {
                 item_id: None,
                 malformed_arguments: None,
             }],
-        )))
+        ))))
         .unwrap();
         drop(log);
         // Make the crashed session's log read-only so the repair append fails.
@@ -4238,7 +4743,7 @@ mod tests {
 
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
         let mut log = SessionLog::create(dir, id).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
         for record in records {
             log.append(&record).unwrap();
@@ -4262,7 +4767,10 @@ mod tests {
         crashed_session(
             dir.path(),
             "lost-end",
-            vec![Record::Message(Message::user("run it")), Record::Message(Message::assistant("already answered"))],
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(Message::assistant("already answered"))),
+            ],
         );
         let (mut agent, seen) = agent(vec![], dir.path());
         agent.load_session("lost-end").unwrap();
@@ -5830,9 +6338,12 @@ mod tests {
             async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!()
             }
-            async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+            async fn detect_capabilities(
+                &self,
+            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>)
+            {
                 self.calls.lock().unwrap().push("capabilities");
-                (Some(DetectedWindow::total(65_536, "test")), None)
+                (Some(DetectedWindow::total(65_536, "test")), None, None)
             }
             async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
                 self.calls.lock().unwrap().push("thinking");
@@ -5884,6 +6395,110 @@ mod tests {
         assert_eq!(agent.estimate_context_tokens(), (1_050 + 2 + 4, true));
         let stats = agent.context_stats();
         assert_eq!(stats.lock().unwrap().session_input_tokens, 1_000);
+    }
+
+    #[test]
+    fn calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image() {
+        // The calibrated anchor charged the prefix's one in-quota image at full
+        // image cost. A later `read_file` adds a newer image that, under
+        // `max_images = 1`, displaces the prefix image into a placeholder on the
+        // wire. Keeping the anchor's full-image cost *and* adding the new image
+        // would double-charge past the quota and overestimate context (tripping
+        // compaction early); the estimate must instead recompute the whole
+        // conversation to mirror the real newest-N wire plan.
+        let (mut agent, _) = agent(vec![], std::path::Path::new("/nonexistent"));
+        agent.reported_vision = Some(crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        });
+        // Both occurrences are intact on disk, so availability does not confound
+        // the displacement the test exercises. Unique bytes keep this image's
+        // sidecar distinct from any other test sharing the process temp dir.
+        let adir = agent.attachments_dir();
+        let img = stored_image(&adir, b"calib-displace-image", 1000, 1000);
+        // Prefix: one message carrying an image, anchored to a reported total.
+        agent.conversation.push(Message::user("look").with_attachments(vec![img.clone()]));
+        agent.calibration = Some((agent.conversation.len(), 5_000));
+        // No suffix yet: the anchor stands (no displacement).
+        assert_eq!(agent.estimate_context_tokens(), (5_000, true));
+        // A newer image in the suffix displaces the prefix image.
+        agent.conversation.push(Message::user("again").with_attachments(vec![img.clone()]));
+        let (tokens, calibrated) = agent.estimate_context_tokens();
+        assert!(!calibrated, "a displaced prefix image invalidates the anchor");
+        let tools: usize = agent
+            .tool_definitions()
+            .iter()
+            .map(|d| {
+                context::text_tokens(&d.name)
+                    + context::text_tokens(&d.description)
+                    + context::text_tokens(&d.parameters.to_string())
+            })
+            .sum();
+        let available = context::available_attachments(&agent.conversation, Some(&agent.attachments_dir()));
+        let expected = context::messages_tokens_with_vision(&agent.conversation, 1, &available) + tools;
+        assert_eq!(tokens, expected, "recomputes the whole conversation per the wire plan");
+        // The stale-anchor behaviour would have double-charged the prefix image.
+        let stale = 5_000 + context::messages_tokens_with_vision(&agent.conversation[1..], 1, &available);
+        assert!(tokens < stale, "recompute avoids the double-charge: {tokens} < {stale}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_tail_budget_mirrors_the_vision_wire_plan() {
+        // The kept-tail budget must charge attachments the way the wire does:
+        // only the newest `max_images` as images, older ones as short text
+        // placeholders. Charging every attachment its full image cost
+        // overcounts an image-heavy tail and discards far more recent history
+        // than `KEEP_RECENT_TOKENS` intends.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("SUMMARY"), text("done")], dir.path());
+        agent.reported_vision = Some(crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        });
+        // A small window so the threshold trips and an auto (Threshold)
+        // compaction runs; the keep budget is `KEEP_RECENT_TOKENS.min(window/4)`.
+        // Memory off keeps the system prompt small so the image tail (not the
+        // prompt) dominates the keep budget.
+        agent.config.context_window = Some(6_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.config.project_instructions = false;
+        agent.config.memory = crate::config::MemoryMode::Off;
+        agent.new_session().unwrap();
+        // The image must be intact on disk for the wire plan (and so the kept-tail
+        // budget) to count it as a sendable image rather than a placeholder.
+        let img_ref = stored_image(&agent.attachments_dir(), b"compaction-tail-image", 1000, 1000);
+        let img = || img_ref.clone();
+        // One large old text turn, then 120 image turns. The keep budget is
+        // window/4 = 1,500. Under `max_images = 1` the wire sends only the
+        // newest image (~1,334 tokens); the 119 older ones are placeholders
+        // (~14 tokens each with framing), so the image tail exceeds the budget
+        // only after ~12 placeholders accrue. The split therefore lands
+        // mid-list, keeping the newest ~12 image turns (1 image + ~11
+        // placeholders ≈ 1,488) and folding the oldest ~108. Charging every
+        // image in full (~120 × 1,340) would blow the budget after the very
+        // first (newest) turn and fold all 119 older ones. The leading large
+        // text turn is always folded.
+        agent.conversation.push(Message::user(&"big ".repeat(4_000)));
+        for i in 0..120 {
+            agent.conversation.push(Message::user(&format!("img{i}")).with_attachments(vec![img()]));
+        }
+        agent.send_message("go").await.unwrap();
+        assert_eq!(agent.context_stats().lock().unwrap().compactions, 1, "threshold compaction ran");
+        let conversation = agent.conversation().to_vec();
+        let kept: Vec<&str> = conversation.iter().map(|m| m.content.as_str()).collect();
+        assert!(!kept.iter().any(|c| c.contains("big")), "the large text turn is folded: {kept:?}");
+        // The newest image turn is always kept; the wire-mirroring budget keeps
+        // a run of older image turns as placeholders that full-image accounting
+        // (which would keep only the single newest) would have folded.
+        assert!(kept.contains(&"img119"), "newest image turn kept: {kept:?}");
+        let kept_images = kept.iter().filter(|c| c.starts_with("img")).count();
+        assert!(kept_images > 1, "wire-mirroring budget keeps older image turns as placeholders, kept {kept_images}");
+        assert!(
+            kept_images < 120,
+            "the image tail still exceeds the budget, so the oldest are folded, kept {kept_images}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6293,7 +6908,7 @@ mod tests {
 
         // A crashed session whose turn never finished: the input was accepted
         // but no answer was recorded, so the resume path continues the turn.
-        crashed_session(dir.path(), "resume-start", vec![Record::Message(Message::user("run it"))]);
+        crashed_session(dir.path(), "resume-start", vec![Record::Message(Box::new(Message::user("run it")))]);
         let (mut agent, seen) = agent(vec![text("continued")], dir.path());
         agent.load_claude_hooks(dir.path());
         agent.load_session("resume-start").unwrap();
@@ -6357,9 +6972,12 @@ mod tests {
             dir.path(),
             "lost-outcome",
             vec![
-                Record::Message(Message::user("run it")),
-                Record::Message(Message::assistant_with_tools("", vec![report("o1", "blocked", "need a token")])),
-                Record::Message(Message::tool_result("o1", goal::TOOL_NAME, "Recorded outcome: blocked.")),
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(Message::assistant_with_tools(
+                    "",
+                    vec![report("o1", "blocked", "need a token")],
+                ))),
+                Record::Message(Box::new(Message::tool_result("o1", goal::TOOL_NAME, "Recorded outcome: blocked."))),
             ],
         );
         let (mut agent, seen) = agent(vec![], dir.path());
@@ -6478,8 +7096,43 @@ mod tests {
         assert_eq!(replayed[2]["status"], "failed", "replay matches the live status");
     }
 
-    type OnCall = Box<dyn Fn(usize, &TurnControl) + Send + Sync>;
+    #[test]
+    fn replay_shows_the_image_marker_on_persisted_tool_results() {
+        // ACP `session/load` replays persisted tool results through
+        // `replay_message`. A resumed client must still see each attachment's
+        // `[image: path, WxH]` marker, matching the live tool-result display —
+        // not the bare model-facing text.
+        let mut agent =
+            Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
+        let img = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: 12,
+            height: 34,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "read_file".into(),
+            arguments: json!({}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        agent.conversation.push(Message::assistant_with_tools("", vec![call]));
+        agent.conversation.push(Message::tool_result("t1", "read_file", "saw it").with_attachments(vec![img]));
+        let events = record_events(&mut agent);
+        agent.replay_history();
+        let events = events.lock().unwrap().clone();
+        let update =
+            events.iter().find(|e| e["sessionUpdate"] == "tool_call_update").expect("the tool result is replayed");
+        let raw = update["rawOutput"].as_str().unwrap();
+        assert!(raw.contains("[image: x.png, 12×34]"), "replay keeps the image marker: {raw}");
+        assert!(raw.contains("saw it"), "and the model-facing text: {raw}");
+    }
 
+    type OnCall = Box<dyn Fn(usize, &TurnControl) + Send + Sync>;
     /// Scripted client that can act on the turn control during a given call.
     struct Interfering {
         responses: Mutex<Vec<LLMResponse>>,

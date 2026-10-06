@@ -45,7 +45,9 @@ pub enum Record {
         text: String,
         recorded_at: DateTime<FixedOffset>,
     },
-    Message(Message),
+    /// Boxed: a `Message` is large, and boxing keeps the enum small (the
+    /// `Replace` variant carries a whole `Vec<Message>`).
+    Message(Box<Message>),
     TurnEnd {
         input_id: String,
         response: String,
@@ -141,6 +143,13 @@ pub struct SessionLog {
 /// Directory for complete copies of truncated tool output of session `id`.
 pub fn spill_dir_for(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.spill"))
+}
+
+/// Directory holding the image attachments of session `id`, one file per
+/// content hash (`<sha256>.<ext>`), so the same image is stored once and the
+/// log records only the reference.
+pub fn attachments_dir_for(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.attachments"))
 }
 
 pub fn default_dir() -> PathBuf {
@@ -416,8 +425,8 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 if crate::history::consumes_hint(&message) {
                     restored.history_hint_consumed = true;
                 }
-                originals.push(message.clone());
-                restored.conversation.push(message);
+                originals.push((*message).clone());
+                restored.conversation.push(*message);
             }
             Record::TurnEnd { input_id, response, outcome, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
@@ -468,7 +477,7 @@ mod tests {
         let path = dir.path().join("s.jsonl");
         let stale: Record =
             serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi","log_line":99}}"#).unwrap();
-        assert_eq!(stale, Record::Message(Message { log_line: Some(99), ..Message::user("hi") }));
+        assert_eq!(stale, Record::Message(Box::new(Message { log_line: Some(99), ..Message::user("hi") })));
         let mut log = String::new();
         for record in [
             Record::Session { version: FORMAT_VERSION, id: "s".into(), created_at: now(), cwd: None, model: None },
@@ -496,7 +505,7 @@ mod tests {
         assert_eq!(recorded_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
         let message: Record =
             serde_json::from_str(r#"{"type":"message","data":{"role":"user","content":"hi"}}"#).unwrap();
-        assert_eq!(message, Record::Message(Message::user("hi")));
+        assert_eq!(message, Record::Message(Box::new(Message::user("hi"))));
         // New records carry the local offset.
         let now = serde_json::to_string(&now()).unwrap();
         assert!(now.contains('+') || now.contains("-0") || now.contains("-1"), "{now}");
@@ -533,8 +542,8 @@ mod tests {
         })
         .unwrap();
         log.append(&input("in-1")).unwrap();
-        log.append(&Record::Message(Message::user("hi"))).unwrap();
-        log.append(&Record::Message(Message::assistant("hello"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("hi")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("hello")))).unwrap();
         log.append(&turn_end("in-1")).unwrap();
         drop(log);
 
@@ -555,13 +564,13 @@ mod tests {
     fn round_trips_and_tracks_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s1").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&input("in-1")).unwrap();
-        log.append(&Record::Message(Message::user("hi"))).unwrap();
-        log.append(&Record::Message(Message::assistant("hello"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("hi")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("hello")))).unwrap();
         log.append(&turn_end("in-1")).unwrap();
         log.append(&input("in-2")).unwrap();
-        log.append(&Record::Message(Message::user("again"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("again")))).unwrap();
         drop(log);
 
         let (_, restored) = SessionLog::open(dir.path(), "s1").unwrap();
@@ -575,7 +584,7 @@ mod tests {
     fn replace_resets_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s2").unwrap();
-        log.append(&Record::Message(Message::user("a"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("a")))).unwrap();
         log.append(&Record::Replace {
             messages: vec![Message::system("new")],
             pending_position: None,
@@ -597,9 +606,9 @@ mod tests {
         // smart compaction can still cite it as `[#N]`.
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s5").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
-        log.append(&Record::Message(Message::user("first"))).unwrap(); // #3
-        log.append(&Record::Message(Message::assistant("reply"))).unwrap(); // #4
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap(); // #2
+        log.append(&Record::Message(Box::new(Message::user("first")))).unwrap(); // #3
+        log.append(&Record::Message(Box::new(Message::assistant("reply")))).unwrap(); // #4
         // Retained messages carry no `log_line`, as a legacy compaction would write.
         log.append(&Record::Replace {
             messages: vec![
@@ -628,7 +637,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s3").unwrap();
         log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
-        log.append(&Record::Message(Message::user("go"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("go")))).unwrap();
         let messages = vec![Message::system("sys"), Message::user("summary"), Message::user("go")];
         log.append(&Record::Replace {
             messages: messages.clone(),
@@ -654,10 +663,10 @@ mod tests {
         // (records #2..=#4) into the summary and keeps only the later one.
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s6").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2 (folded)
-        log.append(&Record::Message(Message::user("same"))).unwrap(); // #3 (folded)
-        log.append(&Record::Message(Message::assistant("x"))).unwrap(); // #4 (folded)
-        log.append(&Record::Message(Message::user("same"))).unwrap(); // #5 (retained)
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap(); // #2 (folded)
+        log.append(&Record::Message(Box::new(Message::user("same")))).unwrap(); // #3 (folded)
+        log.append(&Record::Message(Box::new(Message::assistant("x")))).unwrap(); // #4 (folded)
+        log.append(&Record::Message(Box::new(Message::user("same")))).unwrap(); // #5 (retained)
         // The retained "same" carries no log_line, as a legacy write would.
         log.append(&Record::Replace {
             messages: vec![Message::user("summary"), Message::user("same")],
@@ -691,8 +700,8 @@ mod tests {
             model: None,
         })
         .unwrap();
-        let user = serde_json::to_string(&Record::Message(Message::user("hi"))).unwrap();
-        let answer = serde_json::to_string(&Record::Message(Message::assistant("hello"))).unwrap();
+        let user = serde_json::to_string(&Record::Message(Box::new(Message::user("hi")))).unwrap();
+        let answer = serde_json::to_string(&Record::Message(Box::new(Message::assistant("hello")))).unwrap();
         // Physical lines: 1 header, 2 user, 3 BLANK, 4 assistant.
         std::fs::write(&path, format!("{header}\n{user}\n\n{answer}\n")).unwrap();
 
@@ -705,7 +714,7 @@ mod tests {
         // `#N` collides with the existing assistant (#4) and diverges from
         // `history_read`.
         let (mut log, _) = SessionLog::open(dir.path(), "s7").unwrap();
-        let line = log.append(&Record::Message(Message::user("again"))).unwrap();
+        let line = log.append(&Record::Message(Box::new(Message::user("again")))).unwrap();
         assert_eq!(line, 5, "the append lands on physical line 5, past the blank line 3");
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
@@ -729,7 +738,7 @@ mod tests {
     fn standard_replace_does_not_offer_history_tools() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s8").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Replace {
             messages: vec![Message::user("summary")],
             pending_position: None,
@@ -748,7 +757,7 @@ mod tests {
     fn hint_consumed_tracks_messages_after_the_latest_replace() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s7b").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Replace {
             messages: vec![Message::user("summary")],
             pending_position: None,
@@ -766,7 +775,7 @@ mod tests {
         // A failed tool result carrying the hint consumes it for this compaction.
         let mut log = SessionLog::open(dir.path(), "s7b").unwrap().0;
         let hinted = format!("Exit code: 1\n\n{}", crate::history::FAILED_TOOL_HINT);
-        log.append(&Record::Message(Message::tool_error("c1", "bash", &hinted))).unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_error("c1", "bash", &hinted)))).unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s7b").unwrap();
         assert!(restored.history_hint_consumed, "a hint emitted after the replace is consumed");
@@ -783,9 +792,9 @@ mod tests {
             Message { thinking_blocks: vec![serde_json::json!({"thinking": "a"})], ..Message::assistant("reply") };
         let think_b =
             Message { thinking_blocks: vec![serde_json::json!({"thinking": "b"})], ..Message::assistant("reply") };
-        log.append(&Record::Message(Message::system("sys"))).unwrap(); // #2
-        log.append(&Record::Message(think_a.clone())).unwrap(); // #3
-        log.append(&Record::Message(think_b.clone())).unwrap(); // #4
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap(); // #2
+        log.append(&Record::Message(Box::new(think_a.clone()))).unwrap(); // #3
+        log.append(&Record::Message(Box::new(think_b.clone()))).unwrap(); // #4
         // A legacy replace retains only the second reasoning variant, un-IDed.
         log.append(&Record::Replace {
             messages: vec![Message::user("summary"), Message { log_line: None, ..think_b.clone() }],
@@ -806,7 +815,7 @@ mod tests {
     fn discards_torn_tail_and_appends_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "s3").unwrap();
-        log.append(&Record::Message(Message::user("a"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("a")))).unwrap();
         drop(log);
         let path = path_for(dir.path(), "s3");
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -815,7 +824,7 @@ mod tests {
 
         let (mut log, restored) = SessionLog::open(dir.path(), "s3").unwrap();
         assert_eq!(restored.conversation.len(), 1);
-        log.append(&Record::Message(Message::user("b"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("b")))).unwrap();
         drop(log);
         let (_, restored) = SessionLog::open(dir.path(), "s3").unwrap();
         assert_eq!(restored.conversation.len(), 2);
@@ -838,7 +847,7 @@ mod tests {
 
     #[test]
     fn golden_format_is_stable() {
-        let record = Record::Message(Message::tool_result("c1", "bash", "ok"));
+        let record = Record::Message(Box::new(Message::tool_result("c1", "bash", "ok")));
         assert_eq!(
             serde_json::to_string(&record).unwrap(),
             r#"{"type":"message","data":{"role":"tool","content":"ok","tool_call_id":"c1","name":"bash"}}"#

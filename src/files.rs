@@ -40,6 +40,20 @@ fn remember(path: &Path, bytes: &[u8]) {
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(seen_key(path), digest(bytes));
 }
 
+/// Record a successful image read in the freshness cache, so a later
+/// `write_file`/`edit_file` on the same path passes the "has not been read yet"
+/// check — exactly as a successful text read does via [`read_file`].
+///
+/// `read_file` cannot record this itself: it returns image *metadata* before
+/// the dispatch layer knows whether the model can actually view the image. The
+/// caller invokes this only once the image has truly been delivered to the
+/// model (vision enabled and the attachment prepared and stored); the no-vision
+/// error path returns earlier and so never authorizes a write for an image the
+/// model never saw.
+pub fn mark_image_read(path: &Path, bytes: &[u8]) {
+    remember(path, bytes);
+}
+
 /// Fail unless `current` (the file's bytes on disk) is what the model last saw.
 fn check_fresh(path: &Path, current: &[u8]) -> Result<()> {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&seen_key(path)).copied();
@@ -98,11 +112,22 @@ fn count_arg(args: &Value, name: &str) -> Result<Option<usize>> {
 }
 
 /// Numbered lines `offset..offset+limit` (1-based) of a text file.
-pub fn read_file(args: &Value) -> Result<String> {
+///
+/// An image (PNG, JPEG, GIF or WebP, recognised by magic bytes) returns a
+/// structured [`Value`] object instead of text: `{ "image": { media_type,
+/// extension, path, width, height, bytes } }` — the metadata only, never the
+/// pixels. The dispatch loop re-reads the file by path to downscale it, then
+/// turns that into a message attachment when the model can view images, or a
+/// text error when it cannot. Other binary files keep the "looks like a binary
+/// file" error.
+pub fn read_file(args: &Value) -> Result<Value> {
     let path = path_arg(args)?;
     let offset = count_arg(args, "offset")?.unwrap_or(1);
     let limit = count_arg(args, "limit")?.unwrap_or(DEFAULT_READ_LINES);
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    if let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) {
+        return read_image(&path, &bytes, format);
+    }
     if bytes.iter().take(8192).any(|b| *b == 0) {
         bail!("{} looks like a binary file ({} bytes)", path.display(), bytes.len());
     }
@@ -110,7 +135,7 @@ pub fn read_file(args: &Value) -> Result<String> {
     let total = text.lines().count();
     if total == 0 {
         remember(&path, &bytes);
-        return Ok(format!("({} is empty)", path.display()));
+        return Ok(Value::String(format!("({} is empty)", path.display())));
     }
     if offset > total {
         bail!("offset {offset} is past the end of {} ({total} lines)", path.display());
@@ -131,7 +156,43 @@ pub fn read_file(args: &Value) -> Result<String> {
     if last < total {
         out.push_str(&format!("[showing lines {offset}-{last} of {total}; use offset={} to continue]\n", last + 1));
     }
-    Ok(output::bound_output(&out, MAX_READ_BYTES).0)
+    Ok(Value::String(output::bound_output(&out, MAX_READ_BYTES).0))
+}
+
+/// Build the structured result for an image: its metadata only (never the
+/// pixel bytes). Base64-encoding the whole source here would create an
+/// unbounded transient allocation — several times the file size once the
+/// dispatch loop clones it for the `AfterToolCall` hook and decodes it back —
+/// before the model's byte/dimension limits are ever applied, so a large
+/// image could OOM even though it would end up well under the provider cap.
+/// The dispatch loop instead re-reads the file by `path` and applies `prepare`
+/// (which knows the model's capability) before any base64 encoding; here we
+/// only decode dimensions.
+fn read_image(path: &Path, bytes: &[u8], format: crate::attachment::ImageFormat) -> Result<Value> {
+    let (width, height) = image_dimensions(bytes)?;
+    // Persist an absolute source path so the advertised re-`read_file` workflow
+    // survives a session resume under a different working directory (ACP
+    // `session/load` accepts a new cwd, and CLI resume does not restore the
+    // recorded one). Resolve it against the still-active cwd now; `absolute` is
+    // lexical (no filesystem access), so it never fails for a path we just read.
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok(json!({
+        "image": {
+            "media_type": format.media_type(),
+            "extension": format.extension(),
+            "path": path,
+            "width": width,
+            "height": height,
+            "bytes": bytes.len(),
+        }
+    }))
+}
+
+/// Decode an image's pixel dimensions.
+fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    let reader =
+        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().context("guess image format")?;
+    reader.into_dimensions().context("read image dimensions")
 }
 
 /// What the caller expected the target to be when the write was planned. The
@@ -841,18 +902,20 @@ pub fn register(tools: &ToolRegistry) {
     tools.register(
         ToolDefinition::new(
             "read_file",
-            "Read a text file, returning numbered lines. Use offset/limit to page through large files.",
+            "Read a file. Text files return numbered lines; use offset/limit to page through large \
+             ones (pagination applies to text only). Image files (PNG, JPEG, GIF, WebP) are returned \
+             to vision-capable models as viewable images.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path, absolute or relative to the working directory" },
-                    "offset": { "type": "integer", "description": "1-based first line to return (default 1)" },
-                    "limit": { "type": "integer", "description": "Maximum number of lines (default 2000)" }
+                    "offset": { "type": "integer", "description": "1-based first line to return (text files only, default 1)" },
+                    "limit": { "type": "integer", "description": "Maximum number of lines (text files only, default 2000)" }
                 },
                 "required": ["path"]
             }),
         ),
-        Box::new(|args| read_file(&args).map(Value::String)),
+        Box::new(|args| read_file(&args)),
     );
     tools.register(
         ToolDefinition::new(
@@ -892,15 +955,23 @@ pub fn register(tools: &ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// `read_file` of a text file, as its string content.
+    fn read_text(args: &Value) -> String {
+        match read_file(args).unwrap() {
+            Value::String(text) => text,
+            other => panic!("expected text, got {other}"),
+        }
+    }
+
     #[test]
     fn read_pages_with_line_numbers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         let p = path.to_str().unwrap();
-        let all = read_file(&json!({ "path": p })).unwrap();
+        let all = read_text(&json!({ "path": p }));
         assert!(all.contains("     1\tone\n") && all.contains("     3\tthree\n"));
-        let page = read_file(&json!({ "path": p, "offset": 2, "limit": 1 })).unwrap();
+        let page = read_text(&json!({ "path": p, "offset": 2, "limit": 1 }));
         assert!(page.starts_with("     2\ttwo\n"));
         assert!(page.contains("use offset=3"));
         assert!(read_file(&json!({ "path": p, "offset": 9 })).is_err());
@@ -912,6 +983,62 @@ mod tests {
         let path = dir.path().join("b.bin");
         std::fs::write(&path, [0u8, 1, 2]).unwrap();
         assert!(read_file(&json!({ "path": path })).is_err());
+    }
+
+    /// Encode a solid-colour image of `w`×`h` in `format`.
+    fn make_image(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([10, 120, 200])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn read_returns_images_by_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, format, media_type) in [
+            ("a.png", image::ImageFormat::Png, "image/png"),
+            ("a.jpg", image::ImageFormat::Jpeg, "image/jpeg"),
+            ("a.gif", image::ImageFormat::Gif, "image/gif"),
+            ("a.webp", image::ImageFormat::WebP, "image/webp"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, make_image(40, 20, format)).unwrap();
+            let result = read_file(&json!({ "path": path.to_str().unwrap() })).unwrap();
+            let image = result.get("image").unwrap_or_else(|| panic!("{name} should be an image: {result}"));
+            assert_eq!(image["media_type"], media_type, "{name}");
+            assert_eq!(image["width"], 40, "{name}");
+            assert_eq!(image["height"], 20, "{name}");
+            assert!(image["bytes"].as_u64().is_some_and(|b| b > 0), "{name}");
+            assert!(image.get("data_base64").is_none(), "{name}: metadata must not carry the pixels");
+        }
+    }
+
+    #[test]
+    fn read_image_stores_absolute_source_path() {
+        // Regression: the persisted source path must be absolute so the
+        // re-`read_file` workflow survives a session resume under a different
+        // working directory. `read_image` is lexical here (it never touches the
+        // filesystem for the path), so a relative input must come back absolute.
+        let bytes = make_image(8, 8, image::ImageFormat::Png);
+        let format = crate::attachment::ImageFormat::sniff(&bytes).unwrap();
+        let result = read_image(Path::new("sub/rel.png"), &bytes, format).unwrap();
+        let stored = result["image"]["path"].as_str().unwrap();
+        assert!(Path::new(stored).is_absolute(), "stored path should be absolute: {stored}");
+        assert!(
+            stored.ends_with("sub/rel.png") || stored.ends_with("sub\\rel.png"),
+            "stored path should retain the source tail: {stored}"
+        );
+    }
+
+    #[test]
+    fn read_detects_image_despite_text_extension() {
+        // Magic bytes, not the extension, decide: a PNG named `.txt` is an image.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("misleading.txt");
+        std::fs::write(&path, make_image(8, 8, image::ImageFormat::Png)).unwrap();
+        let result = read_file(&json!({ "path": path.to_str().unwrap() })).unwrap();
+        assert!(result.get("image").is_some(), "PNG bytes named .txt are an image: {result}");
     }
 
     #[test]
@@ -1002,6 +1129,31 @@ mod tests {
         edit_file(&json!({ "path": p, "old_string": "more", "new_string": "less" })).unwrap();
         write_file(&json!({ "path": p, "content": "replaced\n" })).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
+    }
+
+    #[test]
+    fn image_reads_authorize_writes_only_once_dispatched_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        let png = {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        std::fs::write(&path, &png).unwrap();
+        let p = path.to_str().unwrap();
+        // `read_file` returns image metadata but does not itself authorize a
+        // write: only the dispatch layer, once the model can actually view the
+        // image, records the read (the no-vision path must not authorize it).
+        assert!(read_file(&json!({ "path": p })).unwrap().get("image").is_some());
+        let err = write_file(&json!({ "path": p, "content": "x" })).unwrap_err().to_string();
+        assert!(err.contains("has not been read"), "{err}");
+        // Once the image is delivered to the model, a later write passes the
+        // freshness gate — matching a successful text read.
+        mark_image_read(&path, &png);
+        write_file(&json!({ "path": p, "content": "replaced" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
     }
 
     #[test]
