@@ -1092,8 +1092,13 @@ impl Agent {
         Ok(())
     }
 
-    /// Registered tools plus the plan tools when enabled.
-    pub fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
+    /// Every registered tool plus the plan tools when enabled, with **no**
+    /// mode filter applied. This is the full superset for all modes; callers
+    /// that must track a live mode change after capturing it (`/tools`, see
+    /// [`crate::turn_commands::Snapshot`]) take this and filter at render
+    /// time. Use [`tool_definitions`](Self::tool_definitions) for the set the
+    /// agent actually offers the model under the current mode.
+    pub fn tool_definitions_all_modes(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
@@ -1107,6 +1112,13 @@ impl Agent {
         if self.history_tools_enabled() {
             tools.extend(history::definitions());
         }
+        tools
+    }
+
+    /// Registered tools plus the plan tools when enabled, filtered to the
+    /// tools the agent offers under the current mode.
+    pub fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
+        let mut tools = self.tool_definitions_all_modes();
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
         if self.control.mode() == crate::mode::AgentMode::Plan {
@@ -3364,6 +3376,48 @@ mod tests {
         let conversation = agent.conversation();
         let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("echo ran");
         assert!(!tool_result.is_error, "echo is read-only and allowed in plan mode");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        // A mutating tool that plan mode strips.
+        agent.tools().register(
+            ToolDefinition::new("write_file", "write a file", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("ok"))),
+        );
+        assert!(!crate::mode::plan_allows("write_file"), "test needs a plan-disallowed tool");
+
+        // Capture while in Plan mode: the capture must keep the full superset,
+        // not the Plan-filtered set, or the mutating tool is lost for good.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let snapshot = crate::turn_commands::Snapshot::capture(&agent);
+
+        // A mid-turn `/mode normal` makes the live mode Normal; `/tools` must
+        // then list the mutating tool the Plan-time capture would have dropped.
+        let normal = crate::context::ContextStats {
+            mode: crate::mode::AgentMode::Normal,
+            ..Default::default()
+        };
+        let Some(crate::turn_commands::Output::Block(listing)) =
+            snapshot.output("/tools", &normal, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(listing.contains("write_file"), "Plan-mode capture dropped the mutating tool: {listing}");
+
+        // And under a live Plan mode it is still filtered out.
+        let plan = crate::context::ContextStats {
+            mode: crate::mode::AgentMode::Plan,
+            ..Default::default()
+        };
+        let Some(crate::turn_commands::Output::Block(filtered)) =
+            snapshot.output("/tools", &plan, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(!filtered.contains("write_file"), "plan mode must still hide the mutating tool: {filtered}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

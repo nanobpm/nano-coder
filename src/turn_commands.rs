@@ -81,10 +81,12 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn capture(agent: &Agent) -> Self {
-        // Captured unfiltered: `Agent::tool_definitions()` already applies the
-        // current mode's filter, but the mode can change mid-turn, so `/tools`
-        // re-filters these by the live mode when it renders.
-        let tools = agent.tool_definitions();
+        // Captured for every mode: `Agent::tool_definitions()` applies the
+        // capture-time mode's filter, which would bake a Plan-mode capture's
+        // missing mutating tools in permanently; `tool_definitions_all_modes`
+        // returns the full superset so `/tools` can re-filter by the live mode
+        // when it renders.
+        let tools = agent.tool_definitions_all_modes();
 
         let found = agent.skills();
         let mut skills: Vec<String> = Vec::new();
