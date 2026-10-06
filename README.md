@@ -57,7 +57,9 @@ Slash commands work mid-turn too, where it is safe:
 - **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
   `/context`, `/trajectory` (`--json`/`--markdown`), and `/mode` or `/verbosity` without an
   argument) show the current state. `/plan` shows the plan as the agent updates it.
-- **From the agent's next step:** `/mode NAME` and `/verbosity LEVEL`.
+- **From the agent's next step:** `/mode NAME` applies when the agent takes its next step.
+- **Right away (for the rest of the turn):** `/verbosity LEVEL` changes the output level
+  immediately, so it affects the remaining events streamed by the current turn.
 - **After the turn:** commands that change the conversation or take over the keyboard
   (`/compact`, `/restart`, `/settings`, `/model`, `/exit`) wait for the turn to finish.
 

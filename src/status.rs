@@ -561,6 +561,7 @@ mod tests {
             compactions: 1,
             history_searches: 0,
             history_reads: 0,
+            history_available: false,
             auto_compact: Some(0.8),
             smart_compact: false,
             activity: Activity::Tool("bash".into()),
