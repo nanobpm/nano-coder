@@ -711,9 +711,16 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         println!();
     }
     renderer.begin_turn();
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
-    let mut escape = DoubleEscape::default();
-    let outcome = async {
+    let outcome = {
+        // The turn is a non-idle phase: the guard restores the idle `Prompt`
+        // mode on *every* exit path (including a future early `return`, `?`,
+        // or a panic unwinding the loop), not just the single explicit
+        // restore a hand-placed pair offers. It drops at the end of this
+        // block — after `end_turn`, before the steer drain below — preserving
+        // the exact ordering the manual `set_mode` pair had.
+        let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
+        let mut escape = DoubleEscape::default();
+        let outcome = async {
         // Grab the broker before the turn future borrows `agent` mutably.
         let questions = agent.questions();
         let turn = agent.run_turn(None, text);
@@ -869,8 +876,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         }
     }
     .await;
-    renderer.end_turn();
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
+        renderer.end_turn();
+        outcome
+    };
     // A steer typed as the turn finished queues behind what is already
     // waiting, unless the turn was cancelled. Drain it before propagating any
     // turn error too: `start_turn` does not clear pending steers, so a steer

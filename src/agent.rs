@@ -2535,8 +2535,8 @@ impl Agent {
                 let mut pre_hook_deny: Option<String> = None;
                 if let Some(claude_hooks) = self.claude_hooks.as_ref() {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
-                        && !(self.control.mode() == crate::mode::AgentMode::Plan
-                            && !crate::mode::plan_allows(&tool_call.name))
+                        && (self.control.mode() != crate::mode::AgentMode::Plan
+                            || crate::mode::plan_allows(&tool_call.name))
                         && self.policy.check(&tool_call.name, &tool_call.arguments).is_ok();
                     if runnable {
                         let outcome =

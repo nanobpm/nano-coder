@@ -2765,10 +2765,7 @@ mod tests {
             "the first idle Esc after the phase only re-arms; the pre-phase arm did not survive"
         );
         assert_eq!(view.lock().unwrap().line, "draft", "one post-phase Esc keeps the text");
-        assert!(
-            reader.escape_press(&view, t + std::time::Duration::from_millis(150)),
-            "two fresh idle presses clear"
-        );
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(150)), "two fresh idle presses clear");
         assert!(view.lock().unwrap().line.is_empty());
     }
 
