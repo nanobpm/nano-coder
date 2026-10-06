@@ -3169,13 +3169,20 @@ impl Agent {
             .filter(|&i| matches!(self.conversation[i].role, Role::User | Role::Assistant))
             .collect();
         let Some(&last_boundary) = boundaries.last() else { return Ok(None) };
+        // Budget the kept tail against the wire plan, not the full image cost:
+        // the request sends only the newest `max_images` attachments as images
+        // and serializes every older one as a short text placeholder. The cost
+        // of a candidate tail `conversation[k..]` is therefore the wire cost of
+        // that whole span (which charges only its newest `max_images` as
+        // images), *not* a sum of per-message full image costs — the latter
+        // would overcount an image-heavy tail and discard far more recent
+        // history than `KEEP_RECENT_TOKENS` intends. Grow the tail one boundary
+        // at a time and keep the largest span whose wire cost fits the budget.
+        let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
         let mut split = last_boundary;
-        let mut tail_tokens = 0;
-        let mut next = len;
         for &boundary in boundaries.iter().rev() {
-            tail_tokens += context::messages_tokens(&self.conversation[boundary..next]);
-            next = boundary;
-            if tail_tokens > keep_budget {
+            let tail = context::messages_tokens_with_vision(&self.conversation[boundary..], max_images);
+            if tail > keep_budget {
                 break;
             }
             split = boundary;
@@ -6375,6 +6382,69 @@ mod tests {
         // The stale-anchor behaviour would have double-charged the prefix image.
         let stale = 5_000 + context::messages_tokens_with_vision(&agent.conversation[1..], 1);
         assert!(tokens < stale, "recompute avoids the double-charge: {tokens} < {stale}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_tail_budget_mirrors_the_vision_wire_plan() {
+        // The kept-tail budget must charge attachments the way the wire does:
+        // only the newest `max_images` as images, older ones as short text
+        // placeholders. Charging every attachment its full image cost
+        // overcounts an image-heavy tail and discards far more recent history
+        // than `KEEP_RECENT_TOKENS` intends.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("SUMMARY"), text("done")], dir.path());
+        agent.reported_vision = Some(crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        });
+        // A small window so the threshold trips and an auto (Threshold)
+        // compaction runs; the keep budget is `KEEP_RECENT_TOKENS.min(window/4)`.
+        // Memory off keeps the system prompt small so the image tail (not the
+        // prompt) dominates the keep budget.
+        agent.config.context_window = Some(6_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.config.project_instructions = false;
+        agent.config.memory = crate::config::MemoryMode::Off;
+        agent.new_session().unwrap();
+        let img = || crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: 1000,
+            height: 1000,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        // One large old text turn, then 120 image turns. The keep budget is
+        // window/4 = 1,500. Under `max_images = 1` the wire sends only the
+        // newest image (~1,334 tokens); the 119 older ones are placeholders
+        // (~14 tokens each with framing), so the image tail exceeds the budget
+        // only after ~12 placeholders accrue. The split therefore lands
+        // mid-list, keeping the newest ~12 image turns (1 image + ~11
+        // placeholders ≈ 1,488) and folding the oldest ~108. Charging every
+        // image in full (~120 × 1,340) would blow the budget after the very
+        // first (newest) turn and fold all 119 older ones. The leading large
+        // text turn is always folded.
+        agent.conversation.push(Message::user(&"big ".repeat(4_000)));
+        for i in 0..120 {
+            agent.conversation.push(Message::user(&format!("img{i}")).with_attachments(vec![img()]));
+        }
+        agent.send_message("go").await.unwrap();
+        assert_eq!(agent.context_stats().lock().unwrap().compactions, 1, "threshold compaction ran");
+        let conversation = agent.conversation().to_vec();
+        let kept: Vec<&str> = conversation.iter().map(|m| m.content.as_str()).collect();
+        assert!(!kept.iter().any(|c| c.contains("big")), "the large text turn is folded: {kept:?}");
+        // The newest image turn is always kept; the wire-mirroring budget keeps
+        // a run of older image turns as placeholders that full-image accounting
+        // (which would keep only the single newest) would have folded.
+        assert!(kept.contains(&"img119"), "newest image turn kept: {kept:?}");
+        let kept_images = kept.iter().filter(|c| c.starts_with("img")).count();
+        assert!(kept_images > 1, "wire-mirroring budget keeps older image turns as placeholders, kept {kept_images}");
+        assert!(
+            kept_images < 120,
+            "the image tail still exceeds the budget, so the oldest are folded, kept {kept_images}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

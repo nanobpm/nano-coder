@@ -167,11 +167,6 @@ pub fn format_rate(tokens_per_sec: f64) -> String {
     if tokens_per_sec >= 10.0 { format!("{tokens_per_sec:.0} tok/s") } else { format!("{tokens_per_sec:.1} tok/s") }
 }
 
-pub fn message_tokens(message: &Message) -> usize {
-    let images: usize = message.attachments.iter().map(image_tokens).sum();
-    message_text_tokens(message) + images
-}
-
 /// Tokens for everything in a message *except* its image attachments: the
 /// content text, each tool call, and the per-message framing overhead. Split
 /// out so [`messages_tokens_with_vision`] can charge attachments against the
@@ -194,19 +189,16 @@ pub fn image_tokens(attachment: &crate::llm::Attachment) -> usize {
     estimate.clamp(1, max)
 }
 
-pub fn messages_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(message_tokens).sum()
-}
-
 /// Token estimate for `messages` that mirrors the vision wire plan: request
 /// builders send only the newest `max_images` image attachments as images and
 /// serialize every older attachment as its short text placeholder
-/// ([`crate::llm::ChatRequest::attachment_plan`]). A plain [`messages_tokens`]
-/// sum instead charges full image tokens for *every* historical attachment, so
-/// on an image-heavy conversation the status estimate can exceed the real
-/// payload by thousands of tokens and trip auto-compaction before the window is
-/// actually full. Charging only the newest `max_images` as images (and the rest
-/// as placeholder text) keeps the estimate tracking what is really sent.
+/// ([`crate::llm::ChatRequest::attachment_plan`]). Charging full image tokens
+/// for *every* historical attachment instead overcounts an image-heavy
+/// conversation by thousands of tokens, so the status estimate and the
+/// compaction kept-tail budget would trip auto-compaction (and fold recent
+/// history) before the window is actually full. Charging only the newest
+/// `max_images` as images (and the rest as placeholder text) keeps the
+/// estimate tracking what is really sent.
 ///
 /// "Newest" is by occurrence across `messages` in order — the same identity the
 /// wire plan uses — so the oldest `total - max_images` attachments become
@@ -417,7 +409,10 @@ mod tests {
         let m0 = Message::user("first").with_attachments(vec![img.clone()]);
         let m1 = Message::user("second").with_attachments(vec![img.clone(), img.clone()]);
         let convo = [m0, m1];
-        let naive = messages_tokens(&convo);
+        // The naive all-images sum: text/framing plus full image cost for every
+        // attachment (what the wire does *not* send past the newest-N quota).
+        let naive: usize =
+            convo.iter().map(|m| message_text_tokens(m) + m.attachments.iter().map(image_tokens).sum::<usize>()).sum();
         let img_cost = image_tokens(&img);
         let ph_cost = text_tokens(&img.placeholder());
         assert!(img_cost > ph_cost, "a big image must cost more than its placeholder");
