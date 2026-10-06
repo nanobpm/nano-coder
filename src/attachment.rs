@@ -297,17 +297,53 @@ fn stored_filename(attachment: &Attachment) -> Option<String> {
 /// Write an attachment's prepared bytes to the session's attachments directory,
 /// named by content hash so the same image is stored once. Returns the path.
 /// `bytes` are the *prepared* (post-downscale) bytes whose hash is `attachment.sha256`.
+/// A pre-existing copy is reused only when it is intact (its bytes still hash to
+/// `sha256`); a corrupt or truncated one is atomically repaired from `bytes`.
 pub fn store(attachments_dir: &Path, attachment: &Attachment, bytes: &[u8]) -> Result<PathBuf> {
     if sha256_hex(bytes) != attachment.sha256 {
         bail!("attachment bytes do not match their recorded hash");
     }
     let filename = stored_filename(attachment).context("attachment metadata fails validation")?;
     std::fs::create_dir_all(attachments_dir).with_context(|| format!("create {}", attachments_dir.display()))?;
-    let path = attachments_dir.join(filename);
-    if !path.exists() {
-        std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+    let path = attachments_dir.join(&filename);
+    // A present copy is reused only when its bytes still hash to the recorded
+    // sha256. A missing, truncated, partially written, or tampered sidecar is
+    // (re)written from the already-verified `bytes`, so a corrupt file is
+    // repaired in place here rather than trusted and later downgraded to "no
+    // longer available" on the next resume. The write goes through a temp file
+    // and an atomic rename so a concurrent reader never observes a half-written
+    // image and a crash mid-write cannot leave a corrupt sidecar behind.
+    let intact = std::fs::read(&path).is_ok_and(|existing| sha256_hex(&existing) == attachment.sha256);
+    if !intact {
+        write_atomically(attachments_dir, &path, bytes)
+            .with_context(|| format!("persist {}", path.display()))?;
     }
     Ok(path)
+}
+
+/// Write `bytes` to `path` via a uniquely named temp file in the same
+/// directory followed by an atomic rename, so a concurrent reader never
+/// observes a half-written file and a crash mid-write cannot leave a corrupt
+/// sidecar in place of `path`.
+fn write_atomically(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
+    Ok(())
 }
 
 /// Base64-encode an attachment's stored bytes for a provider payload. `None`
@@ -625,5 +661,43 @@ mod tests {
         // Truncation is caught the same way.
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert!(!exists(dir.path(), &attachment));
+    }
+
+    /// A pre-existing stored file whose bytes no longer match the recorded hash
+    /// (truncated / tampered / partially written) is repaired by `store`, not
+    /// trusted. Otherwise the corrupt copy would be left untouched and the next
+    /// resume would downgrade an otherwise-reproducible image to "no longer
+    /// available".
+    #[test]
+    fn store_repairs_a_corrupt_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/x.png"),
+            sha256: sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        let path = store(dir.path(), &attachment, &bytes).unwrap();
+
+        // Corrupt the stored sidecar (as a crash mid-write or tampering would).
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(!exists(dir.path(), &attachment), "precondition: corrupt file is unavailable");
+
+        // Re-storing the same verified bytes repairs it in place.
+        let repaired = store(dir.path(), &attachment, &bytes).unwrap();
+        assert_eq!(repaired, path, "repair keeps the content-hash name");
+        assert!(exists(dir.path(), &attachment), "repaired file is intact again");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "repaired bytes match the recorded hash");
+        // Truncation is repaired the same way.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        store(dir.path(), &attachment, &bytes).unwrap();
+        assert!(exists(dir.path(), &attachment));
+        // No temp files were left behind by the atomic rename.
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(entries.len(), 1, "only the single hash-named file remains");
     }
 }

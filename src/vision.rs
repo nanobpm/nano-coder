@@ -118,10 +118,10 @@ pub fn configured_override(
 }
 
 /// The vision capability for `model` on a provider of `kind`: a configured
-/// override wins (`true` → capable with default limits, `false` → blind); else
-/// the endpoint `reported` value; else a built-in assumption for the current
-/// first-party Anthropic / OpenAI model families. Returns `None` when the model
-/// cannot see images.
+/// override wins (`true` → capable, keeping any limits the endpoint reported;
+/// `false` → blind); else the endpoint `reported` value; else a built-in
+/// assumption for the current first-party Anthropic / OpenAI model families.
+/// Returns `None` when the model cannot see images.
 pub fn resolve(
     global: Option<Override>,
     kind: Option<ProviderKind>,
@@ -131,7 +131,16 @@ pub fn resolve(
 ) -> Option<Vision> {
     let (override_, _source) = configured_override(global, provider, model);
     if let Some(on) = override_ {
-        return on.then(Vision::capable);
+        if !on {
+            return None;
+        }
+        // `true` forces the *capability* on. When the endpoint also reported
+        // concrete limits (media types / byte cap / image count), keep them:
+        // a blanket override (e.g. a global `vision = true`) must not strip a
+        // stricter model's restrictions and let an unsupported media type or an
+        // oversized/too-many-images request be built and rejected. Only when
+        // nothing was reported do we fall back to permissive defaults.
+        return Some(reported.cloned().unwrap_or_else(Vision::capable));
     }
     if let Some(reported) = reported {
         return Some(reported.clone());
@@ -298,6 +307,33 @@ mod tests {
         assert!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "gpt-5-mini", None).is_some());
         assert_eq!(resolve(None, Some(ProviderKind::Openai), &openai_direct, "text-embedding-3", None), None);
         assert_eq!(resolve(None, None, &provider, "m", None), None);
+    }
+
+    #[test]
+    fn forced_true_keeps_reported_endpoint_limits() {
+        // A `vision = true` override forces the capability on, but must not
+        // discard limits the endpoint already reported — otherwise a blanket
+        // (e.g. global) override replaces a strict model's JPEG/PNG-only media
+        // list and byte/image caps with permissive defaults, so GIF/WebP or
+        // too many images get built and the provider rejects the request.
+        let provider = ProviderConfig::default();
+        let strict = Vision {
+            max_images: 2,
+            max_image_bytes: 1_000_000,
+            media_types: vec!["image/jpeg".into(), "image/png".into()],
+        };
+        assert_eq!(
+            resolve(Some(true), Some(ProviderKind::Openai), &provider, "copilot-model", Some(&strict)),
+            Some(strict.clone()),
+            "forced-true must preserve the endpoint's reported limits",
+        );
+        // With nothing reported, forced-true still falls back to permissive defaults.
+        assert_eq!(
+            resolve(Some(true), Some(ProviderKind::Openai), &provider, "some-local", None),
+            Some(Vision::capable()),
+        );
+        // Forced-false still disables vision even when the endpoint reports limits.
+        assert_eq!(resolve(Some(false), Some(ProviderKind::Openai), &provider, "copilot-model", Some(&strict)), None);
     }
 
     #[test]
