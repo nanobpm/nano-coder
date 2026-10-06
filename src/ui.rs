@@ -1744,6 +1744,19 @@ mod tests {
     }
 
     #[test]
+    fn clear_transient_drops_a_hint_before_the_turn_ends() {
+        // An accepted submission clears a refusal hint mid-turn: it must not
+        // wait for `end_turn`.
+        let r = Renderer::frame_for_test();
+        r.transient_note("Unknown command /exin (/help lists commands)");
+        r.clear_transient();
+        assert_eq!(r.frame_transient(), None);
+        // Clearing with no hint armed is a no-op (no redraw, no panic).
+        r.clear_transient();
+        assert_eq!(r.frame_transient(), None);
+    }
+
+    #[test]
     fn begin_turn_supersedes_a_transient_hint() {
         let r = Renderer::frame_for_test();
         r.transient_note("(Ctrl-C again to exit)");
