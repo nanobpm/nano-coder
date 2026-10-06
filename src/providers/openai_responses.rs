@@ -19,13 +19,25 @@ use crate::llm::{ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenU
 use crate::thinking::Request;
 
 /// Responses API request body for `request`, with provider overrides applied.
+/// The Copilot client (the only caller) builds the plan once and uses
+/// [`build_body_with_plan`]; this plan-building convenience is for tests.
+#[cfg(test)]
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+    build_body_with_plan(transport, request, &request.attachment_plan())
+}
+
+/// As [`build_body`], but reusing a caller-supplied attachment plan so a client
+/// that already resolved one does not rescan and rehash every stored sidecar.
+pub(crate) fn build_body_with_plan(
+    transport: &HttpTransport,
+    request: &ChatRequest<'_>,
+    plan: &crate::llm::AttachmentPlan,
+) -> Value {
     let provider = transport.provider();
     let replay = provider.replay_reasoning;
     let mut instructions: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
-    // Resolve the image quota once for the whole request, not per tool message.
-    let plan = request.attachment_plan();
+    // The image quota is resolved once per request by the caller and shared.
     for message in request.messages {
         match message.role {
             Role::System => {
@@ -65,7 +77,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
                 // A tool result with image attachments carries them after the
                 // text: `{type:"input_image", image_url:"data:…;base64,…"}`.
                 // Omitted/missing attachments become a text placeholder.
-                let resolved = request.resolve_attachments_with(message, &plan);
+                let resolved = request.resolve_attachments_with(message, plan);
                 if resolved.is_empty() {
                     input.push(json!({
                         "type": "function_call_output",

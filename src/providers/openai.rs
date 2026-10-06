@@ -28,10 +28,21 @@ impl OpenAiClient {
 
 /// Chat Completions request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+    build_body_with_plan(transport, request, &request.attachment_plan())
+}
+
+/// As [`build_body`], but reusing a caller-supplied attachment plan so a client
+/// that already resolved one (e.g. to set a vision header) does not rescan and
+/// rehash every stored sidecar a second time.
+pub(crate) fn build_body_with_plan(
+    transport: &HttpTransport,
+    request: &ChatRequest<'_>,
+    plan: &crate::llm::AttachmentPlan,
+) -> Value {
     let provider = transport.provider();
     let mut body = json!({
         "model": provider.model,
-        "messages": encode_messages(request, provider.replay_reasoning),
+        "messages": encode_messages(request, provider.replay_reasoning, plan),
     });
     if !request.tools.is_empty() {
         body["tools"] = request
@@ -74,7 +85,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
 /// after the run of tool results they belong to (as `{type:"image_url"}`
 /// parts); the tool message notes the attachment follows. Omitted or missing
 /// attachments become a text placeholder appended to the tool message.
-fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Value> {
+fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool, plan: &crate::llm::AttachmentPlan) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     // Image parts collected from the current run of tool messages, flushed into
     // one user message when the run ends.
@@ -92,8 +103,7 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         }
         out.push(json!({ "role": "user", "content": content }));
     };
-    // Resolve the image quota once for the whole request, not per tool message.
-    let plan = request.attachment_plan();
+    // The image quota is resolved once per request by the caller and shared.
     for message in request.messages {
         if message.role != Role::Tool {
             flush(&mut out, &mut pending_images);
@@ -101,7 +111,7 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         if message.role == Role::Tool && !message.attachments.is_empty() {
             let mut content = message.content.clone();
             let mut added_image = false;
-            for item in request.resolve_attachments_with(message, &plan) {
+            for item in request.resolve_attachments_with(message, plan) {
                 match item {
                     crate::llm::ResolvedAttachment::Image(image) => {
                         pending_images.push(image);

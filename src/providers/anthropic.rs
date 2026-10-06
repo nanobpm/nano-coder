@@ -31,6 +31,16 @@ impl AnthropicClient {
 
 /// Messages API request body for `request`, with provider overrides applied.
 pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -> Value {
+    build_body_with_plan(transport, request, &request.attachment_plan())
+}
+
+/// As [`build_body`], but reusing a caller-supplied attachment plan so a client
+/// that already resolved one does not rescan and rehash every stored sidecar.
+pub(crate) fn build_body_with_plan(
+    transport: &HttpTransport,
+    request: &ChatRequest<'_>,
+    plan: &crate::llm::AttachmentPlan,
+) -> Value {
     let provider = transport.provider();
     let system: Vec<&str> = request
         .messages
@@ -41,7 +51,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     let mut body = json!({
         "model": provider.model,
         "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-        "messages": encode_messages(request),
+        "messages": encode_messages(request, plan),
     });
     if !system.is_empty() {
         body["system"] = json!(system.join("\n\n"));
@@ -103,11 +113,10 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
 
 /// Encode messages as content blocks, merging consecutive same-role turns
 /// (tool results travel as `user` messages and must be grouped).
-fn encode_messages(request: &ChatRequest<'_>) -> Vec<Value> {
+fn encode_messages(request: &ChatRequest<'_>, plan: &crate::llm::AttachmentPlan) -> Vec<Value> {
     let messages = request.messages;
     let mut encoded: Vec<(String, Vec<Value>)> = Vec::new();
-    // Resolve the image quota once for the whole request, not per tool message.
-    let plan = request.attachment_plan();
+    // The image quota is resolved once per request by the caller and shared.
     for message in messages {
         let (role, blocks) = match message.role {
             Role::System => continue,
@@ -116,7 +125,7 @@ fn encode_messages(request: &ChatRequest<'_>) -> Vec<Value> {
                 // A tool result with image attachments carries them as content
                 // blocks after the text: `{type:"image", source:{base64}}`.
                 // Omitted/missing attachments become a text placeholder.
-                let resolved = request.resolve_attachments_with(message, &plan);
+                let resolved = request.resolve_attachments_with(message, plan);
                 let block = if resolved.is_empty() {
                     let mut block = json!({
                         "type": "tool_result",
@@ -480,9 +489,11 @@ mod tests {
         let plain = Message::assistant("answer");
         let with_data = [Message::user("q"), logged];
         let without_data = [Message::user("q"), plain];
+        let req_with = ChatRequest::test_request(&with_data);
+        let req_without = ChatRequest::test_request(&without_data);
         assert_eq!(
-            encode_messages(&ChatRequest::test_request(&with_data)),
-            encode_messages(&ChatRequest::test_request(&without_data))
+            encode_messages(&req_with, &req_with.attachment_plan()),
+            encode_messages(&req_without, &req_without.attachment_plan())
         );
     }
 
@@ -794,7 +805,9 @@ mod tests {
             thinking_blocks: response.thinking_blocks.clone(),
             ..Message::assistant_with_tools(&response.content, response.tool_calls.clone())
         };
-        let encoded = encode_messages(&ChatRequest::test_request(&[Message::user("hello"), assistant]));
+        let msgs = [Message::user("hello"), assistant];
+        let req = ChatRequest::test_request(&msgs);
+        let encoded = encode_messages(&req, &req.attachment_plan());
         assert_eq!(encoded[1]["content"][0], json!({"type": "thinking", "thinking": "Plan.", "signature": "sig"}));
         assert_eq!(encoded[1]["content"][1]["type"], "text");
     }
@@ -834,7 +847,9 @@ mod tests {
             thinking_blocks: vec![json!({"type": "reasoning_content", "text": "from kimi"})],
             ..Message::assistant("hi")
         };
-        let encoded = encode_messages(&ChatRequest::test_request(&[Message::user("hello"), assistant]));
+        let msgs = [Message::user("hello"), assistant];
+        let req = ChatRequest::test_request(&msgs);
+        let encoded = encode_messages(&req, &req.attachment_plan());
         assert_eq!(encoded[1]["content"], json!([{"type": "text", "text": "hi"}]));
     }
 

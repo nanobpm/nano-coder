@@ -453,10 +453,21 @@ impl LLMClient for GithubCopilotClient {
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let provider = self.transport.provider();
         let api = copilot_api_for_model(&provider.model);
-        let body = match api {
-            CopilotApi::Completions => openai::build_body(&self.transport, request),
-            CopilotApi::Responses => openai_responses::build_body(&self.transport, request),
-            CopilotApi::Messages => anthropic::build_body(&self.transport, request),
+        // Resolve the attachment plan once and reuse it for both the body and
+        // the vision-header decision, so image-bearing requests do not rescan
+        // and rehash every stored sidecar twice (body build + `has_images`).
+        // Scoped so the plan (raw-pointer keyed, not `Send`) is dropped before
+        // the retry loop's awaits.
+        let (body, vision) = {
+            let plan = request.attachment_plan();
+            let body = match api {
+                CopilotApi::Completions => openai::build_body_with_plan(&self.transport, request, &plan),
+                CopilotApi::Responses => openai_responses::build_body_with_plan(&self.transport, request, &plan),
+                CopilotApi::Messages => anthropic::build_body_with_plan(&self.transport, request, &plan),
+            };
+            // Tell Copilot this request carries an image so it routes to the
+            // vision path (only when one is actually sent).
+            (body, plan.carries_image())
         };
         // Copilot bills a premium request per user-initiated turn; tool
         // follow-ups are marked agent-initiated, as VS Code does.
@@ -465,9 +476,6 @@ impl LLMClient for GithubCopilotClient {
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
-        // Tell Copilot this request carries an image so it routes to the
-        // vision path (only when one is actually sent).
-        let vision = request.has_images();
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;
@@ -513,17 +521,23 @@ impl LLMClient for GithubCopilotClient {
         }
         let provider = self.transport.provider();
         let api = copilot_api_for_model(&provider.model);
-        let body = match api {
-            CopilotApi::Completions => openai::build_body(&self.transport, request),
-            CopilotApi::Responses => openai_responses::build_body(&self.transport, request),
-            CopilotApi::Messages => anthropic::build_body(&self.transport, request),
+        // One attachment plan for both the body and the vision header (see
+        // `chat`), so the streaming path also avoids a duplicate sidecar scan.
+        // Scoped so the non-`Send` plan is dropped before the loop's awaits.
+        let (body, vision) = {
+            let plan = request.attachment_plan();
+            let body = match api {
+                CopilotApi::Completions => openai::build_body_with_plan(&self.transport, request, &plan),
+                CopilotApi::Responses => openai_responses::build_body_with_plan(&self.transport, request, &plan),
+                CopilotApi::Messages => anthropic::build_body_with_plan(&self.transport, request, &plan),
+            };
+            (body, plan.carries_image())
         };
         let initiator = match request.messages.last().map(|m| &m.role) {
             Some(Role::User) => "user",
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
-        let vision = request.has_images();
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;

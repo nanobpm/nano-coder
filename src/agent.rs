@@ -46,6 +46,21 @@ fn output_margin(window: usize) -> usize {
     window / 50
 }
 
+/// The display form of a tool result: the model-facing `text` with each
+/// attached image noted as `[image: path, WxH]` on its own line. Shared by the
+/// live tool-result event and ACP / trajectory replay so a resumed session
+/// shows the same image markers it showed live, instead of the bare text.
+fn tool_result_display(text: &str, attachments: &[crate::llm::Attachment]) -> String {
+    let mut out = text.to_string();
+    for attachment in attachments {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&attachment.placeholder());
+    }
+    out
+}
+
 /// Accumulates streamed output to estimate a live output rate (completion
 /// tokens per second), throttled so the status line does not redraw on every
 /// delta. Tokens are estimated from streamed bytes (~4 bytes/token) and
@@ -1358,7 +1373,23 @@ impl Agent {
         if let Some((len, tokens)) = self.calibration
             && len <= self.conversation.len()
         {
-            return (tokens + context::messages_tokens_with_vision(&self.conversation[len..], max_images), true);
+            let (prefix, suffix) = self.conversation.split_at(len);
+            // The calibrated `tokens` baked in the prefix's newest `max_images`
+            // attachments at full image cost. A post-anchor (suffix) attachment
+            // claims a newest-`max_images` slot and displaces an older prefix
+            // image into a text placeholder on the wire — but the anchor still
+            // carries that stale full-image cost while the suffix adds the new
+            // image on top, double-charging past the quota. That overestimate
+            // can trip auto-compaction early and shrink `max_tokens`. The anchor
+            // is only valid while no prefix image is displaced; otherwise fall
+            // through to a full recompute that mirrors the current wire plan.
+            let prefix_attachments: usize = prefix.iter().map(|m| m.attachments.len()).sum();
+            let suffix_attachments: usize = suffix.iter().map(|m| m.attachments.len()).sum();
+            let prefix_images = prefix_attachments.min(max_images);
+            let prefix_images_after = prefix_attachments.min(max_images.saturating_sub(suffix_attachments));
+            if prefix_images == prefix_images_after {
+                return (tokens + context::messages_tokens_with_vision(suffix, max_images), true);
+            }
         }
         let tools: usize = self
             .tool_definitions()
@@ -1586,7 +1617,11 @@ impl Agent {
                     return;
                 };
                 let ok = !message.is_error;
-                self.emit(AgentEvent::ToolResult { call, ok, output: &message.content });
+                // Mirror the live path's display output so a resumed ACP /
+                // trajectory client still sees each persisted attachment's
+                // `[image: path, WxH]` marker, not the bare model-facing text.
+                let output = tool_result_display(&message.content, &message.attachments);
+                self.emit(AgentEvent::ToolResult { call, ok, output: &output });
             }
         }
     }
@@ -2905,13 +2940,7 @@ impl Agent {
                 // The display output (trajectory event, ACP) notes each attached
                 // image as `[image: path, WxH]`; the model-facing `result_text`
                 // stays the short text part.
-                let mut display_output = result_text.clone();
-                for attachment in &attachments {
-                    if !display_output.is_empty() {
-                        display_output.push('\n');
-                    }
-                    display_output.push_str(&attachment.placeholder());
-                }
+                let display_output = tool_result_display(&result_text, &attachments);
                 let message = if ok {
                     Message::tool_result(&tool_call.id, &tool_call.name, &result_text)
                 } else {
@@ -6299,6 +6328,55 @@ mod tests {
         assert_eq!(stats.lock().unwrap().session_input_tokens, 1_000);
     }
 
+    #[test]
+    fn calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image() {
+        // The calibrated anchor charged the prefix's one in-quota image at full
+        // image cost. A later `read_file` adds a newer image that, under
+        // `max_images = 1`, displaces the prefix image into a placeholder on the
+        // wire. Keeping the anchor's full-image cost *and* adding the new image
+        // would double-charge past the quota and overestimate context (tripping
+        // compaction early); the estimate must instead recompute the whole
+        // conversation to mirror the real newest-N wire plan.
+        let (mut agent, _) = agent(vec![], std::path::Path::new("/nonexistent"));
+        agent.reported_vision = Some(crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        });
+        let img = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: 1000,
+            height: 1000,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        // Prefix: one message carrying an image, anchored to a reported total.
+        agent.conversation.push(Message::user("look").with_attachments(vec![img.clone()]));
+        agent.calibration = Some((agent.conversation.len(), 5_000));
+        // No suffix yet: the anchor stands (no displacement).
+        assert_eq!(agent.estimate_context_tokens(), (5_000, true));
+        // A newer image in the suffix displaces the prefix image.
+        agent.conversation.push(Message::user("again").with_attachments(vec![img.clone()]));
+        let (tokens, calibrated) = agent.estimate_context_tokens();
+        assert!(!calibrated, "a displaced prefix image invalidates the anchor");
+        let tools: usize = agent
+            .tool_definitions()
+            .iter()
+            .map(|d| {
+                context::text_tokens(&d.name)
+                    + context::text_tokens(&d.description)
+                    + context::text_tokens(&d.parameters.to_string())
+            })
+            .sum();
+        let expected = context::messages_tokens_with_vision(&agent.conversation, 1) + tools;
+        assert_eq!(tokens, expected, "recomputes the whole conversation per the wire plan");
+        // The stale-anchor behaviour would have double-charged the prefix image.
+        let stale = 5_000 + context::messages_tokens_with_vision(&agent.conversation[1..], 1);
+        assert!(tokens < stale, "recompute avoids the double-charge: {tokens} < {stale}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn streams_deltas_and_reports_thinking_before_the_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -6894,8 +6972,43 @@ mod tests {
         assert_eq!(replayed[2]["status"], "failed", "replay matches the live status");
     }
 
-    type OnCall = Box<dyn Fn(usize, &TurnControl) + Send + Sync>;
+    #[test]
+    fn replay_shows_the_image_marker_on_persisted_tool_results() {
+        // ACP `session/load` replays persisted tool results through
+        // `replay_message`. A resumed client must still see each attachment's
+        // `[image: path, WxH]` marker, matching the live tool-result display —
+        // not the bare model-facing text.
+        let mut agent =
+            Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
+        let img = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: 12,
+            height: 34,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "read_file".into(),
+            arguments: json!({}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        agent.conversation.push(Message::assistant_with_tools("", vec![call]));
+        agent.conversation.push(Message::tool_result("t1", "read_file", "saw it").with_attachments(vec![img]));
+        let events = record_events(&mut agent);
+        agent.replay_history();
+        let events = events.lock().unwrap().clone();
+        let update =
+            events.iter().find(|e| e["sessionUpdate"] == "tool_call_update").expect("the tool result is replayed");
+        let raw = update["rawOutput"].as_str().unwrap();
+        assert!(raw.contains("[image: x.png, 12×34]"), "replay keeps the image marker: {raw}");
+        assert!(raw.contains("saw it"), "and the model-facing text: {raw}");
+    }
 
+    type OnCall = Box<dyn Fn(usize, &TurnControl) + Send + Sync>;
     /// Scripted client that can act on the turn control during a given call.
     struct Interfering {
         responses: Mutex<Vec<LLMResponse>>,

@@ -376,18 +376,16 @@ impl ChatRequest<'_> {
     /// does not consume a slot an older available image could have used; each
     /// still resolves to its own "no longer available" placeholder. An empty
     /// set (no vision, or `max_images == 0`) sends none.
-    fn sendable(&self) -> std::collections::HashSet<*const crate::llm::Attachment> {
-        self.attachment_plan().sendable
-    }
-
+    ///
     /// The per-request attachment resolution plan, computed **once** and reused
-    /// across every message. Resolving each message independently recomputes
-    /// `sendable()` — which hashes every stored image via `attachment::exists`
-    /// — so a conversation with N image-bearing messages would hash the whole
+    /// across every message. Resolving each message independently would rebuild
+    /// it — hashing every stored image via `attachment::exists` — so a
+    /// conversation with N image-bearing messages would hash the whole
     /// attachment set N times (O(N²) file I/O) even when `max_images` is 1.
     /// Building the plan here hashes each stored file at most once (O(N)); the
     /// serializers compute it before their message loop and pass it to
-    /// [`Self::resolve_attachments_with`].
+    /// [`Self::resolve_attachments_with`], and the vision-header decision reuses
+    /// it via [`AttachmentPlan::carries_image`] instead of rescanning.
     pub fn attachment_plan(&self) -> AttachmentPlan {
         let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
         let mut available: Vec<&crate::llm::Attachment> =
@@ -466,18 +464,6 @@ impl ChatRequest<'_> {
     pub fn resolve_attachments(&self, message: &Message) -> Vec<ResolvedAttachment> {
         self.resolve_attachments_with(message, &self.attachment_plan())
     }
-
-    /// Whether any message in the request carries an attachment that will be
-    /// sent as an image (used by GitHub Copilot to set its vision header). An
-    /// attachment counts only when it is both sendable *and* its stored file
-    /// is intact (present and hash-matching) — a deleted or tampered file
-    /// resolves to a text placeholder, not an image, so the vision header must
-    /// not claim one.
-    pub fn has_images(&self) -> bool {
-        // `sendable()` already excludes references whose files are missing or
-        // tampered, so a non-empty set means at least one real image is sent.
-        !self.sendable().is_empty()
-    }
 }
 
 /// An image's wire bytes: its (post-downscale) media type and base64 data.
@@ -505,6 +491,18 @@ pub enum ResolvedAttachment {
 pub struct AttachmentPlan {
     available: std::collections::HashSet<*const crate::llm::Attachment>,
     sendable: std::collections::HashSet<*const crate::llm::Attachment>,
+}
+
+impl AttachmentPlan {
+    /// Whether this request sends at least one real image (a sendable,
+    /// on-disk-intact attachment): used by GitHub Copilot to set its vision
+    /// header. A deleted or tampered file resolves to a text placeholder, not
+    /// an image, and is excluded here, so the header never claims an image the
+    /// payload does not carry. Lets the client decide vision routing from the
+    /// plan it already built, without a second sidecar-hashing scan.
+    pub fn carries_image(&self) -> bool {
+        !self.sendable.is_empty()
+    }
 }
 
 impl<'a> ChatRequest<'a> {
@@ -803,7 +801,7 @@ mod tests {
         ));
         assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Omitted(_)));
         assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
-        assert!(request.has_images());
+        assert!(request.attachment_plan().carries_image());
 
         // Two images: b and c are sent, a is omitted.
         let request = ChatRequest {
@@ -814,6 +812,28 @@ mod tests {
         assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
         assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
         assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn plan_carries_image_reflects_what_is_actually_sent() {
+        // The shared-plan accessor the Copilot client uses for its vision header
+        // must report an image only when a sendable, on-disk-intact attachment
+        // is sent: not for a missing file, a zero quota, or no vision.
+        let dir = tempfile::tempdir().unwrap();
+        let present = attachment("p", Some(dir.path()));
+        let missing = attachment("m", None);
+        for (vis, atts, expected, label) in [
+            (Some(vision(1)), vec![present.clone()], true, "available image"),
+            (Some(vision(1)), vec![missing.clone()], false, "missing file"),
+            (Some(vision(0)), vec![present.clone()], false, "no image quota"),
+            (None, vec![present.clone()], false, "no vision"),
+            (Some(vision(1)), vec![], false, "no attachments"),
+        ] {
+            let messages = vec![Message::tool_result("t1", "read_file", "x").with_attachments(atts)];
+            let request =
+                ChatRequest { vision: vis, attachments_dir: Some(dir.path()), ..ChatRequest::test_request(&messages) };
+            assert_eq!(request.attachment_plan().carries_image(), expected, "{label}");
+        }
     }
 
     #[test]
@@ -858,7 +878,7 @@ mod tests {
         }
         // A deleted file resolves to a placeholder, so the request carries no
         // image and must not claim a vision request.
-        assert!(!request.has_images(), "deleted file must not report a sendable image");
+        assert!(!request.attachment_plan().carries_image(), "deleted file must not report a sendable image");
     }
 
     #[test]
@@ -892,7 +912,7 @@ mod tests {
             }
             other => panic!("missing newest should be a placeholder, got {other:?}"),
         }
-        assert!(request.has_images(), "an available image is sent despite the missing newest");
+        assert!(request.attachment_plan().carries_image(), "an available image is sent despite the missing newest");
     }
 
     #[test]
@@ -952,7 +972,7 @@ mod tests {
             other => panic!("tampered newest should be a placeholder, got {other:?}"),
         }
         // An intact image is sent, so the vision header is still honest.
-        assert!(request.has_images());
+        assert!(request.attachment_plan().carries_image());
     }
 
     #[test]
@@ -971,7 +991,7 @@ mod tests {
             ..ChatRequest::test_request(&messages)
         };
         assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
-        assert!(!request.has_images(), "a tampered file must not report a sendable image");
+        assert!(!request.attachment_plan().carries_image(), "a tampered file must not report a sendable image");
     }
 
     #[test]
@@ -982,7 +1002,7 @@ mod tests {
         ];
         let request = ChatRequest { attachments_dir: Some(dir.path()), ..ChatRequest::test_request(&messages) };
         assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
-        assert!(!request.has_images());
+        assert!(!request.attachment_plan().carries_image());
     }
 
     #[test]
