@@ -634,7 +634,9 @@ impl Agent {
             stats.model = self.client.model_name().to_string();
             stats.tokens = tokens;
             stats.calibrated = calibrated;
-            stats.window = self.context_window();
+            let (window, window_source) = self.context_window_with_source();
+            stats.window = window;
+            stats.window_source = window_source;
             stats.messages = self.conversation.len();
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();

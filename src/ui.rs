@@ -201,6 +201,17 @@ pub struct Renderer {
     /// `begin_turn`, then raised the moment a non-empty answer delta is
     /// actually suppressed while quiet (and by a mid-turn switch to `quiet`).
     touched_quiet: AtomicBool,
+    /// Set when an assistant message has closed since the last answer delta, so
+    /// the next non-empty answer delta begins a *new* message segment. The
+    /// turn-end reprint (gated on [`Self::answer_may_be_truncated`]) reprints
+    /// only `outcome.response` — the turn's *final* assistant message — so the
+    /// truncation guard must reflect whether that final answer's live stream is
+    /// incomplete, not whether any earlier (already-finalized, never-reprinted)
+    /// message was suppressed while quiet. On each new answer segment the guard
+    /// is cleared, so a quiet intermediate/tool-call response followed by a
+    /// normally-streamed final answer no longer spuriously reprints it. Reset
+    /// at `begin_turn`.
+    answer_segment_closed: AtomicBool,
     /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
     /// terminal. When set, all output is composed into one frame (transcript,
     /// editor, status as the last line) and diff-rendered by a single writer,
@@ -270,6 +281,7 @@ impl Renderer {
             tty,
             expanded: AtomicBool::new(false),
             touched_quiet: AtomicBool::new(false),
+            answer_segment_closed: AtomicBool::new(false),
             frame,
         })
     }
@@ -693,6 +705,8 @@ impl Renderer {
         // whose answer streams normally after a switch to a louder level must
         // not be reprinted.
         self.touched_quiet.store(false, Ordering::Relaxed);
+        // The first answer streamed this turn is a fresh segment.
+        self.answer_segment_closed.store(false, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         state.in_turn = true;
         state.at_line_start = true;
@@ -847,10 +861,23 @@ impl Renderer {
             // Merely being quiet (with no delta suppressed yet) must not set
             // this — a turn that switches to a louder level before any delta
             // streams its answer normally, and reprinting would duplicate it.
-            if let AgentEvent::TextDelta { text } = event
-                && !text.is_empty()
-            {
-                self.touched_quiet.store(true, Ordering::Relaxed);
+            match event {
+                AgentEvent::TextDelta { text } if !text.is_empty() => {
+                    // A new answer segment: clear any truncation signal left by
+                    // an earlier, already-finalized message (the turn-end
+                    // reprint only reprints the final answer), then flag this
+                    // segment's suppression.
+                    if self.answer_segment_closed.swap(false, Ordering::Relaxed) {
+                        self.touched_quiet.store(false, Ordering::Relaxed);
+                    }
+                    self.touched_quiet.store(true, Ordering::Relaxed);
+                }
+                // An assistant message closed while quiet: the next answer
+                // delta begins a fresh segment (see `answer_segment_closed`).
+                AgentEvent::AssistantMessage { .. } => {
+                    self.answer_segment_closed.store(true, Ordering::Relaxed);
+                }
+                _ => {}
             }
             return;
         }
@@ -873,6 +900,13 @@ impl Renderer {
             AgentEvent::TextDelta { text } => {
                 self.finish_thinking(&mut state);
                 if !text.is_empty() {
+                    // A new answer segment is streaming normally: drop any
+                    // truncation signal from an earlier, already-finalized
+                    // message so only this (potentially final) answer's own
+                    // quiet suppression can request a turn-end reprint.
+                    if self.answer_segment_closed.swap(false, Ordering::Relaxed) {
+                        self.touched_quiet.store(false, Ordering::Relaxed);
+                    }
                     if !state.streamed_text {
                         self.newline(&mut state);
                         let stamp = stamp();
@@ -893,6 +927,9 @@ impl Renderer {
                 self.newline(&mut state);
                 state.streamed_text = false;
                 state.streamed_thinking = false;
+                // This message is final; the next answer delta starts a fresh
+                // segment (see `answer_segment_closed`).
+                self.answer_segment_closed.store(true, Ordering::Relaxed);
             }
             // In normal mode a plan change is shown as the checklist (the
             // `Plan` event) rather than as a tool call and its result.
@@ -1308,6 +1345,7 @@ mod tests {
                 tty: true,
                 expanded: AtomicBool::new(false),
                 touched_quiet: AtomicBool::new(false),
+                answer_segment_closed: AtomicBool::new(false),
                 frame: Some(Mutex::new(FrameState {
                     out: FrameRenderer::new(io::stdout()),
                     items: Vec::new(),
@@ -1334,6 +1372,7 @@ mod tests {
                 tty: true,
                 expanded: AtomicBool::new(false),
                 touched_quiet: AtomicBool::new(false),
+                answer_segment_closed: AtomicBool::new(false),
                 frame: None,
             })
         }
@@ -1415,6 +1454,50 @@ mod tests {
             !r.answer_may_be_truncated(),
             "entering quiet with no suppressed delta must not flag truncation"
         );
+    }
+
+    #[test]
+    fn truncation_guard_resets_per_answer_segment() {
+        // A multi-message turn: an intermediate/tool-call response is suppressed
+        // while quiet, then the user switches to normal and the FINAL answer
+        // streams in full. The turn-end reprint only reprints the final answer,
+        // so the guard must be clear — otherwise the fully-streamed final answer
+        // is duplicated. The guard tracks the final segment, not any earlier one.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // Intermediate response suppressed while quiet, then it closes.
+        r.event(&AgentEvent::TextDelta { text: "intermediate" });
+        assert!(r.answer_may_be_truncated(), "the suppressed intermediate delta flags truncation");
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "intermediate" });
+
+        // Switch to normal; the final answer streams in full.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "final answer" });
+        assert!(
+            !r.answer_may_be_truncated(),
+            "a final answer streamed normally after an earlier quiet segment must not be reprinted"
+        );
+        r.event(&AgentEvent::AssistantMessage { message_id: "m2", text: "final answer" });
+        assert!(!r.answer_may_be_truncated(), "the final segment was never suppressed");
+
+        // But if the FINAL answer itself is quiet-prefixed before switching
+        // louder, its live stream IS incomplete and must be reprinted.
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "A" }); // suppressed intermediate
+        r.event(&AgentEvent::AssistantMessage { message_id: "m3", text: "A" });
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::TextDelta { text: "final prefix" }); // final answer starts quiet
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: " suffix" });
+        assert!(
+            r.answer_may_be_truncated(),
+            "a final answer whose own prefix was suppressed while quiet must be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
     }
 
     #[test]

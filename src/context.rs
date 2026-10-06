@@ -78,6 +78,12 @@ pub struct ContextStats {
     /// True when `tokens` is anchored to usage reported by the provider.
     pub calibrated: bool,
     pub window: usize,
+    /// Where `window` came from (config, the endpoint, a model-name default,
+    /// or learned from a context-overflow error), for `/context`. Live, so a
+    /// mid-turn context-overflow that lowers the window via `learned_window`
+    /// updates this label alongside the number instead of leaving a stale
+    /// source frozen at turn start.
+    pub window_source: String,
     pub messages: usize,
     pub session_input_tokens: u64,
     pub session_output_tokens: u64,

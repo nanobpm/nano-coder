@@ -554,6 +554,7 @@ mod tests {
             tokens: 96_500,
             calibrated: true,
             window: 128_000,
+            window_source: "known for the model name".into(),
             messages: 42,
             session_input_tokens: 310_000,
             session_output_tokens: 12_400,
