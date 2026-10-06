@@ -55,8 +55,8 @@ drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites o
 asking for input (the `question` tool's picker owns the terminal until you answer).
 Slash commands work mid-turn too, where it is safe:
 - **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
-  `/context`, `/trajectory`, and `/mode` or `/verbosity` without an argument) show the current state.
-  `/plan` shows the plan as the agent updates it.
+  `/context`, `/trajectory` (`--json`/`--markdown`), and `/mode` or `/verbosity` without an
+  argument) show the current state. `/plan` shows the plan as the agent updates it.
 - **From the agent's next step:** `/mode NAME` and `/verbosity LEVEL`.
 - **After the turn:** commands that change the conversation or take over the keyboard
   (`/compact`, `/restart`, `/settings`, `/model`, `/exit`) wait for the turn to finish.

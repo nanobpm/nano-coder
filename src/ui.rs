@@ -521,10 +521,17 @@ impl Renderer {
     /// a concurrent editor/resize/event render can't interleave its escape
     /// sequences with the raw bytes (`println!` takes no terminal lock, so the
     /// frame mutex is the only thing serializing them).
+    ///
+    /// Unlike the other transcript writes this does NOT finish an in-flight
+    /// stream: typed mid-turn (the only way this runs while a response is
+    /// streaming), clearing `fs.stream` would make the trailing
+    /// `AssistantMessage` see no active stream and append the full response
+    /// again, duplicating the answer. The pending `TextDelta`s still append
+    /// to the streamed item above the export, and `AssistantMessage` closes
+    /// the stream out as usual.
     pub fn print_raw(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
-            self.frame_finish_stream(&mut fs);
             println!("{text}");
             fs.items.push(stamped(Item::Raw(text.to_string())));
             fs.out.invalidate();
@@ -1178,6 +1185,33 @@ mod tests {
         let raw =
             r.frame_items().iter().filter(|i| matches!(&i.item, Item::Raw(t) if t.contains("session_id"))).count();
         assert_eq!(raw, 1, "the export must survive the frame restore: {:?}", r.frame_items());
+    }
+
+    #[test]
+    fn raw_export_mid_stream_does_not_duplicate_the_answer() {
+        let r = Renderer::frame_for_test();
+        // `/trajectory --json` typed while the answer streams: the export must
+        // not close the stream out. If it did, the trailing `AssistantMessage`
+        // would see no active stream and append the full response a second
+        // time (and a delta split across the export would start a new item).
+        r.event(&AgentEvent::TextDelta { text: "Here " });
+        r.print_raw("{\"session_id\":\"s\"}");
+        r.event(&AgentEvent::TextDelta { text: "is the answer." });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+        let items = r.frame_items();
+        let messages: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { role: Role::Assistant, text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, ["Here is the answer."], "streamed answer duplicated or split: {items:?}");
+        assert_eq!(
+            items.iter().filter(|i| matches!(&i.item, Item::Raw(t) if t.contains("session_id"))).count(),
+            1,
+            "the export must still be kept: {items:?}"
+        );
     }
 
     #[test]

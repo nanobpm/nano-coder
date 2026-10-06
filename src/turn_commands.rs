@@ -7,11 +7,13 @@
 //! `TurnControl`. `run_command` builds its output the same way, so a command
 //! shows the same thing during a turn as after it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::agent::Agent;
 use crate::context::ContextStats;
 use crate::plan::Plan;
+use crate::providers::ProviderConfig;
 
 /// When a command can run relative to a turn in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,12 +31,15 @@ pub enum Timing {
 /// When `cmd` (a trimmed `/…` line) can run during a turn.
 pub fn timing(cmd: &str) -> Timing {
     let (name, arg) = cmd.split_once(char::is_whitespace).map(|(n, a)| (n, a.trim())).unwrap_or((cmd, ""));
-    match (name, arg.is_empty()) {
-        ("/help" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/context", true) => Timing::Immediate,
-        ("/trajectory", _) => Timing::Immediate,
+    match (name, arg) {
+        ("/help" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/context", "") => Timing::Immediate,
+        // Only the supported export forms run early; anything else defers so
+        // the between-turns command reports the unknown option (as it does for
+        // every other command given arguments it doesn't take).
+        ("/trajectory", "" | "--json" | "--markdown" | "--md") => Timing::Immediate,
         // Without an argument these just show the current value.
-        ("/mode" | "/verbosity", true) => Timing::Immediate,
-        ("/mode" | "/verbosity", false) => Timing::NextStep,
+        ("/mode" | "/verbosity", "") => Timing::Immediate,
+        ("/mode" | "/verbosity", _) => Timing::NextStep,
         _ => Timing::AfterTurn,
     }
 }
@@ -53,7 +58,14 @@ pub enum Output {
 pub struct Snapshot {
     tools: String,
     skills: String,
-    providers: String,
+    /// The effective provider configs and the default provider's name. The
+    /// `/providers` listing is rendered from these on demand (see
+    /// [`Snapshot::providers`]): building it eagerly would run
+    /// `settings::key_status` — a synchronous credential-file read for
+    /// GitHub Copilot when its env var is unset — on every turn, even when
+    /// `/providers` is never used.
+    providers: BTreeMap<String, ProviderConfig>,
+    default_provider: String,
     session: String,
     session_path: Option<PathBuf>,
     system_tokens: usize,
@@ -87,16 +99,7 @@ impl Snapshot {
         }
 
         let (user, default_provider) = agent.config().effective_providers();
-        let mut providers = vec![format!("Providers (default: {default_provider}):")];
-        for (name, provider) in crate::providers::effective_providers(&user) {
-            let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
-            let key = crate::settings::key_status(&provider);
-            let url = provider.base_url.unwrap_or_else(|| match provider.kind {
-                Some(crate::providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
-                _ => "-".into(),
-            });
-            providers.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
-        }
+        let providers = crate::providers::effective_providers(&user);
 
         let session = match (agent.session_id(), agent.session_path()) {
             (Some(id), Some(path)) => format!("Session {id}: {}", path.display()),
@@ -106,7 +109,8 @@ impl Snapshot {
         Self {
             tools: tools.join("\n"),
             skills: skills.join("\n"),
-            providers: providers.join("\n"),
+            providers,
+            default_provider,
             session,
             session_path: agent.session_path().map(PathBuf::from),
             system_tokens: crate::context::text_tokens(&agent.system_prompt()),
@@ -125,7 +129,7 @@ impl Snapshot {
             "/help" => block(crate::commands::help_text()),
             "/tools" => block(self.tools.clone()),
             "/skills" => block(self.skills.clone()),
-            "/providers" => block(self.providers.clone()),
+            "/providers" => block(self.providers()),
             "/session" => block(self.session.clone()),
             "/plan" if plan.is_empty() => block("No plan yet. The agent makes one with the plan_add tool.".into()),
             "/plan" => block(plan.render(true, usize::MAX).trim_end().to_string()),
@@ -152,6 +156,23 @@ impl Snapshot {
             }
             _ => None,
         }
+    }
+
+    /// The `/providers` listing, rendered on demand: `settings::key_status`
+    /// can read a credential file, so this runs only when the listing is
+    /// actually requested, not when the snapshot is captured.
+    fn providers(&self) -> String {
+        let mut out = vec![format!("Providers (default: {}):", self.default_provider)];
+        for (name, provider) in &self.providers {
+            let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
+            let key = crate::settings::key_status(provider);
+            let url = provider.base_url.clone().unwrap_or_else(|| match provider.kind {
+                Some(crate::providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
+                _ => "-".into(),
+            });
+            out.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
+        }
+        out.join("\n")
     }
 
     fn context(&self, stats: &ContextStats) -> String {
@@ -246,7 +267,7 @@ mod tests {
         {
             assert_eq!(timing(cmd), Timing::Immediate, "{cmd}");
         }
-        for cmd in ["/trajectory", "/trajectory --json", "/trajectory --markdown"] {
+        for cmd in ["/trajectory", "/trajectory --json", "/trajectory --markdown", "/trajectory --md"] {
             assert_eq!(timing(cmd), Timing::Immediate, "{cmd}");
         }
         for cmd in ["/mode plan", "/verbosity quiet", "/mode  auto "] {
@@ -259,6 +280,11 @@ mod tests {
         }
         // A read-only command given arguments it doesn't take is not run early.
         assert_eq!(timing("/plan extra"), Timing::AfterTurn);
+        // Only the supported `/trajectory` forms run early: an unknown option
+        // defers to the between-turns command, which reports the bad option.
+        for cmd in ["/trajectory --bogus", "/trajectory extra", "/trajectory --json extra"] {
+            assert_eq!(timing(cmd), Timing::AfterTurn, "{cmd}");
+        }
     }
 
     #[test]
