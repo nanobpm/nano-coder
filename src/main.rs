@@ -2508,6 +2508,19 @@ async fn main() -> Result<()> {
                         }
                         prompt(&terminal, false);
                     }
+                    TermInput::Escape => {
+                        // The input-clearing half of the gesture happens in
+                        // `lineedit::LineReader` (see `escape_press`), the only
+                        // place that sees every Esc. An Escape that surfaces
+                        // here means the buffer was already empty, so there is
+                        // nothing to clear. Consume it in place like the other
+                        // mid-line events (ToggleThinking/CycleMode) rather than
+                        // breaking out to the outer loop's `continue`, which
+                        // would restart the loop and re-emit `prompt()` — a
+                        // spurious redraw that contradicts the inert-empty
+                        // no-op contract. Staying in the inner loop keeps the
+                        // empty-buffer Esc a true zero-redraw no-op.
+                    }
                     other => break other,
                 }
             };
@@ -2525,9 +2538,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 TermInput::Escape => {
-                    // The input-clearing half of the gesture happens in
-                    // `lineedit::LineReader` (see `escape_press`), which is the
-                    // only place that sees every Esc; nothing to do here.
+                    // Escape is now consumed in the inner event loop above (a
+                    // true no-op on an empty buffer), so it never breaks out to
+                    // here. This arm is retained only for match exhaustiveness,
+                    // mirroring the ToggleThinking/CycleMode/Rejected arm below.
                     continue;
                 }
                 TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
