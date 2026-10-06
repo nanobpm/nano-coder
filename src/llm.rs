@@ -617,6 +617,17 @@ pub trait LLMClient: Send + Sync {
     fn kind(&self) -> Option<crate::providers::ProviderKind> {
         None
     }
+    /// The live endpoint this client actually sends requests to, captured when
+    /// the client was built. Used for first-party host detection (vision
+    /// capability) so it tracks the client in use, not the possibly-edited
+    /// config: after a provider edit whose client rebuild fails, the saved
+    /// config holds the new `base_url` while the session keeps the old client,
+    /// so reading `base_url` from config would misclassify the live endpoint.
+    /// `None` for test doubles and clients with no fixed HTTP endpoint, where
+    /// callers fall back to the configured `base_url`.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A context window reported by the provider's endpoint.

@@ -728,6 +728,10 @@ impl LLMClient for GithubCopilotClient {
     fn kind(&self) -> Option<ProviderKind> {
         Some(ProviderKind::GithubCopilot)
     }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.transport.provider().base_url)
+    }
 }
 
 #[cfg(test)]

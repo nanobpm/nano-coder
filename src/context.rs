@@ -1,10 +1,18 @@
 //! Context-window accounting and compaction helpers.
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use regex::Regex;
 
 use crate::llm::{Message, Role};
+
+/// The attachment occurrences that are *sendable as images* — identified by
+/// address, exactly as the wire plan ([`crate::llm::ChatRequest::attachment_plan`])
+/// keys them — so the token estimate can charge availability the same way the
+/// request builder does. Reading the same image twice is two occurrences.
+pub type AttachmentAvailability = HashSet<*const crate::llm::Attachment>;
 
 /// Used when neither config nor the model name gives a window.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
@@ -189,33 +197,77 @@ pub fn image_tokens(attachment: &crate::llm::Attachment) -> usize {
     estimate.clamp(1, max)
 }
 
+/// The attachment occurrences in `messages` whose stored bytes are still intact
+/// on disk — the same availability gate the wire plan
+/// ([`crate::llm::ChatRequest::attachment_plan`]) applies before sending an
+/// image (present *and* hash-matching, so availability can never diverge from
+/// what the payload actually sends). Occurrences are keyed by address, not
+/// content hash, exactly as the wire plan keys them, so the same image read
+/// twice counts as two occurrences.
+///
+/// Build it **once** over a conversation and reuse it across every sub-slice
+/// (e.g. each candidate compaction tail, or the calibrated suffix) so the
+/// stored set is hashed once, not once per slice — rehashing per slice would be
+/// O(N²) file I/O, the same trap [`crate::llm::ChatRequest::attachment_plan`]
+/// avoids. With no attachments directory nothing is available, matching a
+/// request that can send no image.
+pub fn available_attachments(messages: &[Message], attachments_dir: Option<&Path>) -> AttachmentAvailability {
+    let Some(dir) = attachments_dir else {
+        return HashSet::new();
+    };
+    messages
+        .iter()
+        .flat_map(|m| m.attachments.iter())
+        .filter(|a| crate::attachment::exists(dir, a))
+        .map(|a| a as *const crate::llm::Attachment)
+        .collect()
+}
+
 /// Token estimate for `messages` that mirrors the vision wire plan: request
-/// builders send only the newest `max_images` image attachments as images and
-/// serialize every older attachment as its short text placeholder
+/// builders send only the newest `max_images` *available* image attachments as
+/// images and serialize every other attachment as its short text placeholder
 /// ([`crate::llm::ChatRequest::attachment_plan`]). Charging full image tokens
 /// for *every* historical attachment instead overcounts an image-heavy
 /// conversation by thousands of tokens, so the status estimate and the
 /// compaction kept-tail budget would trip auto-compaction (and fold recent
 /// history) before the window is actually full. Charging only the newest
-/// `max_images` as images (and the rest as placeholder text) keeps the
-/// estimate tracking what is really sent.
+/// `max_images` available ones as images (and the rest as placeholder text)
+/// keeps the estimate tracking what is really sent.
 ///
 /// "Newest" is by occurrence across `messages` in order — the same identity the
-/// wire plan uses — so the oldest `total - max_images` attachments become
-/// placeholders. `max_images == 0` (no vision) charges every attachment as a
-/// placeholder, matching a request that sends none.
-pub fn messages_tokens_with_vision(messages: &[Message], max_images: usize) -> usize {
-    let total_attachments: usize = messages.iter().map(|m| m.attachments.len()).sum();
-    // The oldest `omitted` attachment occurrences serialize as text
-    // placeholders; only the newest `max_images` are sent as images.
-    let omitted = total_attachments.saturating_sub(max_images);
-    let mut seen = 0usize;
+/// wire plan uses — restricted to the occurrences in `available` (built with
+/// [`available_attachments`]). An unavailable reference (missing or tampered on
+/// resume) is **excluded from the image quota**, exactly as the wire plan
+/// excludes it: it does not consume a slot an older available image could fill,
+/// so it is charged as a placeholder while the backfilled older image is
+/// charged in full. Treating a missing newest reference as an image slot would
+/// undercount by the whole backfilled image (thousands of tokens) and delay
+/// compaction past the real context limit. `max_images == 0` (no vision), or an
+/// empty `available` set, charges every attachment as a placeholder — matching a
+/// request that sends none.
+pub fn messages_tokens_with_vision(
+    messages: &[Message],
+    max_images: usize,
+    available: &AttachmentAvailability,
+) -> usize {
+    let is_available = |a: &crate::llm::Attachment| available.contains(&(a as *const crate::llm::Attachment));
+    // Only *available* occurrences can be sent as images, so only they count
+    // toward the quota. The oldest `omitted` available occurrences serialize as
+    // placeholders; the newest `max_images` available ones are sent as images.
+    // Every unavailable occurrence is always a placeholder.
+    let available_total = messages.iter().flat_map(|m| m.attachments.iter()).filter(|a| is_available(a)).count();
+    let omitted = available_total.saturating_sub(max_images);
+    let mut seen_available = 0usize;
     let mut total = 0usize;
     for message in messages {
         total += message_text_tokens(message);
         for attachment in &message.attachments {
-            total += if seen < omitted { text_tokens(&attachment.placeholder()) } else { image_tokens(attachment) };
-            seen += 1;
+            let available_here = is_available(attachment);
+            let sendable = available_here && seen_available >= omitted;
+            total += if sendable { image_tokens(attachment) } else { text_tokens(&attachment.placeholder()) };
+            if available_here {
+                seen_available += 1;
+            }
         }
     }
     total
@@ -409,6 +461,10 @@ mod tests {
         let m0 = Message::user("first").with_attachments(vec![img.clone()]);
         let m1 = Message::user("second").with_attachments(vec![img.clone(), img.clone()]);
         let convo = [m0, m1];
+        // Every occurrence is intact on disk (available), so the newest-N plan
+        // alone decides image vs. placeholder.
+        let all: AttachmentAvailability =
+            convo.iter().flat_map(|m| m.attachments.iter()).map(|a| a as *const crate::llm::Attachment).collect();
         // The naive all-images sum: text/framing plus full image cost for every
         // attachment (what the wire does *not* send past the newest-N quota).
         let naive: usize =
@@ -420,12 +476,50 @@ mod tests {
         // max_images = 1: only the newest occurrence is sent as an image; the
         // two older ones become placeholders. The saving over the naive
         // all-images sum is exactly two image→placeholder swaps.
-        assert_eq!(naive - messages_tokens_with_vision(&convo, 1), 2 * (img_cost - ph_cost));
+        assert_eq!(naive - messages_tokens_with_vision(&convo, 1, &all), 2 * (img_cost - ph_cost));
         // max_images = 0 (no vision): every attachment becomes a placeholder.
-        assert_eq!(naive - messages_tokens_with_vision(&convo, 0), 3 * (img_cost - ph_cost));
+        assert_eq!(naive - messages_tokens_with_vision(&convo, 0, &all), 3 * (img_cost - ph_cost));
         // max_images >= total attachments: identical to the all-images sum.
-        assert_eq!(messages_tokens_with_vision(&convo, 3), naive);
-        assert_eq!(messages_tokens_with_vision(&convo, 99), naive);
+        assert_eq!(messages_tokens_with_vision(&convo, 3, &all), naive);
+        assert_eq!(messages_tokens_with_vision(&convo, 99, &all), naive);
+    }
+
+    #[test]
+    fn messages_tokens_charge_the_backfilled_image_when_the_newest_is_unavailable() {
+        // The finding's exact shape: an older, available large image and a
+        // newer, *missing* (tampered/deleted on resume) small image, under a
+        // one-image quota. The wire plan excludes the unavailable newest from
+        // the quota and backfills the slot with the available older image —
+        // sending it in full — so the token estimate must do the same.
+        let attachment = |w, h| crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: w,
+            height: h,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        let max = crate::attachment::MAX_DIMENSION;
+        let big = attachment(max, max); // older, available
+        let tiny = attachment(1, 1); // newer, unavailable on resume
+        let convo = [Message::user("look").with_attachments(vec![big.clone(), tiny.clone()])];
+        // Only the older `big` is intact on disk; `tiny`'s file is gone.
+        let available: AttachmentAvailability =
+            [&convo[0].attachments[0] as *const crate::llm::Attachment].into_iter().collect();
+
+        // Availability-aware: `big` is charged in full (backfilled image), `tiny`
+        // as a placeholder.
+        let got = messages_tokens_with_vision(&convo, 1, &available);
+        let want = message_text_tokens(&convo[0]) + image_tokens(&big) + text_tokens(&tiny.placeholder());
+        assert_eq!(got, want, "the backfilled older image is charged in full");
+
+        // The old occurrence-order estimate (availability-blind) would have
+        // charged the newest `tiny` as the one image (1 token) and `big`, over
+        // quota, as a placeholder — undercounting by nearly the whole image and
+        // delaying compaction past the real limit.
+        let buggy = message_text_tokens(&convo[0]) + text_tokens(&big.placeholder()) + image_tokens(&tiny);
+        assert!(got > buggy + 3_000, "availability-aware estimate avoids the undercount: {got} vs {buggy}");
     }
 
     #[test]

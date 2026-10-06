@@ -1177,7 +1177,17 @@ impl Agent {
     pub fn vision(&self) -> Option<crate::vision::Vision> {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
-        let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        let mut provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        // First-party host detection must track the client actually in use, not
+        // the possibly-edited config: after a provider edit whose client
+        // rebuild fails, the saved config holds the new `base_url` while the
+        // session keeps the old client. Mirror how `kind`/`model_name` already
+        // come from the live client by overriding `base_url` with its captured
+        // endpoint when it exposes one (`None` only for test doubles, where the
+        // configured `base_url` is the right fallback).
+        if let Some(endpoint) = self.client.endpoint() {
+            provider.base_url = Some(endpoint.to_string());
+        }
         crate::vision::resolve(
             self.config.vision,
             self.client.kind(),
@@ -1208,8 +1218,10 @@ impl Agent {
     /// image result. When the model cannot view images, returns `Err` with the
     /// text error (a hint naming the fix). When it can, the file is re-read by
     /// `path`, downscaled to the model's limits, stored under the session's
-    /// attachments directory, and returned as `(text, attachments)`.
-    fn image_result(&self, result: &Value) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
+    /// attachments directory, and returned as `(text, attachments)` — the
+    /// decode/resize/encode span runs on a blocking thread (see
+    /// [`Self::prepare_image_attachment`]) so it never stalls the async runtime.
+    async fn image_result(&self, result: &Value) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
         let Some(image) = result.get("image") else { return Ok(None) };
         let path_str = image.get("path").and_then(Value::as_str).unwrap_or_default();
         let path = std::path::PathBuf::from(path_str);
@@ -1224,10 +1236,34 @@ impl Agent {
         if path_str.is_empty() {
             return Err("image result had no path".to_string());
         }
-        // Re-read the source by path rather than carrying its base64 through the
-        // tool result: encoding the whole image into the result (and cloning it
-        // for the `AfterToolCall` hook) would cost several times its file size
-        // before `prepare` reduces it below the model's limits.
+        let limits = vision.image_limits();
+        let attachments_dir = self.attachments_dir();
+        // Reading the source, decoding/resizing/re-encoding it to the model's
+        // limits, hashing, and storing it are CPU- and I/O-heavy — precisely the
+        // large-image path. Running them inline on the Tokio worker would block
+        // the runtime for a substantial period, stalling every other session,
+        // cancellation, and I/O task, even though ordinary tool handlers already
+        // go through `execute_blocking`. Offload the whole span to a blocking
+        // thread; only the cheap capability gating above stays on the runtime.
+        tokio::task::spawn_blocking(move || Self::prepare_image_attachment(path, &limits, &attachments_dir))
+            .await
+            .map_err(|e| format!("image processing task failed: {e}"))?
+    }
+
+    /// The blocking span of [`Self::image_result`], run on a blocking thread:
+    /// re-read the source by `path` (rather than carrying its base64 through the
+    /// tool result, which would cost several times its file size before
+    /// `prepare` reduces it), downscale/re-encode it to `limits`, store the
+    /// prepared bytes by hash under `attachments_dir`, record the source as read
+    /// (so a later `write_file`/`edit_file` on this path passes the freshness
+    /// gate, exactly as a successful text read does), and return the tool-result
+    /// text plus the attachment. Reached only once vision is on, so it never
+    /// authorizes a write for a model that cannot view the image.
+    fn prepare_image_attachment(
+        path: std::path::PathBuf,
+        limits: &crate::attachment::ImageLimits,
+        attachments_dir: &std::path::Path,
+    ) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) => return Err(format!("{}: could not read image: {e}", path.display())),
@@ -1235,8 +1271,6 @@ impl Agent {
         let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) else {
             return Err(format!("{}: unrecognised image data", path.display()));
         };
-        // Downscale to the model's limits and store the prepared bytes by hash.
-        let limits = vision.image_limits();
         let prepared = match crate::attachment::prepare(
             &bytes,
             format,
@@ -1256,14 +1290,9 @@ impl Agent {
             bytes: prepared.bytes.len(),
             extension: prepared.extension,
         };
-        if let Err(e) = crate::attachment::store(&self.attachments_dir(), &attachment, &prepared.bytes) {
+        if let Err(e) = crate::attachment::store(attachments_dir, &attachment, &prepared.bytes) {
             return Err(format!("{}: could not store image: {e}", path.display()));
         }
-        // The model is about to receive the image, so record the source bytes
-        // as read — a later write_file/edit_file on this path then passes the
-        // freshness gate, exactly as a successful text read does. Only reached
-        // once vision is on and the attachment was prepared and stored; the
-        // no-vision error path returned earlier, so it never authorizes a write.
         crate::files::mark_image_read(&path, &bytes);
         let text = format!(
             "{}, {}×{}, {}",
@@ -1370,25 +1399,42 @@ impl Agent {
         // historical image its full token cost overcounts the real payload and
         // can trip auto-compaction before the window is actually full.
         let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
+        // Which stored attachments are still intact on disk, hashed once and
+        // shared across the slices below. The wire plan sends only *available*
+        // images, so the estimate must charge availability the same way: a
+        // missing/tampered newest reference is a placeholder, not an image slot,
+        // and the older image the wire backfills in its place carries the full
+        // image cost. Ignoring availability undercounts a resumed, image-heavy
+        // request by thousands of tokens and delays compaction past the limit.
+        let available = context::available_attachments(&self.conversation, Some(&self.attachments_dir()));
         if let Some((len, tokens)) = self.calibration
             && len <= self.conversation.len()
         {
             let (prefix, suffix) = self.conversation.split_at(len);
             // The calibrated `tokens` baked in the prefix's newest `max_images`
-            // attachments at full image cost. A post-anchor (suffix) attachment
-            // claims a newest-`max_images` slot and displaces an older prefix
-            // image into a text placeholder on the wire — but the anchor still
-            // carries that stale full-image cost while the suffix adds the new
-            // image on top, double-charging past the quota. That overestimate
-            // can trip auto-compaction early and shrink `max_tokens`. The anchor
-            // is only valid while no prefix image is displaced; otherwise fall
-            // through to a full recompute that mirrors the current wire plan.
-            let prefix_attachments: usize = prefix.iter().map(|m| m.attachments.len()).sum();
-            let suffix_attachments: usize = suffix.iter().map(|m| m.attachments.len()).sum();
+            // *available* attachments at full image cost. A post-anchor (suffix)
+            // available attachment claims a newest-`max_images` slot and displaces
+            // an older prefix image into a text placeholder on the wire — but the
+            // anchor still carries that stale full-image cost while the suffix adds
+            // the new image on top, double-charging past the quota. That
+            // overestimate can trip auto-compaction early and shrink `max_tokens`.
+            // The anchor is only valid while no prefix image is displaced;
+            // otherwise fall through to a full recompute that mirrors the current
+            // wire plan. Only *available* attachments claim image slots, so the
+            // displacement check counts availability, not raw occurrences — a
+            // missing suffix reference cannot displace a prefix image.
+            let count_available = |msgs: &[Message]| {
+                msgs.iter()
+                    .flat_map(|m| m.attachments.iter())
+                    .filter(|a| available.contains(&(*a as *const crate::llm::Attachment)))
+                    .count()
+            };
+            let prefix_attachments = count_available(prefix);
+            let suffix_attachments = count_available(suffix);
             let prefix_images = prefix_attachments.min(max_images);
             let prefix_images_after = prefix_attachments.min(max_images.saturating_sub(suffix_attachments));
             if prefix_images == prefix_images_after {
-                return (tokens + context::messages_tokens_with_vision(suffix, max_images), true);
+                return (tokens + context::messages_tokens_with_vision(suffix, max_images, &available), true);
             }
         }
         let tools: usize = self
@@ -1400,7 +1446,7 @@ impl Agent {
                     + context::text_tokens(&d.parameters.to_string())
             })
             .sum();
-        (context::messages_tokens_with_vision(&self.conversation, max_images) + tools, false)
+        (context::messages_tokens_with_vision(&self.conversation, max_images, &available) + tools, false)
     }
 
     /// Recompute the shared statistics and notify the event sink.
@@ -2859,7 +2905,7 @@ impl Agent {
                     // (even one with a top-level `image` field) is stringified
                     // unchanged, so it is never misread as an attachment or a
                     // spurious "image result had no data" error.
-                    other if tool_call.name == "read_file" => match self.image_result(&other) {
+                    other if tool_call.name == "read_file" => match self.image_result(&other).await {
                         Ok(Some((text, found))) => {
                             attachments = found;
                             text
@@ -3179,9 +3225,15 @@ impl Agent {
         // history than `KEEP_RECENT_TOKENS` intends. Grow the tail one boundary
         // at a time and keep the largest span whose wire cost fits the budget.
         let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
+        // Hash the stored attachment set once and reuse it for every candidate
+        // tail below, so availability costs O(N) file I/O, not O(N²). The budget
+        // must charge availability the way the wire does: a missing/tampered
+        // reference is a placeholder, and the older image the wire backfills in
+        // its place carries the full image cost.
+        let available = context::available_attachments(&self.conversation, Some(&self.attachments_dir()));
         let mut split = last_boundary;
         for &boundary in boundaries.iter().rev() {
-            let tail = context::messages_tokens_with_vision(&self.conversation[boundary..], max_images);
+            let tail = context::messages_tokens_with_vision(&self.conversation[boundary..], max_images, &available);
             if tail > keep_budget {
                 break;
             }
@@ -4040,6 +4092,25 @@ mod tests {
 
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
+    }
+
+    /// Store `bytes` as an attachment in `dir` and return the matching reference,
+    /// so the wire plan's availability gate (`attachment::exists`) sees it as
+    /// present and intact. The stored bytes need not decode — `exists` only
+    /// hash-matches — and the `width`/`height` are the logical dimensions the
+    /// token estimator charges, independent of the bytes.
+    fn stored_image(dir: &std::path::Path, bytes: &[u8], w: u32, h: u32) -> crate::llm::Attachment {
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: crate::attachment::sha256_hex(bytes),
+            width: w,
+            height: h,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir, &attachment, bytes).unwrap();
+        attachment
     }
 
     #[test]
@@ -6350,15 +6421,11 @@ mod tests {
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
         });
-        let img = crate::llm::Attachment {
-            media_type: "image/png".into(),
-            path: std::path::PathBuf::from("x.png"),
-            sha256: String::new(),
-            width: 1000,
-            height: 1000,
-            bytes: 0,
-            extension: "png".into(),
-        };
+        // Both occurrences are intact on disk, so availability does not confound
+        // the displacement the test exercises. Unique bytes keep this image's
+        // sidecar distinct from any other test sharing the process temp dir.
+        let adir = agent.attachments_dir();
+        let img = stored_image(&adir, b"calib-displace-image", 1000, 1000);
         // Prefix: one message carrying an image, anchored to a reported total.
         agent.conversation.push(Message::user("look").with_attachments(vec![img.clone()]));
         agent.calibration = Some((agent.conversation.len(), 5_000));
@@ -6377,10 +6444,11 @@ mod tests {
                     + context::text_tokens(&d.parameters.to_string())
             })
             .sum();
-        let expected = context::messages_tokens_with_vision(&agent.conversation, 1) + tools;
+        let available = context::available_attachments(&agent.conversation, Some(&agent.attachments_dir()));
+        let expected = context::messages_tokens_with_vision(&agent.conversation, 1, &available) + tools;
         assert_eq!(tokens, expected, "recomputes the whole conversation per the wire plan");
         // The stale-anchor behaviour would have double-charged the prefix image.
-        let stale = 5_000 + context::messages_tokens_with_vision(&agent.conversation[1..], 1);
+        let stale = 5_000 + context::messages_tokens_with_vision(&agent.conversation[1..], 1, &available);
         assert!(tokens < stale, "recompute avoids the double-charge: {tokens} < {stale}");
     }
 
@@ -6407,15 +6475,10 @@ mod tests {
         agent.config.project_instructions = false;
         agent.config.memory = crate::config::MemoryMode::Off;
         agent.new_session().unwrap();
-        let img = || crate::llm::Attachment {
-            media_type: "image/png".into(),
-            path: std::path::PathBuf::from("x.png"),
-            sha256: String::new(),
-            width: 1000,
-            height: 1000,
-            bytes: 0,
-            extension: "png".into(),
-        };
+        // The image must be intact on disk for the wire plan (and so the kept-tail
+        // budget) to count it as a sendable image rather than a placeholder.
+        let img_ref = stored_image(&agent.attachments_dir(), b"compaction-tail-image", 1000, 1000);
+        let img = || img_ref.clone();
         // One large old text turn, then 120 image turns. The keep budget is
         // window/4 = 1,500. Under `max_images = 1` the wire sends only the
         // newest image (~1,334 tokens); the 119 older ones are placeholders

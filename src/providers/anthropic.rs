@@ -463,6 +463,10 @@ impl LLMClient for AnthropicClient {
     fn kind(&self) -> Option<ProviderKind> {
         Some(ProviderKind::Anthropic)
     }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.transport.provider().base_url)
+    }
 }
 
 #[cfg(test)]

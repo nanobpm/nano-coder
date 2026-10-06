@@ -515,6 +515,10 @@ impl LLMClient for OpenAiClient {
     fn kind(&self) -> Option<ProviderKind> {
         Some(ProviderKind::Openai)
     }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.transport.provider().base_url)
+    }
 }
 
 /// Per-request timeout for context-window probes.
