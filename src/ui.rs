@@ -199,7 +199,7 @@ pub struct Renderer {
     /// streams straight to the terminal and can't retract, uses this flag to
     /// reprint the authoritative full response at turn end. Reset at
     /// `begin_turn`, then raised the moment a non-empty answer delta is
-    /// actually suppressed while quiet (and by a mid-turn switch to `quiet`).
+    /// actually suppressed while quiet.
     touched_quiet: AtomicBool,
     /// Set when an assistant message has closed since the last answer delta, so
     /// the next non-empty answer delta begins a *new* message segment. The
@@ -876,6 +876,25 @@ impl Renderer {
                 // delta begins a fresh segment (see `answer_segment_closed`).
                 AgentEvent::AssistantMessage { .. } => {
                     self.answer_segment_closed.store(true, Ordering::Relaxed);
+                    // Close the legacy renderer's open stream. A message can
+                    // begin streaming at a louder level and have only its
+                    // terminating `AssistantMessage` arrive after a switch to
+                    // quiet; this arm then returns without finalizing the open
+                    // stream, leaving `streamed_text == true` with no trailing
+                    // newline. The next louder segment's `TextDelta` would see
+                    // that flag, skip its own stamp/newline, and append to this
+                    // message's truncated prefix — merging two assistant
+                    // messages on one line — and the new-segment guard reset
+                    // means the turn-end reprint can't repair it. Finalizing
+                    // the stream here ends the segment cleanly, exactly as the
+                    // normal-verbosity `AssistantMessage` arm does.
+                    let mut state = self.state.lock().unwrap();
+                    self.finish_thinking(&mut state);
+                    if state.streamed_text {
+                        self.newline(&mut state);
+                    }
+                    state.streamed_text = false;
+                    state.streamed_thinking = false;
                 }
                 _ => {}
             }
@@ -1496,6 +1515,40 @@ mod tests {
         assert!(
             r.answer_may_be_truncated(),
             "a final answer whose own prefix was suppressed while quiet must be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn quiet_assistant_message_closes_legacy_stream() {
+        // A message streams at normal, then verbosity switches to quiet before
+        // its terminating `AssistantMessage` arrives. The quiet gate must close
+        // the legacy renderer's open stream (reset `streamed_text`, end the
+        // line) so a later normal `TextDelta` begins a fresh segment instead of
+        // appending to this message's prefix and merging two messages.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Normal);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "first" });
+        assert!(r.state.lock().unwrap().streamed_text, "the first message is streaming");
+
+        // Switch to quiet; the message's closing `AssistantMessage` arrives here.
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "first" });
+        {
+            let state = r.state.lock().unwrap();
+            assert!(!state.streamed_text, "the closed segment must reset the legacy stream");
+            assert!(state.at_line_start, "the closed segment must end the line");
+        }
+
+        // Back to normal: the next message must start a fresh, un-merged stream.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "second" });
+        assert!(
+            r.state.lock().unwrap().streamed_text,
+            "a new message after a quiet-closed segment streams on its own line"
         );
         set_verbosity(Verbosity::Normal);
     }
