@@ -1094,11 +1094,15 @@ impl Agent {
     }
 
     /// Every registered tool plus the plan tools when enabled, with **no**
-    /// mode filter applied. This is the full superset for all modes; callers
-    /// that must track a live mode change after capturing it (`/tools`, see
-    /// [`crate::turn_commands::Snapshot`]) take this and filter at render
-    /// time. Use [`tool_definitions`](Self::tool_definitions) for the set the
-    /// agent actually offers the model under the current mode.
+    /// mode filter applied. This is the full superset for all modes, but it
+    /// still omits the history tools when they are disabled. Callers that must
+    /// track a live change after capturing it (`/tools`, see
+    /// [`crate::turn_commands::Snapshot`]) take
+    /// [`tool_definitions_superset`](Self::tool_definitions_superset) instead —
+    /// it builds on this and *also* keeps the history tools so a mid-turn
+    /// availability change can be re-filtered live — and filter at render time.
+    /// Use [`tool_definitions`](Self::tool_definitions) for the set the agent
+    /// actually offers the model under the current mode.
     pub fn tool_definitions_all_modes(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
@@ -3435,6 +3439,45 @@ mod tests {
             panic!("/tools produced no block");
         };
         assert!(!filtered.contains("write_file"), "plan mode must still hide the mutating tool: {filtered}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_snapshot_captured_without_history_still_lists_it_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        // History tools are disabled at capture time: no smart summary is in
+        // context yet, so `tool_definitions_all_modes` would drop them.
+        assert!(!agent.history_tools_enabled(), "history must be disabled at capture for this test");
+
+        // Capture must keep the history tools in the superset anyway, or a
+        // same-turn smart auto-compaction that enables them later leaves
+        // `/tools` unable to list tools the next model step actually receives.
+        let snapshot = crate::turn_commands::Snapshot::capture(&agent);
+
+        // With history live, `/tools` must list the history tools the
+        // capture-time availability would have dropped.
+        let available = crate::context::ContextStats { history_available: true, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(listing)) =
+            snapshot.output("/tools", &available, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(
+            listing.contains(crate::history::SEARCH_TOOL) && listing.contains(crate::history::READ_TOOL),
+            "capture dropped the history tools: {listing}"
+        );
+
+        // And while history is unavailable they are still filtered out.
+        let unavailable = crate::context::ContextStats { history_available: false, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(hidden)) =
+            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(
+            !hidden.contains(crate::history::SEARCH_TOOL) && !hidden.contains(crate::history::READ_TOOL),
+            "history tools must stay hidden while unavailable: {hidden}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
