@@ -64,8 +64,10 @@ impl DoubleEscape {
 
     /// Record a press at `now`; true when it completes a double press. For
     /// detectors that are not scoped to an edit generation (e.g. the turn-loop
-    /// cancel and the Ctrl-C exit gesture), which live for a single purpose and
-    /// never cross a prompt/turn boundary.
+    /// cancel, which uses this `DoubleEscape` type), which live for a single
+    /// purpose and never cross a prompt/turn boundary. The Ctrl-C exit gesture
+    /// is a *separate* `DoublePress` detector in `src/main.rs`, not a user of
+    /// this method.
     pub fn press(&mut self, now: std::time::Instant) -> bool {
         self.press_in(now, 0)
     }
