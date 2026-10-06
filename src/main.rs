@@ -663,27 +663,27 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
                                     let plan = control.plan();
-                                    // `/trajectory` reads and decodes the whole
-                                    // session log from disk; run that on the
-                                    // blocking pool so the synchronous I/O does
-                                    // not stall this async worker thread (the
-                                    // other immediate commands are pure in-memory
-                                    // formatting, so they stay inline). A join
-                                    // error can only come from a panic in the
-                                    // render; surface it rather than unwrapping.
-                                    let out = if text == "/trajectory" || text.starts_with("/trajectory ") {
-                                        let snap = snapshot.clone();
-                                        let cmd = text.to_string();
-                                        tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
-                                            .await
-                                            .unwrap_or_else(|_| {
-                                                Some(turn_commands::Output::Block(
-                                                    "Could not render the trajectory (internal task error)".to_string(),
-                                                ))
-                                            })
-                                    } else {
-                                        snapshot.output(text, &stats, &plan)
-                                    };
+                                    // Some immediate commands do synchronous disk
+                                    // I/O while rendering — `/trajectory` reads and
+                                    // decodes the whole session log, and `/providers`
+                                    // can do a credential-file read via
+                                    // `settings::key_status` — so render every
+                                    // immediate command on the blocking pool rather
+                                    // than special-casing one. That keeps the
+                                    // synchronous I/O off this async worker thread no
+                                    // matter which command runs. A join error can only
+                                    // come from a panic in the render; surface it
+                                    // rather than unwrapping.
+                                    let snap = snapshot.clone();
+                                    let cmd = text.to_string();
+                                    let label = cmd.clone();
+                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            Some(turn_commands::Output::Block(format!(
+                                                "Could not render {label} (internal task error)"
+                                            )))
+                                        });
                                     match out {
                                         Some(turn_commands::Output::Block(out)) => renderer.turn_block(&out),
                                         Some(turn_commands::Output::Raw(out)) if renderer.is_frame() => {
