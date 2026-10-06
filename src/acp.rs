@@ -62,7 +62,11 @@ fn enforce_slash_invariant(text: String) -> Result<String, String> {
     let trimmed = text.trim();
     if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
         return Err(crate::commands::rejection(trimmed).unwrap_or_else(|| {
-            format!("Can't run {trimmed:?}: unexpected arguments (/help lists commands and their arguments)")
+            // `rejection` returns None here only for a *known* command, which
+            // reached this fallback because ACP doesn't implement it. Name that
+            // reason rather than blaming arguments it was never given.
+            let word = trimmed.split_whitespace().next().unwrap_or(trimmed);
+            format!("Can't run {word}: this command is not available over ACP")
         }));
     }
     Ok(crate::commands::unescape_prompt(trimmed).map(str::to_string).unwrap_or(text))
@@ -86,8 +90,18 @@ fn classify_during_turn(msg: &Value, active: Option<&str>) -> DuringTurn {
         Some("session/prompt") if for_active => {
             let text = prompt_text(&params);
             let trimmed = text.trim();
-            // Slash commands operate on the agent itself, so they wait for the turn.
-            if trimmed.is_empty() || trimmed.starts_with('/') { DuringTurn::Defer } else { DuringTurn::Steer(text) }
+            if trimmed.is_empty() {
+                DuringTurn::Defer
+            } else if trimmed.starts_with('/') && crate::commands::unescape_prompt(trimmed).is_none() {
+                // A real slash command operates on the agent itself, so it
+                // waits for the turn. A `//…` escaped prompt is an ordinary
+                // message, so it steers instead (below), as the terminal does.
+                DuringTurn::Defer
+            } else {
+                // Plain text, or a `//…` prompt unescaped to a single leading
+                // `/`, steers the running turn.
+                DuringTurn::Steer(crate::commands::unescape_prompt(trimmed).map(str::to_string).unwrap_or(text))
+            }
         }
         _ => DuringTurn::Defer,
     }
@@ -649,10 +663,15 @@ fn requeue_steers(deferred: &mut VecDeque<Value>, leftover: Vec<Steer>, marks: &
         .collect();
     // Marks are nondecreasing: insert the latest first so earlier marks stay valid.
     for (mark, steer) in placed.into_iter().rev() {
+        // A steer unescaped from `//…` (so its text starts with `/`) must be
+        // re-escaped when requeued as a prompt, or `handle_message` would
+        // reject it as a slash command instead of unescaping it back to the
+        // message the user sent — matching the terminal's requeue path.
+        let text = if steer.text.starts_with('/') { format!("/{}", steer.text) } else { steer.text };
         let mut prompt = json!({
             "jsonrpc": "2.0",
             "method": "session/prompt",
-            "params": { "sessionId": active, "prompt": [{ "type": "text", "text": steer.text }] },
+            "params": { "sessionId": active, "prompt": [{ "type": "text", "text": text }] },
         });
         if let Some(tag) = steer.tag {
             prompt["id"] = tag;
@@ -756,8 +775,16 @@ mod tests {
         // Unknown command: rejected with a suggestion, not sent as a turn.
         let note = enforce_slash_invariant("/exin".to_string()).unwrap_err();
         assert!(note.starts_with("Unknown command /exin. Did you mean /exit?"), "{note}");
-        // A known command ACP doesn't implement is still never sent to the model.
-        assert!(enforce_slash_invariant("/help".to_string()).is_err());
+        // A known command ACP doesn't implement is rejected as unavailable
+        // over ACP — not blamed for arguments it never had.
+        let help = enforce_slash_invariant("/help".to_string()).unwrap_err();
+        assert_eq!(help, "Can't run /help: this command is not available over ACP");
+        // Even with trailing arguments, a known unimplemented command reports
+        // the real reason rather than "unexpected arguments".
+        assert_eq!(
+            enforce_slash_invariant("/help me".to_string()).unwrap_err(),
+            "Can't run /help: this command is not available over ACP"
+        );
         // A path-like slash line is rejected with the `//` escape hint.
         assert!(enforce_slash_invariant("/usr/lib is big".to_string()).unwrap_err().contains("type //usr/lib"));
         // Leading whitespace doesn't smuggle a slash line past the check.
@@ -766,6 +793,39 @@ mod tests {
         assert_eq!(enforce_slash_invariant("//usr/lib is big".to_string()).unwrap(), "/usr/lib is big");
         // Plain prompts pass through untouched (verbatim, including whitespace).
         assert_eq!(enforce_slash_invariant("hello world\n".to_string()).unwrap(), "hello world\n");
+    }
+
+    #[test]
+    fn escaped_prompts_steer_mid_turn_while_commands_defer() {
+        let prompt = |t: &str| json!({"method": "session/prompt", "params": {"prompt": [{"type": "text", "text": t}]}});
+        // A `//…` escaped prompt steers the running turn, unescaped to one `/`,
+        // instead of waiting for the turn and starting a separate one.
+        match classify_during_turn(&prompt("//usr/lib is big"), None) {
+            DuringTurn::Steer(t) => assert_eq!(t, "/usr/lib is big"),
+            _ => panic!("escaped prompt should steer mid-turn"),
+        }
+        // Plain text steers verbatim.
+        match classify_during_turn(&prompt("keep going"), None) {
+            DuringTurn::Steer(t) => assert_eq!(t, "keep going"),
+            _ => panic!("plain text should steer"),
+        }
+        // A real slash command waits for the turn; an empty prompt defers.
+        assert!(matches!(classify_during_turn(&prompt("/plan"), None), DuringTurn::Defer));
+        assert!(matches!(classify_during_turn(&prompt("   "), None), DuringTurn::Defer));
+    }
+
+    #[test]
+    fn requeued_escaped_steers_are_re_escaped() {
+        // A steer unescaped from `//…` that missed its turn is requeued with
+        // its `/` restored, so `handle_message` unescapes it back to a prompt
+        // rather than rejecting it as an unknown slash command.
+        let mut deferred: VecDeque<Value> = VecDeque::new();
+        requeue_steers(&mut deferred, vec![steer("/usr/lib is big", 1)], &[0], Some("s"));
+        assert_eq!(prompt_text(&deferred[0]["params"]), "//usr/lib is big");
+        // Plain-text steers are requeued verbatim.
+        let mut deferred: VecDeque<Value> = VecDeque::new();
+        requeue_steers(&mut deferred, vec![steer("keep going", 2)], &[0], Some("s"));
+        assert_eq!(prompt_text(&deferred[0]["params"]), "keep going");
     }
 
     #[test]
