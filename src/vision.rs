@@ -143,9 +143,23 @@ pub fn resolve(
 }
 
 /// Whether an OpenAI-direct model name is a current vision-capable family.
+///
+/// Families are matched as whole, delimited name segments rather than bare
+/// substrings, so a name that merely *contains* a family token (e.g.
+/// `gpt-4o3-custom`, or an `o3` appearing in a fine-tune suffix) is not
+/// mistaken for it. A model is a family member when, after stripping an
+/// optional `ft:<base>:…` fine-tune wrapper down to its base, the base either
+/// equals the family token or continues with a `-` (e.g. `o4-mini`,
+/// `gpt-4o-2024-08-06`).
 fn assumes_openai_vision(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("gpt-5") || m.contains("o4") || m.contains("o3")
+    // `ft:<base>:<org>::<id>` → `<base>`; a plain name is its own base.
+    let base = m.strip_prefix("ft:").map_or(m.as_str(), |rest| rest.split(':').next().unwrap_or(rest));
+    const FAMILIES: [&str; 5] = ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4"];
+    FAMILIES.iter().any(|family| match base.strip_prefix(family) {
+        Some(rest) => rest.is_empty() || rest.starts_with('-'),
+        None => false,
+    })
 }
 
 #[cfg(test)]
@@ -208,6 +222,30 @@ mod tests {
         assert!(resolve(None, Some(ProviderKind::Openai), &provider, "gpt-5-mini", None).is_some());
         assert_eq!(resolve(None, Some(ProviderKind::Openai), &provider, "text-embedding-3", None), None);
         assert_eq!(resolve(None, None, &provider, "m", None), None);
+    }
+
+    #[test]
+    fn openai_vision_families_match_whole_segments() {
+        // Current vision families, including fine-tune wrappers and dated snapshots.
+        for model in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "ft:gpt-4o-2024-08-06:org::id",
+            "ft:o3-mini:org::id",
+        ] {
+            assert!(assumes_openai_vision(model), "{model} should be a vision family");
+        }
+        // Names that merely contain a family token must not be mistaken for it.
+        for model in ["gpt-4o3-custom", "text-embedding-3", "o3pro", "whisper-o4", "ft:gpt-3.5-turbo:org::o3"] {
+            assert!(!assumes_openai_vision(model), "{model} should not be a vision family");
+        }
     }
 
     #[test]

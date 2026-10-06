@@ -1210,7 +1210,7 @@ impl Agent {
             width: prepared.width,
             height: prepared.height,
             bytes: prepared.bytes.len(),
-            extension: format.extension().to_string(),
+            extension: prepared.extension,
         };
         if let Err(e) = crate::attachment::store(&self.attachments_dir(), &attachment, &prepared.bytes) {
             return Err(format!("{}: could not store image: {e}", path.display()));

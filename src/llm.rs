@@ -404,13 +404,22 @@ impl ChatRequest<'_> {
     }
 
     /// Whether any message in the request carries an attachment that will be
-    /// sent as an image (used by GitHub Copilot to set its vision header).
+    /// sent as an image (used by GitHub Copilot to set its vision header). An
+    /// attachment counts only when it is both sendable *and* its stored file
+    /// still exists — a deleted file resolves to a text placeholder, not an
+    /// image, so the vision header must not claim one.
     pub fn has_images(&self) -> bool {
         let sendable = self.sendable();
         if sendable.is_empty() {
             return false;
         }
-        self.messages.iter().flat_map(|m| m.attachments.iter()).any(|a| sendable.contains(a.sha256.as_str()))
+        let Some(dir) = self.attachments_dir else {
+            return false;
+        };
+        self.messages
+            .iter()
+            .flat_map(|m| m.attachments.iter())
+            .any(|a| sendable.contains(a.sha256.as_str()) && crate::attachment::exists(dir, a))
     }
 }
 
@@ -730,6 +739,9 @@ mod tests {
             }
             other => panic!("missing file should be a placeholder, got {other:?}"),
         }
+        // A deleted file resolves to a placeholder, so the request carries no
+        // image and must not claim a vision request.
+        assert!(!request.has_images(), "deleted file must not report a sendable image");
     }
 
     #[test]

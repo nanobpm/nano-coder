@@ -114,7 +114,10 @@ pub fn prepare(
     let accepts_source =
         accepted_media_types.is_empty() || accepted_media_types.iter().any(|t| t == format.media_type());
     let mut out_bytes = bytes.to_vec();
-    let mut media_type = format.media_type().to_string();
+    // The format the prepared bytes are actually encoded as — media type and
+    // file extension are both derived from this, so they never disagree with
+    // the bytes (e.g. after a JPEG re-encode).
+    let mut out_format = format;
 
     let needs_downscale = width > max_dim || height > max_dim;
     let needs_reencode = !accepts_source;
@@ -137,7 +140,7 @@ pub fn prepare(
             let encoded = if use_jpeg { encode_jpeg(&img)? } else { encode_format(&img, format)? };
             if encoded.len() <= max_bytes || (w <= 16 && h <= 16) {
                 out_bytes = encoded;
-                media_type = if use_jpeg { "image/jpeg".to_string() } else { format.media_type().to_string() };
+                out_format = if use_jpeg { ImageFormat::Jpeg } else { format };
                 width = w;
                 height = h;
                 break;
@@ -151,14 +154,22 @@ pub fn prepare(
             }
         }
     }
-    Ok(PreparedImage { bytes: out_bytes, media_type, width, height })
+    Ok(PreparedImage {
+        bytes: out_bytes,
+        media_type: out_format.media_type().to_string(),
+        extension: out_format.extension().to_string(),
+        width,
+        height,
+    })
 }
 
 /// An image ready to send: its (possibly downscaled / re-encoded) bytes, the
-/// media type of those bytes, and their pixel dimensions.
+/// media type of those bytes, the file extension matching that media type, and
+/// their pixel dimensions.
 pub struct PreparedImage {
     pub bytes: Vec<u8>,
     pub media_type: String,
+    pub extension: String,
     pub width: u32,
     pub height: u32,
 }
@@ -229,6 +240,13 @@ pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<St
     Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
 }
 
+/// Whether an attachment's stored copy still exists on disk. Used to decide
+/// whether a request actually carries a sendable image (e.g. the file may have
+/// been deleted before a resume), without reading or encoding its bytes.
+pub fn exists(attachments_dir: &Path, attachment: &Attachment) -> bool {
+    attachments_dir.join(format!("{}.{}", attachment.sha256, attachment.extension)).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +288,7 @@ mod tests {
         assert_eq!(prepared.width, 1568);
         assert_eq!(prepared.height, 784);
         assert_eq!(prepared.media_type, "image/png");
+        assert_eq!(prepared.extension, "png");
         // The prepared bytes decode to the downscaled dimensions.
         assert_eq!(dimensions(&prepared.bytes).unwrap(), (1568, 784));
     }
@@ -292,6 +311,9 @@ mod tests {
         let accepted = vec!["image/jpeg".to_string(), "image/png".to_string()];
         let prepared = prepare(&bytes, ImageFormat::Gif, MAX_DIMENSION, DEFAULT_MAX_BYTES, &accepted).unwrap();
         assert_eq!(prepared.media_type, "image/jpeg");
+        // The stored extension must track the re-encoded format, not the source,
+        // so a JPEG payload is not written as `<sha>.gif`.
+        assert_eq!(prepared.extension, "jpg");
         assert_eq!(ImageFormat::sniff(&prepared.bytes), Some(ImageFormat::Jpeg));
     }
 
@@ -307,6 +329,10 @@ mod tests {
         let bytes = out.into_inner();
         let prepared = prepare(&bytes, ImageFormat::Png, MAX_DIMENSION, 50_000, &[]).unwrap();
         assert!(prepared.bytes.len() <= 50_000, "{} bytes", prepared.bytes.len());
+        // Forced under the cap it falls back to JPEG, so both media type and
+        // extension must report JPEG.
+        assert_eq!(prepared.media_type, "image/jpeg");
+        assert_eq!(prepared.extension, "jpg");
     }
 
     #[test]
@@ -325,9 +351,11 @@ mod tests {
         let p1 = store(dir.path(), &attachment, &bytes).unwrap();
         let p2 = store(dir.path(), &attachment, &bytes).unwrap();
         assert_eq!(p1, p2, "same hash stores once");
+        assert!(exists(dir.path(), &attachment));
         assert!(read_base64(dir.path(), &attachment).is_some());
         // A missing file reads as None (the resume fallback).
         std::fs::remove_file(&p1).unwrap();
+        assert!(!exists(dir.path(), &attachment));
         assert_eq!(read_base64(dir.path(), &attachment), None);
         // Tampered bytes that don't match the hash are rejected.
         assert!(store(dir.path(), &attachment, b"other").is_err());

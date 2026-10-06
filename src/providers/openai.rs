@@ -83,7 +83,7 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         if pending.is_empty() {
             return;
         }
-        let mut content: Vec<Value> = vec![json!({"type": "text", "text": "[image attached in the next message]"})];
+        let mut content: Vec<Value> = vec![json!({"type": "text", "text": "[attached image]"})];
         for image in pending.drain(..) {
             content.push(json!({
                 "type": "image_url",
@@ -878,6 +878,9 @@ mod tests {
         assert!(encoded[2]["content"].as_str().unwrap().contains("[image attached in the next message]"));
         assert_eq!(encoded[3]["role"], "user");
         let parts = encoded[3]["content"].as_array().unwrap();
+        // The carrying user message uses a distinct, non-self-referential label —
+        // not the tool message's forward-pointing note repeated here.
+        assert_eq!(parts[0]["text"], "[attached image]");
         assert_eq!(parts[1]["type"], "image_url");
         let expected = format!(
             "data:image/png;base64,{}",
