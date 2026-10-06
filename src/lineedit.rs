@@ -1246,10 +1246,14 @@ impl LineReader {
     }
 
     /// Record an Esc press at `now` for the idle prompt's "Esc Esc clears the
-    /// input" gesture at `view`; true when the press completes the double press.
-    /// A lone press (or a second one after [`DOUBLE_ESCAPE_WINDOW`] has lapsed)
-    /// arms the detector and leaves the text alone, so an Esc used alone for
-    /// line editing does not discard the buffer.
+    /// input" gesture at `view`; true only when the press completes the double
+    /// press *and* that completed gesture cleared non-empty input. A completed
+    /// pair on an empty prompt still consumes the pair but returns `false`
+    /// (there is nothing to clear), so `false` does not by itself mean the pair
+    /// went uncompleted. A lone press (or a second one after
+    /// [`DOUBLE_ESCAPE_WINDOW`] has lapsed) arms the detector and leaves the
+    /// text alone, so an Esc used alone for line editing does not discard the
+    /// buffer.
     ///
     /// The gesture is scoped to the idle prompt (`EditMode::Prompt`) in both
     /// directions: during a turn the input lives on the status line as the
