@@ -3,6 +3,8 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -549,12 +551,20 @@ impl Renderer {
             return;
         }
         let mut state = self.state.lock().unwrap();
-        if state.streamed_text && !state.at_line_start {
+        // Defer whenever the cursor is not at a line boundary, regardless of
+        // whether that line is answer text or reasoning: a `thinking_delta`
+        // leaves the cursor mid-line with `streamed_text` false, and printing
+        // now would prefix the JSON/Markdown with the partial thinking line.
+        if !state.at_line_start {
             state.deferred_raw.push(text.to_string());
             return;
         }
-        drop(state);
-        self.print_raw(text);
+        // Write through `out` (not a bare `println!`) while retaining the state
+        // lock: `out` holds the process-wide terminal lock, so a concurrent
+        // status/SIGWINCH redraw cannot interleave its escape sequences with
+        // the raw payload and corrupt it.
+        self.out(&mut state, text);
+        self.out(&mut state, "\n");
     }
 
     pub fn print_block(&self, text: &str) {
@@ -693,10 +703,13 @@ impl Renderer {
     /// final-answer reconciliation (frame: in place; legacy: a turn-end reprint
     /// gated on [`Self::answer_may_be_truncated`]) is what prevents a switch
     /// across the `quiet` boundary from truncating the streamed answer.
+    ///
+    /// This does NOT raise the truncation guard itself: merely entering quiet
+    /// has not dropped any answer text yet, so a `/verbosity quiet` followed by
+    /// `/verbosity normal` before any delta arrives would otherwise reprint a
+    /// fully streamed answer. Only the quiet `event` gate raises the guard,
+    /// when it actually suppresses a non-empty `TextDelta`.
     pub fn set_verbosity_mid_turn(&self, level: Verbosity) {
-        if level == Verbosity::Quiet {
-            self.touched_quiet.store(true, Ordering::Relaxed);
-        }
         set_verbosity(level);
     }
 
@@ -803,6 +816,15 @@ impl Renderer {
 
     pub fn event(&self, event: &AgentEvent) {
         if let Some(frame) = &self.frame {
+            // Hold the test verbosity lock across the quiet check and the event
+            // application so the pair is atomic against a concurrent test that
+            // changes the global level: without it a test that sets quiet
+            // (e.g. the truncation-guard test) can flip the level between this
+            // read and `frame_event`, making an unlocked renderer test drop its
+            // events and fail nondeterministically. Production never mutates
+            // verbosity on the event path, so the uncontended lock is free.
+            #[cfg(test)]
+            let _verbosity_guard = tests::verbosity_lock();
             if verbosity() == Verbosity::Quiet
                 && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
             {
@@ -1181,10 +1203,62 @@ mod tests {
     /// setting different levels at once would race and flake. Acquired with
     /// `verbosity_lock()`, which ignores poisoning so one panicking test does
     /// not cascade a `PoisonError` failure into the others.
+    ///
+    /// The lock is *reentrant on the owning thread*: a test that holds it and
+    /// then drives the renderer's `event` path re-acquires it in the frame
+    /// quiet gate (which locks it so the verbosity check + event application is
+    /// atomic against other tests). A plain `Mutex` would deadlock there, so
+    /// recursion by the owning thread is allowed while other threads still
+    /// block on the inner mutex.
     static VERBOSITY_LOCK: Mutex<()> = Mutex::new(());
+    static VERBOSITY_OWNER: AtomicUsize = AtomicUsize::new(0);
 
-    fn verbosity_lock() -> std::sync::MutexGuard<'static, ()> {
-        VERBOSITY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    thread_local! {
+        static VERBOSITY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A reentrant guard for [`VERBOSITY_LOCK`]: the owning thread may hold
+    /// several at once (each acquisition increments a thread-local depth); the
+    /// inner mutex is released only when the last guard for that thread drops.
+    pub(super) struct VerbosityGuard {
+        inner: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for VerbosityGuard {
+        fn drop(&mut self) {
+            let remaining = VERBOSITY_DEPTH.with(|d| {
+                let r = d.get().saturating_sub(1);
+                d.set(r);
+                r
+            });
+            if remaining == 0 {
+                // Outermost guard for this thread: release the inner mutex.
+                self.inner.take();
+                VERBOSITY_OWNER.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub(super) fn verbosity_lock() -> VerbosityGuard {
+        let tid = current_thread_id();
+        if VERBOSITY_OWNER.load(Ordering::SeqCst) == tid && tid != 0 {
+            // Already owned by this thread: recurse without touching the mutex.
+            VERBOSITY_DEPTH.with(|d| d.set(d.get() + 1));
+            return VerbosityGuard { inner: None };
+        }
+        let inner = VERBOSITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        VERBOSITY_OWNER.store(tid, Ordering::SeqCst);
+        VERBOSITY_DEPTH.with(|d| d.set(1));
+        VerbosityGuard { inner: Some(inner) }
+    }
+
+    /// A unique, nonzero per-thread id for identifying the lock owner.
+    fn current_thread_id() -> usize {
+        thread_local! {
+            static ID: usize = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
+        ID.with(|id| *id)
     }
 
     impl Renderer {
@@ -1286,6 +1360,77 @@ mod tests {
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "hello" });
         assert!(r.answer_may_be_truncated(), "a suppressed non-empty delta must flag truncation");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn entering_quiet_alone_does_not_flag_truncation() {
+        // `/verbosity quiet` then `/verbosity normal` before any answer delta
+        // arrives must not flag truncation: nothing was suppressed, so the
+        // answer streams in full and reprinting it would duplicate it. Only a
+        // genuinely suppressed non-empty delta raises the guard.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+        set_verbosity(Verbosity::Normal);
+        r.begin_turn();
+        r.set_verbosity_mid_turn(Verbosity::Quiet);
+        r.set_verbosity_mid_turn(Verbosity::Normal);
+        assert!(
+            !r.answer_may_be_truncated(),
+            "entering quiet with no suppressed delta must not flag truncation"
+        );
+    }
+
+    #[test]
+    fn turn_raw_defers_while_reasoning_is_mid_line() {
+        // A thinking delta leaves the cursor mid-line with `streamed_text`
+        // false. A raw export then must still be deferred (not printed into the
+        // middle of the reasoning line) and flushed verbatim at end_turn.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
+        assert!(!r.state.lock().unwrap().at_line_start, "a thinking delta leaves the cursor mid-line");
+        r.turn_raw("{\"k\":1}");
+        assert_eq!(
+            r.state.lock().unwrap().deferred_raw,
+            vec!["{\"k\":1}".to_string()],
+            "a raw export during mid-line reasoning must be deferred"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn turn_raw_defers_while_answer_text_is_mid_line() {
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "partial answer" });
+        r.turn_raw("{\"k\":1}");
+        assert_eq!(
+            r.state.lock().unwrap().deferred_raw,
+            vec!["{\"k\":1}".to_string()],
+            "a raw export during a half-streamed answer must be deferred"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn turn_raw_at_a_line_boundary_prints_without_deferring() {
+        // At a line boundary the export goes out immediately (through the
+        // terminal-locked `out`), leaving nothing queued for end_turn.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        assert!(r.state.lock().unwrap().at_line_start);
+        r.turn_raw("{\"k\":1}");
+        assert!(
+            r.state.lock().unwrap().deferred_raw.is_empty(),
+            "a raw export at a line boundary must not be deferred"
+        );
         set_verbosity(Verbosity::Normal);
     }
 
