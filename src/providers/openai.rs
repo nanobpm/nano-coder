@@ -121,8 +121,11 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
                 // text alone still reads coherently. Gated on this message adding
                 // an image — not on `pending_images` (which may hold an earlier
                 // tool's image) — so a tool with only a missing/omitted
-                // attachment does not falsely claim an image follows.
-                encoded["content"] = json!(format!("{content}\n[image attached in the next message]"));
+                // attachment does not falsely claim an image follows. The image
+                // is flushed only after the whole consecutive run of tool
+                // results, so say "after the tool results", not "in the next
+                // message" (another `tool` message may come next).
+                encoded["content"] = json!(format!("{content}\n[image attached after the tool results]"));
             }
             out.push(encoded);
             continue;
@@ -882,7 +885,7 @@ mod tests {
         // user, assistant, tool (text + a note), then a user message with the image.
         assert_eq!(encoded.len(), 4);
         assert_eq!(encoded[2]["role"], "tool");
-        assert!(encoded[2]["content"].as_str().unwrap().contains("[image attached in the next message]"));
+        assert!(encoded[2]["content"].as_str().unwrap().contains("[image attached after the tool results]"));
         assert_eq!(encoded[3]["role"], "user");
         let parts = encoded[3]["content"].as_array().unwrap();
         // The carrying user message uses a distinct, non-self-referential label —
@@ -900,7 +903,7 @@ mod tests {
     fn tool_without_its_own_image_does_not_claim_one_follows() {
         // Two consecutive tool results flushed into one user message: the first
         // carries an image, the second only a missing attachment. The second
-        // tool must NOT say "[image attached in the next message]" — that image
+        // tool must NOT say "[image attached after the tool results]" — that image
         // belongs to the first tool, not it.
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
@@ -968,12 +971,12 @@ mod tests {
         let c2 = &encoded[2];
         assert_eq!(c1["tool_call_id"], "c1");
         assert!(
-            c1["content"].as_str().unwrap().contains("[image attached in the next message]"),
+            c1["content"].as_str().unwrap().contains("[image attached after the tool results]"),
             "the tool that actually added an image should note it: {c1}"
         );
         assert_eq!(c2["tool_call_id"], "c2");
         assert!(
-            !c2["content"].as_str().unwrap().contains("[image attached in the next message]"),
+            !c2["content"].as_str().unwrap().contains("[image attached after the tool results]"),
             "a tool with no image of its own must not claim one follows: {c2}"
         );
         assert!(

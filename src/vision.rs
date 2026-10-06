@@ -210,10 +210,21 @@ fn assumes_anthropic_vision(model: &str) -> bool {
 /// optional `ft:<base>:…` fine-tune wrapper down to its base, the base either
 /// equals the family token or continues with a `-` (e.g. `o4-mini`,
 /// `gpt-4o-2024-08-06`).
+///
+/// The text-only `o3-mini` subfamily is carved out: the bare `o3` prefix would
+/// otherwise classify `o3-mini` (and dated `o3-mini-*` aliases) as
+/// vision-capable, but `o3-mini` cannot see images, so on the direct OpenAI
+/// provider — where detection returns no report and `resolve` falls back here —
+/// it would be sent images the API rejects.
 fn assumes_openai_vision(model: &str) -> bool {
     let m = model.to_lowercase();
     // `ft:<base>:<org>::<id>` → `<base>`; a plain name is its own base.
     let base = m.strip_prefix("ft:").map_or(m.as_str(), |rest| rest.split(':').next().unwrap_or(rest));
+    // `o3-mini` is text-only; exclude it (and `o3-mini-*` aliases) before the
+    // family-prefix match below claims it via `o3`.
+    if base == "o3-mini" || base.starts_with("o3-mini-") {
+        return false;
+    }
     const FAMILIES: [&str; 5] = ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4"];
     FAMILIES.iter().any(|family| match base.strip_prefix(family) {
         Some(rest) => rest.is_empty() || rest.starts_with('-'),
@@ -360,10 +371,8 @@ mod tests {
             "gpt-5",
             "gpt-5-mini",
             "o3",
-            "o3-mini",
             "o4-mini",
             "ft:gpt-4o-2024-08-06:org::id",
-            "ft:o3-mini:org::id",
         ] {
             assert!(assumes_openai_vision(model), "{model} should be a vision family");
         }
@@ -371,6 +380,17 @@ mod tests {
         for model in ["gpt-4o3-custom", "text-embedding-3", "o3pro", "whisper-o4", "ft:gpt-3.5-turbo:org::o3"] {
             assert!(!assumes_openai_vision(model), "{model} should not be a vision family");
         }
+    }
+
+    #[test]
+    fn o3_mini_is_text_only_not_vision() {
+        // `o3-mini` and its dated aliases / fine-tune wrappers are blind even
+        // though the bare `o3` family prefix would otherwise claim them; full
+        // `o3` stays vision-capable.
+        for model in ["o3-mini", "o3-mini-2025-01-31", "ft:o3-mini:org::id"] {
+            assert!(!assumes_openai_vision(model), "{model} should be blind");
+        }
+        assert!(assumes_openai_vision("o3"), "full o3 keeps vision");
     }
 
     #[test]

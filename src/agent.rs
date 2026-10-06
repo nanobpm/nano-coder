@@ -1140,8 +1140,24 @@ impl Agent {
     }
 
     /// Probe the vision capability the endpoint reports, leaving any configured
-    /// override to win at resolution time (`vision()`).
+    /// override to win at resolution time (`vision()`). Skipped when a
+    /// configured `vision` override already decides the capability: the probe
+    /// re-fetches `/models` plus llama.cpp `/props` or Ollama `/api/show` right
+    /// after `detect_capabilities` fetched the same responses, so running it
+    /// for an unused result adds a second serial probe budget on a slow
+    /// endpoint for nothing.
     async fn detect_vision(&mut self) {
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        let (override_, _source) =
+            crate::vision::configured_override(self.config.vision, &provider, self.model_name());
+        if override_.is_some() {
+            // A configured override wins at resolution time, so the endpoint
+            // report would be discarded; leave it unset and skip the probe.
+            self.reported_vision = None;
+            return;
+        }
         let probe = self.client.detect_vision();
         self.reported_vision = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
     }

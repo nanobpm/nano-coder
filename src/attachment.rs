@@ -275,6 +275,25 @@ impl Default for ImageLimits {
     }
 }
 
+/// An attachment's on-disk file name, `<sha256>.<extension>`, validated before
+/// it is joined onto the attachments directory.
+///
+/// The metadata comes from a deserialized session log, so neither field is
+/// trustworthy: a crafted or corrupt entry could carry `../` (or an absolute /
+/// separator-bearing) `sha256` or `extension` and make a resume read or write
+/// *outside* `<session>.attachments`, sending unrelated local bytes to the
+/// provider. Both fields are therefore restricted to the shapes the writer
+/// produces — `sha256` is 64 lowercase hex digits, `extension` is one of the
+/// known image extensions — so the joined name can never escape the directory.
+/// Returns `None` for anything else; callers then treat the attachment as
+/// unavailable (read) or refuse it (store).
+fn stored_filename(attachment: &Attachment) -> Option<String> {
+    let sha = attachment.sha256.as_str();
+    let valid_sha = sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    let valid_ext = matches!(attachment.extension.as_str(), "png" | "jpg" | "gif" | "webp");
+    (valid_sha && valid_ext).then(|| format!("{sha}.{}", attachment.extension))
+}
+
 /// Write an attachment's prepared bytes to the session's attachments directory,
 /// named by content hash so the same image is stored once. Returns the path.
 /// `bytes` are the *prepared* (post-downscale) bytes whose hash is `attachment.sha256`.
@@ -282,8 +301,9 @@ pub fn store(attachments_dir: &Path, attachment: &Attachment, bytes: &[u8]) -> R
     if sha256_hex(bytes) != attachment.sha256 {
         bail!("attachment bytes do not match their recorded hash");
     }
+    let filename = stored_filename(attachment).context("attachment metadata fails validation")?;
     std::fs::create_dir_all(attachments_dir).with_context(|| format!("create {}", attachments_dir.display()))?;
-    let path = attachments_dir.join(format!("{}.{}", attachment.sha256, attachment.extension));
+    let path = attachments_dir.join(filename);
     if !path.exists() {
         std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
     }
@@ -292,10 +312,14 @@ pub fn store(attachments_dir: &Path, attachment: &Attachment, bytes: &[u8]) -> R
 
 /// Base64-encode an attachment's stored bytes for a provider payload. `None`
 /// when the file is missing (e.g. deleted before a resume) — the caller then
-/// sends a text placeholder instead.
+/// sends a text placeholder instead. The stored bytes are re-checked against
+/// the recorded hash so a tampered or swapped file is not sent to the provider.
 pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<String> {
-    let path = attachments_dir.join(format!("{}.{}", attachment.sha256, attachment.extension));
+    let path = attachments_dir.join(stored_filename(attachment)?);
     let bytes = std::fs::read(path).ok()?;
+    if sha256_hex(&bytes) != attachment.sha256 {
+        return None;
+    }
     Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
 }
 
@@ -303,7 +327,10 @@ pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<St
 /// whether a request actually carries a sendable image (e.g. the file may have
 /// been deleted before a resume), without reading or encoding its bytes.
 pub fn exists(attachments_dir: &Path, attachment: &Attachment) -> bool {
-    attachments_dir.join(format!("{}.{}", attachment.sha256, attachment.extension)).exists()
+    match stored_filename(attachment) {
+        Some(filename) => attachments_dir.join(filename).exists(),
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -505,5 +532,68 @@ mod tests {
         assert_eq!(read_base64(dir.path(), &attachment), None);
         // Tampered bytes that don't match the hash are rejected.
         assert!(store(dir.path(), &attachment, b"other").is_err());
+    }
+
+    /// An attachment whose `sha256` / `extension` came from a crafted or
+    /// corrupt session log and would escape the attachments directory.
+    #[test]
+    fn crafted_metadata_cannot_escape_the_attachments_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        let good = sha256_hex(&bytes);
+        let mut attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/x.png"),
+            sha256: good.clone(),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+
+        // A `sha256` that is not exactly 64 lowercase hex digits is rejected:
+        // path traversal, separators, absolute paths, and wrong-length/uppercase
+        // hashes alike. `store` refuses it; `read_base64`/`exists` treat it as
+        // unavailable rather than joining it onto the directory.
+        for bad in ["../escape", "/etc/passwd", "a/b", &good.to_uppercase(), "abc", &format!("{good}x")] {
+            attachment.sha256 = bad.to_string();
+            assert!(store(dir.path(), &attachment, &bytes).is_err(), "store sha256={bad:?}");
+            assert_eq!(read_base64(dir.path(), &attachment), None, "read sha256={bad:?}");
+            assert!(!exists(dir.path(), &attachment), "exists sha256={bad:?}");
+        }
+
+        // An `extension` outside the known image set is rejected the same way.
+        attachment.sha256 = good.clone();
+        for bad in ["../escape", "png/..", "exe", "PNG", ""] {
+            attachment.extension = bad.to_string();
+            assert!(store(dir.path(), &attachment, &bytes).is_err(), "store ext={bad:?}");
+            assert_eq!(read_base64(dir.path(), &attachment), None, "read ext={bad:?}");
+            assert!(!exists(dir.path(), &attachment), "exists ext={bad:?}");
+        }
+        // Nothing was written outside (or inside) the attachments dir.
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    /// A stored file whose bytes no longer match the recorded hash is not sent.
+    #[test]
+    fn read_base64_rejects_a_tampered_stored_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/x.png"),
+            sha256: sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        let path = store(dir.path(), &attachment, &bytes).unwrap();
+        assert!(read_base64(dir.path(), &attachment).is_some());
+        // Overwrite the stored copy with different bytes; the hash no longer
+        // matches, so the attachment reads as unavailable rather than sending
+        // the swapped content to the provider.
+        std::fs::write(&path, b"tampered").unwrap();
+        assert_eq!(read_base64(dir.path(), &attachment), None);
     }
 }
