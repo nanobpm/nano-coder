@@ -83,10 +83,12 @@ impl Snapshot {
     pub fn capture(agent: &Agent) -> Self {
         // Captured for every mode: `Agent::tool_definitions()` applies the
         // capture-time mode's filter, which would bake a Plan-mode capture's
-        // missing mutating tools in permanently; `tool_definitions_all_modes`
-        // returns the full superset so `/tools` can re-filter by the live mode
-        // when it renders.
-        let tools = agent.tool_definitions_all_modes();
+        // missing mutating tools in permanently; `tool_definitions_superset`
+        // returns the full superset (including the history tools, even when not
+        // yet available) so `/tools` can re-filter by the live mode and live
+        // history availability when it renders — a same-turn smart compaction
+        // can enable the history tools after this capture.
+        let tools = agent.tool_definitions_superset();
 
         let found = agent.skills();
         let mut skills: Vec<String> = Vec::new();
@@ -133,7 +135,7 @@ impl Snapshot {
         let block = |text: String| Some(Output::Block(text));
         match cmd {
             "/help" => block(crate::commands::help_text()),
-            "/tools" => block(self.tools(stats.mode)),
+            "/tools" => block(self.tools(stats.mode, stats.history_available)),
             "/skills" => block(self.skills.clone()),
             "/providers" => block(self.providers()),
             "/session" => block(self.session.clone()),
@@ -168,10 +170,16 @@ impl Snapshot {
     /// filtered by the *live* mode: a `/mode` change mid-turn takes effect on
     /// the agent's next step, so the listing must reflect the mode that step
     /// will actually run under, not the mode the snapshot was captured in.
-    fn tools(&self, mode: crate::mode::AgentMode) -> String {
+    fn tools(&self, mode: crate::mode::AgentMode, history_available: bool) -> String {
         let mut out = vec!["Available tools:".to_string()];
         for def in &self.tools {
             if mode == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&def.name) {
+                continue;
+            }
+            // The history tools are captured in the superset unconditionally;
+            // show them only while they are actually offered, re-checked live so
+            // a same-turn smart compaction that enables them is reflected here.
+            if !history_available && crate::history::is_history_tool(&def.name) {
                 continue;
             }
             out.push(format!("  {} - {}", def.name, def.description));
@@ -364,5 +372,32 @@ mod tests {
         let Some(Output::Block(filtered)) = snapshot.output("/tools", &plan, &Plan::default()) else { panic!() };
         assert!(filtered.contains("read_file"), "{filtered}");
         assert!(!filtered.contains("edit_file"), "{filtered}");
+    }
+
+    #[test]
+    fn tools_listing_follows_live_history_availability() {
+        // The history tools are captured in the superset even when unavailable
+        // at snapshot time: a same-turn smart auto-compaction can enable them,
+        // so `/tools` filters them by the live `history_available` flag — not by
+        // a value frozen when the snapshot was captured at turn start.
+        let snapshot = Snapshot {
+            tools: vec![
+                crate::tools::ToolDefinition::new("read_file", "read a file", serde_json::json!({})),
+                crate::tools::ToolDefinition::new(crate::history::SEARCH_TOOL, "search history", serde_json::json!({})),
+                crate::tools::ToolDefinition::new(crate::history::READ_TOOL, "read history", serde_json::json!({})),
+            ],
+            ..Default::default()
+        };
+        let without = ContextStats { history_available: false, ..Default::default() };
+        let with = ContextStats { history_available: true, ..Default::default() };
+
+        let Some(Output::Block(hidden)) = snapshot.output("/tools", &without, &Plan::default()) else { panic!() };
+        assert!(hidden.contains("read_file"), "{hidden}");
+        assert!(!hidden.contains(crate::history::SEARCH_TOOL), "{hidden}");
+        assert!(!hidden.contains(crate::history::READ_TOOL), "{hidden}");
+
+        let Some(Output::Block(shown)) = snapshot.output("/tools", &with, &Plan::default()) else { panic!() };
+        assert!(shown.contains(crate::history::SEARCH_TOOL), "{shown}");
+        assert!(shown.contains(crate::history::READ_TOOL), "{shown}");
     }
 }

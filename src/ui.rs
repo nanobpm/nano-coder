@@ -1232,9 +1232,14 @@ mod tests {
                 r
             });
             if remaining == 0 {
-                // Outermost guard for this thread: release the inner mutex.
-                self.inner.take();
+                // Outermost guard for this thread. Clear the owner *while the
+                // mutex is still held*, then release it: clearing after the
+                // release opens a gap where another thread acquires the mutex
+                // and publishes its id, which this store would then clobber
+                // back to 0 — a recursive `event()` on that new owner would see
+                // owner 0, re-lock its own non-reentrant mutex, and deadlock.
                 VERBOSITY_OWNER.store(0, Ordering::SeqCst);
+                self.inner.take();
             }
         }
     }
@@ -1250,6 +1255,37 @@ mod tests {
         VERBOSITY_OWNER.store(tid, Ordering::SeqCst);
         VERBOSITY_DEPTH.with(|d| d.set(1));
         VerbosityGuard { inner: Some(inner) }
+    }
+
+    #[test]
+    fn verbosity_guard_owner_tracks_reentrancy_and_handoff() {
+        let tid = current_thread_id();
+        let outer = verbosity_lock();
+        // Held by this thread: the owner is published while the mutex is held.
+        assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        {
+            let _inner = verbosity_lock();
+            // Reentrant acquire does not change the owner.
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        }
+        // Dropping an inner (non-outermost) guard keeps the lock owned.
+        assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        drop(outer);
+
+        // A second thread can now take the lock cleanly: the outermost drop
+        // cleared the owner *before* releasing the mutex, so this handoff never
+        // sees the owner clobbered back to 0 under it (which would deadlock a
+        // recursive acquire). It observes itself as the owner while it holds it.
+        let handed = std::thread::spawn(|| {
+            let other = current_thread_id();
+            let g = verbosity_lock();
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), other);
+            let _reentrant = verbosity_lock(); // must not deadlock
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), other);
+            drop(_reentrant);
+            drop(g);
+        });
+        handed.join().expect("second thread acquired the verbosity lock without deadlock");
     }
 
     /// A unique, nonzero per-thread id for identifying the lock owner.

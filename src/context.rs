@@ -88,6 +88,10 @@ pub struct ContextStats {
     /// `history_search` / `history_read` calls this session.
     pub history_searches: u32,
     pub history_reads: u32,
+    /// Whether the history tools are currently offered to the model (a smart
+    /// summary is in context and the session is persisted). Live, so a mid-turn
+    /// `/tools` reflects history tools a same-turn smart auto-compaction enabled.
+    pub history_available: bool,
     /// Auto-compaction threshold as a fraction of the window (None = off).
     pub auto_compact: Option<f64>,
     /// Compactions will be smart (session log plus history tools): the

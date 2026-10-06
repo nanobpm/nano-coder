@@ -638,6 +638,7 @@ impl Agent {
             stats.messages = self.conversation.len();
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
+            stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
@@ -1110,6 +1111,22 @@ impl Agent {
             tools.push(skills::definition());
         }
         if self.history_tools_enabled() {
+            tools.extend(history::definitions());
+        }
+        tools
+    }
+
+    /// The full tool superset for a mid-turn snapshot that filters live: like
+    /// [`Self::tool_definitions_all_modes`] but *always* includes the history
+    /// tools, regardless of their current availability. A smart auto-compaction
+    /// can enable the history tools part-way through the same turn, so freezing
+    /// their availability at snapshot capture would make a later mid-turn
+    /// `/tools` omit tools the next model step actually receives. The snapshot
+    /// instead re-filters them against the live `ContextStats::history_available`
+    /// flag at render time, exactly as it re-filters the mode.
+    pub fn tool_definitions_superset(&self) -> Vec<crate::tools::ToolDefinition> {
+        let mut tools = self.tool_definitions_all_modes();
+        if !self.history_tools_enabled() {
             tools.extend(history::definitions());
         }
         tools
