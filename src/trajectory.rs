@@ -548,9 +548,17 @@ fn append_message_rows(turn: &mut Turn, message: &Message, prev_ts: &mut Option<
                 (Some(prev), Some(now)) => u64::try_from((now - *prev).num_milliseconds()).ok(),
                 _ => None,
             };
+            // Show each attached image as `[image: path, WxH]` after the text.
+            let mut text = message.content.clone();
+            for attachment in &message.attachments {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&attachment.placeholder());
+            }
             let mut row = Row::new(
                 RowKind::Tool { name, ok: !message.is_error, call_id: message.tool_call_id.clone(), duration_ms },
-                message.content.clone(),
+                text,
             );
             row.timestamp = message.timestamp;
             turn.rows.push(row);
@@ -798,12 +806,15 @@ mod tests {
         }];
         vec![
             Record::Session { version: 1, id: "sess-x".into(), created_at: now(), cwd: None, model: None },
-            Record::Message(Message { timestamp: Some(now()), ..Message::system("sys") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::system("sys") })),
             Record::Input { id: "in-1".into(), text: "add a feature".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("add a feature") }),
-            Record::Message(first),
-            Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "read_file", "ok") }),
-            Record::Message(assistant("feature added", "")),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("add a feature") })),
+            Record::Message(Box::new(first)),
+            Record::Message(Box::new(Message {
+                timestamp: Some(now()),
+                ..Message::tool_result("c1", "read_file", "ok")
+            })),
+            Record::Message(Box::new(assistant("feature added", ""))),
             Record::TurnEnd {
                 input_id: "in-1".into(),
                 response: "feature added".into(),
@@ -915,7 +926,7 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message({
+            Record::Message(Box::new({
                 let mut msg = assistant("", "");
                 msg.tool_calls = vec![ToolCall {
                     id: "c1".into(),
@@ -924,10 +935,13 @@ mod tests {
                     ..Default::default()
                 }];
                 msg
-            }),
-            Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "report_outcome", "ok") }),
+            })),
+            Record::Message(Box::new(Message {
+                timestamp: Some(now()),
+                ..Message::tool_result("c1", "report_outcome", "ok")
+            })),
             // The synthetic final answer: no usage, no duration_ms.
-            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::assistant("done") })),
             Record::TurnEnd {
                 input_id: "i".into(),
                 response: "done".into(),
@@ -955,11 +969,11 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("go") })),
             // A real legacy request: no usage, no duration_ms.
-            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("working on it") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::assistant("working on it") })),
             // The synthetic final answer appended after `report_outcome`.
-            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::assistant("done") })),
             Record::TurnEnd {
                 input_id: "i".into(),
                 response: "done".into(),
@@ -984,9 +998,9 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("go") })),
             // The one real request: no usage, no duration_ms (legacy log).
-            Record::Message(Message { timestamp: Some(now()), ..Message::assistant("done") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::assistant("done") })),
             Record::TurnEnd {
                 input_id: "i".into(),
                 response: "done".into(),
@@ -1011,8 +1025,8 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
-            Record::Message(thinking_request),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("go") })),
+            Record::Message(Box::new(thinking_request)),
             Record::TurnEnd {
                 input_id: "i".into(),
                 response: "thought through".into(),
@@ -1047,7 +1061,7 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(msg),
+            Record::Message(Box::new(msg)),
         ];
         let traj = Trajectory::from_records(&recs);
         let rows = &traj.turns[0].rows;
@@ -1067,7 +1081,7 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("go") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("go") })),
             Record::TurnEnd {
                 input_id: "i".into(),
                 response: "[turn cancelled]".into(),
@@ -1098,7 +1112,7 @@ mod tests {
         let mut recs = records();
         recs.insert(
             6,
-            Record::Message(Message { timestamp: Some(now()), ..Message::tool_error("c2", "bash", "boom") }),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::tool_error("c2", "bash", "boom") })),
         );
         let traj = Trajectory::from_records(&recs);
         let tool = traj.turns[0].rows.iter().find(|r| matches!(&r.kind, RowKind::Tool { name, .. } if name == "bash"));
@@ -1136,7 +1150,7 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(msg),
+            Record::Message(Box::new(msg)),
         ];
         let traj = Trajectory::from_records(&recs);
         let rows = &traj.turns[0].rows;
@@ -1176,8 +1190,11 @@ mod tests {
         let recs = vec![
             Record::Session { version: 1, id: "s".into(), created_at: now(), cwd: None, model: None },
             Record::Input { id: "i".into(), text: "go".into(), recorded_at: now() },
-            Record::Message(msg),
-            Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c1", "read_file", "ok") }),
+            Record::Message(Box::new(msg)),
+            Record::Message(Box::new(Message {
+                timestamp: Some(now()),
+                ..Message::tool_result("c1", "read_file", "ok")
+            })),
         ];
         let traj = Trajectory::from_records(&recs);
         let turn = &traj.turns[0];
@@ -1230,7 +1247,7 @@ mod tests {
         // move the cursor, clear the screen, or overflow the row width.
         let recs = vec![
             Record::Input { id: "in-1".into(), text: "hi\x1b[2Jwiped\tafter".into(), recorded_at: now() },
-            Record::Message(assistant("ok", "")),
+            Record::Message(Box::new(assistant("ok", ""))),
         ];
         let plain = Trajectory::from_records(&recs).to_plain();
         assert!(!plain.contains('\x1b'), "no ESC byte survives");
@@ -1246,8 +1263,8 @@ mod tests {
         // line breaks in the quoted prompt/response survive.
         let recs = vec![
             Record::Input { id: "in-1".into(), text: "ask\x1b[2Jwiped\nsecond".into(), recorded_at: now() },
-            Record::Message(Message { timestamp: Some(now()), ..Message::user("ask\x1b[2Jwiped\nsecond") }),
-            Record::Message(assistant("resp\x1b]8;;http://evil\x07x", "")),
+            Record::Message(Box::new(Message { timestamp: Some(now()), ..Message::user("ask\x1b[2Jwiped\nsecond") })),
+            Record::Message(Box::new(assistant("resp\x1b]8;;http://evil\x07x", ""))),
             Record::TurnEnd {
                 input_id: "in-1".into(),
                 response: "final\x1b[31mred".into(),
@@ -1311,7 +1328,10 @@ mod tests {
         let mut recs = records();
         recs.insert(
             6,
-            Record::Message(Message { timestamp: Some(now()), ..Message::tool_result("c", "bash", "```\ncode\n```") }),
+            Record::Message(Box::new(Message {
+                timestamp: Some(now()),
+                ..Message::tool_result("c", "bash", "```\ncode\n```")
+            })),
         );
         let md = Trajectory::from_records(&recs).to_markdown();
         // The outer fence must be longer than the embedded one so it is not

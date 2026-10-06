@@ -98,11 +98,21 @@ fn count_arg(args: &Value, name: &str) -> Result<Option<usize>> {
 }
 
 /// Numbered lines `offset..offset+limit` (1-based) of a text file.
-pub fn read_file(args: &Value) -> Result<String> {
+///
+/// An image (PNG, JPEG, GIF or WebP, recognised by magic bytes) returns a
+/// structured [`Value`] object instead of text: `{ "image": { media_type,
+/// path, width, height, bytes, data_base64 } }`. The dispatch loop turns that
+/// into a message attachment when the model can view images, or a text error
+/// when it cannot. Other binary files keep the "looks like a binary file"
+/// error.
+pub fn read_file(args: &Value) -> Result<Value> {
     let path = path_arg(args)?;
     let offset = count_arg(args, "offset")?.unwrap_or(1);
     let limit = count_arg(args, "limit")?.unwrap_or(DEFAULT_READ_LINES);
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    if let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) {
+        return read_image(&path, &bytes, format);
+    }
     if bytes.iter().take(8192).any(|b| *b == 0) {
         bail!("{} looks like a binary file ({} bytes)", path.display(), bytes.len());
     }
@@ -110,7 +120,7 @@ pub fn read_file(args: &Value) -> Result<String> {
     let total = text.lines().count();
     if total == 0 {
         remember(&path, &bytes);
-        return Ok(format!("({} is empty)", path.display()));
+        return Ok(Value::String(format!("({} is empty)", path.display())));
     }
     if offset > total {
         bail!("offset {offset} is past the end of {} ({total} lines)", path.display());
@@ -131,7 +141,33 @@ pub fn read_file(args: &Value) -> Result<String> {
     if last < total {
         out.push_str(&format!("[showing lines {offset}-{last} of {total}; use offset={} to continue]\n", last + 1));
     }
-    Ok(output::bound_output(&out, MAX_READ_BYTES).0)
+    Ok(Value::String(output::bound_output(&out, MAX_READ_BYTES).0))
+}
+
+/// Build the structured result for an image: its metadata and the source bytes
+/// base64-encoded. Downscaling to the model's limits happens in the dispatch
+/// loop, which knows the model's capability; here we only decode dimensions.
+fn read_image(path: &Path, bytes: &[u8], format: crate::attachment::ImageFormat) -> Result<Value> {
+    let (width, height) = image_dimensions(bytes)?;
+    let data_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    Ok(json!({
+        "image": {
+            "media_type": format.media_type(),
+            "extension": format.extension(),
+            "path": path,
+            "width": width,
+            "height": height,
+            "bytes": bytes.len(),
+            "data_base64": data_base64,
+        }
+    }))
+}
+
+/// Decode an image's pixel dimensions.
+fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    let reader =
+        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().context("guess image format")?;
+    reader.into_dimensions().context("read image dimensions")
 }
 
 /// What the caller expected the target to be when the write was planned. The
@@ -852,7 +888,7 @@ pub fn register(tools: &ToolRegistry) {
                 "required": ["path"]
             }),
         ),
-        Box::new(|args| read_file(&args).map(Value::String)),
+        Box::new(|args| read_file(&args)),
     );
     tools.register(
         ToolDefinition::new(
@@ -892,15 +928,23 @@ pub fn register(tools: &ToolRegistry) {
 mod tests {
     use super::*;
 
+    /// `read_file` of a text file, as its string content.
+    fn read_text(args: &Value) -> String {
+        match read_file(args).unwrap() {
+            Value::String(text) => text,
+            other => panic!("expected text, got {other}"),
+        }
+    }
+
     #[test]
     fn read_pages_with_line_numbers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         let p = path.to_str().unwrap();
-        let all = read_file(&json!({ "path": p })).unwrap();
+        let all = read_text(&json!({ "path": p }));
         assert!(all.contains("     1\tone\n") && all.contains("     3\tthree\n"));
-        let page = read_file(&json!({ "path": p, "offset": 2, "limit": 1 })).unwrap();
+        let page = read_text(&json!({ "path": p, "offset": 2, "limit": 1 }));
         assert!(page.starts_with("     2\ttwo\n"));
         assert!(page.contains("use offset=3"));
         assert!(read_file(&json!({ "path": p, "offset": 9 })).is_err());
@@ -912,6 +956,44 @@ mod tests {
         let path = dir.path().join("b.bin");
         std::fs::write(&path, [0u8, 1, 2]).unwrap();
         assert!(read_file(&json!({ "path": path })).is_err());
+    }
+
+    /// Encode a solid-colour image of `w`×`h` in `format`.
+    fn make_image(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([10, 120, 200])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn read_returns_images_by_magic_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, format, media_type) in [
+            ("a.png", image::ImageFormat::Png, "image/png"),
+            ("a.jpg", image::ImageFormat::Jpeg, "image/jpeg"),
+            ("a.gif", image::ImageFormat::Gif, "image/gif"),
+            ("a.webp", image::ImageFormat::WebP, "image/webp"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, make_image(40, 20, format)).unwrap();
+            let result = read_file(&json!({ "path": path.to_str().unwrap() })).unwrap();
+            let image = result.get("image").unwrap_or_else(|| panic!("{name} should be an image: {result}"));
+            assert_eq!(image["media_type"], media_type, "{name}");
+            assert_eq!(image["width"], 40, "{name}");
+            assert_eq!(image["height"], 20, "{name}");
+            assert!(image["data_base64"].as_str().is_some_and(|d| !d.is_empty()), "{name}");
+        }
+    }
+
+    #[test]
+    fn read_detects_image_despite_text_extension() {
+        // Magic bytes, not the extension, decide: a PNG named `.txt` is an image.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("misleading.txt");
+        std::fs::write(&path, make_image(8, 8, image::ImageFormat::Png)).unwrap();
+        let result = read_file(&json!({ "path": path.to_str().unwrap() })).unwrap();
+        assert!(result.get("image").is_some(), "PNG bytes named .txt are an image: {result}");
     }
 
     #[test]

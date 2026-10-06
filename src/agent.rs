@@ -489,6 +489,8 @@ pub struct Agent {
     detected_window: Option<DetectedWindow>,
     /// Thinking levels reported by the endpoint (see `detect_context_window`).
     reported_thinking: Option<crate::thinking::Reported>,
+    /// Vision capability reported by the endpoint (see `detect_context_window`).
+    reported_vision: Option<crate::vision::Vision>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -631,6 +633,7 @@ impl Agent {
             learned_window: None,
             detected_window: None,
             reported_thinking: None,
+            reported_vision: None,
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -747,6 +750,8 @@ impl Agent {
                 temperature: None,
                 max_tokens: Some(400),
                 thinking: None,
+                vision: None,
+                attachments_dir: None,
             };
             let reply = tokio::time::timeout(Duration::from_secs(60), client.chat(&request)).await;
             if let Ok(Ok(response)) = reply
@@ -1119,6 +1124,7 @@ impl Agent {
         let (window, thinking) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         self.detected_window = window;
         self.reported_thinking = thinking;
+        self.detect_vision().await;
         self.refresh_stats();
     }
 
@@ -1129,7 +1135,94 @@ impl Agent {
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_levels();
         self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+        self.detect_vision().await;
         self.refresh_stats();
+    }
+
+    /// Probe the vision capability the endpoint reports, leaving any configured
+    /// override to win at resolution time (`vision()`).
+    async fn detect_vision(&mut self) {
+        let probe = self.client.detect_vision();
+        self.reported_vision = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
+    }
+
+    /// The effective vision capability for the current model: a configured
+    /// `vision` override wins, else the endpoint report, else the built-in
+    /// assumption for current Anthropic / OpenAI families. `None` = the model
+    /// cannot view images.
+    pub fn vision(&self) -> Option<crate::vision::Vision> {
+        let (user, _default_provider) = self.config.effective_providers();
+        let providers = providers::effective_providers(&user);
+        let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
+        crate::vision::resolve(
+            self.config.vision,
+            self.client.kind(),
+            &provider,
+            self.model_name(),
+            self.reported_vision.as_ref(),
+        )
+    }
+
+    /// Turn a `read_file` image result (`{"image": {…, data_base64}}`) into the
+    /// tool-result text and its attachment. Returns `Ok(None)` when `result` is
+    /// not an image result. When the model cannot view images, returns `Err`
+    /// with the text error (a hint naming the fix). When it can, the image is
+    /// downscaled to the model's limits, stored under the session's attachments
+    /// directory, and returned as `(text, attachments)`.
+    fn image_result(&self, result: &Value) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
+        let Some(image) = result.get("image") else { return Ok(None) };
+        let path_str = image.get("path").and_then(Value::as_str).unwrap_or_default();
+        let path = std::path::PathBuf::from(path_str);
+        let Some(vision) = self.vision() else {
+            return Err(format!(
+                "{} is an image ({}), but the current model can't view images; \
+                 switch to a vision model or set `vision = true`",
+                path.display(),
+                image.get("media_type").and_then(Value::as_str).unwrap_or("unknown type")
+            ));
+        };
+        let Some(data_base64) = image.get("data_base64").and_then(Value::as_str) else {
+            return Err(format!("{}: image result had no data", path.display()));
+        };
+        let bytes = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_base64) {
+            Ok(bytes) => bytes,
+            Err(e) => return Err(format!("{}: undecodable image data: {e}", path.display())),
+        };
+        let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) else {
+            return Err(format!("{}: unrecognised image data", path.display()));
+        };
+        // Downscale to the model's limits and store the prepared bytes by hash.
+        let limits = vision.image_limits();
+        let prepared = match crate::attachment::prepare(
+            &bytes,
+            format,
+            limits.max_dimension,
+            limits.max_bytes,
+            &limits.accepted_media_types,
+        ) {
+            Ok(prepared) => prepared,
+            Err(e) => return Err(format!("{}: could not process image: {e}", path.display())),
+        };
+        let attachment = crate::llm::Attachment {
+            media_type: prepared.media_type,
+            path: path.clone(),
+            sha256: crate::attachment::sha256_hex(&prepared.bytes),
+            width: prepared.width,
+            height: prepared.height,
+            bytes: prepared.bytes.len(),
+            extension: format.extension().to_string(),
+        };
+        if let Err(e) = crate::attachment::store(&self.attachments_dir(), &attachment, &prepared.bytes) {
+            return Err(format!("{}: could not store image: {e}", path.display()));
+        }
+        let text = format!(
+            "{}, {}×{}, {}",
+            attachment.media_type,
+            attachment.width,
+            attachment.height,
+            crate::context::format_bytes(attachment.bytes)
+        );
+        Ok(Some((text, vec![attachment])))
     }
 
     /// `context_window` from config or the provider entry.
@@ -1476,6 +1569,18 @@ impl Agent {
         self.spill_dir.read().unwrap().clone()
     }
 
+    /// Directory this session's image attachments are stored in. Persisted
+    /// sessions keep them beside their log so the references in the log stay
+    /// valid after the process exits; an ephemeral session uses a
+    /// process-local temp dir.
+    fn attachments_dir(&self) -> std::path::PathBuf {
+        if let (Some(id), true) = (self.session_id.as_deref(), self.session.is_some()) {
+            session::attachments_dir_for(&self.config.session_dir(), id)
+        } else {
+            std::env::temp_dir().join(format!("nano-coder-attachments-{}", std::process::id()))
+        }
+    }
+
     /// Persisted sessions keep spilled output beside their log, so the paths
     /// in the log stay valid after the process exits.
     fn set_spill_dir(&self, id: &str) {
@@ -1540,7 +1645,7 @@ impl Agent {
             let cwd = std::env::current_dir().ok().map(|d| d.display().to_string());
             let model = Some(format!("{}/{}", self.client.provider_name(), self.client.model_name()));
             let mut log = SessionLog::create_with(&self.config.session_dir(), &id, cwd, model)?;
-            log.append(&Record::Message(system.clone()))?;
+            log.append(&Record::Message(Box::new(system.clone())))?;
             Some(log)
         } else {
             None
@@ -1616,7 +1721,7 @@ impl Agent {
             // repaired result keeps its event time (for `/trajectory`) and its
             // persisted `#N` (for citations) without waiting for a reload.
             message.timestamp.get_or_insert_with(session::now);
-            let line = log.append(&Record::Message(message.clone()))?;
+            let line = log.append(&Record::Message(Box::new(message.clone())))?;
             message.log_line.get_or_insert(line);
         }
         staged.extend(repairs);
@@ -1723,7 +1828,7 @@ impl Agent {
     fn push(&mut self, mut message: Message) -> Result<()> {
         message.timestamp.get_or_insert_with(session::now);
         if let Some(log) = &mut self.session {
-            let line = log.append(&Record::Message(message.clone()))?;
+            let line = log.append(&Record::Message(Box::new(message.clone())))?;
             message.log_line.get_or_insert(line);
         }
         self.conversation.push(message);
@@ -2304,12 +2409,15 @@ impl Agent {
                 // actually offer `history_search`/`history_read` for the folded
                 // history instead of reusing the pre-compaction tool set.
                 let tools = self.tool_definitions();
+                let attachments_dir = self.attachments_dir();
                 let request = ChatRequest {
                     messages: &self.conversation,
                     tools: &tools,
                     temperature: resolved_temperature.value(),
                     max_tokens: Some(request_max_tokens),
                     thinking: resolved_thinking.request(),
+                    vision: self.vision(),
+                    attachments_dir: Some(attachments_dir.as_path()),
                 };
                 let control = self.control.clone();
                 let (event_sink, session_id) = (&self.event_sink, self.session_id.as_deref());
@@ -2652,7 +2760,7 @@ impl Agent {
                     dispatched = true;
                     self.tools.execute_blocking(&effective_call.name, effective_call.arguments.clone()).await
                 };
-                let ok = result.is_ok();
+                let mut ok = result.is_ok();
                 let result = match result {
                     Ok(value) => value,
                     Err(e) => json!({ "error": e.to_string() }),
@@ -2665,9 +2773,25 @@ impl Agent {
                     .with_data("result", result.clone());
                 self.hooks.trigger(&ctx);
 
+                // A `read_file` image result carries the source bytes; turn it
+                // into a message attachment (downscaled to the model's limits)
+                // when the model can view images, else a text error with a hint.
+                let mut attachments: Vec<crate::llm::Attachment> = Vec::new();
                 let mut result_text = match result {
                     Value::String(text) => text,
-                    other => other.to_string(),
+                    other => match self.image_result(&other) {
+                        Ok(Some((text, found))) => {
+                            attachments = found;
+                            text
+                        }
+                        Ok(None) => other.to_string(),
+                        // The image read fine but the model can't view it: surface
+                        // it as a tool error so the model treats it as a failure.
+                        Err(text) => {
+                            ok = false;
+                            text
+                        }
+                    },
                 };
                 if ok
                     && matches!(tool_call.name.as_str(), "read_file" | "write_file" | "edit_file")
@@ -2724,13 +2848,24 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
+                // The display output (trajectory event, ACP) notes each attached
+                // image as `[image: path, WxH]`; the model-facing `result_text`
+                // stays the short text part.
+                let mut display_output = result_text.clone();
+                for attachment in &attachments {
+                    if !display_output.is_empty() {
+                        display_output.push('\n');
+                    }
+                    display_output.push_str(&attachment.placeholder());
+                }
                 let message = if ok {
                     Message::tool_result(&tool_call.id, &tool_call.name, &result_text)
                 } else {
                     Message::tool_error(&tool_call.id, &tool_call.name, &result_text)
-                };
+                }
+                .with_attachments(attachments);
                 self.push(message)?;
-                self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &result_text });
+                self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &display_output });
             }
             self.refresh_stats();
             if reported.is_some() {
@@ -3043,6 +3178,11 @@ impl Agent {
             // A summary needs no extended reasoning; the model's own default
             // applies, as before thinking levels existed.
             thinking: None,
+            // The summary request never includes images: the transcript renders
+            // them as text placeholders, and the freshly built summary messages
+            // carry no attachments.
+            vision: None,
+            attachments_dir: None,
         };
         let control = self.control.clone();
         // Stream the summary even though its text is used only once complete.
@@ -3600,6 +3740,143 @@ mod tests {
         }
     }
 
+    /// A scripted response calling `read_file` on `path`.
+    fn read_call(id: &str, path: &str) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({"path": path}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// An agent with the real file tools and a scripted client; `vision` sets
+    /// the global `vision` override (the scripted client's "scripted" model is
+    /// not a known vision family, so detection alone would report blind).
+    fn file_agent(responses: Vec<LLMResponse>, dir: &std::path::Path, vision: Option<bool>) -> (Agent, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = Scripted { responses: Mutex::new(responses), seen: seen.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            vision,
+            ..Config::default()
+        };
+        let agent = Agent::new(Box::new(client), config);
+        crate::files::register(agent.tools());
+        (agent, seen)
+    }
+
+    /// Write a small PNG and return its path.
+    fn write_png(dir: &std::path::Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([5, 50, 250])));
+        let path = dir.join(name);
+        img.save(&path).unwrap();
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_attaches_an_image_for_a_vision_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        let (mut agent, seen) =
+            file_agent(vec![read_call("c1", png.to_str().unwrap()), text("a blue board")], dir.path(), Some(true));
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "look").await.unwrap();
+        assert_eq!(outcome.response, "a blue board");
+
+        // The tool-result message carries the image attachment and a text part.
+        let image_message = agent
+            .conversation()
+            .iter()
+            .find(|m| m.role == Role::Tool && !m.attachments.is_empty())
+            .expect("a tool result with an attachment");
+        assert!(
+            image_message.content.starts_with("image/png, 64×32, ") && image_message.content.ends_with('B'),
+            "text part: {}",
+            image_message.content
+        );
+        let attachment = &image_message.attachments[0];
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!((attachment.width, attachment.height), (64, 32));
+        assert_eq!(attachment.path, png);
+
+        // The bytes are stored once under the session's attachments directory.
+        let stored = session::attachments_dir_for(&agent.config().session_dir(), agent.session_id().unwrap())
+            .join(format!("{}.png", attachment.sha256));
+        assert!(stored.exists(), "stored at {}", stored.display());
+
+        // The next request sends the image (the scripted client saw it).
+        let requests = seen.lock().unwrap();
+        let second = &requests[1];
+        let tool = second.iter().find(|m| m.role == Role::Tool).unwrap();
+        assert_eq!(tool.attachments.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_file_image_errors_with_a_hint_when_the_model_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        // No vision override and a non-vision model: the read returns a text error.
+        let (mut agent, _seen) = file_agent(vec![read_call("c1", png.to_str().unwrap()), text("ok")], dir.path(), None);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "look").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(tool.is_error, "the read failed");
+        assert!(tool.attachments.is_empty());
+        assert!(tool.content.contains("can't view images"), "hint: {}", tool.content);
+        assert!(tool.content.contains("vision = true"), "names the fix: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_session_keeps_attachments_and_survives_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = write_png(dir.path(), "board.png", 64, 32);
+        let session_id;
+        let sha;
+        {
+            let (mut agent, _) =
+                file_agent(vec![read_call("c1", png.to_str().unwrap()), text("done")], dir.path(), Some(true));
+            agent.new_session().unwrap();
+            agent.run_turn(Some("in-1"), "look").await.unwrap();
+            session_id = agent.session_id().unwrap().to_string();
+            sha =
+                agent.conversation().iter().find(|m| !m.attachments.is_empty()).unwrap().attachments[0].sha256.clone();
+        }
+        // Resume: the attachment reference survives in the log.
+        let (mut agent, _) = file_agent(vec![text("again")], dir.path(), Some(true));
+        agent.load_session(&session_id).unwrap();
+        let tool = agent.conversation().iter().find(|m| !m.attachments.is_empty()).expect("attachment kept");
+        assert_eq!(tool.attachments[0].sha256, sha);
+
+        // Delete the stored image; the request builder falls back to a
+        // placeholder instead of failing.
+        let stored =
+            session::attachments_dir_for(&agent.config().session_dir(), &session_id).join(format!("{sha}.png"));
+        std::fs::remove_file(&stored).unwrap();
+        let attachments_dir = agent.attachments_dir();
+        let request = crate::llm::ChatRequest {
+            messages: agent.conversation(),
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: agent.vision(),
+            attachments_dir: Some(attachments_dir.as_path()),
+        };
+        match &request.resolve_attachments(tool)[0] {
+            crate::llm::ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+            }
+            other => panic!("missing file should be a placeholder, got {other:?}"),
+        }
+    }
+
     fn text(content: &str) -> LLMResponse {
         LLMResponse { content: content.into(), ..Default::default() }
     }
@@ -4140,10 +4417,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = "sess-crash";
         let mut log = SessionLog::create(dir.path(), id).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
-        log.append(&Record::Message(Message::user("run it"))).unwrap();
-        log.append(&Record::Message(Message::assistant_with_tools(
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
             "",
             vec![ToolCall {
                 id: "c9".into(),
@@ -4152,7 +4429,7 @@ mod tests {
                 item_id: None,
                 malformed_arguments: None,
             }],
-        )))
+        ))))
         .unwrap();
         drop(log);
 
@@ -4183,10 +4460,10 @@ mod tests {
         // A crashed session on disk whose resume needs a (fallible) repair append.
         let crashed = "sess-readonly";
         let mut log = SessionLog::create(dir.path(), crashed).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "m1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
-        log.append(&Record::Message(Message::user("run it"))).unwrap();
-        log.append(&Record::Message(Message::assistant_with_tools(
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
             "",
             vec![ToolCall {
                 id: "c9".into(),
@@ -4195,7 +4472,7 @@ mod tests {
                 item_id: None,
                 malformed_arguments: None,
             }],
-        )))
+        ))))
         .unwrap();
         drop(log);
         // Make the crashed session's log read-only so the repair append fails.
@@ -4238,7 +4515,7 @@ mod tests {
 
     fn crashed_session(dir: &std::path::Path, id: &str, records: Vec<Record>) {
         let mut log = SessionLog::create(dir, id).unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
         log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
         for record in records {
             log.append(&record).unwrap();
@@ -4262,7 +4539,10 @@ mod tests {
         crashed_session(
             dir.path(),
             "lost-end",
-            vec![Record::Message(Message::user("run it")), Record::Message(Message::assistant("already answered"))],
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(Message::assistant("already answered"))),
+            ],
         );
         let (mut agent, seen) = agent(vec![], dir.path());
         agent.load_session("lost-end").unwrap();
@@ -6299,7 +6579,7 @@ mod tests {
 
         // A crashed session whose turn never finished: the input was accepted
         // but no answer was recorded, so the resume path continues the turn.
-        crashed_session(dir.path(), "resume-start", vec![Record::Message(Message::user("run it"))]);
+        crashed_session(dir.path(), "resume-start", vec![Record::Message(Box::new(Message::user("run it")))]);
         let (mut agent, seen) = agent(vec![text("continued")], dir.path());
         agent.load_claude_hooks(dir.path());
         agent.load_session("resume-start").unwrap();
@@ -6363,9 +6643,12 @@ mod tests {
             dir.path(),
             "lost-outcome",
             vec![
-                Record::Message(Message::user("run it")),
-                Record::Message(Message::assistant_with_tools("", vec![report("o1", "blocked", "need a token")])),
-                Record::Message(Message::tool_result("o1", goal::TOOL_NAME, "Recorded outcome: blocked.")),
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(Message::assistant_with_tools(
+                    "",
+                    vec![report("o1", "blocked", "need a token")],
+                ))),
+                Record::Message(Box::new(Message::tool_result("o1", goal::TOOL_NAME, "Recorded outcome: blocked."))),
             ],
         );
         let (mut agent, seen) = agent(vec![], dir.path());

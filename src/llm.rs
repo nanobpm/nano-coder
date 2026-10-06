@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 use crate::tools::ToolDefinition;
 
@@ -26,12 +27,49 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// An image attached to a message (currently only produced by `read_file`).
+///
+/// The pixels live on disk under the session's `attachments/` directory, named
+/// `<sha256>.<extension>`; the message records only the reference and metadata,
+/// so session logs stay small and the same image is stored once. `content`
+/// stays text. Request builders turn the attachment into provider bytes
+/// (base64) for the newest few images the model accepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// MIME type of the stored bytes (e.g. `image/png`). After downscaling /
+    /// re-encoding this is the type of what is actually sent.
+    pub media_type: String,
+    /// The path the image was read from (for display and re-`read_file`).
+    pub path: PathBuf,
+    /// Hex sha256 of the stored (prepared) bytes; names the attachment file.
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    /// Byte size of the stored (prepared) image.
+    pub bytes: usize,
+    /// File extension of the stored copy (`png`, `jpg`, `gif`, `webp`).
+    pub extension: String,
+}
+
+impl Attachment {
+    /// The placeholder text shown where an image is summarized away, omitted
+    /// past the model's per-request image limit, or missing on resume.
+    pub fn placeholder(&self) -> String {
+        format!("[image: {}, {}×{}]", self.path.display(), self.width, self.height)
+    }
+}
+
 /// Provider-neutral conversation message. Assistant messages carry the tool
 /// calls they requested so the next request can replay them faithfully.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Images attached to this message (tool results from `read_file`). Not
+    /// sent as text; request builders encode the newest few per the model's
+    /// limit. Kept in the session log as references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,6 +123,7 @@ impl Message {
         Self {
             role,
             content: content.to_string(),
+            attachments: vec![],
             tool_calls: vec![],
             is_error: false,
             thinking_blocks: vec![],
@@ -126,6 +165,12 @@ impl Message {
 
     pub fn tool_error(tool_call_id: &str, name: &str, content: &str) -> Self {
         Self { is_error: true, ..Self::tool_result(tool_call_id, name, content) }
+    }
+
+    /// Attach `attachments` to this (tool-result) message.
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 }
 
@@ -300,6 +345,106 @@ pub struct ChatRequest<'a> {
     pub max_tokens: Option<i64>,
     /// Thinking level to ask for; `None` sends nothing.
     pub thinking: Option<crate::thinking::Request>,
+    /// The model's vision capability: how the newest few image attachments are
+    /// sent and how many a request may carry. `None` (or `max_images == 0`)
+    /// means attachments become text placeholders.
+    pub vision: Option<crate::vision::Vision>,
+    /// Directory message attachments are stored in, so the builder can read
+    /// their bytes. `None` for requests that cannot carry images (compaction).
+    pub attachments_dir: Option<&'a std::path::Path>,
+}
+
+impl ChatRequest<'_> {
+    /// The set of attachment `sha256` hashes this request sends as images: the
+    /// newest `vision.max_images` across the conversation (every older one is
+    /// omitted, its message showing a placeholder instead). Without this a
+    /// second image on a model capped at one image would fail the request. An
+    /// empty set (no vision, or `max_images == 0`) sends none.
+    fn sendable(&self) -> std::collections::HashSet<&str> {
+        let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
+        let mut all: Vec<&crate::llm::Attachment> = self.messages.iter().flat_map(|m| m.attachments.iter()).collect();
+        // Keep the newest `max`: drop the oldest excess from the front.
+        let keep = max.min(all.len());
+        let drop = all.len() - keep;
+        all.drain(..drop);
+        all.into_iter().map(|a| a.sha256.as_str()).collect()
+    }
+
+    /// Resolve each of `message`'s attachments for the wire, in order: either
+    /// the image data to send, or the placeholder text standing in for it
+    /// (omitted past the model's image limit, or missing on resume).
+    pub fn resolve_attachments(&self, message: &Message) -> Vec<ResolvedAttachment> {
+        if message.attachments.is_empty() {
+            return Vec::new();
+        }
+        let sendable = self.sendable();
+        message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                if !sendable.contains(attachment.sha256.as_str()) {
+                    return ResolvedAttachment::Omitted(format!(
+                        "[image omitted: {} (sent earlier)]",
+                        attachment.path.display()
+                    ));
+                }
+                match self.attachments_dir.and_then(|dir| crate::attachment::read_base64(dir, attachment)) {
+                    Some(data_base64) => {
+                        ResolvedAttachment::Image(ImageData { media_type: attachment.media_type.clone(), data_base64 })
+                    }
+                    None => ResolvedAttachment::Omitted(format!(
+                        "[image: {}, {}×{} (no longer available)]",
+                        attachment.path.display(),
+                        attachment.width,
+                        attachment.height
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether any message in the request carries an attachment that will be
+    /// sent as an image (used by GitHub Copilot to set its vision header).
+    pub fn has_images(&self) -> bool {
+        let sendable = self.sendable();
+        if sendable.is_empty() {
+            return false;
+        }
+        self.messages.iter().flat_map(|m| m.attachments.iter()).any(|a| sendable.contains(a.sha256.as_str()))
+    }
+}
+
+/// An image's wire bytes: its (post-downscale) media type and base64 data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+/// How one attachment appears in a request: as image data, or as a text
+/// placeholder (omitted past the model's image limit, or missing on resume).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAttachment {
+    Image(ImageData),
+    Omitted(String),
+}
+
+impl<'a> ChatRequest<'a> {
+    /// A request over `messages` with no tools, temperature, output cap,
+    /// thinking or vision — the common test fixture. Field updates use struct
+    /// update syntax (`ChatRequest { max_tokens: Some(1), ..test_request(&m) }`).
+    #[cfg(test)]
+    pub fn test_request(messages: &'a [Message]) -> Self {
+        ChatRequest {
+            messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        }
+    }
 }
 
 /// Incremental output while a response streams in.
@@ -354,6 +499,14 @@ pub trait LLMClient: Send + Sync {
     }
     /// The thinking levels the endpoint reports for the current model, if any.
     async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        None
+    }
+    /// The vision capability the endpoint reports for the current model, if
+    /// any. `None` means "no report" (the built-in assumption / config override
+    /// then decides), not "cannot see" — a provider that knows the model is
+    /// blind reports `Some` with `max_images == 0` is not used; blindness is
+    /// simply the absence of a capability.
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         None
     }
     /// The window and thinking levels the endpoint reports, probed together.
@@ -482,6 +635,113 @@ impl ThinkSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An attachment with a stable hash of `tag`, stored (when `dir` is set).
+    fn attachment(tag: &str, dir: Option<&std::path::Path>) -> Attachment {
+        let bytes = tag.as_bytes().to_vec();
+        let a = Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from(format!("/tmp/{tag}.png")),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        if let Some(dir) = dir {
+            crate::attachment::store(dir, &a, &bytes).unwrap();
+        }
+        a
+    }
+
+    fn vision(max_images: usize) -> crate::vision::Vision {
+        crate::vision::Vision {
+            max_images,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn attachments_round_trip_and_stay_off_plain_messages() {
+        let message = Message::tool_result("c1", "read_file", "image/png, 10×10, 5 B")
+            .with_attachments(vec![attachment("a", None)]);
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["attachments"][0]["media_type"], "image/png");
+        assert_eq!(json["attachments"][0]["width"], 10);
+        assert_eq!(serde_json::from_value::<Message>(json).unwrap(), message);
+        // A message with no attachments writes no `attachments` field, and a
+        // log from before attachments existed still loads.
+        let plain = serde_json::to_value(Message::assistant("hi")).unwrap();
+        assert!(plain.get("attachments").is_none());
+        assert_eq!(serde_json::from_value::<Message>(plain).unwrap(), Message::assistant("hi"));
+    }
+
+    #[test]
+    fn resolves_newest_n_images_and_omits_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) =
+            (attachment("a", Some(dir.path())), attachment("b", Some(dir.path())), attachment("c", Some(dir.path())));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "first").with_attachments(vec![a.clone()]),
+            Message::tool_result("t2", "read_file", "second").with_attachments(vec![b.clone()]),
+            Message::tool_result("t3", "read_file", "third").with_attachments(vec![c.clone()]),
+        ];
+        // A model capped at one image sends only the newest (c); a and b are omitted.
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(
+            request.resolve_attachments(&messages[0])[0],
+            ResolvedAttachment::Omitted(ref t) if t.contains("omitted") && t.contains("a.png")
+        ));
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Omitted(_)));
+        assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+        assert!(request.has_images());
+
+        // Two images: b and c are sent, a is omitted.
+        let request = ChatRequest {
+            vision: Some(vision(2)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
+        assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn missing_attachment_file_becomes_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reference an image whose file was never written (e.g. deleted before resume).
+        let missing = attachment("gone", None);
+        let messages = vec![Message::tool_result("t1", "read_file", "saw it").with_attachments(vec![missing])];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        match &request.resolve_attachments(&messages[0])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("gone.png"), "{text}");
+                assert!(text.contains("no longer available"), "{text}");
+            }
+            other => panic!("missing file should be a placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_vision_sends_no_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "x").with_attachments(vec![attachment("a", Some(dir.path()))]),
+        ];
+        let request = ChatRequest { attachments_dir: Some(dir.path()), ..ChatRequest::test_request(&messages) };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(!request.has_images());
+    }
 
     #[test]
     fn trajectory_fields_round_trip_and_stay_out_of_plain_messages() {

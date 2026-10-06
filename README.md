@@ -672,6 +672,39 @@ reaches the wire. The status bar shows
 `/settings` sets it for the current model, its provider or all models (picking from the
 levels the model supports), and the session log records it for each reply.
 
+### Vision
+
+`read_file` returns images (PNG, JPEG, GIF and WebP, recognised by magic bytes) to
+models that can view them: the result is a short text part (`image/png, 1600×900, 131 KB`)
+plus an image attachment the model sees directly. Images over the provider's limits are
+downscaled first (longest side 1568 px, under the model's byte cap), and re-encoded to
+JPEG/PNG when the model doesn't accept the source type. Other binary files still return
+the "looks like a binary file" error, which notes whether the current model supports
+images.
+
+Whether a model can see images comes from, in order: a `vision = true|false` override
+(global, `[providers.<name>]`, or `[providers.<name>.models."<model>"]`, like `thinking`);
+what the endpoint reports (GitHub Copilot `/models` `capabilities.supports.vision` and its
+`limits.vision`, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
+`modalities.vision`); and a built-in assumption for current Anthropic and OpenAI model
+families. A model that can't see images gets the text error with a hint to switch models
+or set `vision = true`:
+
+```toml
+vision = true                            # all models
+
+[providers.ollama.models."my-clip-model"]
+vision = true                            # this model only
+```
+
+A request carries only the newest few images the model allows (GitHub Copilot's
+`max_prompt_images`, default 1); older ones become `[image omitted: path (sent earlier)]`.
+Each image counts toward the context estimate at a fixed cost from its size, so the status
+bar and auto-compaction stay honest, and compaction replaces images with the same
+placeholder. Images are stored once per session under `<session>.attachments/` (named by
+content hash), so session logs stay small and `--resume` still works; a missing file on
+resume is sent as a text placeholder.
+
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
 `retryable_statuses`.

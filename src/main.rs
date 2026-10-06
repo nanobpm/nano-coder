@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 mod acp;
 mod agent;
+mod attachment;
 mod bash;
 mod claude_hooks;
 mod commands;
@@ -48,6 +49,7 @@ mod thinking;
 mod tools;
 mod trajectory;
 mod ui;
+mod vision;
 
 use agent::Agent;
 use config::ConfigManager;

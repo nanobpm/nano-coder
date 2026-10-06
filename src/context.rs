@@ -148,6 +148,15 @@ pub fn format_tokens(tokens: usize) -> String {
     }
 }
 
+/// `131 KB`-style byte-size label.
+pub fn format_bytes(bytes: usize) -> String {
+    match bytes {
+        0..=1023 => format!("{bytes} B"),
+        1024..=1_048_575 => format!("{:.0} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
 /// Rough token count for text (about four characters per token).
 pub fn text_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
@@ -161,7 +170,17 @@ pub fn format_rate(tokens_per_sec: f64) -> String {
 pub fn message_tokens(message: &Message) -> usize {
     let calls: usize =
         message.tool_calls.iter().map(|c| text_tokens(&c.name) + text_tokens(&c.arguments.to_string()) + 4).sum();
-    text_tokens(&message.content) + calls + 4
+    let images: usize = message.attachments.iter().map(image_tokens).sum();
+    text_tokens(&message.content) + calls + images + 4
+}
+
+/// Fixed token cost estimate for one image, from its pixel dimensions
+/// (Anthropic's ~`w*h/750`, capped at ~1,600 tokens after the downscale
+/// `read_file` applies). Keeps the status bar and auto-compaction honest about
+/// what an image costs.
+pub fn image_tokens(attachment: &crate::llm::Attachment) -> usize {
+    let estimate = (attachment.width as usize * attachment.height as usize).div_ceil(750);
+    estimate.clamp(1, 1_600)
 }
 
 pub fn messages_tokens(messages: &[Message]) -> usize {
@@ -267,7 +286,13 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
             Role::Tool => {
                 let name = message.name.as_deref().unwrap_or("tool");
                 let label = if message.is_error { "failed" } else { "result" };
-                format!("TOOL {label} ({name}):\n{}", clip(&message.content, 2_000))
+                let mut block = format!("TOOL {label} ({name}):\n{}", clip(&message.content, 2_000));
+                // The summary request never includes images; render each as a
+                // placeholder so the transcript still notes it was seen.
+                for attachment in &message.attachments {
+                    block.push_str(&format!("\n{}", attachment.placeholder()));
+                }
+                block
             }
         };
         let block = match (ids, message.log_line) {

@@ -91,6 +91,9 @@ pub struct ProviderConfig {
     /// Thinking level for this provider's models: `"default"`, `"off"` or a
     /// level name. Overrides the top-level `thinking`.
     pub thinking: Option<crate::thinking::Thinking>,
+    /// Whether this provider's models can view images (`read_file` image
+    /// attachments). Overrides the top-level `vision` and endpoint detection.
+    pub vision: Option<bool>,
     /// Thinking levels this provider's models accept, overriding the built-in
     /// table (e.g. `["low", "high"]`; add `"off"` if thinking can be turned off).
     pub thinking_levels: Option<Vec<String>>,
@@ -135,6 +138,7 @@ impl ProviderConfig {
             replay_reasoning,
             temperature,
             thinking,
+            vision,
             thinking_levels
         );
         self.headers.extend(other.headers.clone());
@@ -145,6 +149,9 @@ impl ProviderConfig {
             }
             if settings.thinking.is_some() {
                 entry.thinking = settings.thinking.clone();
+            }
+            if settings.vision.is_some() {
+                entry.vision = settings.vision;
             }
             if settings.thinking_levels.is_some() {
                 entry.thinking_levels = settings.thinking_levels.clone();

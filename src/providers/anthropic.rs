@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{HttpTransport, ProviderKind, ResolvedProvider, StreamAction};
 use crate::llm::{
-    ChatRequest, LLMClient, LLMResponse, Message, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
+    ChatRequest, LLMClient, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole,
 };
 use crate::thinking::Request;
 
@@ -41,7 +41,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     let mut body = json!({
         "model": provider.model,
         "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-        "messages": encode_messages(request.messages),
+        "messages": encode_messages(request),
     });
     if !system.is_empty() {
         body["system"] = json!(system.join("\n\n"));
@@ -103,15 +103,19 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
 
 /// Encode messages as content blocks, merging consecutive same-role turns
 /// (tool results travel as `user` messages and must be grouped).
-fn encode_messages(messages: &[Message]) -> Vec<Value> {
+fn encode_messages(request: &ChatRequest<'_>) -> Vec<Value> {
+    let messages = request.messages;
     let mut encoded: Vec<(String, Vec<Value>)> = Vec::new();
     for message in messages {
         let (role, blocks) = match message.role {
             Role::System => continue,
             Role::User => ("user", vec![json!({"type": "text", "text": message.content})]),
-            Role::Tool => (
-                "user",
-                vec![{
+            Role::Tool => {
+                // A tool result with image attachments carries them as content
+                // blocks after the text: `{type:"image", source:{base64}}`.
+                // Omitted/missing attachments become a text placeholder.
+                let resolved = request.resolve_attachments(message);
+                let block = if resolved.is_empty() {
                     let mut block = json!({
                         "type": "tool_result",
                         "tool_use_id": message.tool_call_id,
@@ -121,8 +125,35 @@ fn encode_messages(messages: &[Message]) -> Vec<Value> {
                         block["is_error"] = json!(true);
                     }
                     block
-                }],
-            ),
+                } else {
+                    let mut content = vec![json!({"type": "text", "text": message.content})];
+                    for item in resolved {
+                        match item {
+                            crate::llm::ResolvedAttachment::Image(image) => content.push(json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": image.media_type,
+                                    "data": image.data_base64,
+                                },
+                            })),
+                            crate::llm::ResolvedAttachment::Omitted(text) => {
+                                content.push(json!({"type": "text", "text": text}))
+                            }
+                        }
+                    }
+                    let mut block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id,
+                        "content": content,
+                    });
+                    if message.is_error {
+                        block["is_error"] = json!(true);
+                    }
+                    block
+                };
+                ("user", vec![block])
+            }
             Role::Assistant => {
                 // Reasoning blocks must precede the text and tool use they led to.
                 // Blocks from other providers (e.g. OpenAI-style reasoning) are not replayable here.
@@ -426,6 +457,7 @@ impl LLMClient for AnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Message;
     use crate::providers::{ProviderConfig, resolve, test_server};
     use crate::tools::ToolDefinition;
     use std::collections::HashMap;
@@ -444,7 +476,12 @@ mod tests {
             ..Message::assistant("answer")
         };
         let plain = Message::assistant("answer");
-        assert_eq!(encode_messages(&[Message::user("q"), logged]), encode_messages(&[Message::user("q"), plain]));
+        let with_data = [Message::user("q"), logged];
+        let without_data = [Message::user("q"), plain];
+        assert_eq!(
+            encode_messages(&ChatRequest::test_request(&with_data)),
+            encode_messages(&ChatRequest::test_request(&without_data))
+        );
     }
 
     fn client(base_url: &str) -> AnthropicClient {
@@ -471,6 +508,8 @@ mod tests {
                 temperature: Some(0.5),
                 max_tokens,
                 thinking: Some(thinking),
+                vision: None,
+                attachments_dir: None,
             })
         };
         // Adaptive models: the level is an effort.
@@ -504,6 +543,8 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: None,
             thinking: Some(Request::AdaptiveOn),
+            vision: None,
+            attachments_dir: None,
         });
         assert_eq!(b["thinking"], json!({ "type": "adaptive" }));
         assert!(b.get("output_config").is_none(), "the override owns output_config: {b}");
@@ -539,6 +580,8 @@ mod tests {
             temperature: Some(1.5),
             max_tokens: None,
             thinking: None,
+            vision: None,
+            attachments_dir: None,
         });
         assert_eq!(body["system"], "be brief");
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -553,6 +596,68 @@ mod tests {
         assert_eq!(encoded[2]["role"], "user");
         assert_eq!(encoded[2]["content"].as_array().unwrap().len(), 2);
         assert_eq!(encoded[2]["content"][1]["tool_use_id"], "t2");
+    }
+
+    /// A stored image attachment on a tool-result message, with vision on.
+    fn image_request(dir: &std::path::Path) -> (Vec<Message>, crate::vision::Vision) {
+        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/diagram.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 1600,
+            height: 900,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir, &attachment, &bytes).unwrap();
+        let messages = vec![
+            Message::user("what does this diagram show?"),
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/tmp/diagram.png"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
+            ),
+            Message::tool_result("t1", "read_file", "image/png, 1600×900, 131 KB").with_attachments(vec![attachment]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 5,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        (messages, vision)
+    }
+
+    #[test]
+    fn tool_result_carries_image_as_base64_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (messages, vision) = image_request(dir.path());
+        let body = client("http://x").build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        });
+        let encoded = body["messages"].as_array().unwrap();
+        // The tool result block's content is text + image blocks.
+        let tool_result = &encoded[2]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "t1");
+        let content = tool_result["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type": "text", "text": "image/png, 1600×900, 131 KB"}));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG\r\n\x1a\nfakepng");
+        assert_eq!(content[1]["source"]["data"], json!(expected));
     }
 
     #[tokio::test]
@@ -583,6 +688,8 @@ mod tests {
                 temperature: None,
                 max_tokens: Some(64),
                 thinking: None,
+                vision: None,
+                attachments_dir: None,
             })
             .await
             .unwrap();
@@ -654,6 +761,8 @@ mod tests {
                     temperature: None,
                     max_tokens: Some(64),
                     thinking: None,
+                    vision: None,
+                    attachments_dir: None,
                 },
                 &sink,
             )
@@ -673,7 +782,7 @@ mod tests {
             thinking_blocks: response.thinking_blocks.clone(),
             ..Message::assistant_with_tools(&response.content, response.tool_calls.clone())
         };
-        let encoded = encode_messages(&[Message::user("hello"), assistant]);
+        let encoded = encode_messages(&ChatRequest::test_request(&[Message::user("hello"), assistant]));
         assert_eq!(encoded[1]["content"][0], json!({"type": "thinking", "thinking": "Plan.", "signature": "sig"}));
         assert_eq!(encoded[1]["content"][1]["type"], "text");
     }
@@ -713,7 +822,7 @@ mod tests {
             thinking_blocks: vec![json!({"type": "reasoning_content", "text": "from kimi"})],
             ..Message::assistant("hi")
         };
-        let encoded = encode_messages(&[Message::user("hello"), assistant]);
+        let encoded = encode_messages(&ChatRequest::test_request(&[Message::user("hello"), assistant]));
         assert_eq!(encoded[1]["content"], json!([{"type": "text", "text": "hi"}]));
     }
 
@@ -763,6 +872,8 @@ mod tests {
                     temperature: None,
                     max_tokens: Some(64),
                     thinking: None,
+                    vision: None,
+                    attachments_dir: None,
                 },
                 &sink,
             )

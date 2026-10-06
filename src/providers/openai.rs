@@ -31,7 +31,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     let provider = transport.provider();
     let mut body = json!({
         "model": provider.model,
-        "messages": request.messages.iter().map(|m| encode_message(m, provider.replay_reasoning)).collect::<Vec<_>>(),
+        "messages": encode_messages(request, provider.replay_reasoning),
     });
     if !request.tools.is_empty() {
         body["tools"] = request
@@ -67,6 +67,63 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
         Some(Request::Budget(_) | Request::AdaptiveOn) | None => {}
     }
     transport.finish_body(body)
+}
+
+/// Encode the conversation as Chat Completions messages. `tool` messages carry
+/// only text, so a tool result's images are sent in a `user` message right
+/// after the run of tool results they belong to (as `{type:"image_url"}`
+/// parts); the tool message notes the attachment follows. Omitted or missing
+/// attachments become a text placeholder appended to the tool message.
+fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    // Image parts collected from the current run of tool messages, flushed into
+    // one user message when the run ends.
+    let mut pending_images: Vec<crate::llm::ImageData> = Vec::new();
+    let flush = |out: &mut Vec<Value>, pending: &mut Vec<crate::llm::ImageData>| {
+        if pending.is_empty() {
+            return;
+        }
+        let mut content: Vec<Value> = vec![json!({"type": "text", "text": "[image attached in the next message]"})];
+        for image in pending.drain(..) {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", image.media_type, image.data_base64) },
+            }));
+        }
+        out.push(json!({ "role": "user", "content": content }));
+    };
+    for message in request.messages {
+        if message.role != Role::Tool {
+            flush(&mut out, &mut pending_images);
+        }
+        if message.role == Role::Tool && !message.attachments.is_empty() {
+            let mut content = message.content.clone();
+            for item in request.resolve_attachments(message) {
+                match item {
+                    crate::llm::ResolvedAttachment::Image(image) => pending_images.push(image),
+                    crate::llm::ResolvedAttachment::Omitted(text) => {
+                        content.push('\n');
+                        content.push_str(&text);
+                    }
+                }
+            }
+            let mut encoded = json!({
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": content,
+            });
+            if !pending_images.is_empty() {
+                // Note on the tool message that its image follows, so the text
+                // alone still reads coherently.
+                encoded["content"] = json!(format!("{content}\n[image attached in the next message]"));
+            }
+            out.push(encoded);
+            continue;
+        }
+        out.push(encode_message(message, replay_reasoning));
+    }
+    flush(&mut out, &mut pending_images);
+    out
 }
 
 fn encode_message(message: &Message, replay_reasoning: bool) -> Value {
@@ -386,6 +443,10 @@ impl LLMClient for OpenAiClient {
         detect_thinking(&self.transport).await
     }
 
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
+        detect_vision(&self.transport).await
+    }
+
     async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
         detect_capabilities(&self.transport).await
     }
@@ -584,6 +645,32 @@ pub(crate) async fn detect_capabilities(
     }
 }
 
+/// Probe the endpoint for the loaded model's vision capability: llama.cpp
+/// `/props` (`modalities.vision`) or Ollama `/api/show` (the `vision`
+/// capability). Other OpenAI-compatible servers report nothing here; the
+/// built-in assumption or a config override decides for them.
+pub(crate) async fn detect_vision(transport: &HttpTransport) -> Option<crate::vision::Vision> {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    match identify(&provider.name, root, entry) {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            let props = probe(transport, reqwest::Method::GET, &url, None).await?;
+            crate::vision::Vision::from_llamacpp_props(&props)
+        }
+        Server::Ollama => {
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await?;
+            crate::vision::Vision::from_ollama_show(&show)
+        }
+        Server::LmStudio | Server::Other => None,
+    }
+}
+
 /// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from the
 /// model's parameters. The model's maximum (`model_info`) is not used: Ollama
 /// runs with a smaller default unless `num_ctx` says otherwise. Returns the
@@ -716,8 +803,15 @@ mod tests {
     #[test]
     fn encodes_thinking_levels_and_lets_extra_body_win() {
         let messages = [Message::user("q")];
-        let request =
-            |thinking| ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking };
+        let request = |thinking| ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking,
+            vision: None,
+            attachments_dir: None,
+        };
         let client = OpenAiClient::new(provider("http://x", "")).unwrap();
         assert_eq!(client.build_body(&request(Some(Request::Effort("high".into()))))["reasoning_effort"], "high");
         assert_eq!(client.build_body(&request(Some(Request::Off)))["reasoning_effort"], "none");
@@ -732,6 +826,64 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
         let body = client.build_body(&request(Some(Request::TemplateEffort("high".into()))));
         assert_eq!(body["chat_template_kwargs"], json!({ "reasoning_effort": "high" }));
+    }
+
+    #[test]
+    fn tool_result_image_goes_in_a_followup_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/plot.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 800,
+            height: 600,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &attachment, &bytes).unwrap();
+        let messages = vec![
+            Message::user("look at the plot"),
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/tmp/plot.png"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
+            ),
+            Message::tool_result("c1", "read_file", "image/png, 800×600, 50 KB").with_attachments(vec![attachment]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        let body = client.build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        });
+        let encoded = body["messages"].as_array().unwrap();
+        // user, assistant, tool (text + a note), then a user message with the image.
+        assert_eq!(encoded.len(), 4);
+        assert_eq!(encoded[2]["role"], "tool");
+        assert!(encoded[2]["content"].as_str().unwrap().contains("[image attached in the next message]"));
+        assert_eq!(encoded[3]["role"], "user");
+        let parts = encoded[3]["content"].as_array().unwrap();
+        assert_eq!(parts[1]["type"], "image_url");
+        let expected = format!(
+            "data:image/png;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+        );
+        assert_eq!(parts[1]["image_url"]["url"], json!(expected));
     }
 
     #[test]
@@ -781,6 +933,8 @@ mod tests {
             temperature: Some(0.2),
             max_tokens: Some(100),
             thinking: None,
+            vision: None,
+            attachments_dir: None,
         });
         assert_eq!(body["model"], "some-model");
         assert_eq!(body["think"], false);
@@ -861,7 +1015,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "hi");
@@ -880,7 +1042,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let response = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap();
         assert_eq!(response.content, "whole");
@@ -929,7 +1099,15 @@ mod tests {
         let sink = |_e: StreamEvent<'_>| {};
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -967,7 +1145,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1002,7 +1188,15 @@ mod tests {
         };
         let result = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await;
@@ -1047,7 +1241,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1074,7 +1276,15 @@ mod tests {
         let client = OpenAiClient::new(provider(&url, "")).unwrap();
         let messages = [Message::user("hello")];
         let err = client
-            .chat(&ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None })
+            .chat(&ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: None,
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("invalid_api_key"), "{err:#}");
@@ -1105,7 +1315,15 @@ mod tests {
         };
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &sink,
             )
             .await
@@ -1144,8 +1362,15 @@ mod tests {
         resolved.replay_reasoning = true;
         let client = OpenAiClient::new(resolved.clone()).unwrap();
         let messages = [Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let response = client.chat_stream(&request, &|_| {}).await.unwrap();
         // Only the provider's reasoning field is replayed, not inline <think> text.
         assert_eq!(response.thinking_blocks, vec![json!({"type": "reasoning_content", "text": "Need ls."})]);
@@ -1163,8 +1388,15 @@ mod tests {
                 ..Message::assistant("done")
             },
         ];
-        let request =
-            ChatRequest { messages: &history, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &history,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let body = client.build_body(&request);
         assert_eq!(body["messages"][1]["reasoning_content"], "Need ls.");
         assert!(body["messages"][2].get("reasoning_content").is_none(), "Anthropic blocks are not replayed");
@@ -1182,7 +1414,15 @@ mod tests {
         let messages = [Message::user("hello")];
         let response = client
             .chat_stream(
-                &ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None },
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
                 &|_| {},
             )
             .await

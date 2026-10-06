@@ -465,6 +465,9 @@ impl LLMClient for GithubCopilotClient {
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
+        // Tell Copilot this request carries an image so it routes to the
+        // vision path (only when one is actually sent).
+        let vision = request.has_images();
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;
@@ -476,6 +479,7 @@ impl LLMClient for GithubCopilotClient {
                         .bearer_auth(&session.token)
                         .header("X-Initiator", initiator)
                         .header("Openai-Intent", "conversation-edits");
+                    let builder = if vision { builder.header("Copilot-Vision-Request", "true") } else { builder };
                     match api {
                         CopilotApi::Messages => builder.header("anthropic-version", ANTHROPIC_VERSION),
                         _ => builder,
@@ -519,6 +523,7 @@ impl LLMClient for GithubCopilotClient {
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
+        let vision = request.has_images();
         let mut force_refresh = false;
         loop {
             let session = self.session_token(force_refresh).await?;
@@ -528,6 +533,7 @@ impl LLMClient for GithubCopilotClient {
                     .bearer_auth(&session.token)
                     .header("X-Initiator", initiator)
                     .header("Openai-Intent", "conversation-edits");
+                let builder = if vision { builder.header("Copilot-Vision-Request", "true") } else { builder };
                 match api {
                     CopilotApi::Messages => builder.header("anthropic-version", ANTHROPIC_VERSION),
                     _ => builder,
@@ -591,6 +597,16 @@ impl LLMClient for GithubCopilotClient {
         // Bounded like the window probe.
         tokio::time::timeout(PROBE_TIMEOUT, async {
             crate::thinking::Reported::from_model_entry(&self.model_entry(PROBE_TIMEOUT).await?)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
+        // Bounded like the window probe; reads the same cached `/models` entry.
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            crate::vision::Vision::from_model_entry(&self.model_entry(PROBE_TIMEOUT).await?)
         })
         .await
         .ok()
@@ -776,8 +792,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/chat/completions");
@@ -792,8 +815,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         assert_eq!(client.chat(&request).await.unwrap().content, "pong");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/responses");
@@ -817,8 +847,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         assert_eq!(client.chat(&request).await.unwrap().content, "bonjour");
         let api_log = api_log.lock().unwrap();
         assert_eq!(api_log[0].path, "/v1/messages");
@@ -831,6 +868,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sends_vision_header_when_request_carries_an_image() {
+        let ok = json!({
+            "content": [{ "type": "text", "text": "a diagram" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 4, "output_tokens": 2 }
+        })
+        .to_string();
+        let (api, api_log) = test_server::serve(vec![(200, "", ok)]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client_model(&auth, "claude-sonnet-4.5");
+        // A tool result carrying a stored image attachment.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/d.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 100,
+            height: 100,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &attachment, &bytes).unwrap();
+        let vision = crate::vision::Vision {
+            max_images: 1,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let with_image =
+            vec![Message::tool_result("t1", "read_file", "image/png, 100×100, 8 B").with_attachments(vec![attachment])];
+        let request = ChatRequest {
+            messages: &with_image,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        };
+        client.chat(&request).await.unwrap();
+        let headers = api_log.lock().unwrap()[0].headers.to_lowercase();
+        assert!(headers.contains("copilot-vision-request: true"), "vision header set: {headers}");
+
+        // Without an image the header is absent.
+        let (api2, api_log2) = test_server::serve(vec![(
+            200,
+            "",
+            json!({
+                "content": [{ "type": "text", "text": "hi" }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })
+            .to_string(),
+        )])
+        .await;
+        let (auth2, _) = test_server::serve(vec![(200, "", token_body(&api2, "sess-2"))]).await;
+        let client2 = client_model(&auth2, "claude-sonnet-4.5");
+        let plain = vec![Message::user("hi")];
+        let request = ChatRequest {
+            messages: &plain,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        client2.chat(&request).await.unwrap();
+        let headers = api_log2.lock().unwrap()[0].headers.to_lowercase();
+        assert!(!headers.contains("copilot-vision-request"), "no image, no vision header: {headers}");
+    }
+
+    #[tokio::test]
     async fn stream_routes_completions_model_to_chat_completions() {
         let sse = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -840,8 +950,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "o4-mini");
         let messages = vec![Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -869,8 +986,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "gpt-6-astra");
         let messages = vec![Message::user("ping")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -903,8 +1027,15 @@ mod tests {
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client_model(&auth, "claude-sonnet-4.5");
         let messages = vec![Message::system("be brief"), Message::user("hi")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: Some(64), thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: Some(64),
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let seen = std::sync::Mutex::new(String::new());
         let sink = |event: StreamEvent<'_>| {
             if let StreamEvent::Text(t) = event {
@@ -940,8 +1071,15 @@ mod tests {
         let client = client(&auth);
 
         let messages = vec![Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let followup = vec![
             Message::user("hello"),
@@ -957,8 +1095,15 @@ mod tests {
             ),
             Message::tool_result("c", "t", "ok"),
         ];
-        let request =
-            ChatRequest { messages: &followup, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &followup,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         client.chat(&request).await.unwrap();
 
         let auth_log = auth_log.lock().unwrap();
@@ -987,8 +1132,15 @@ mod tests {
                 .await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         assert_eq!(auth_log.lock().unwrap().len(), 2);
         assert!(api_log.lock().unwrap()[1].headers.to_lowercase().contains("bearer sess-2"));
@@ -999,8 +1151,15 @@ mod tests {
         let (auth, _) = test_server::serve(vec![(404, "", r#"{"message":"Not Found"}"#.into())]).await;
         let client = client(&auth);
         let messages = vec![Message::user("hello")];
-        let request =
-            ChatRequest { messages: &messages, tools: &[], temperature: None, max_tokens: None, thinking: None };
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
         let err = format!("{:#}", client.chat(&request).await.unwrap_err());
         assert!(err.contains("--login github-copilot"), "{err}");
     }
