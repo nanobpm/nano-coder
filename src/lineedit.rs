@@ -29,22 +29,45 @@ pub const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_
 /// completing the old one, so an Esc used alone (readline/vi line-editing) does
 /// not half-trigger the gesture. Callers decide on the press that *completes*
 /// the pair, never on the first one.
+///
+/// A pair is also scoped to a single uninterrupted idle-prompt session: each
+/// armed press records the edit *generation* it was made in (see
+/// [`EditView::edit_generation`]), and a later press only completes the pair
+/// when the generation still matches. The reader is persistent and a single
+/// `read_line` stays outstanding across a Prompt→Turn→Prompt transition (an Esc
+/// is forwarded to the turn loop without returning), so a time-only pair could
+/// otherwise let one arm made before a turn complete with one Esc at the next
+/// prompt. The generation changes on every mode transition, invalidating such a
+/// stale arm even though the gesture's own `read_line` never reset it.
 #[derive(Default)]
 pub struct DoubleEscape {
-    last: Option<std::time::Instant>,
+    last: Option<(std::time::Instant, u64)>,
 }
 
 impl DoubleEscape {
-    /// Record a press at `now`; true when it completes a double press. The pair
-    /// is consumed, so the next press starts a fresh one.
-    pub fn press(&mut self, now: std::time::Instant) -> bool {
+    /// Record a press at `now` in edit generation `generation`; true when it
+    /// completes a double press. A press completes the pair only when the prior
+    /// arm is within [`DOUBLE_ESCAPE_WINDOW`] *and* was made in the same
+    /// generation, so a mode transition between the two presses starts a fresh
+    /// pair. The pair is consumed, so the next press starts a fresh one.
+    pub fn press_in(&mut self, now: std::time::Instant, generation: u64) -> bool {
         match self.last.take() {
-            Some(last) if now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => true,
+            Some((last, armed_gen)) if armed_gen == generation && now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => {
+                true
+            }
             _ => {
-                self.last = Some(now);
+                self.last = Some((now, generation));
                 false
             }
         }
+    }
+
+    /// Record a press at `now`; true when it completes a double press. For
+    /// detectors that are not scoped to an edit generation (e.g. the turn-loop
+    /// cancel and the Ctrl-C exit gesture), which live for a single purpose and
+    /// never cross a prompt/turn boundary.
+    pub fn press(&mut self, now: std::time::Instant) -> bool {
+        self.press_in(now, 0)
     }
 
     /// Forget any armed press, so the next one starts a fresh pair. Used at a
@@ -109,6 +132,11 @@ pub struct EditView {
     /// Cursor position as a character index into `line` (0..=chars).
     cursor: usize,
     mode: EditMode,
+    /// Bumped on every mode transition. The double-Esc detector records the
+    /// generation an Esc armed in, so an arm cannot survive a Prompt↔Turn
+    /// transition and complete at the next prompt: a pair must be two presses
+    /// at the same uninterrupted idle prompt.
+    edit_generation: u64,
     status: Option<Arc<StatusLine>>,
     /// Rows below the prompt used by the command menu.
     menu_rows: usize,
@@ -162,6 +190,7 @@ impl EditView {
             line: String::new(),
             cursor: 0,
             mode: EditMode::Prompt,
+            edit_generation: 0,
             status,
             menu_rows: 0,
             menu_hidden: false,
@@ -237,6 +266,12 @@ impl EditView {
     }
 
     pub fn set_mode(&mut self, mode: EditMode) {
+        if mode != self.mode {
+            // A pair of Esc presses is scoped to one uninterrupted idle prompt;
+            // bumping the generation on every transition invalidates any arm
+            // made before this change so it cannot complete after it.
+            self.edit_generation = self.edit_generation.wrapping_add(1);
+        }
         self.mode = mode;
         if self.on_edit.is_some() {
             // The frame renderer owns the screen: refresh through the hook
@@ -1220,12 +1255,19 @@ impl LineReader {
     /// press must neither clear the text nor *arm* the detector. Arming on a
     /// turn-time press would let one Esc at the next idle prompt complete the
     /// pair and clear the buffer, when the gesture requires two presses there.
+    ///
+    /// The pair is also scoped to one *uninterrupted* idle prompt: the reader
+    /// is persistent and a single `read_line` stays outstanding across a
+    /// Prompt→Turn→Prompt transition (an Esc is forwarded without returning),
+    /// so the arm is tagged with the view's edit generation and only completes
+    /// while that generation is unchanged. An intervening turn bumps it, so an
+    /// arm made before the turn cannot complete with one Esc at the next prompt.
     pub fn escape_press(&mut self, view: &SharedView, now: std::time::Instant) -> bool {
         let mut view = view.lock().unwrap();
         if view.mode != EditMode::Prompt {
             return false;
         }
-        if !self.escape.press(now) {
+        if !self.escape.press_in(now, view.edit_generation) {
             return false;
         }
         view.clear_input_if_any()
@@ -1607,6 +1649,7 @@ mod tests {
             line: line.into(),
             cursor: line.chars().count(),
             mode: EditMode::Turn,
+            edit_generation: 0,
             status: None,
             menu_rows: 0,
             menu_hidden: false,
@@ -2561,6 +2604,32 @@ mod tests {
         );
         assert_eq!(view.lock().unwrap().line, "next message", "one idle Esc keeps the text");
         assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two idle Esc presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn an_arm_does_not_survive_an_intervening_turn() {
+        // The reader is persistent and a single `read_line` stays outstanding
+        // across a Prompt→Turn→Prompt transition (an Esc is forwarded to the
+        // turn loop without returning), so `read_line`'s own reset never runs.
+        // An Esc armed at the idle prompt must not pair with one Esc at the
+        // *next* prompt after a turn ran in between: `set_mode` bumps the edit
+        // generation, invalidating the stale arm.
+        let (mut reader, view) = prompt_reader("draft");
+        let t = std::time::Instant::now();
+        // Arm at the idle prompt.
+        assert!(!reader.escape_press(&view, t), "the first Esc only arms");
+        // A queued turn runs on the same outstanding read, then we return to
+        // the prompt — within the double-Esc window.
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "one Esc after the turn must not complete the pre-turn arm"
+        );
+        assert_eq!(view.lock().unwrap().line, "draft", "the draft survives one post-turn Esc");
+        // Two fresh presses at the same prompt still clear.
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two presses clear");
         assert!(view.lock().unwrap().line.is_empty());
     }
 
