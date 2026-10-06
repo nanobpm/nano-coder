@@ -56,7 +56,11 @@ pub enum Output {
 /// borrows it. None of it changes during a turn.
 #[derive(Debug, Default, Clone)]
 pub struct Snapshot {
-    tools: String,
+    /// The mode-independent tool definitions, captured unfiltered. `/tools`
+    /// filters them by the *live* mode at render time (see
+    /// [`Snapshot::tools`]) so a `/mode` change mid-turn is reflected in the
+    /// next listing instead of showing the turn-start mode's tools.
+    tools: Vec<crate::tools::ToolDefinition>,
     skills: String,
     /// The effective provider configs and the default provider's name. The
     /// `/providers` listing is rendered from these on demand (see
@@ -77,10 +81,10 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn capture(agent: &Agent) -> Self {
-        let mut tools = vec!["Available tools:".to_string()];
-        for def in agent.tool_definitions() {
-            tools.push(format!("  {} - {}", def.name, def.description));
-        }
+        // Captured unfiltered: `Agent::tool_definitions()` already applies the
+        // current mode's filter, but the mode can change mid-turn, so `/tools`
+        // re-filters these by the live mode when it renders.
+        let tools = agent.tool_definitions();
 
         let found = agent.skills();
         let mut skills: Vec<String> = Vec::new();
@@ -107,7 +111,7 @@ impl Snapshot {
         };
 
         Self {
-            tools: tools.join("\n"),
+            tools,
             skills: skills.join("\n"),
             providers,
             default_provider,
@@ -127,7 +131,7 @@ impl Snapshot {
         let block = |text: String| Some(Output::Block(text));
         match cmd {
             "/help" => block(crate::commands::help_text()),
-            "/tools" => block(self.tools.clone()),
+            "/tools" => block(self.tools(stats.mode)),
             "/skills" => block(self.skills.clone()),
             "/providers" => block(self.providers()),
             "/session" => block(self.session.clone()),
@@ -156,6 +160,21 @@ impl Snapshot {
             }
             _ => None,
         }
+    }
+
+    /// The `/tools` listing, rendered from the captured definitions but
+    /// filtered by the *live* mode: a `/mode` change mid-turn takes effect on
+    /// the agent's next step, so the listing must reflect the mode that step
+    /// will actually run under, not the mode the snapshot was captured in.
+    fn tools(&self, mode: crate::mode::AgentMode) -> String {
+        let mut out = vec!["Available tools:".to_string()];
+        for def in &self.tools {
+            if mode == crate::mode::AgentMode::Plan && !crate::mode::plan_allows(&def.name) {
+                continue;
+            }
+            out.push(format!("  {} - {}", def.name, def.description));
+        }
+        out.join("\n")
     }
 
     /// The `/providers` listing, rendered on demand: `settings::key_status`
@@ -319,5 +338,29 @@ mod tests {
             };
             assert!(note.contains("Session persistence is disabled"), "{note}");
         }
+    }
+
+    #[test]
+    fn tools_listing_follows_the_live_mode() {
+        // One allowed and one mutating tool: the captured definitions are
+        // mode-independent, so the listing is filtered by the mode in force
+        // when `/tools` runs, not the mode at snapshot capture.
+        let snapshot = Snapshot {
+            tools: vec![
+                crate::tools::ToolDefinition::new("read_file", "read a file", serde_json::json!({})),
+                crate::tools::ToolDefinition::new("edit_file", "edit a file", serde_json::json!({})),
+            ],
+            ..Default::default()
+        };
+        let normal = ContextStats { mode: AgentMode::Normal, ..Default::default() };
+        let plan = ContextStats { mode: AgentMode::Plan, ..Default::default() };
+
+        let Some(Output::Block(all)) = snapshot.output("/tools", &normal, &Plan::default()) else { panic!() };
+        assert!(all.contains("read_file"), "{all}");
+        assert!(all.contains("edit_file"), "{all}");
+
+        let Some(Output::Block(filtered)) = snapshot.output("/tools", &plan, &Plan::default()) else { panic!() };
+        assert!(filtered.contains("read_file"), "{filtered}");
+        assert!(!filtered.contains("edit_file"), "{filtered}");
     }
 }

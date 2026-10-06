@@ -176,6 +176,11 @@ struct State {
     stream_pad: usize,
     /// Notes held back until the streamed line they would interrupt ends.
     deferred: Vec<String>,
+    /// Raw payloads (e.g. `/trajectory --json`) held back until the streamed
+    /// line they would interrupt ends. Kept separate from `deferred` because
+    /// these are emitted verbatim — no stamp, no DIM — so the export stays
+    /// byte-exact.
+    deferred_raw: Vec<String>,
 }
 
 pub struct Renderer {
@@ -190,9 +195,9 @@ pub struct Renderer {
     /// level loses the suppressed deltas. The frame renderer reconciles the
     /// final `AssistantMessage` in place regardless; the legacy renderer, which
     /// streams straight to the terminal and can't retract, uses this flag to
-    /// reprint the authoritative full response at turn end. Seeded at
-    /// `begin_turn` from the starting level and raised by a mid-turn switch to
-    /// `quiet`.
+    /// reprint the authoritative full response at turn end. Reset at
+    /// `begin_turn`, then raised the moment a non-empty answer delta is
+    /// actually suppressed while quiet (and by a mid-turn switch to `quiet`).
     touched_quiet: AtomicBool,
     /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
     /// terminal. When set, all output is composed into one frame (transcript,
@@ -530,6 +535,28 @@ impl Renderer {
         }
     }
 
+    /// Raw output of a command run while a turn is streaming (e.g.
+    /// `/trajectory --json`). The frame renderer emits it verbatim via
+    /// `print_raw`. The legacy renderer must not route it through `note` —
+    /// that would prepend a timestamp and wrap it in DIM/reset escapes,
+    /// corrupting JSON and Markdown — but it also can't print it straight away
+    /// without landing in the middle of a half-streamed line. So it is held
+    /// back (like a deferred note) and emitted verbatim once the streamed line
+    /// ends at `end_turn`, keeping the payload byte-exact.
+    pub fn turn_raw(&self, text: &str) {
+        if self.frame.is_some() {
+            self.print_raw(text);
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.streamed_text && !state.at_line_start {
+            state.deferred_raw.push(text.to_string());
+            return;
+        }
+        drop(state);
+        self.print_raw(text);
+    }
+
     pub fn print_block(&self, text: &str) {
         if let Some(frame) = &self.frame {
             let mut fs = frame.lock().unwrap();
@@ -650,9 +677,12 @@ impl Renderer {
     pub fn begin_turn(&self) {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
-        // Seed the truncation guard from the starting level (see the field):
-        // a turn that begins quiet has already suppressed any streamed deltas.
-        self.touched_quiet.store(verbosity() == Verbosity::Quiet, Ordering::Relaxed);
+        // Reset the truncation guard: it is raised only when a non-empty answer
+        // delta is *actually* suppressed while quiet (see the quiet gate in
+        // `event`), not merely because the turn starts quiet — a quiet turn
+        // whose answer streams normally after a switch to a louder level must
+        // not be reprinted.
+        self.touched_quiet.store(false, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         state.in_turn = true;
         state.at_line_start = true;
@@ -696,6 +726,12 @@ impl Renderer {
         self.newline(&mut state);
         for note in std::mem::take(&mut state.deferred) {
             self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
+        }
+        // Raw exports queued mid-turn go out verbatim (no stamp/DIM), each on
+        // its own line, so the payload stays byte-exact.
+        for raw in std::mem::take(&mut state.deferred_raw) {
+            self.out(&mut state, &raw);
+            self.out(&mut state, "\n");
         }
         state.in_turn = false;
         state.streamed_text = false;
@@ -782,6 +818,18 @@ impl Renderer {
             status.draw();
         }
         if verbosity() == Verbosity::Quiet {
+            // Mark the truncation guard only when a non-empty answer delta is
+            // actually suppressed here: those deltas never reach the terminal,
+            // so if the turn later ends at a louder level the live stream is
+            // incomplete and the legacy renderer reprints the full response.
+            // Merely being quiet (with no delta suppressed yet) must not set
+            // this — a turn that switches to a louder level before any delta
+            // streams its answer normally, and reprinting would duplicate it.
+            if let AgentEvent::TextDelta { text } = event
+                && !text.is_empty()
+            {
+                self.touched_quiet.store(true, Ordering::Relaxed);
+            }
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -1128,6 +1176,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Serializes tests that read or mutate the process-global verbosity
+    /// (`LEVEL`): the test harness runs them on separate threads, so two tests
+    /// setting different levels at once would race and flake. Acquired with
+    /// `verbosity_lock()`, which ignores poisoning so one panicking test does
+    /// not cascade a `PoisonError` failure into the others.
+    static VERBOSITY_LOCK: Mutex<()> = Mutex::new(());
+
+    fn verbosity_lock() -> std::sync::MutexGuard<'static, ()> {
+        VERBOSITY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     impl Renderer {
         /// Build a frame-mode renderer regardless of tty, for driving
         /// `frame_event` in tests. Rendering writes to stdout (captured by the
@@ -1151,6 +1210,21 @@ mod tests {
                     prompt_stamp: stamp(),
                     transient: None,
                 })),
+            })
+        }
+
+        /// Build a legacy (non-frame) renderer for driving the legacy `event`
+        /// path in tests. The truncation guard is a legacy-renderer concern:
+        /// the frame renderer reconciles the final `AssistantMessage` in place
+        /// and never consults `touched_quiet`.
+        fn legacy_for_test() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(State { at_line_start: true, ..Default::default() }),
+                status: None,
+                tty: true,
+                expanded: AtomicBool::new(false),
+                touched_quiet: AtomicBool::new(false),
+                frame: None,
             })
         }
 
@@ -1191,6 +1265,31 @@ mod tests {
     }
 
     #[test]
+    fn truncation_guard_tracks_suppressed_deltas_not_quiet_start() {
+        // A turn that merely *starts* quiet has not lost any answer yet: if the
+        // user switches to a louder level before any delta arrives, the answer
+        // streams in full and must NOT be reprinted. The guard is raised only
+        // once a non-empty delta is actually suppressed while quiet.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // No delta suppressed yet — only the quiet start. Switching to normal
+        // before any answer delta means the answer streams normally.
+        set_verbosity(Verbosity::Normal);
+        assert!(!r.answer_may_be_truncated(), "a quiet start with no suppressed delta must not flag truncation");
+
+        // A fresh turn that genuinely suppresses a non-empty delta while quiet
+        // IS flagged (the legacy renderer then reprints the full response).
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "hello" });
+        assert!(r.answer_may_be_truncated(), "a suppressed non-empty delta must flag truncation");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
     fn streamed_reasoning_then_text_emits_one_thinking_summary() {
         let r = Renderer::frame_for_test();
         // Reasoning streams as deltas, then the answer streams as text, then a
@@ -1219,6 +1318,10 @@ mod tests {
 
     #[test]
     fn user_message_event_is_recorded_in_frame_transcript() {
+        // Reads the process-global verbosity (a concurrent test setting `quiet`
+        // would make `event` drop the message), so serialize against those.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
         let r = Renderer::frame_for_test();
         // Replaying a resumed session (and mid-turn steer messages) surface as
         // `UserMessage` events; they must land in the transcript.
