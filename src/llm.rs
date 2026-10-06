@@ -355,16 +355,28 @@ pub struct ChatRequest<'a> {
 }
 
 impl ChatRequest<'_> {
+    /// Whether an attachment's stored bytes are still on disk (and so can be
+    /// sent as an image). A reference with no attachments dir, or whose file was
+    /// deleted before a resume, is unavailable and resolves to a placeholder.
+    fn attachment_available(&self, attachment: &crate::llm::Attachment) -> bool {
+        self.attachments_dir.map(|dir| crate::attachment::exists(dir, attachment)).unwrap_or(false)
+    }
+
     /// The attachment *occurrences* this request sends as images: the newest
-    /// `vision.max_images` across the conversation (every older one is omitted,
-    /// its message showing a placeholder instead). Identified by occurrence, not
-    /// content hash, so reading the same image twice does not make *both* copies
-    /// sendable and overflow a model's image limit — a model capped at one image
-    /// keeps only the newest occurrence even when an older message repeats its
-    /// SHA. An empty set (no vision, or `max_images == 0`) sends none.
+    /// `vision.max_images` *available* occurrences across the conversation (every
+    /// older one is omitted, its message showing a placeholder instead).
+    /// Identified by occurrence, not content hash, so reading the same image
+    /// twice does not make *both* copies sendable and overflow a model's image
+    /// limit — a model capped at one image keeps only the newest occurrence even
+    /// when an older message repeats its SHA. Unavailable references (missing on
+    /// resume) are excluded from the quota so a deleted newest image does not
+    /// consume a slot an older available image could have used; each still
+    /// resolves to its own "no longer available" placeholder. An empty set (no
+    /// vision, or `max_images == 0`) sends none.
     fn sendable(&self) -> std::collections::HashSet<*const crate::llm::Attachment> {
         let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
-        let mut all: Vec<&crate::llm::Attachment> = self.messages.iter().flat_map(|m| m.attachments.iter()).collect();
+        let mut all: Vec<&crate::llm::Attachment> =
+            self.messages.iter().flat_map(|m| m.attachments.iter()).filter(|a| self.attachment_available(a)).collect();
         // Keep the newest `max`: drop the oldest excess from the front.
         let keep = max.min(all.len());
         let drop = all.len() - keep;
@@ -384,22 +396,34 @@ impl ChatRequest<'_> {
             .attachments
             .iter()
             .map(|attachment| {
-                if !sendable.contains(&(attachment as *const crate::llm::Attachment)) {
-                    return ResolvedAttachment::Omitted(format!(
+                if sendable.contains(&(attachment as *const crate::llm::Attachment)) {
+                    return match self.attachments_dir.and_then(|dir| crate::attachment::read_base64(dir, attachment)) {
+                        Some(data_base64) => ResolvedAttachment::Image(ImageData {
+                            media_type: attachment.media_type.clone(),
+                            data_base64,
+                        }),
+                        None => ResolvedAttachment::Omitted(format!(
+                            "[image: {}, {}×{} (no longer available)]",
+                            attachment.path.display(),
+                            attachment.width,
+                            attachment.height
+                        )),
+                    };
+                }
+                // Not selected: either an available image beyond the newest-N
+                // quota (sent earlier), or a reference whose file is gone.
+                if self.attachment_available(attachment) {
+                    ResolvedAttachment::Omitted(format!(
                         "[image omitted: {} (sent earlier)]",
                         attachment.path.display()
-                    ));
-                }
-                match self.attachments_dir.and_then(|dir| crate::attachment::read_base64(dir, attachment)) {
-                    Some(data_base64) => {
-                        ResolvedAttachment::Image(ImageData { media_type: attachment.media_type.clone(), data_base64 })
-                    }
-                    None => ResolvedAttachment::Omitted(format!(
+                    ))
+                } else {
+                    ResolvedAttachment::Omitted(format!(
                         "[image: {}, {}×{} (no longer available)]",
                         attachment.path.display(),
                         attachment.width,
                         attachment.height
-                    )),
+                    ))
                 }
             })
             .collect()
@@ -411,17 +435,9 @@ impl ChatRequest<'_> {
     /// still exists — a deleted file resolves to a text placeholder, not an
     /// image, so the vision header must not claim one.
     pub fn has_images(&self) -> bool {
-        let sendable = self.sendable();
-        if sendable.is_empty() {
-            return false;
-        }
-        let Some(dir) = self.attachments_dir else {
-            return false;
-        };
-        self.messages
-            .iter()
-            .flat_map(|m| m.attachments.iter())
-            .any(|a| sendable.contains(&(a as *const crate::llm::Attachment)) && crate::attachment::exists(dir, a))
+        // `sendable()` already excludes references whose files are missing, so a
+        // non-empty set means at least one real image will be sent.
+        !self.sendable().is_empty()
     }
 }
 
@@ -766,6 +782,63 @@ mod tests {
         // A deleted file resolves to a placeholder, so the request carries no
         // image and must not claim a vision request.
         assert!(!request.has_images(), "deleted file must not report a sendable image");
+    }
+
+    #[test]
+    fn missing_newest_image_does_not_consume_quota_from_an_available_older_one() {
+        // On resume the newest image's file is gone but an older one survives.
+        // A model capped at one image must still send the available older image,
+        // not waste its only slot on the missing newest reference.
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("older", Some(dir.path())); // stored
+        let newest_missing = attachment("newest", None); // never written
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "older").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "newest").with_attachments(vec![newest_missing]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        // The available older image is sent...
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Image(_)),
+            "available older image must fill the slot the missing newest cannot use"
+        );
+        // ...and the missing newest resolves to its own "no longer available"
+        // placeholder, not "sent earlier".
+        match &request.resolve_attachments(&messages[1])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+                assert!(!text.contains("sent earlier"), "{text}");
+            }
+            other => panic!("missing newest should be a placeholder, got {other:?}"),
+        }
+        assert!(request.has_images(), "an available image is sent despite the missing newest");
+    }
+
+    #[test]
+    fn available_image_beyond_quota_says_sent_earlier() {
+        // Two available images, capped at one: the older available one is over
+        // quota and must read "sent earlier" (distinct from "no longer available").
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("a", Some(dir.path()));
+        let newest = attachment("b", Some(dir.path()));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "a").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "b").with_attachments(vec![newest]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        match &request.resolve_attachments(&messages[0])[0] {
+            ResolvedAttachment::Omitted(text) => assert!(text.contains("sent earlier"), "{text}"),
+            other => panic!("over-quota available image should say sent earlier, got {other:?}"),
+        }
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
     }
 
     #[test]

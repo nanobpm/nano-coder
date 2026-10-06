@@ -98,9 +98,13 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         }
         if message.role == Role::Tool && !message.attachments.is_empty() {
             let mut content = message.content.clone();
+            let mut added_image = false;
             for item in request.resolve_attachments(message) {
                 match item {
-                    crate::llm::ResolvedAttachment::Image(image) => pending_images.push(image),
+                    crate::llm::ResolvedAttachment::Image(image) => {
+                        pending_images.push(image);
+                        added_image = true;
+                    }
                     crate::llm::ResolvedAttachment::Omitted(text) => {
                         content.push('\n');
                         content.push_str(&text);
@@ -112,9 +116,12 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
                 "tool_call_id": message.tool_call_id,
                 "content": content,
             });
-            if !pending_images.is_empty() {
-                // Note on the tool message that its image follows, so the text
-                // alone still reads coherently.
+            if added_image {
+                // Note on the tool message that *its own* image follows, so the
+                // text alone still reads coherently. Gated on this message adding
+                // an image — not on `pending_images` (which may hold an earlier
+                // tool's image) — so a tool with only a missing/omitted
+                // attachment does not falsely claim an image follows.
                 encoded["content"] = json!(format!("{content}\n[image attached in the next message]"));
             }
             out.push(encoded);
@@ -887,6 +894,92 @@ mod tests {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
         );
         assert_eq!(parts[1]["image_url"]["url"], json!(expected));
+    }
+
+    #[test]
+    fn tool_without_its_own_image_does_not_claim_one_follows() {
+        // Two consecutive tool results flushed into one user message: the first
+        // carries an image, the second only a missing attachment. The second
+        // tool must NOT say "[image attached in the next message]" — that image
+        // belongs to the first tool, not it.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+        let present = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/present.png"),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        crate::attachment::store(dir.path(), &present, &bytes).unwrap();
+        // A second attachment whose file was never written (missing on resume).
+        let missing = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/missing.png"),
+            sha256: crate::attachment::sha256_hex(b"missing-bytes"),
+            width: 10,
+            height: 10,
+            bytes: 13,
+            extension: "png".into(),
+        };
+        let messages = vec![
+            Message::assistant_with_tools(
+                "",
+                vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "/tmp/present.png"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "/tmp/missing.png"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+            ),
+            Message::tool_result("c1", "read_file", "present").with_attachments(vec![present]),
+            Message::tool_result("c2", "read_file", "missing").with_attachments(vec![missing]),
+        ];
+        let vision = crate::vision::Vision {
+            max_images: 4,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        };
+        let client = OpenAiClient::new(provider("http://x", "")).unwrap();
+        let body = client.build_body(&ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: Some(vision),
+            attachments_dir: Some(dir.path()),
+        });
+        let encoded = body["messages"].as_array().unwrap();
+        // assistant, tool c1 (adds image + note), tool c2 (no image), user (image).
+        let c1 = &encoded[1];
+        let c2 = &encoded[2];
+        assert_eq!(c1["tool_call_id"], "c1");
+        assert!(
+            c1["content"].as_str().unwrap().contains("[image attached in the next message]"),
+            "the tool that actually added an image should note it: {c1}"
+        );
+        assert_eq!(c2["tool_call_id"], "c2");
+        assert!(
+            !c2["content"].as_str().unwrap().contains("[image attached in the next message]"),
+            "a tool with no image of its own must not claim one follows: {c2}"
+        );
+        assert!(
+            c2["content"].as_str().unwrap().contains("no longer available"),
+            "the missing attachment should resolve to a placeholder: {c2}"
+        );
     }
 
     #[test]

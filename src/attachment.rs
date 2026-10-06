@@ -235,11 +235,29 @@ fn encode_as(img: &image::DynamicImage, codec: ImageFormat) -> Result<Vec<u8>> {
 
 fn encode_jpeg(img: &image::DynamicImage) -> Result<Vec<u8>> {
     let mut out = std::io::Cursor::new(Vec::new());
-    // JPEG has no alpha; flatten onto white so transparent pixels do not turn black.
-    let rgb = img.to_rgb8();
+    // JPEG has no alpha; composite onto white so transparent pixels do not turn
+    // black. `to_rgb8()` alone would merely drop the alpha channel, leaving the
+    // (commonly black) RGB under transparent pixels.
+    let rgb = flatten_onto_white(img);
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
     encoder.encode_image(&rgb).context("encode jpeg")?;
     Ok(out.into_inner())
+}
+
+/// Alpha-composite `img` over an opaque white background, returning RGB. Fully
+/// opaque pixels are unchanged; fully transparent pixels become white.
+fn flatten_onto_white(img: &image::DynamicImage) -> image::RgbImage {
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut rgb = image::RgbImage::new(width, height);
+    for (dst, src) in rgb.pixels_mut().zip(rgba.pixels()) {
+        let a = u32::from(src[3]);
+        let inv = 255 - a;
+        // `channel * a + white(255) * (255 - a)`, rounded, over 255.
+        let over = |c: u8| (((u32::from(c) * a + 255 * inv) + 127) / 255) as u8;
+        *dst = image::Rgb([over(src[0]), over(src[1]), over(src[2])]);
+    }
+    rgb
 }
 
 /// The per-model limits an image is prepared against.
@@ -312,6 +330,37 @@ mod tests {
     #[test]
     fn sha256_is_stable() {
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn jpeg_composites_transparency_onto_white_not_black() {
+        // A fully transparent pixel over black RGB: dropping alpha (`to_rgb8`)
+        // would keep it black; compositing onto white must make it near-white.
+        let mut rgba = image::RgbaImage::new(2, 1);
+        rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 0])); // transparent, black RGB
+        rgba.put_pixel(1, 0, image::Rgba([10, 20, 30, 255])); // opaque
+        let img = image::DynamicImage::ImageRgba8(rgba);
+
+        let flat = flatten_onto_white(&img);
+        assert_eq!(flat.get_pixel(0, 0), &image::Rgb([255, 255, 255]), "transparent pixel must flatten to white");
+        assert_eq!(flat.get_pixel(1, 0), &image::Rgb([10, 20, 30]), "opaque pixel must be unchanged");
+
+        // The encoded JPEG must decode with the transparent region near white
+        // (JPEG is lossy, so allow a small tolerance), never near black.
+        let jpeg = encode_jpeg(&img).unwrap();
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap().to_rgb8();
+        let p = decoded.get_pixel(0, 0);
+        assert!(p[0] > 230 && p[1] > 230 && p[2] > 230, "transparent region must encode near white, got {p:?}");
+    }
+
+    #[test]
+    fn jpeg_half_transparent_blends_toward_white() {
+        // 50% alpha over black must land roughly mid-grey, not black.
+        let mut rgba = image::RgbaImage::new(1, 1);
+        rgba.put_pixel(0, 0, image::Rgba([0, 0, 0, 128]));
+        let flat = flatten_onto_white(&image::DynamicImage::ImageRgba8(rgba));
+        let p = flat.get_pixel(0, 0);
+        assert!((120..=140).contains(&p[0]), "half-transparent black over white should be ~mid-grey, got {p:?}");
     }
 
     fn make_png(w: u32, h: u32) -> Vec<u8> {
