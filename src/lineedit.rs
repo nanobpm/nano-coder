@@ -2513,10 +2513,28 @@ mod tests {
     fn clear_input_if_any_is_an_inert_no_op_on_an_empty_line() {
         // "only when there is text": an empty buffer must not be redrawn (or
         // trip history), so the second Esc on an empty prompt does nothing.
+        // Pin both halves of "inert": the edit hook must not fire (no redraw)
+        // and a browsing history position must survive (no `history.edited()`).
+        let calls = Arc::new(Mutex::new(0usize));
         let mut view = view("");
+        let counter = calls.clone();
+        view.on_edit = Some(Arc::new(move |_: &str, _: usize, _: usize, _: &[String]| {
+            *counter.lock().unwrap() += 1;
+        }));
+        // Enter a browsing state directly (keeping the buffer empty, the case
+        // under test): a stray `history.edited()` on the empty path would reset
+        // `position`, changing what the next Down returns.
+        view.history.record("earlier");
+        assert_eq!(view.history.up(""), Some("earlier"), "recall entered the browsing state");
+
+        *calls.lock().unwrap() = 0;
         assert!(!view.clear_input_if_any(), "nothing to clear");
         assert!(view.line.is_empty());
         assert_eq!(view.cursor, 0);
+        assert_eq!(*calls.lock().unwrap(), 0, "the empty path triggers no redraw");
+        // Browsing position survived: Down past the newest entry still returns
+        // to the saved (empty) draft, which a `history.edited()` would have lost.
+        assert_eq!(view.history.down(), Some(""), "the browsing position was not reset by the no-op");
     }
 
     /// A prompt-mode reader with `line` in its buffer, drawing disabled.
@@ -2632,6 +2650,45 @@ mod tests {
         assert_eq!(view.lock().unwrap().line, "draft", "the draft survives one post-turn Esc");
         // Two fresh presses at the same prompt still clear.
         assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn escape_during_compaction_neither_clears_nor_arms() {
+        // A `/compact` deferred from a turn runs after the turn loop already
+        // restored `EditMode::Prompt`, on the same outstanding read. The
+        // compaction marks itself a non-idle (`Turn`) phase, so while a partial
+        // next message sits in the buffer an Esc pressed to cancel the
+        // compaction must neither clear that text nor arm the clear gesture —
+        // and the Prompt→Turn→Prompt transitions bump the edit generation, so
+        // an arm made before the compaction cannot complete with one Esc after.
+        let (mut reader, view) = prompt_reader("next message");
+        let t = std::time::Instant::now();
+        // Arm the gesture at the idle prompt before the turn/compaction.
+        assert!(!reader.escape_press(&view, t), "the first Esc only arms");
+        // Turn runs and ends (Prompt restored), then the deferred compaction
+        // marks itself Turn. Both transitions invalidate the pre-existing arm.
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        view.lock().unwrap().set_mode(EditMode::Turn); // compaction runs
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "a compaction-time Esc is not the gesture's and does not complete the stale arm"
+        );
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(200)),
+            "a second compaction-time Esc still does not clear"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "the partial input survives compaction");
+        // Compaction finishes, restoring the idle prompt: the gesture is live
+        // again, but needs two fresh presses (the compaction-time ones did not arm it).
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(300)),
+            "the first idle Esc after compaction only re-arms"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "one post-compaction Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(400)), "two idle presses clear");
         assert!(view.lock().unwrap().line.is_empty());
     }
 

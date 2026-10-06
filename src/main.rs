@@ -1200,13 +1200,26 @@ async fn run_compaction(
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
     let stats = agent.context_stats();
+    // Compaction is a non-idle phase: a `/compact` deferred from a turn runs
+    // here *after* the turn loop already restored `EditMode::Prompt` (see
+    // `run_interactive_turn`), while the persistent line reader stays
+    // outstanding. Left in `Prompt`, the idle "Esc Esc clears the input"
+    // gesture would erase a partially typed next message with the same presses
+    // that cancel the compaction — the destructive behaviour that guard exists
+    // to prevent. Mark the phase `Turn` so `escape_press` neither clears nor
+    // arms; the Prompt→Turn→Prompt transitions bump the edit generation, so a
+    // stale pre-compaction arm cannot complete afterwards either.
+    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
     let compaction = agent.compact(mode, instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
-    loop {
+    // The loop only exits by resolving the compaction future; capture the
+    // report so the idle `Prompt` mode is restored on that single path before
+    // returning (there is no early `return` that could skip the restore).
+    let report = loop {
         tokio::select! {
             biased;
-            report = &mut compaction => return report,
+            report = &mut compaction => break report,
             input = terminal.recv() => match input {
                 TermInput::Interrupt => {
                     control.cancel();
@@ -1266,7 +1279,10 @@ async fn run_compaction(
                 }
             },
         }
-    }
+    };
+    // Restore the idle prompt so the next read's Esc Esc gesture is live again.
+    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
+    report
 }
 
 /// Parse the id from `/memory forget <id>` args, requiring a token boundary
