@@ -355,9 +355,12 @@ pub struct ChatRequest<'a> {
 }
 
 impl ChatRequest<'_> {
-    /// Whether an attachment's stored bytes are still on disk (and so can be
-    /// sent as an image). A reference with no attachments dir, or whose file was
-    /// deleted before a resume, is unavailable and resolves to a placeholder.
+    /// Whether an attachment's stored bytes are still on disk *and intact*
+    /// (present and hash-matching, the same gate `read_base64` applies before
+    /// encoding, so availability can never diverge from what the payload
+    /// actually sends). A reference with no attachments dir, or whose file was
+    /// deleted or tampered with before a resume, is unavailable and resolves
+    /// to a placeholder.
     fn attachment_available(&self, attachment: &crate::llm::Attachment) -> bool {
         self.attachments_dir.map(|dir| crate::attachment::exists(dir, attachment)).unwrap_or(false)
     }
@@ -368,11 +371,11 @@ impl ChatRequest<'_> {
     /// Identified by occurrence, not content hash, so reading the same image
     /// twice does not make *both* copies sendable and overflow a model's image
     /// limit — a model capped at one image keeps only the newest occurrence even
-    /// when an older message repeats its SHA. Unavailable references (missing on
-    /// resume) are excluded from the quota so a deleted newest image does not
-    /// consume a slot an older available image could have used; each still
-    /// resolves to its own "no longer available" placeholder. An empty set (no
-    /// vision, or `max_images == 0`) sends none.
+    /// when an older message repeats its SHA. Unavailable references (missing or
+    /// tampered on resume) are excluded from the quota so a lost newest image
+    /// does not consume a slot an older available image could have used; each
+    /// still resolves to its own "no longer available" placeholder. An empty
+    /// set (no vision, or `max_images == 0`) sends none.
     fn sendable(&self) -> std::collections::HashSet<*const crate::llm::Attachment> {
         let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
         let mut all: Vec<&crate::llm::Attachment> =
@@ -432,11 +435,12 @@ impl ChatRequest<'_> {
     /// Whether any message in the request carries an attachment that will be
     /// sent as an image (used by GitHub Copilot to set its vision header). An
     /// attachment counts only when it is both sendable *and* its stored file
-    /// still exists — a deleted file resolves to a text placeholder, not an
-    /// image, so the vision header must not claim one.
+    /// is intact (present and hash-matching) — a deleted or tampered file
+    /// resolves to a text placeholder, not an image, so the vision header must
+    /// not claim one.
     pub fn has_images(&self) -> bool {
-        // `sendable()` already excludes references whose files are missing, so a
-        // non-empty set means at least one real image will be sent.
+        // `sendable()` already excludes references whose files are missing or
+        // tampered, so a non-empty set means at least one real image is sent.
         !self.sendable().is_empty()
     }
 }
@@ -839,6 +843,62 @@ mod tests {
             other => panic!("over-quota available image should say sent earlier, got {other:?}"),
         }
         assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn tampered_newest_image_consumes_no_quota_and_sets_no_false_header() {
+        // The newest image's stored file was tampered with (its bytes no longer
+        // match the recorded hash). Availability is the same hash-validated
+        // gate `read_base64` applies, so the tampered newest is unavailable:
+        // it must not consume the only image slot, the older intact image is
+        // sent instead, and the tampered one resolves to a "no longer
+        // available" placeholder rather than "sent earlier".
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("older", Some(dir.path())); // stored, intact
+        let newest = attachment("newest", Some(dir.path())); // stored, then tampered
+        let tampered_path = dir.path().join(format!("{}.{}", newest.sha256, newest.extension));
+        std::fs::write(&tampered_path, b"tampered").unwrap();
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "older").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "newest").with_attachments(vec![newest]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Image(_)),
+            "the intact older image must fill the slot the tampered newest cannot use"
+        );
+        match &request.resolve_attachments(&messages[1])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+                assert!(!text.contains("sent earlier"), "{text}");
+            }
+            other => panic!("tampered newest should be a placeholder, got {other:?}"),
+        }
+        // An intact image is sent, so the vision header is still honest.
+        assert!(request.has_images());
+    }
+
+    #[test]
+    fn tampered_only_image_sets_no_vision_header() {
+        // The request's only attachment is tampered: nothing sendable remains,
+        // so the Copilot vision header must not claim an image that resolves
+        // to a placeholder.
+        let dir = tempfile::tempdir().unwrap();
+        let only = attachment("only", Some(dir.path()));
+        let tampered_path = dir.path().join(format!("{}.{}", only.sha256, only.extension));
+        std::fs::write(&tampered_path, b"tampered").unwrap();
+        let messages = vec![Message::tool_result("t1", "read_file", "x").with_attachments(vec![only])];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(!request.has_images(), "a tampered file must not report a sendable image");
     }
 
     #[test]

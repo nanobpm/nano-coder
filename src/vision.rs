@@ -208,8 +208,11 @@ fn assumes_anthropic_vision(model: &str) -> bool {
 /// `gpt-4o3-custom`, or an `o3` appearing in a fine-tune suffix) is not
 /// mistaken for it. A model is a family member when, after stripping an
 /// optional `ft:<base>:…` fine-tune wrapper down to its base, the base either
-/// equals the family token or continues with a `-` (e.g. `o4-mini`,
-/// `gpt-4o-2024-08-06`).
+/// equals the family token or continues with a `-` or `.` (e.g. `o4-mini`,
+/// `gpt-4o-2024-08-06`, `gpt-5.6`). The `.` delimiter admits dotted revisions
+/// of a vision family (`gpt-5.1`, `gpt-5.6`) — the direct OpenAI provider
+/// returns no endpoint report, so without it they would be misclassified as
+/// blind — while a digit continuation (`gpt-50`) stays blind.
 ///
 /// The text-only `o3-mini` subfamily is carved out: the bare `o3` prefix would
 /// otherwise classify `o3-mini` (and dated `o3-mini-*` aliases) as
@@ -227,7 +230,7 @@ fn assumes_openai_vision(model: &str) -> bool {
     }
     const FAMILIES: [&str; 5] = ["gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4"];
     FAMILIES.iter().any(|family| match base.strip_prefix(family) {
-        Some(rest) => rest.is_empty() || rest.starts_with('-'),
+        Some(rest) => rest.is_empty() || rest.starts_with('-') || rest.starts_with('.'),
         None => false,
     })
 }
@@ -380,6 +383,20 @@ mod tests {
         for model in ["gpt-4o3-custom", "text-embedding-3", "o3pro", "whisper-o4", "ft:gpt-3.5-turbo:org::o3"] {
             assert!(!assumes_openai_vision(model), "{model} should not be a vision family");
         }
+    }
+
+    #[test]
+    fn dotted_gpt5_revisions_are_vision_families() {
+        // The repository already routes dotted GPT-5 revisions (e.g. `gpt-5.6`
+        // in github_copilot.rs); on the direct OpenAI provider — which returns
+        // no endpoint report — they must not fall through to blind. `.` is a
+        // family delimiter alongside `-`, while a digit continuation is not.
+        for model in ["gpt-5.1", "gpt-5.6", "gpt-5.6-sol", "ft:gpt-5.1:org::id"] {
+            assert!(assumes_openai_vision(model), "{model} should be a vision family");
+        }
+        assert!(!assumes_openai_vision("gpt-50"), "a digit continuation is not a revision");
+        // The text-only carve-out still wins over the bare `o3` family prefix.
+        assert!(!assumes_openai_vision("o3-mini"), "o3-mini stays blind");
     }
 
     #[test]

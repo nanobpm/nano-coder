@@ -323,14 +323,18 @@ pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<St
     Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
 }
 
-/// Whether an attachment's stored copy still exists on disk. Used to decide
-/// whether a request actually carries a sendable image (e.g. the file may have
-/// been deleted before a resume), without reading or encoding its bytes.
+/// Whether an attachment's stored copy is still available *intact* on disk:
+/// present and matching its recorded hash — exactly the integrity gate
+/// `read_base64` applies before encoding. Used to decide whether a request
+/// actually carries a sendable image (e.g. the file may have been deleted
+/// before a resume). Quota and vision-header decisions go through this so a
+/// tampered or truncated file cannot consume an image slot or trigger the
+/// vision header only to resolve to a placeholder: it is treated as
+/// unavailable and never sent.
 pub fn exists(attachments_dir: &Path, attachment: &Attachment) -> bool {
-    match stored_filename(attachment) {
-        Some(filename) => attachments_dir.join(filename).exists(),
-        None => false,
-    }
+    let Some(filename) = stored_filename(attachment) else { return false };
+    let Ok(bytes) = std::fs::read(attachments_dir.join(filename)) else { return false };
+    sha256_hex(&bytes) == attachment.sha256
 }
 
 #[cfg(test)]
@@ -595,5 +599,31 @@ mod tests {
         // the swapped content to the provider.
         std::fs::write(&path, b"tampered").unwrap();
         assert_eq!(read_base64(dir.path(), &attachment), None);
+    }
+
+    /// Availability is the same integrity gate as `read_base64`: a tampered
+    /// stored file reports as unavailable, so it can neither consume an image
+    /// quota slot nor trigger the vision header only to resolve to a
+    /// placeholder.
+    #[test]
+    fn exists_rejects_a_tampered_stored_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        let attachment = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("/tmp/x.png"),
+            sha256: sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        let path = store(dir.path(), &attachment, &bytes).unwrap();
+        assert!(exists(dir.path(), &attachment));
+        std::fs::write(&path, b"tampered").unwrap();
+        assert!(!exists(dir.path(), &attachment));
+        // Truncation is caught the same way.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(!exists(dir.path(), &attachment));
     }
 }
