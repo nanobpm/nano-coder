@@ -92,6 +92,8 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         }
         out.push(json!({ "role": "user", "content": content }));
     };
+    // Resolve the image quota once for the whole request, not per tool message.
+    let plan = request.attachment_plan();
     for message in request.messages {
         if message.role != Role::Tool {
             flush(&mut out, &mut pending_images);
@@ -99,7 +101,7 @@ fn encode_messages(request: &ChatRequest<'_>, replay_reasoning: bool) -> Vec<Val
         if message.role == Role::Tool && !message.attachments.is_empty() {
             let mut content = message.content.clone();
             let mut added_image = false;
-            for item in request.resolve_attachments(message) {
+            for item in request.resolve_attachments_with(message, &plan) {
                 match item {
                     crate::llm::ResolvedAttachment::Image(image) => {
                         pending_images.push(image);
@@ -457,7 +459,9 @@ impl LLMClient for OpenAiClient {
         detect_vision(&self.transport).await
     }
 
-    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         detect_capabilities(&self.transport).await
     }
 
@@ -603,7 +607,7 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
 /// serially at startup or on a model switch.
 pub(crate) async fn detect_capabilities(
     transport: &HttpTransport,
-) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
     let provider = transport.provider();
     let base = provider.base_url.as_str();
     let root = base.strip_suffix("/v1").unwrap_or(base);
@@ -623,7 +627,9 @@ pub(crate) async fn detect_capabilities(
             // A window listed directly on the `/models` entry wins over /props.
             let window = entry.and_then(window_in_entry).or(window);
             let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
-            (window, thinking)
+            // Vision comes from the same `/props` response — no second probe.
+            let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
+            (window, thinking, vision)
         }
         Server::Ollama => {
             let (window, show) = match entry.and_then(window_in_entry) {
@@ -636,7 +642,9 @@ pub(crate) async fn detect_capabilities(
                 None => ollama_window(transport, root, model).await,
             };
             let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
-            (window, thinking)
+            // Vision comes from the same `/api/show` response — no second probe.
+            let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
+            (window, thinking, vision)
         }
         Server::LmStudio => {
             let window = match entry.and_then(window_in_entry) {
@@ -649,9 +657,9 @@ pub(crate) async fn detect_capabilities(
                     .and_then(as_tokens)
                     .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length")),
             };
-            (window, None)
+            (window, None, None)
         }
-        Server::Other => (entry.and_then(window_in_entry), None),
+        Server::Other => (entry.and_then(window_in_entry), None, None),
     }
 }
 
@@ -1686,7 +1694,7 @@ mod tests {
             },
         )]);
         let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
-        let (window, thinking) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
+        let (window, thinking, _vision) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
         let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
         (window, thinking, paths)
     }

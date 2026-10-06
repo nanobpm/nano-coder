@@ -106,6 +106,8 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
 fn encode_messages(request: &ChatRequest<'_>) -> Vec<Value> {
     let messages = request.messages;
     let mut encoded: Vec<(String, Vec<Value>)> = Vec::new();
+    // Resolve the image quota once for the whole request, not per tool message.
+    let plan = request.attachment_plan();
     for message in messages {
         let (role, blocks) = match message.role {
             Role::System => continue,
@@ -114,7 +116,7 @@ fn encode_messages(request: &ChatRequest<'_>) -> Vec<Value> {
                 // A tool result with image attachments carries them as content
                 // blocks after the text: `{type:"image", source:{base64}}`.
                 // Omitted/missing attachments become a text placeholder.
-                let resolved = request.resolve_attachments(message);
+                let resolved = request.resolve_attachments_with(message, &plan);
                 let block = if resolved.is_empty() {
                     let mut block = json!({
                         "type": "tool_result",

@@ -613,13 +613,15 @@ impl LLMClient for GithubCopilotClient {
         .flatten()
     }
 
-    /// The window and thinking levels read from one shared `/models` fetch.
-    /// Both detections need the current model's `/models` entry, and
+    /// The window, thinking levels and vision capability read from one shared
+    /// `/models` fetch. All three need the current model's `/models` entry, and
     /// `model_entry` caches only a successful response, so probing each on its
     /// own (the default) would re-fetch — and re-wait out the timeout — when
-    /// the first probe failed. Fetching the entry once and deriving both halves
-    /// keeps a slow or unavailable endpoint from being probed twice serially.
-    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+    /// the first probe failed. Fetching the entry once and deriving every half
+    /// keeps a slow or unavailable endpoint from being probed repeatedly.
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         // Bound the whole probe: `models_json` first does a token exchange whose
         // request carries the transport's normal (long) timeout, so a stalled
         // exchange could otherwise blow past the probe budget even though the
@@ -654,7 +656,9 @@ impl LLMClient for GithubCopilotClient {
                 (None, None) => None,
             };
             let thinking = crate::thinking::Reported::from_model_entry(&entry);
-            Some((window, thinking))
+            // Vision comes from the same cached `/models` entry — no second probe.
+            let vision = crate::vision::Vision::from_model_entry(&entry);
+            Some((window, thinking, vision))
         })
         .await
         .ok()
@@ -1187,17 +1191,19 @@ mod tests {
 
     #[tokio::test]
     async fn detect_capabilities_reads_both_from_one_models_request() {
-        // The agent probes via `detect_capabilities`, so the window and thinking
-        // levels must come from a single `/models` fetch — not one each.
+        // The agent probes via `detect_capabilities`, so the window, thinking
+        // levels AND vision must all come from a single `/models` fetch — not
+        // one each (an earlier bug issued a second serial vision probe).
         let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
             "limits": { "max_prompt_tokens": 111 },
-            "supports": { "reasoning_effort": ["none", "low", "high"] } } }] });
+            "supports": { "reasoning_effort": ["none", "low", "high"], "vision": true } } }] });
         let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (window, thinking) = client.detect_capabilities().await;
+        let (window, thinking, vision) = client.detect_capabilities().await;
         assert_eq!(window.unwrap().tokens, 111);
         assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
+        assert!(vision.is_some(), "vision derived from the same shared /models entry");
         assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
     }
 
@@ -1209,7 +1215,7 @@ mod tests {
         let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (window, thinking) = client.detect_capabilities().await;
+        let (window, thinking, _vision) = client.detect_capabilities().await;
         assert_eq!((window, thinking), (None, None));
         assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the second probe");
     }

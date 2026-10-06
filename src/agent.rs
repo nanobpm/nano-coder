@@ -1121,10 +1121,15 @@ impl Agent {
             return;
         }
         let probe = self.client.detect_capabilities();
-        let (window, thinking) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         self.detected_window = window;
         self.reported_thinking = thinking;
-        self.detect_vision().await;
+        // Vision is derived from the same probe responses `detect_capabilities`
+        // already fetched, so it costs no extra round trip. A configured
+        // `vision` override still wins at resolution time (`vision()` ignores
+        // this report when an override is set), so storing the report here is
+        // harmless even then.
+        self.reported_vision = vision;
         self.refresh_stats();
     }
 
@@ -1140,12 +1145,14 @@ impl Agent {
     }
 
     /// Probe the vision capability the endpoint reports, leaving any configured
-    /// override to win at resolution time (`vision()`). Skipped when a
-    /// configured `vision` override already decides the capability: the probe
-    /// re-fetches `/models` plus llama.cpp `/props` or Ollama `/api/show` right
-    /// after `detect_capabilities` fetched the same responses, so running it
-    /// for an unused result adds a second serial probe budget on a slow
-    /// endpoint for nothing.
+    /// override to win at resolution time (`vision()`). Used only on the
+    /// configured-window path (`detect_thinking`), where the combined
+    /// `detect_capabilities` probe is skipped to avoid an unwanted window
+    /// follow-up; the default path derives vision from that combined probe
+    /// instead of calling this. Skipped when a configured `vision` override
+    /// already decides the capability: the probe re-fetches `/models` plus
+    /// llama.cpp `/props` or Ollama `/api/show`, so running it for an unused
+    /// result adds a serial probe budget on a slow endpoint for nothing.
     async fn detect_vision(&mut self) {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
@@ -1193,12 +1200,14 @@ impl Agent {
         }
     }
 
-    /// Turn a `read_file` image result (`{"image": {…, data_base64}}`) into the
-    /// tool-result text and its attachment. Returns `Ok(None)` when `result` is
-    /// not an image result. When the model cannot view images, returns `Err`
-    /// with the text error (a hint naming the fix). When it can, the image is
-    /// downscaled to the model's limits, stored under the session's attachments
-    /// directory, and returned as `(text, attachments)`.
+    /// Turn a `read_file` image result (`{"image": {…, path}}`, metadata only)
+    /// into the tool-result text and its attachment. The caller gates this on
+    /// `tool_call.name == "read_file"`, since only that tool owns this private
+    /// `{"image": …}` protocol. Returns `Ok(None)` when `result` is not an
+    /// image result. When the model cannot view images, returns `Err` with the
+    /// text error (a hint naming the fix). When it can, the file is re-read by
+    /// `path`, downscaled to the model's limits, stored under the session's
+    /// attachments directory, and returned as `(text, attachments)`.
     fn image_result(&self, result: &Value) -> Result<Option<(String, Vec<crate::llm::Attachment>)>, String> {
         let Some(image) = result.get("image") else { return Ok(None) };
         let path_str = image.get("path").and_then(Value::as_str).unwrap_or_default();
@@ -1211,12 +1220,16 @@ impl Agent {
                 image.get("media_type").and_then(Value::as_str).unwrap_or("unknown type")
             ));
         };
-        let Some(data_base64) = image.get("data_base64").and_then(Value::as_str) else {
-            return Err(format!("{}: image result had no data", path.display()));
-        };
-        let bytes = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_base64) {
+        if path_str.is_empty() {
+            return Err("image result had no path".to_string());
+        }
+        // Re-read the source by path rather than carrying its base64 through the
+        // tool result: encoding the whole image into the result (and cloning it
+        // for the `AfterToolCall` hook) would cost several times its file size
+        // before `prepare` reduces it below the model's limits.
+        let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(e) => return Err(format!("{}: undecodable image data: {e}", path.display())),
+            Err(e) => return Err(format!("{}: could not read image: {e}", path.display())),
         };
         let Some(format) = crate::attachment::ImageFormat::sniff(&bytes) else {
             return Err(format!("{}: unrecognised image data", path.display()));
@@ -2809,7 +2822,12 @@ impl Agent {
                 let mut attachments: Vec<crate::llm::Attachment> = Vec::new();
                 let mut result_text = match result {
                     Value::String(text) => text,
-                    other => match self.image_result(&other) {
+                    // Only `read_file` owns the private `{"image": …}` result
+                    // protocol. Any other tool that returns a structured value
+                    // (even one with a top-level `image` field) is stringified
+                    // unchanged, so it is never misread as an attachment or a
+                    // spurious "image result had no data" error.
+                    other if tool_call.name == "read_file" => match self.image_result(&other) {
                         Ok(Some((text, found))) => {
                             attachments = found;
                             text
@@ -2822,6 +2840,7 @@ impl Agent {
                             text
                         }
                     },
+                    other => other.to_string(),
                 };
                 // A non-image binary file takes read_file's generic "looks
                 // like a binary file" error, which cannot name the model's
@@ -3896,6 +3915,50 @@ mod tests {
         agent.run_turn(Some("in-1"), "read").await.unwrap();
         let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
         assert!(tool.content.contains("can't view images"), "capability hint: {}", tool.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_read_file_decodes_image_results() {
+        let dir = tempfile::tempdir().unwrap();
+        // A vision-capable model, so the `{"image": …}` shape WOULD be decoded
+        // into an attachment (or an "image result had no data" error) if the
+        // decoding were gated on the result shape rather than the tool name.
+        let (mut agent, _) = file_agent(
+            vec![
+                LLMResponse {
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "shot".into(),
+                        arguments: json!({}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    }],
+                    ..Default::default()
+                },
+                text("ok"),
+            ],
+            dir.path(),
+            Some(true),
+        );
+        // A non-`read_file` tool that legitimately returns a structured object
+        // with a top-level `image` field.
+        agent.tools().register(
+            ToolDefinition::new("shot", "shot", json!({"type": "object"})),
+            Box::new(|_| {
+                Ok(json!({ "image": { "media_type": "image/png", "path": "/nope.png",
+                    "width": 1, "height": 1, "bytes": 3 } }))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
+        assert!(!tool.is_error, "a non-read_file image-shaped result is not an image error: {}", tool.content);
+        assert!(tool.attachments.is_empty(), "no attachment is created for a non-read_file tool");
+        assert!(
+            tool.content.contains("\"image\""),
+            "the structured result is stringified unchanged: {}",
+            tool.content
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6181,9 +6244,11 @@ mod tests {
             async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!()
             }
-            async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
+            async fn detect_capabilities(
+                &self,
+            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
                 self.calls.lock().unwrap().push("capabilities");
-                (Some(DetectedWindow::total(65_536, "test")), None)
+                (Some(DetectedWindow::total(65_536, "test")), None, None)
             }
             async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
                 self.calls.lock().unwrap().push("thinking");

@@ -377,29 +377,47 @@ impl ChatRequest<'_> {
     /// still resolves to its own "no longer available" placeholder. An empty
     /// set (no vision, or `max_images == 0`) sends none.
     fn sendable(&self) -> std::collections::HashSet<*const crate::llm::Attachment> {
-        let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
-        let mut all: Vec<&crate::llm::Attachment> =
-            self.messages.iter().flat_map(|m| m.attachments.iter()).filter(|a| self.attachment_available(a)).collect();
-        // Keep the newest `max`: drop the oldest excess from the front.
-        let keep = max.min(all.len());
-        let drop = all.len() - keep;
-        all.drain(..drop);
-        all.into_iter().map(|a| a as *const crate::llm::Attachment).collect()
+        self.attachment_plan().sendable
     }
 
-    /// Resolve each of `message`'s attachments for the wire, in order: either
-    /// the image data to send, or the placeholder text standing in for it
-    /// (omitted past the model's image limit, or missing on resume).
-    pub fn resolve_attachments(&self, message: &Message) -> Vec<ResolvedAttachment> {
+    /// The per-request attachment resolution plan, computed **once** and reused
+    /// across every message. Resolving each message independently recomputes
+    /// `sendable()` — which hashes every stored image via `attachment::exists`
+    /// — so a conversation with N image-bearing messages would hash the whole
+    /// attachment set N times (O(N²) file I/O) even when `max_images` is 1.
+    /// Building the plan here hashes each stored file at most once (O(N)); the
+    /// serializers compute it before their message loop and pass it to
+    /// [`Self::resolve_attachments_with`].
+    pub fn attachment_plan(&self) -> AttachmentPlan {
+        let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
+        let mut available: Vec<&crate::llm::Attachment> =
+            self.messages.iter().flat_map(|m| m.attachments.iter()).filter(|a| self.attachment_available(a)).collect();
+        let available_set: std::collections::HashSet<*const crate::llm::Attachment> =
+            available.iter().map(|a| *a as *const crate::llm::Attachment).collect();
+        // Keep the newest `max` as sendable: drop the oldest excess from the front.
+        let keep = max.min(available.len());
+        let drop = available.len() - keep;
+        available.drain(..drop);
+        let sendable = available.into_iter().map(|a| a as *const crate::llm::Attachment).collect();
+        AttachmentPlan { available: available_set, sendable }
+    }
+
+    /// Resolve each of `message`'s attachments for the wire using a precomputed
+    /// [`AttachmentPlan`], in order: either the image data to send, or the
+    /// placeholder text standing in for it (omitted past the model's image
+    /// limit, or missing on resume). Serializers build the plan once per
+    /// request and pass it here for every message, so the attachment set is
+    /// hashed once rather than once per message.
+    pub fn resolve_attachments_with(&self, message: &Message, plan: &AttachmentPlan) -> Vec<ResolvedAttachment> {
         if message.attachments.is_empty() {
             return Vec::new();
         }
-        let sendable = self.sendable();
         message
             .attachments
             .iter()
             .map(|attachment| {
-                if sendable.contains(&(attachment as *const crate::llm::Attachment)) {
+                let ptr = attachment as *const crate::llm::Attachment;
+                if plan.sendable.contains(&ptr) {
                     return match self.attachments_dir.and_then(|dir| crate::attachment::read_base64(dir, attachment)) {
                         Some(data_base64) => ResolvedAttachment::Image(ImageData {
                             media_type: attachment.media_type.clone(),
@@ -415,7 +433,7 @@ impl ChatRequest<'_> {
                 }
                 // Not selected: either an available image beyond the newest-N
                 // quota (sent earlier), or a reference whose file is gone.
-                if self.attachment_available(attachment) {
+                if plan.available.contains(&ptr) {
                     ResolvedAttachment::Omitted(format!(
                         "[image omitted: {} (sent earlier)]",
                         attachment.path.display()
@@ -430,6 +448,15 @@ impl ChatRequest<'_> {
                 }
             })
             .collect()
+    }
+
+    /// Resolve one message's attachments, building a fresh [`AttachmentPlan`]
+    /// for it. Convenience for single-message callers and tests; serializers
+    /// that resolve every message build the plan once with
+    /// [`Self::attachment_plan`] and call [`Self::resolve_attachments_with`].
+    #[cfg(test)]
+    pub fn resolve_attachments(&self, message: &Message) -> Vec<ResolvedAttachment> {
+        self.resolve_attachments_with(message, &self.attachment_plan())
     }
 
     /// Whether any message in the request carries an attachment that will be
@@ -458,6 +485,18 @@ pub struct ImageData {
 pub enum ResolvedAttachment {
     Image(ImageData),
     Omitted(String),
+}
+
+/// A request's attachment resolution plan, computed once and shared across
+/// messages: which attachment occurrences are available on disk, and which of
+/// those fall within the image quota (and so are sent as images). Occurrences
+/// are keyed by pointer, not content hash, so the same image read twice counts
+/// as two occurrences. Build it with [`ChatRequest::attachment_plan`] and pass
+/// it to [`ChatRequest::resolve_attachments_with`] for every message, so the
+/// stored attachment set is hashed once per request instead of once per message.
+pub struct AttachmentPlan {
+    available: std::collections::HashSet<*const crate::llm::Attachment>,
+    sendable: std::collections::HashSet<*const crate::llm::Attachment>,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -540,15 +579,18 @@ pub trait LLMClient: Send + Sync {
     async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         None
     }
-    /// The window and thinking levels the endpoint reports, probed together.
+    /// The window, thinking levels and vision capability the endpoint reports,
+    /// probed together.
     ///
-    /// The default probes each on its own; a provider whose two detections
-    /// would fetch the same endpoint response (OpenAI-compatible servers probe
-    /// `/models`, then llama.cpp `/props` or Ollama `/api/show` for both)
+    /// The default probes each on its own; a provider whose detections would
+    /// fetch the same endpoint response (OpenAI-compatible servers probe
+    /// `/models`, then llama.cpp `/props` or Ollama `/api/show` for all three)
     /// overrides this to share one fetch, so a slow or unavailable endpoint is
-    /// not probed twice serially.
-    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>) {
-        (self.detect_context_window().await, self.detect_thinking_levels().await)
+    /// not probed two or three times serially.
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        (self.detect_context_window().await, self.detect_thinking_levels().await, self.detect_vision().await)
     }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;

@@ -24,6 +24,8 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
     let replay = provider.replay_reasoning;
     let mut instructions: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
+    // Resolve the image quota once for the whole request, not per tool message.
+    let plan = request.attachment_plan();
     for message in request.messages {
         match message.role {
             Role::System => {
@@ -63,7 +65,7 @@ pub(crate) fn build_body(transport: &HttpTransport, request: &ChatRequest<'_>) -
                 // A tool result with image attachments carries them after the
                 // text: `{type:"input_image", image_url:"data:…;base64,…"}`.
                 // Omitted/missing attachments become a text placeholder.
-                let resolved = request.resolve_attachments(message);
+                let resolved = request.resolve_attachments_with(message, &plan);
                 if resolved.is_empty() {
                     input.push(json!({
                         "type": "function_call_output",

@@ -101,10 +101,11 @@ fn count_arg(args: &Value, name: &str) -> Result<Option<usize>> {
 ///
 /// An image (PNG, JPEG, GIF or WebP, recognised by magic bytes) returns a
 /// structured [`Value`] object instead of text: `{ "image": { media_type,
-/// path, width, height, bytes, data_base64 } }`. The dispatch loop turns that
-/// into a message attachment when the model can view images, or a text error
-/// when it cannot. Other binary files keep the "looks like a binary file"
-/// error.
+/// extension, path, width, height, bytes } }` — the metadata only, never the
+/// pixels. The dispatch loop re-reads the file by path to downscale it, then
+/// turns that into a message attachment when the model can view images, or a
+/// text error when it cannot. Other binary files keep the "looks like a binary
+/// file" error.
 pub fn read_file(args: &Value) -> Result<Value> {
     let path = path_arg(args)?;
     let offset = count_arg(args, "offset")?.unwrap_or(1);
@@ -144,12 +145,17 @@ pub fn read_file(args: &Value) -> Result<Value> {
     Ok(Value::String(output::bound_output(&out, MAX_READ_BYTES).0))
 }
 
-/// Build the structured result for an image: its metadata and the source bytes
-/// base64-encoded. Downscaling to the model's limits happens in the dispatch
-/// loop, which knows the model's capability; here we only decode dimensions.
+/// Build the structured result for an image: its metadata only (never the
+/// pixel bytes). Base64-encoding the whole source here would create an
+/// unbounded transient allocation — several times the file size once the
+/// dispatch loop clones it for the `AfterToolCall` hook and decodes it back —
+/// before the model's byte/dimension limits are ever applied, so a large
+/// image could OOM even though it would end up well under the provider cap.
+/// The dispatch loop instead re-reads the file by `path` and applies `prepare`
+/// (which knows the model's capability) before any base64 encoding; here we
+/// only decode dimensions.
 fn read_image(path: &Path, bytes: &[u8], format: crate::attachment::ImageFormat) -> Result<Value> {
     let (width, height) = image_dimensions(bytes)?;
-    let data_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
     Ok(json!({
         "image": {
             "media_type": format.media_type(),
@@ -158,7 +164,6 @@ fn read_image(path: &Path, bytes: &[u8], format: crate::attachment::ImageFormat)
             "width": width,
             "height": height,
             "bytes": bytes.len(),
-            "data_base64": data_base64,
         }
     }))
 }
@@ -984,7 +989,8 @@ mod tests {
             assert_eq!(image["media_type"], media_type, "{name}");
             assert_eq!(image["width"], 40, "{name}");
             assert_eq!(image["height"], 20, "{name}");
-            assert!(image["data_base64"].as_str().is_some_and(|d| !d.is_empty()), "{name}");
+            assert!(image["bytes"].as_u64().is_some_and(|b| b > 0), "{name}");
+            assert!(image.get("data_base64").is_none(), "{name}: metadata must not carry the pixels");
         }
     }
 
