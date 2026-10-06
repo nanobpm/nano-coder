@@ -458,9 +458,7 @@ mod tests {
         }
         // The text-only `o1-mini`/`o1-preview` subfamilies (and dated aliases /
         // fine-tune wrappers) stay blind, like `o3-mini`.
-        for model in
-            ["o1-mini", "o1-mini-2024-09-12", "o1-preview", "o1-preview-2024-09-12", "ft:o1-mini:org::id"]
-        {
+        for model in ["o1-mini", "o1-mini-2024-09-12", "o1-preview", "o1-preview-2024-09-12", "ft:o1-mini:org::id"] {
             assert!(!assumes_openai_vision(model), "{model} should be blind");
         }
         // A name that merely contains `o1` is not the family.

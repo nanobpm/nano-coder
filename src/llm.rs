@@ -424,7 +424,10 @@ impl ChatRequest<'_> {
                     // unsupported type and rejected. `read_for_limits` keeps
                     // compliant bytes unchanged and re-encodes only when needed.
                     let limits = self.vision.as_ref().map(|v| v.image_limits()).unwrap_or_default();
-                    return match self.attachments_dir.and_then(|dir| crate::attachment::read_for_limits(dir, attachment, &limits)) {
+                    return match self
+                        .attachments_dir
+                        .and_then(|dir| crate::attachment::read_for_limits(dir, attachment, &limits))
+                    {
                         Some(ready) => ResolvedAttachment::Image(ImageData {
                             media_type: ready.media_type,
                             data_base64: ready.data_base64,
@@ -592,9 +595,7 @@ pub trait LLMClient: Send + Sync {
     /// `/api/v0/models`). A provider whose thinking and vision detections read
     /// the same endpoint response (llama.cpp `/props`, Ollama `/api/show`)
     /// overrides this to fetch it once rather than probing twice serially.
-    async fn detect_thinking_and_vision(
-        &self,
-    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         (self.detect_thinking_levels().await, self.detect_vision().await)
     }
     /// The window, thinking levels and vision capability the endpoint reports,

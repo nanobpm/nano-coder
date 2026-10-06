@@ -4039,11 +4039,7 @@ mod tests {
         let tool = agent.conversation().iter().find(|m| m.role == Role::Tool).expect("a tool result");
         assert!(!tool.is_error, "a non-read_file image-shaped result is not an image error: {}", tool.content);
         assert!(tool.attachments.is_empty(), "no attachment is created for a non-read_file tool");
-        assert!(
-            tool.content.contains("\"image\""),
-            "the structured result is stringified unchanged: {}",
-            tool.content
-        );
+        assert!(tool.content.contains("\"image\""), "the structured result is stringified unchanged: {}", tool.content);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6350,7 +6346,8 @@ mod tests {
             }
             async fn detect_capabilities(
                 &self,
-            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>)
+            {
                 self.calls.lock().unwrap().push("capabilities");
                 (Some(DetectedWindow::total(65_536, "test")), None, None)
             }

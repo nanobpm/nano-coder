@@ -475,9 +475,7 @@ impl LLMClient for OpenAiClient {
         detect_capabilities(&self.transport).await
     }
 
-    async fn detect_thinking_and_vision(
-        &self,
-    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         detect_thinking_and_vision(&self.transport).await
     }
 

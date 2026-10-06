@@ -107,10 +107,8 @@ fn exif_orientation(bytes: &[u8], format: ImageFormat) -> image::metadata::Orien
     use image::ImageDecoder as _;
     let cursor = std::io::Cursor::new(bytes);
     let orientation = match format {
-        ImageFormat::Jpeg => image::codecs::jpeg::JpegDecoder::new(cursor)
-            .and_then(|mut d| d.orientation()),
-        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(cursor)
-            .and_then(|mut d| d.orientation()),
+        ImageFormat::Jpeg => image::codecs::jpeg::JpegDecoder::new(cursor).and_then(|mut d| d.orientation()),
+        ImageFormat::WebP => image::codecs::webp::WebPDecoder::new(cursor).and_then(|mut d| d.orientation()),
         ImageFormat::Png | ImageFormat::Gif => return image::metadata::Orientation::NoTransforms,
     };
     orientation.unwrap_or(image::metadata::Orientation::NoTransforms)
@@ -382,8 +380,7 @@ pub fn store(attachments_dir: &Path, attachment: &Attachment, bytes: &[u8]) -> R
     // image and a crash mid-write cannot leave a corrupt sidecar behind.
     let intact = std::fs::read(&path).is_ok_and(|existing| sha256_hex(&existing) == attachment.sha256);
     if !intact {
-        write_atomically(attachments_dir, &path, bytes)
-            .with_context(|| format!("persist {}", path.display()))?;
+        write_atomically(attachments_dir, &path, bytes).with_context(|| format!("persist {}", path.display()))?;
     }
     Ok(path)
 }
@@ -395,16 +392,8 @@ pub fn store(attachments_dir: &Path, attachment: &Attachment, bytes: &[u8]) -> R
 fn write_atomically(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}-{}",
-        std::process::id(),
-        nanos,
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = dir.join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, COUNTER.fetch_add(1, Ordering::Relaxed)));
     // A partial write (e.g. `ENOSPC`) can create the temp file and still fail,
     // so remove it on the write-error path too — every exit that has touched
     // `tmp` must clean it up, not just the rename failure below (mirrors
@@ -473,8 +462,7 @@ pub fn read_for_limits(attachments_dir: &Path, attachment: &Attachment, limits: 
     }
     let format = ImageFormat::sniff(&bytes)?;
     let media_type = format.media_type();
-    let accepts = limits.accepted_media_types.is_empty()
-        || limits.accepted_media_types.iter().any(|t| t == media_type);
+    let accepts = limits.accepted_media_types.is_empty() || limits.accepted_media_types.iter().any(|t| t == media_type);
     // Fast path: the stored bytes already satisfy the active limits (accepted
     // type, within the byte cap, within the dimension cap). The dimensions are
     // read from the hash-verified bytes themselves via a cheap header-only
@@ -667,12 +655,7 @@ mod tests {
         );
         // The source is 100:1; an aspect-preserving shrink keeps it near that.
         let ratio = prepared.width as f64 / prepared.height as f64;
-        assert!(
-            ratio > 60.0,
-            "aspect ratio distorted: {}×{} (ratio {ratio:.1})",
-            prepared.width,
-            prepared.height
-        );
+        assert!(ratio > 60.0, "aspect ratio distorted: {}×{} (ratio {ratio:.1})", prepared.width, prepared.height);
     }
 
     /// A JPEG whose EXIF orientation says "rotate 90° clockwise": the stored
