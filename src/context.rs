@@ -168,10 +168,18 @@ pub fn format_rate(tokens_per_sec: f64) -> String {
 }
 
 pub fn message_tokens(message: &Message) -> usize {
+    let images: usize = message.attachments.iter().map(image_tokens).sum();
+    message_text_tokens(message) + images
+}
+
+/// Tokens for everything in a message *except* its image attachments: the
+/// content text, each tool call, and the per-message framing overhead. Split
+/// out so [`messages_tokens_with_vision`] can charge attachments against the
+/// wire plan (image vs. placeholder) without re-deriving this.
+fn message_text_tokens(message: &Message) -> usize {
     let calls: usize =
         message.tool_calls.iter().map(|c| text_tokens(&c.name) + text_tokens(&c.arguments.to_string()) + 4).sum();
-    let images: usize = message.attachments.iter().map(image_tokens).sum();
-    text_tokens(&message.content) + calls + images + 4
+    text_tokens(&message.content) + calls + 4
 }
 
 /// Token cost estimate for one image, from its pixel dimensions (Anthropic's
@@ -188,6 +196,37 @@ pub fn image_tokens(attachment: &crate::llm::Attachment) -> usize {
 
 pub fn messages_tokens(messages: &[Message]) -> usize {
     messages.iter().map(message_tokens).sum()
+}
+
+/// Token estimate for `messages` that mirrors the vision wire plan: request
+/// builders send only the newest `max_images` image attachments as images and
+/// serialize every older attachment as its short text placeholder
+/// ([`crate::llm::ChatRequest::attachment_plan`]). A plain [`messages_tokens`]
+/// sum instead charges full image tokens for *every* historical attachment, so
+/// on an image-heavy conversation the status estimate can exceed the real
+/// payload by thousands of tokens and trip auto-compaction before the window is
+/// actually full. Charging only the newest `max_images` as images (and the rest
+/// as placeholder text) keeps the estimate tracking what is really sent.
+///
+/// "Newest" is by occurrence across `messages` in order — the same identity the
+/// wire plan uses — so the oldest `total - max_images` attachments become
+/// placeholders. `max_images == 0` (no vision) charges every attachment as a
+/// placeholder, matching a request that sends none.
+pub fn messages_tokens_with_vision(messages: &[Message], max_images: usize) -> usize {
+    let total_attachments: usize = messages.iter().map(|m| m.attachments.len()).sum();
+    // The oldest `omitted` attachment occurrences serialize as text
+    // placeholders; only the newest `max_images` are sent as images.
+    let omitted = total_attachments.saturating_sub(max_images);
+    let mut seen = 0usize;
+    let mut total = 0usize;
+    for message in messages {
+        total += message_text_tokens(message);
+        for attachment in &message.attachments {
+            total += if seen < omitted { text_tokens(&attachment.placeholder()) } else { image_tokens(attachment) };
+            seen += 1;
+        }
+    }
+    total
 }
 
 /// Context window by model family, for models whose provider config has none.
@@ -361,6 +400,37 @@ mod tests {
         // Smaller images keep the plain w*h/750 estimate (floored at 1).
         assert_eq!(image_tokens(&attachment(100, 100)), 14);
         assert_eq!(image_tokens(&attachment(1, 1)), 1);
+    }
+
+    #[test]
+    fn messages_tokens_with_vision_honors_the_newest_n_plan() {
+        let img = crate::llm::Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from("x.png"),
+            sha256: String::new(),
+            width: 1000,
+            height: 1000,
+            bytes: 0,
+            extension: "png".into(),
+        };
+        // Three image occurrences across two messages.
+        let m0 = Message::user("first").with_attachments(vec![img.clone()]);
+        let m1 = Message::user("second").with_attachments(vec![img.clone(), img.clone()]);
+        let convo = [m0, m1];
+        let naive = messages_tokens(&convo);
+        let img_cost = image_tokens(&img);
+        let ph_cost = text_tokens(&img.placeholder());
+        assert!(img_cost > ph_cost, "a big image must cost more than its placeholder");
+
+        // max_images = 1: only the newest occurrence is sent as an image; the
+        // two older ones become placeholders. The saving over the naive
+        // all-images sum is exactly two image→placeholder swaps.
+        assert_eq!(naive - messages_tokens_with_vision(&convo, 1), 2 * (img_cost - ph_cost));
+        // max_images = 0 (no vision): every attachment becomes a placeholder.
+        assert_eq!(naive - messages_tokens_with_vision(&convo, 0), 3 * (img_cost - ph_cost));
+        // max_images >= total attachments: identical to the all-images sum.
+        assert_eq!(messages_tokens_with_vision(&convo, 3), naive);
+        assert_eq!(messages_tokens_with_vision(&convo, 99), naive);
     }
 
     #[test]

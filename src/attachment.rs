@@ -185,7 +185,6 @@ pub fn prepare(
         );
     };
 
-    let mut out_bytes = bytes.to_vec();
     // The format the prepared bytes are actually encoded as — media type and
     // file extension are both derived from this, so they never disagree with
     // the bytes (e.g. after a JPEG re-encode).
@@ -193,7 +192,13 @@ pub fn prepare(
 
     let needs_downscale = width > max_dim || height > max_dim;
     let needs_reencode = !accepts_source;
-    if needs_downscale || needs_reencode || out_bytes.len() > max_bytes {
+    // Copy the source only on the passthrough return path (the `else` below).
+    // The re-encode/downscale branch builds a fresh encoded buffer and never
+    // reads a copy of the source, so copying it up front would pin a full
+    // duplicate of the (large) input in memory alongside the decoded pixels —
+    // exactly the avoidable spike downscaling exists to prevent. `bytes.len()`
+    // needs no copy, so the size check compares against `bytes` directly.
+    let out_bytes = if needs_downscale || needs_reencode || bytes.len() > max_bytes {
         // Decode the raw pixels, then apply the orientation read above to them:
         // re-encoding strips the EXIF metadata, so without this a phone photo
         // shot in portrait would be sent rotated or mirrored. `width`/`height`
@@ -217,11 +222,10 @@ pub fn prepare(
             let (w, h) = (img.width(), img.height());
             let encoded = encode_as(&img, codec)?;
             if encoded.len() <= max_bytes {
-                out_bytes = encoded;
                 out_format = codec;
                 width = w;
                 height = h;
-                break;
+                break encoded;
             }
             // Too big: switch to the size-reducing codec first, before shrinking.
             if codec != shrink_codec {
@@ -246,7 +250,12 @@ pub fn prepare(
             let (nw, nh) = scaled_dimensions(w, h, target);
             img = img.resize(nw, nh, image::imageops::FilterType::Triangle);
         }
-    }
+    } else {
+        // Passthrough: accepted source type, within the dimension and byte
+        // caps. The source bytes are sent verbatim, so this is the only path
+        // that needs a copy of them.
+        bytes.to_vec()
+    };
     Ok(PreparedImage {
         bytes: out_bytes,
         media_type: out_format.media_type().to_string(),

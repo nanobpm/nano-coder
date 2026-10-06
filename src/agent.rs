@@ -1350,10 +1350,15 @@ impl Agent {
     /// Estimated tokens the next request would send, anchored to the last
     /// reported usage when available.
     pub fn estimate_context_tokens(&self) -> (usize, bool) {
+        // Mirror the vision wire plan: only the newest `max_images` attachments
+        // are sent as images, older ones as text placeholders. Charging every
+        // historical image its full token cost overcounts the real payload and
+        // can trip auto-compaction before the window is actually full.
+        let max_images = self.vision().map(|v| v.max_images).unwrap_or(0);
         if let Some((len, tokens)) = self.calibration
             && len <= self.conversation.len()
         {
-            return (tokens + context::messages_tokens(&self.conversation[len..]), true);
+            return (tokens + context::messages_tokens_with_vision(&self.conversation[len..], max_images), true);
         }
         let tools: usize = self
             .tool_definitions()
@@ -1364,7 +1369,7 @@ impl Agent {
                     + context::text_tokens(&d.parameters.to_string())
             })
             .sum();
-        (context::messages_tokens(&self.conversation) + tools, false)
+        (context::messages_tokens_with_vision(&self.conversation, max_images) + tools, false)
     }
 
     /// Recompute the shared statistics and notify the event sink.
