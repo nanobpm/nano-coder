@@ -601,14 +601,24 @@ mod tests {
     }
 
     /// A stored image attachment on a tool-result message, with vision on.
-    fn image_request(dir: &std::path::Path) -> (Vec<Message>, crate::vision::Vision) {
-        let bytes = b"\x89PNG\r\n\x1a\nfakepng".to_vec();
+    /// Returns the raw stored bytes too, so callers can assert the exact
+    /// base64 the compliant fast path passes through unchanged.
+    fn image_request(dir: &std::path::Path) -> (Vec<Message>, crate::vision::Vision, Vec<u8>) {
+        // A real, decodable PNG: resolution now re-prepares stored bytes to the
+        // active model's limits, sniffing their format, so a fake byte string
+        // would be rejected. Dimensions stay within MAX_DIMENSION (1568) and the
+        // bytes within the model's cap, so the compliant fast path passes them
+        // through verbatim.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1200, 675, image::Rgb([20, 120, 200])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
         let attachment = crate::llm::Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from("/tmp/diagram.png"),
             sha256: crate::attachment::sha256_hex(&bytes),
-            width: 1600,
-            height: 900,
+            width: 1200,
+            height: 675,
             bytes: bytes.len(),
             extension: "png".into(),
         };
@@ -625,20 +635,20 @@ mod tests {
                     malformed_arguments: None,
                 }],
             ),
-            Message::tool_result("t1", "read_file", "image/png, 1600×900, 131 KB").with_attachments(vec![attachment]),
+            Message::tool_result("t1", "read_file", "image/png, 1200×675, 131 KB").with_attachments(vec![attachment]),
         ];
         let vision = crate::vision::Vision {
             max_images: 5,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
         };
-        (messages, vision)
+        (messages, vision, bytes)
     }
 
     #[test]
     fn tool_result_carries_image_as_base64_block() {
         let dir = tempfile::tempdir().unwrap();
-        let (messages, vision) = image_request(dir.path());
+        let (messages, vision, bytes) = image_request(dir.path());
         let body = client("http://x").build_body(&ChatRequest {
             messages: &messages,
             tools: &[],
@@ -654,11 +664,11 @@ mod tests {
         assert_eq!(tool_result["type"], "tool_result");
         assert_eq!(tool_result["tool_use_id"], "t1");
         let content = tool_result["content"].as_array().unwrap();
-        assert_eq!(content[0], json!({"type": "text", "text": "image/png, 1600×900, 131 KB"}));
+        assert_eq!(content[0], json!({"type": "text", "text": "image/png, 1200×675, 131 KB"}));
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["source"]["type"], "base64");
         assert_eq!(content[1]["source"]["media_type"], "image/png");
-        let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x89PNG\r\n\x1a\nfakepng");
+        let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
         assert_eq!(content[1]["source"]["data"], json!(expected));
     }
 

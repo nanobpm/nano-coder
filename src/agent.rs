@@ -1134,48 +1134,25 @@ impl Agent {
         self.refresh_stats();
     }
 
-    /// Probe only the thinking levels the endpoint reports, leaving the
-    /// (already cleared) detected window alone. Used when the window comes
-    /// from config and the window half of the combined probe would be
-    /// discarded anyway.
+    /// Probe the thinking levels *and* vision capability together, leaving the
+    /// (already cleared) detected window alone. Used when the window comes from
+    /// config and the window half of the combined probe would be discarded
+    /// anyway.
+    ///
+    /// Thinking and vision are derived from one shared endpoint response
+    /// (llama.cpp `/props`, Ollama `/api/show`, Copilot `/models`), so probing
+    /// them together fetches it once instead of running two serial probes — and
+    /// waiting through two probe budgets — at startup or on a model switch.
+    /// Storing the vision report unconditionally is correct: a `vision = false`
+    /// override discards it at resolution time, while `true`/none keep it
+    /// (`true` forces the capability on yet preserves the endpoint's reported
+    /// limits), mirroring `detect_context_window` on the default path.
     async fn detect_thinking(&mut self) {
-        let probe = self.client.detect_thinking_levels();
-        self.reported_thinking = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
-        self.detect_vision().await;
+        let probe = self.client.detect_thinking_and_vision();
+        let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        self.reported_thinking = thinking;
+        self.reported_vision = vision;
         self.refresh_stats();
-    }
-
-    /// Probe the vision capability the endpoint reports, leaving any configured
-    /// override to win at resolution time (`vision()`). Used only on the
-    /// configured-window path (`detect_thinking`), where the combined
-    /// `detect_capabilities` probe is skipped to avoid an unwanted window
-    /// follow-up; the default path derives vision from that combined probe
-    /// instead of calling this. Skipped only when a configured `vision = false`
-    /// override blinds the model: `resolve` then returns `None` regardless of
-    /// the report, so the probe (which re-fetches `/models` plus llama.cpp
-    /// `/props` or Ollama `/api/show`) would add a serial probe budget on a slow
-    /// endpoint for a genuinely discarded result. A `vision = true` override, by
-    /// contrast, only forces the *capability* on and `resolve` keeps the
-    /// endpoint's reported limits (media types / byte & image caps), so the
-    /// report is NOT discarded there — probe and store it, mirroring
-    /// `detect_context_window`, which likewise keeps the report under an
-    /// override. Skipping it on forced-true would strip a stricter model's
-    /// limits and let an unsupported/oversized request be built and rejected.
-    async fn detect_vision(&mut self) {
-        let (user, _default_provider) = self.config.effective_providers();
-        let providers = providers::effective_providers(&user);
-        let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
-        let (override_, _source) =
-            crate::vision::configured_override(self.config.vision, &provider, self.model_name());
-        if override_ == Some(false) {
-            // A `false` override blinds the model at resolution time, so the
-            // endpoint report is truly discarded; leave it unset and skip the
-            // probe. `true`/`None` still keep the report, so fall through.
-            self.reported_vision = None;
-            return;
-        }
-        let probe = self.client.detect_vision();
-        self.reported_vision = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().flatten();
     }
 
     /// The effective vision capability for the current model: a configured
@@ -1267,6 +1244,12 @@ impl Agent {
         if let Err(e) = crate::attachment::store(&self.attachments_dir(), &attachment, &prepared.bytes) {
             return Err(format!("{}: could not store image: {e}", path.display()));
         }
+        // The model is about to receive the image, so record the source bytes
+        // as read — a later write_file/edit_file on this path then passes the
+        // freshness gate, exactly as a successful text read does. Only reached
+        // once vision is on and the attachment was prepared and stored; the
+        // no-vision error path returned earlier, so it never authorizes a write.
+        crate::files::mark_image_read(&path, &bytes);
         let text = format!(
             "{}, {}×{}, {}",
             attachment.media_type,

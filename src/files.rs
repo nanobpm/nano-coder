@@ -40,6 +40,20 @@ fn remember(path: &Path, bytes: &[u8]) {
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(seen_key(path), digest(bytes));
 }
 
+/// Record a successful image read in the freshness cache, so a later
+/// `write_file`/`edit_file` on the same path passes the "has not been read yet"
+/// check — exactly as a successful text read does via [`read_file`].
+///
+/// `read_file` cannot record this itself: it returns image *metadata* before
+/// the dispatch layer knows whether the model can actually view the image. The
+/// caller invokes this only once the image has truly been delivered to the
+/// model (vision enabled and the attachment prepared and stored); the no-vision
+/// error path returns earlier and so never authorizes a write for an image the
+/// model never saw.
+pub fn mark_image_read(path: &Path, bytes: &[u8]) {
+    remember(path, bytes);
+}
+
 /// Fail unless `current` (the file's bytes on disk) is what the model last saw.
 fn check_fresh(path: &Path, current: &[u8]) -> Result<()> {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(&seen_key(path)).copied();
@@ -1092,6 +1106,31 @@ mod tests {
         edit_file(&json!({ "path": p, "old_string": "more", "new_string": "less" })).unwrap();
         write_file(&json!({ "path": p, "content": "replaced\n" })).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
+    }
+
+    #[test]
+    fn image_reads_authorize_writes_only_once_dispatched_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pic.png");
+        let png = {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        std::fs::write(&path, &png).unwrap();
+        let p = path.to_str().unwrap();
+        // `read_file` returns image metadata but does not itself authorize a
+        // write: only the dispatch layer, once the model can actually view the
+        // image, records the read (the no-vision path must not authorize it).
+        assert!(read_file(&json!({ "path": p })).unwrap().get("image").is_some());
+        let err = write_file(&json!({ "path": p, "content": "x" })).unwrap_err().to_string();
+        assert!(err.contains("has not been read"), "{err}");
+        // Once the image is delivered to the model, a later write passes the
+        // freshness gate — matching a successful text read.
+        mark_image_read(&path, &png);
+        write_file(&json!({ "path": p, "content": "replaced" })).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
     }
 
     #[test]

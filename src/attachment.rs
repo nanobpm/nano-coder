@@ -350,6 +350,11 @@ fn write_atomically(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
 /// when the file is missing (e.g. deleted before a resume) — the caller then
 /// sends a text placeholder instead. The stored bytes are re-checked against
 /// the recorded hash so a tampered or swapped file is not sent to the provider.
+///
+/// The wire path now goes through [`read_for_limits`], which also conforms the
+/// bytes to the active model's limits; this plain reader stays as the integrity
+/// primitive those limit tests build on.
+#[cfg(test)]
 pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<String> {
     let path = attachments_dir.join(stored_filename(attachment)?);
     let bytes = std::fs::read(path).ok()?;
@@ -357,6 +362,67 @@ pub fn read_base64(attachments_dir: &Path, attachment: &Attachment) -> Option<St
         return None;
     }
     Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
+}
+
+/// An attachment read and made to comply with the active model's limits,
+/// ready to place on the wire.
+pub struct ReadyImage {
+    /// Base64 of the (possibly re-encoded) bytes that satisfy the limits.
+    pub data_base64: String,
+    /// The media type of those bytes (derived from the bytes, not the stored
+    /// metadata, so a re-encode or a mislabeled file never disagrees with what
+    /// is actually sent).
+    pub media_type: String,
+}
+
+/// Read an attachment's stored bytes and make them comply with the *active*
+/// model's `limits`, returning the base64 payload and the media type to send.
+///
+/// The stored bytes were prepared for whatever model first read the image; a
+/// later request can switch to — or resume under — a stricter model that caps
+/// bytes lower or accepts fewer media types. Sending the stored bytes unchanged
+/// would then ship an oversized or unsupported image the provider rejects. So
+/// the bytes are re-checked against the current `limits` and re-encoded or
+/// downscaled only when they no longer comply; when they already do, they are
+/// sent unchanged with no decode. The media type is taken from the bytes'
+/// actual magic, so a stored file mislabeled in the session log cannot send a
+/// type the model rejects.
+///
+/// `None` when the file is missing or tampered (hash mismatch), its bytes are
+/// not a recognised image, or it cannot be made to satisfy `limits` at all —
+/// the caller then sends a text placeholder instead of an out-of-limits image.
+pub fn read_for_limits(attachments_dir: &Path, attachment: &Attachment, limits: &ImageLimits) -> Option<ReadyImage> {
+    let path = attachments_dir.join(stored_filename(attachment)?);
+    let bytes = std::fs::read(path).ok()?;
+    if sha256_hex(&bytes) != attachment.sha256 {
+        return None;
+    }
+    let format = ImageFormat::sniff(&bytes)?;
+    let media_type = format.media_type();
+    let accepts = limits.accepted_media_types.is_empty()
+        || limits.accepted_media_types.iter().any(|t| t == media_type);
+    // Fast path: the stored bytes already satisfy the active limits (accepted
+    // type, within the byte cap, within the dimension cap). The recorded
+    // dimensions describe exactly these hash-verified bytes, so trusting them
+    // here avoids re-decoding a compliant image on every request.
+    if accepts
+        && bytes.len() <= limits.max_bytes
+        && attachment.width <= limits.max_dimension
+        && attachment.height <= limits.max_dimension
+    {
+        return Some(ReadyImage {
+            data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+            media_type: media_type.to_string(),
+        });
+    }
+    // Otherwise re-prepare against the current model's limits; `prepare` fails
+    // when no accepted codec can meet the byte cap, in which case we omit it.
+    let prepared =
+        prepare(&bytes, format, limits.max_dimension, limits.max_bytes, &limits.accepted_media_types).ok()?;
+    Some(ReadyImage {
+        data_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &prepared.bytes),
+        media_type: prepared.media_type,
+    })
 }
 
 /// Whether an attachment's stored copy is still available *intact* on disk:
@@ -699,5 +765,87 @@ mod tests {
         // No temp files were left behind by the atomic rename.
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(entries.len(), 1, "only the single hash-named file remains");
+    }
+
+    fn make_gif(w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb([10, 20, 30])));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Gif).unwrap();
+        out.into_inner()
+    }
+
+    fn store_bytes(dir: &Path, bytes: &[u8], ext: &str, media_type: &str) -> crate::llm::Attachment {
+        let (width, height) = dimensions(bytes).unwrap();
+        let attachment = crate::llm::Attachment {
+            media_type: media_type.into(),
+            path: std::path::PathBuf::from("/tmp/x"),
+            sha256: sha256_hex(bytes),
+            width,
+            height,
+            bytes: bytes.len(),
+            extension: ext.into(),
+        };
+        store(dir, &attachment, bytes).unwrap();
+        attachment
+    }
+
+    /// Compliant stored bytes are sent unchanged, with the media type derived
+    /// from the bytes themselves (not the possibly-stale stored metadata).
+    #[test]
+    fn read_for_limits_passes_compliant_bytes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        // Metadata lies that these PNG bytes are a JPEG; the wire media type
+        // must still follow the actual bytes so the model never gets a type it
+        // rejects.
+        let attachment = store_bytes(dir.path(), &bytes, "png", "image/jpeg");
+        let ready = read_for_limits(dir.path(), &attachment, &ImageLimits::default()).unwrap();
+        assert_eq!(ready.media_type, "image/png", "media type comes from the bytes, not the stored field");
+        let expect = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        assert_eq!(ready.data_base64, expect, "compliant bytes sent unchanged");
+    }
+
+    /// A stored image whose type the active model does not accept is re-encoded
+    /// to an accepted codec at send time — the class the reviewer flagged: a
+    /// stricter model selected after the image was stored must not receive an
+    /// unsupported type.
+    #[test]
+    fn read_for_limits_reencodes_for_a_stricter_media_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_gif(20, 20);
+        let attachment = store_bytes(dir.path(), &bytes, "gif", "image/gif");
+        let limits = ImageLimits { accepted_media_types: vec!["image/png".into()], ..ImageLimits::default() };
+        let ready = read_for_limits(dir.path(), &attachment, &limits).unwrap();
+        assert_eq!(ready.media_type, "image/png", "GIF re-encoded into the accepted PNG codec");
+        let reencoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &ready.data_base64).unwrap();
+        assert_eq!(ImageFormat::sniff(&reencoded), Some(ImageFormat::Png));
+    }
+
+    /// When the stored bytes cannot be made to satisfy the active model's
+    /// limits at all, the attachment is omitted (None) rather than sent
+    /// oversized — the provider would reject it otherwise.
+    #[test]
+    fn read_for_limits_omits_when_limits_cannot_be_met() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(64, 64);
+        let attachment = store_bytes(dir.path(), &bytes, "png", "image/png");
+        // A byte cap so small no re-encode at the minimum size can meet it.
+        let limits = ImageLimits { max_bytes: 10, ..ImageLimits::default() };
+        assert!(read_for_limits(dir.path(), &attachment, &limits).is_none());
+    }
+
+    /// Missing and tampered files are omitted, exactly like the integrity gate
+    /// the plain reader applies.
+    #[test]
+    fn read_for_limits_rejects_missing_and_tampered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = make_png(10, 10);
+        let attachment = store_bytes(dir.path(), &bytes, "png", "image/png");
+        assert!(read_for_limits(dir.path(), &attachment, &ImageLimits::default()).is_some());
+        let path = dir.path().join(stored_filename(&attachment).unwrap());
+        std::fs::write(&path, b"tampered").unwrap();
+        assert!(read_for_limits(dir.path(), &attachment, &ImageLimits::default()).is_none(), "tampered → omitted");
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_for_limits(dir.path(), &attachment, &ImageLimits::default()).is_none(), "missing → omitted");
     }
 }

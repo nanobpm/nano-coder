@@ -418,10 +418,18 @@ impl ChatRequest<'_> {
             .map(|attachment| {
                 let ptr = attachment as *const crate::llm::Attachment;
                 if plan.sendable.contains(&ptr) {
-                    return match self.attachments_dir.and_then(|dir| crate::attachment::read_base64(dir, attachment)) {
-                        Some(data_base64) => ResolvedAttachment::Image(ImageData {
-                            media_type: attachment.media_type.clone(),
-                            data_base64,
+                    // Re-prepare the stored bytes against the *active* model's
+                    // limits (byte cap + accepted media types), not only the
+                    // `max_images` count the plan enforced: a stored image first
+                    // prepared for a laxer model (or resumed under a stricter
+                    // one) could otherwise be sent oversized or as an
+                    // unsupported type and rejected. `read_for_limits` keeps
+                    // compliant bytes unchanged and re-encodes only when needed.
+                    let limits = self.vision.as_ref().map(|v| v.image_limits()).unwrap_or_default();
+                    return match self.attachments_dir.and_then(|dir| crate::attachment::read_for_limits(dir, attachment, &limits)) {
+                        Some(ready) => ResolvedAttachment::Image(ImageData {
+                            media_type: ready.media_type,
+                            data_base64: ready.data_base64,
                         }),
                         None => ResolvedAttachment::Omitted(format!(
                             "[image: {}, {}×{} (no longer available)]",
@@ -579,6 +587,18 @@ pub trait LLMClient: Send + Sync {
     async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         None
     }
+    /// The thinking levels and vision capability the endpoint reports, probed
+    /// together but **without** the context-window follow-ups. Used when the
+    /// window is already configured, so the window probe would be discarded
+    /// anyway (and running it can add an unwanted follow-up like LM Studio's
+    /// `/api/v0/models`). A provider whose thinking and vision detections read
+    /// the same endpoint response (llama.cpp `/props`, Ollama `/api/show`)
+    /// overrides this to fetch it once rather than probing twice serially.
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        (self.detect_thinking_levels().await, self.detect_vision().await)
+    }
     /// The window, thinking levels and vision capability the endpoint reports,
     /// probed together.
     ///
@@ -711,7 +731,18 @@ mod tests {
 
     /// An attachment with a stable hash of `tag`, stored (when `dir` is set).
     fn attachment(tag: &str, dir: Option<&std::path::Path>) -> Attachment {
-        let bytes = tag.as_bytes().to_vec();
+        // A real, tag-distinct PNG: resolution re-prepares stored bytes and
+        // sniffs their format, so the stored file must be a decodable image,
+        // not raw tag bytes. The pixel colour derives from the tag so distinct
+        // tags hash distinctly (and the same tag stays one shared image).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&tag, &mut hasher);
+        let n = std::hash::Hasher::finish(&hasher);
+        let colour = image::Rgb([(n & 0xff) as u8, ((n >> 8) & 0xff) as u8, ((n >> 16) & 0xff) as u8]);
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, colour));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
         let a = Attachment {
             media_type: "image/png".into(),
             path: std::path::PathBuf::from(format!("/tmp/{tag}.png")),

@@ -465,6 +465,12 @@ impl LLMClient for OpenAiClient {
         detect_capabilities(&self.transport).await
     }
 
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        detect_thinking_and_vision(&self.transport).await
+    }
+
     async fn list_models(&self) -> Result<Vec<String>> {
         let provider = self.transport.provider();
         let mut request = self.transport.http().get(format!("{}/models", provider.base_url));
@@ -660,6 +666,45 @@ pub(crate) async fn detect_capabilities(
             (window, None, None)
         }
         Server::Other => (entry.and_then(window_in_entry), None, None),
+    }
+}
+
+/// Probe the endpoint for the thinking levels and vision capability in one
+/// pass, **without** the context-window follow-ups. Used on the
+/// configured-window path, where the window is already known: both detections
+/// share the same `/models` list to identify the server and the same
+/// server-specific response (llama.cpp `/props`, Ollama `/api/show`), so
+/// fetching it once keeps a slow or unavailable endpoint from being probed
+/// twice serially (and from waiting through two probe budgets). The
+/// window-only follow-ups (Ollama `/api/ps`, LM Studio `/api/v0/models`) are
+/// skipped since the window is discarded here.
+pub(crate) async fn detect_thinking_and_vision(
+    transport: &HttpTransport,
+) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    let provider = transport.provider();
+    let base = provider.base_url.as_str();
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let model = provider.model.as_str();
+    let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
+    let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    match identify(&provider.name, root, entry) {
+        Server::LlamaCpp => {
+            let url = format!("{root}/props?model={}", urlencode(model));
+            let props = probe(transport, reqwest::Method::GET, &url, None).await;
+            let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
+            let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
+            (thinking, vision)
+        }
+        Server::Ollama => {
+            let url = format!("{root}/api/show");
+            let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
+            let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
+            let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
+            (thinking, vision)
+        }
+        // These servers report neither thinking nor vision from their own
+        // endpoints; the built-in assumption or a config override decides.
+        Server::LmStudio | Server::Other => (None, None),
     }
 }
 
@@ -1725,6 +1770,51 @@ mod tests {
         assert_eq!(win, window(16384, "Ollama num_ctx"));
         assert_eq!(thinking.map(|r| r.format), Some(Format::Effort));
         assert_eq!(paths, ["/v1/models", "/api/ps", "/api/show"], "/api/show is shared, not repeated");
+    }
+
+    async fn detect_tv(
+        provider_name: &str,
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Vec<String>) {
+        let (url, captured) = test_server::serve(responses).await;
+        let user = HashMap::from([(
+            provider_name.to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
+        let (thinking, vision) = OpenAiClient::new(resolved).unwrap().detect_thinking_and_vision().await;
+        let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        (thinking, vision, paths)
+    }
+
+    #[tokio::test]
+    async fn thinking_and_vision_probe_shares_one_fetch() {
+        // On the configured-window path the window probe is skipped, but
+        // thinking and vision must still come from a single shared endpoint
+        // fetch — not two serial probes that re-fetch /models and /props or
+        // /api/show.
+
+        // llama.cpp: one /models and one /props serve both thinking and vision.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "llamacpp"}]});
+        let props = json!({"modalities": {"vision": true}, "chat_template": "{% if enable_thinking %}"});
+        let (thinking, vision, paths) =
+            detect_tv("box", vec![(200, "", models.to_string()), (200, "", props.to_string())]).await;
+        assert_eq!(thinking.map(|r| r.levels), Some(vec!["off".to_string(), "on".to_string()]));
+        assert!(vision.is_some(), "vision derived from the shared /props");
+        assert_eq!(paths, ["/v1/models", "/props?model=qwen3%3A8b"], "each endpoint probed once, no /api/ps");
+
+        // Ollama: one /models and one /api/show — and no window-only /api/ps.
+        let models = json!({"data": [{"id": "qwen3:8b", "owned_by": "library"}]});
+        let show = json!({"capabilities": ["completion", "thinking", "vision"]});
+        let (thinking, vision, paths) =
+            detect_tv("ollama", vec![(200, "", models.to_string()), (200, "", show.to_string())]).await;
+        assert!(thinking.is_some(), "thinking derived from the shared /api/show");
+        assert!(vision.is_some(), "vision derived from the same /api/show");
+        assert_eq!(paths, ["/v1/models", "/api/show"], "/api/show fetched once, no /api/ps window probe");
     }
 
     #[tokio::test]
