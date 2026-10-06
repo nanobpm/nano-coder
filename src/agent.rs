@@ -1125,10 +1125,11 @@ impl Agent {
         self.detected_window = window;
         self.reported_thinking = thinking;
         // Vision is derived from the same probe responses `detect_capabilities`
-        // already fetched, so it costs no extra round trip. A configured
-        // `vision` override still wins at resolution time (`vision()` ignores
-        // this report when an override is set), so storing the report here is
-        // harmless even then.
+        // already fetched, so it costs no extra round trip. Storing the report
+        // is always the right move: a `vision = false` override discards it at
+        // resolution time, but `true`/none keep it (`true` forces the capability
+        // on yet preserves the endpoint's reported limits), so keeping it here
+        // lets `resolve` apply those limits on the default path too.
         self.reported_vision = vision;
         self.refresh_stats();
     }
@@ -1149,19 +1150,27 @@ impl Agent {
     /// configured-window path (`detect_thinking`), where the combined
     /// `detect_capabilities` probe is skipped to avoid an unwanted window
     /// follow-up; the default path derives vision from that combined probe
-    /// instead of calling this. Skipped when a configured `vision` override
-    /// already decides the capability: the probe re-fetches `/models` plus
-    /// llama.cpp `/props` or Ollama `/api/show`, so running it for an unused
-    /// result adds a serial probe budget on a slow endpoint for nothing.
+    /// instead of calling this. Skipped only when a configured `vision = false`
+    /// override blinds the model: `resolve` then returns `None` regardless of
+    /// the report, so the probe (which re-fetches `/models` plus llama.cpp
+    /// `/props` or Ollama `/api/show`) would add a serial probe budget on a slow
+    /// endpoint for a genuinely discarded result. A `vision = true` override, by
+    /// contrast, only forces the *capability* on and `resolve` keeps the
+    /// endpoint's reported limits (media types / byte & image caps), so the
+    /// report is NOT discarded there — probe and store it, mirroring
+    /// `detect_context_window`, which likewise keeps the report under an
+    /// override. Skipping it on forced-true would strip a stricter model's
+    /// limits and let an unsupported/oversized request be built and rejected.
     async fn detect_vision(&mut self) {
         let (user, _default_provider) = self.config.effective_providers();
         let providers = providers::effective_providers(&user);
         let provider = providers.get(self.provider_name()).cloned().unwrap_or_default();
         let (override_, _source) =
             crate::vision::configured_override(self.config.vision, &provider, self.model_name());
-        if override_.is_some() {
-            // A configured override wins at resolution time, so the endpoint
-            // report would be discarded; leave it unset and skip the probe.
+        if override_ == Some(false) {
+            // A `false` override blinds the model at resolution time, so the
+            // endpoint report is truly discarded; leave it unset and skip the
+            // probe. `true`/`None` still keep the report, so fall through.
             self.reported_vision = None;
             return;
         }
