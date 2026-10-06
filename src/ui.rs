@@ -184,6 +184,16 @@ pub struct Renderer {
     /// Stdout is a terminal (in-place redraws are possible).
     tty: bool,
     expanded: AtomicBool,
+    /// Set when the turn's live answer stream may have been left incomplete by
+    /// a mid-turn verbosity change. Only `quiet` suppresses streamed deltas, so
+    /// a turn that is `quiet` for part of a streamed answer but ends at another
+    /// level loses the suppressed deltas. The frame renderer reconciles the
+    /// final `AssistantMessage` in place regardless; the legacy renderer, which
+    /// streams straight to the terminal and can't retract, uses this flag to
+    /// reprint the authoritative full response at turn end. Seeded at
+    /// `begin_turn` from the starting level and raised by a mid-turn switch to
+    /// `quiet`.
+    touched_quiet: AtomicBool,
     /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
     /// terminal. When set, all output is composed into one frame (transcript,
     /// editor, status as the last line) and diff-rendered by a single writer,
@@ -252,6 +262,7 @@ impl Renderer {
             status,
             tty,
             expanded: AtomicBool::new(false),
+            touched_quiet: AtomicBool::new(false),
             frame,
         })
     }
@@ -397,8 +408,30 @@ impl Renderer {
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
-                if fs.stream.is_none() && !text.is_empty() {
-                    fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                // Reconcile the streamed answer with the authoritative final
+                // text. Normally the accumulated deltas already equal `text`,
+                // so this is a no-op. But a mid-turn `/verbosity` change can
+                // desync them: switching to quiet mid-stream drops the
+                // remaining deltas (leaving a truncated prefix), and switching
+                // away from quiet starts a fresh stream at a suffix (dropping
+                // the earlier deltas). Overwriting in place — rather than
+                // trusting accumulation — restores the full message in every
+                // case without duplicating it or disturbing the item's order
+                // (a mid-stream `/trajectory` export sits in a later item).
+                match fs.stream {
+                    Some(i) if !text.is_empty() => {
+                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) =
+                            fs.items.get_mut(i)
+                            && existing.as_str() != *text
+                        {
+                            *existing = (*text).to_string();
+                        }
+                    }
+                    Some(_) => {}
+                    None if !text.is_empty() => {
+                        fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                    }
+                    None => {}
                 }
                 self.frame_finish_stream(fs);
             }
@@ -617,9 +650,32 @@ impl Renderer {
     pub fn begin_turn(&self) {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
+        // Seed the truncation guard from the starting level (see the field):
+        // a turn that begins quiet has already suppressed any streamed deltas.
+        self.touched_quiet.store(verbosity() == Verbosity::Quiet, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         state.in_turn = true;
         state.at_line_start = true;
+    }
+
+    /// Set the global verbosity in response to `/verbosity` typed mid-turn.
+    /// Applying it immediately keeps the rest of the turn at the new level; the
+    /// final-answer reconciliation (frame: in place; legacy: a turn-end reprint
+    /// gated on [`Self::answer_may_be_truncated`]) is what prevents a switch
+    /// across the `quiet` boundary from truncating the streamed answer.
+    pub fn set_verbosity_mid_turn(&self, level: Verbosity) {
+        if level == Verbosity::Quiet {
+            self.touched_quiet.store(true, Ordering::Relaxed);
+        }
+        set_verbosity(level);
+    }
+
+    /// Whether the turn's live-streamed answer may be incomplete because the
+    /// verbosity was `quiet` for part of it (so some streamed deltas were
+    /// suppressed). The legacy renderer reprints the full response when this is
+    /// true and the turn did not already reprint via its `quiet` end path.
+    pub fn answer_may_be_truncated(&self) -> bool {
+        self.touched_quiet.load(Ordering::Relaxed)
     }
 
     pub fn end_turn(&self) {
@@ -1082,6 +1138,7 @@ mod tests {
                 status: None,
                 tty: true,
                 expanded: AtomicBool::new(false),
+                touched_quiet: AtomicBool::new(false),
                 frame: Some(Mutex::new(FrameState {
                     out: FrameRenderer::new(io::stdout()),
                     items: Vec::new(),
@@ -1212,6 +1269,35 @@ mod tests {
             1,
             "the export must still be kept: {items:?}"
         );
+    }
+
+    #[test]
+    fn assistant_message_reconciles_a_partial_stream() {
+        // A mid-turn `/verbosity` change can desync the streamed deltas from
+        // the final answer: switching to quiet drops the remaining deltas
+        // (leaving a truncated prefix), and switching away from quiet starts a
+        // fresh stream at a suffix (dropping the earlier deltas). Either way the
+        // open stream item holds only part of the answer when `AssistantMessage`
+        // arrives. It must reconcile to the full authoritative text — in place,
+        // without duplicating — rather than trusting the accumulated deltas.
+        for partial in ["Here ", "answer."] {
+            let r = Renderer::frame_for_test();
+            r.event(&AgentEvent::TextDelta { text: partial });
+            r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+            let messages: Vec<_> = r
+                .frame_items()
+                .iter()
+                .filter_map(|i| match &i.item {
+                    Item::Message { role: Role::Assistant, text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                ["Here is the answer."],
+                "partial stream {partial:?} was not reconciled to the full answer"
+            );
+        }
     }
 
     #[test]

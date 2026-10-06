@@ -189,8 +189,10 @@ fn apply_next_step_setting(
     } else if let Some(arg) = cmd.strip_prefix("/verbosity ") {
         match arg.trim().parse::<ui::Verbosity>() {
             Ok(level) => {
-                // The agent's config copy is synced when the turn ends.
-                ui::set_verbosity(level);
+                // The agent's config copy is synced when the turn ends. Route
+                // through the renderer so a mid-turn change reconciles the
+                // final streamed answer instead of truncating it.
+                renderer.set_verbosity_mid_turn(level);
                 format!("Verbosity set to {level} ({}); /settings saves it", level.describe())
             }
             Err(e) => e,
@@ -660,7 +662,29 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             SteerRoute::DeferCommand => match turn_commands::timing(text) {
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
-                                    match snapshot.output(text, &stats, &control.plan()) {
+                                    let plan = control.plan();
+                                    // `/trajectory` reads and decodes the whole
+                                    // session log from disk; run that on the
+                                    // blocking pool so the synchronous I/O does
+                                    // not stall this async worker thread (the
+                                    // other immediate commands are pure in-memory
+                                    // formatting, so they stay inline). A join
+                                    // error can only come from a panic in the
+                                    // render; surface it rather than unwrapping.
+                                    let out = if text == "/trajectory" || text.starts_with("/trajectory ") {
+                                        let snap = snapshot.clone();
+                                        let cmd = text.to_string();
+                                        tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                            .await
+                                            .unwrap_or_else(|_| {
+                                                Some(turn_commands::Output::Block(
+                                                    "Could not render the trajectory (internal task error)".to_string(),
+                                                ))
+                                            })
+                                    } else {
+                                        snapshot.output(text, &stats, &plan)
+                                    };
+                                    match out {
                                         Some(turn_commands::Output::Block(out)) => renderer.turn_block(&out),
                                         Some(turn_commands::Output::Raw(out)) if renderer.is_frame() => {
                                             renderer.print_raw(&out)
@@ -1284,6 +1308,13 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
                     let last = outcome.response.lines().last().unwrap_or_default();
                     println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
+                } else if terminal.renderer.answer_may_be_truncated() {
+                    // The turn was quiet for part of its streamed answer but
+                    // ended at a louder level, so the live stream dropped the
+                    // deltas emitted while quiet. Reprint the authoritative
+                    // full response (the quiet end path above already does this
+                    // when the turn ends quiet).
+                    println!("{}", ui::stamp_block(&outcome.response));
                 }
             }
             Ok(true)
