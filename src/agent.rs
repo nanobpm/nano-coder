@@ -691,16 +691,28 @@ impl Agent {
             // indefinitely if it hangs), stalling streaming and cancel/other
             // input. Offload the blocking build to the blocking thread pool and
             // await it, so the runtime stays responsive while the key command
-            // runs. The build also honours the turn's cancel flag: on cancel it
-            // kills the key-command child and fails fast, and we race the await
-            // against `control.cancelled()` below so the turn returns promptly
-            // instead of blocking on a hung command.
+            // runs. The build honours a cancel flag: on cancel it kills the
+            // key-command child and fails fast, and we race the await against
+            // `control.cancelled()` below so the turn returns promptly instead
+            // of blocking on a hung command.
+            //
+            // The flag the build polls must be a **build-local** token, not the
+            // turn-wide cancel flag. On cancel we drop `handle` below, but a
+            // dropped `spawn_blocking` task keeps running — so the key-command
+            // worker outlives this call. If it polled the turn-wide flag,
+            // `run_turn` could return and the next turn's `start_turn()` would
+            // reset that flag back to `false` before the worker's 50 ms poll
+            // observed the cancel, letting the supposedly-killed helper run on
+            // until its 120 s timeout. A token private to this build can never
+            // be reset by the next turn, so once we set it the worker reliably
+            // kills its child.
             let config_for_build = self.config.clone();
             let spec_for_build = spec.clone();
-            let cancel = self.control.cancel_flag();
+            let build_cancel = Arc::new(AtomicBool::new(false));
+            let cancel_for_build = build_cancel.clone();
             let control = self.control.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                Self::client_for_cancellable(&config_for_build, &spec_for_build, Some(&cancel))
+                Self::client_for_cancellable(&config_for_build, &spec_for_build, Some(&cancel_for_build))
             });
             let built = tokio::select! {
                 joined = handle => match joined {
@@ -708,12 +720,16 @@ impl Agent {
                     Err(join) => Err(anyhow::anyhow!("building client for {spec:?} panicked: {join}")),
                 },
                 _ = control.cancelled() => {
-                    // Cancelled mid-build: the blocking build observes the same
-                    // cancel flag, kills its key-command child, and unblocks, so
-                    // stop waiting and abort the switch rather than install a
-                    // client for a turn the user just cancelled. The request has
-                    // been consumed, so it will not fire into the next turn.
-                    // Signal the caller to stop before its next model call.
+                    // Cancelled mid-build: set the build-local token so the
+                    // still-running blocking build observes it, kills its
+                    // key-command child, and unblocks — even though we drop its
+                    // handle here and the next turn will reset the turn-wide
+                    // cancel flag. Then stop waiting and abort the switch rather
+                    // than install a client for a turn the user just cancelled.
+                    // The request has been consumed, so it will not fire into
+                    // the next turn. Signal the caller to stop before its next
+                    // model call.
+                    build_cancel.store(true, Ordering::SeqCst);
                     return true;
                 }
             };
@@ -4067,6 +4083,56 @@ mod tests {
         assert_eq!(agent.provider_name(), provider, "the switch did not apply");
         assert_eq!(agent.model_name(), model);
         assert!(agent.control().has_model_request(), "the request stays queued for the next turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset() {
+        // A `/model` switch cancelled *while its api_key_command child is still
+        // building* must kill that child. `apply_model_request` drops the
+        // blocking build's `JoinHandle` on cancel, but a dropped
+        // `spawn_blocking` task keeps running, so the key-command worker
+        // outlives the call. If the worker polled the turn-wide cancel flag,
+        // the next turn's `start_turn()` would reset it to `false` before the
+        // worker's 50 ms poll saw the cancel, and the supposedly-killed helper
+        // would run on until its 120 s timeout. The build-local token the fix
+        // uses cannot be reset by the next turn, so the child is killed and the
+        // marker its command would touch never appears.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("LEAKED");
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.config.providers.insert(
+            "slowmock".to_string(),
+            crate::providers::ProviderConfig {
+                kind: Some(crate::providers::ProviderKind::Mock),
+                default_model: Some("m".to_string()),
+                // Sleeps, then (only if not killed) touches the marker. A
+                // killed process group never reaches the `touch`.
+                api_key_command: Some(format!("sleep 1; touch {}", marker.display())),
+                ..Default::default()
+            },
+        );
+        let control = agent.control().clone();
+        control.set_model("slowmock/x");
+        // Run the build on a task so we can cancel it mid-build (it blocks in
+        // the key command's `sleep`), exercising the dropped-handle path rather
+        // than the pre-build cancel guard.
+        let build = tokio::spawn(async move { agent.apply_model_request().await });
+        // Let the blocking build spawn and enter the key command's sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        control.cancel();
+        assert!(build.await.unwrap(), "the cancelled build signals the caller to stop");
+        // Simulate the next turn resetting the turn-wide cancel flag before the
+        // detached worker's next poll — the exact sequence that let a
+        // supposedly-cancelled helper survive when the build observed the
+        // turn-wide flag instead of a build-local token.
+        control.cancel_flag().store(false, Ordering::SeqCst);
+        // Well past both the worker's 50 ms poll and the command's 1 s sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the cancelled key-command child was killed via the build-local token, not left running \
+             past the turn-wide flag reset to touch the marker",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
