@@ -974,6 +974,16 @@ impl Renderer {
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
                 if !state.streamed_text && !text.is_empty() {
+                    // This non-streamed message is the full, authoritative
+                    // answer and is printed here in its entirety. Drop any
+                    // truncation signal left by an earlier suppressed segment
+                    // (or by this answer's own quiet-suppressed deltas, which
+                    // never set `streamed_text`) so turn-end reconciliation does
+                    // not reprint — and thus duplicate — what we just printed.
+                    // When the answer instead streamed live (`streamed_text`),
+                    // that live stream may be incomplete, so the guard is left
+                    // set for the reprint.
+                    self.touched_quiet.store(false, Ordering::Relaxed);
                     self.newline(&mut state);
                     self.out(&mut state, &stamp_block(text));
                 }
@@ -1555,6 +1565,57 @@ pub(crate) mod tests {
         assert!(
             r.answer_may_be_truncated(),
             "a final answer whose own prefix was suppressed while quiet must be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn non_streamed_final_message_clears_an_earlier_suppressed_segments_guard() {
+        // `report_outcome` synthesizes the final answer and emits only an
+        // `AssistantMessage` (no preceding `TextDelta`). If an earlier tool-loop
+        // response was suppressed while quiet, that non-streamed final message is
+        // printed in full by the louder `AssistantMessage` arm — so the stale
+        // guard from the earlier segment must be cleared, or turn-end
+        // reconciliation reprints (duplicates) the just-printed answer.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // Earlier tool-loop response suppressed while quiet, then it closes.
+        r.event(&AgentEvent::TextDelta { text: "intermediate" });
+        assert!(r.answer_may_be_truncated(), "the suppressed intermediate delta flags truncation");
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "intermediate" });
+
+        // Switch louder; the final answer arrives as a non-streamed message.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m2", text: "final answer" });
+        assert!(
+            !r.answer_may_be_truncated(),
+            "a non-streamed final message printed in full must not be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn fully_quiet_final_answer_closed_by_a_louder_message_is_not_reprinted() {
+        // The whole final answer streams while quiet (every delta suppressed, so
+        // `streamed_text` stays false), then the user switches louder and the
+        // terminating `AssistantMessage` arrives. The louder arm prints the full
+        // text in place, so the guard must be cleared — reprinting would
+        // duplicate the answer just printed.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "final answer" }); // suppressed while quiet
+        assert!(r.answer_may_be_truncated(), "the suppressed final delta flags truncation");
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "final answer" });
+        assert!(
+            !r.answer_may_be_truncated(),
+            "a non-streamed message that printed the full answer must not be reprinted"
         );
         set_verbosity(Verbosity::Normal);
     }
