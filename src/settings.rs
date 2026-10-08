@@ -58,7 +58,10 @@ impl Changes {
     }
 }
 
-/// How a provider's API key is found, for display.
+/// How a provider's API key is found, for display. For a GitHub Copilot
+/// provider whose env var is unset this reads the stored-credentials file, so
+/// call it only when the status is actually shown (e.g. `/providers`, the
+/// settings dialog), not on a hot path like per-turn snapshot capture.
 pub fn key_status(provider: &ProviderConfig) -> String {
     let env_var = provider.api_key_env.as_ref().filter(|v| !v.is_empty());
     match (&provider.api_key, env_var, &provider.api_key_command) {

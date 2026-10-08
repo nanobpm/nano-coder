@@ -238,6 +238,9 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// The plan as last published by the agent (every `AgentEvent::Plan`),
+    /// so `/plan` can show it while a turn holds the agent.
+    plan: Mutex<crate::plan::Plan>,
     /// `/thinking LEVEL` for this session; wins over the config. Shared so a
     /// level set mid-turn applies from the agent's next model call.
     thinking: Mutex<Option<crate::thinking::Thinking>>,
@@ -259,6 +262,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                plan: Mutex::new(crate::plan::Plan::default()),
                 thinking: Mutex::new(None),
             }),
         }
@@ -319,6 +323,15 @@ impl TurnControl {
         let mut mode = self.inner.mode.lock().unwrap();
         *mode = mode.next();
         *mode
+    }
+
+    /// The plan as the agent last published it.
+    pub fn plan(&self) -> crate::plan::Plan {
+        self.inner.plan.lock().unwrap().clone()
+    }
+
+    pub fn publish_plan(&self, plan: &crate::plan::Plan) {
+        *self.inner.plan.lock().unwrap() = plan.clone();
     }
 
     /// Flag for synchronous tools (e.g. bash) to poll.
@@ -1461,10 +1474,13 @@ impl Agent {
             stats.model = self.client.model_name().to_string();
             stats.tokens = tokens;
             stats.calibrated = calibrated;
-            stats.window = self.context_window();
+            let (window, window_source) = self.context_window_with_source();
+            stats.window = window;
+            stats.window_source = window_source;
             stats.messages = self.conversation.len();
             stats.auto_compact = self.config.auto_compact.then_some(self.config.auto_compact_threshold);
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
+            stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
@@ -1584,6 +1600,9 @@ impl Agent {
     }
 
     fn emit(&self, event: AgentEvent) {
+        if let AgentEvent::Plan { plan } = &event {
+            self.control.publish_plan(plan);
+        }
         if let Some(sink) = &self.event_sink {
             sink(self.session_id.as_deref(), &event);
         }
@@ -2196,8 +2215,17 @@ impl Agent {
         Ok(())
     }
 
-    /// Registered tools plus the plan tools when enabled.
-    pub fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
+    /// Every registered tool plus the plan tools when enabled, with **no**
+    /// mode filter applied. This is the full superset for all modes, but it
+    /// still omits the history tools when they are disabled. Callers that must
+    /// track a live change after capturing it (`/tools`, see
+    /// [`crate::turn_commands::Snapshot`]) take
+    /// [`tool_definitions_superset`](Self::tool_definitions_superset) instead —
+    /// it builds on this and *also* keeps the history tools so a mid-turn
+    /// availability change can be re-filtered live — and filter at render time.
+    /// Use [`tool_definitions`](Self::tool_definitions) for the set the agent
+    /// actually offers the model under the current mode.
+    pub fn tool_definitions_all_modes(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
@@ -2214,6 +2242,29 @@ impl Agent {
         if self.memory_enabled() {
             tools.extend(memory::definitions(self.memory_writable()));
         }
+        tools
+    }
+
+    /// The full tool superset for a mid-turn snapshot that filters live: like
+    /// [`Self::tool_definitions_all_modes`] but *always* includes the history
+    /// tools, regardless of their current availability. A smart auto-compaction
+    /// can enable the history tools part-way through the same turn, so freezing
+    /// their availability at snapshot capture would make a later mid-turn
+    /// `/tools` omit tools the next model step actually receives. The snapshot
+    /// instead re-filters them against the live `ContextStats::history_available`
+    /// flag at render time, exactly as it re-filters the mode.
+    pub fn tool_definitions_superset(&self) -> Vec<crate::tools::ToolDefinition> {
+        let mut tools = self.tool_definitions_all_modes();
+        if !self.history_tools_enabled() {
+            tools.extend(history::definitions());
+        }
+        tools
+    }
+
+    /// Registered tools plus the plan tools when enabled, filtered to the
+    /// tools the agent offers under the current mode.
+    pub fn tool_definitions(&self) -> Vec<crate::tools::ToolDefinition> {
+        let mut tools = self.tool_definitions_all_modes();
         // Plan mode is read-only: only analysis/planning/reporting tools are
         // offered (the dispatch backstops this for calls already in flight).
         if self.control.mode() == crate::mode::AgentMode::Plan {
@@ -6682,6 +6733,8 @@ mod tests {
         assert!(last[7].is_error && last[7].content.contains("items are 1, 2"), "{}", last[7].content);
         assert_eq!(agent.plan().progress(), (1, 2));
         assert_eq!(agent.context_stats().lock().unwrap().plan, Some((1, 2)));
+        // Published on the control handle too, for `/plan` typed mid-turn.
+        assert_eq!(&agent.control().plan(), agent.plan());
 
         let plans: Vec<Value> =
             events.lock().unwrap().iter().filter(|u| u["sessionUpdate"] == "plan").cloned().collect();
@@ -7413,6 +7466,81 @@ mod tests {
         let conversation = agent.conversation();
         let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("echo ran");
         assert!(!tool_result.is_error, "echo is read-only and allowed in plan mode");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_snapshot_captured_in_plan_mode_still_lists_mutating_tools_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        // A mutating tool that plan mode strips.
+        agent.tools().register(
+            ToolDefinition::new("write_file", "write a file", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("ok"))),
+        );
+        assert!(!crate::mode::plan_allows("write_file"), "test needs a plan-disallowed tool");
+
+        // Capture while in Plan mode: the capture must keep the full superset,
+        // not the Plan-filtered set, or the mutating tool is lost for good.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let snapshot = crate::turn_commands::Snapshot::capture(&agent);
+
+        // A mid-turn `/mode normal` makes the live mode Normal; `/tools` must
+        // then list the mutating tool the Plan-time capture would have dropped.
+        let normal = crate::context::ContextStats { mode: crate::mode::AgentMode::Normal, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(listing)) =
+            snapshot.output("/tools", &normal, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(listing.contains("write_file"), "Plan-mode capture dropped the mutating tool: {listing}");
+
+        // And under a live Plan mode it is still filtered out.
+        let plan = crate::context::ContextStats { mode: crate::mode::AgentMode::Plan, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(filtered)) =
+            snapshot.output("/tools", &plan, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(!filtered.contains("write_file"), "plan mode must still hide the mutating tool: {filtered}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_snapshot_captured_without_history_still_lists_it_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _) = agent(vec![], dir.path());
+        // History tools are disabled at capture time: no smart summary is in
+        // context yet, so `tool_definitions_all_modes` would drop them.
+        assert!(!agent.history_tools_enabled(), "history must be disabled at capture for this test");
+
+        // Capture must keep the history tools in the superset anyway, or a
+        // same-turn smart auto-compaction that enables them later leaves
+        // `/tools` unable to list tools the next model step actually receives.
+        let snapshot = crate::turn_commands::Snapshot::capture(&agent);
+
+        // With history live, `/tools` must list the history tools the
+        // capture-time availability would have dropped.
+        let available = crate::context::ContextStats { history_available: true, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(listing)) =
+            snapshot.output("/tools", &available, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(
+            listing.contains(crate::history::SEARCH_TOOL) && listing.contains(crate::history::READ_TOOL),
+            "capture dropped the history tools: {listing}"
+        );
+
+        // And while history is unavailable they are still filtered out.
+        let unavailable = crate::context::ContextStats { history_available: false, ..Default::default() };
+        let Some(crate::turn_commands::Output::Block(hidden)) =
+            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default())
+        else {
+            panic!("/tools produced no block");
+        };
+        assert!(
+            !hidden.contains(crate::history::SEARCH_TOOL) && !hidden.contains(crate::history::READ_TOOL),
+            "history tools must stay hidden while unavailable: {hidden}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

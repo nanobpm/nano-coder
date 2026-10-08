@@ -466,6 +466,23 @@ mod tests {
         assert_eq!(edit_distance("same", "same"), 0);
     }
 
+    #[test]
+    fn closest_skips_the_matrix_for_oversized_input() {
+        // A near-miss still resolves (the length guard must not drop real
+        // candidates whose length is within two of a command).
+        assert_eq!(closest("/exin"), Some("/exit"));
+        assert_eq!(closest("/modle"), Some("/model"));
+        // A token far longer than any command never builds the O(word·name)
+        // edit-distance matrix (the length guard skips every candidate first),
+        // so unbounded editor input cannot hang or exhaust memory here.
+        let huge = format!("/{}", "x".repeat(100_000));
+        assert_eq!(closest(&huge), None);
+        // Rejection still works (and suggests nothing) for the oversized token.
+        let note = rejection(&huge).unwrap();
+        assert!(note.starts_with("Unknown command"), "{note:.40}");
+        assert!(!note.contains("Did you mean"), "{note:.40}");
+    }
+
     fn plain(row: &str) -> String {
         regex::Regex::new("\x1b\\[[0-9;]*m").unwrap().replace_all(row, "").into_owned()
     }

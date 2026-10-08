@@ -2,6 +2,8 @@
 //! events into streamed text, collapsible thinking and inline tool calls.
 
 use std::io::{self, IsTerminal, Write};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -176,6 +178,11 @@ struct State {
     stream_pad: usize,
     /// Notes held back until the streamed line they would interrupt ends.
     deferred: Vec<String>,
+    /// Raw payloads (e.g. `/trajectory --json`) held back until the streamed
+    /// line they would interrupt ends. Kept separate from `deferred` because
+    /// these are emitted verbatim — no stamp, no DIM — so the export stays
+    /// byte-exact.
+    deferred_raw: Vec<String>,
     /// The dropped frame's full transcript, in original on-screen order,
     /// captured by `set_mode(Legacy)` for `replay_transcript` to reprint after
     /// the post-switch screen+scrollback clear. Replaying THIS — not the
@@ -192,6 +199,27 @@ pub struct Renderer {
     /// Stdout is a terminal (in-place redraws are possible).
     tty: bool,
     expanded: AtomicBool,
+    /// Set when the turn's live answer stream may have been left incomplete by
+    /// a mid-turn verbosity change. Only `quiet` suppresses streamed deltas, so
+    /// a turn that is `quiet` for part of a streamed answer but ends at another
+    /// level loses the suppressed deltas. The frame renderer reconciles the
+    /// final `AssistantMessage` in place regardless; the legacy renderer, which
+    /// streams straight to the terminal and can't retract, uses this flag to
+    /// reprint the authoritative full response at turn end. Reset at
+    /// `begin_turn`, then raised the moment a non-empty answer delta is
+    /// actually suppressed while quiet.
+    touched_quiet: AtomicBool,
+    /// Set when an assistant message has closed since the last answer delta, so
+    /// the next non-empty answer delta begins a *new* message segment. The
+    /// turn-end reprint (gated on [`Self::answer_may_be_truncated`]) reprints
+    /// only `outcome.response` — the turn's *final* assistant message — so the
+    /// truncation guard must reflect whether that final answer's live stream is
+    /// incomplete, not whether any earlier (already-finalized, never-reprinted)
+    /// message was suppressed while quiet. On each new answer segment the guard
+    /// is cleared, so a quiet intermediate/tool-call response followed by a
+    /// normally-streamed final answer no longer spuriously reprints it. Reset
+    /// at `begin_turn`.
+    answer_segment_closed: AtomicBool,
     /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
     /// terminal. When set, all output is composed into one frame (transcript,
     /// editor, status as the last line) and diff-rendered by a single writer,
@@ -276,6 +304,8 @@ impl Renderer {
             status,
             tty,
             expanded: AtomicBool::new(false),
+            touched_quiet: AtomicBool::new(false),
+            answer_segment_closed: AtomicBool::new(false),
             frame,
         })
     }
@@ -644,8 +674,30 @@ impl Renderer {
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
-                if fs.stream.is_none() && !text.is_empty() {
-                    fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                // Reconcile the streamed answer with the authoritative final
+                // text. Normally the accumulated deltas already equal `text`,
+                // so this is a no-op. But a mid-turn `/verbosity` change can
+                // desync them: switching to quiet mid-stream drops the
+                // remaining deltas (leaving a truncated prefix), and switching
+                // away from quiet starts a fresh stream at a suffix (dropping
+                // the earlier deltas). Overwriting in place — rather than
+                // trusting accumulation — restores the full message in every
+                // case without duplicating it or disturbing the item's order
+                // (a mid-stream `/trajectory` export sits in a later item).
+                match fs.stream {
+                    Some(i) if !text.is_empty() => {
+                        if let Some(StampedItem { item: Item::Message { text: existing, .. }, .. }) =
+                            fs.items.get_mut(i)
+                            && existing.as_str() != *text
+                        {
+                            *existing = (*text).to_string();
+                        }
+                    }
+                    Some(_) => {}
+                    None if !text.is_empty() => {
+                        fs.items.push(stamped(Item::Message { role: Role::Assistant, text: (*text).to_string() }));
+                    }
+                    None => {}
                 }
                 self.frame_finish_stream(fs);
             }
@@ -807,6 +859,48 @@ impl Renderer {
     /// Emit command / informational output (e.g. slash-command replies). In
     /// frame mode it is captured as a transcript item so direct writes can't
     /// corrupt the owned frame; otherwise it prints inline as before.
+    /// Output of a command run while a turn is streaming. The frame renderer
+    /// adds it to the transcript as usual; the legacy renderer prints it as a
+    /// note, which waits for a half-streamed line to end rather than landing
+    /// in the middle of it (`print_block` there is a bare `println!`).
+    pub fn turn_block(&self, text: &str) {
+        if self.is_frame() {
+            self.print_block(text);
+        } else {
+            self.note(text);
+        }
+    }
+
+    /// Raw output of a command run while a turn is streaming (e.g.
+    /// `/trajectory --json`). The frame renderer emits it verbatim via
+    /// `print_raw`. The legacy renderer must not route it through `note` —
+    /// that would prepend a timestamp and wrap it in DIM/reset escapes,
+    /// corrupting JSON and Markdown — but it also can't print it straight away
+    /// without landing in the middle of a half-streamed line. So it is held
+    /// back (like a deferred note) and emitted verbatim once the streamed line
+    /// ends at `end_turn`, keeping the payload byte-exact.
+    pub fn turn_raw(&self, text: &str) {
+        if self.is_frame() {
+            self.print_raw(text);
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        // Defer whenever the cursor is not at a line boundary, regardless of
+        // whether that line is answer text or reasoning: a `thinking_delta`
+        // leaves the cursor mid-line with `streamed_text` false, and printing
+        // now would prefix the JSON/Markdown with the partial thinking line.
+        if !state.at_line_start {
+            state.deferred_raw.push(text.to_string());
+            return;
+        }
+        // Write through `out` (not a bare `println!`) while retaining the state
+        // lock: `out` holds the process-wide terminal lock, so a concurrent
+        // status/SIGWINCH redraw cannot interleave its escape sequences with
+        // the raw payload and corrupt it.
+        self.out(&mut state, text);
+        self.out(&mut state, "\n");
+    }
+
     ///
     /// DOCUMENTED LIMITATION: in legacy mode this writes straight to scrollback
     /// and is NOT recorded, so it does not survive a live legacy → frame switch
@@ -837,10 +931,17 @@ impl Renderer {
     /// a concurrent editor/resize/event render can't interleave its escape
     /// sequences with the raw bytes (`println!` takes no terminal lock, so the
     /// frame mutex is the only thing serializing them).
+    ///
+    /// Unlike the other transcript writes this does NOT finish an in-flight
+    /// stream: typed mid-turn (the only way this runs while a response is
+    /// streaming), clearing `fs.stream` would make the trailing
+    /// `AssistantMessage` see no active stream and append the full response
+    /// again, duplicating the answer. The pending `TextDelta`s still append
+    /// to the streamed item above the export, and `AssistantMessage` closes
+    /// the stream out as usual.
     pub fn print_raw(&self, text: &str) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
-            self.frame_finish_stream(fs);
             println!("{text}");
             fs.items.push(stamped(Item::Raw(text.to_string())));
             fs.out.invalidate();
@@ -934,9 +1035,40 @@ impl Renderer {
     pub fn begin_turn(&self) {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
+        // Reset the truncation guard: it is raised only when a non-empty answer
+        // delta is *actually* suppressed while quiet (see the quiet gate in
+        // `event`), not merely because the turn starts quiet — a quiet turn
+        // whose answer streams normally after a switch to a louder level must
+        // not be reprinted.
+        self.touched_quiet.store(false, Ordering::Relaxed);
+        // The first answer streamed this turn is a fresh segment.
+        self.answer_segment_closed.store(false, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         state.in_turn = true;
         state.at_line_start = true;
+    }
+
+    /// Set the global verbosity in response to `/verbosity` typed mid-turn.
+    /// Applying it immediately keeps the rest of the turn at the new level; the
+    /// final-answer reconciliation (frame: in place; legacy: a turn-end reprint
+    /// gated on [`Self::answer_may_be_truncated`]) is what prevents a switch
+    /// across the `quiet` boundary from truncating the streamed answer.
+    ///
+    /// This does NOT raise the truncation guard itself: merely entering quiet
+    /// has not dropped any answer text yet, so a `/verbosity quiet` followed by
+    /// `/verbosity normal` before any delta arrives would otherwise reprint a
+    /// fully streamed answer. Only the quiet `event` gate raises the guard,
+    /// when it actually suppresses a non-empty `TextDelta`.
+    pub fn set_verbosity_mid_turn(&self, level: Verbosity) {
+        set_verbosity(level);
+    }
+
+    /// Whether the turn's live-streamed answer may be incomplete because the
+    /// verbosity was `quiet` for part of it (so some streamed deltas were
+    /// suppressed). The legacy renderer reprints the full response when this is
+    /// true and the turn did not already reprint via its `quiet` end path.
+    pub fn answer_may_be_truncated(&self) -> bool {
+        self.touched_quiet.load(Ordering::Relaxed)
     }
 
     pub fn end_turn(&self) {
@@ -964,6 +1096,12 @@ impl Renderer {
         self.newline(&mut state);
         for note in std::mem::take(&mut state.deferred) {
             self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
+        }
+        // Raw exports queued mid-turn go out verbatim (no stamp/DIM), each on
+        // its own line, so the payload stays byte-exact.
+        for raw in std::mem::take(&mut state.deferred_raw) {
+            self.out(&mut state, &raw);
+            self.out(&mut state, "\n");
         }
         state.in_turn = false;
         state.streamed_text = false;
@@ -1036,6 +1174,15 @@ impl Renderer {
     pub fn event(&self, event: &AgentEvent) {
         let mut guard = self.frame.lock().unwrap();
         if let Some(fs) = guard.as_mut() {
+            // Hold the test verbosity lock across the quiet check and the event
+            // application so the pair is atomic against a concurrent test that
+            // changes the global level: without it a test that sets quiet
+            // (e.g. the truncation-guard test) can flip the level between this
+            // read and `frame_event`, making an unlocked renderer test drop its
+            // events and fail nondeterministically. Production never mutates
+            // verbosity on the event path, so the uncontended lock is free.
+            #[cfg(test)]
+            let _verbosity_guard = tests::verbosity_lock();
             // Quiet mode suppresses live steer/user chatter, but a history
             // replay (`fs.batch`) must keep its recorded user prompts — else
             // switching a quiet session to frame clears scrollback and rebuilds
@@ -1055,6 +1202,50 @@ impl Renderer {
             status.draw();
         }
         if verbosity() == Verbosity::Quiet {
+            // Mark the truncation guard only when a non-empty answer delta is
+            // actually suppressed here: those deltas never reach the terminal,
+            // so if the turn later ends at a louder level the live stream is
+            // incomplete and the legacy renderer reprints the full response.
+            // Merely being quiet (with no delta suppressed yet) must not set
+            // this — a turn that switches to a louder level before any delta
+            // streams its answer normally, and reprinting would duplicate it.
+            match event {
+                AgentEvent::TextDelta { text } if !text.is_empty() => {
+                    // A new answer segment: clear any truncation signal left by
+                    // an earlier, already-finalized message (the turn-end
+                    // reprint only reprints the final answer), then flag this
+                    // segment's suppression.
+                    if self.answer_segment_closed.swap(false, Ordering::Relaxed) {
+                        self.touched_quiet.store(false, Ordering::Relaxed);
+                    }
+                    self.touched_quiet.store(true, Ordering::Relaxed);
+                }
+                // An assistant message closed while quiet: the next answer
+                // delta begins a fresh segment (see `answer_segment_closed`).
+                AgentEvent::AssistantMessage { .. } => {
+                    self.answer_segment_closed.store(true, Ordering::Relaxed);
+                    // Close the legacy renderer's open stream. A message can
+                    // begin streaming at a louder level and have only its
+                    // terminating `AssistantMessage` arrive after a switch to
+                    // quiet; this arm then returns without finalizing the open
+                    // stream, leaving `streamed_text == true` with no trailing
+                    // newline. The next louder segment's `TextDelta` would see
+                    // that flag, skip its own stamp/newline, and append to this
+                    // message's truncated prefix — merging two assistant
+                    // messages on one line — and the new-segment guard reset
+                    // means the turn-end reprint can't repair it. Finalizing
+                    // the stream here ends the segment cleanly, exactly as the
+                    // normal-verbosity `AssistantMessage` arm does.
+                    let mut state = self.state.lock().unwrap();
+                    self.finish_thinking(&mut state);
+                    if state.streamed_text {
+                        self.newline(&mut state);
+                    }
+                    state.streamed_text = false;
+                    state.streamed_thinking = false;
+                }
+                _ => {}
+            }
             return;
         }
         let mut state = self.state.lock().unwrap();
@@ -1076,6 +1267,13 @@ impl Renderer {
             AgentEvent::TextDelta { text } => {
                 self.finish_thinking(&mut state);
                 if !text.is_empty() {
+                    // A new answer segment is streaming normally: drop any
+                    // truncation signal from an earlier, already-finalized
+                    // message so only this (potentially final) answer's own
+                    // quiet suppression can request a turn-end reprint.
+                    if self.answer_segment_closed.swap(false, Ordering::Relaxed) {
+                        self.touched_quiet.store(false, Ordering::Relaxed);
+                    }
                     if !state.streamed_text {
                         self.newline(&mut state);
                         let stamp = stamp();
@@ -1096,6 +1294,9 @@ impl Renderer {
                 self.newline(&mut state);
                 state.streamed_text = false;
                 state.streamed_thinking = false;
+                // This message is final; the next answer delta starts a fresh
+                // segment (see `answer_segment_closed`).
+                self.answer_segment_closed.store(true, Ordering::Relaxed);
             }
             // In normal mode a plan change is shown as the checklist (the
             // `Plan` event) rather than as a tool call and its result.
@@ -1407,9 +1608,108 @@ fn strip_ansi(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Serializes tests that read or mutate the process-global verbosity
+    /// (`LEVEL`): the test harness runs them on separate threads, so two tests
+    /// setting different levels at once would race and flake. Acquired with
+    /// `verbosity_lock()`, which ignores poisoning so one panicking test does
+    /// not cascade a `PoisonError` failure into the others.
+    ///
+    /// The lock is *reentrant on the owning thread*: a test that holds it and
+    /// then drives the renderer's `event` path re-acquires it in the frame
+    /// quiet gate (which locks it so the verbosity check + event application is
+    /// atomic against other tests). A plain `Mutex` would deadlock there, so
+    /// recursion by the owning thread is allowed while other threads still
+    /// block on the inner mutex.
+    static VERBOSITY_LOCK: Mutex<()> = Mutex::new(());
+    static VERBOSITY_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static VERBOSITY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A reentrant guard for [`VERBOSITY_LOCK`]: the owning thread may hold
+    /// several at once (each acquisition increments a thread-local depth); the
+    /// inner mutex is released only when the last guard for that thread drops.
+    pub(crate) struct VerbosityGuard {
+        inner: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for VerbosityGuard {
+        fn drop(&mut self) {
+            let remaining = VERBOSITY_DEPTH.with(|d| {
+                let r = d.get().saturating_sub(1);
+                d.set(r);
+                r
+            });
+            if remaining == 0 {
+                // Outermost guard for this thread. Clear the owner *while the
+                // mutex is still held*, then release it: clearing after the
+                // release opens a gap where another thread acquires the mutex
+                // and publishes its id, which this store would then clobber
+                // back to 0 — a recursive `event()` on that new owner would see
+                // owner 0, re-lock its own non-reentrant mutex, and deadlock.
+                VERBOSITY_OWNER.store(0, Ordering::SeqCst);
+                self.inner.take();
+            }
+        }
+    }
+
+    pub(crate) fn verbosity_lock() -> VerbosityGuard {
+        let tid = current_thread_id();
+        if VERBOSITY_OWNER.load(Ordering::SeqCst) == tid && tid != 0 {
+            // Already owned by this thread: recurse without touching the mutex.
+            VERBOSITY_DEPTH.with(|d| d.set(d.get() + 1));
+            return VerbosityGuard { inner: None };
+        }
+        let inner = VERBOSITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        VERBOSITY_OWNER.store(tid, Ordering::SeqCst);
+        VERBOSITY_DEPTH.with(|d| d.set(1));
+        VerbosityGuard { inner: Some(inner) }
+    }
+
+    #[test]
+    fn verbosity_guard_owner_tracks_reentrancy_and_handoff() {
+        let tid = current_thread_id();
+        let outer = verbosity_lock();
+        // Held by this thread: the owner is published while the mutex is held.
+        assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        {
+            let _inner = verbosity_lock();
+            // Reentrant acquire does not change the owner.
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        }
+        // Dropping an inner (non-outermost) guard keeps the lock owned.
+        assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), tid);
+        drop(outer);
+
+        // A second thread can now take the lock cleanly: the outermost drop
+        // cleared the owner *before* releasing the mutex, so this handoff never
+        // sees the owner clobbered back to 0 under it (which would deadlock a
+        // recursive acquire). It observes itself as the owner while it holds it.
+        let handed = std::thread::spawn(|| {
+            let other = current_thread_id();
+            let g = verbosity_lock();
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), other);
+            let _reentrant = verbosity_lock(); // must not deadlock
+            assert_eq!(VERBOSITY_OWNER.load(Ordering::SeqCst), other);
+            drop(_reentrant);
+            drop(g);
+        });
+        handed.join().expect("second thread acquired the verbosity lock without deadlock");
+    }
+
+    /// A unique, nonzero per-thread id for identifying the lock owner.
+    fn current_thread_id() -> usize {
+        thread_local! {
+            static ID: usize = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
+        ID.with(|id| *id)
+    }
 
     impl Renderer {
         /// Build a frame-mode renderer regardless of tty, for driving
@@ -1421,7 +1721,25 @@ mod tests {
                 status: None,
                 tty: true,
                 expanded: AtomicBool::new(false),
+                touched_quiet: AtomicBool::new(false),
+                answer_segment_closed: AtomicBool::new(false),
                 frame: Mutex::new(Some(Self::fresh_frame())),
+            })
+        }
+
+        /// Build a legacy (non-frame) renderer for driving the legacy `event`
+        /// path in tests. The truncation guard is a legacy-renderer concern:
+        /// the frame renderer reconciles the final `AssistantMessage` in place
+        /// and never consults `touched_quiet`.
+        pub(crate) fn legacy_for_test() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(State { at_line_start: true, ..Default::default() }),
+                status: None,
+                tty: true,
+                expanded: AtomicBool::new(false),
+                touched_quiet: AtomicBool::new(false),
+                answer_segment_closed: AtomicBool::new(false),
+                frame: Mutex::new(None),
             })
         }
 
@@ -1765,6 +2083,177 @@ mod tests {
     }
 
     #[test]
+    fn truncation_guard_tracks_suppressed_deltas_not_quiet_start() {
+        // A turn that merely *starts* quiet has not lost any answer yet: if the
+        // user switches to a louder level before any delta arrives, the answer
+        // streams in full and must NOT be reprinted. The guard is raised only
+        // once a non-empty delta is actually suppressed while quiet.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // No delta suppressed yet — only the quiet start. Switching to normal
+        // before any answer delta means the answer streams normally.
+        set_verbosity(Verbosity::Normal);
+        assert!(!r.answer_may_be_truncated(), "a quiet start with no suppressed delta must not flag truncation");
+
+        // A fresh turn that genuinely suppresses a non-empty delta while quiet
+        // IS flagged (the legacy renderer then reprints the full response).
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "hello" });
+        assert!(r.answer_may_be_truncated(), "a suppressed non-empty delta must flag truncation");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn entering_quiet_alone_does_not_flag_truncation() {
+        // `/verbosity quiet` then `/verbosity normal` before any answer delta
+        // arrives must not flag truncation: nothing was suppressed, so the
+        // answer streams in full and reprinting it would duplicate it. Only a
+        // genuinely suppressed non-empty delta raises the guard.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+        set_verbosity(Verbosity::Normal);
+        r.begin_turn();
+        r.set_verbosity_mid_turn(Verbosity::Quiet);
+        r.set_verbosity_mid_turn(Verbosity::Normal);
+        assert!(!r.answer_may_be_truncated(), "entering quiet with no suppressed delta must not flag truncation");
+    }
+
+    #[test]
+    fn truncation_guard_resets_per_answer_segment() {
+        // A multi-message turn: an intermediate/tool-call response is suppressed
+        // while quiet, then the user switches to normal and the FINAL answer
+        // streams in full. The turn-end reprint only reprints the final answer,
+        // so the guard must be clear — otherwise the fully-streamed final answer
+        // is duplicated. The guard tracks the final segment, not any earlier one.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // Intermediate response suppressed while quiet, then it closes.
+        r.event(&AgentEvent::TextDelta { text: "intermediate" });
+        assert!(r.answer_may_be_truncated(), "the suppressed intermediate delta flags truncation");
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "intermediate" });
+
+        // Switch to normal; the final answer streams in full.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "final answer" });
+        assert!(
+            !r.answer_may_be_truncated(),
+            "a final answer streamed normally after an earlier quiet segment must not be reprinted"
+        );
+        r.event(&AgentEvent::AssistantMessage { message_id: "m2", text: "final answer" });
+        assert!(!r.answer_may_be_truncated(), "the final segment was never suppressed");
+
+        // But if the FINAL answer itself is quiet-prefixed before switching
+        // louder, its live stream IS incomplete and must be reprinted.
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "A" }); // suppressed intermediate
+        r.event(&AgentEvent::AssistantMessage { message_id: "m3", text: "A" });
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::TextDelta { text: "final prefix" }); // final answer starts quiet
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: " suffix" });
+        assert!(
+            r.answer_may_be_truncated(),
+            "a final answer whose own prefix was suppressed while quiet must be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn quiet_assistant_message_closes_legacy_stream() {
+        // A message streams at normal, then verbosity switches to quiet before
+        // its terminating `AssistantMessage` arrives. The quiet gate must close
+        // the legacy renderer's open stream (reset `streamed_text`, end the
+        // line) so a later normal `TextDelta` begins a fresh segment instead of
+        // appending to this message's prefix and merging two messages.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Normal);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "first" });
+        assert!(r.state.lock().unwrap().streamed_text, "the first message is streaming");
+
+        // Switch to quiet; the message's closing `AssistantMessage` arrives here.
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "first" });
+        {
+            let state = r.state.lock().unwrap();
+            assert!(!state.streamed_text, "the closed segment must reset the legacy stream");
+            assert!(state.at_line_start, "the closed segment must end the line");
+        }
+
+        // Back to normal: the next message must start a fresh, un-merged stream.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "second" });
+        assert!(
+            r.state.lock().unwrap().streamed_text,
+            "a new message after a quiet-closed segment streams on its own line"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn turn_raw_defers_while_reasoning_is_mid_line() {
+        // A thinking delta leaves the cursor mid-line with `streamed_text`
+        // false. A raw export then must still be deferred (not printed into the
+        // middle of the reasoning line) and flushed verbatim at end_turn.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
+        assert!(!r.state.lock().unwrap().at_line_start, "a thinking delta leaves the cursor mid-line");
+        r.turn_raw("{\"k\":1}");
+        assert_eq!(
+            r.state.lock().unwrap().deferred_raw,
+            vec!["{\"k\":1}".to_string()],
+            "a raw export during mid-line reasoning must be deferred"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn turn_raw_defers_while_answer_text_is_mid_line() {
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "partial answer" });
+        r.turn_raw("{\"k\":1}");
+        assert_eq!(
+            r.state.lock().unwrap().deferred_raw,
+            vec!["{\"k\":1}".to_string()],
+            "a raw export during a half-streamed answer must be deferred"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn turn_raw_at_a_line_boundary_prints_without_deferring() {
+        // At a line boundary the export goes out immediately (through the
+        // terminal-locked `out`), leaving nothing queued for end_turn.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        assert!(r.state.lock().unwrap().at_line_start);
+        r.turn_raw("{\"k\":1}");
+        assert!(
+            r.state.lock().unwrap().deferred_raw.is_empty(),
+            "a raw export at a line boundary must not be deferred"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
     fn streamed_reasoning_then_text_emits_one_thinking_summary() {
         let r = Renderer::frame_for_test();
         // Reasoning streams as deltas, then the answer streams as text, then a
@@ -1856,6 +2345,10 @@ mod tests {
 
     #[test]
     fn user_message_event_is_recorded_in_frame_transcript() {
+        // Reads the process-global verbosity (a concurrent test setting `quiet`
+        // would make `event` drop the message), so serialize against those.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
         let r = Renderer::frame_for_test();
         // Replaying a resumed session (and mid-turn steer messages) surface as
         // `UserMessage` events; they must land in the transcript.
@@ -1879,6 +2372,62 @@ mod tests {
         let raw =
             r.frame_items().iter().filter(|i| matches!(&i.item, Item::Raw(t) if t.contains("session_id"))).count();
         assert_eq!(raw, 1, "the export must survive the frame restore: {:?}", r.frame_items());
+    }
+
+    #[test]
+    fn raw_export_mid_stream_does_not_duplicate_the_answer() {
+        let r = Renderer::frame_for_test();
+        // `/trajectory --json` typed while the answer streams: the export must
+        // not close the stream out. If it did, the trailing `AssistantMessage`
+        // would see no active stream and append the full response a second
+        // time (and a delta split across the export would start a new item).
+        r.event(&AgentEvent::TextDelta { text: "Here " });
+        r.print_raw("{\"session_id\":\"s\"}");
+        r.event(&AgentEvent::TextDelta { text: "is the answer." });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+        let items = r.frame_items();
+        let messages: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { role: Role::Assistant, text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, ["Here is the answer."], "streamed answer duplicated or split: {items:?}");
+        assert_eq!(
+            items.iter().filter(|i| matches!(&i.item, Item::Raw(t) if t.contains("session_id"))).count(),
+            1,
+            "the export must still be kept: {items:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_message_reconciles_a_partial_stream() {
+        // A mid-turn `/verbosity` change can desync the streamed deltas from
+        // the final answer: switching to quiet drops the remaining deltas
+        // (leaving a truncated prefix), and switching away from quiet starts a
+        // fresh stream at a suffix (dropping the earlier deltas). Either way the
+        // open stream item holds only part of the answer when `AssistantMessage`
+        // arrives. It must reconcile to the full authoritative text — in place,
+        // without duplicating — rather than trusting the accumulated deltas.
+        for partial in ["Here ", "answer."] {
+            let r = Renderer::frame_for_test();
+            r.event(&AgentEvent::TextDelta { text: partial });
+            r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "Here is the answer." });
+            let messages: Vec<_> = r
+                .frame_items()
+                .iter()
+                .filter_map(|i| match &i.item {
+                    Item::Message { role: Role::Assistant, text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                ["Here is the answer."],
+                "partial stream {partial:?} was not reconciled to the full answer"
+            );
+        }
     }
 
     #[test]

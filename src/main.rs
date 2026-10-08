@@ -48,6 +48,7 @@ mod temperature;
 mod thinking;
 mod tools;
 mod trajectory;
+mod turn_commands;
 mod ui;
 mod vision;
 
@@ -171,6 +172,42 @@ enum TermInput {
     CycleMode,
     /// An unknown `/command` refused by the editor (kept there, unsent): why.
     Rejected(String),
+}
+
+/// Apply `/mode NAME` or `/verbosity LEVEL` typed during a turn through
+/// shared state (the agent reads its mode from `TurnControl` at each step;
+/// verbosity is global). Returns the note to show.
+fn apply_next_step_setting(
+    cmd: &str,
+    control: &agent::TurnControl,
+    stats: &context::SharedStats,
+    renderer: &ui::Renderer,
+) -> String {
+    if let Some(arg) = cmd.strip_prefix("/mode ") {
+        match arg.trim().parse::<mode::AgentMode>() {
+            Ok(mode) => {
+                control.set_mode(mode);
+                // As for Shift+Tab mid-turn: refresh the status line now.
+                stats.lock().unwrap().mode = mode;
+                renderer.event(&agent::AgentEvent::Context);
+                format!("Mode set to {mode} ({}); applies from the agent's next step", mode.describe())
+            }
+            Err(e) => e,
+        }
+    } else if let Some(arg) = cmd.strip_prefix("/verbosity ") {
+        match arg.trim().parse::<ui::Verbosity>() {
+            Ok(level) => {
+                // The agent's config copy is synced when the turn ends. Route
+                // through the renderer so a mid-turn change reconciles the
+                // final streamed answer instead of truncating it.
+                renderer.set_verbosity_mid_turn(level);
+                format!("Verbosity set to {level} ({}); /settings saves it", level.describe())
+            }
+            Err(e) => e,
+        }
+    } else {
+        format!("[{cmd}: not a setting]")
+    }
 }
 
 /// "Model set to …", plus a warning when the new model ignores a temperature
@@ -725,6 +762,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         let outcome = async {
         // Grab the broker before the turn future borrows `agent` mutably.
         let questions = agent.questions();
+        // What read-only commands typed mid-turn show (see `turn_commands`);
+        // the plan is republished by the agent as it changes.
+        let snapshot = turn_commands::Snapshot::capture(agent);
+        control.publish_plan(agent.plan());
         let turn = agent.run_turn(None, text);
         tokio::pin!(turn);
         let mut question_rx = questions.subscribe();
@@ -844,10 +885,51 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 renderer.note(&format!("[thinking: {shown} — from the agent's next step]"));
                             }
                             SteerRoute::Thinking(Err(e)) => renderer.note(&format!("[thinking: {e}]")),
-                            SteerRoute::DeferCommand => {
-                                renderer.note(&format!("[commands wait for the turn to finish: {text}]"));
-                                terminal.queued.push_back(TermInput::Line(line));
-                            }
+                            SteerRoute::DeferCommand => match turn_commands::timing(text) {
+                                turn_commands::Timing::Immediate => {
+                                    let stats = stats.lock().unwrap().clone();
+                                    let plan = control.plan();
+                                    // Some immediate commands do synchronous disk
+                                    // I/O while rendering — `/trajectory` reads and
+                                    // decodes the whole session log, and `/providers`
+                                    // can do a credential-file read via
+                                    // `settings::key_status` — so render every
+                                    // immediate command on the blocking pool rather
+                                    // than special-casing one. That keeps the
+                                    // synchronous I/O off this async worker thread no
+                                    // matter which command runs. A join error can only
+                                    // come from a panic in the render; surface it
+                                    // rather than unwrapping.
+                                    let snap = snapshot.clone();
+                                    let cmd = text.to_string();
+                                    let label = cmd.clone();
+                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            Some(turn_commands::Output::Block(format!(
+                                                "Could not render {label} (internal task error)"
+                                            )))
+                                        });
+                                    match out {
+                                        Some(turn_commands::Output::Block(out)) => renderer.turn_block(&out),
+                                        // Raw exports must stay byte-exact: route
+                                        // them through `turn_raw`, which prints
+                                        // verbatim in frame mode and defers a
+                                        // stamp/DIM-free write in legacy mode
+                                        // (routing via `turn_block` would decorate
+                                        // the payload and corrupt JSON/Markdown).
+                                        Some(turn_commands::Output::Raw(out)) => renderer.turn_raw(&out),
+                                        None => renderer.note(&format!("[{text}: not available during a turn]")),
+                                    }
+                                }
+                                turn_commands::Timing::NextStep => {
+                                    renderer.note(&apply_next_step_setting(text, &control, &stats, &renderer));
+                                }
+                                turn_commands::Timing::AfterTurn => {
+                                    renderer.note(&format!("[waits for the turn to finish: {text}]"));
+                                    terminal.queued.push_back(TermInput::Line(line));
+                                }
+                            },
                             SteerRoute::Steer => {
                                 // The agent adds it to the conversation before its
                                 // next model call; if the turn ends first it is
@@ -879,6 +961,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     }
     .await;
         renderer.end_turn();
+        // `/verbosity LEVEL` typed mid-turn set the global; keep the config copy
+        // (which `/settings` saves) in step, as the between-turns command does.
+        agent.config_mut().verbosity = ui::verbosity();
         outcome
     };
     // A steer typed as the turn finished queues behind what is already
@@ -1492,11 +1577,68 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
 
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     match cmd {
-        "/exit" | "/quit" => Ok(false),
-        "/help" => {
-            terminal.renderer.print_block(&commands::help_text());
+        "/trajectory" if !terminal.outstanding && terminal.renderer.is_frame() && io::stdin().is_terminal() => {
+            // Page a trajectory that doesn't fit on screen. The pager owns the
+            // screen until it exits; force a full redraw so the frame
+            // renderer's next differential render isn't diffed against what
+            // the pager left (as /settings does). Typed during a turn, a stdin
+            // read is still pending and would race the pager for keys, so it
+            // prints instead (below); the legacy renderer's status line pins a
+            // scroll region a full-screen pager would disturb, so it prints too.
+            match turn_commands::Snapshot::capture(agent).load_trajectory() {
+                Err(note) => terminal.renderer.print_block(&note),
+                Ok(traj) => {
+                    let text = traj.to_plain();
+                    if trajectory_pageable(&traj) {
+                        let paged = trajectory::page(&text);
+                        terminal.renderer.frame_resize();
+                        if !paged {
+                            terminal.renderer.print_block(&text);
+                        }
+                    } else {
+                        terminal.renderer.print_block(&text);
+                    }
+                }
+            }
             Ok(true)
         }
+        // Any other `/trajectory` form (an export, or an unsupported option):
+        // run it through the snapshot's option parser so a bad option gets the
+        // specific "Unknown option" message rather than the generic
+        // "unexpected arguments" backstop. Between turns there is no need to
+        // restrict which forms run — that restriction (see `timing`) exists
+        // only to decide what is safe *mid-turn*.
+        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
+            let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
+            match turn_commands::Snapshot::capture(agent)
+                .output(cmd, &stats, agent.plan())
+                .expect("/trajectory always produces an output")
+            {
+                turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
+                // Export modes bypass the transcript renderer (`print_raw`, not
+                // `print_block`): the frame would wrap long lines and prefix a
+                // timestamp, making the JSON unparseable and mangling Markdown.
+                turn_commands::Output::Raw(text) => terminal.renderer.print_raw(&text),
+            }
+            Ok(true)
+        }
+        _ if turn_commands::timing(cmd) == turn_commands::Timing::Immediate
+            && let Some(output) = turn_commands::Snapshot::capture(agent).output(
+                cmd,
+                &context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() },
+                agent.plan(),
+            ) =>
+        {
+            match output {
+                turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
+                // Export modes bypass the transcript renderer (`print_raw`, not
+                // `print_block`): the frame would wrap long lines and prefix a
+                // timestamp, making the JSON unparseable and mangling Markdown.
+                turn_commands::Output::Raw(text) => terminal.renderer.print_raw(&text),
+            }
+            Ok(true)
+        }
+        "/exit" | "/quit" => Ok(false),
         _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
             let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
             let focus = focus.map(str::to_string);
@@ -1505,75 +1647,6 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 Some(report) => terminal.renderer.print_block(&format!("Conversation {report}")),
                 None => terminal.renderer.print_block("Nothing to compact"),
             }
-            Ok(true)
-        }
-        "/context" => {
-            let stats = agent.context_stats().lock().unwrap().clone();
-            let mut out: Vec<String> = Vec::new();
-            out.push(format!("Model:        {}/{}", stats.provider, stats.model));
-            out.push(format!("Temperature:  {}", agent.temperature().describe()));
-            out.push(format!("Thinking:     {}", agent.thinking().describe()));
-            out.push(format!(
-                "Context:      {}{} of {} tokens ({:.1}%){}",
-                if stats.calibrated { "" } else { "~" },
-                stats.tokens,
-                stats.window,
-                stats.percent(),
-                if stats.calibrated { ", anchored to reported usage" } else { ", estimated" }
-            ));
-            out.push(format!("Messages:     {}", stats.messages));
-            let system_tokens = crate::context::text_tokens(&agent.system_prompt());
-            out.push(format!("System prompt: {} tokens", system_tokens));
-            let files = agent.project_instruction_files();
-            if files.is_empty() {
-                out.push(
-                    "Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)".to_string(),
-                );
-            } else {
-                out.push(format!("Instructions: {}", files.join(", ")));
-            }
-            let on_demand = agent.on_demand_instruction_files();
-            if !on_demand.is_empty() {
-                out.push(format!("Rules (on demand): {}", on_demand.join(", ")));
-            }
-            for warning in agent.instruction_warnings() {
-                out.push(format!("Instructions warning: {warning}"));
-            }
-            let skills = agent.skills();
-            if !skills.is_empty() || !skills.warnings.is_empty() {
-                out.push(format!("Skills:       {} (/skills to list them)", skills.skills.len()));
-            }
-            if let Some((done, total)) = stats.plan {
-                out.push(format!("Plan:         {done}/{total} done (/plan to show it)"));
-            }
-            out.push(format!(
-                "Session:      {} input, {} output tokens",
-                stats.session_input_tokens, stats.session_output_tokens
-            ));
-            if let Some(aic) = stats.session_aic {
-                out.push(format!("AI Credits:   {aic:.2} used this session"));
-            }
-            match stats.auto_compact {
-                Some(t) => out.push(format!(
-                    "Auto-compact: at {:.0}% (~{} tokens); compacted {} time(s)",
-                    t * 100.0,
-                    (stats.window as f64 * t) as usize,
-                    stats.compactions
-                )),
-                None => out.push("Auto-compact: off".to_string()),
-            }
-            out.push(format!(
-                "Compaction:   {} mode (/compact --smart or --standard overrides once)",
-                agent.config().compaction_mode.as_str()
-            ));
-            if stats.history_searches + stats.history_reads > 0 {
-                out.push(format!(
-                    "History:      {} search(es), {} read(s) this session",
-                    stats.history_searches, stats.history_reads
-                ));
-            }
-            out.push(format!("(context window {})", agent.context_window_with_source().1));
-            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/settings" if terminal.outstanding => {
@@ -1629,41 +1702,6 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // switch and notices above, so an errored exit still leaves the
             // terminal in the new mode and shows what the dialog retained.
             outcome?;
-            Ok(true)
-        }
-        "/tools" => {
-            let mut out = vec!["Available tools:".to_string()];
-            for def in agent.tool_definitions() {
-                out.push(format!("  {} - {}", def.name, def.description));
-            }
-            terminal.renderer.print_block(&out.join("\n"));
-            Ok(true)
-        }
-        "/skills" => {
-            let skills = agent.skills();
-            let mut out: Vec<String> = Vec::new();
-            if skills.is_empty() {
-                out.push(format!(
-                    "No skills found (looked in {}, ai.lock and {}).",
-                    agent.config().skills.dirs.join(", "),
-                    agent.config().skills.user_dirs.join(", ")
-                ));
-            }
-            for skill in &skills.skills {
-                out.push(format!("  {} - {}\n      {}", skill.name, skill.description, skill.dir.display()));
-            }
-            for warning in &skills.warnings {
-                out.push(format!("Warning: {warning}"));
-            }
-            terminal.renderer.print_block(&out.join("\n"));
-            Ok(true)
-        }
-        "/plan" => {
-            if agent.plan().is_empty() {
-                terminal.renderer.print_block("No plan yet. The agent makes one with the plan_add tool.");
-            } else {
-                terminal.renderer.print_block(agent.plan().render(true, usize::MAX).trim_end());
-            }
             Ok(true)
         }
         _ if cmd == "/memory" || cmd.starts_with("/memory ") => {
@@ -1752,70 +1790,6 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             terminal.renderer.print_block(&model_set_text(agent));
             Ok(true)
         }
-        "/providers" => {
-            let (user, default_provider) = agent.config().effective_providers();
-            let mut out = vec![format!("Providers (default: {default_provider}):")];
-            for (name, provider) in providers::effective_providers(&user) {
-                let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
-                let key = settings::key_status(&provider);
-                let url = provider.base_url.unwrap_or_else(|| match provider.kind {
-                    Some(providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
-                    _ => "-".into(),
-                });
-                out.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
-            }
-            terminal.renderer.print_block(&out.join("\n"));
-            Ok(true)
-        }
-        "/session" => {
-            match (agent.session_id(), agent.session_path()) {
-                (Some(id), Some(path)) => terminal.renderer.print_block(&format!("Session {id}: {}", path.display())),
-                _ => terminal.renderer.print_block("Session persistence is disabled"),
-            }
-            Ok(true)
-        }
-        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
-            let arg = cmd["/trajectory".len()..].trim();
-            let Some(path) = agent.session_path() else {
-                terminal.renderer.print_block("Session persistence is disabled: no trajectory to show");
-                return Ok(true);
-            };
-            let records = match session::read_records_at(path, None) {
-                Ok(records) => records,
-                Err(e) => {
-                    terminal.renderer.print_block(&format!("Could not read the session log: {e:#}"));
-                    return Ok(true);
-                }
-            };
-            let traj = trajectory::Trajectory::from_records(&records);
-            match arg {
-                // Export modes bypass the transcript renderer (`print_raw`, not
-                // `print_block`): the frame would wrap long lines and prefix a
-                // timestamp, making the JSON unparseable and mangling Markdown.
-                "--json" => terminal.renderer.print_raw(&traj.to_json()),
-                "--markdown" | "--md" => terminal.renderer.print_raw(&traj.to_markdown()),
-                "" if !terminal.outstanding && terminal.renderer.is_frame() && trajectory_pageable(&traj) => {
-                    // The pager owns the screen until it exits; force a full
-                    // redraw so the frame renderer's next differential render
-                    // isn't diffed against what the pager left (as /settings
-                    // does). Typed during a turn, a stdin read is still pending
-                    // and would race the pager for keys, so print instead; the
-                    // legacy renderer's status line pins a scroll region a
-                    // full-screen pager would disturb, so it prints too.
-                    let text = traj.to_plain();
-                    let paged = trajectory::page(&text);
-                    terminal.renderer.frame_resize();
-                    if !paged {
-                        terminal.renderer.print_block(&text);
-                    }
-                }
-                "" => terminal.renderer.print_block(&traj.to_plain()),
-                other => terminal
-                    .renderer
-                    .print_block(&format!("Unknown option {other:?}; use /trajectory [--json|--markdown]")),
-            }
-            Ok(true)
-        }
         _ if cmd == "/resume" || cmd.starts_with("/resume ") => {
             resume_command(agent, cmd["/resume".len()..].trim(), terminal)?;
             Ok(true)
@@ -1831,25 +1805,6 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 terminal.renderer.print_block(&format!("Session: {id}"));
             }
-            Ok(true)
-        }
-        "/verbosity" => {
-            let current = ui::verbosity();
-            let mut out = vec![format!("Verbosity: {current} ({})", current.describe())];
-            for level in ui::Verbosity::ALL {
-                out.push(format!("  {:<8} {}", level.to_string(), level.describe()));
-            }
-            terminal.renderer.print_block(&out.join("\n"));
-            Ok(true)
-        }
-        "/mode" => {
-            let current = agent.mode();
-            let mut out = vec![format!("Mode: {current} ({})", current.describe())];
-            for mode in mode::AgentMode::ALL {
-                out.push(format!("  {:<8} {}", mode.to_string(), mode.describe()));
-            }
-            out.push("(Shift+Tab cycles; /mode NAME sets it directly)".to_string());
-            terminal.renderer.print_block(&out.join("\n"));
             Ok(true)
         }
         "/thinking" => {
@@ -1898,20 +1853,61 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // `//…` is a prompt that starts with `/`.
             let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
-            // In frame mode the turn's response is already rendered from its
-            // events; re-printing it here would duplicate the answer and
-            // corrupt the owned frame.
-            if !terminal.renderer.is_frame() {
-                if ui::verbosity() == ui::Verbosity::Quiet {
-                    println!("{}", ui::stamp_block(&outcome.response));
-                } else if outcome.stop_reason == agent::StopReason::Cancelled {
-                    println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
-                } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
-                    let last = outcome.response.lines().last().unwrap_or_default();
-                    println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
-                }
-            }
+            print_turn_outcome(&outcome, &terminal.renderer);
             Ok(true)
+        }
+    }
+}
+
+/// What the legacy turn-end print should emit for a finished turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnPrint {
+    /// Frame mode: the response is already rendered from its events; print
+    /// nothing (re-printing would duplicate the answer and corrupt the frame).
+    Nothing,
+    /// Reprint the full response.
+    Full { dim: bool },
+    /// Max-turn fallback: print only the stop-note line, dimmed.
+    LastLineDim,
+}
+
+/// Chooses what the legacy turn-end print emits. The truncation repair runs
+/// before the max-turn fallback: a response stopped at the request cap still
+/// carries its full final content in `outcome.response`, so when part of it was
+/// quiet-suppressed the authoritative full text must be reprinted — printing
+/// only the stop-note line would leave the answer truncated.
+fn turn_print(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) -> TurnPrint {
+    if renderer.is_frame() {
+        TurnPrint::Nothing
+    } else if ui::verbosity() == ui::Verbosity::Quiet {
+        TurnPrint::Full { dim: false }
+    } else if outcome.stop_reason == agent::StopReason::Cancelled {
+        TurnPrint::Full { dim: true }
+    } else if renderer.answer_may_be_truncated() {
+        // The turn was quiet for part of its streamed answer but ended at a
+        // louder level, so the live stream dropped the deltas emitted while
+        // quiet. Reprint the authoritative full response (the quiet end path
+        // above already does this when the turn ends quiet).
+        TurnPrint::Full { dim: false }
+    } else if outcome.stop_reason == agent::StopReason::MaxTurnRequests {
+        TurnPrint::LastLineDim
+    } else {
+        TurnPrint::Nothing
+    }
+}
+
+/// Prints a finished turn's response in legacy (non-frame) mode per
+/// [`turn_print`].
+fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
+    match turn_print(outcome, renderer) {
+        TurnPrint::Nothing => {}
+        TurnPrint::Full { dim: false } => println!("{}", ui::stamp_block(&outcome.response)),
+        TurnPrint::Full { dim: true } => {
+            println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
+        }
+        TurnPrint::LastLineDim => {
+            let last = outcome.response.lines().last().unwrap_or_default();
+            println!("{}", ui::stamp_block(&format!("\x1b[2m{last}\x1b[0m")));
         }
     }
 }
@@ -2807,6 +2803,45 @@ mod tests {
         // Blank input is a no-op on both paths.
         assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
+    }
+
+    /// A max-turn response whose streamed answer was quiet-suppressed must be
+    /// reprinted in full (the truncation repair), not reduced to its dimmed
+    /// stop-note line by the max-turn fallback.
+    #[test]
+    fn turn_print_repairs_truncation_before_the_max_turn_fallback() {
+        let _lock = ui::tests::verbosity_lock();
+        let r = ui::Renderer::legacy_for_test();
+        let outcome = agent::TurnOutcome {
+            response: "full final answer\n[stopped after 3 LLM calls without a final answer]".into(),
+            stop_reason: agent::StopReason::MaxTurnRequests,
+            outcome: None,
+        };
+
+        // A non-empty answer delta suppressed while quiet flags truncation.
+        ui::set_verbosity(ui::Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&agent::AgentEvent::TextDelta { text: "full final answer" });
+        assert!(r.answer_may_be_truncated());
+        // The user switches back before the cap is enforced on the next loop.
+        ui::set_verbosity(ui::Verbosity::Normal);
+
+        assert_eq!(
+            turn_print(&outcome, &r),
+            TurnPrint::Full { dim: false },
+            "a quiet-suppressed max-turn answer must be reprinted in full, not truncated to its stop-note line"
+        );
+
+        // Without the truncation flag the max-turn fallback still prints only
+        // the dimmed stop-note line.
+        let r2 = ui::Renderer::legacy_for_test();
+        r2.begin_turn();
+        assert_eq!(
+            turn_print(&outcome, &r2),
+            TurnPrint::LastLineDim,
+            "an untruncated max-turn response keeps the dimmed stop-note fallback"
+        );
+        ui::set_verbosity(ui::Verbosity::Normal);
     }
 
     #[test]
