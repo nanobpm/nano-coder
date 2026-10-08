@@ -802,8 +802,13 @@ impl Agent {
     /// A result whose `generation` no longer matches `current` is discarded:
     /// a later model switch has superseded this probe, so its window must not
     /// overwrite the newer model's. The stats update is also conservative: a
-    /// fresher source (a learned window from a context overflow, or a
-    /// configured window a later switch picked) is never overwritten.
+    /// fresher source (a configured window a later switch picked) is never
+    /// overwritten. A learned window (from a context overflow) is normally
+    /// fresher too, but a probe reporting a *stricter* (smaller) window is
+    /// allowed to replace it: the slot already stores the detected window, so
+    /// `context_window_with_source()` would otherwise start using the smaller
+    /// value while `/context` and the status line kept reporting the larger
+    /// learned one — leaving the two permanently inconsistent.
     fn finish_detect(
         detected: Option<DetectedWindow>,
         generation: u64,
@@ -833,6 +838,13 @@ impl Agent {
             if stats.window_source.starts_with("reported by the endpoint")
                 || stats.window_source == "known for the model name"
                 || stats.window_source == "default"
+                // A learned window is fresher, but a probe that reports a
+                // *stricter* (smaller) limit must replace it: the slot already
+                // holds the detected window, so refusing here would leave
+                // `context_window_with_source()` using the smaller value while
+                // `/context` and the status line keep reporting the larger
+                // learned one.
+                || (stats.window_source == "learned from a context-overflow error" && window < stats.window)
             {
                 stats.window = window;
                 stats.window_source = source;
@@ -4046,6 +4058,60 @@ mod tests {
             stats.clone(),
         );
         assert_eq!(stats.lock().unwrap().window, 8192, "a probe must refine a default-source window");
+    }
+
+    #[test]
+    fn a_stricter_probe_replaces_a_learned_window_stat() {
+        // A probe can land after an overflow has published a learned window.
+        // The slot already stores the detected window, so `context_window_with_source()`
+        // starts using the smaller value; the shared stats must follow, or `/context`
+        // and the status line keep reporting the larger learned window indefinitely.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 200_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 128_000, source: "max_model_len".to_string() }),
+            1,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 128_000, "a stricter detected window must replace the learned stat");
+        assert!(s.window_source.starts_with("reported by the endpoint"));
+    }
+
+    #[test]
+    fn a_looser_probe_does_not_replace_a_learned_window_stat() {
+        // A learned window reflects a real overflow, so a probe reporting a
+        // *larger* window must not loosen it: the learned limit is the binding one.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 100_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 200_000, source: "max_model_len".to_string() }),
+            1,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 100_000, "a looser detected window must not replace the learned stat");
+        assert_eq!(s.window_source, "learned from a context-overflow error");
     }
 
     #[tokio::test(flavor = "multi_thread")]

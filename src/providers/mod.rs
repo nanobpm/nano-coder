@@ -260,7 +260,7 @@ pub struct ResolvedProvider {
 
 /// Check that `spec` names a known provider with a usable `kind`, model, and
 /// endpoint, against an already-resolved `providers` map — **without side
-/// effects**. Unlike [`resolve`], it never runs an `api_key_command`
+/// effects**. Unlike [`resolve_cancellable`], it never runs an `api_key_command`
 /// subprocess or builds a client, so it is safe to call synchronously on the
 /// UI thread (e.g. when a `/model <spec>` is typed mid-turn) to report an
 /// unbuildable spec immediately instead of letting it fail silently later. It
@@ -310,7 +310,7 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
 /// caught by `Some(_)`/`HttpTransport::new`; it only fails later while building
 /// the request URL — by which point a mid-turn switch has already replaced the
 /// working client and lost the current model. Validating it here (shared by
-/// [`validate_spec`] and [`resolve`]) rejects the bad endpoint at queue time
+/// [`validate_spec`] and [`resolve_cancellable`]) rejects the bad endpoint at queue time
 /// and preserves the queue-time bad-endpoint guarantee.
 fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
     if base_url.trim().is_empty() {
@@ -352,7 +352,7 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
     resolve_cancellable(spec, user, default_provider, None)
 }
 
-/// Like [`resolve`], but a running `api_key_command` honours `cancel`: when the
+/// Like the test-only `resolve` wrapper, but a running `api_key_command` honours `cancel`: when the
 /// flag flips the child process is killed and the build fails fast, so a hung
 /// key command can never wedge a cancellable caller (e.g. a mid-turn `/model`
 /// switch). `cancel` is `None` for build paths with no turn to cancel against.
