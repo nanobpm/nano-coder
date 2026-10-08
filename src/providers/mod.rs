@@ -16,8 +16,8 @@ pub mod retry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -478,10 +478,14 @@ fn run_key_command(provider: &str, command: &str, cancel: Option<&Arc<AtomicBool
 /// The child runs in its own process group (`process_group(0)`) and is killed
 /// with `killpg`, not `child.kill()`: killing only the `sh` leader would leave
 /// descendants it spawned (e.g. the `sleep` in `sleep 30; printf sk`) holding
-/// the stdout/stderr pipes open, so the reader-thread joins below would block
-/// until those grandchildren exit — defeating the timeout/cancellation. Killing
-/// the whole group tears the descendants down too, so the pipes hit EOF and the
-/// joins return promptly.
+/// the stdout/stderr pipes open, so an unconditional reader-thread join would
+/// block until those grandchildren exit — defeating the timeout/cancellation.
+/// Killing the whole group tears in-group descendants down too, so the pipes
+/// hit EOF promptly. A descendant that *escapes* the group (`setsid`/`setpgid`)
+/// is outside `killpg`'s reach, so its inherited pipe never hits EOF; for that
+/// case the reader threads are **detached**, never joined, and their output is
+/// read from a shared buffer they publish into incrementally — so a
+/// process-group escapee can delay nothing here.
 fn run_key_command_bounded(
     provider: &str,
     command: &str,
@@ -498,46 +502,64 @@ fn run_key_command_bounded(
         .process_group(0)
         .spawn()
         .with_context(|| format!("provider {provider:?}: running api_key_command {command:?}"))?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    // Each reader signals completion via a shared flag so the wait loop can
-    // poll whether the pipes have drained (hit EOF) without blocking on a
-    // `join`: a descendant that outlives the `sh` leader keeps its inherited
-    // pipe open, so an unconditional join after the leader exits would block
-    // until that descendant finishes — ignoring the timeout/cancellation.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    // Each reader streams its pipe into a SHARED buffer and signals completion
+    // via a shared flag. Two independent properties matter:
+    //
+    //  * The wait loop polls the done flags (never a `join`), so a descendant
+    //    that outlives the `sh` leader while holding an inherited pipe open
+    //    cannot stall the loop.
+    //  * The captured bytes live in the shared buffer, published incrementally
+    //    as they are read, so the already-written key is retrievable WITHOUT
+    //    joining the reader thread. This is what bounds us against a descendant
+    //    that escapes the process group entirely (`setsid`/`setpgid`): `killpg`
+    //    cannot force EOF on it, so its reader thread's `read` never returns and
+    //    the thread can never be joined. The previous design read `read_to_end`
+    //    into a thread-local buffer and then `join`ed to retrieve it — which
+    //    hangs forever on exactly that escapee, defeating the timeout and
+    //    cancellation. We instead detach the reader threads and take whatever
+    //    they have already published.
     let stdout_done = Arc::new(AtomicBool::new(false));
     let stderr_done = Arc::new(AtomicBool::new(false));
-    let stdout_done_flag = stdout_done.clone();
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        stdout_done_flag.store(true, Ordering::SeqCst);
-        buf
-    });
-    let stderr_done_flag = stderr_done.clone();
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        stderr_done_flag.store(true, Ordering::SeqCst);
-        buf
-    });
-    // Kill the whole process group (not just the `sh` leader) and reap so
-    // neither the shell nor any descendant can linger, then drain the reader
-    // threads (the pipes hit EOF once the group is gone).
-    fn kill_group_and_reap(
-        child: &mut std::process::Child,
-        stdout_reader: std::thread::JoinHandle<Vec<u8>>,
-        stderr_reader: std::thread::JoinHandle<Vec<u8>>,
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    fn spawn_pipe_reader<P: Read + Send + 'static>(
+        pipe: Option<P>,
+        buf: Arc<Mutex<Vec<u8>>>,
+        done: Arc<AtomicBool>,
     ) {
+        // Detached on purpose (no returned JoinHandle): see the comment above —
+        // a process-group escapee keeps the pipe open, so this thread may never
+        // finish, and nothing may ever join it.
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut b) = buf.lock() {
+                                b.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+    spawn_pipe_reader(stdout_pipe, stdout_buf.clone(), stdout_done.clone());
+    spawn_pipe_reader(stderr_pipe, stderr_buf.clone(), stderr_done.clone());
+    // Kill the whole process group (not just the `sh` leader) and reap so
+    // neither the shell nor any in-group descendant can linger. The detached
+    // reader threads are intentionally NOT joined here (a process-group escapee
+    // could keep a pipe open forever); their captured output is read from the
+    // shared buffers instead.
+    fn kill_group_and_reap(child: &mut std::process::Child) {
         // SAFETY: killpg only signals the child's own process group.
         unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
         let _ = child.wait();
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
     }
     let start = Instant::now();
     let mut leader_status: Option<std::process::ExitStatus> = None;
@@ -560,7 +582,7 @@ fn run_key_command_bounded(
                     // Can't tell whether the child is alive; kill the whole
                     // process group and reap so neither it nor any descendant
                     // can linger, then surface the wait error.
-                    kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+                    kill_group_and_reap(&mut child);
                     return Err(e);
                 }
             }
@@ -570,23 +592,26 @@ fn run_key_command_bounded(
         let timed_out = start.elapsed() >= timeout;
         if let Some(status) = leader_status {
             // The leader has exited, so everything it wrote to stdout is already
-            // buffered in the pipe — the key, if any, is captured. Return as
-            // soon as the readers drain naturally. If instead a backgrounded
+            // buffered in the pipe — the key, if any, is captured (and the
+            // reader threads publish it into the shared buffer as they read).
+            // Return as soon as the readers drain naturally. If instead a
             // descendant keeps a pipe open (so the readers never hit EOF), don't
             // block on it or discard the captured key: once a short drain grace
             // elapses (or the timeout fires), tear the whole group down to force
-            // EOF so the post-loop joins return the captured output promptly. An
-            // explicit cancel still aborts, even with a key in hand.
+            // EOF for in-group descendants and take the already-captured output.
+            // An explicit cancel still aborts, even with a key in hand.
             if cancelled {
-                kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+                kill_group_and_reap(&mut child);
                 bail!("provider {provider:?}: api_key_command {command:?} cancelled");
             }
             let drain_grace_elapsed = leader_exit_at.is_some_and(|t| t.elapsed() >= KEY_COMMAND_DRAIN_GRACE);
             if readers_done || drain_grace_elapsed || timed_out {
                 if !readers_done {
-                    // A descendant still holds a pipe open; close it so the
-                    // reader threads hit EOF and the post-loop joins return the
-                    // already-captured output promptly.
+                    // A descendant still holds a pipe open; close it (for an
+                    // in-group descendant this forces EOF so the reader finishes
+                    // promptly). A process-group escapee is out of `killpg`'s
+                    // reach, but its output was already published incrementally,
+                    // so the bounded retrieval below still returns the key.
                     // SAFETY: killpg only signals the child's own process group.
                     unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
                     let _ = child.wait();
@@ -597,7 +622,7 @@ fn run_key_command_bounded(
             // The leader is still running and we've hit the deadline: kill the
             // whole process group (not just the `sh` leader) and reap so no
             // descendant can linger, then surface the timeout/cancellation.
-            kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+            kill_group_and_reap(&mut child);
             if cancelled {
                 bail!("provider {provider:?}: api_key_command {command:?} cancelled");
             }
@@ -605,8 +630,20 @@ fn run_key_command_bounded(
         }
         std::thread::sleep(KEY_COMMAND_POLL);
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // Give the readers a brief, BOUNDED window to publish everything they have
+    // (for an in-group descendant `killpg` above has forced EOF, so they finish
+    // almost immediately). Never block indefinitely: a descendant that escaped
+    // the process group keeps its pipe open forever and its reader thread can
+    // never finish, so once the window elapses we take whatever has been
+    // published so far — the key the exited leader already wrote.
+    let retrieve_deadline = Instant::now() + KEY_COMMAND_DRAIN_GRACE;
+    while !(stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst))
+        && Instant::now() < retrieve_deadline
+    {
+        std::thread::sleep(KEY_COMMAND_POLL);
+    }
+    let stdout = stdout_buf.lock().map(|b| b.clone()).unwrap_or_default();
+    let stderr = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
     let key = String::from_utf8_lossy(&stdout).trim().to_string();
     if !status.success() || key.is_empty() {
         bail!(
@@ -1262,6 +1299,92 @@ mod key_command_tests {
         .unwrap();
         assert!(key.starts_with("sk-x"), "unexpected key prefix: {}", &key[..key.len().min(8)]);
         assert!(key.len() > 64 * 1024, "drained well past a pipe buffer without deadlock: {} bytes", key.len());
+    }
+
+    /// An `sh` fragment that backgrounds a descendant which *escapes* the
+    /// child's process group (a new session via `setsid`) and holds the
+    /// inherited stdout pipe open for ~30s. Because it leaves the group,
+    /// `killpg(child_group)` cannot reach it, so its reader thread never hits
+    /// EOF — the exact shape of the Copilot finding. Returns `None` when no
+    /// tool to create a new session is available, so the test skips rather than
+    /// failing on a bare CI image.
+    fn pgroup_escapee_holding_stdout() -> Option<&'static str> {
+        fn have(tool: &str) -> bool {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {tool}"))
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if have("setsid") {
+            Some("setsid sleep 30 &")
+        } else if have("perl") {
+            Some("perl -e 'use POSIX; POSIX::setsid(); sleep 30' &")
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn bounded_key_command_returns_key_despite_process_group_escapee() {
+        // Regression (Copilot high-severity finding): the key is printed in the
+        // foreground, then a descendant ESCAPES the process group (`setsid`) and
+        // holds stdout open past the timeout. `killpg` cannot force EOF on an
+        // escapee, so the previous design's unconditional reader-thread `join`
+        // blocked for the full 30s, defeating the timeout and cancellation. The
+        // captured key must instead come back promptly from the shared buffer.
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let cmd = format!("printf sk-escape; {escapee}");
+        let start = Instant::now();
+        let key = run_key_command_bounded("cmd", &cmd, Duration::from_millis(100), None).unwrap();
+        assert_eq!(key, "sk-escape");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the return: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn bounded_key_command_times_out_on_keyless_process_group_escapee() {
+        // Same escapee shape but with NO key printed: there is nothing to
+        // return, so the call must fail promptly rather than hang on the
+        // escapee's still-open pipe.
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", escapee, Duration::from_millis(100), None).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the timeout: {:?}",
+            start.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed") || msg.contains("timed out"), "{msg}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_applies_despite_process_group_escapee() {
+        // The cancel path must also not hang on a process-group escapee: the
+        // leader exits immediately while the escapee holds the pipe, and only
+        // the cancel flag can end the wait — promptly, without a reader join.
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let cmd = format!("printf sk; {escapee}");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", &cmd, Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the cancel: {:?}",
+            start.elapsed()
+        );
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
     }
 }
 
