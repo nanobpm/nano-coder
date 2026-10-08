@@ -205,6 +205,9 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// A `/model <spec>` typed mid-turn: the agent applies it just before its
+    /// next model call (see `Agent::apply_model_request`).
+    model: Mutex<Option<String>>,
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
@@ -226,6 +229,7 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                model: Mutex::new(None),
                 plan: Mutex::new(crate::plan::Plan::default()),
             }),
         }
@@ -268,6 +272,18 @@ impl TurnControl {
 
     pub fn set_mode(&self, mode: crate::mode::AgentMode) {
         *self.inner.mode.lock().unwrap() = mode;
+    }
+
+    /// Ask the running turn to switch to `spec` (`provider/model`) at its next
+    /// model call; a later request replaces an earlier unapplied one.
+    pub fn set_model(&self, spec: &str) {
+        *self.inner.model.lock().unwrap() = Some(spec.to_string());
+    }
+
+    /// The `/model <spec>` requested mid-turn, if any; the agent takes it once
+    /// as it applies the switch.
+    pub fn take_model_request(&self) -> Option<String> {
+        self.inner.model.lock().unwrap().take()
     }
 
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
@@ -344,6 +360,14 @@ pub enum AgentEvent<'a> {
     /// The task plan changed (or is being replayed).
     Plan {
         plan: &'a Plan,
+    },
+    /// The agent switched models mid-turn (a `/model <spec>` typed during the
+    /// turn, applied at the next model call). Both specs are in canonical
+    /// `provider/model` form, ready for the UI to record in the recents MRU;
+    /// `previous` is the model switched away from.
+    ModelSwitched {
+        spec: &'a str,
+        previous: &'a str,
     },
 }
 
@@ -548,6 +572,48 @@ impl Agent {
         self.compact_floor = 0;
         self.detect_context_window().await;
         Ok(())
+    }
+
+    /// Apply a `/model <spec>` typed mid-turn (queued on the `TurnControl`),
+    /// so the switch takes effect at the next model call. Switching in the
+    /// middle of a tool loop is fine: the conversation history is
+    /// provider-neutral. The new client is built before the request is taken,
+    /// so an unbuildable spec leaves the request parked for the next step,
+    /// where it fails the same way — the turn keeps running on the current
+    /// model either way, and the typed command line is still queued behind the
+    /// turn, where `run_command` surfaces the error. Emits
+    /// `AgentEvent::ModelSwitched` so the UI can record the switch in the
+    /// recents MRU while the turn holds the agent.
+    async fn apply_model_request(&mut self) {
+        let Some(spec) = self.control.take_model_request() else { return };
+        // Record the model actually in use (resolved by the live client)
+        // before switching, so a provider-default edit made in the same
+        // session cannot rewrite which model we record leaving. Both specs go
+        // out canonical, so the recents MRU never re-parses them.
+        let (user, default_provider) = self.config.effective_providers();
+        let all = providers::effective_providers(&user);
+        let previous = crate::recents::canonical(
+            &format!("{}/{}", self.client.provider_name(), self.client.model_name()),
+            &all,
+            &default_provider,
+        );
+        match Self::client_for(&self.config, &spec) {
+            Ok(client) => {
+                self.client = client;
+                self.config.model = spec.clone();
+                self.calibration = None;
+                self.learned_window = None;
+                self.detected_window = None;
+                self.compact_floor = 0;
+                self.detect_context_window().await;
+                let spec = crate::recents::canonical(&spec, &all, &default_provider);
+                self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
+            }
+            Err(_) => {
+                // Leave the request queued for the next step (see above).
+                self.control.set_model(&spec);
+            }
+        }
     }
 
     /// Ask the endpoint for the model's context window, unless config sets it.
@@ -1299,6 +1365,9 @@ impl Agent {
                 break;
             }
             self.absorb_steers()?;
+            // A `/model <spec>` typed mid-turn applies here, so the request
+            // built below goes to the new model.
+            self.apply_model_request().await;
 
             // Refresh the mode note on the system prompt before rebuilding the
             // tools, so a mid-turn Shift+Tab keeps the prompt and the available
@@ -1927,6 +1996,7 @@ fn sanitize(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::llm::{LLMResponse, ToolCall};
+    use crate::recents;
     use crate::tools::ToolDefinition;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -3190,6 +3260,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_during_tool_call_applies_at_the_next_model_call() {
+        // `/model <spec>` typed mid-turn (here: while the first response's
+        // tool call is still being dispatched) is applied before the next
+        // model call, in the middle of the tool loop.
+        let dir = tempfile::tempdir().unwrap();
+        // The recents MRU the `ModelSwitched` event feeds (as
+        // `Terminal::model_switched` does for a switch at the prompt).
+        let recents = Arc::new(Mutex::new(recents::Recents::default()));
+        let recents_path = dir.path().join("recent-models.json");
+        let (mut agent, _) = interfering(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/switched");
+                }
+            },
+            None,
+        );
+        {
+            let slot = recents.clone();
+            let path = recents_path.clone();
+            agent.set_event_sink(Box::new(move |_, event| {
+                if let AgentEvent::ModelSwitched { spec, previous } = event {
+                    let mut recents = slot.lock().unwrap();
+                    recents.record(previous);
+                    recents.record(spec);
+                    recents::save(&path, &recents);
+                }
+            }));
+        }
+        agent.new_session().unwrap();
+        let before = format!("{}/{}", agent.provider_name(), agent.model_name());
+        let outcome = agent.run_turn(Some("in-1"), "do it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // The answer came from the mock client the turn switched to.
+        assert!(outcome.response.starts_with("Based on the echo tool result: "), "{}", outcome.response);
+        // The turn's second model call went to the new model.
+        assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
+        assert_eq!(agent.model_name(), "switched");
+        assert_eq!(agent.config().model, "mock/switched");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // Both sides of the switch were recorded, newest first.
+        let models = recents.lock().unwrap().models().to_vec();
+        let previous = recents::canonical(&before, &Default::default(), "mock");
+        assert_eq!(models, ["mock/switched".to_string(), previous]);
+        assert!(recents_path.exists(), "the MRU was persisted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_to_an_unknown_provider_keeps_the_current_model() {
+        // An unbuildable spec never reaches the model: the turn finishes on
+        // the current model and the request stays queued so the typed line —
+        // replayed after the turn — reports the error.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering(
+            vec![text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("nosuchprovider/x");
+                }
+            },
+            None,
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.response, "done");
+        assert_eq!(agent.provider_name(), "test", "unchanged");
+        assert_eq!(agent.model_name(), "interfering", "unchanged");
+        assert_eq!(agent.control().take_model_request().as_deref(), Some("nosuchprovider/x"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn steer_during_tool_call_joins_next_model_call() {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, seen) = interfering(
@@ -3419,10 +3563,7 @@ mod tests {
 
         // A mid-turn `/mode normal` makes the live mode Normal; `/tools` must
         // then list the mutating tool the Plan-time capture would have dropped.
-        let normal = crate::context::ContextStats {
-            mode: crate::mode::AgentMode::Normal,
-            ..Default::default()
-        };
+        let normal = crate::context::ContextStats { mode: crate::mode::AgentMode::Normal, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
             snapshot.output("/tools", &normal, &crate::plan::Plan::default())
         else {
@@ -3431,10 +3572,7 @@ mod tests {
         assert!(listing.contains("write_file"), "Plan-mode capture dropped the mutating tool: {listing}");
 
         // And under a live Plan mode it is still filtered out.
-        let plan = crate::context::ContextStats {
-            mode: crate::mode::AgentMode::Plan,
-            ..Default::default()
-        };
+        let plan = crate::context::ContextStats { mode: crate::mode::AgentMode::Plan, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(filtered)) =
             snapshot.output("/tools", &plan, &crate::plan::Plan::default())
         else {

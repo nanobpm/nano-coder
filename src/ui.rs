@@ -2,9 +2,9 @@
 //! events into streamed text, collapsible thinking and inline tool calls.
 
 use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -520,7 +520,9 @@ impl Renderer {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
             }
-            AgentEvent::Context => {}
+            // The mid-turn `/model <spec>` note is printed when the command is
+            // typed; the event exists so the sink records the recents MRU.
+            AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
         }
         self.frame_render(fs);
     }
@@ -1029,6 +1031,9 @@ impl Renderer {
                 self.out(&mut state, &format!("{}{DIM}⟳ context compacted{RESET}\n", stamp()));
             }
             AgentEvent::UserMessage { .. } | AgentEvent::Context | AgentEvent::Compacted => {}
+            // The mid-turn `/model <spec>` note is printed when the command
+            // is typed; the event exists so the sink records the recents MRU.
+            AgentEvent::ModelSwitched { .. } => {}
         }
     }
 
@@ -1469,10 +1474,7 @@ pub(crate) mod tests {
         r.begin_turn();
         r.set_verbosity_mid_turn(Verbosity::Quiet);
         r.set_verbosity_mid_turn(Verbosity::Normal);
-        assert!(
-            !r.answer_may_be_truncated(),
-            "entering quiet with no suppressed delta must not flag truncation"
-        );
+        assert!(!r.answer_may_be_truncated(), "entering quiet with no suppressed delta must not flag truncation");
     }
 
     #[test]

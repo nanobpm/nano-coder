@@ -166,9 +166,10 @@ enum TermInput {
     Rejected(String),
 }
 
-/// Apply `/mode NAME` or `/verbosity LEVEL` typed during a turn through
-/// shared state (the agent reads its mode from `TurnControl` at each step;
-/// verbosity is global). Returns the note to show.
+/// Apply `/mode NAME`, `/verbosity LEVEL` or `/model SPEC` typed during a
+/// turn through shared state (the agent reads its mode and a requested model
+/// from `TurnControl` at each step; verbosity is global). Returns the note to
+/// show.
 fn apply_next_step_setting(
     cmd: &str,
     control: &agent::TurnControl,
@@ -197,6 +198,21 @@ fn apply_next_step_setting(
             }
             Err(e) => e,
         }
+    } else if let Some(arg) = cmd.strip_prefix("/model ") {
+        let spec = arg.trim();
+        if spec.is_empty() {
+            // The bare picker owns the keyboard, so it waits for the turn;
+            // `timing` agrees, so this is only a backstop.
+            return format!("[{cmd}: waits for the turn to finish]");
+        }
+        // The agent applies the switch just before its next model call
+        // (`Agent::apply_model_request`), so this is safe in the middle of a
+        // tool loop: the history is provider-neutral. The spec is validated
+        // when the client is built there; an unbuildable spec keeps the turn
+        // on the current model, and the typed line — still queued behind the
+        // turn — reports the error when `run_command` retries it.
+        control.set_model(spec);
+        format!("Model switch to {spec} queued; applies from the next model call (the history carries over)")
     } else {
         format!("[{cmd}: not a setting]")
     }
@@ -1638,20 +1654,6 @@ async fn main() -> Result<()> {
         }));
         let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
         ui::install(renderer.clone());
-        let sink = renderer.clone();
-        agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
-        agent.set_streaming(true);
-        agent.refresh_stats();
-        let frame_mode = renderer.is_frame();
-        // Emit the startup banner now the renderer exists. In frame mode seed it
-        // into the owned transcript via `print_block` so the first full redraw
-        // (which clears the scrollback) cannot erase it; in legacy mode print it
-        // inline, with the trailing blank line the banner has always had.
-        if frame_mode {
-            renderer.print_block(&banner.join("\n"));
-        } else {
-            println!("{}\n", banner.join("\n"));
-        }
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = {
             let mut loaded = recents::load(&recents_path);
@@ -1667,6 +1669,36 @@ async fn main() -> Result<()> {
             }
             Arc::new(Mutex::new(loaded))
         };
+        {
+            let sink = renderer.clone();
+            let recents = recents.clone();
+            let recents_path = recents_path.clone();
+            agent.set_event_sink(Box::new(move |_, event| {
+                sink.event(event);
+                // A `/model <spec>` typed mid-turn is applied by the agent
+                // itself, so the between-turns `run_command` arm never runs:
+                // record the switch in the recents MRU here instead, as
+                // `Terminal::model_switched` does for a switch at the prompt.
+                if let agent::AgentEvent::ModelSwitched { spec, previous } = event {
+                    let mut recents = recents.lock().unwrap();
+                    recents.record(previous);
+                    recents.record(spec);
+                    recents::save(&recents_path, &recents);
+                }
+            }));
+        }
+        agent.set_streaming(true);
+        agent.refresh_stats();
+        let frame_mode = renderer.is_frame();
+        // Emit the startup banner now the renderer exists. In frame mode seed it
+        // into the owned transcript via `print_block` so the first full redraw
+        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // inline, with the trailing blank line the banner has always had.
+        if frame_mode {
+            renderer.print_block(&banner.join("\n"));
+        } else {
+            println!("{}\n", banner.join("\n"));
+        }
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),
