@@ -603,7 +603,20 @@ impl Agent {
 
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
-        self.client = Self::client_for(&self.config, spec)?;
+        // `client_for` → `build_client` → `resolve` can run an `api_key_command`
+        // as a child process. `set_model` is awaited from the async TUI/ACP
+        // command loops (between turns), so running that inline freezes the
+        // runtime for the command's full duration, stalling the UI/event loop.
+        // Offload the blocking build to the blocking thread pool and await it so
+        // the runtime stays responsive while the key command runs — the same
+        // pattern `apply_model_request` uses for the mid-turn switch.
+        let config_for_build = self.config.clone();
+        let spec_for_build = spec.to_string();
+        self.client = tokio::task::spawn_blocking(move || {
+            Self::client_for(&config_for_build, &spec_for_build)
+        })
+        .await
+        .map_err(|join| anyhow::anyhow!("building client for {spec:?} panicked: {join}"))??;
         self.config.model = spec.to_string();
         // A direct switch supersedes any still-unapplied mid-turn `/model`
         // request: one queued during the final in-flight call of a prior turn
@@ -3709,6 +3722,67 @@ mod tests {
             None,
             "the stale queued request was cleared, not left to fire next turn"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime() {
+        // `set_model` builds the new client, and building it can run an
+        // `api_key_command` as a child process. That build must be offloaded to
+        // the blocking pool (as `apply_model_request` does), not run inline on
+        // the async executor: the between-turn `/model` switch is awaited from
+        // the single-threaded TUI/ACP event loops, so an inline blocking build
+        // would freeze the whole UI for the command's duration. Proof: on a
+        // single-threaded runtime a concurrently-spawned async task keeps
+        // ticking while the key command sleeps; if the build ran inline it would
+        // monopolise the only executor thread and the ticker would not advance.
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent_with_slow_key_command(dir.path());
+        agent.new_session().unwrap();
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        agent.set_model("slowmock/x").await.unwrap();
+        ticker.abort();
+
+        assert_eq!(agent.model_name(), "x", "the switch took effect");
+        assert_eq!(agent.config().model, "slowmock/x");
+        // The key command sleeps ~300ms; at 10ms ticks the async ticker would
+        // advance many times if (and only if) the executor stayed free. Require
+        // several to rule out the inline-blocking regression without being
+        // flaky about exact scheduling.
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 5,
+            "the runtime kept scheduling other tasks while the key command ran (ticks={}): a stall means the \
+             blocking client build ran inline on the executor instead of spawn_blocking",
+            ticks.load(Ordering::SeqCst),
+        );
+    }
+
+    fn agent_with_slow_key_command(dir: &std::path::Path) -> (Agent, Seen) {
+        let (mut agent, seen) = agent(vec![text("done")], dir);
+        // A Mock provider needs no endpoint and builds instantly, so the only
+        // slow part of the client build is its `api_key_command` child process —
+        // isolating exactly the blocking work `set_model` must offload.
+        agent.config.providers.insert(
+            "slowmock".to_string(),
+            crate::providers::ProviderConfig {
+                kind: Some(crate::providers::ProviderKind::Mock),
+                default_model: Some("m".to_string()),
+                api_key_command: Some("sleep 0.3; printf sk".to_string()),
+                ..Default::default()
+            },
+        );
+        (agent, seen)
     }
 
     #[tokio::test(flavor = "multi_thread")]
