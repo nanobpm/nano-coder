@@ -175,6 +175,7 @@ fn apply_next_step_setting(
     control: &agent::TurnControl,
     stats: &context::SharedStats,
     renderer: &ui::Renderer,
+    snapshot: &turn_commands::Snapshot,
 ) -> String {
     if let Some(arg) = cmd.strip_prefix("/mode ") {
         match arg.trim().parse::<mode::AgentMode>() {
@@ -207,12 +208,19 @@ fn apply_next_step_setting(
         }
         // The agent applies the switch just before its next model call
         // (`Agent::apply_model_request`), so this is safe in the middle of a
-        // tool loop: the history is provider-neutral. The spec is validated
-        // when the client is built there; an unbuildable spec keeps the turn
-        // on the current model, and the typed line — still queued behind the
-        // turn — reports the error when `run_command` retries it.
+        // tool loop: the history is provider-neutral. Validate the spec now,
+        // against the turn-start providers (they do not change during a turn),
+        // so an unbuildable spec is reported immediately and is never queued —
+        // a dead request must not sit on the control and leak into later turns.
+        // A spec that passes here almost always builds at apply time; the rare
+        // late failure (e.g. a failing api-key command) is surfaced then via
+        // `AgentEvent::ModelSwitchFailed` and the request is dropped, not
+        // retried.
+        if let Err(e) = snapshot.validate_model_spec(spec) {
+            return format!("[{cmd}: {e}]");
+        }
         control.set_model(spec);
-        format!("Model switch to {spec} queued; applies from the next model call (the history carries over)")
+        format!("Model switch to {spec} queued; applies at the next model call (the history carries over)")
     } else {
         format!("[{cmd}: not a setting]")
     }
@@ -713,7 +721,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     }
                                 }
                                 turn_commands::Timing::NextStep => {
-                                    renderer.note(&apply_next_step_setting(text, &control, &stats, &renderer));
+                                    renderer.note(&apply_next_step_setting(text, &control, &stats, &renderer, &snapshot));
                                 }
                                 turn_commands::Timing::AfterTurn => {
                                     renderer.note(&format!("[waits for the turn to finish: {text}]"));
@@ -1673,7 +1681,7 @@ async fn main() -> Result<()> {
             let sink = renderer.clone();
             let recents = recents.clone();
             let recents_path = recents_path.clone();
-            agent.set_event_sink(Box::new(move |_, event| {
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
                 sink.event(event);
                 // A `/model <spec>` typed mid-turn is applied by the agent
                 // itself, so the between-turns `run_command` arm never runs:

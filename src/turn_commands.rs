@@ -134,6 +134,16 @@ impl Snapshot {
         }
     }
 
+    /// Validate a `/model <spec>` typed mid-turn against the turn-start
+    /// providers, without side effects (see `providers::validate_spec`), so an
+    /// unbuildable spec is reported the moment it is typed instead of failing
+    /// silently at the next model call. The providers do not change during a
+    /// turn, so the turn-start snapshot is authoritative. Returns the error
+    /// message to show, or `Ok(())` if the spec builds.
+    pub fn validate_model_spec(&self, spec: &str) -> Result<(), String> {
+        crate::providers::validate_spec(spec, &self.providers, &self.default_provider).map_err(|e| e.to_string())
+    }
+
     /// The output of a read-only command (see [`timing`]), or `None` for any
     /// other command. `stats` and `plan` are the live values.
     pub fn output(&self, cmd: &str, stats: &ContextStats, plan: &Plan) -> Option<Output> {

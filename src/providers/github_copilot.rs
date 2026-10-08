@@ -401,6 +401,18 @@ impl GithubCopilotClient {
 
 #[async_trait]
 impl LLMClient for GithubCopilotClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        // Clone manually: the session-token cache (`tokio::sync::Mutex`) is not
+        // `Clone`, and a fresh cache is correct — the clone re-fetches a session
+        // token on first use.
+        Box::new(Self {
+            transport: self.transport.clone(),
+            oauth: self.oauth.clone(),
+            endpoints: self.endpoints.clone(),
+            session: tokio::sync::Mutex::new(None),
+        })
+    }
+
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let provider = self.transport.provider();
         let api = copilot_api_for_model(&provider.model);

@@ -254,6 +254,34 @@ pub struct ResolvedProvider {
     pub replay_reasoning: bool,
 }
 
+/// Check that `spec` names a known provider with a usable `kind`, model, and
+/// endpoint, against an already-resolved `providers` map — **without side
+/// effects**. Unlike [`resolve`], it never runs an `api_key_command`
+/// subprocess or builds a client, so it is safe to call synchronously on the
+/// UI thread (e.g. when a `/model <spec>` is typed mid-turn) to report an
+/// unbuildable spec immediately instead of letting it fail silently later. It
+/// returns the same errors `resolve` would for these cases; the api-key path
+/// is intentionally not checked here (that is the apply-time safety net's job).
+pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, default_provider: &str) -> Result<()> {
+    let (name, model) = parse_model_spec(spec, providers, default_provider);
+    let config = providers.get(name).ok_or_else(|| {
+        anyhow!(
+            "unknown provider {name:?} for model {spec:?}; known providers: {}",
+            providers.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    let kind = config.kind.ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
+    model
+        .map(str::to_string)
+        .or_else(|| config.default_model.clone())
+        .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
+    match (kind, &config.base_url) {
+        (ProviderKind::Mock | ProviderKind::GithubCopilot, _) | (_, Some(_)) => {}
+        (_, None) => bail!("provider {name:?} has no base_url"),
+    }
+    Ok(())
+}
+
 pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provider: &str) -> Result<ResolvedProvider> {
     let providers = effective_providers(user);
     let (name, model) = parse_model_spec(spec, &providers, default_provider);
@@ -376,6 +404,7 @@ pub fn build_client(
 }
 
 /// Shared JSON-over-HTTP transport with retries.
+#[derive(Clone)]
 pub(crate) struct HttpTransport {
     client: reqwest::Client,
     provider: ResolvedProvider,
@@ -836,6 +865,44 @@ mod tests {
             parse_model_spec("meta-llama/llama-4", &providers, "together"),
             ("together", Some("meta-llama/llama-4"))
         );
+    }
+
+    #[test]
+    fn validate_spec_matches_resolve_for_the_buildable_cases() {
+        let providers = effective_providers(&HashMap::new());
+        // A buildable spec passes validation and also resolves.
+        assert!(validate_spec("mock/anything", &providers, "mock").is_ok());
+        assert!(resolve("mock/anything", &HashMap::new(), "mock").is_ok());
+        // A provider that cannot build a client (openai kind, no base_url) is
+        // rejected the same way by both, so queue-time validation never queues
+        // a spec that would only fail (silently, pre-fix) at the next model call.
+        let mut user = HashMap::new();
+        user.insert(
+            "broken".to_string(),
+            ProviderConfig { kind: Some(ProviderKind::Openai), default_model: Some("m".into()), ..Default::default() },
+        );
+        let providers = effective_providers(&user);
+        let err = validate_spec("broken/x", &providers, "mock").unwrap_err().to_string();
+        assert!(err.contains("base_url"), "{err}");
+        assert!(resolve("broken/x", &user, "mock").is_err());
+    }
+
+    #[test]
+    fn validate_spec_rejects_a_provider_without_a_model() {
+        // A user provider with a kind and base_url but no default model, and a
+        // bare spec that supplies none, must be rejected (not silently queued).
+        let mut user = HashMap::new();
+        user.insert(
+            "bare".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some("http://localhost:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        let providers = effective_providers(&user);
+        let err = validate_spec("bare", &providers, "mock").unwrap_err().to_string();
+        assert!(err.contains("no model"), "{err}");
     }
 
     #[test]

@@ -337,6 +337,10 @@ pub trait LLMClient: Send + Sync {
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         None
     }
+    /// A boxed clone, for work that outlives the caller's borrow — e.g. the
+    /// agent probing the context window in a background task after a mid-turn
+    /// `/model` switch, so the probe never blocks the next model call.
+    fn clone_boxed(&self) -> Box<dyn LLMClient>;
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
 }

@@ -89,6 +89,10 @@ fn mock_thinking(request: &ChatRequest<'_>) -> String {
 
 #[async_trait]
 impl LLMClient for MockLLMClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        Box::new(Self::new(&self.model))
+    }
+
     /// Streams word by word, with small delays, to exercise streaming output.
     async fn chat_stream(&self, request: &ChatRequest<'_>, sink: StreamSink<'_>) -> Result<LLMResponse> {
         let response = self.chat(request).await?;

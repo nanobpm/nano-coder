@@ -134,8 +134,9 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
         | AgentEvent::Context
         | AgentEvent::Compacted
         // Interactive-only (a `/model` typed mid-turn); an ACP client switches
-        // models between turns, so this never fires here.
-        | AgentEvent::ModelSwitched { .. } => {
+        // models between turns, so these never fire here.
+        | AgentEvent::ModelSwitched { .. }
+        | AgentEvent::ModelSwitchFailed { .. } => {
             return None;
         }
     })
@@ -395,7 +396,7 @@ fn is_jsonrpc_request(msg: &Value) -> bool {
 /// request (e.g. the client isn't speaking ACP), so the caller can exit
 /// non-zero instead of masking a misconfiguration as success.
 pub async fn run_acp(agent: &mut Agent) -> Result<bool> {
-    agent.set_event_sink(Box::new(|session_id, event| {
+    agent.set_event_sink(std::sync::Arc::new(|session_id, event| {
         if let Some(update) = update_for(event) {
             send_notification("session/update", json!({ "sessionId": session_id, "update": update }));
         }

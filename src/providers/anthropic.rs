@@ -14,6 +14,7 @@ const API_VERSION: &str = "2023-06-01";
 /// The Messages API requires `max_tokens`.
 const DEFAULT_MAX_TOKENS: i64 = 8192;
 
+#[derive(Clone)]
 pub struct AnthropicClient {
     transport: HttpTransport,
 }
@@ -333,6 +334,10 @@ pub(crate) async fn stream(
 
 #[async_trait]
 impl LLMClient for AnthropicClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        Box::new(self.clone())
+    }
+
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let body = self.build_body(request);
         let api_key = self.transport.provider().api_key.clone();

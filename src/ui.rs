@@ -523,6 +523,12 @@ impl Renderer {
             // The mid-turn `/model <spec>` note is printed when the command is
             // typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
+            // A mid-turn `/model <spec>` that could not be applied: surface the
+            // error in the transcript so the failed switch is never silent.
+            AgentEvent::ModelSwitchFailed { spec, error } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Note(format!("⚠ model switch to {spec} failed: {error}"))));
+            }
         }
         self.frame_render(fs);
     }
@@ -856,6 +862,14 @@ impl Renderer {
             status.draw();
         }
         if verbosity() == Verbosity::Quiet {
+            // A failed mid-turn `/model` switch is user-facing in every
+            // verbosity — quiet suppresses streamed output, not warnings.
+            if let AgentEvent::ModelSwitchFailed { spec, error } = event {
+                let mut state = self.state.lock().unwrap();
+                self.newline(&mut state);
+                self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+                return;
+            }
             // Mark the truncation guard only when a non-empty answer delta is
             // actually suppressed here: those deltas never reach the terminal,
             // so if the turn later ends at a louder level the live stream is
@@ -1034,6 +1048,12 @@ impl Renderer {
             // The mid-turn `/model <spec>` note is printed when the command
             // is typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } => {}
+            // A mid-turn `/model <spec>` that could not be applied: surface the
+            // error inline so the failed switch is never silent.
+            AgentEvent::ModelSwitchFailed { spec, error } => {
+                self.newline(&mut state);
+                self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+            }
         }
     }
 
