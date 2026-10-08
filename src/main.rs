@@ -762,6 +762,12 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     // `/verbosity LEVEL` typed mid-turn set the global; keep the config copy
     // (which `/settings` saves) in step, as the between-turns command does.
     agent.config_mut().verbosity = ui::verbosity();
+    // A mid-turn `/model` switch updates the agent's config but not the shared
+    // editor context (the between-turns path refreshes it via
+    // `Terminal::model_switched`). Resync now the turn has returned so `/model`
+    // completion treats the newly switched model as `current`, matching the
+    // prompt-level switch.
+    terminal.sync_context(agent);
     terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
     // A steer typed as the turn finished queues behind what is already
     // waiting, unless the turn was cancelled. Drain it before propagating any

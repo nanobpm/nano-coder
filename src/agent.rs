@@ -585,6 +585,12 @@ impl Agent {
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
         self.client = Self::client_for(&self.config, spec)?;
         self.config.model = spec.to_string();
+        // A direct switch supersedes any still-unapplied mid-turn `/model`
+        // request: one queued during the final in-flight call of a prior turn
+        // outlives that turn, and without clearing it the first call of the
+        // next turn would consume the stale request and silently switch away
+        // from the model this direct switch just selected.
+        self.control.take_model_request();
         self.calibration = None;
         self.learned_window = None;
         *self.detected_window.lock().unwrap() = None;
@@ -3531,6 +3537,28 @@ mod tests {
         assert_eq!(failures.len(), 1, "one failure reported: {failures:?}");
         assert_eq!(failures[0].0, "flaky/x");
         assert!(failures[0].1.contains("api_key_command"), "error explains the failure: {}", failures[0].1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_direct_model_switch_supersedes_a_stale_queued_request() {
+        // A `/model` queued during a prior turn's final in-flight call is not
+        // consumed before that turn ends, so it outlives the turn on the
+        // `TurnControl`. A later direct (prompt-level) switch via
+        // `Agent::set_model` must supersede it: otherwise the first model call
+        // of the next turn would consume the stale request and silently switch
+        // away from the model the direct switch just selected.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.control().set_model("mock/stale");
+        agent.set_model("mock/direct").await.unwrap();
+        assert_eq!(agent.config().model, "mock/direct");
+        assert_eq!(agent.model_name(), "direct", "the direct switch took effect");
+        assert_eq!(
+            agent.control().take_model_request(),
+            None,
+            "the stale queued request was cleared, not left to fire next turn"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

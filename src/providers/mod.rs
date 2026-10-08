@@ -276,8 +276,31 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     match (kind, &config.base_url) {
-        (ProviderKind::Mock | ProviderKind::GithubCopilot, _) | (_, Some(_)) => {}
+        // Mock/Copilot derive (or do not need) an endpoint, so any/no base_url
+        // is fine; a real HTTP provider must carry a usable one.
+        (ProviderKind::Mock | ProviderKind::GithubCopilot, _) => {}
+        (_, Some(url)) => validate_http_base_url(name, url)?,
         (_, None) => bail!("provider {name:?} has no base_url"),
+    }
+    Ok(())
+}
+
+/// A configured HTTP(S) provider endpoint must be a real, absolute http(s)
+/// URL. Requests are built as `format!("{base_url}{path}")` (see
+/// [`HttpTransport::post_json`]), so an empty or malformed `base_url` is not
+/// caught by `Some(_)`/`HttpTransport::new`; it only fails later while building
+/// the request URL — by which point a mid-turn switch has already replaced the
+/// working client and lost the current model. Validating it here (shared by
+/// [`validate_spec`] and [`resolve`]) rejects the bad endpoint at queue time
+/// and preserves the queue-time bad-endpoint guarantee.
+fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
+    if base_url.trim().is_empty() {
+        bail!("provider {provider:?} has an empty base_url");
+    }
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|e| anyhow!("provider {provider:?} has a malformed base_url {base_url:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("provider {provider:?} base_url {base_url:?} must be http(s), not {:?}", parsed.scheme());
     }
     Ok(())
 }
@@ -301,7 +324,10 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
         (ProviderKind::Mock | ProviderKind::GithubCopilot, url) => {
             url.clone().unwrap_or_default().trim_end_matches('/').to_string()
         }
-        (_, Some(url)) => url.trim_end_matches('/').to_string(),
+        (_, Some(url)) => {
+            validate_http_base_url(name, url)?;
+            url.trim_end_matches('/').to_string()
+        }
         (_, None) => bail!("provider {name:?} has no base_url"),
     };
     let api_key = match (&config.api_key, &config.api_key_env) {
@@ -903,6 +929,51 @@ mod tests {
         let providers = effective_providers(&user);
         let err = validate_spec("bare", &providers, "mock").unwrap_err().to_string();
         assert!(err.contains("no model"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_rejects_an_empty_or_malformed_base_url() {
+        // An HTTP provider whose base_url is *present* but empty/whitespace,
+        // unparseable, or non-http(s) must be rejected at queue time by BOTH
+        // `validate_spec` and `resolve`: `Some(_)` and `HttpTransport::new`
+        // accept it, so without parsing it a mid-turn switch would replace the
+        // working client and only fail later while building the request URL
+        // (losing the current model). Each variant is its own occurrence of the
+        // same fail-open class.
+        let mut user = HashMap::new();
+        for (name, url) in
+            [("empty", "   "), ("bad", "not a url"), ("ftp", "ftp://host/v1"), ("nohost", "http://")]
+        {
+            user.insert(
+                name.to_string(),
+                ProviderConfig {
+                    kind: Some(ProviderKind::Openai),
+                    default_model: Some("m".into()),
+                    base_url: Some(url.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let providers = effective_providers(&user);
+        for name in ["empty", "bad", "ftp", "nohost"] {
+            let spec = format!("{name}/x");
+            assert!(validate_spec(&spec, &providers, "mock").is_err(), "validate_spec accepted {name}");
+            assert!(resolve(&spec, &user, "mock").is_err(), "resolve accepted {name}");
+        }
+        // A well-formed endpoint still passes both, unchanged.
+        let mut ok = HashMap::new();
+        ok.insert(
+            "good".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                default_model: Some("m".into()),
+                base_url: Some("http://localhost:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        let providers = effective_providers(&ok);
+        assert!(validate_spec("good/x", &providers, "mock").is_ok());
+        assert!(resolve("good/x", &ok, "mock").is_ok());
     }
 
     #[test]
