@@ -1751,6 +1751,12 @@ impl Agent {
                         let estimate = self.estimate_context_tokens().0;
                         self.learned_window =
                             Some(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
+                        // Publish the just-learned window to the shared stats
+                        // before the awaited compaction below: mid-turn
+                        // `/context` renders exclusively from `SharedStats`, so
+                        // without this refresh it keeps showing the old window
+                        // and source for the whole client build and compaction.
+                        self.refresh_stats();
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
                         // The overflow compaction is a model call too: apply a
                         // `/model` queued while the overflowing request was in
