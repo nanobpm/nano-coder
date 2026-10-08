@@ -18,7 +18,8 @@ cargo install nano-coder             # or build from source
 - **Providers**: OpenAI-compatible and Anthropic endpoints (remote or local), selected per model as `provider/model`, with retry/backoff
 - **Tool Calling**: Agent can invoke registered tools during conversation, including a real `bash` tool with timeouts and bounded output
 - **Sessions**: Append-only JSONL session logs with resume and input-ID deduplication
-- **Lifecycle Hooks**: 6 hook events for observing/intercepting agent behavior
+- **Lifecycle Hooks**: 6 internal hook events for observing agent behavior, plus
+  Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
@@ -33,7 +34,7 @@ cargo install nano-coder             # or build from source
 ### Interactive CLI Mode (default)
 
 ```bash
-cargo run
+nano-coder
 ```
 
 Starts the interactive REPL where you can chat with the agent and use slash commands.
@@ -65,13 +66,15 @@ Slash commands work mid-turn too, where it is safe:
 
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
+At the idle prompt, **Esc Esc** instead clears the input, so a half-typed or pasted prompt
+can be discarded without deleting it character by character.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 
 ### ACP Headless Mode (--acp flag)
 
 ```bash
-cargo run -- --acp
+nano-coder --acp
 ```
 
 Speaks the Agent Communication Protocol (ACP) over stdio using newline-delimited JSON-RPC 2.0 messages. Compatible with c8ctl-nano's `spawnCaptureAcp` executor.
@@ -127,7 +130,8 @@ escalation). Redelivering the input returns the same outcome. See [Outcomes](#ou
 
 **Slash commands work via ACP too:**
 - `/compact [--smart|--standard] [focus]` - summarizes the conversation; the result has
-  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode` and `fallback`
+  `compacted`, `before`, `after`, `tokensBefore`, `tokensAfter`, `summarized`, `mode`, `fallback`
+  and `truncated`
 - `/settings` - returns current settings as JSON
 - `/tools` - lists registered tools
 - `/plan` - returns `plan` (JSON) and `text` (the rendered plan)
@@ -148,7 +152,8 @@ src/
 ├── main.rs      # Single binary entry point (interactive + ACP modes)
 ├── agent.rs     # Agent core: conversation management, tool execution loop
 ├── acp.rs       # ACP JSON-RPC protocol handler
-├── hooks.rs     # Lifecycle hook registry and event system
+├── hooks.rs     # Internal (observe-only) lifecycle hook registry and events
+├── claude_hooks.rs # External Claude Code–compatible user hooks engine
 ├── tools.rs     # Tool registration and dispatch system
 ├── llm.rs       # Provider-neutral messages and the async LLMClient trait
 ├── providers/   # Provider registry + presets, HTTP transport with retries
@@ -164,6 +169,8 @@ src/
 ├── sandbox.rs   # Seatbelt (macOS) / Landlock (Linux) sandbox for shell commands
 ├── output.rs    # Head/tail output bounding, spilling long output to disk
 ├── session.rs   # Versioned append-only JSONL session log
+├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
+├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
 ├── status.rs    # Bottom-of-terminal status line
 ├── ui.rs        # Verbosity levels and the streaming output renderer
@@ -174,6 +181,7 @@ src/
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
 ├── queue.rs     # The interactive message queue and the /queue editor
 ├── goal.rs      # report_outcome tool (completed / blocked / needs_input)
+├── memory.rs    # Cross-session memory: memory_save / memory_search / memory_forget
 ├── mode.rs      # Agent mode (normal / plan / auto) and the plan-mode tool gate
 ├── question.rs  # question tool and the mid-turn question / turn-cap rendezvous
 ├── commands.rs  # Slash-command table for /help and the as-you-type menu
@@ -187,7 +195,14 @@ Mode selection: `--acp` flag enables ACP headless mode; default is interactive C
 
 ## Lifecycle Hooks
 
-The harness exposes 6 lifecycle hook events:
+nano-coder has two hook systems.
+
+### Internal hooks (observe-only)
+
+The harness exposes 6 internal lifecycle hook events for in-process Rust
+callbacks. These are **observe-only**: a callback can inspect the event payload
+(for logging, metrics, debugging) but cannot block, modify, or redirect the
+agent. They are registered programmatically against `agent.hooks()`.
 
 | Hook | When it fires |
 |------|---------------|
@@ -197,6 +212,36 @@ The harness exposes 6 lifecycle hook events:
 | `after_llm_response` | After receiving LLM response |
 | `before_tool_call` | Before executing a tool |
 | `after_tool_call` | After tool execution completes |
+
+### External user hooks (Claude Code–compatible)
+
+nano-coder also runs **external user hooks** that follow the
+[Claude Code hooks protocol](https://docs.claude.com/en/docs/claude-code/hooks),
+so existing Claude Code hook configurations work unchanged. These are loaded,
+in order, from:
+
+1. `[hooks]` in nano-coder's own user config (`config.toml`), in Claude's structure
+2. `~/.claude/settings.json` (your Claude Code user settings; disable with `claude_user_hooks = false`)
+3. `<project>/.claude/settings.json` (project settings, committed)
+4. `<project>/.claude/settings.local.json` (project-local, git-ignored)
+
+Each hook is a `command` that nano-coder runs as a subprocess, passing the
+event payload as JSON on stdin and interpreting its exit code and (optional)
+JSON stdout per Claude's protocol. Hooks can **block** a tool call or prompt,
+**modify** a tool's input, or **inject additional context**. nano-coder
+translates its tool names (`bash`→`Bash`, `read_file`→`Read`, `write_file`→
+`Write`, `edit_file`→`Edit`, `grep`→`Grep`, `glob`→`Glob`) and the `file_path`/
+`path` argument so Claude-authored matchers and scripts match correctly.
+
+Supported events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, and `Stop`. A `PreToolUse` hook that fails (crashes, times out,
+or exits non-zero) **fails closed** and blocks the tool call; failures in other
+events are non-blocking.
+
+Run `/hooks` at the prompt to list the loaded hooks, which files they came
+from, and any that were skipped (e.g. unsupported events reserved for later
+phases). Disable them with `--no-hooks`, or granularly via the
+`disable_hooks`, `disable_project_hooks`, and `claude_user_hooks` settings.
 
 ## Built-in Tools
 
@@ -227,6 +272,9 @@ The harness exposes 6 lifecycle hook events:
   away message. Headless (ACP) sessions get an error instead.
 - `load_skill` - Return a skill's instructions and list its other files; `name`. Offered only
   when skills were found (see [Skills](#skills)).
+- `memory_save`, `memory_search`, `memory_forget` - Cross-session memory: facts the model saves
+  in one session and finds in later ones (see [Memory](#memory)). Offered when `memory` is on;
+  read-only runs (headless/ACP) offer `memory_search` only.
 
 Any other tool's result longer than 40,000 characters is cut the same way as bash output,
 with the whole result saved under the temp directory (`nano-coder-<pid>/tool-<id>-<name>.txt`)
@@ -314,7 +362,7 @@ can fix it. To send a message that starts with `/`, such as a path, type `//`:
 Typing `/` at the prompt lists the commands under it, and each further character narrows the
 list. Tab completes the command, or the part all matches share. Esc hides the list. The
 list is built from the same table as `/help` (`src/commands.rs`). Commands with a known
-argument set (`/model`, `/mode`, `/verbosity`) get the same treatment for their first
+argument set (`/model`, `/mode`, `/verbosity`, `/thinking`) get the same treatment for their first
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
@@ -340,15 +388,19 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
+- `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
+- `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
   - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
+- `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt with the frame renderer: invoked mid-turn (while a turn runs) or under the legacy renderer it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
 
@@ -366,9 +418,32 @@ cargo run
 cargo run -- --model anthropic/claude-sonnet-4-5
 cargo run -- --model ollama/qwen2.5:1.5b
 cargo run -- --resume sess-20260923T012518-7e7923f8
+cargo run -- --resume        # pick a session
+cargo run -- --resume last   # the most recent session in this directory
 ```
 
-Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume SESSION_ID`,
+**Resuming.** `--resume` without an ID opens a picker of this directory's saved sessions, most
+recently used first. Each row shows when the session was last used, its project (the last part of
+its directory), how many prompts it has, and its last prompt. When the last prompt says little
+("do it"), the row also shows the more telling prompt before it. Type to filter, Enter to resume,
+Esc to cancel. The last entry shows sessions from every directory. At the prompt, `/resume` does the same without restarting. Sessions with no prompts are
+left out. Sessions from before this feature don't record their directory: they are shown in every
+directory, with `?` as the project. Without a terminal, `--resume` prints the list and exits.
+`--list-sessions [--all] [--json]` prints the list for scripts (`--all`: every directory).
+
+The picker reads `.index.jsonl` in the session directory: one summary per session, updated at the
+end of each turn. It is only a cache. A session that is missing from it, or whose log changed
+since it was indexed, is summarized from its log again, and deleting the file rebuilds it.
+
+**Titles.** With `session_titles = true`, once a session has a prompt that says something (not
+just "hi"), nano-coder asks the model for a title of at most six words in the background. It uses
+`title_model` (a cheap one is enough) or the session's model. The request is a few hundred tokens,
+tried at most once per session per run (so a failed or deleted title is retried after a restart,
+not on the next turn). The picker then shows `title · last prompt`. Titles live only in the index,
+so older nano-coders can still read the logs. Deleting `index.jsonl` loses them; a new run then
+asks again on the session's next turn.
+
+Flags: `--login github-copilot`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
 `--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
 
@@ -378,18 +453,20 @@ and `cargo test`; CI checks all three. To keep `git blame` past the one-time ref
 
 ## Configuration
 
-Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`) are still used if the new ones don't exist:
+Create `~/.config/nano-coder/config.toml` (every field is optional). Directories from before the rename (`agentic-harness`, for config and for data such as sessions) are moved to `nano-coder` at startup when the new ones don't exist yet. A symlink is left at the old path so an older nano-coder still finds them. If that compatibility symlink can't be created, a warning is printed and the link is retried on later starts; if the move itself fails, the old directory is used:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
-temperature = 0.7
+temperature = 0.7                       # or "default" to send none (see Temperature below)
 max_tokens = 4096
 max_iterations = 0                      # LLM calls per user input (0 = unbounded)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
 # session_dir = "/path/to/sessions"    # default: <platform data dir>/nano-coder/sessions
+session_titles = false                  # ask the model for a few-word title per session (--resume picker)
+# title_model = "openai/gpt-4o-mini"    # model for titles (default: the session's model)
 auto_compact = true                     # summarize automatically when the context fills up
 auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
@@ -398,10 +475,16 @@ verbosity = "normal"                    # quiet | normal | verbose | debug (or -
 renderer = "frame"                      # frame (default: app-owned redraw on resize) | legacy
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
-project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"]
+project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"]
+user_instruction_files = ["~/.claude/CLAUDE.md", "~/.agents/AGENTS.md"]   # yours, for every project
+user_rules_dirs = ["~/.claude/rules"]
+instruction_imports_outside_project = false   # let project @imports / rule links leave the repo
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
+memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
+# memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
+memory_expiry_days = 90                 # expire memories unused this long (0 = never)
 
 [skills]                                # see Skills
 enabled = true
@@ -446,7 +529,7 @@ Built-in presets:
 | `kimi` | openai | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
 | `mistral` | openai | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
 | `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` |
-| `qwen` | openai | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `qwen` | openai | Model Studio (default: Standard, Singapore — all plans/regions below) | `DASHSCOPE_API_KEY` / `BAILIAN_*_PLAN_API_KEY` |
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
@@ -484,17 +567,160 @@ timeout_secs = 300                      # idle timeout: max silence between stre
 max_retries = 3
 ```
 
-`qwen` is Qwen Cloud (Alibaba Cloud Model Studio), e.g. `--model qwen/qwen3.8-max`. The
-preset uses the Singapore endpoint. API keys are bound to a region, so for another region
-or your workspace domain override `base_url`, e.g.
-`https://dashscope-us.aliyuncs.com/compatible-mode/v1` or
-`https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`.
+`qwen` is Qwen Cloud (Alibaba Cloud Model Studio), e.g. `--model qwen/qwen3.8-max`.
+Model Studio serves the same models through three plans, each with its own hostnames and
+API-key variable. All of them speak OpenAI Chat Completions, so each is just a `base_url`
++ `api_key_env`:
+
+| Plan | Region | Base URL | API key env |
+|---|---|---|---|
+| Standard API key | Singapore (International) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | China (Beijing) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | US (Virginia) | `https://dashscope-us.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Standard API key | China (Hong Kong) | `https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| Token Plan | Singapore (International) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `BAILIAN_TOKEN_PLAN_API_KEY` |
+| Token Plan | China (Beijing) | `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1` | `BAILIAN_TOKEN_PLAN_API_KEY` |
+| Coding Plan | Singapore (International) | `https://coding-intl.dashscope.aliyuncs.com/v1` | `BAILIAN_CODING_PLAN_API_KEY` |
+| Coding Plan | China (Beijing) | `https://coding.dashscope.aliyuncs.com/v1` | `BAILIAN_CODING_PLAN_API_KEY` |
+
+The `qwen` preset defaults to **Standard API key, Singapore** (the first row). In
+`/settings` → *Add or edit a provider* → `qwen` these eight endpoints are offered as a
+*Qwen / Model Studio endpoint* picker (plus a custom URL), so you can switch plan and
+region without retyping a URL. Picking a plan also points the provider at that plan's
+API-key variable — the preset's `DASHSCOPE_API_KEY` becomes `BAILIAN_TOKEN_PLAN_API_KEY`
+for Token Plan, and `BAILIAN_CODING_PLAN_API_KEY` for Coding Plan. Set the variable (or a
+key command / literal key) at the key prompt that follows. API keys are also bound to a
+*region*, so a key issued for another region still needs the matching endpoint row.
+
+To configure an endpoint in the config file directly, override `base_url` and
+`api_key_env` (append `/compatible-mode/v1` to a workspace domain, e.g.
+`https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`):
+
+```toml
+[providers.qwen]                        # Token Plan, China
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+api_key_env = "BAILIAN_TOKEN_PLAN_API_KEY"
+```
 
 `kimi` is the Kimi API from platform.kimi.ai, e.g. `--model kimi/kimi-k3` or
 `kimi/kimi-k2.7-code`. The preset drops `temperature` (K3 fixes it) and sets
 `replay_reasoning = true`, which sends each assistant message's `reasoning_content` back
 as thinking models like K3 require. Set `extra_body = { reasoning_effort = "low" }` to
 make K3 think less.
+
+### Temperature
+
+`temperature` is a number, or `"default"` to send none so the model uses its own default.
+It can be set for all models, for one provider, or for one model; the most specific
+setting wins:
+
+```toml
+temperature = 0.7                       # all models
+
+[providers.groq]
+temperature = "default"                 # every groq model uses its own default
+
+[providers.anthropic.models."claude-sonnet-4-5"]
+temperature = 0.3                       # this model only
+```
+
+Some models accept no temperature, and for them the model default is the only option:
+GitHub Copilot's reasoning models (GPT-5 and later, Grok, …) and any provider with
+`drop_params = ["temperature"]` (such as the `kimi` preset). A number set for such a
+provider or model is ignored with a warning at startup and when you switch to it; the
+top-level `temperature` just doesn't apply to them. Anthropic accepts 0 to 1, so a higher
+value is sent as 1, with a warning. `/context` shows the temperature in use and where it
+comes from, and `/settings` edits it for the current model, its provider, or all models.
+
+### Thinking
+
+`thinking` sets how much the model reasons before it answers: `"default"` sends nothing
+(the model decides), `"off"` turns thinking off, and a level such as `"low"`, `"medium"`,
+`"high"`, `"xhigh"` or `"max"` asks for that much. Like `temperature`, it can be set for all
+models, one provider or one model, and `/thinking LEVEL` overrides them for the session:
+
+```toml
+thinking = "medium"                     # all models that support it
+
+[providers.anthropic.models."claude-opus-4-7"]
+thinking = "xhigh"                      # this model only
+```
+
+A model only gets levels it supports. They come from, in order: `thinking_levels` on the
+model or provider; what the endpoint reports for the model; and a built-in table
+of Claude (3.7 Sonnet and later) and OpenAI reasoning models (GPT-5 and later, o1/o3/o4).
+Endpoints that report levels:
+
+- **GitHub Copilot:** `/models` lists each model's levels, read with the same request as its
+  context window.
+- **Ollama:** a model with the `thinking` capability (`/api/show`) gets `off`, `low`,
+  `medium` and `high`. Ollama refuses a level for a model without it, so none is sent then.
+- **llama.cpp:** the loaded model's chat template (`/props`) decides. A template with an
+  `enable_thinking` switch (Qwen 3 and the like) gets `off` and `on`, and any named level
+  turns thinking on; a template that takes `reasoning_effort` (gpt-oss) gets `low`, `medium`
+  and `high`.
+
+Ollama and llama.cpp are recognized however the provider is named, the same way as for the
+context window. For other models, list the levels yourself:
+
+```toml
+[providers.together.models."deepseek-r1"]
+thinking_levels = ["low", "medium", "high"]   # add "off" if thinking can be turned off
+```
+
+A level the model lacks is moved to the nearest one it has (the highest below it, else the
+lowest), and a model with no known levels is sent nothing. A setting for the provider, the
+model or the session warns when it is adjusted or ignored; the top-level `thinking` doesn't
+warn, since it applies to every model.
+
+How the level is sent depends on the API: `reasoning_effort` (Chat Completions, Ollama
+included; Ollama ignores its native `think` flag on `/v1`), `chat_template_kwargs` for
+llama.cpp (`enable_thinking`, or `reasoning_effort` for templates that take a level; it
+ignores the top-level `reasoning_effort`),
+`reasoning.effort` (Responses), and for Anthropic Messages adaptive thinking with
+`output_config.effort`, or on Claude 3.7 to 4.5 a fixed `budget_tokens` (1024 for minimal, then
+2048, 8192, 16384, 32768, 65536 up to max). The budget has to stay below `max_tokens`, so raise
+`max_tokens` to use a large one. Anthropic takes no custom temperature while thinking, so
+none is sent then. A matching key in the provider's `extra_body` (`reasoning_effort`, `reasoning`,
+`think`, `chat_template_kwargs`, `thinking`, `output_config`) is sent instead, with a warning; the
+configured level is then reported as overridden (not as sent), since the override's value is what
+reaches the wire. The status bar shows
+`think LEVEL` while a level is sent, `/context` shows it with where it comes from,
+`/settings` sets it for the current model, its provider or all models (picking from the
+levels the model supports), and the session log records it for each reply.
+
+### Vision
+
+`read_file` returns images (PNG, JPEG, GIF and WebP, recognised by magic bytes) to
+models that can view them: the result is a short text part (`image/png, 1600×900, 131 KB`)
+plus an image attachment the model sees directly. Images over the provider's limits are
+downscaled first (longest side 1568 px, under the model's byte cap), and re-encoded to
+JPEG/PNG when the model doesn't accept the source type. Other binary files still return
+the "looks like a binary file" error, which notes whether the current model supports
+images.
+
+Whether a model can see images comes from, in order: a `vision = true|false` override
+(global, `[providers.<name>]`, or `[providers.<name>.models."<model>"]`, like `thinking`);
+what the endpoint reports (GitHub Copilot `/models` `capabilities.supports.vision` and its
+`limits.vision`, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
+`modalities.vision`); and a built-in assumption for current Anthropic and OpenAI model
+families. A model that can't see images gets the text error with a hint to switch models
+or set `vision = true`:
+
+```toml
+vision = true                            # all models
+
+[providers.ollama.models."my-clip-model"]
+vision = true                            # this model only
+```
+
+A request carries only the newest few images the model allows (GitHub Copilot's
+`max_prompt_images`, default 1); older ones become `[image omitted: path (sent earlier)]`.
+Each image counts toward the context estimate at a fixed cost from its size, so the status
+bar and auto-compaction stay honest, and compaction replaces images with the same
+placeholder. Images are stored once per session under `<session>.attachments/` (named by
+content hash), so session logs stay small and `--resume` still works; a missing file on
+resume is sent as a text placeholder.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
 which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
@@ -591,7 +817,8 @@ editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the sta
 Alt/Option-Left/Right (or Alt-B/Alt-F) move by word, and Up/Down recall submitted lines from
 the session's input history (Down past the newest restores what you were typing). The mouse is never captured, so the
 terminal keeps its native behaviour — the wheel scrolls the scrollback and drag selects text. Backspace and Delete remove the character before/under the cursor, Ctrl-U clears the
-input and Ctrl-W deletes the word before the cursor. At the prompt between turns,
+input, Ctrl-W deletes the word before the cursor, and Esc Esc (twice within a second)
+clears the whole input at the prompt. At the prompt between turns,
 Ctrl-Enter (or Cmd-Enter) inserts a newline without sending, and pasted text keeps its line breaks as a single multi-line input
 instead of sending line by line. Ctrl-D exits on an empty line.
 
@@ -616,7 +843,9 @@ scrollback and reflows history itself on a resize, with the status line pinned t
 
 ## Status Line and Compaction
 
-In an interactive terminal the bottom row shows the provider/model, context usage
+In an interactive terminal the bottom row shows the provider/model, the working directory
+(home shown as `~`; on a narrow terminal the middle directories collapse to `…`, as in
+`~/…/src/providers`, before other items are dropped), context usage
 (`~` marks an estimate; without it the figure is anchored to the provider's reported usage),
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count (labelled `smart-compact` when compactions are smart, else `auto-compact`), the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
@@ -647,7 +876,9 @@ sets the window). The window a server has *loaded* is preferred over the model's
 
 Compaction asks the current model to summarize older messages, keeping the recent tail
 (up to 20k tokens, never starting at a tool result). Auto-compaction runs before a model
-call when usage passes the threshold. It won't run again until the context has grown by
+call when usage passes the threshold, or earlier if the prompt would leave less than the
+reserved output room (`MIN_OUTPUT_RESERVE`, plus an estimation margin) within the window.
+It won't run again until the context has grown by
 another 10% of the window, so a context that can't shrink isn't summarized on every call.
 If summarizing fails, the older messages are dropped with a note. The session log records
 the new conversation, so `--resume` continues from it.
@@ -693,24 +924,61 @@ providers and models on synthetic or forked real sessions (see its README). See 
 
 ## Project Instructions
 
-When a session starts, the harness looks for instruction files in every directory from the
-git root (the nearest ancestor containing `.git`) down to the working directory. Outside a
-repository only the working directory is checked. In each directory the first file found from
-`project_instruction_files` is used, so `AGENTS.md` wins over `CLAUDE.md`, which wins over
-`.github/copilot-instructions.md`. The files are appended to the system prompt, root first,
-under a "Repository instructions" heading that tells the model to follow them. So the model
-has them before it makes any change, without having to decide to read them. Each file is
-capped at 32 KiB and the total at 64 KiB.
+nano-coder reads the instruction files you already have for other tools, including Claude
+Code's, so there is nothing to duplicate.
 
-Instruction files deeper in the tree than the working directory, such as `pkg/AGENTS.md`,
-are loaded lazily. The first time `read_file`, `write_file` or `edit_file` touches a path
-under such a directory, its instructions are appended to that tool result, once per
-directory. After a compaction they are attached again the next time they apply. Files that
-the `bash` tool touches don't trigger this.
+**Your files.** Each file in `user_instruction_files` that exists (default `~/.claude/CLAUDE.md`
+and `~/.agents/AGENTS.md`) is loaded first, under a "Your instructions" heading, followed by
+the rules in `user_rules_dirs` (default `~/.claude/rules`).
 
-Instructions are read again when a session is resumed, so edits to `AGENTS.md` take effect.
-`/context` lists the loaded files. To turn loading off, set `project_instructions = false`,
-or set `AGENTIC_NO_PROJECT_INSTRUCTIONS`.
+**The repository's files.** When a session starts, the harness looks in every directory from
+the git root (the nearest ancestor containing `.git`) down to the working directory. Outside
+a repository only the working directory is checked. In each directory:
+
+- the first file found from `project_instruction_files` is used, so `AGENTS.md` wins over
+  `CLAUDE.md`, then `.claude/CLAUDE.md`, then `.github/copilot-instructions.md`;
+- `CLAUDE.local.md` (personal, not committed) is loaded as well, after it.
+
+Rules in `.claude/rules/**/*.md` at the git root are loaded after the root directory's
+files. These files are appended to the system prompt, root first, under a "Repository
+instructions" heading that tells the model to follow them. So the model has them before it
+makes any change, without having to decide to read them. Block-level `<!-- ... -->` comments
+are removed first. Each file is capped at 32 KiB and the total at 64 KiB; a file over the
+limit is named, with a note to read it with `read_file`.
+
+**Imports.** `CLAUDE.md`, `CLAUDE.local.md`, rules and imported files can pull in other files
+with `@path`, as in Claude Code: relative to the importing file, `~/` allowed, up to four
+levels deep, each file once. Code spans and fenced code blocks are skipped, `\ ` escapes a
+space, and a path that doesn't exist is treated as a mention. `AGENTS.md` has no import
+syntax, so `@` there is never expanded. **Imports in repository files may not leave the
+repository**: a committed `CLAUDE.md` could otherwise send `~/.ssh/...` to the model provider.
+They are skipped with a warning in the banner and `/context`, and so are rules that are
+symlinks to files outside it. Set `instruction_imports_outside_project = true` to allow them.
+Your own files can import from anywhere.
+
+**Rules for some paths.** A rule with `paths` front matter loads only when it is needed:
+
+```markdown
+---
+paths:
+  - "src/api/**/*.{ts,tsx}"
+---
+All API endpoints must validate their input.
+```
+
+Patterns are relative to the git root (`**` crosses directories, `*` and `?` don't, `{a,b}`
+alternatives).
+
+**Deeper directories and path rules load lazily.** Instruction files deeper than the working
+directory, such as `pkg/AGENTS.md`, and rules whose `paths` match are attached to the result
+of the first `read_file`, `write_file` or `edit_file` call that touches a matching path, once
+each. After a compaction they are attached again the next time they apply. Files that the
+`bash` tool touches don't trigger this.
+
+Instructions are read again when a session is resumed, so edits take effect. `/context` lists
+the loaded files, the rules waiting for a matching path, and anything skipped. To turn loading
+off (yours and the repository's), set `project_instructions = false`, or set
+`AGENTIC_NO_PROJECT_INSTRUCTIONS`.
 
 ## Skills
 
@@ -799,6 +1067,66 @@ tool out.
 can tell it apart from a clean `completed` without guessing from the text. For a richer,
 multi-choice question that does not end the turn, the model uses the `question` tool instead.
 
+## Memory
+
+Cross-session memory lets the model save a fact in one session and find it in later ones, so
+a project's quirks and the machine's setup are not rediscovered every time ("tests run with
+`cargo test`, not `make test`"; "Python comes from `uv`"). A memory is a **hint to verify, not
+a rule**: entries are dated, framed in the prompt as possibly out of date, shown in the
+transcript when saved, undoable with `/memory`, and never grant any permission.
+
+Two scopes:
+
+- `user` - the machine and your habits (toolchains, auth, preferences).
+- `project` - keyed by the git remote (fallback: the git root path); this repo's quirks and
+  setup. Unavailable outside a git repository.
+
+Storage mirrors the session log's format but not its write pattern: each scope is a JSONL
+file, one entry per line, under `<memory_dir>/user.jsonl` and `<memory_dir>/projects/<key>.jsonl`
+(default `<data>/memory`, next to `sessions/`). Every save, matching search, expiry prune, and
+forget **atomically rewrites** the complete scope (write a sibling temp file, then rename) rather
+than appending, so do not infer session-log-style append behaviour or append-write performance.
+Each entry has an id, the text, created and last-used dates, the source session, and optional
+evidence (a file path or command). Search is a case-insensitive regex
+over the text and the optional evidence, as in `history_search` - no embeddings or vector
+store.
+
+**Tools** (offered when `memory` is on): `memory_save(scope, text, evidence?)`,
+`memory_search(pattern, scope?)`, `memory_forget(id)`.
+
+**Prompt.** A capped, dated index (most-recently-used first, ~4 KB with the guidance) is
+appended to the system prompt at session start, framed as "notes from earlier sessions; may be
+out of date; verify before relying on them". The rest is reachable with `memory_search`.
+
+**What gets saved.** When saving is possible, the prompt says what is worth saving, even
+before anything has been saved (adapted from Claude Code's auto memory):
+
+- **Save:** corrections you give and approaches you confirm; your preferences; decisions and
+  context the code and git history don't record; where to find things outside the repository;
+  setup that was costly to work out.
+- **Skip:** what the code, git history or instruction files already say, one-off debugging,
+  session logs, and secrets.
+
+Asking the model to remember something saves it. Asking for it to go in `AGENTS.md` or
+`CLAUDE.md` edits that file instead. Once per session, after 30 tool calls without a save,
+a reminder asks whether anything durable is worth saving (`reminders = false` turns
+reminders off).
+
+**Control and hygiene.**
+
+- Each save is confirmed to the model (`remembered (scope, id): ...`), so it shows in the
+  transcript. `/memory` lists every entry with its id; `/memory forget <id>` deletes one; the
+  files are human-readable and can be edited directly.
+- Obvious secrets (keys, tokens, passwords, `.env`-style assignments, private-key blocks) are
+  rejected on save - store where to find them instead.
+- Using an entry (a `memory_search` match) in a writable session bumps its last-used date;
+  read-only and Plan-mode searches never bump it. Entries unused for
+  `memory_expiry_days` (default 90; `0` disables) expire on the next load.
+- Memories never touch the permission rules.
+
+Set `memory = "on"` (full), `"read_only"` (index and `memory_search` only), or `"off"`.
+Headless/ACP runs downgrade `on` to `read_only` by default, since no human vets a save live.
+
 ## Sessions
 
 When `persist_sessions` is on, each conversation is written to `<session_dir>/<id>.jsonl`.
@@ -844,7 +1172,7 @@ agent.tools().register(tool_def, Box::new(|args| {
 
 The model sees a JSON string result as plain text and any other value as serialized JSON.
 
-### Adding Hooks
+### Adding internal (observe-only) hooks
 
 ```rust
 agent.hooks().register(HookEvent::BeforeToolCall, Box::new(|ctx| {
@@ -852,6 +1180,10 @@ agent.hooks().register(HookEvent::BeforeToolCall, Box::new(|ctx| {
     println!("About to call tool: {}", tool_name);
 }));
 ```
+
+These callbacks observe only; to block, modify, or add context to a tool call
+or prompt, use the external Claude-compatible user hooks described under
+[Lifecycle Hooks](#lifecycle-hooks).
 
 ### Custom LLM Client
 

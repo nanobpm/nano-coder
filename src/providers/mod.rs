@@ -11,6 +11,7 @@ pub mod github_copilot;
 pub mod mock;
 pub mod openai;
 pub mod openai_responses;
+pub mod qwen;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
@@ -84,6 +85,22 @@ pub struct ProviderConfig {
     /// for thinking models that require it in multi-turn and tool-call
     /// conversations (e.g. Kimi K3). Default false.
     pub replay_reasoning: Option<bool>,
+    /// Temperature for this provider's models: a number, or `"default"` to
+    /// send none. Overrides the top-level `temperature`.
+    pub temperature: Option<crate::temperature::Temperature>,
+    /// Thinking level for this provider's models: `"default"`, `"off"` or a
+    /// level name. Overrides the top-level `thinking`.
+    pub thinking: Option<crate::thinking::Thinking>,
+    /// Whether this provider's models can view images (`read_file` image
+    /// attachments). Overrides the top-level `vision` and endpoint detection.
+    pub vision: Option<bool>,
+    /// Thinking levels this provider's models accept, overriding the built-in
+    /// table (e.g. `["low", "high"]`; add `"off"` if thinking can be turned off).
+    pub thinking_levels: Option<Vec<String>>,
+    /// Per-model settings (`[providers.NAME.models."MODEL"]`), which win over
+    /// the provider's.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, crate::temperature::ModelSettings>,
 }
 
 impl ProviderConfig {
@@ -118,9 +135,28 @@ impl ProviderConfig {
             retry_initial_backoff_ms,
             retry_max_backoff_ms,
             retryable_statuses,
-            replay_reasoning
+            replay_reasoning,
+            temperature,
+            thinking,
+            vision,
+            thinking_levels
         );
         self.headers.extend(other.headers.clone());
+        for (model, settings) in &other.models {
+            let entry = self.models.entry(model.clone()).or_default();
+            if settings.temperature.is_some() {
+                entry.temperature = settings.temperature;
+            }
+            if settings.thinking.is_some() {
+                entry.thinking = settings.thinking.clone();
+            }
+            if settings.vision.is_some() {
+                entry.vision = settings.vision;
+            }
+            if settings.thinking_levels.is_some() {
+                entry.thinking_levels = settings.thinking_levels.clone();
+            }
+        }
         self
     }
 }
@@ -179,10 +215,13 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
     );
     add(
         "qwen",
+        // The endpoint (host and API-key variable) is derived from the Qwen
+        // plan/region table in `qwen`, so a new Model Studio region appears
+        // here and in the `/settings` endpoint picker at once.
         ProviderConfig::preset(
             Openai,
-            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            Some("DASHSCOPE_API_KEY"),
+            qwen::default_endpoint().base_url,
+            Some(qwen::default_endpoint().plan.api_key_env()),
         ),
     );
     add("ollama", ProviderConfig::preset(Openai, "http://localhost:11434/v1", None));
@@ -371,7 +410,7 @@ pub fn build_client(
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
         ProviderKind::GithubCopilot => Box::new(github_copilot::GithubCopilotClient::new(resolved)?),
-        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.model)),
+        ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.name, &resolved.model)),
     })
 }
 
@@ -391,6 +430,25 @@ pub(crate) enum StreamAction<'a> {
     /// any attempt-local accumulator state so buffered deltas are not
     /// duplicated on the retry.
     Reset,
+}
+
+/// Recursively merge `source` into `target`, both JSON objects. A key present
+/// in both is merged when both values are objects (so nested fields coexist),
+/// otherwise `source` wins. Non-object arguments are left untouched. Used by
+/// `finish_body` so an `extra_body` nested option does not clobber an unrelated
+/// generated sibling field (e.g. `output_config.format` vs the generated
+/// `output_config.effort`).
+fn merge_object(target: &mut Value, source: &Value) {
+    if let (Value::Object(target), Value::Object(source)) = (target, source) {
+        for (key, value) in source {
+            match target.get_mut(key) {
+                Some(existing @ Value::Object(_)) if value.is_object() => merge_object(existing, value),
+                _ => {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
 }
 
 impl HttpTransport {
@@ -416,7 +474,29 @@ impl HttpTransport {
     pub fn finish_body(&self, mut body: Value) -> Value {
         if let Some(object) = body.as_object_mut() {
             for (key, value) in &self.provider.extra_body {
-                object.insert(key.clone(), value.clone());
+                // `temperature` is owned by the resolution path
+                // (`temperature::resolve`), which already folds any
+                // `extra_body` value into the request's effective temperature
+                // — capping it for Anthropic and dropping it for models that
+                // reject one. Re-inserting the raw value here would overwrite
+                // that resolved value, so the request would no longer match the
+                // effective temperature reported to the user. Skip it.
+                if key == "temperature" {
+                    continue;
+                }
+                match object.get_mut(key) {
+                    // Merge nested objects field-by-field so an unrelated
+                    // `extra_body` option (e.g. `output_config.format`) does not
+                    // clobber a generated sibling field (e.g. the adaptive
+                    // `output_config.effort`). `extra_body` still wins per field,
+                    // so a control it does set replaces the generated one.
+                    Some(existing @ Value::Object(_)) if value.is_object() => {
+                        merge_object(existing, value);
+                    }
+                    _ => {
+                        object.insert(key.clone(), value.clone());
+                    }
+                }
             }
             for key in &self.provider.drop_params {
                 object.remove(key);
@@ -824,6 +904,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finish_body_keeps_resolved_temperature() {
+        // `temperature` is owned by the resolution path; even when a provider's
+        // extra_body carries one, `finish_body` must not re-insert it over the
+        // value the request already set. Other extra_body keys still merge.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some("http://localhost/v1".into()),
+                extra_body: Some(toml::from_str("temperature = 2.0\nthink = false").unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"temperature": 0.3}));
+        assert_eq!(finished["temperature"], serde_json::json!(0.3));
+        assert_eq!(finished["think"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn finish_body_deep_merges_nested_extra_body_objects() {
+        // A generated nested field (e.g. the adaptive `output_config.effort`)
+        // and an unrelated `extra_body` sibling (`output_config.format`) must
+        // coexist: `finish_body` deep-merges object-valued keys instead of
+        // clobbering the whole object. Regression: a shallow insert replaced the
+        // generated `output_config` wholesale, dropping the requested thinking
+        // effort while keeping only `format`.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = { format = "json" }"#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(
+            finished["output_config"],
+            serde_json::json!({"effort": "high", "format": "json"}),
+            "nested objects merge field-by-field"
+        );
+        // A field the extra_body DOES set still wins (per-field override).
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = { effort = "low" }"#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(finished["output_config"], serde_json::json!({"effort": "low"}), "extra_body wins per field");
+        // A non-object extra_body value replaces wholesale, as before.
+        let user: std::collections::HashMap<String, ProviderConfig> = std::collections::HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Anthropic),
+                base_url: Some("http://localhost".into()),
+                extra_body: Some(toml::from_str(r#"output_config = "scalar""#).unwrap()),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let finished = transport.finish_body(serde_json::json!({"output_config": {"effort": "high"}}));
+        assert_eq!(finished["output_config"], serde_json::json!("scalar"), "a scalar override replaces the object");
+    }
+
+    #[test]
     fn parses_model_specs() {
         let providers = presets();
         assert_eq!(
@@ -859,7 +1011,8 @@ mod tests {
     fn qwen_and_kimi_presets() {
         let user = HashMap::new();
         let qwen = resolve("qwen/qwen3.8-max", &user, "mock").unwrap();
-        assert_eq!(qwen.base_url, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1");
+        // Derived, not hardcoded: the preset's host is the endpoint table's default.
+        assert_eq!(qwen.base_url, super::qwen::default_endpoint().base_url);
         assert!(!qwen.replay_reasoning);
         let kimi = resolve("kimi/kimi-k3", &user, "mock").unwrap();
         assert_eq!((kimi.base_url.as_str(), kimi.model.as_str()), ("https://api.moonshot.ai/v1", "kimi-k3"));
@@ -868,6 +1021,20 @@ mod tests {
         assert_eq!(kimi.max_tokens_param, "max_completion_tokens");
         assert_eq!(presets()["kimi"].api_key_env.as_deref(), Some("MOONSHOT_API_KEY"));
         assert_eq!(presets()["qwen"].api_key_env.as_deref(), Some("DASHSCOPE_API_KEY"));
+    }
+
+    #[test]
+    fn the_qwen_preset_is_derived_from_the_endpoint_table() {
+        // The preset's host and key variable come from the single endpoint table,
+        // so they cannot drift from the `/settings` picker.
+        let preset = presets().remove("qwen").unwrap();
+        assert_eq!(preset.base_url.as_deref(), Some(qwen::default_endpoint().base_url));
+        assert_eq!(preset.api_key_env.as_deref(), Some(qwen::default_endpoint().plan.api_key_env()));
+        // Every plan's host resolves to that plan's API-key variable.
+        for endpoint in qwen::ENDPOINTS {
+            assert_eq!(qwen::endpoint_for_url(endpoint.base_url), Some(endpoint));
+            assert!(endpoint.plan.api_key_env().ends_with("_API_KEY"), "{:?}", endpoint.plan);
+        }
     }
 
     #[test]

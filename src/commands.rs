@@ -25,6 +25,8 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/settings", args: "", description: "View/edit settings" },
     Command { name: "/verbosity", args: "[quiet|normal|verbose|debug]", description: "Show or set output detail" },
     Command { name: "/plan", args: "", description: "Show the agent's task plan with notes" },
+    Command { name: "/memory", args: "[forget ID]", description: "List cross-session memories (or forget one by id)" },
+    Command { name: "/hooks", args: "", description: "List loaded user hooks (.claude/settings.json and friends)" },
     Command {
         name: "/queue",
         args: "[list|add text|remove N...|edit N text|clear]",
@@ -38,6 +40,11 @@ pub const COMMANDS: &[Command] = &[
         description: "Show the model and pick a new one (or switch directly)",
     },
     Command { name: "/mode", args: "[normal|plan|auto]", description: "Show or set the agent mode (Shift+Tab cycles)" },
+    Command {
+        name: "/thinking",
+        args: "[level|default|off|reset]",
+        description: "Show or set the thinking level for this session",
+    },
     Command { name: "/providers", args: "", description: "List configured providers" },
     Command { name: "/session", args: "", description: "Show the session ID and log path" },
     Command {
@@ -45,6 +52,7 @@ pub const COMMANDS: &[Command] = &[
         args: "[--json|--markdown]",
         description: "Show this session's turn-by-turn trajectory in your pager (or export it)",
     },
+    Command { name: "/resume", args: "[ID|last]", description: "Switch to a saved session: pick one, or give its ID" },
     Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },
     Command { name: "/exit", args: "", description: "Exit the agent" },
     Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
@@ -63,7 +71,6 @@ pub fn parse_compact_args(args: &str) -> (Option<crate::config::CompactionMode>,
     (mode, Some(focus).filter(|f| !f.is_empty()))
 }
 
-/// Commands whose name starts with `prefix`.
 /// Why a submitted `/…` line can't be sent: its first word is not a command.
 /// `None` for anything else (not a `/` line, a known command, or a `//`
 /// escaped prompt). Such a line is never sent to the model, since a mistyped
@@ -102,17 +109,13 @@ fn closest(word: &str) -> Option<&'static str> {
     let len = word.chars().count();
     COMMANDS
         .iter()
-        .filter_map(|c| {
-            // Edit distance is never smaller than the length difference, so a
-            // candidate more than two chars longer or shorter than `word` can
-            // never be within two edits. Check that first: it keeps
-            // `edit_distance` — which allocates an O(word·name) matrix — from
-            // running on unbounded editor input. A long `/…` token would
-            // otherwise allocate one row per input char for every command,
-            // which can hang or exhaust memory.
-            let len_diff = len.abs_diff(c.name.chars().count());
-            (len_diff <= 2).then(|| (edit_distance(word, c.name), len_diff, c.name))
-        })
+        .map(|c| (len.abs_diff(c.name.chars().count()), c.name))
+        // A distance of at most two is impossible when the lengths differ by
+        // more than two, so skip `edit_distance` (which allocates an
+        // O(word x name) matrix) for those: `word` can be an arbitrarily long
+        // paste or path, and every command is a short name.
+        .filter(|(len_diff, _)| *len_diff <= 2)
+        .map(|(len_diff, name)| (edit_distance(word, name), len_diff, name))
         .filter(|(d, _, _)| *d <= 2)
         // Fewest edits; on a tie, the same length (`/modle` -> `/model`, not `/mode`).
         .min_by_key(|(d, len_diff, _)| (*d, *len_diff))
@@ -196,6 +199,7 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
             .iter()
             .map(|v| Suggestion { value: v.to_string(), note: v.describe().to_string() })
             .collect(),
+        "/thinking" => thinking_suggestions(),
         _ => Vec::new(),
     };
     all.into_iter().filter(|s| s.value.starts_with(prefix)).collect()
@@ -205,7 +209,23 @@ pub fn suggestions(config: &Config, recents: &[String], line: &str) -> Vec<Sugge
 /// set, so its argument type-ahead should be drawn (even when the typed
 /// prefix matches nothing, to say so).
 pub fn has_argument_menu(line: &str) -> bool {
-    matches!(split_command(line), Some(("/model" | "/mode" | "/verbosity", _)))
+    matches!(split_command(line), Some(("/model" | "/mode" | "/verbosity" | "/thinking", _)))
+}
+
+/// `/thinking` candidates: the special values, then the named levels. Which
+/// levels the current model takes shows in `/thinking`; another one is
+/// fitted to the nearest it has.
+fn thinking_suggestions() -> Vec<Suggestion> {
+    let special = [
+        ("default", "send no level; the model decides"),
+        ("off", "turn thinking off, where the model allows it"),
+        ("reset", "drop the session level; use the configured one"),
+    ];
+    special
+        .iter()
+        .map(|(value, note)| Suggestion { value: value.to_string(), note: note.to_string() })
+        .chain(crate::thinking::ORDER.iter().map(|level| Suggestion { value: level.to_string(), note: String::new() }))
+        .collect()
 }
 
 /// `/model` candidates, most-taken pathways first: the current model, then
@@ -321,7 +341,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("\n  {:width$}  {}", synopsis(c), c.description));
     }
     out.push_str("\nType / to list commands as you type; Tab completes commands and /model, /mode, /verbosity arguments; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.");
-    out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
+    out.push_str("\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Esc Esc also clears the input at the prompt, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)");
     out
 }
 
@@ -423,6 +443,18 @@ mod tests {
         assert_eq!(unescape_prompt("  //x"), Some("/x"));
         assert_eq!(unescape_prompt("/exit"), None);
         assert_eq!(unescape_prompt("hello"), None);
+    }
+
+    #[test]
+    fn oversized_words_skip_edit_distance_and_suggest_nothing() {
+        // A word far longer than any command can't be within two edits, so
+        // `closest` returns nothing and no suggestion is appended — without
+        // computing an O(word x name) matrix per command for the long input.
+        let long = format!("/{}", "x".repeat(10_000));
+        assert_eq!(closest(&long), None);
+        let note = rejection(&long).unwrap();
+        assert!(note.starts_with("Unknown command /"), "{note}");
+        assert!(!note.contains("Did you mean"), "{note}");
     }
 
     #[test]

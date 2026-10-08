@@ -349,7 +349,8 @@ mod tests {
         // window via `learned_window` must relabel the source alongside the
         // number, so `/context` never pairs a fresh window with a stale source.
         let snapshot = Snapshot::default();
-        let fresh = ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
+        let fresh =
+            ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
         let Some(Output::Block(before)) = snapshot.output("/context", &fresh, &Plan::default()) else { panic!() };
         assert!(before.ends_with("(context window known for the model name)"), "{before}");
 

@@ -30,6 +30,16 @@ pub fn terminal_size() -> Option<(u16, u16)> {
     (ok && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
 }
 
+/// Size of the terminal on **stderr**, where dialoguer pickers render. The
+/// `--resume` picker is gated on stdin/stderr being terminals (stdout may be
+/// redirected), so measuring stdout would fall back to a default even when
+/// the stderr terminal is narrower and the supposedly fitted rows wrap.
+pub fn stderr_terminal_size() -> Option<(u16, u16)> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    (ok && size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
 fn write_raw(bytes: &str) {
     with_term_lock(|| emit(bytes));
 }
@@ -188,6 +198,43 @@ fn resize_sequence(rows: u16) -> String {
     format!("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;{}r\x1b8", scroll_region_bottom(rows))
 }
 
+/// Bytes that re-own the screen for legacy mode after the frame renderer is
+/// dropped. The frame's last full redraw is still on the display (dropping
+/// `FrameState` emits nothing), so first clear the screen AND scrollback —
+/// the caller replays the conversation and reprints the frame-only items, so
+/// anything left visible is a stale copy that would otherwise scroll into
+/// scrollback as a duplicate. Then re-pin the scroll region to the status
+/// line's rows (the frame's redraws reset it to the whole screen) and leave
+/// the cursor on the last scrollable row, where the replay starts writing.
+///
+/// Unlike [`resize_sequence`] this does NOT erase below a restored cursor and
+/// does NOT restore the frame's saved cursor (which sits on the bottom status
+/// row): the caller runs this BEFORE the legacy editor/status redraw, so
+/// there is no fresh prompt to preserve yet — erasing/restoring there could
+/// wipe the row the editor is about to draw on, and the replay would then
+/// start writing on the reserved status row.
+fn repin_sequence(rows: u16) -> String {
+    format!("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;{}r\x1b[{};1H", scroll_region_bottom(rows), scroll_region_bottom(rows))
+}
+
+/// Bytes that clear the frame-owned screen and scrollback WITHOUT re-pinning
+/// a scroll region: the frame-to-legacy clear for when no status line is
+/// installed (`AGENTIC_NO_STATUS`, or a terminal shorter than five rows). The
+/// frame's last redraw is still on the display, so this drops the region,
+/// homes the cursor and wipes the screen + scrollback — the caller's legacy
+/// replay reprints the conversation, so anything left visible would scroll
+/// into scrollback as a duplicate. Unlike [`repin_sequence`] there is no
+/// bottom row to reserve, so the cursor is simply left at home.
+fn clear_display_sequence() -> &'static str {
+    "\x1b[r\x1b[H\x1b[2J\x1b[3J"
+}
+
+/// Clear the frame-owned screen and scrollback when no status line is
+/// installed (see [`clear_display_sequence`]).
+pub fn clear_display() {
+    with_term_lock(|| emit(clear_display_sequence()));
+}
+
 impl StatusLine {
     /// Reserve the bottom row, when stdin and stdout are a terminal and
     /// `AGENTIC_NO_STATUS` is unset.
@@ -270,6 +317,26 @@ impl StatusLine {
     pub fn resize(&self) {
         self.draw();
         self.anchor();
+    }
+
+    /// Re-pin the scroll region to the status line's rows. The frame renderer's
+    /// full redraw resets the region to the whole screen (`\x1b[r`); after a
+    /// live switch back to legacy the region must be re-pinned or the status
+    /// bar (pinned to the bottom row) would scroll off. `draw()` alone does not
+    /// re-pin it, because it only does so when the terminal *size* changed —
+    /// and a renderer switch does not change the size.
+    ///
+    /// This also clears the frame's last redraw off the screen (dropping the
+    /// frame emits nothing, so without a clear the replayed conversation is
+    /// written over the still-visible frame copy and the surplus scrolls into
+    /// scrollback as a duplicate). It deliberately does NOT use
+    /// [`resize_sequence`]'s erase-below-and-restore: the caller runs this
+    /// before the legacy editor/status redraw, so there is no fresh prompt to
+    /// preserve yet, and restoring the frame's saved cursor (the bottom status
+    /// row) would let the erase wipe the row the editor is about to draw on.
+    pub fn repin_scroll_region(&self) {
+        let Some((rows, _)) = terminal_size() else { return };
+        with_term_lock(|| emit(&repin_sequence(rows)));
     }
 
     /// Close any gap between the cursor and the status line by scrolling the
@@ -385,6 +452,78 @@ pub fn render_input(text: &str, cursor: usize, queued: usize, cols: usize) -> St
     )
 }
 
+/// Index of the cwd in the status segments (after the model).
+const CWD_SEGMENT: usize = 1;
+/// The narrowest the cwd is elided to before whole segments are dropped.
+const CWD_MIN_CELLS: usize = 16;
+
+/// `path` for display, with the home directory shown as `~`. Only whole
+/// leading components match: `/home/joshua` is not a prefix of
+/// `/home/joshua2`.
+pub fn tilde_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let home = home.filter(|h| h.components().count() > 1);
+    // The working directory is reported with symlinks resolved (on macOS
+    // `/tmp` is `/private/tmp`), so also try the resolved home directory.
+    // Apply the same root guard after canonicalization: a symlinked home that
+    // resolves to `/` would otherwise strip the `/` prefix from every
+    // absolute path and display it as `~/…`.
+    let resolved = home.and_then(|h| h.canonicalize().ok()).filter(|h| h.components().count() > 1);
+    let rest = home
+        .and_then(|h| path.strip_prefix(h).ok())
+        .or_else(|| resolved.as_deref().and_then(|h| path.strip_prefix(h).ok()));
+    match rest {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Shorten `path` to at most `budget` terminal cells by replacing middle
+/// directories with `…`: keep the first component (`~`, or the first
+/// directory under `/`) and as many trailing components as fit, e.g.
+/// `~/workspace/nano/src/providers` -> `~/…/src/providers`. When even the
+/// first and last components don't fit, keep the end of the last one
+/// (`…providers`), since that is the directory the user is in.
+fn elide_path(path: &str, budget: usize) -> String {
+    if cell_width(path) <= budget {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    // `/a/b/c` splits to ["", "a", "b", "c"]: keep "/a" as the head.
+    let head_len = if parts.first() == Some(&"") { 2 } else { 1 };
+    if parts.len() > head_len + 1 {
+        let head = parts[..head_len].join("/");
+        // Take trailing components while they fit, always leaving at least
+        // one middle component to elide (or nothing would be gained).
+        let mut keep = 0;
+        while head_len + keep + 1 < parts.len() {
+            let tail = parts[parts.len() - keep - 1..].join("/");
+            if cell_width(&format!("{head}/…/{tail}")) > budget {
+                break;
+            }
+            keep += 1;
+        }
+        if keep > 0 {
+            return format!("{head}/…/{}", parts[parts.len() - keep..].join("/"));
+        }
+    }
+    // Keep the end of the path, with `…` in front, within the budget.
+    if budget == 0 {
+        return String::new();
+    }
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1; // the leading `…`
+    for c in path.chars().rev() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        kept.push(c);
+        used += w;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
 fn render(stats: &ContextStats, cols: usize) -> String {
     let percent = stats.percent();
     let threshold = stats.auto_compact.map(|t| t * 100.0);
@@ -427,6 +566,10 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     };
     if let Some((text, color)) = mode_segment {
         segments.push(Segment { text: text.to_string(), color: Some(color), priority: 10 });
+    }
+    // The thinking level, when one is sent (none: the model decides).
+    if let Some(level) = &stats.thinking {
+        segments.push(Segment { text: format!(" think {level} "), color: Some("\x1b[38;5;147m"), priority: 4 });
     }
     if stats.session_input_tokens + stats.session_output_tokens > 0 {
         segments.push(Segment {
@@ -478,6 +621,14 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     let width = |segments: &[Segment]| -> usize {
         segments.iter().map(|s| cell_width(&s.text)).sum::<usize>() + segments.len().saturating_sub(1)
     };
+    // Too wide: first shorten the cwd by eliding its middle directories, down
+    // to CWD_MIN_CELLS, before any other segment is dropped.
+    let overflow = width(&segments).saturating_sub(cols);
+    if overflow > 0 {
+        let cwd_width = cell_width(&stats.cwd);
+        let budget = cwd_width.saturating_sub(overflow).max(CWD_MIN_CELLS.min(cwd_width));
+        segments[CWD_SEGMENT].text = format!(" {} ", elide_path(&stats.cwd, budget));
+    }
     while width(&segments) > cols && segments.len() > 1 {
         let lowest = segments.iter().enumerate().min_by_key(|(_, s)| s.priority).map(|(i, _)| i).unwrap();
         segments.remove(lowest);
@@ -570,7 +721,18 @@ mod tests {
             cwd: "/tmp/project".into(),
             tokens_per_sec: None,
             mode: crate::mode::AgentMode::Normal,
+            thinking: None,
         }
+    }
+
+    #[test]
+    fn shows_the_thinking_level_only_when_one_is_sent() {
+        assert!(!visible(&render(&stats(), 160)).contains("think "));
+        let line = visible(&render(&ContextStats { thinking: Some("high".into()), ..stats() }, 160));
+        assert!(line.contains("think high"), "{line:?}");
+        // Dropped before the model and context on a narrow terminal.
+        let line = visible(&render(&ContextStats { thinking: Some("high".into()), ..stats() }, 50));
+        assert!(!line.contains("think high") && line.contains("work/llama-b"), "{line:?}");
     }
 
     #[test]
@@ -653,6 +815,73 @@ mod tests {
         );
         // The surrounding real path characters survive.
         assert!(visible(&line).contains("abcd") || visible(&line).contains("/tmp/a"), "{line:?}");
+    }
+
+    #[test]
+    fn home_is_shown_as_tilde() {
+        use std::path::Path;
+        let home = Some(Path::new("/Users/joshua"));
+        assert_eq!(tilde_path(Path::new("/Users/joshua"), home), "~");
+        assert_eq!(tilde_path(Path::new("/Users/joshua/workspace/nano"), home), "~/workspace/nano");
+        // Whole components only, and paths outside home are unchanged.
+        assert_eq!(tilde_path(Path::new("/Users/joshua2/x"), home), "/Users/joshua2/x");
+        assert_eq!(tilde_path(Path::new("/tmp/project"), home), "/tmp/project");
+        assert_eq!(tilde_path(Path::new("/tmp"), None), "/tmp");
+        // A home of `/` would turn every path into `~/…`: leave it alone.
+        assert_eq!(tilde_path(Path::new("/tmp"), Some(Path::new("/"))), "/tmp");
+        // A home reached through a symlink matches the resolved working dir.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real-home");
+        std::fs::create_dir_all(real.join("proj")).unwrap();
+        let link = dir.path().join("link-home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(tilde_path(&real.join("proj"), Some(&link)), "~/proj");
+        // A symlinked home that resolves to `/` is still a root home: leave
+        // absolute paths alone rather than stripping the resolved `/` prefix.
+        let root_link = dir.path().join("root-home");
+        std::os::unix::fs::symlink("/", &root_link).unwrap();
+        assert_eq!(tilde_path(Path::new("/tmp"), Some(&root_link)), "/tmp");
+        assert_eq!(tilde_path(Path::new("/any/where"), Some(&root_link)), "/any/where");
+    }
+
+    #[test]
+    fn elide_path_drops_middle_directories_first() {
+        let path = "~/workspace/rusty-harness/src/providers";
+        assert_eq!(elide_path(path, 100), path, "fits: unchanged");
+        assert_eq!(elide_path(path, 31), "~/…/rusty-harness/src/providers");
+        assert_eq!(elide_path(path, 30), "~/…/src/providers");
+        assert_eq!(elide_path(path, 20), "~/…/src/providers");
+        assert_eq!(elide_path(path, 15), "~/…/providers");
+        // Too narrow for head and last component: keep the end of the path.
+        assert_eq!(elide_path(path, 8), "…oviders");
+        assert_eq!(elide_path(path, 1), "…");
+        assert_eq!(elide_path(path, 0), "");
+        // Absolute paths keep their first directory.
+        assert_eq!(elide_path("/var/lib/docker/volumes/data", 22), "/var/…/volumes/data");
+        // Nothing in the middle to elide.
+        assert_eq!(elide_path("/verylongdirectory/name", 10), "…tory/name");
+        // Budgeted by terminal cells: CJK glyphs are two cells wide.
+        let wide = elide_path("/项目/工作目录/深层/路径", 12);
+        assert!(cell_width(&wide) <= 12, "{wide:?}");
+        assert!(wide.ends_with("路径"), "{wide:?}");
+    }
+
+    #[test]
+    fn a_long_cwd_is_elided_before_other_segments_are_dropped() {
+        let long = ContextStats { cwd: "~/workspace/clients/acme/monorepo/services/billing/api".into(), ..stats() };
+        let full = visible(&render(&long, 400));
+        assert!(full.contains(&long.cwd), "wide: shown whole {full:?}");
+        // Narrow enough that the whole cwd would push segments off, but wide
+        // enough for all of them once the cwd is elided.
+        let wide_enough = cell_width(visible(&render(&stats(), 400)).trim_end()) + 20;
+        let line = visible(&render(&long, wide_enough));
+        assert!(line.contains("~/…/"), "{line:?}");
+        assert!(line.ends_with("api ") || line.contains("/api "), "the current directory stays: {line:?}");
+        for part in ["work/llama-b", "ctx 96.5k/128k 75%", "42 msgs", "auto-compact 80% (1×)", "▶ bash", "plan 2/5"]
+        {
+            assert!(line.contains(part), "{part} dropped instead of eliding the cwd: {line:?}");
+        }
+        assert!(cell_width(&line) <= wide_enough);
     }
 
     #[test]
@@ -763,6 +992,35 @@ mod tests {
             let seq = resize_sequence(rows);
             assert!(!seq.contains(";1H"), "addressed an absolute row for {rows} rows: {seq:?}");
         }
+    }
+
+    #[test]
+    fn clear_display_sequence_clears_without_repinning_a_region() {
+        // The no-status frame → legacy clear: the frame's last redraw is still
+        // on the display, so the screen AND scrollback are wiped (the replay
+        // reprints everything), but with no status line there is no bottom row
+        // to reserve — no region re-pin and no absolute cursor row.
+        let seq = clear_display_sequence();
+        assert!(seq.contains("\x1b[H\x1b[2J\x1b[3J"), "frame copy not cleared: {seq:?}");
+        assert!(!seq.contains("\x1b[1;"), "no region re-pin: {seq:?}");
+        assert!(!seq.contains(";1H"), "no absolute cursor row: {seq:?}");
+    }
+
+    #[test]
+    fn repin_sequence_clears_the_frame_and_repins_without_a_cursor_restore() {
+        // Frame → legacy: the frame's last redraw is still on the display, so
+        // the sequence clears the screen AND scrollback (the replay reprints
+        // everything), then re-pins the region and parks the cursor on the
+        // last scrollable row, where the replay starts writing.
+        let seq = repin_sequence(40);
+        assert!(seq.contains("\x1b[H\x1b[2J\x1b[3J"), "frame copy not cleared: {seq:?}");
+        assert!(seq.contains("\x1b[1;39r"), "region not re-pinned: {seq:?}");
+        assert!(seq.ends_with("\x1b[39;1H"), "cursor not left on the last scrollable row: {seq:?}");
+        // Unlike a resize there is no fresh prompt to preserve (this runs
+        // before the legacy editor redraw), so no save/restore and no
+        // cursor-relative erase that could wipe the row being drawn on.
+        assert!(!seq.contains("\x1b7") && !seq.contains("\x1b8"), "must not restore the frame's cursor: {seq:?}");
+        assert!(!seq.contains("\x1b[J"), "must not erase below a restored cursor: {seq:?}");
     }
 
     #[test]

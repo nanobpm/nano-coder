@@ -123,7 +123,7 @@ pub fn load(path: &Path) -> Result<Vec<(u64, Message)>> {
         }
         // A torn or unknown record is skipped rather than failing the search.
         if let Ok(Record::Message(message)) = serde_json::from_slice::<Record>(line) {
-            messages.push((index as u64 + 1, message));
+            messages.push((index as u64 + 1, *message));
         }
     }
     Ok(messages)
@@ -362,6 +362,11 @@ pub fn read(path: &Path, args: &Value, spill_dir: &Path) -> Result<String> {
     for call in &message.tool_calls {
         text.push_str(&format!("\n[called {} id={} {}]", call.name, call.id, call.arguments));
     }
+    // An image attachment is shown as a placeholder with its source path, so
+    // the model can `read_file` the path again to view it.
+    for attachment in &message.attachments {
+        text.push_str(&format!("\n{}", attachment.placeholder()));
+    }
     Ok(crate::output::bound_and_spill(&text, limit, spill_dir, &format!("history-{id}.txt")))
 }
 
@@ -373,8 +378,8 @@ mod tests {
     /// A log with a compaction: lines 2-6 are messages, 7 a replace.
     fn log(dir: &Path) -> std::path::PathBuf {
         let mut log = SessionLog::create(dir, "h").unwrap();
-        log.append(&Record::Message(Message::system("sys"))).unwrap();
-        log.append(&Record::Message(Message::user("fix the flaky test in auth.rs"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("fix the flaky test in auth.rs")))).unwrap();
         let call = crate::llm::ToolCall {
             id: "c1".into(),
             name: "bash".into(),
@@ -382,10 +387,10 @@ mod tests {
             item_id: None,
             malformed_arguments: None,
         };
-        log.append(&Record::Message(Message::assistant_with_tools("", vec![call]))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools("", vec![call])))).unwrap();
         let long = format!("{}error[E0308]: mismatched types at auth.rs:42{}", "a ".repeat(400), " b".repeat(400));
-        log.append(&Record::Message(Message::tool_error("c1", "bash", &long))).unwrap();
-        log.append(&Record::Message(Message::assistant("fixed"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_error("c1", "bash", &long)))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("fixed")))).unwrap();
         let replace = Record::Replace {
             messages: vec![Message::system("sys"), Message::user("summary"), Message::assistant("fixed")],
             pending_position: None,
@@ -410,7 +415,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "t").unwrap();
         let thought = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
-        log.append(&Record::Message(thought)).unwrap();
+        log.append(&Record::Message(Box::new(thought))).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }
@@ -454,7 +459,7 @@ mod tests {
         let text = format!(
             "Compiling lease {noise} Compiling lease {noise} error[E0599]: no method named `renew` in lease {noise}"
         );
-        log.append(&Record::Message(Message::tool_result("t1", "bash", &text))).unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_result("t1", "bash", &text)))).unwrap();
         let out = search(log.path(), &json!({"pattern": "lease"})).unwrap();
         assert!(out.contains("[3 matches]") && out.contains("no method named `renew`"), "{out}");
     }
@@ -486,10 +491,10 @@ mod tests {
         assert!(out.starts_with("#4 assistant") && !out.contains("after tool output"), "{out}");
 
         let mut log = crate::session::SessionLog::create(dir.path(), "multi").unwrap();
-        log.append(&Record::Message(Message::user("go"))).unwrap();
-        log.append(&Record::Message(Message::tool_result("a", "bash", "one"))).unwrap();
-        log.append(&Record::Message(Message::tool_result("b", "bash", "two"))).unwrap();
-        log.append(&Record::Message(Message::assistant("both said something"))).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("go")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_result("a", "bash", "one")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_result("b", "bash", "two")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("both said something")))).unwrap();
         let out = search(log.path(), &json!({"pattern": "something"})).unwrap();
         assert!(out.contains("[after tool output #3–#4]"), "{out}");
     }
@@ -529,7 +534,7 @@ mod tests {
         let mut thinker = Message::assistant("");
         thinker.thinking_blocks =
             vec![json!({"type": "thinking", "thinking": "weigh the options", "signature": "sig"})];
-        log.append(&Record::Message(thinker)).unwrap();
+        log.append(&Record::Message(Box::new(thinker))).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] weigh the options"), "{out}");
     }
@@ -543,7 +548,7 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "t").unwrap();
         let mut thinker = Message { thinking: "check auth.rs first".into(), ..Message::assistant("on it") };
         thinker.thinking_blocks = vec![json!({"type": "reasoning_content", "text": "check auth.rs first"})];
-        log.append(&Record::Message(thinker)).unwrap();
+        log.append(&Record::Message(Box::new(thinker))).unwrap();
         let out = read(log.path(), &json!({"id": 2}), dir.path()).unwrap();
         assert!(out.contains("[thinking] check auth.rs first\non it"), "{out}");
     }

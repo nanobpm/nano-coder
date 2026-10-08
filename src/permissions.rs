@@ -126,7 +126,7 @@ fn command_glob(pattern: &str) -> Result<Regex, String> {
 }
 
 /// `**` crosses directories, `*` and `?` do not. `~/` is the home directory.
-fn path_glob(pattern: &str) -> Result<Regex, String> {
+pub(crate) fn path_glob(pattern: &str) -> Result<Regex, String> {
     let pattern = match (pattern.strip_prefix("~/"), dirs::home_dir()) {
         (Some(rest), Some(home)) => format!("{}/{rest}", home.display()),
         _ => pattern.to_string(),
@@ -312,6 +312,50 @@ impl Policy {
         }
         Ok(())
     }
+}
+
+/// Whether a permission-style rule string (e.g. `Bash(git push *)`,
+/// `Read(**/.env)`, `Edit(src/**)`) matches a tool call. Used by hook `if`
+/// filters, so a hook can target the same calls an allow/deny rule would. The
+/// rule grammar and matching are exactly those of the allow/deny rules,
+/// including testing each command of a compound shell line. Returns `false`
+/// when the rule fails to parse or does not apply to `tool`.
+pub fn rule_matches(rule_src: &str, tool: &str, args: &Value) -> bool {
+    let Ok(rule) = Rule::parse(rule_src) else { return false };
+    if !rule.applies_to(tool) {
+        return false;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    match rule.subject {
+        Subject::Command => {
+            let Some(command) = args.get("command").and_then(Value::as_str) else { return false };
+            if rule.matches(command.trim()) {
+                return true;
+            }
+            match shell::parse(command).and_then(|parsed| expand_all(&parsed)) {
+                Ok(commands) => commands.iter().any(|cmd| rule.matches(&command_text(cmd))),
+                Err(_) => false,
+            }
+        }
+        Subject::Path => {
+            let Some(path) = args.get("path").and_then(Value::as_str) else { return false };
+            let joined = cwd.join(expand_tilde(path));
+            let absolute = normalize(&joined);
+            let resolved = resolve_symlinks(&joined);
+            path_rule_matches(&rule, &absolute, &cwd) || path_rule_matches(&rule, &resolved, &cwd)
+        }
+        Subject::Arguments => rule.matches(&args.to_string()),
+    }
+}
+
+/// Validate a permission-style rule string, returning the parse error when it
+/// is malformed. Hook `if` filters use this at load time so a broken filter
+/// (e.g. `Bash(git push *`, missing its closing `)`) is reported as a skipped
+/// handler instead of being silently treated as a non-match at call time
+/// (`rule_matches` returns `false` for it, so the guard would never run while
+/// `/hooks` still lists it as loaded).
+pub fn validate_rule(rule_src: &str) -> Result<(), String> {
+    Rule::parse(rule_src).map(|_| ())
 }
 
 fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {

@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 use crate::tools::ToolDefinition;
 
@@ -26,12 +27,49 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// An image attached to a message (currently only produced by `read_file`).
+///
+/// The pixels live on disk under the session's `attachments/` directory, named
+/// `<sha256>.<extension>`; the message records only the reference and metadata,
+/// so session logs stay small and the same image is stored once. `content`
+/// stays text. Request builders turn the attachment into provider bytes
+/// (base64) for the newest few images the model accepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// MIME type of the stored bytes (e.g. `image/png`). After downscaling /
+    /// re-encoding this is the type of what is actually sent.
+    pub media_type: String,
+    /// The path the image was read from (for display and re-`read_file`).
+    pub path: PathBuf,
+    /// Hex sha256 of the stored (prepared) bytes; names the attachment file.
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    /// Byte size of the stored (prepared) image.
+    pub bytes: usize,
+    /// File extension of the stored copy (`png`, `jpg`, `gif`, `webp`).
+    pub extension: String,
+}
+
+impl Attachment {
+    /// The placeholder text shown where an image is summarized away, omitted
+    /// past the model's per-request image limit, or missing on resume.
+    pub fn placeholder(&self) -> String {
+        format!("[image: {}, {}×{}]", self.path.display(), self.width, self.height)
+    }
+}
+
 /// Provider-neutral conversation message. Assistant messages carry the tool
 /// calls they requested so the next request can replay them faithfully.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Images attached to this message (tool results from `read_file`). Not
+    /// sent as text; request builders encode the newest few per the model's
+    /// limit. Kept in the session log as references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +105,17 @@ pub struct Message {
     /// message, in milliseconds. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Assistant messages: the effective sampling temperature sent for the
+    /// request that produced this message and where it came from, e.g.
+    /// `0.3 (set for this model)` or `model default (global setting)`. Recorded
+    /// so runs can be compared. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<String>,
+    /// Assistant messages: the thinking level sent for the request that
+    /// produced this message and where it came from, e.g. `high (set for this
+    /// model)`. Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 impl Message {
@@ -74,6 +123,7 @@ impl Message {
         Self {
             role,
             content: content.to_string(),
+            attachments: vec![],
             tool_calls: vec![],
             is_error: false,
             thinking_blocks: vec![],
@@ -84,6 +134,8 @@ impl Message {
             thinking: String::new(),
             usage: None,
             duration_ms: None,
+            temperature: None,
+            thinking_level: None,
         }
     }
 
@@ -113,6 +165,12 @@ impl Message {
 
     pub fn tool_error(tool_call_id: &str, name: &str, content: &str) -> Self {
         Self { is_error: true, ..Self::tool_result(tool_call_id, name, content) }
+    }
+
+    /// Attach `attachments` to this (tool-result) message.
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
+        self
     }
 }
 
@@ -272,7 +330,7 @@ impl ToolCall {
 /// (e.g. `max_output_tokens`) before it reaches here, so only a genuine
 /// length reason is classified as one and a generic `incomplete` keeps the
 /// cause-neutral advice.
-fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
+pub(crate) fn stop_reason_is_length(stop_reason: Option<&str>) -> bool {
     stop_reason.is_some_and(|reason| {
         matches!(reason.to_ascii_lowercase().as_str(), "length" | "max_tokens" | "max_output_tokens")
     })
@@ -285,6 +343,187 @@ pub struct ChatRequest<'a> {
     pub tools: &'a [ToolDefinition],
     pub temperature: Option<f64>,
     pub max_tokens: Option<i64>,
+    /// Thinking level to ask for; `None` sends nothing.
+    pub thinking: Option<crate::thinking::Request>,
+    /// The model's vision capability: how the newest few image attachments are
+    /// sent and how many a request may carry. `None` (or `max_images == 0`)
+    /// means attachments become text placeholders.
+    pub vision: Option<crate::vision::Vision>,
+    /// Directory message attachments are stored in, so the builder can read
+    /// their bytes. `None` for requests that cannot carry images (compaction).
+    pub attachments_dir: Option<&'a std::path::Path>,
+}
+
+impl ChatRequest<'_> {
+    /// Whether an attachment's stored bytes are still on disk *and intact*
+    /// (present and hash-matching, the same gate `read_base64` applies before
+    /// encoding, so availability can never diverge from what the payload
+    /// actually sends). A reference with no attachments dir, or whose file was
+    /// deleted or tampered with before a resume, is unavailable and resolves
+    /// to a placeholder.
+    fn attachment_available(&self, attachment: &crate::llm::Attachment) -> bool {
+        self.attachments_dir.map(|dir| crate::attachment::exists(dir, attachment)).unwrap_or(false)
+    }
+
+    /// The attachment *occurrences* this request sends as images: the newest
+    /// `vision.max_images` *available* occurrences across the conversation (every
+    /// older one is omitted, its message showing a placeholder instead).
+    /// Identified by occurrence, not content hash, so reading the same image
+    /// twice does not make *both* copies sendable and overflow a model's image
+    /// limit — a model capped at one image keeps only the newest occurrence even
+    /// when an older message repeats its SHA. Unavailable references (missing or
+    /// tampered on resume) are excluded from the quota so a lost newest image
+    /// does not consume a slot an older available image could have used; each
+    /// still resolves to its own "no longer available" placeholder. An empty
+    /// set (no vision, or `max_images == 0`) sends none.
+    ///
+    /// The per-request attachment resolution plan, computed **once** and reused
+    /// across every message. Resolving each message independently would rebuild
+    /// it — hashing every stored image via `attachment::exists` — so a
+    /// conversation with N image-bearing messages would hash the whole
+    /// attachment set N times (O(N²) file I/O) even when `max_images` is 1.
+    /// Building the plan here hashes each stored file at most once (O(N)); the
+    /// serializers compute it before their message loop and pass it to
+    /// [`Self::resolve_attachments_with`], and the vision-header decision reuses
+    /// it via [`AttachmentPlan::carries_image`] instead of rescanning.
+    pub fn attachment_plan(&self) -> AttachmentPlan {
+        let max = self.vision.as_ref().map(|v| v.max_images).unwrap_or(0);
+        let mut available: Vec<&crate::llm::Attachment> =
+            self.messages.iter().flat_map(|m| m.attachments.iter()).filter(|a| self.attachment_available(a)).collect();
+        let available_set: std::collections::HashSet<*const crate::llm::Attachment> =
+            available.iter().map(|a| *a as *const crate::llm::Attachment).collect();
+        // Keep the newest `max` as sendable: drop the oldest excess from the front.
+        let keep = max.min(available.len());
+        let drop = available.len() - keep;
+        available.drain(..drop);
+        let sendable = available.into_iter().map(|a| a as *const crate::llm::Attachment).collect();
+        AttachmentPlan { available: available_set, sendable }
+    }
+
+    /// Resolve each of `message`'s attachments for the wire using a precomputed
+    /// [`AttachmentPlan`], in order: either the image data to send, or the
+    /// placeholder text standing in for it (omitted past the model's image
+    /// limit, or missing on resume). Serializers build the plan once per
+    /// request and pass it here for every message, so the attachment set is
+    /// hashed once rather than once per message.
+    pub fn resolve_attachments_with(&self, message: &Message, plan: &AttachmentPlan) -> Vec<ResolvedAttachment> {
+        if message.attachments.is_empty() {
+            return Vec::new();
+        }
+        message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let ptr = attachment as *const crate::llm::Attachment;
+                if plan.sendable.contains(&ptr) {
+                    // Re-prepare the stored bytes against the *active* model's
+                    // limits (byte cap + accepted media types), not only the
+                    // `max_images` count the plan enforced: a stored image first
+                    // prepared for a laxer model (or resumed under a stricter
+                    // one) could otherwise be sent oversized or as an
+                    // unsupported type and rejected. `read_for_limits` keeps
+                    // compliant bytes unchanged and re-encodes only when needed.
+                    let limits = self.vision.as_ref().map(|v| v.image_limits()).unwrap_or_default();
+                    return match self
+                        .attachments_dir
+                        .and_then(|dir| crate::attachment::read_for_limits(dir, attachment, &limits))
+                    {
+                        Some(ready) => ResolvedAttachment::Image(ImageData {
+                            media_type: ready.media_type,
+                            data_base64: ready.data_base64,
+                        }),
+                        None => ResolvedAttachment::Omitted(format!(
+                            "[image: {}, {}×{} (no longer available)]",
+                            attachment.path.display(),
+                            attachment.width,
+                            attachment.height
+                        )),
+                    };
+                }
+                // Not selected: either an available image beyond the newest-N
+                // quota (sent earlier), or a reference whose file is gone.
+                if plan.available.contains(&ptr) {
+                    ResolvedAttachment::Omitted(format!(
+                        "[image omitted: {} (sent earlier)]",
+                        attachment.path.display()
+                    ))
+                } else {
+                    ResolvedAttachment::Omitted(format!(
+                        "[image: {}, {}×{} (no longer available)]",
+                        attachment.path.display(),
+                        attachment.width,
+                        attachment.height
+                    ))
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve one message's attachments, building a fresh [`AttachmentPlan`]
+    /// for it. Convenience for single-message callers and tests; serializers
+    /// that resolve every message build the plan once with
+    /// [`Self::attachment_plan`] and call [`Self::resolve_attachments_with`].
+    #[cfg(test)]
+    pub fn resolve_attachments(&self, message: &Message) -> Vec<ResolvedAttachment> {
+        self.resolve_attachments_with(message, &self.attachment_plan())
+    }
+}
+
+/// An image's wire bytes: its (post-downscale) media type and base64 data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+/// How one attachment appears in a request: as image data, or as a text
+/// placeholder (omitted past the model's image limit, or missing on resume).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAttachment {
+    Image(ImageData),
+    Omitted(String),
+}
+
+/// A request's attachment resolution plan, computed once and shared across
+/// messages: which attachment occurrences are available on disk, and which of
+/// those fall within the image quota (and so are sent as images). Occurrences
+/// are keyed by pointer, not content hash, so the same image read twice counts
+/// as two occurrences. Build it with [`ChatRequest::attachment_plan`] and pass
+/// it to [`ChatRequest::resolve_attachments_with`] for every message, so the
+/// stored attachment set is hashed once per request instead of once per message.
+pub struct AttachmentPlan {
+    available: std::collections::HashSet<*const crate::llm::Attachment>,
+    sendable: std::collections::HashSet<*const crate::llm::Attachment>,
+}
+
+impl AttachmentPlan {
+    /// Whether this request sends at least one real image (a sendable,
+    /// on-disk-intact attachment): used by GitHub Copilot to set its vision
+    /// header. A deleted or tampered file resolves to a text placeholder, not
+    /// an image, and is excluded here, so the header never claims an image the
+    /// payload does not carry. Lets the client decide vision routing from the
+    /// plan it already built, without a second sidecar-hashing scan.
+    pub fn carries_image(&self) -> bool {
+        !self.sendable.is_empty()
+    }
+}
+
+impl<'a> ChatRequest<'a> {
+    /// A request over `messages` with no tools, temperature, output cap,
+    /// thinking or vision — the common test fixture. Field updates use struct
+    /// update syntax (`ChatRequest { max_tokens: Some(1), ..test_request(&m) }`).
+    #[cfg(test)]
+    pub fn test_request(messages: &'a [Message]) -> Self {
+        ChatRequest {
+            messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        }
+    }
 }
 
 /// Incremental output while a response streams in.
@@ -337,8 +576,59 @@ pub trait LLMClient: Send + Sync {
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         None
     }
+    /// The thinking levels the endpoint reports for the current model, if any.
+    async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
+        None
+    }
+    /// The vision capability the endpoint reports for the current model, if
+    /// any. `None` means "no report" (the built-in assumption / config override
+    /// then decides), not "cannot see" — a provider that knows the model is
+    /// blind reports `Some` with `max_images == 0` is not used; blindness is
+    /// simply the absence of a capability.
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
+        None
+    }
+    /// The thinking levels and vision capability the endpoint reports, probed
+    /// together but **without** the context-window follow-ups. Used when the
+    /// window is already configured, so the window probe would be discarded
+    /// anyway (and running it can add an unwanted follow-up like LM Studio's
+    /// `/api/v0/models`). A provider whose thinking and vision detections read
+    /// the same endpoint response (llama.cpp `/props`, Ollama `/api/show`)
+    /// overrides this to fetch it once rather than probing twice serially.
+    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        (self.detect_thinking_levels().await, self.detect_vision().await)
+    }
+    /// The window, thinking levels and vision capability the endpoint reports,
+    /// probed together.
+    ///
+    /// The default probes each on its own; a provider whose detections would
+    /// fetch the same endpoint response (OpenAI-compatible servers probe
+    /// `/models`, then llama.cpp `/props` or Ollama `/api/show` for all three)
+    /// overrides this to share one fetch, so a slow or unavailable endpoint is
+    /// not probed two or three times serially.
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+        (self.detect_context_window().await, self.detect_thinking_levels().await, self.detect_vision().await)
+    }
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    /// The provider API kind this client speaks. `None` for test doubles that
+    /// imitate no real provider API.
+    fn kind(&self) -> Option<crate::providers::ProviderKind> {
+        None
+    }
+    /// The live endpoint this client actually sends requests to, captured when
+    /// the client was built. Used for first-party host detection (vision
+    /// capability) so it tracks the client in use, not the possibly-edited
+    /// config: after a provider edit whose client rebuild fails, the saved
+    /// config holds the new `base_url` while the session keeps the old client,
+    /// so reading `base_url` from config would misclassify the live endpoint.
+    /// `None` for test doubles and clients with no fixed HTTP endpoint, where
+    /// callers fall back to the configured `base_url`.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A context window reported by the provider's endpoint.
@@ -347,6 +637,39 @@ pub struct DetectedWindow {
     pub tokens: usize,
     /// Where it came from, e.g. `/v1/models max_model_len`.
     pub source: String,
+    /// Whether `tokens` caps the whole request (prompt + output) or the prompt
+    /// alone. Total unless the endpoint says otherwise.
+    pub cap: ContextCap,
+    /// The combined prompt + output window, when the endpoint reports it
+    /// alongside a prompt-only `tokens` cap (GitHub Copilot advertises both
+    /// `max_prompt_tokens` and the larger `max_context_window_tokens`). A
+    /// prompt-only `cap` leaves `max_tokens` unchanged, which can still push
+    /// prompt + output past this window, so it is enforced as a second limit.
+    /// `None` for a `Total` cap, where `tokens` already is the combined window.
+    pub total_tokens: Option<usize>,
+}
+
+impl DetectedWindow {
+    /// A window that caps the whole request, prompt + output.
+    pub fn total(tokens: usize, source: impl Into<String>) -> Self {
+        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total, total_tokens: None }
+    }
+}
+
+/// Whether a context window caps the whole request or only the prompt.
+///
+/// Most endpoints reject a request whose prompt *plus* `max_tokens` exceeds the
+/// window, so the output reservation counts against it (`Total`). GitHub Copilot
+/// instead enforces a prompt-only budget (`max_prompt_tokens`) that sits below
+/// the full window: output tokens do not consume it, so subtracting the output
+/// reservation would compact and cap completions earlier than the real limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContextCap {
+    /// `tokens` is the combined prompt + output budget; reserve output room in it.
+    #[default]
+    Total,
+    /// `tokens` caps the prompt alone; output tokens do not consume it.
+    Prompt,
 }
 
 /// Splits `<think>...</think>` sections out of streamed content (servers that
@@ -415,6 +738,284 @@ impl ThinkSplitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An attachment with a stable hash of `tag`, stored (when `dir` is set).
+    fn attachment(tag: &str, dir: Option<&std::path::Path>) -> Attachment {
+        // A real, tag-distinct PNG: resolution re-prepares stored bytes and
+        // sniffs their format, so the stored file must be a decodable image,
+        // not raw tag bytes. The pixel colour derives from the tag so distinct
+        // tags hash distinctly (and the same tag stays one shared image).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&tag, &mut hasher);
+        let n = std::hash::Hasher::finish(&hasher);
+        let colour = image::Rgb([(n & 0xff) as u8, ((n >> 8) & 0xff) as u8, ((n >> 16) & 0xff) as u8]);
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, colour));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        let bytes = out.into_inner();
+        let a = Attachment {
+            media_type: "image/png".into(),
+            path: std::path::PathBuf::from(format!("/tmp/{tag}.png")),
+            sha256: crate::attachment::sha256_hex(&bytes),
+            width: 10,
+            height: 10,
+            bytes: bytes.len(),
+            extension: "png".into(),
+        };
+        if let Some(dir) = dir {
+            crate::attachment::store(dir, &a, &bytes).unwrap();
+        }
+        a
+    }
+
+    fn vision(max_images: usize) -> crate::vision::Vision {
+        crate::vision::Vision {
+            max_images,
+            max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
+            media_types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn attachments_round_trip_and_stay_off_plain_messages() {
+        let message = Message::tool_result("c1", "read_file", "image/png, 10×10, 5 B")
+            .with_attachments(vec![attachment("a", None)]);
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["attachments"][0]["media_type"], "image/png");
+        assert_eq!(json["attachments"][0]["width"], 10);
+        assert_eq!(serde_json::from_value::<Message>(json).unwrap(), message);
+        // A message with no attachments writes no `attachments` field, and a
+        // log from before attachments existed still loads.
+        let plain = serde_json::to_value(Message::assistant("hi")).unwrap();
+        assert!(plain.get("attachments").is_none());
+        assert_eq!(serde_json::from_value::<Message>(plain).unwrap(), Message::assistant("hi"));
+    }
+
+    #[test]
+    fn resolves_newest_n_images_and_omits_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) =
+            (attachment("a", Some(dir.path())), attachment("b", Some(dir.path())), attachment("c", Some(dir.path())));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "first").with_attachments(vec![a.clone()]),
+            Message::tool_result("t2", "read_file", "second").with_attachments(vec![b.clone()]),
+            Message::tool_result("t3", "read_file", "third").with_attachments(vec![c.clone()]),
+        ];
+        // A model capped at one image sends only the newest (c); a and b are omitted.
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(
+            request.resolve_attachments(&messages[0])[0],
+            ResolvedAttachment::Omitted(ref t) if t.contains("omitted") && t.contains("a.png")
+        ));
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Omitted(_)));
+        assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+        assert!(request.attachment_plan().carries_image());
+
+        // Two images: b and c are sent, a is omitted.
+        let request = ChatRequest {
+            vision: Some(vision(2)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
+        assert!(matches!(request.resolve_attachments(&messages[2])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn plan_carries_image_reflects_what_is_actually_sent() {
+        // The shared-plan accessor the Copilot client uses for its vision header
+        // must report an image only when a sendable, on-disk-intact attachment
+        // is sent: not for a missing file, a zero quota, or no vision.
+        let dir = tempfile::tempdir().unwrap();
+        let present = attachment("p", Some(dir.path()));
+        let missing = attachment("m", None);
+        for (vis, atts, expected, label) in [
+            (Some(vision(1)), vec![present.clone()], true, "available image"),
+            (Some(vision(1)), vec![missing.clone()], false, "missing file"),
+            (Some(vision(0)), vec![present.clone()], false, "no image quota"),
+            (None, vec![present.clone()], false, "no vision"),
+            (Some(vision(1)), vec![], false, "no attachments"),
+        ] {
+            let messages = vec![Message::tool_result("t1", "read_file", "x").with_attachments(atts)];
+            let request =
+                ChatRequest { vision: vis, attachments_dir: Some(dir.path()), ..ChatRequest::test_request(&messages) };
+            assert_eq!(request.attachment_plan().carries_image(), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn repeated_same_image_counts_each_occurrence_not_unique_hashes() {
+        // Reading the same image twice: a model capped at one image must send
+        // only the newest occurrence, not both copies of the shared SHA.
+        let dir = tempfile::tempdir().unwrap();
+        let shared = attachment("dup", Some(dir.path()));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "first read").with_attachments(vec![shared.clone()]),
+            Message::tool_result("t2", "read_file", "second read").with_attachments(vec![shared.clone()]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)),
+            "the older occurrence of a repeated image must be omitted"
+        );
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn missing_attachment_file_becomes_a_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        // Reference an image whose file was never written (e.g. deleted before resume).
+        let missing = attachment("gone", None);
+        let messages = vec![Message::tool_result("t1", "read_file", "saw it").with_attachments(vec![missing])];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        match &request.resolve_attachments(&messages[0])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("gone.png"), "{text}");
+                assert!(text.contains("no longer available"), "{text}");
+            }
+            other => panic!("missing file should be a placeholder, got {other:?}"),
+        }
+        // A deleted file resolves to a placeholder, so the request carries no
+        // image and must not claim a vision request.
+        assert!(!request.attachment_plan().carries_image(), "deleted file must not report a sendable image");
+    }
+
+    #[test]
+    fn missing_newest_image_does_not_consume_quota_from_an_available_older_one() {
+        // On resume the newest image's file is gone but an older one survives.
+        // A model capped at one image must still send the available older image,
+        // not waste its only slot on the missing newest reference.
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("older", Some(dir.path())); // stored
+        let newest_missing = attachment("newest", None); // never written
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "older").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "newest").with_attachments(vec![newest_missing]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        // The available older image is sent...
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Image(_)),
+            "available older image must fill the slot the missing newest cannot use"
+        );
+        // ...and the missing newest resolves to its own "no longer available"
+        // placeholder, not "sent earlier".
+        match &request.resolve_attachments(&messages[1])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+                assert!(!text.contains("sent earlier"), "{text}");
+            }
+            other => panic!("missing newest should be a placeholder, got {other:?}"),
+        }
+        assert!(request.attachment_plan().carries_image(), "an available image is sent despite the missing newest");
+    }
+
+    #[test]
+    fn available_image_beyond_quota_says_sent_earlier() {
+        // Two available images, capped at one: the older available one is over
+        // quota and must read "sent earlier" (distinct from "no longer available").
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("a", Some(dir.path()));
+        let newest = attachment("b", Some(dir.path()));
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "a").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "b").with_attachments(vec![newest]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        match &request.resolve_attachments(&messages[0])[0] {
+            ResolvedAttachment::Omitted(text) => assert!(text.contains("sent earlier"), "{text}"),
+            other => panic!("over-quota available image should say sent earlier, got {other:?}"),
+        }
+        assert!(matches!(request.resolve_attachments(&messages[1])[0], ResolvedAttachment::Image(_)));
+    }
+
+    #[test]
+    fn tampered_newest_image_consumes_no_quota_and_sets_no_false_header() {
+        // The newest image's stored file was tampered with (its bytes no longer
+        // match the recorded hash). Availability is the same hash-validated
+        // gate `read_base64` applies, so the tampered newest is unavailable:
+        // it must not consume the only image slot, the older intact image is
+        // sent instead, and the tampered one resolves to a "no longer
+        // available" placeholder rather than "sent earlier".
+        let dir = tempfile::tempdir().unwrap();
+        let older = attachment("older", Some(dir.path())); // stored, intact
+        let newest = attachment("newest", Some(dir.path())); // stored, then tampered
+        let tampered_path = dir.path().join(format!("{}.{}", newest.sha256, newest.extension));
+        std::fs::write(&tampered_path, b"tampered").unwrap();
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "older").with_attachments(vec![older]),
+            Message::tool_result("t2", "read_file", "newest").with_attachments(vec![newest]),
+        ];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(
+            matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Image(_)),
+            "the intact older image must fill the slot the tampered newest cannot use"
+        );
+        match &request.resolve_attachments(&messages[1])[0] {
+            ResolvedAttachment::Omitted(text) => {
+                assert!(text.contains("no longer available"), "{text}");
+                assert!(!text.contains("sent earlier"), "{text}");
+            }
+            other => panic!("tampered newest should be a placeholder, got {other:?}"),
+        }
+        // An intact image is sent, so the vision header is still honest.
+        assert!(request.attachment_plan().carries_image());
+    }
+
+    #[test]
+    fn tampered_only_image_sets_no_vision_header() {
+        // The request's only attachment is tampered: nothing sendable remains,
+        // so the Copilot vision header must not claim an image that resolves
+        // to a placeholder.
+        let dir = tempfile::tempdir().unwrap();
+        let only = attachment("only", Some(dir.path()));
+        let tampered_path = dir.path().join(format!("{}.{}", only.sha256, only.extension));
+        std::fs::write(&tampered_path, b"tampered").unwrap();
+        let messages = vec![Message::tool_result("t1", "read_file", "x").with_attachments(vec![only])];
+        let request = ChatRequest {
+            vision: Some(vision(1)),
+            attachments_dir: Some(dir.path()),
+            ..ChatRequest::test_request(&messages)
+        };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(!request.attachment_plan().carries_image(), "a tampered file must not report a sendable image");
+    }
+
+    #[test]
+    fn no_vision_sends_no_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = vec![
+            Message::tool_result("t1", "read_file", "x").with_attachments(vec![attachment("a", Some(dir.path()))]),
+        ];
+        let request = ChatRequest { attachments_dir: Some(dir.path()), ..ChatRequest::test_request(&messages) };
+        assert!(matches!(request.resolve_attachments(&messages[0])[0], ResolvedAttachment::Omitted(_)));
+        assert!(!request.attachment_plan().carries_image());
+    }
 
     #[test]
     fn trajectory_fields_round_trip_and_stay_out_of_plain_messages() {
