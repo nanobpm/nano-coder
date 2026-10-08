@@ -1504,6 +1504,11 @@ impl Agent {
             self.hooks.trigger(&ctx);
 
             if self.over_threshold() {
+                // The threshold compaction below is itself a model call, so a
+                // `/model` queued since the top of the iteration must apply to
+                // it too — otherwise the summary is written by the model the
+                // user just switched away from.
+                self.apply_model_request().await;
                 self.compact_logged(CompactTrigger::Threshold, self.config.compaction_mode, None).await?;
                 if self.control.is_cancelled() {
                     cancelled = true;
@@ -1517,6 +1522,11 @@ impl Agent {
             let mut request_started;
             let response = loop {
                 self.set_activity(Activity::Thinking);
+                // Every attempt is a model call (and the overflow branch below
+                // compacts with one more), so a `/model` queued while the
+                // previous attempt or compaction was in flight applies here,
+                // before the request is built — never after it.
+                self.apply_model_request().await;
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
                 // the history tools, so recomputing here lets the retried request
@@ -1639,6 +1649,10 @@ impl Agent {
                         self.learned_window =
                             Some(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
+                        // The overflow compaction is a model call too: apply a
+                        // `/model` queued while the overflowing request was in
+                        // flight before the summary goes out on the old model.
+                        self.apply_model_request().await;
                         let compacted =
                             self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
                         if compacted.is_none() || self.control.is_cancelled() {
@@ -3456,11 +3470,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it() {
         // A `/model <spec>` that passes queue-time validation but whose client
-        // still fails to build at the next model call (here: a provider with no
-        // base_url) must not fail silently: the turn finishes on the current
-        // model, the dead request is dropped (not re-queued, so it cannot leak
-        // into the next turn and retry forever), and a `ModelSwitchFailed`
-        // event is emitted so the user is told.
+        // still fails to build at the next model call must not fail silently:
+        // the turn finishes on the current model, the dead request is dropped
+        // (not re-queued, so it cannot leak into the next turn and retry
+        // forever), and a `ModelSwitchFailed` event is emitted so the user is
+        // told. Here the apply-time failure is a provider whose
+        // `api_key_command` fails: the spec is fully valid — kind, model and
+        // base_url all present — so `validate_spec` accepts it at queue time
+        // (it never runs the command) and only building the client surfaces
+        // the failure, exercising the advertised
+        // validation-passes/apply-fails path.
         let dir = tempfile::tempdir().unwrap();
         // Two model calls (a tool call, then the final text) so the switch is
         // applied between them — a single final-answer call would end the turn
@@ -3470,17 +3489,20 @@ mod tests {
             dir.path(),
             |call, control| {
                 if call == 1 {
-                    control.set_model("broken/x");
+                    control.set_model("flaky/x");
                 }
             },
             None,
             |mut config| {
-                // Openai kind with no base_url cannot build a client.
+                // Syntactically valid, endpoint configured; only the key
+                // lookup fails, and that happens at apply time.
                 config.providers.insert(
-                    "broken".to_string(),
+                    "flaky".to_string(),
                     crate::providers::ProviderConfig {
                         kind: Some(crate::providers::ProviderKind::Openai),
                         default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        api_key_command: Some("exit 1".to_string()),
                         ..Default::default()
                     },
                 );
@@ -3507,8 +3529,140 @@ mod tests {
         // The failure was surfaced to the UI, naming the spec.
         let failures = failures.lock().unwrap();
         assert_eq!(failures.len(), 1, "one failure reported: {failures:?}");
-        assert_eq!(failures[0].0, "broken/x");
-        assert!(failures[0].1.contains("base_url"), "error explains the failure: {}", failures[0].1);
+        assert_eq!(failures[0].0, "flaky/x");
+        assert!(failures[0].1.contains("api_key_command"), "error explains the failure: {}", failures[0].1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_during_a_call_applies_before_threshold_compaction() {
+        // Threshold auto-compaction is itself a model call, so a `/model`
+        // queued while the triggering call was in flight must apply to the
+        // summarization request — not after it. The mock client panics if it
+        // is ever asked to chat, so the switch provably happened first.
+        let dir = tempfile::tempdir().unwrap();
+        let big = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let (mut agent, _) = interfering_with(
+            vec![big, text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/summarizer");
+                }
+            },
+            None,
+            |config| config,
+        );
+        // A tiny window with a low threshold forces compaction on the second
+        // iteration, right after the big tool result lands.
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.tools().register(
+            ToolDefinition::new("big", "big", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("x".repeat(8_000)))),
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(agent.provider_name(), "mock", "switched before the compaction call");
+        assert_eq!(agent.model_name(), "summarizer");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry() {
+        // A `/model` typed while an overflowing request is in flight must be
+        // consumed before the overflow compaction's summarization call, and
+        // the retried request must go to the new model too — never the old
+        // one. The switch target is an unreachable OpenAI endpoint, so any
+        // call that reaches it fails to connect. The summary and the retry
+        // both go to the new client (the switch is consumed before the
+        // summary), so the turn fails to connect rather than completing on
+        // the old model — proving the switch was not deferred past the
+        // compaction.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), tool_call("c2")],
+            dir.path(),
+            |_, _| {},
+            None,
+            |mut config| {
+                config.providers.insert(
+                    "flaky".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("x".to_string()),
+                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                        // Fail fast: no retries, a short timeout, so the test
+                        // does not wait out the default backoff schedule.
+                        max_retries: Some(0),
+                        timeout_secs: Some(2),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        // The second call overflows; while it is "in flight" the user queues
+        // the switch. The compaction summary and the retry both go to the new
+        // client (the switch is consumed before the summary), so the turn
+        // fails to connect there.
+        let ok_tool: std::result::Result<LLMResponse, String> = Ok(tool_call("c1"));
+        let overflow: std::result::Result<LLMResponse, String> =
+            Err("HTTP 400: maximum context length is 4096 tokens.".to_string());
+        let summary: std::result::Result<LLMResponse, String> = Ok(text("SUMMARY"));
+        let control = agent.control();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        struct OverflowThenSummary {
+            results: Mutex<Vec<std::result::Result<LLMResponse, String>>>,
+            seen: Seen,
+            control: TurnControl,
+        }
+        #[async_trait]
+        impl LLMClient for OverflowThenSummary {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("the probe is never spawned for a configured provider")
+            }
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.seen.lock().unwrap().push(request.messages.to_vec());
+                if self.seen.lock().unwrap().len() == 2 {
+                    // The overflowing call is in flight now: queue the switch.
+                    self.control.set_model("flaky/x");
+                }
+                self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+        agent.client = Box::new(OverflowThenSummary {
+            results: Mutex::new(vec![ok_tool, overflow, summary]),
+            seen: seen.clone(),
+            control,
+        });
+        agent.new_session().unwrap();
+        let error = agent.run_turn(Some("in-1"), "hi").await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("maximum context length"), "the retry did not overflow on the old client: {message}");
+        assert_eq!(agent.provider_name(), "flaky", "switched before the overflow retry");
+        assert_eq!(agent.model_name(), "x");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // The old client served only the tool call and the overflowing call;
+        // the compaction summary and the retry both went to the new client
+        // (which is why the turn fails to connect).
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "tool, overflow — everything after the switch left on the new client");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -176,13 +176,18 @@ struct State {
     /// Width of the current streamed answer's stamp, so continuation lines
     /// can be indented to align under it.
     stream_pad: usize,
-    /// Notes held back until the streamed line they would interrupt ends.
-    deferred: Vec<String>,
-    /// Raw payloads (e.g. `/trajectory --json`) held back until the streamed
-    /// line they would interrupt ends. Kept separate from `deferred` because
-    /// these are emitted verbatim — no stamp, no DIM — so the export stays
-    /// byte-exact.
-    deferred_raw: Vec<String>,
+    /// Output held back until the streamed line it would interrupt ends, in
+    /// submission order. Notes are stamped and dimmed; raw payloads (e.g.
+    /// `/trajectory --json`) go out verbatim — no stamp, no DIM — so the
+    /// export stays byte-exact. One ordered queue keeps a raw export queued
+    /// between two notes from leapfrogging them at `end_turn`.
+    deferred: Vec<Deferred>,
+}
+
+/// A held-back line of output: a dimmed note, or a verbatim raw payload.
+enum Deferred {
+    Note(String),
+    Raw(String),
 }
 
 pub struct Renderer {
@@ -576,7 +581,7 @@ impl Renderer {
         // leaves the cursor mid-line with `streamed_text` false, and printing
         // now would prefix the JSON/Markdown with the partial thinking line.
         if !state.at_line_start {
-            state.deferred_raw.push(text.to_string());
+            state.deferred.push(Deferred::Raw(text.to_string()));
             return;
         }
         // Write through `out` (not a bare `println!`) while retaining the state
@@ -675,7 +680,14 @@ impl Renderer {
                 state.at_line_start = last == '\n';
             }
             if state.at_line_start && !state.deferred.is_empty() && state.thinking.is_none() {
-                let notes: String = state.deferred.drain(..).map(|n| format!("{DIM}{n}{RESET}\n")).collect();
+                let notes: String = state
+                    .deferred
+                    .drain(..)
+                    .map(|d| match d {
+                        Deferred::Note(n) => format!("{DIM}{n}{RESET}\n"),
+                        Deferred::Raw(r) => format!("{r}\n"),
+                    })
+                    .collect();
                 let _ = stdout.write_all(notes.as_bytes());
                 let _ = stdout.flush();
             }
@@ -759,14 +771,17 @@ impl Renderer {
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
         self.newline(&mut state);
-        for note in std::mem::take(&mut state.deferred) {
-            self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
-        }
-        // Raw exports queued mid-turn go out verbatim (no stamp/DIM), each on
-        // its own line, so the payload stays byte-exact.
-        for raw in std::mem::take(&mut state.deferred_raw) {
-            self.out(&mut state, &raw);
-            self.out(&mut state, "\n");
+        // Everything queued mid-turn goes out in submission order: notes
+        // stamped and dimmed, raw exports verbatim (no stamp/DIM), each on its
+        // own line, so payloads stay byte-exact without reordering.
+        for item in std::mem::take(&mut state.deferred) {
+            match item {
+                Deferred::Note(note) => self.out(&mut state, &format!("{DIM}{note}{RESET}\n")),
+                Deferred::Raw(raw) => {
+                    self.out(&mut state, &raw);
+                    self.out(&mut state, "\n");
+                }
+            }
         }
         state.in_turn = false;
         state.streamed_text = false;
@@ -784,7 +799,7 @@ impl Renderer {
         }
         let mut state = self.state.lock().unwrap();
         if state.streamed_text && !state.at_line_start {
-            state.deferred.push(format!("{}{DIM}{text}", stamp()));
+            state.deferred.push(Deferred::Note(format!("{}{DIM}{text}", stamp())));
             return;
         }
         self.note_now(&mut state, text);
@@ -1590,9 +1605,11 @@ pub(crate) mod tests {
         r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
         assert!(!r.state.lock().unwrap().at_line_start, "a thinking delta leaves the cursor mid-line");
         r.turn_raw("{\"k\":1}");
-        assert_eq!(
-            r.state.lock().unwrap().deferred_raw,
-            vec!["{\"k\":1}".to_string()],
+        assert!(
+            matches!(
+                r.state.lock().unwrap().deferred.as_slice(),
+                [Deferred::Raw(payload)] if payload == "{\"k\":1}"
+            ),
             "a raw export during mid-line reasoning must be deferred"
         );
         set_verbosity(Verbosity::Normal);
@@ -1606,9 +1623,11 @@ pub(crate) mod tests {
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "partial answer" });
         r.turn_raw("{\"k\":1}");
-        assert_eq!(
-            r.state.lock().unwrap().deferred_raw,
-            vec!["{\"k\":1}".to_string()],
+        assert!(
+            matches!(
+                r.state.lock().unwrap().deferred.as_slice(),
+                [Deferred::Raw(payload)] if payload == "{\"k\":1}"
+            ),
             "a raw export during a half-streamed answer must be deferred"
         );
         set_verbosity(Verbosity::Normal);
@@ -1625,9 +1644,33 @@ pub(crate) mod tests {
         assert!(r.state.lock().unwrap().at_line_start);
         r.turn_raw("{\"k\":1}");
         assert!(
-            r.state.lock().unwrap().deferred_raw.is_empty(),
+            r.state.lock().unwrap().deferred.is_empty(),
             "a raw export at a line boundary must not be deferred"
         );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn deferred_notes_and_raw_exports_keep_submission_order() {
+        // A raw export queued between two notes must not leapfrog them at
+        // end_turn: one ordered queue drains note, raw, note.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "partial answer" });
+        r.note("first");
+        r.turn_raw("{\"k\":1}");
+        r.note("second");
+        let deferred = std::mem::take(&mut r.state.lock().unwrap().deferred);
+        let kinds: Vec<&str> = deferred
+            .iter()
+            .map(|d| match d {
+                Deferred::Note(_) => "note",
+                Deferred::Raw(_) => "raw",
+            })
+            .collect();
+        assert_eq!(kinds, ["note", "raw", "note"], "deferred output keeps submission order");
         set_verbosity(Verbosity::Normal);
     }
 
