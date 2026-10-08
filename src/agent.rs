@@ -286,6 +286,14 @@ impl TurnControl {
         self.inner.model.lock().unwrap().take()
     }
 
+    /// Whether a `/model <spec>` request is currently queued, without consuming
+    /// it. Used to detect a newer request that arrived while an earlier one was
+    /// still being applied, so a now-stale built client is discarded instead of
+    /// installed (see `Agent::apply_model_request`).
+    pub fn has_model_request(&self) -> bool {
+        self.inner.model.lock().unwrap().is_some()
+    }
+
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
     pub fn cycle_mode(&self) -> crate::mode::AgentMode {
         let mut mode = self.inner.mode.lock().unwrap();
@@ -553,8 +561,20 @@ impl Agent {
     }
 
     fn client_for(config: &Config, spec: &str) -> Result<Box<dyn LLMClient>> {
+        Self::client_for_cancellable(config, spec, None)
+    }
+
+    /// Like [`Agent::client_for`], but a running `api_key_command` honours
+    /// `cancel`: the child process is killed and the build fails fast when the
+    /// flag flips, so a mid-turn `/model` switch whose key command hangs cannot
+    /// wedge the turn.
+    fn client_for_cancellable(
+        config: &Config,
+        spec: &str,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<Box<dyn LLMClient>> {
         let (providers, default_provider) = config.effective_providers();
-        providers::build_client(spec, &providers, &default_provider)
+        providers::build_client_cancellable(spec, &providers, &default_provider, cancel)
     }
 
     pub fn tools(&self) -> &ToolRegistry {
@@ -610,54 +630,104 @@ impl Agent {
     /// so the user is told and the dead request cannot leak into later turns.
     /// A successful switch emits `AgentEvent::ModelSwitched` so the UI can
     /// record it in the recents MRU while the turn holds the agent.
+    ///
+    /// Two races are handled: (1) if a newer `/model` request is queued while
+    /// an earlier one is still building, the stale client is discarded and the
+    /// newest spec is built instead, so the next model call never lands on a
+    /// superseded spec; (2) if the turn is cancelled while a key command is
+    /// building (or hanging), the build is killed and the switch is abandoned
+    /// rather than blocking the turn.
     async fn apply_model_request(&mut self) {
-        let Some(spec) = self.control.take_model_request() else { return };
-        // Record the model actually in use (resolved by the live client)
-        // before switching, so a provider-default edit made in the same
-        // session cannot rewrite which model we record leaving. Both specs go
-        // out canonical, so the recents MRU never re-parses them.
-        let (user, default_provider) = self.config.effective_providers();
-        let all = providers::effective_providers(&user);
-        let previous = crate::recents::canonical(
-            &format!("{}/{}", self.client.provider_name(), self.client.model_name()),
-            &all,
-            &default_provider,
-        );
-        // `client_for` → `build_client` → `resolve` can run an `api_key_command`
-        // via blocking `std::process::Command::output()`. `apply_model_request`
-        // is awaited from the async `run_turn` loop, so running that inline
-        // freezes the worker for the command's full duration (or indefinitely
-        // if it hangs), stalling streaming and cancel/other input. Offload the
-        // blocking build to the blocking thread pool and await it, so the
-        // runtime stays responsive while the key command runs.
-        let config_for_build = self.config.clone();
-        let spec_for_build = spec.clone();
-        let built = tokio::task::spawn_blocking(move || Self::client_for(&config_for_build, &spec_for_build)).await;
-        let built = match built {
-            Ok(result) => result,
-            Err(join) => Err(anyhow::anyhow!("building client for {spec:?} panicked: {join}")),
-        };
-        match built {
-            Ok(client) => {
-                self.client = client;
-                self.config.model = spec.clone();
-                self.calibration = None;
-                self.learned_window = None;
-                *self.detected_window.lock().unwrap() = None;
-                self.compact_floor = 0;
-                self.detect_context_window_for_switch();
-                let spec = crate::recents::canonical(&spec, &all, &default_provider);
-                self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
+        // Loop so that a newer `/model` request arriving while an earlier one
+        // is being built is honoured: each pass builds exactly one spec, then
+        // re-checks the slot and rebuilds the newest if it was superseded.
+        loop {
+            // Don't start (or keep) switching for a turn the user cancelled;
+            // the pending request stays queued for the next turn's first call.
+            if self.control.is_cancelled() {
+                return;
             }
-            Err(e) => {
-                // The spec passed queue-time validation but the client still
-                // failed to build. Drop the request (do not re-queue it, which
-                // would retry the same failure every step and leak into the
-                // next turn) and tell the user; the turn stays on the current
-                // model.
-                let error = e.to_string();
-                self.emit(AgentEvent::ModelSwitchFailed { spec: &spec, error: &error });
+            let Some(spec) = self.control.take_model_request() else { return };
+            // Record the model actually in use (resolved by the live client)
+            // before switching, so a provider-default edit made in the same
+            // session cannot rewrite which model we record leaving. Both specs
+            // go out canonical, so the recents MRU never re-parses them.
+            let (user, default_provider) = self.config.effective_providers();
+            let all = providers::effective_providers(&user);
+            let previous = crate::recents::canonical(
+                &format!("{}/{}", self.client.provider_name(), self.client.model_name()),
+                &all,
+                &default_provider,
+            );
+            // `client_for` → `build_client` → `resolve` can run an
+            // `api_key_command` as a child process. `apply_model_request` is
+            // awaited from the async `run_turn` loop, so running that inline
+            // freezes the worker for the command's full duration (or
+            // indefinitely if it hangs), stalling streaming and cancel/other
+            // input. Offload the blocking build to the blocking thread pool and
+            // await it, so the runtime stays responsive while the key command
+            // runs. The build also honours the turn's cancel flag: on cancel it
+            // kills the key-command child and fails fast, and we race the await
+            // against `control.cancelled()` below so the turn returns promptly
+            // instead of blocking on a hung command.
+            let config_for_build = self.config.clone();
+            let spec_for_build = spec.clone();
+            let cancel = self.control.cancel_flag();
+            let control = self.control.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                Self::client_for_cancellable(&config_for_build, &spec_for_build, Some(&cancel))
+            });
+            let built = tokio::select! {
+                joined = handle => match joined {
+                    Ok(result) => result,
+                    Err(join) => Err(anyhow::anyhow!("building client for {spec:?} panicked: {join}")),
+                },
+                _ = control.cancelled() => {
+                    // Cancelled mid-build: the blocking build observes the same
+                    // cancel flag, kills its key-command child, and unblocks, so
+                    // stop waiting and abort the switch rather than install a
+                    // client for a turn the user just cancelled. The request has
+                    // been consumed, so it will not fire into the next turn.
+                    return;
+                }
+            };
+            // A newer `/model` request can arrive while the build above is
+            // awaited. The spec we just built is then stale: installing it would
+            // point the next model call at the superseded spec even though the
+            // newer command was acked for that call. Discard this client
+            // (success or failure) and loop to build the newest queued spec.
+            if self.control.has_model_request() {
+                continue;
             }
+            // Cancellation can also land as the build finishes (the `select!`
+            // may pick the completed build over `cancelled()`); don't install a
+            // client for a turn the user just cancelled.
+            if self.control.is_cancelled() {
+                return;
+            }
+            match built {
+                Ok(client) => {
+                    self.client = client;
+                    self.config.model = spec.clone();
+                    self.calibration = None;
+                    self.learned_window = None;
+                    *self.detected_window.lock().unwrap() = None;
+                    self.compact_floor = 0;
+                    self.detect_context_window_for_switch();
+                    let spec = crate::recents::canonical(&spec, &all, &default_provider);
+                    self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
+                }
+                Err(e) => {
+                    // The spec passed queue-time validation but the client still
+                    // failed to build. Drop the request (do not re-queue it,
+                    // which would retry the same failure every step and leak
+                    // into the next turn) and tell the user; the turn stays on
+                    // the current model.
+                    let error = e.to_string();
+                    self.emit(AgentEvent::ModelSwitchFailed { spec: &spec, error: &error });
+                }
+            }
+            return;
         }
     }
 
@@ -3485,6 +3555,72 @@ mod tests {
         let previous = recents::canonical(&before, &Default::default(), "mock");
         assert_eq!(models, ["mock/switched".to_string(), previous]);
         assert!(recents_path.exists(), "the MRU was persisted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_newer_model_request_during_a_slow_build_supersedes_the_stale_one() {
+        // A `/model` switch whose client build is slow (here: a provider whose
+        // `api_key_command` sleeps) can be superseded by a newer `/model`
+        // request arriving while that build is still in flight. The agent must
+        // install the newest spec, not the stale one it happened to finish
+        // building: otherwise the next model call would land on a superseded
+        // model even though the newer command was acked for it.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    // Queue the slow-building switch, then — from another
+                    // thread, while that build sleeps — queue a newer switch.
+                    control.set_model("slow/x");
+                    let newer = control.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        newer.set_model("mock/final");
+                    });
+                }
+            },
+            None,
+            |mut config| {
+                config.providers.insert(
+                    "slow".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        // Build takes ~1s, so the newer request above is queued
+                        // well before it finishes and the stale-check catches it.
+                        api_key_command: Some("sleep 1; printf sk".to_string()),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        let switched = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let slot = switched.clone();
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+                if let AgentEvent::ModelSwitched { spec, .. } = event {
+                    slot.lock().unwrap().push(spec.to_string());
+                }
+            }));
+        }
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "do it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // The newest spec won; the stale `slow/x` was discarded, never installed.
+        assert_eq!(agent.provider_name(), "mock", "the newest switch took effect");
+        assert_eq!(agent.model_name(), "final");
+        assert_eq!(agent.config().model, "mock/final");
+        assert_eq!(agent.control().take_model_request(), None, "both requests consumed");
+        let switched = switched.lock().unwrap();
+        assert_eq!(
+            switched.as_slice(),
+            ["mock/final".to_string()],
+            "only the newest switch was announced: {switched:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

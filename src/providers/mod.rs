@@ -14,7 +14,10 @@ pub mod openai_responses;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -341,7 +344,23 @@ fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Test-only convenience wrapper over [`resolve_cancellable`] with no cancel
+/// flag; production builds go through `build_client` → `resolve_cancellable`.
+#[cfg(test)]
 pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provider: &str) -> Result<ResolvedProvider> {
+    resolve_cancellable(spec, user, default_provider, None)
+}
+
+/// Like [`resolve`], but a running `api_key_command` honours `cancel`: when the
+/// flag flips the child process is killed and the build fails fast, so a hung
+/// key command can never wedge a cancellable caller (e.g. a mid-turn `/model`
+/// switch). `cancel` is `None` for build paths with no turn to cancel against.
+pub fn resolve_cancellable(
+    spec: &str,
+    user: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<ResolvedProvider> {
     let providers = effective_providers(user);
     let (name, model) = parse_model_spec(spec, &providers, default_provider);
     let config = providers.get(name).ok_or_else(|| {
@@ -382,7 +401,7 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
     };
     let api_key = match (api_key, &config.api_key_command) {
         (Some(key), _) => Some(key),
-        (None, Some(command)) => Some(run_key_command(name, command)?),
+        (None, Some(command)) => Some(run_key_command(name, command, cancel)?),
         (None, None) => None,
     };
     let extra_body = match &config.extra_body {
@@ -426,19 +445,100 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
     })
 }
 
-fn run_key_command(provider: &str, command: &str) -> Result<String> {
-    let output = std::process::Command::new("sh")
+/// Upper bound on how long an `api_key_command` may run before it is killed.
+/// A key lookup should be near-instant; without a bound a command that hangs
+/// (e.g. a credential helper waiting on a prompt that never comes) would freeze
+/// every client build — and, for a mid-turn `/model` switch, wedge the turn —
+/// indefinitely. Generous enough for a real network round-trip, short enough
+/// that a genuine hang is recovered from.
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Poll granularity while waiting for the key command to exit.
+const KEY_COMMAND_POLL: Duration = Duration::from_millis(50);
+
+fn run_key_command(provider: &str, command: &str, cancel: Option<&Arc<AtomicBool>>) -> Result<String> {
+    run_key_command_bounded(provider, command, KEY_COMMAND_TIMEOUT, cancel)
+}
+
+/// Run `command` to produce an api key, bounded by `timeout` and by `cancel`.
+///
+/// The child is spawned (not `output()`-ed) so it can be killed: the wait loop
+/// polls `try_wait` and, on either timeout or a set `cancel` flag, kills the
+/// child and its wait returns an error rather than blocking forever. stdout and
+/// stderr are drained on dedicated threads so a command that writes more than a
+/// pipe buffer cannot deadlock against the wait loop (it would otherwise block
+/// on write, never exit, and be killed as a false timeout).
+fn run_key_command_bounded(
+    provider: &str,
+    command: &str,
+    timeout: Duration,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<String> {
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("provider {provider:?}: running api_key_command {command:?}"))?;
-    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || key.is_empty() {
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let start = Instant::now();
+    let status = loop {
+        let waited =
+            child.try_wait().with_context(|| format!("provider {provider:?}: waiting on api_key_command {command:?}"));
+        match waited {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+                let timed_out = start.elapsed() >= timeout;
+                if cancelled || timed_out {
+                    // Kill and reap so the child cannot linger, then drain the
+                    // reader threads (the pipes hit EOF once the child is gone).
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    if cancelled {
+                        bail!("provider {provider:?}: api_key_command {command:?} cancelled");
+                    }
+                    bail!("provider {provider:?}: api_key_command {command:?} timed out after {}s", timeout.as_secs());
+                }
+                std::thread::sleep(KEY_COMMAND_POLL);
+            }
+            Err(e) => {
+                // Can't tell whether the child is alive; kill and reap so it
+                // cannot linger, then surface the wait error.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(e);
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let key = String::from_utf8_lossy(&stdout).trim().to_string();
+    if !status.success() || key.is_empty() {
         bail!(
             "provider {provider:?}: api_key_command {command:?} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            status,
+            String::from_utf8_lossy(&stderr).trim()
         );
     }
     Ok(key)
@@ -465,7 +565,20 @@ pub fn build_client(
     user: &HashMap<String, ProviderConfig>,
     default_provider: &str,
 ) -> Result<Box<dyn LLMClient>> {
-    let resolved = resolve(spec, user, default_provider)?;
+    build_client_cancellable(spec, user, default_provider, None)
+}
+
+/// Like [`build_client`], but a running `api_key_command` honours `cancel`: the
+/// child is killed and the build fails fast when the flag flips, so a mid-turn
+/// `/model` switch whose key command hangs cannot wedge the turn. `cancel` is
+/// `None` for build paths with no turn to cancel against.
+pub fn build_client_cancellable(
+    spec: &str,
+    user: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<Box<dyn LLMClient>> {
+    let resolved = resolve_cancellable(spec, user, default_provider, cancel)?;
     Ok(match resolved.kind {
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
@@ -916,6 +1029,66 @@ mod key_command_tests {
     fn failing_api_key_command_is_an_error() {
         let err = resolve("cmd/m", &with_command("echo nope >&2; exit 3"), "mock").unwrap_err();
         assert!(format!("{err:#}").contains("nope"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_returns_the_trimmed_key() {
+        let key = run_key_command_bounded("cmd", "printf '  sk-ok\\n'", Duration::from_secs(5), None).unwrap();
+        assert_eq!(key, "sk-ok");
+    }
+
+    #[test]
+    fn bounded_key_command_times_out_and_kills_a_hung_command() {
+        // A command that never exits must not block forever: the timeout fires,
+        // the child is killed, and the error names the timeout — all promptly.
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_honours_cancellation_and_kills_the_child() {
+        // With the cancel flag already set, a hung command is killed and the
+        // build fails fast with a cancellation error rather than waiting out
+        // the (here, long) timeout.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "cancelled slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancelled_mid_flight_is_killed() {
+        // Flag starts clear and flips from another thread while the command is
+        // running: the wait loop observes it, kills the child, and fails fast.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "cancelled slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_drains_large_output_without_deadlock() {
+        // A command that writes more than a pipe buffer (64KiB) must not
+        // deadlock the wait loop: the reader threads drain concurrently, so the
+        // command exits and the (trimmed) key comes back intact.
+        let key = run_key_command_bounded(
+            "cmd",
+            "printf 'sk-'; yes x | head -c 200000 | tr -d '\\n'",
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        assert!(key.starts_with("sk-x"), "unexpected key prefix: {}", &key[..key.len().min(8)]);
+        assert!(key.len() > 64 * 1024, "drained well past a pipe buffer without deadlock: {} bytes", key.len());
     }
 }
 
