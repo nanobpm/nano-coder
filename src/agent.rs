@@ -456,6 +456,12 @@ pub struct Agent {
     /// task (see `detect_context_window_for_switch`), which publishes here
     /// when it lands.
     detected_window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
+    /// Monotonic switch counter, bumped on every model change (see
+    /// `detect_context_window_for_switch`). A background window probe captures
+    /// the generation it was spawned under and discards its result if a later
+    /// switch has since bumped it, so a slow probe for a superseded model can
+    /// never overwrite the current model's detected window.
+    detect_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -520,6 +526,7 @@ impl Agent {
             calibration: None,
             learned_window: None,
             detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -636,6 +643,10 @@ impl Agent {
 
     /// Ask the endpoint for the model's context window, unless config sets it.
     pub async fn detect_context_window(&mut self) {
+        // Bump the generation so any in-flight background probe from an earlier
+        // mid-turn switch (see `detect_context_window_for_switch`) is discarded
+        // and cannot overwrite the window this blocking detect establishes.
+        self.detect_generation.fetch_add(1, Ordering::SeqCst);
         *self.detected_window.lock().unwrap() = None;
         if self.configured_window().is_none() {
             let probe = self.client.detect_context_window();
@@ -650,22 +661,34 @@ impl Agent {
     /// configured window (`context_window` in config or on the provider entry)
     /// that value is authoritative, so the HTTP probe is skipped outright;
     /// otherwise the probe runs in the background and the stats refresh it
-    /// triggers lands whenever the endpoint answers. The next model call goes
-    /// out immediately either way, with the model-name fallback window until
-    /// the probe (if any) reports.
+    /// triggers lands whenever the endpoint answers. Either way the new
+    /// model's fallback stats are published immediately so the status line and
+    /// `/context` reflect the switch at once rather than showing the previous
+    /// model's provider/window until (or unless) the probe lands. The next
+    /// model call goes out immediately, with the model-name fallback window
+    /// until the probe (if any) reports.
     fn detect_context_window_for_switch(&mut self) {
+        // Bump the generation *before* clearing the slot so any in-flight probe
+        // for the previous model is already invalidated: its `finish_detect`
+        // re-reads the generation under the slot lock and discards a stale
+        // result rather than clobbering this model's window.
+        let generation = self.detect_generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.detected_window.lock().unwrap() = None;
+        // Publish the new model's fallback stats (provider/model name + the
+        // model-name or default window) right away, so a slow or `None` probe
+        // cannot leave the UI on the previous model's window.
+        self.refresh_stats();
         if self.configured_window().is_some() {
-            self.refresh_stats();
             return;
         }
         let probe = self.client.clone_boxed();
         let slot = self.detected_window.clone();
         let sink = self.event_sink.clone();
         let stats = self.stats.clone();
+        let current = self.detect_generation.clone();
         tokio::spawn(async move {
             let detected = tokio::time::timeout(DETECT_TIMEOUT, probe.detect_context_window()).await.ok().flatten();
-            Self::finish_detect(detected, slot, sink, stats);
+            Self::finish_detect(detected, generation, current, slot, sink, stats);
         });
     }
 
@@ -673,22 +696,40 @@ impl Agent {
     /// refresh the stats, emitting `AgentEvent::Context` through the sink so
     /// the UI picks the window up whenever the probe lands. A failed or timed
     /// out probe publishes nothing — the model-name fallback window stays.
-    /// The stats update is conservative: a fresher source (a learned window
-    /// from a context overflow, or a configured window a later switch picked)
-    /// is never overwritten by a stale probe.
+    /// A result whose `generation` no longer matches `current` is discarded:
+    /// a later model switch has superseded this probe, so its window must not
+    /// overwrite the newer model's. The stats update is also conservative: a
+    /// fresher source (a learned window from a context overflow, or a
+    /// configured window a later switch picked) is never overwritten.
     fn finish_detect(
         detected: Option<DetectedWindow>,
+        generation: u64,
+        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
         slot: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
         sink: Option<EventSink>,
         stats: SharedStats,
     ) {
         let Some(detected) = detected else { return };
         let (window, source) = (detected.tokens, format!("reported by the endpoint ({})", detected.source));
-        *slot.lock().unwrap() = Some(detected);
+        {
+            // Check the generation under the slot lock so a switch racing this
+            // completion either bumps it before we read (we discard) or clears
+            // the slot after we write (it then refreshes to its own fallback).
+            let mut slot = slot.lock().unwrap();
+            if current.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            *slot = Some(detected);
+        }
         {
             let mut stats = stats.lock().unwrap();
+            // Re-check: a switch may have superseded us between the two locks.
+            if current.load(Ordering::SeqCst) != generation {
+                return;
+            }
             if stats.window_source.starts_with("reported by the endpoint")
                 || stats.window_source == "known for the model name"
+                || stats.window_source == "default"
             {
                 stats.window = window;
                 stats.window_source = source;
@@ -3533,6 +3574,66 @@ mod tests {
         // The mock client reports no window, so the background probe publishes
         // nothing and the model-name fallback stays in effect.
         assert!(agent.detected_window.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stale_background_probe_is_discarded_after_a_later_switch() {
+        // A window probe spawned for one model can finish after the user has
+        // already switched to another. It must not overwrite the newer model's
+        // window: `finish_detect` discards any result whose generation no
+        // longer matches the live one.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(5));
+        let stats = SharedStats::default();
+        stats.lock().unwrap().window_source = "known for the model name".to_string();
+
+        // Probe spawned under generation 3 lands after the generation moved to 5.
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 999, source: "stale".to_string() }),
+            3,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        assert!(slot.lock().unwrap().is_none(), "a stale probe must not write the window slot");
+        assert_eq!(stats.lock().unwrap().window, 0, "a stale probe must not touch the shared stats");
+
+        // A probe for the live generation publishes normally.
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 4096, source: "fresh".to_string() }),
+            5,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().tokens, 4096, "the live probe writes the slot");
+        assert_eq!(stats.lock().unwrap().window, 4096, "the live probe refreshes the stats");
+        assert!(stats.lock().unwrap().window_source.starts_with("reported by the endpoint"));
+    }
+
+    #[test]
+    fn a_background_probe_refines_a_default_window_source() {
+        // When the new model has no known window the fallback source is
+        // "default"; a later endpoint probe must still be allowed to refine it
+        // (the conservative stats gate exempts "default", not just the
+        // model-name fallback).
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        stats.lock().unwrap().window_source = "default".to_string();
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 8192, source: "max_model_len".to_string() }),
+            1,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        assert_eq!(stats.lock().unwrap().window, 8192, "a probe must refine a default-source window");
     }
 
     #[tokio::test(flavor = "multi_thread")]

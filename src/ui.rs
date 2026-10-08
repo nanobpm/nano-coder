@@ -848,7 +848,10 @@ impl Renderer {
             #[cfg(test)]
             let _verbosity_guard = tests::verbosity_lock();
             if verbosity() == Verbosity::Quiet
-                && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
+                && !matches!(
+                    event,
+                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context | AgentEvent::ModelSwitchFailed { .. }
+                )
             {
                 return;
             }
@@ -1653,6 +1656,26 @@ pub(crate) mod tests {
         r.event(&AgentEvent::Thinking { text: "quick thought" });
         let thinking = r.frame_items().iter().filter(|i| matches!(i.item, Item::Thinking { .. })).count();
         assert_eq!(thinking, 1);
+    }
+
+    #[test]
+    fn frame_quiet_preserves_a_model_switch_failure() {
+        // A failed mid-turn `/model` switch is user-facing in every verbosity.
+        // In frame mode the quiet gate returns before `frame_event` for all but
+        // a few events; `ModelSwitchFailed` must be exempt so the warning still
+        // lands in the transcript instead of being silently dropped — exactly
+        // the mode where the legacy path explicitly preserves it.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Quiet);
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ModelSwitchFailed { spec: "broken/x", error: "no base_url" });
+        set_verbosity(Verbosity::Normal);
+        let note = r
+            .frame_items()
+            .iter()
+            .filter(|i| matches!(&i.item, Item::Note(t) if t.contains("broken/x") && t.contains("no base_url")))
+            .count();
+        assert_eq!(note, 1, "the switch failure must survive the frame quiet gate: {:?}", r.frame_items());
     }
 
     #[test]
