@@ -297,6 +297,18 @@ fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
     if base_url.trim().is_empty() {
         bail!("provider {provider:?} has an empty base_url");
     }
+    // `resolve` stores `base_url` verbatim (only `trim_end_matches('/')`), but
+    // `reqwest::Url::parse` silently strips leading/trailing whitespace and C0
+    // control characters while validating. That mismatch is a fail-open gap: a
+    // value like " http://host/v1" or "http://host\n" parses here yet is kept
+    // raw and only breaks later in `format!("{base_url}{path}")`. A real
+    // endpoint never contains whitespace or control characters, so reject any —
+    // validating the exact string that will be used downstream.
+    if let Some(bad) = base_url.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        bail!(
+            "provider {provider:?} base_url {base_url:?} must not contain whitespace or control characters (found {bad:?})"
+        );
+    }
     let parsed = reqwest::Url::parse(base_url)
         .map_err(|e| anyhow!("provider {provider:?} has a malformed base_url {base_url:?}: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -941,9 +953,20 @@ mod tests {
         // (losing the current model). Each variant is its own occurrence of the
         // same fail-open class.
         let mut user = HashMap::new();
-        for (name, url) in
-            [("empty", "   "), ("bad", "not a url"), ("ftp", "ftp://host/v1"), ("nohost", "http://")]
-        {
+        for (name, url) in [
+            ("empty", "   "),
+            ("bad", "not a url"),
+            ("ftp", "ftp://host/v1"),
+            ("nohost", "http://"),
+            // Leading/trailing whitespace and control characters are stripped
+            // by the URL parser but kept verbatim by `resolve`, so they must be
+            // rejected too — otherwise they pass validation yet break later at
+            // request-build time (same fail-open class).
+            ("lead_space", " http://host/v1"),
+            ("trail_newline", "http://host/v1\n"),
+            ("inner_tab", "http://ho\tst/v1"),
+            ("control", "http://host/v1\u{0001}"),
+        ] {
             user.insert(
                 name.to_string(),
                 ProviderConfig {
@@ -955,7 +978,7 @@ mod tests {
             );
         }
         let providers = effective_providers(&user);
-        for name in ["empty", "bad", "ftp", "nohost"] {
+        for name in ["empty", "bad", "ftp", "nohost", "lead_space", "trail_newline", "inner_tab", "control"] {
             let spec = format!("{name}/x");
             assert!(validate_spec(&spec, &providers, "mock").is_err(), "validate_spec accepted {name}");
             assert!(resolve(&spec, &user, "mock").is_err(), "resolve accepted {name}");

@@ -1643,10 +1643,7 @@ pub(crate) mod tests {
         r.begin_turn();
         assert!(r.state.lock().unwrap().at_line_start);
         r.turn_raw("{\"k\":1}");
-        assert!(
-            r.state.lock().unwrap().deferred.is_empty(),
-            "a raw export at a line boundary must not be deferred"
-        );
+        assert!(r.state.lock().unwrap().deferred.is_empty(), "a raw export at a line boundary must not be deferred");
         set_verbosity(Verbosity::Normal);
     }
 
