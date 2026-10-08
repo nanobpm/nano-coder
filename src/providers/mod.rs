@@ -283,8 +283,16 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         // other HTTP endpoint — otherwise a malformed override passes
         // queue-time validation, replaces the working client, and fails only
         // on the next request. A real HTTP provider must carry a usable one.
+        //
+        // The emptiness guard here must match `api_base`'s `configured.is_empty()`
+        // test exactly: that is the string that decides "derive vs use the
+        // override". A trimming guard (`!url.trim().is_empty()`) would exempt a
+        // whitespace-only override (`"   "`) from validation while `api_base`
+        // still treats it as present and uses it verbatim — reopening the
+        // fail-open gap. Using `!url.is_empty()` routes any present-but-whitespace
+        // override into `validate_http_base_url`, which rejects it.
         (ProviderKind::Mock, _) => {}
-        (ProviderKind::GithubCopilot, Some(url)) if !url.trim().is_empty() => validate_http_base_url(name, url)?,
+        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => validate_http_base_url(name, url)?,
         (ProviderKind::GithubCopilot, _) => {}
         (_, Some(url)) => validate_http_base_url(name, url)?,
         (_, None) => bail!("provider {name:?} has no base_url"),
@@ -352,9 +360,11 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
         // session token unless overridden; a present non-empty override is used
         // verbatim by `GithubCopilotClient::api_base`, so validate it like any
         // other HTTP endpoint (sharing the queue-time bad-endpoint guarantee)
-        // before storing it.
+        // before storing it. The emptiness guard must match `api_base`'s
+        // `is_empty()` test (not a trimming one) so a whitespace-only override
+        // is validated (and rejected) rather than exempted here yet used there.
         (ProviderKind::Mock, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
-        (ProviderKind::GithubCopilot, Some(url)) if !url.trim().is_empty() => {
+        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => {
             validate_http_base_url(name, url)?;
             url.trim_end_matches('/').to_string()
         }
@@ -1051,6 +1061,12 @@ mod tests {
             ("non-http", "ftp://host/v1"),
             ("query", "https://host/v1?token=x"),
             ("whitespace", " https://host/v1"),
+            // A whitespace-only override is *not* empty to `api_base`'s
+            // `configured.is_empty()` test, so it is used verbatim
+            // (`format!("{}{}", "   ", path)` -> a broken endpoint). It must be
+            // rejected here too, not exempted by a trimming guard — otherwise it
+            // passes queue-time validation and fails only on the next request.
+            ("whitespace-only", "   "),
         ] {
             let mut user = HashMap::new();
             user.insert(
