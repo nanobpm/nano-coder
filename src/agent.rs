@@ -603,6 +603,15 @@ impl Agent {
 
     /// Switch to another `provider/model`, keeping the conversation.
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
+        // A direct switch supersedes any still-unapplied mid-turn `/model`
+        // request: one queued during the final in-flight call of a prior turn
+        // outlives that turn, and without clearing it the first call of the
+        // next turn would consume the stale request and silently switch away
+        // from the model this direct switch just selected. Consume it *before*
+        // the fallible build below: if the new client fails to build we return
+        // at the `?`, and a request left queued here would then fire on the
+        // next turn even though the user's latest intent was this failed spec.
+        self.control.take_model_request();
         // `client_for` → `build_client` → `resolve` can run an `api_key_command`
         // as a child process. `set_model` is awaited from the async TUI/ACP
         // command loops (between turns), so running that inline freezes the
@@ -618,12 +627,6 @@ impl Agent {
         .await
         .map_err(|join| anyhow::anyhow!("building client for {spec:?} panicked: {join}"))??;
         self.config.model = spec.to_string();
-        // A direct switch supersedes any still-unapplied mid-turn `/model`
-        // request: one queued during the final in-flight call of a prior turn
-        // outlives that turn, and without clearing it the first call of the
-        // next turn would consume the stale request and silently switch away
-        // from the model this direct switch just selected.
-        self.control.take_model_request();
         self.calibration = None;
         self.learned_window = None;
         *self.detected_window.lock().unwrap() = None;
@@ -650,17 +653,26 @@ impl Agent {
     /// superseded spec; (2) if the turn is cancelled while a key command is
     /// building (or hanging), the build is killed and the switch is abandoned
     /// rather than blocking the turn.
-    async fn apply_model_request(&mut self) {
+    ///
+    /// Returns `true` when the turn was cancelled (the switch was abandoned),
+    /// so the caller must **stop before issuing the next model call**. Just
+    /// abandoning the switch is not enough: the caller otherwise falls through
+    /// into `compact_with` or the chat `select!`, where a cancellation that is
+    /// already pending still races an immediately-ready model future — so one
+    /// call could still land on the old model after the user cancelled.
+    #[must_use]
+    async fn apply_model_request(&mut self) -> bool {
         // Loop so that a newer `/model` request arriving while an earlier one
         // is being built is honoured: each pass builds exactly one spec, then
         // re-checks the slot and rebuilds the newest if it was superseded.
         loop {
             // Don't start (or keep) switching for a turn the user cancelled;
             // the pending request stays queued for the next turn's first call.
+            // Signal the caller to stop before it reaches a model call.
             if self.control.is_cancelled() {
-                return;
+                return true;
             }
-            let Some(spec) = self.control.take_model_request() else { return };
+            let Some(spec) = self.control.take_model_request() else { return false };
             // Record the model actually in use (resolved by the live client)
             // before switching, so a provider-default edit made in the same
             // session cannot rewrite which model we record leaving. Both specs
@@ -701,7 +713,8 @@ impl Agent {
                     // stop waiting and abort the switch rather than install a
                     // client for a turn the user just cancelled. The request has
                     // been consumed, so it will not fire into the next turn.
-                    return;
+                    // Signal the caller to stop before its next model call.
+                    return true;
                 }
             };
             // A newer `/model` request can arrive while the build above is
@@ -714,9 +727,10 @@ impl Agent {
             }
             // Cancellation can also land as the build finishes (the `select!`
             // may pick the completed build over `cancelled()`); don't install a
-            // client for a turn the user just cancelled.
+            // client for a turn the user just cancelled. Signal the caller to
+            // stop before its next model call.
             if self.control.is_cancelled() {
-                return;
+                return true;
             }
             match built {
                 Ok(client) => {
@@ -740,7 +754,7 @@ impl Agent {
                     self.emit(AgentEvent::ModelSwitchFailed { spec: &spec, error: &error });
                 }
             }
-            return;
+            return false;
         }
     }
 
@@ -839,12 +853,14 @@ impl Agent {
                 || stats.window_source == "known for the model name"
                 || stats.window_source == "default"
                 // A learned window is fresher, but a probe that reports a
-                // *stricter* (smaller) limit must replace it: the slot already
-                // holds the detected window, so refusing here would leave
-                // `context_window_with_source()` using the smaller value while
-                // `/context` and the status line keep reporting the larger
-                // learned one.
-                || (stats.window_source == "learned from a context-overflow error" && window < stats.window)
+                // *stricter* (smaller-or-equal) limit must replace it: the slot
+                // already holds the detected window, and
+                // `context_window_with_source()` prefers the detected value
+                // whenever `learned < detected` is false — equality included.
+                // Refusing on equality would leave `/context` and the status
+                // line reporting "learned" while the agent internally uses the
+                // endpoint source, so allow equality here too.
+                || (stats.window_source == "learned from a context-overflow error" && window <= stats.window)
             {
                 stats.window = window;
                 stats.window_source = source;
@@ -1595,8 +1611,14 @@ impl Agent {
             }
             self.absorb_steers()?;
             // A `/model <spec>` typed mid-turn applies here, so the request
-            // built below goes to the new model.
-            self.apply_model_request().await;
+            // built below goes to the new model. If the turn was cancelled
+            // while the switch was building, stop before the threshold
+            // compaction or chat call below — otherwise one call could still
+            // land on the old model after the user cancelled.
+            if self.apply_model_request().await {
+                cancelled = true;
+                break;
+            }
 
             // Refresh the mode note on the system prompt before rebuilding the
             // tools, so a mid-turn Shift+Tab keeps the prompt and the available
@@ -1632,15 +1654,21 @@ impl Agent {
 
             let mut overflow_retried = false;
             // Reset per attempt, so the recorded duration is the request that
-            // produced the response, not earlier overflowed attempts.
-            let mut request_started;
+            // produced the response, not earlier overflowed attempts. Seeded so
+            // an early cancel break (before the first attempt sets it) leaves it
+            // defined; that path discards the response and never reads it.
+            let mut request_started = Instant::now();
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Every attempt is a model call (and the overflow branch below
                 // compacts with one more), so a `/model` queued while the
                 // previous attempt or compaction was in flight applies here,
-                // before the request is built — never after it.
-                self.apply_model_request().await;
+                // before the request is built — never after it. If the turn was
+                // cancelled while the switch was building, stop before the chat
+                // call below rather than issuing it on the old model.
+                if self.apply_model_request().await {
+                    break None;
+                }
                 // Rebuilt every retry iteration, not just once before the loop:
                 // an overflow retry compacts (in smart mode) below, which unlocks
                 // the history tools, so recomputing here lets the retried request
@@ -1714,8 +1742,13 @@ impl Agent {
                 refresh.tick().await; // discard the immediate first tick
                 let result = loop {
                     tokio::select! {
-                        response = &mut call => break Some(response),
+                        // Prefer cancellation: a cancel that is already pending
+                        // when this request is in flight must win over an
+                        // immediately-ready model future, so a cancelled turn
+                        // never processes one more call on the (old) model.
+                        biased;
                         () = control.cancelled() => break None,
+                        response = &mut call => break Some(response),
                         _ = refresh.tick(), if meter_live => {
                             let rate = rate_meter.lock().unwrap().sample(Instant::now());
                             if let Some(rate) = rate {
@@ -2037,8 +2070,13 @@ impl Agent {
         // Applying here is the single choke point for *every* trigger (manual,
         // threshold, overflow), so no compaction path can summarize on the
         // model the user just switched away from. Idempotent: a no-op when the
-        // caller already drained the slot before calling in.
-        self.apply_model_request().await;
+        // caller already drained the slot before calling in. If the turn was
+        // cancelled while the switch was building, stop before the summary call
+        // rather than issuing it on the old model.
+        if self.apply_model_request().await {
+            self.refresh_stats();
+            return Ok(None);
+        }
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
@@ -2121,8 +2159,13 @@ impl Agent {
         };
         let control = self.control.clone();
         let result = tokio::select! {
-            result = self.client.chat(&request) => result,
+            // Prefer cancellation: a cancel already pending when the summary
+            // request is issued must win over an immediately-ready model
+            // future, so a cancelled compaction never lands a call on the
+            // model the user just switched away from.
+            biased;
             () = control.cancelled() => return Ok(None),
+            result = self.client.chat(&request) => result,
         };
         let (summary, fallback) = match result {
             Ok(response) if !response.content.trim().is_empty() => {
@@ -3750,6 +3793,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_direct_model_switch_still_clears_a_stale_queued_request() {
+        // The stale-request clear must happen *before* the fallible client
+        // build, not after it. A `/model B` whose client fails to build returns
+        // at the `?`; if the stale mid-turn request A were cleared only after a
+        // successful build, a failed B would leave A queued and the next turn's
+        // first call would silently switch to the superseded A. Clearing up
+        // front means a failed direct switch leaves no stale request behind.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![],
+            dir.path(),
+            |_, _| {},
+            None,
+            |mut config| {
+                // Syntactically valid, endpoint configured; only the key lookup
+                // fails, so the client fails to build at `set_model` time.
+                config.providers.insert(
+                    "flaky".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        api_key_command: Some("exit 1".to_string()),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        agent.new_session().unwrap();
+        agent.control().set_model("mock/leftover");
+        agent.set_model("flaky/x").await.expect_err("the unbuildable client fails the switch");
+        assert_eq!(
+            agent.control().take_model_request(),
+            None,
+            "the stale request was cleared before the failed build, not left to fire next turn"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime() {
         // `set_model` builds the new client, and building it can run an
@@ -3969,6 +4052,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_apply_model_request_signals_the_caller_and_keeps_the_request() {
+        // A `/model` queued mid-turn plus a cancel that is already pending must
+        // not install the new client, and `apply_model_request` must report the
+        // cancellation so the caller stops before its next model call —
+        // otherwise one call still lands on the (old) model after the user
+        // cancelled. The request stays queued for the next turn's first call.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let (provider, model) = (agent.provider_name().to_string(), agent.model_name().to_string());
+        agent.control().set_model("mock/summarizer");
+        agent.control().cancel();
+        assert!(agent.apply_model_request().await, "a cancelled turn signals the caller to stop");
+        assert_eq!(agent.provider_name(), provider, "the switch did not apply");
+        assert_eq!(agent.model_name(), model);
+        assert!(agent.control().has_model_request(), "the request stays queued for the next turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_compaction_does_not_issue_the_summary_call() {
+        // A cancel pending when compaction would summarize must stop before the
+        // model call rather than race an immediately-ready response onto the
+        // old model (the `biased;` select plus the caller guard). Only the
+        // turn's two calls are scripted; a summary call would pop an empty
+        // queue and panic, so a green test proves none was issued.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![tool_call("c1"), text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        agent.control().cancel();
+        let report =
+            agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        assert!(report.is_none(), "a cancelled compaction summarizes nothing");
+        assert_eq!(seen.lock().unwrap().len(), 2, "no summary call was issued on cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn mid_turn_model_switch_with_a_configured_window_skips_the_probe() {
         // A mid-turn `/model` switch must not stall the agent loop on the
         // context-window probe. When the new spec carries a configured window
@@ -4145,6 +4264,39 @@ mod tests {
         let s = stats.lock().unwrap();
         assert_eq!(s.window, 100_000, "a looser detected window must not replace the learned stat");
         assert_eq!(s.window_source, "learned from a context-overflow error");
+    }
+
+    #[test]
+    fn an_equal_probe_replaces_a_learned_window_stat_source() {
+        // When the detected window equals the learned one,
+        // `context_window_with_source()` prefers the detected slot (the
+        // `learned < window` guard is false on equality), so the shared stats
+        // must follow and relabel the source. Otherwise `/context` keeps saying
+        // "learned" while the agent internally reports the endpoint source.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 128_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Some(DetectedWindow { tokens: 128_000, source: "max_model_len".to_string() }),
+            1,
+            current.clone(),
+            slot.clone(),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 128_000, "the window is unchanged on equality");
+        assert!(
+            s.window_source.starts_with("reported by the endpoint"),
+            "an equal detected window relabels the source to match context_window_with_source: {}",
+            s.window_source
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

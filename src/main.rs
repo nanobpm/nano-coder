@@ -178,12 +178,12 @@ fn apply_next_step_setting(
     snapshot: &turn_commands::Snapshot,
 ) -> String {
     // Split the command from its argument on ANY whitespace, exactly as
-    // `turn_commands::timing` classifies it. Matching on an ASCII space only
-    // (e.g. `strip_prefix("/model ")`) would mishandle a tab- or newline-
-    // separated line: `timing` routes `/model\tmock/x` here as `NextStep`, but
-    // a space-only split would then fail to recognise it and report "not a
-    // setting" instead of queuing the switch.
-    let (name, arg) = cmd.split_once(char::is_whitespace).map(|(n, a)| (n, a.trim())).unwrap_or((cmd, ""));
+    // `turn_commands::timing` classifies it (shared `split_cmd`). Matching on an
+    // ASCII space only (e.g. `strip_prefix("/model ")`) would mishandle a tab-
+    // or newline-separated line: `timing` routes `/model\tmock/x` here as
+    // `NextStep`, but a space-only split would then fail to recognise it and
+    // report "not a setting" instead of queuing the switch.
+    let (name, arg) = turn_commands::split_cmd(cmd);
     match name {
         "/mode" => match arg.parse::<mode::AgentMode>() {
             Ok(mode) => {
@@ -1130,8 +1130,18 @@ async fn run_compaction(
 }
 
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
+    // Split name from argument on ANY whitespace, the same rule `timing` and
+    // `Snapshot::output` use, so a tab/newline-separated form (e.g.
+    // `/trajectory\t--json`) dispatches identically to its space-separated twin
+    // instead of being silently dropped by an ASCII-space `starts_with`.
+    let (name, arg) = turn_commands::split_cmd(cmd);
     match cmd {
-        "/trajectory" if !terminal.outstanding && terminal.renderer.is_frame() && io::stdin().is_terminal() => {
+        _ if name == "/trajectory"
+            && arg.is_empty()
+            && !terminal.outstanding
+            && terminal.renderer.is_frame()
+            && io::stdin().is_terminal() =>
+        {
             // Page a trajectory that doesn't fit on screen. The pager owns the
             // screen until it exits; force a full redraw so the frame
             // renderer's next differential render isn't diffed against what
@@ -1162,7 +1172,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         // "unexpected arguments" backstop. Between turns there is no need to
         // restrict which forms run — that restriction (see `timing`) exists
         // only to decide what is safe *mid-turn*.
-        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
+        _ if name == "/trajectory" => {
             let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
             match turn_commands::Snapshot::capture(agent)
                 .output(cmd, &stats, agent.plan())
@@ -1193,8 +1203,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/exit" | "/quit" => Ok(false),
-        _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
-            let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
+        _ if name == "/compact" => {
+            let (mode, focus) = commands::parse_compact_args(arg);
             let focus = focus.map(str::to_string);
             terminal.renderer.print_block("Compacting...");
             match run_compaction(agent, mode, focus.as_deref(), terminal).await? {
@@ -1240,7 +1250,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        "/model" if terminal.outstanding => {
+        _ if name == "/model" && arg.is_empty() && terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive picker would race it for keystrokes.
             terminal.renderer.print_block(&format!(
@@ -1251,7 +1261,10 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             ));
             Ok(true)
         }
-        "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+        _ if name == "/model"
+            && arg.is_empty()
+            && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) =>
+        {
             // The picker reads keystrokes from stdin and draws on stderr, so it
             // needs both to be terminals; piped input/output just gets the
             // current model.
@@ -1263,7 +1276,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             ));
             Ok(true)
         }
-        "/model" => {
+        _ if name == "/model" && arg.is_empty() => {
             // Capture the model actually in use (resolved by the live
             // client) before switching, so a provider-default edit made in the
             // same session cannot rewrite which model we record leaving.
@@ -1292,12 +1305,12 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with("/model ") => {
+        _ if name == "/model" && !arg.is_empty() => {
             // Capture the model actually in use (resolved by the live
             // client) before switching, so a provider-default edit made in the
             // same session cannot rewrite which model we record leaving.
             let before = format!("{}/{}", agent.provider_name(), agent.model_name());
-            agent.set_model(cmd["/model ".len()..].trim()).await?;
+            agent.set_model(arg).await?;
             terminal.model_switched(agent, &before);
             terminal.renderer.print_block(&format!(
                 "Model set to {} (provider {})",
@@ -1319,8 +1332,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with("/mode ") => {
-            match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
+        _ if name == "/mode" && !arg.is_empty() => {
+            match arg.parse::<mode::AgentMode>() {
                 Ok(m) => {
                     agent.set_mode(m);
                     terminal.renderer.print_block(&format!("Mode set to {m} ({})", m.describe()));
@@ -1329,8 +1342,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with("/verbosity ") => {
-            match cmd["/verbosity ".len()..].parse::<ui::Verbosity>() {
+        _ if name == "/verbosity" && !arg.is_empty() => {
+            match arg.parse::<ui::Verbosity>() {
                 Ok(level) => {
                     ui::set_verbosity(level);
                     agent.config_mut().verbosity = level;
