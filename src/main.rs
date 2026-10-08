@@ -177,8 +177,15 @@ fn apply_next_step_setting(
     renderer: &ui::Renderer,
     snapshot: &turn_commands::Snapshot,
 ) -> String {
-    if let Some(arg) = cmd.strip_prefix("/mode ") {
-        match arg.trim().parse::<mode::AgentMode>() {
+    // Split the command from its argument on ANY whitespace, exactly as
+    // `turn_commands::timing` classifies it. Matching on an ASCII space only
+    // (e.g. `strip_prefix("/model ")`) would mishandle a tab- or newline-
+    // separated line: `timing` routes `/model\tmock/x` here as `NextStep`, but
+    // a space-only split would then fail to recognise it and report "not a
+    // setting" instead of queuing the switch.
+    let (name, arg) = cmd.split_once(char::is_whitespace).map(|(n, a)| (n, a.trim())).unwrap_or((cmd, ""));
+    match name {
+        "/mode" => match arg.parse::<mode::AgentMode>() {
             Ok(mode) => {
                 control.set_mode(mode);
                 // As for Shift+Tab mid-turn: refresh the status line now.
@@ -187,9 +194,8 @@ fn apply_next_step_setting(
                 format!("Mode set to {mode} ({}); applies from the agent's next step", mode.describe())
             }
             Err(e) => e,
-        }
-    } else if let Some(arg) = cmd.strip_prefix("/verbosity ") {
-        match arg.trim().parse::<ui::Verbosity>() {
+        },
+        "/verbosity" => match arg.parse::<ui::Verbosity>() {
             Ok(level) => {
                 // The agent's config copy is synced when the turn ends. Route
                 // through the renderer so a mid-turn change reconciles the
@@ -198,31 +204,31 @@ fn apply_next_step_setting(
                 format!("Verbosity set to {level} ({}); /settings saves it", level.describe())
             }
             Err(e) => e,
+        },
+        "/model" => {
+            let spec = arg;
+            if spec.is_empty() {
+                // The bare picker owns the keyboard, so it waits for the turn;
+                // `timing` agrees, so this is only a backstop.
+                return format!("[{cmd}: waits for the turn to finish]");
+            }
+            // The agent applies the switch just before its next model call
+            // (`Agent::apply_model_request`), so this is safe in the middle of a
+            // tool loop: the history is provider-neutral. Validate the spec now,
+            // against the turn-start providers (they do not change during a turn),
+            // so an unbuildable spec is reported immediately and is never queued —
+            // a dead request must not sit on the control and leak into later turns.
+            // A spec that passes here almost always builds at apply time; the rare
+            // late failure (e.g. a failing api-key command) is surfaced then via
+            // `AgentEvent::ModelSwitchFailed` and the request is dropped, not
+            // retried.
+            if let Err(e) = snapshot.validate_model_spec(spec) {
+                return format!("[{cmd}: {e}]");
+            }
+            control.set_model(spec);
+            format!("Model switch to {spec} queued; applies at the next model call (the history carries over)")
         }
-    } else if let Some(arg) = cmd.strip_prefix("/model ") {
-        let spec = arg.trim();
-        if spec.is_empty() {
-            // The bare picker owns the keyboard, so it waits for the turn;
-            // `timing` agrees, so this is only a backstop.
-            return format!("[{cmd}: waits for the turn to finish]");
-        }
-        // The agent applies the switch just before its next model call
-        // (`Agent::apply_model_request`), so this is safe in the middle of a
-        // tool loop: the history is provider-neutral. Validate the spec now,
-        // against the turn-start providers (they do not change during a turn),
-        // so an unbuildable spec is reported immediately and is never queued —
-        // a dead request must not sit on the control and leak into later turns.
-        // A spec that passes here almost always builds at apply time; the rare
-        // late failure (e.g. a failing api-key command) is surfaced then via
-        // `AgentEvent::ModelSwitchFailed` and the request is dropped, not
-        // retried.
-        if let Err(e) = snapshot.validate_model_spec(spec) {
-            return format!("[{cmd}: {e}]");
-        }
-        control.set_model(spec);
-        format!("Model switch to {spec} queued; applies at the next model call (the history carries over)")
-    } else {
-        format!("[{cmd}: not a setting]")
+        _ => format!("[{cmd}: not a setting]"),
     }
 }
 
@@ -2033,6 +2039,39 @@ mod tests {
         // Blank input is a no-op on both paths.
         assert!(matches!(classify_steer_input("", true), SteerRoute::Ignore));
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
+    }
+
+    #[test]
+    fn next_step_setting_accepts_any_whitespace_separator() {
+        // Regression: `turn_commands::timing` splits the command from its arg on
+        // ANY whitespace, so `/model\tmock/x` is routed here as `NextStep`. The
+        // dispatch must parse the separator the same way — a space-only match
+        // (the old `strip_prefix("/model ")`) reported "not a setting" for a
+        // tab- or newline-separated line, silently dropping the switch.
+        let control = agent::TurnControl::default();
+        let stats: context::SharedStats = std::sync::Arc::new(std::sync::Mutex::new(context::ContextStats::default()));
+        let renderer = ui::Renderer::legacy_for_test();
+        let snapshot = turn_commands::Snapshot::default();
+
+        // Every NextStep command, separated by a tab rather than a space.
+        for sep in ["\t", "\n", "\u{0b}", "  "] {
+            let note = apply_next_step_setting(
+                &format!("/mode{sep}plan"),
+                &control,
+                &stats,
+                &renderer,
+                &snapshot,
+            );
+            assert!(note.starts_with("Mode set to"), "tab/space `/mode` not recognised: {note:?}");
+        }
+        // And it still matches the ordinary single-space form.
+        let note = apply_next_step_setting("/mode plan", &control, &stats, &renderer, &snapshot);
+        assert!(note.starts_with("Mode set to"), "space `/mode` regressed: {note:?}");
+
+        // A genuinely unknown command is still reported as not a setting, and a
+        // name that only shares a prefix (`/modex`) must not match `/mode`.
+        assert!(apply_next_step_setting("/nope arg", &control, &stats, &renderer, &snapshot).contains("not a setting"));
+        assert!(apply_next_step_setting("/modex plan", &control, &stats, &renderer, &snapshot).contains("not a setting"));
     }
 
     /// A max-turn response whose streamed answer was quiet-suppressed must be

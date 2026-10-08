@@ -15,6 +15,7 @@ pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -467,6 +468,14 @@ fn run_key_command(provider: &str, command: &str, cancel: Option<&Arc<AtomicBool
 /// stderr are drained on dedicated threads so a command that writes more than a
 /// pipe buffer cannot deadlock against the wait loop (it would otherwise block
 /// on write, never exit, and be killed as a false timeout).
+///
+/// The child runs in its own process group (`process_group(0)`) and is killed
+/// with `killpg`, not `child.kill()`: killing only the `sh` leader would leave
+/// descendants it spawned (e.g. the `sleep` in `sleep 30; printf sk`) holding
+/// the stdout/stderr pipes open, so the reader-thread joins below would block
+/// until those grandchildren exit — defeating the timeout/cancellation. Killing
+/// the whole group tears the descendants down too, so the pipes hit EOF and the
+/// joins return promptly.
 fn run_key_command_bounded(
     provider: &str,
     command: &str,
@@ -479,6 +488,8 @@ fn run_key_command_bounded(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group so a kill reaches descendants, not just the shell.
+        .process_group(0)
         .spawn()
         .with_context(|| format!("provider {provider:?}: running api_key_command {command:?}"))?;
     let mut stdout_pipe = child.stdout.take();
@@ -507,9 +518,12 @@ fn run_key_command_bounded(
                 let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
                 let timed_out = start.elapsed() >= timeout;
                 if cancelled || timed_out {
-                    // Kill and reap so the child cannot linger, then drain the
-                    // reader threads (the pipes hit EOF once the child is gone).
-                    let _ = child.kill();
+                    // Kill the whole process group (not just the `sh` leader) and
+                    // reap so neither the shell nor any descendant can linger, then
+                    // drain the reader threads (the pipes hit EOF once the group is
+                    // gone).
+                    // SAFETY: killpg only signals the child's own process group.
+                    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
                     let _ = child.wait();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
@@ -521,9 +535,11 @@ fn run_key_command_bounded(
                 std::thread::sleep(KEY_COMMAND_POLL);
             }
             Err(e) => {
-                // Can't tell whether the child is alive; kill and reap so it
-                // cannot linger, then surface the wait error.
-                let _ = child.kill();
+                // Can't tell whether the child is alive; kill the whole process
+                // group and reap so neither it nor any descendant can linger,
+                // then surface the wait error.
+                // SAFETY: killpg only signals the child's own process group.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
@@ -1045,6 +1061,34 @@ mod key_command_tests {
         let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_millis(100), None).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(10), "timed out slowly: {:?}", start.elapsed());
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_timeout_kills_descendants_holding_the_pipes() {
+        // Regression: `sleep 30; printf sk` makes `sh` FORK `sleep` (rather than
+        // exec-replacing itself), so `sleep` inherits the stdout/stderr pipes.
+        // Killing only the `sh` leader would leave `sleep` holding them open and
+        // the reader-thread joins would block for the full 30s — defeating the
+        // timeout. Killing the whole process group tears `sleep` down too, so
+        // the pipes hit EOF and the call returns promptly.
+        let start = Instant::now();
+        let err =
+            run_key_command_bounded("cmd", "sleep 30; printf sk", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_kills_descendants_holding_the_pipes() {
+        // As above, but via the cancel path: the forked `sleep` must be torn
+        // down with the group so the reader joins do not block out the long
+        // timeout.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30; printf sk", Duration::from_secs(600), Some(&cancel))
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
     }
 
     #[test]
