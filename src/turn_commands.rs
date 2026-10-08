@@ -21,10 +21,11 @@ pub enum Timing {
     /// Read-only: runs straight away from the snapshot and live stats.
     Immediate,
     /// A setting the agent reads at its next step (`/mode NAME`,
-    /// `/verbosity LEVEL`): applied straight away through shared state.
+    /// `/verbosity LEVEL`, `/model SPEC`): applied straight away through
+    /// shared state.
     NextStep,
-    /// Changes the conversation, owns the keyboard, or switches the client:
-    /// waits for the turn to finish.
+    /// Changes the conversation, owns the keyboard, or waits on the in-flight
+    /// request: waits for the turn to finish.
     AfterTurn,
 }
 
@@ -40,6 +41,12 @@ pub fn timing(cmd: &str) -> Timing {
         // Without an argument these just show the current value.
         ("/mode" | "/verbosity", "") => Timing::Immediate,
         ("/mode" | "/verbosity", _) => Timing::NextStep,
+        // A model switch is queued on the turn's control and applied just
+        // before the agent's next model call, so a switch in the middle of a
+        // tool loop is fine (the history is provider-neutral). The bare
+        // `/model` picker owns the keyboard, so it still waits for the turn.
+        ("/model", "") => Timing::AfterTurn,
+        ("/model", _) => Timing::NextStep,
         _ => Timing::AfterTurn,
     }
 }
@@ -300,9 +307,12 @@ mod tests {
         for cmd in ["/mode plan", "/verbosity quiet", "/mode  auto "] {
             assert_eq!(timing(cmd), Timing::NextStep, "{cmd}");
         }
-        for cmd in
-            ["/compact", "/compact --smart", "/restart", "/settings", "/model", "/model mock/x", "/exit", "/quit"]
-        {
+        // `/model SPEC` applies at the agent's next model call, even in the
+        // middle of a tool loop; the bare picker still waits for the turn.
+        for cmd in ["/model mock/x", "/model  anthropic/claude-x "] {
+            assert_eq!(timing(cmd), Timing::NextStep, "{cmd}");
+        }
+        for cmd in ["/compact", "/compact --smart", "/restart", "/settings", "/model", "/exit", "/quit"] {
             assert_eq!(timing(cmd), Timing::AfterTurn, "{cmd}");
         }
         // A read-only command given arguments it doesn't take is not run early.
@@ -349,7 +359,8 @@ mod tests {
         // window via `learned_window` must relabel the source alongside the
         // number, so `/context` never pairs a fresh window with a stale source.
         let snapshot = Snapshot::default();
-        let fresh = ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
+        let fresh =
+            ContextStats { window: 128_000, window_source: "known for the model name".into(), ..Default::default() };
         let Some(Output::Block(before)) = snapshot.output("/context", &fresh, &Plan::default()) else { panic!() };
         assert!(before.ends_with("(context window known for the model name)"), "{before}");
 

@@ -58,10 +58,14 @@ Slash commands work mid-turn too, where it is safe:
   `/context`, `/trajectory` (`--json`/`--markdown`), and `/mode` or `/verbosity` without an
   argument) show the current state. `/plan` shows the plan as the agent updates it.
 - **From the agent's next step:** `/mode NAME` applies when the agent takes its next step.
+- **From the next model call:** `/model provider/model` switches model mid-turn — even in
+  the middle of a tool loop (the history carries over) — applied just before the agent's
+  next model call.
 - **Right away (for the rest of the turn):** `/verbosity LEVEL` changes the output level
   immediately, so it affects the remaining events streamed by the current turn.
 - **After the turn:** commands that change the conversation or take over the keyboard
-  (`/compact`, `/restart`, `/settings`, `/model`, `/exit`) wait for the turn to finish.
+  (`/compact`, `/restart`, `/settings`, the bare `/model` picker, `/exit`) wait for the
+  turn to finish.
 
 **Esc Esc** (twice within a second) or **Ctrl-C** cancels
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.

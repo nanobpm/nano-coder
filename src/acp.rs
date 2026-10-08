@@ -132,7 +132,10 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
         AgentEvent::TextDelta { .. }
         | AgentEvent::ThinkingDelta { .. }
         | AgentEvent::Context
-        | AgentEvent::Compacted => {
+        | AgentEvent::Compacted
+        // Interactive-only (a `/model` typed mid-turn); an ACP client switches
+        // models between turns, so this never fires here.
+        | AgentEvent::ModelSwitched { .. } => {
             return None;
         }
     })
