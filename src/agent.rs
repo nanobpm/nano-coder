@@ -1619,11 +1619,10 @@ impl Agent {
             self.hooks.trigger(&ctx);
 
             if self.over_threshold() {
-                // The threshold compaction below is itself a model call, so a
-                // `/model` queued since the top of the iteration must apply to
-                // it too — otherwise the summary is written by the model the
-                // user just switched away from.
-                self.apply_model_request().await;
+                // The threshold compaction is itself a model call; `compact_logged`
+                // applies any `/model` queued since the top of the iteration
+                // before summarizing, so the summary never goes out on the model
+                // the user just switched away from.
                 self.compact_logged(CompactTrigger::Threshold, self.config.compaction_mode, None).await?;
                 if self.control.is_cancelled() {
                     cancelled = true;
@@ -1770,10 +1769,10 @@ impl Agent {
                         // and source for the whole client build and compaction.
                         self.refresh_stats();
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
-                        // The overflow compaction is a model call too: apply a
-                        // `/model` queued while the overflowing request was in
-                        // flight before the summary goes out on the old model.
-                        self.apply_model_request().await;
+                        // The overflow compaction is a model call too;
+                        // `compact_logged` applies a `/model` queued while the
+                        // overflowing request was in flight before the summary
+                        // goes out on the old model.
                         let compacted =
                             self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
                         if compacted.is_none() || self.control.is_cancelled() {
@@ -2031,6 +2030,15 @@ impl Agent {
         instructions: Option<&str>,
     ) -> Result<Option<CompactReport>> {
         self.set_activity(Activity::Compacting);
+        // Compaction summarizes via a model call (`compact_with`), so a
+        // `/model` queued but not yet applied — e.g. one typed during a turn's
+        // final in-flight call, which `run_turn` never reaches a hook to apply,
+        // followed by a manual `/compact` — must take effect before that call.
+        // Applying here is the single choke point for *every* trigger (manual,
+        // threshold, overflow), so no compaction path can summarize on the
+        // model the user just switched away from. Idempotent: a no-op when the
+        // caller already drained the slot before calling in.
+        self.apply_model_request().await;
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
@@ -3933,6 +3941,31 @@ mod tests {
         // (which is why the turn fails to connect).
         let calls = seen.lock().unwrap();
         assert_eq!(calls.len(), 2, "tool, overflow — everything after the switch left on the new client");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_before_manual_compaction_applies_to_the_summary() {
+        // A `/model` typed during a turn's final in-flight call stays queued:
+        // `run_turn` returns without reaching another apply hook. If the next
+        // command is `/compact`, `Agent::compact` summarizes with a model call,
+        // which must go to the newly selected model — not the one the user just
+        // switched away from. Only the turn's two calls are scripted; a summary
+        // left on the old client would pop an empty queue and panic, so a green
+        // test proves the switch was applied before the summary.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![tool_call("c1"), text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        // The still-queued mid-turn switch, left pending after the final call.
+        agent.control().set_model("mock/summarizer");
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.summarized > 0, "the summary call actually ran");
+        assert_eq!(agent.provider_name(), "mock", "switch applied before the summary call");
+        assert_eq!(agent.model_name(), "summarizer");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // The old scripted client served only the turn's two calls, never the
+        // summary (which went to the new client).
+        assert_eq!(seen.lock().unwrap().len(), 2, "the summary did not go to the old client");
     }
 
     #[tokio::test(flavor = "multi_thread")]
