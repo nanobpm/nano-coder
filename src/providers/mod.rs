@@ -455,6 +455,12 @@ pub fn resolve_cancellable(
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Poll granularity while waiting for the key command to exit.
 const KEY_COMMAND_POLL: Duration = Duration::from_millis(50);
+/// Grace period, measured from the leader's exit, to let the reader threads
+/// drain the pipes before we force EOF. A well-behaved (even backgrounded)
+/// writer closes the pipes within this window; a descendant that keeps a pipe
+/// open past it is torn down so the already-captured key is returned rather
+/// than discarded.
+const KEY_COMMAND_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 fn run_key_command(provider: &str, command: &str, cancel: Option<&Arc<AtomicBool>>) -> Result<String> {
     run_key_command_bounded(provider, command, KEY_COMMAND_TIMEOUT, cancel)
@@ -535,17 +541,20 @@ fn run_key_command_bounded(
     }
     let start = Instant::now();
     let mut leader_status: Option<std::process::ExitStatus> = None;
+    let mut leader_exit_at: Option<Instant> = None;
     let status = loop {
         // Reap the leader once it exits, but keep polling: a backgrounded
-        // descendant (e.g. the `sleep` in `sleep 30 & printf sk`) can outlive
-        // the leader while holding the pipes open, so the run is only done
-        // once the leader has exited AND both readers have hit EOF.
+        // descendant (e.g. the `sleep` in `printf sk; sleep 30 &`) can outlive
+        // the leader while holding the pipes open.
         if leader_status.is_none() {
             let waited = child
                 .try_wait()
                 .with_context(|| format!("provider {provider:?}: waiting on api_key_command {command:?}"));
             match waited {
-                Ok(Some(status)) => leader_status = Some(status),
+                Ok(Some(status)) => {
+                    leader_status = Some(status);
+                    leader_exit_at = Some(Instant::now());
+                }
                 Ok(None) => {}
                 Err(e) => {
                     // Can't tell whether the child is alive; kill the whole
@@ -557,12 +566,37 @@ fn run_key_command_bounded(
             }
         }
         let readers_done = stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst);
-        if let (Some(status), true) = (leader_status, readers_done) {
-            break status;
-        }
         let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
         let timed_out = start.elapsed() >= timeout;
-        if cancelled || timed_out {
+        if let Some(status) = leader_status {
+            // The leader has exited, so everything it wrote to stdout is already
+            // buffered in the pipe — the key, if any, is captured. Return as
+            // soon as the readers drain naturally. If instead a backgrounded
+            // descendant keeps a pipe open (so the readers never hit EOF), don't
+            // block on it or discard the captured key: once a short drain grace
+            // elapses (or the timeout fires), tear the whole group down to force
+            // EOF so the post-loop joins return the captured output promptly. An
+            // explicit cancel still aborts, even with a key in hand.
+            if cancelled {
+                kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+                bail!("provider {provider:?}: api_key_command {command:?} cancelled");
+            }
+            let drain_grace_elapsed = leader_exit_at.is_some_and(|t| t.elapsed() >= KEY_COMMAND_DRAIN_GRACE);
+            if readers_done || drain_grace_elapsed || timed_out {
+                if !readers_done {
+                    // A descendant still holds a pipe open; close it so the
+                    // reader threads hit EOF and the post-loop joins return the
+                    // already-captured output promptly.
+                    // SAFETY: killpg only signals the child's own process group.
+                    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                    let _ = child.wait();
+                }
+                break status;
+            }
+        } else if cancelled || timed_out {
+            // The leader is still running and we've hit the deadline: kill the
+            // whole process group (not just the `sh` leader) and reap so no
+            // descendant can linger, then surface the timeout/cancellation.
             kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
             if cancelled {
                 bail!("provider {provider:?}: api_key_command {command:?} cancelled");
@@ -1116,20 +1150,48 @@ mod key_command_tests {
     }
 
     #[test]
-    fn bounded_key_command_timeout_applies_after_the_leader_exits() {
-        // Regression: `sleep 30 & printf sk` makes `sh` exit IMMEDIATELY (the
-        // `sleep` is backgrounded), so the leader `try_wait` returns Some right
-        // away — but the backgrounded `sleep` still holds the stdout/stderr
-        // pipes open. Joining the reader threads unconditionally at that point
-        // would block for the full 30s, ignoring the timeout. The wait loop
-        // must keep polling after the leader exits and, on timeout, kill the
-        // whole process group so the pipes hit EOF and the call returns
-        // promptly.
+    fn bounded_key_command_returns_captured_key_after_the_leader_exits() {
+        // Regression: `printf sk; sleep 30 &` makes `sh` write the key in the
+        // foreground and then exit IMMEDIATELY (the `sleep` is backgrounded),
+        // so the leader `try_wait` returns Some right away — but the
+        // backgrounded `sleep` still holds the stdout/stderr pipes open.
+        // Joining the reader threads unconditionally at that point would block
+        // for the full 30s; discarding the captured key on timeout (an earlier
+        // regression) would throw away a perfectly good key. The wait loop must
+        // instead tear the whole process group down to force EOF and return the
+        // already-captured key promptly, well inside the timeout.
+        let start = Instant::now();
+        let key =
+            run_key_command_bounded("cmd", "printf sk; sleep 30 &", Duration::from_millis(100), None).unwrap();
+        assert_eq!(key, "sk");
+        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the return: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn bounded_key_command_returns_key_when_descendant_holds_pipe_before_the_key() {
+        // The adversarial-finding shape: the key is printed in the foreground
+        // AFTER a backgrounded descendant that keeps a pipe open past the
+        // timeout. The leader still exits once the foreground `printf` is done,
+        // the key is buffered, and it must come back rather than erroring just
+        // because the descendant is still holding a pipe.
+        let start = Instant::now();
+        let key =
+            run_key_command_bounded("cmd", "sleep 30 & printf sk-good", Duration::from_millis(100), None).unwrap();
+        assert_eq!(key, "sk-good");
+        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the return: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn bounded_key_command_times_out_when_no_key_was_captured() {
+        // A backgrounded descendant that holds the pipe open but where the
+        // leader produced NO key must still fail: there is nothing to return, so
+        // the group is torn down and the empty capture surfaces as a failure
+        // rather than hanging on the descendant.
         let start = Instant::now();
         let err =
-            run_key_command_bounded("cmd", "sleep 30 & printf sk", Duration::from_millis(100), None).unwrap_err();
-        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the join: {:?}", start.elapsed());
-        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+            run_key_command_bounded("cmd", "sleep 30 &", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the return: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("failed"), "{err:#}");
     }
 
     #[test]
