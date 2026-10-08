@@ -208,6 +208,10 @@ struct ControlInner {
     /// A `/model <spec>` typed mid-turn: the agent applies it just before its
     /// next model call (see `Agent::apply_model_request`).
     model: Mutex<Option<String>>,
+    /// Fired whenever `set_model` queues/replaces a request, so an in-flight
+    /// build of a now-stale spec can be cancelled immediately rather than
+    /// waited out (see `Agent::apply_model_request`).
+    model_tx: tokio::sync::watch::Sender<u64>,
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
@@ -230,6 +234,7 @@ impl Default for TurnControl {
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
                 model: Mutex::new(None),
+                model_tx: tokio::sync::watch::channel(0u64).0,
                 plan: Mutex::new(crate::plan::Plan::default()),
             }),
         }
@@ -278,6 +283,9 @@ impl TurnControl {
     /// model call; a later request replaces an earlier unapplied one.
     pub fn set_model(&self, spec: &str) {
         *self.inner.model.lock().unwrap() = Some(spec.to_string());
+        // Notify any in-flight build of a now-stale spec so it cancels and the
+        // loop rebuilds the newest spec immediately (see `apply_model_request`).
+        self.inner.model_tx.send_modify(|generation| *generation += 1);
     }
 
     /// The `/model <spec>` requested mid-turn, if any; the agent takes it once
@@ -319,6 +327,21 @@ impl TurnControl {
     pub async fn cancelled(&self) {
         let mut rx = self.inner.cancel_tx.subscribe();
         let _ = rx.wait_for(|cancelled| *cancelled).await;
+    }
+
+    /// Resolves once a newer `/model` request is queued after the returned
+    /// generation is captured. Used to cancel an in-flight build of a spec that
+    /// a newer request has just superseded. The caller passes the `watch`
+    /// generation snapshot taken *before* it started building, so a request that
+    /// landed during the build is observed immediately.
+    pub async fn model_request_changed(&self, mut rx: tokio::sync::watch::Receiver<u64>) {
+        let _ = rx.changed().await;
+    }
+
+    /// Subscribe to `/model` request notifications; the returned receiver's
+    /// current value is the generation at subscribe time.
+    pub fn model_request_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.model_tx.subscribe()
     }
 
     fn start_turn(&self) {
@@ -711,6 +734,11 @@ impl Agent {
             let build_cancel = Arc::new(AtomicBool::new(false));
             let cancel_for_build = build_cancel.clone();
             let control = self.control.clone();
+            // Subscribe to `/model` request notifications BEFORE spawning the
+            // build, so a newer request that lands while this build runs is
+            // observed by the `select!` below (the receiver's generation is
+            // captured now; `changed()` fires on the next `set_model`).
+            let model_rx = self.control.model_request_rx();
             let handle = tokio::task::spawn_blocking(move || {
                 Self::client_for_cancellable(&config_for_build, &spec_for_build, Some(&cancel_for_build))
             });
@@ -731,6 +759,15 @@ impl Agent {
                     // model call.
                     build_cancel.store(true, Ordering::SeqCst);
                     return true;
+                }
+                _ = control.model_request_changed(model_rx) => {
+                    // A newer `/model` request superseded this spec while it was
+                    // still building. Cancel the stale build (its key-command
+                    // child is killed via the build-local token) and loop at once
+                    // to build the newest spec, instead of waiting out a slow or
+                    // hung build for a spec that is already outdated.
+                    build_cancel.store(true, Ordering::SeqCst);
+                    continue;
                 }
             };
             // A newer `/model` request can arrive while the build above is

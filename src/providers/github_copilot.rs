@@ -11,6 +11,7 @@
 //! it checks. It is only used when explicitly selected.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -338,7 +339,10 @@ pub struct GithubCopilotClient {
     transport: HttpTransport,
     oauth: String,
     endpoints: Endpoints,
-    session: tokio::sync::Mutex<Option<SessionToken>>,
+    /// The cached session token, shared across clones (`clone_boxed`) so a
+    /// freshly built client and its clone reuse one OAuth-to-session exchange
+    /// instead of each performing their own on first use.
+    session: Arc<tokio::sync::Mutex<Option<SessionToken>>>,
 }
 
 impl GithubCopilotClient {
@@ -377,7 +381,7 @@ impl GithubCopilotClient {
     }
 
     pub fn with_endpoints(provider: ResolvedProvider, oauth: String, endpoints: Endpoints) -> Result<Self> {
-        Ok(Self { transport: HttpTransport::new(provider)?, oauth, endpoints, session: tokio::sync::Mutex::new(None) })
+        Ok(Self { transport: HttpTransport::new(provider)?, oauth, endpoints, session: Arc::new(tokio::sync::Mutex::new(None)) })
     }
 
     async fn session_token(&self, force: bool) -> Result<SessionToken> {
@@ -402,14 +406,17 @@ impl GithubCopilotClient {
 #[async_trait]
 impl LLMClient for GithubCopilotClient {
     fn clone_boxed(&self) -> Box<dyn LLMClient> {
-        // Clone manually: the session-token cache (`tokio::sync::Mutex`) is not
-        // `Clone`, and a fresh cache is correct — the clone re-fetches a session
-        // token on first use.
+        // Share the session-token cache (`Arc<tokio::sync::Mutex<_>>`) with the
+        // clone: a newly built client and its clone otherwise start with empty
+        // caches, so the background context-window probe and the immediately
+        // following model call would each perform a separate, often concurrent
+        // OAuth-to-session exchange on every mid-turn switch. Sharing the cache
+        // means the probe's exchange is reused by the chat call.
         Box::new(Self {
             transport: self.transport.clone(),
             oauth: self.oauth.clone(),
             endpoints: self.endpoints.clone(),
-            session: tokio::sync::Mutex::new(None),
+            session: self.session.clone(),
         })
     }
 
