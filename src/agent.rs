@@ -623,7 +623,21 @@ impl Agent {
             &all,
             &default_provider,
         );
-        match Self::client_for(&self.config, &spec) {
+        // `client_for` → `build_client` → `resolve` can run an `api_key_command`
+        // via blocking `std::process::Command::output()`. `apply_model_request`
+        // is awaited from the async `run_turn` loop, so running that inline
+        // freezes the worker for the command's full duration (or indefinitely
+        // if it hangs), stalling streaming and cancel/other input. Offload the
+        // blocking build to the blocking thread pool and await it, so the
+        // runtime stays responsive while the key command runs.
+        let config_for_build = self.config.clone();
+        let spec_for_build = spec.clone();
+        let built = tokio::task::spawn_blocking(move || Self::client_for(&config_for_build, &spec_for_build)).await;
+        let built = match built {
+            Ok(result) => result,
+            Err(join) => Err(anyhow::anyhow!("building client for {spec:?} panicked: {join}")),
+        };
+        match built {
             Ok(client) => {
                 self.client = client;
                 self.config.model = spec.clone();

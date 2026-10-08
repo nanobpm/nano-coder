@@ -276,9 +276,16 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     match (kind, &config.base_url) {
-        // Mock/Copilot derive (or do not need) an endpoint, so any/no base_url
-        // is fine; a real HTTP provider must carry a usable one.
-        (ProviderKind::Mock | ProviderKind::GithubCopilot, _) => {}
+        // Mock derives (or does not need) an endpoint, so any/no base_url is
+        // fine. Copilot derives its endpoint from the session token *unless
+        // overridden*; a present non-empty override is used verbatim by
+        // `GithubCopilotClient::api_base`, so it must be validated like any
+        // other HTTP endpoint — otherwise a malformed override passes
+        // queue-time validation, replaces the working client, and fails only
+        // on the next request. A real HTTP provider must carry a usable one.
+        (ProviderKind::Mock, _) => {}
+        (ProviderKind::GithubCopilot, Some(url)) if !url.trim().is_empty() => validate_http_base_url(name, url)?,
+        (ProviderKind::GithubCopilot, _) => {}
         (_, Some(url)) => validate_http_base_url(name, url)?,
         (_, None) => bail!("provider {name:?} has no base_url"),
     }
@@ -314,6 +321,15 @@ fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("provider {provider:?} base_url {base_url:?} must be http(s), not {:?}", parsed.scheme());
     }
+    // Request endpoints are formed by string-appending a path to `base_url`
+    // (`format!("{base_url}{path}")`), so a query or fragment makes the result
+    // unusable: `https://host/v1?token=x` becomes
+    // `https://host/v1?token=x/chat/completions`, putting the API path in the
+    // query, and a fragment is never sent. Reject both so a base_url that
+    // passes validation is actually usable downstream.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("provider {provider:?} base_url {base_url:?} must not contain a query or fragment");
+    }
     Ok(())
 }
 
@@ -332,10 +348,17 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     let base_url = match (kind, &config.base_url) {
-        // Copilot derives its endpoint from the session token unless overridden.
-        (ProviderKind::Mock | ProviderKind::GithubCopilot, url) => {
-            url.clone().unwrap_or_default().trim_end_matches('/').to_string()
+        // Mock needs no endpoint. Copilot derives its endpoint from the
+        // session token unless overridden; a present non-empty override is used
+        // verbatim by `GithubCopilotClient::api_base`, so validate it like any
+        // other HTTP endpoint (sharing the queue-time bad-endpoint guarantee)
+        // before storing it.
+        (ProviderKind::Mock, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        (ProviderKind::GithubCopilot, Some(url)) if !url.trim().is_empty() => {
+            validate_http_base_url(name, url)?;
+            url.trim_end_matches('/').to_string()
         }
+        (ProviderKind::GithubCopilot, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
         (_, Some(url)) => {
             validate_http_base_url(name, url)?;
             url.trim_end_matches('/').to_string()
@@ -966,6 +989,11 @@ mod tests {
             ("trail_newline", "http://host/v1\n"),
             ("inner_tab", "http://ho\tst/v1"),
             ("control", "http://host/v1\u{0001}"),
+            // A query or fragment makes the string-appended request URL
+            // unusable (the API path lands in the query / the fragment is
+            // dropped), so both must be rejected too — same fail-open class.
+            ("query", "https://host/v1?token=x"),
+            ("fragment", "https://host/v1#frag"),
         ] {
             user.insert(
                 name.to_string(),
@@ -978,7 +1006,18 @@ mod tests {
             );
         }
         let providers = effective_providers(&user);
-        for name in ["empty", "bad", "ftp", "nohost", "lead_space", "trail_newline", "inner_tab", "control"] {
+        for name in [
+            "empty",
+            "bad",
+            "ftp",
+            "nohost",
+            "lead_space",
+            "trail_newline",
+            "inner_tab",
+            "control",
+            "query",
+            "fragment",
+        ] {
             let spec = format!("{name}/x");
             assert!(validate_spec(&spec, &providers, "mock").is_err(), "validate_spec accepted {name}");
             assert!(resolve(&spec, &user, "mock").is_err(), "resolve accepted {name}");
@@ -997,6 +1036,50 @@ mod tests {
         let providers = effective_providers(&ok);
         assert!(validate_spec("good/x", &providers, "mock").is_ok());
         assert!(resolve("good/x", &ok, "mock").is_ok());
+    }
+
+    #[test]
+    fn copilot_endpoint_override_is_validated_when_present() {
+        // A GitHub Copilot provider derives its endpoint from the session token
+        // when `base_url` is absent/empty, but a *present non-empty* override is
+        // used verbatim by `GithubCopilotClient::api_base`. Both `validate_spec`
+        // and `resolve` must reject a malformed override (rather than exempting
+        // every Copilot base_url), or a bad override passes queue-time
+        // validation and only fails on the next request.
+        for (name, url) in [
+            ("malformed", "not a url"),
+            ("non-http", "ftp://host/v1"),
+            ("query", "https://host/v1?token=x"),
+            ("whitespace", " https://host/v1"),
+        ] {
+            let mut user = HashMap::new();
+            user.insert(
+                "github-copilot".to_string(),
+                ProviderConfig { base_url: Some(url.into()), ..Default::default() },
+            );
+            let providers = effective_providers(&user);
+            let spec = "github-copilot/gpt-4.1";
+            assert!(
+                validate_spec(spec, &providers, "github-copilot").is_err(),
+                "validate_spec accepted {name} override"
+            );
+            assert!(resolve(spec, &user, "github-copilot").is_err(), "resolve accepted {name} override");
+        }
+        // A well-formed override passes both, and an absent/empty override still
+        // derives from the session token (no validation, no error).
+        let mut user = HashMap::new();
+        user.insert(
+            "github-copilot".to_string(),
+            ProviderConfig { base_url: Some("https://copilot.example.com/v1".into()), ..Default::default() },
+        );
+        let providers = effective_providers(&user);
+        assert!(validate_spec("github-copilot/gpt-4.1", &providers, "github-copilot").is_ok());
+        let resolved = resolve("github-copilot/gpt-4.1", &user, "github-copilot").unwrap();
+        assert_eq!(resolved.base_url, "https://copilot.example.com/v1");
+        // Absent override -> derived (empty stored base_url), valid.
+        assert!(
+            validate_spec("github-copilot/gpt-4.1", &effective_providers(&HashMap::new()), "github-copilot").is_ok()
+        );
     }
 
     #[test]
