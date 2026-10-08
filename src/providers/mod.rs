@@ -494,58 +494,82 @@ fn run_key_command_bounded(
         .with_context(|| format!("provider {provider:?}: running api_key_command {command:?}"))?;
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
+    // Each reader signals completion via a shared flag so the wait loop can
+    // poll whether the pipes have drained (hit EOF) without blocking on a
+    // `join`: a descendant that outlives the `sh` leader keeps its inherited
+    // pipe open, so an unconditional join after the leader exits would block
+    // until that descendant finishes — ignoring the timeout/cancellation.
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let stderr_done = Arc::new(AtomicBool::new(false));
+    let stdout_done_flag = stdout_done.clone();
     let stdout_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(pipe) = stdout_pipe.as_mut() {
             let _ = pipe.read_to_end(&mut buf);
         }
+        stdout_done_flag.store(true, Ordering::SeqCst);
         buf
     });
+    let stderr_done_flag = stderr_done.clone();
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(pipe) = stderr_pipe.as_mut() {
             let _ = pipe.read_to_end(&mut buf);
         }
+        stderr_done_flag.store(true, Ordering::SeqCst);
         buf
     });
+    // Kill the whole process group (not just the `sh` leader) and reap so
+    // neither the shell nor any descendant can linger, then drain the reader
+    // threads (the pipes hit EOF once the group is gone).
+    fn kill_group_and_reap(
+        child: &mut std::process::Child,
+        stdout_reader: std::thread::JoinHandle<Vec<u8>>,
+        stderr_reader: std::thread::JoinHandle<Vec<u8>>,
+    ) {
+        // SAFETY: killpg only signals the child's own process group.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+    }
     let start = Instant::now();
+    let mut leader_status: Option<std::process::ExitStatus> = None;
     let status = loop {
-        let waited =
-            child.try_wait().with_context(|| format!("provider {provider:?}: waiting on api_key_command {command:?}"));
-        match waited {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
-                let timed_out = start.elapsed() >= timeout;
-                if cancelled || timed_out {
-                    // Kill the whole process group (not just the `sh` leader) and
-                    // reap so neither the shell nor any descendant can linger, then
-                    // drain the reader threads (the pipes hit EOF once the group is
-                    // gone).
-                    // SAFETY: killpg only signals the child's own process group.
-                    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    if cancelled {
-                        bail!("provider {provider:?}: api_key_command {command:?} cancelled");
-                    }
-                    bail!("provider {provider:?}: api_key_command {command:?} timed out after {}s", timeout.as_secs());
+        // Reap the leader once it exits, but keep polling: a backgrounded
+        // descendant (e.g. the `sleep` in `sleep 30 & printf sk`) can outlive
+        // the leader while holding the pipes open, so the run is only done
+        // once the leader has exited AND both readers have hit EOF.
+        if leader_status.is_none() {
+            let waited = child
+                .try_wait()
+                .with_context(|| format!("provider {provider:?}: waiting on api_key_command {command:?}"));
+            match waited {
+                Ok(Some(status)) => leader_status = Some(status),
+                Ok(None) => {}
+                Err(e) => {
+                    // Can't tell whether the child is alive; kill the whole
+                    // process group and reap so neither it nor any descendant
+                    // can linger, then surface the wait error.
+                    kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+                    return Err(e);
                 }
-                std::thread::sleep(KEY_COMMAND_POLL);
-            }
-            Err(e) => {
-                // Can't tell whether the child is alive; kill the whole process
-                // group and reap so neither it nor any descendant can linger,
-                // then surface the wait error.
-                // SAFETY: killpg only signals the child's own process group.
-                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(e);
             }
         }
+        let readers_done = stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst);
+        if let (Some(status), true) = (leader_status, readers_done) {
+            break status;
+        }
+        let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        let timed_out = start.elapsed() >= timeout;
+        if cancelled || timed_out {
+            kill_group_and_reap(&mut child, stdout_reader, stderr_reader);
+            if cancelled {
+                bail!("provider {provider:?}: api_key_command {command:?} cancelled");
+            }
+            bail!("provider {provider:?}: api_key_command {command:?} timed out after {}s", timeout.as_secs());
+        }
+        std::thread::sleep(KEY_COMMAND_POLL);
     };
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
@@ -1089,6 +1113,49 @@ mod key_command_tests {
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the join: {:?}", start.elapsed());
         assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_timeout_applies_after_the_leader_exits() {
+        // Regression: `sleep 30 & printf sk` makes `sh` exit IMMEDIATELY (the
+        // `sleep` is backgrounded), so the leader `try_wait` returns Some right
+        // away — but the backgrounded `sleep` still holds the stdout/stderr
+        // pipes open. Joining the reader threads unconditionally at that point
+        // would block for the full 30s, ignoring the timeout. The wait loop
+        // must keep polling after the leader exits and, on timeout, kill the
+        // whole process group so the pipes hit EOF and the call returns
+        // promptly.
+        let start = Instant::now();
+        let err =
+            run_key_command_bounded("cmd", "sleep 30 & printf sk", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_applies_after_the_leader_exits() {
+        // As above, but via the cancel path with a long timeout: the leader
+        // exits immediately while the backgrounded `sleep` holds the pipes, so
+        // only the cancel flag can end the wait — and it must do so promptly by
+        // killing the whole process group.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30 & printf sk", Duration::from_secs(600), Some(&cancel))
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "backgrounded descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_backgrounded_success_returns_the_key() {
+        // A backgrounded writer that FINISHES promptly must still yield its
+        // key: the leader exits immediately, the pipes hit EOF once the
+        // short-lived background `printf` closes them, and the call returns the
+        // key without waiting for any timeout.
+        let start = Instant::now();
+        let key = run_key_command_bounded("cmd", "printf sk-ok &", Duration::from_secs(5), None).unwrap();
+        assert_eq!(key, "sk-ok");
+        assert!(start.elapsed() < Duration::from_secs(4), "took the slow path: {:?}", start.elapsed());
     }
 
     #[test]
