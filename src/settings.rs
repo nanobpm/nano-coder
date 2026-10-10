@@ -21,6 +21,15 @@ const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 struct Changes {
     model: bool,
     temperature: bool,
+    /// Providers whose `temperature` changed.
+    provider_temperatures: BTreeSet<String>,
+    /// `(provider, model)` pairs whose `temperature` changed.
+    model_temperatures: BTreeSet<(String, String)>,
+    thinking: bool,
+    /// Providers whose `thinking` changed.
+    provider_thinking: BTreeSet<String>,
+    /// `(provider, model)` pairs whose `thinking` changed.
+    model_thinking: BTreeSet<(String, String)>,
     max_tokens: bool,
     max_iterations: bool,
     system_prompt: bool,
@@ -34,6 +43,11 @@ impl Changes {
     fn any(&self) -> bool {
         self.model
             || self.temperature
+            || !self.provider_temperatures.is_empty()
+            || !self.model_temperatures.is_empty()
+            || self.thinking
+            || !self.provider_thinking.is_empty()
+            || !self.model_thinking.is_empty()
             || self.max_tokens
             || self.max_iterations
             || self.system_prompt
@@ -86,15 +100,26 @@ pub async fn run(
     config_path: &Path,
     recents: &recents::SharedRecents,
     recents_path: &Path,
-) -> Result<()> {
+) -> (Vec<String>, Result<()>) {
     let mut changes = Changes::default();
+    // Notices (e.g. a client-rebuild failure) that must survive the dialog's
+    // exit redraw: the caller re-shows them through the renderer after
+    // `frame_resize`, since a plain `println!` here is wiped in frame mode.
+    // They are returned on EVERY exit — including a cancel/error at a later
+    // prompt — so a rebuild failure already recorded is never dropped (the
+    // dialog's own `println!` of it is gone by then, and the session keeps the
+    // old client). The prompts below distinguish Esc/cancel (a plain Done that
+    // returns `notices`) from a genuine terminal I/O failure, which surfaces as
+    // an `Err` carried out alongside the retained `notices`.
+    let mut notices: Vec<String> = Vec::new();
     loop {
         let config = agent.config();
         println!("\nSettings ({}):", config_path.display());
         let items = [
             format!("Model            {} (provider {})", config.model, agent.provider_name()),
             "Add or edit a provider".to_string(),
-            format!("Temperature      {}", config.temperature),
+            format!("Temperature      {}", agent.temperature().describe()),
+            format!("Thinking         {}", agent.thinking().describe()),
             format!("Max tokens       {}", config.max_tokens),
             format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
@@ -113,102 +138,215 @@ pub async fn run(
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
-        let selection = Select::new().with_prompt("Select setting").items(&items).default(0).interact()?;
+        // `interact_opt` distinguishes Esc (Ok(None)) from a genuine terminal
+        // I/O failure (Err), which must surface rather than be read as a normal
+        // exit. The nested selectors already do this; the top-level loop must
+        // too, so a failed read/write is not silently reported as a plain Done.
+        // Any retained notices ride along on the error path.
+        //
+        // Esc is a plain Done: it must follow the SAME completion path as the
+        // explicit `Done` item, which offers to save when `changes.any()`.
+        // Returning early here would leave edits active only in memory without
+        // offering to persist them. `finish!` is that shared path (a macro, not
+        // a closure, so its `return` exits `run` from either call site).
+        macro_rules! finish {
+            () => {{
+                // Esc on the save confirm is a supported "no" (`interact_opt` →
+                // `Ok(None)`); only a genuine I/O failure is `Err` and surfaces.
+                let save = if changes.any() {
+                    match Confirm::new()
+                        .with_prompt(format!("Save changes to {}?", config_path.display()))
+                        .default(true)
+                        .interact_opt()
+                    {
+                        Ok(save) => save.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    }
+                } else {
+                    false
+                };
+                if save {
+                    save_and_report(agent.config(), &mut changes, config_path, &mut notices);
+                }
+                return (notices, Ok(()));
+            }};
+        }
+        let selection = match Select::new().with_prompt("Select setting").items(&items).default(0).interact_opt() {
+            Ok(Some(selection)) => selection,
+            Ok(None) => finish!(),
+            Err(e) => return (notices, Err(e.into())),
+        };
         match selection {
             0 => {
                 let snapshot = recents.lock().unwrap().models().to_vec();
-                if let Some(spec) = pick_model_interactive(agent, &snapshot).await? {
-                    switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                // A genuine terminal I/O failure inside the picker is `Err` and
+                // must surface (not be read as "no model picked"); Esc maps to
+                // `Ok(None)` and is a plain skip.
+                match pick_model_interactive(agent, &snapshot).await {
+                    Ok(Some(spec)) => switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await,
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e)),
                 }
             }
             1 => {
-                if let Some(name) = edit_provider(agent)? {
+                // Surface a genuine I/O failure from the provider editor; Esc is
+                // `Ok(None)` (a skip). The rebuild-failure notice is retained and
+                // returned on every exit, so it is not lost on this error path.
+                let edit = match edit_provider(agent).await {
+                    Ok(Some(edit)) => edit,
+                    Ok(None) => continue,
+                    Err(e) => return (notices, Err(e)),
+                };
+                {
+                    let name = edit.name;
+                    // Keep only the LATEST rebuild outcome for this provider:
+                    // a prior failure notice for the same provider is now
+                    // resolved (the rebuild just succeeded) or superseded (it
+                    // failed again, with a fresher message), so drop it before
+                    // recording the new outcome.
+                    let stale = format!("Provider {name} saved, but could not rebuild the client:");
+                    notices.retain(|n| !n.starts_with(&stale));
+                    if let Some(notice) = edit.rebuild_notice {
+                        notices.push(notice);
+                    }
                     changes.providers.insert(name.clone());
-                    if Confirm::new().with_prompt(format!("Pick a model from {name} now?")).default(true).interact()? {
+                    // Esc is a supported "no" here (`interact_opt` → `Ok(None)`);
+                    // only a genuine I/O failure is `Err` and must surface.
+                    let pick_now = match Confirm::new()
+                        .with_prompt(format!("Pick a model from {name} now?"))
+                        .default(true)
+                        .interact_opt()
+                    {
+                        Ok(pick) => pick.unwrap_or(false),
+                        Err(e) => return (notices, Err(e.into())),
+                    };
+                    if pick_now {
                         let (user, default_provider) = agent.config().effective_providers();
                         let all = providers::effective_providers(&user);
-                        if let Step::Done(spec) =
-                            pick_model_from_provider(&name, &all, &user, &default_provider).await?
-                        {
-                            switch_model(agent, &spec, &mut changes, recents, recents_path).await;
+                        match pick_model_from_provider(&name, &all, &user, &default_provider).await {
+                            Ok(Step::Done(spec)) => {
+                                switch_model(agent, &spec, &mut changes, recents, recents_path, &mut notices).await;
+                            }
+                            Ok(Step::Back) => {}
+                            Err(e) => return (notices, Err(e)),
                         }
                     }
                 }
             }
             2 => {
-                let value: f64 = Input::new()
-                    .with_prompt("Temperature (0.0-2.0)")
-                    .default(agent.config().temperature)
-                    .interact_text()?;
-                agent.config_mut().temperature = value;
-                changes.temperature = true;
+                match edit_temperature(agent, &mut changes) {
+                    Ok(()) => {}
+                    Err(e) => return (notices, Err(e)),
+                }
             }
             3 => {
-                let value: i32 =
-                    Input::new().with_prompt("Max tokens").default(agent.config().max_tokens).interact_text()?;
-                agent.config_mut().max_tokens = value;
-                changes.max_tokens = true;
+                if let Err(e) = edit_thinking(agent, &mut changes) {
+                    return (notices, Err(e));
+                }
             }
             4 => {
-                let value: usize = Input::new()
-                    .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
-                    .default(agent.config().max_iterations)
-                    .interact_text()?;
-                agent.config_mut().max_iterations = value;
-                changes.max_iterations = true;
+                match Input::<i32>::new()
+                    .with_prompt("Max tokens")
+                    .default(agent.config().max_tokens)
+                    .interact_text()
+                {
+                    Ok(value) => {
+                        agent.config_mut().max_tokens = value;
+                        changes.max_tokens = true;
+                        // `max_tokens` caps the Anthropic thinking budget, so
+                        // `thinking()` can drop or restore a fixed-budget level
+                        // here; refresh so the status bar's level matches what
+                        // the next request will actually send.
+                        agent.refresh_stats();
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             5 => {
-                let value: String = Input::new()
-                    .with_prompt("System prompt")
-                    .default(agent.config().system_prompt.clone())
-                    .interact_text()?;
-                agent.set_system_prompt(&value)?;
-                changes.system_prompt = true;
+                match Input::<usize>::new()
+                    .with_prompt("Turn cap in LLM calls per input (0 = unbounded; a positive cap makes normal mode ask before stopping, auto ignores it)")
+                    .default(agent.config().max_iterations)
+                    .interact_text()
+                {
+                    Ok(value) => {
+                        agent.config_mut().max_iterations = value;
+                        changes.max_iterations = true;
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             6 => {
-                edit_context(agent)?;
-                changes.compaction = true;
+                match Input::<String>::new()
+                    .with_prompt("System prompt")
+                    .default(agent.config().system_prompt.clone())
+                    .interact_text()
+                {
+                    Ok(value) => {
+                    // `set_system_prompt` is atomic (it rolls its config change
+                    // back on failure), so on error the prompt is unchanged;
+                    // retain a notice since the dialog's own `println!` is wiped
+                    // by the exit redraw in frame mode. Keep only the LATEST
+                    // outcome: a prior failure notice is resolved by this
+                    // success (or superseded by a fresher failure), so drop it
+                    // first or the exit redraw would re-show a settled failure.
+                    const SYSTEM_PROMPT_NOTICE: &str = "Could not update the system prompt:";
+                    notices.retain(|n| !n.starts_with(SYSTEM_PROMPT_NOTICE));
+                    match agent.set_system_prompt(&value) {
+                        Ok(()) => changes.system_prompt = true,
+                        Err(e) => notices.push(format!("{SYSTEM_PROMPT_NOTICE} {e:#}")),
+                    }
+                    }
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
             7 => {
+                match edit_context(agent) {
+                    Ok(()) => changes.compaction = true,
+                    Err(e) => return (notices, Err(e)),
+                }
+            }
+            8 => {
                 let levels = crate::ui::Verbosity::ALL;
                 let labels: Vec<String> = levels.iter().map(|l| format!("{l:<8} {}", l.describe())).collect();
                 let current = levels.iter().position(|l| *l == agent.config().verbosity).unwrap_or(1);
-                let choice = Select::new().with_prompt("Verbosity").items(&labels).default(current).interact()?;
-                agent.config_mut().verbosity = levels[choice];
-                crate::ui::set_verbosity(levels[choice]);
-                changes.verbosity = true;
+                // Esc keeps the current setting (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Verbosity").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        agent.config_mut().verbosity = levels[choice];
+                        crate::ui::set_verbosity(levels[choice]);
+                        changes.verbosity = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
+                }
             }
-            8 => {
+            9 => {
                 let modes = crate::frame::RendererMode::ALL;
                 let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
                 let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                let choice = Select::new().with_prompt("Renderer").items(&labels).default(current).interact()?;
-                let previous = agent.config().renderer;
-                agent.config_mut().renderer = modes[choice];
-                changes.renderer = true;
-                if modes[choice] != previous {
-                    // The live renderer and the `frame_mode` branch in `main`
-                    // are fixed at startup, so a renderer switch only takes
-                    // effect on the next launch.
-                    println!(
-                        "Renderer set to {}. Restart nano-coder for it to take effect \
-                         (the active renderer is fixed for this session).",
-                        modes[choice]
-                    );
+                // Esc keeps the current renderer (`Ok(None)`); only a genuine I/O
+                // failure is `Err` and must surface.
+                match Select::new().with_prompt("Renderer").items(&labels).default(current).interact_opt() {
+                    Ok(Some(choice)) => {
+                        let previous = agent.config().renderer;
+                        agent.config_mut().renderer = modes[choice];
+                        changes.renderer = true;
+                        if modes[choice] != previous {
+                            // The switch is applied live by `main` (which detects the
+                            // changed `renderer` after the dialog returns and flips the
+                            // frame renderer, the line editor, and the scroll region).
+                            println!("Renderer set to {} — taking effect now.", modes[choice]);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => save_and_report(agent.config(), &mut changes, config_path),
-            _ => {
-                if changes.any()
-                    && Confirm::new()
-                        .with_prompt(format!("Save changes to {}?", config_path.display()))
-                        .default(true)
-                        .interact()?
-                {
-                    save_and_report(agent.config(), &mut changes, config_path);
-                }
-                return Ok(());
-            }
+            10 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
+            // `Done` and Esc share the one completion path (`finish!`), so both
+            // offer to save when `changes.any()` before returning.
+            _ => finish!(),
         }
     }
 }
@@ -219,15 +357,42 @@ async fn switch_model(
     changes: &mut Changes,
     recents: &recents::SharedRecents,
     recents_path: &Path,
+    notices: &mut Vec<String>,
 ) {
     let previous = format!("{}/{}", agent.provider_name(), agent.model_name());
     match agent.set_model(spec).await {
         Ok(()) => {
             changes.model = true;
             record_switch(agent, &previous, recents, recents_path);
+            // A successful switch installs a fresh live client for the
+            // now-current provider, so any earlier "could not rebuild the
+            // client" failure notice for that same provider is stale: the
+            // client it warned about has now been rebuilt. Drop it, or the exit
+            // redraw would incorrectly warn the live client was not rebuilt.
+            let stale = format!("Provider {} saved, but could not rebuild the client:", agent.provider_name());
+            notices.retain(|n| !n.starts_with(&stale));
+            // The switch succeeded, so any earlier "Could not switch model:"
+            // failure from this same visit is now stale — the model it said
+            // could not be set is active. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not switch model:"));
             println!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+            if let Some(warning) = agent.temperature().warning {
+                println!("Warning: {warning}");
+            }
+            if let Some(warning) = agent.thinking().warning {
+                println!("Warning: {warning}");
+            }
         }
-        Err(e) => println!("Could not switch model: {e:#}"),
+        Err(e) => {
+            // Return the failure as a retained notice (not a `println!`): in
+            // frame mode the dialog's exit redraw (`frame_resize`) wipes a
+            // plain `println!`, so a failed model switch would vanish even
+            // though the session keeps the old model. Mirror the client-rebuild
+            // notice so `main` re-shows it through the renderer after the
+            // redraw.
+            notices.push(format!("Could not switch model: {e:#}"));
+        }
     }
 }
 
@@ -253,13 +418,22 @@ fn record_switch(agent: &Agent, previous: &str, recents: &recents::SharedRecents
     recents::save(recents_path, &guard);
 }
 
-fn save_and_report(config: &Config, changes: &mut Changes, path: &Path) {
+fn save_and_report(config: &Config, changes: &mut Changes, path: &Path, notices: &mut Vec<String>) {
     match save(config, changes, path) {
         Ok(()) => {
             *changes = Changes::default();
+            // The save succeeded, so any earlier "Could not save:" failure from
+            // this same visit is now stale — the configuration it said could
+            // not be persisted was written. Drop it, or the exit redraw would
+            // keep warning about a failure that a later retry resolved.
+            notices.retain(|n| !n.starts_with("Could not save:"));
             println!("Saved to {}", path.display());
         }
-        Err(e) => println!("Could not save: {e:#}"),
+        // Return the failure as a retained notice (not a `println!`): in frame
+        // mode the dialog's exit redraw wipes a plain `println!`, so a failed
+        // save would vanish even though the edits were not persisted. Mirror
+        // the client-rebuild notice so `main` re-shows it after the redraw.
+        Err(e) => notices.push(format!("Could not save: {e:#}")),
     }
 }
 
@@ -354,6 +528,102 @@ fn model_choice(choice: Option<usize>, models: &[String]) -> Step {
 fn model_spec(provider: &str, model: &str) -> Step {
     let model = model.trim();
     if model.is_empty() { Step::Back } else { Step::Done(format!("{provider}/{model}")) }
+}
+
+/// Whether the endpoint picker applies to a provider: the `qwen` family and
+/// any provider explicitly configured for a Model Studio host. A provider
+/// named `qwen` always qualifies, so a user who renamed or re-pointed the
+/// preset still gets the picker. Detection is host-aware (not limited to the
+/// eight exact matrix URLs) so a renamed provider on a Model Studio *workspace*
+/// domain — e.g. `<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/...` — is
+/// recognised too.
+fn is_qwen_provider(name: &str, config: &ProviderConfig) -> bool {
+    if name == "qwen" {
+        return true;
+    }
+    config.base_url.as_deref().is_some_and(providers::qwen::is_model_studio_url)
+}
+
+/// Who a picker row is: a known Model Studio endpoint, the row that keeps a
+/// custom URL, or `Keep`, which leaves the provider's current URL untouched.
+#[derive(Debug, PartialEq)]
+enum QwenEndpointChoice {
+    Known(&'static providers::qwen::QwenEndpoint),
+    Custom,
+    Keep,
+}
+
+/// The rows of the Qwen endpoint picker, in `ENDPOINTS` order with the current
+/// endpoint first (so Enter keeps it) followed by the custom/keep rows.
+/// `current` is the provider's configured URL (any value).
+fn qwen_endpoint_rows(current: &str) -> Vec<(String, QwenEndpointChoice)> {
+    let matches: Option<&'static providers::qwen::QwenEndpoint> = providers::qwen::endpoint_for_url(current);
+    let mut rows: Vec<(String, QwenEndpointChoice)> = Vec::new();
+    if let Some(endpoint) = matches {
+        rows.push((format!("{}  (current)", endpoint.label()), QwenEndpointChoice::Known(endpoint)));
+    }
+    for endpoint in providers::qwen::ENDPOINTS {
+        if Some(endpoint) != matches {
+            rows.push((endpoint.label(), QwenEndpointChoice::Known(endpoint)));
+        }
+    }
+    rows.push(("Custom URL (e.g. your workspace domain, a proxy)".to_string(), QwenEndpointChoice::Custom));
+    if matches.is_none() {
+        rows.push((format!("Keep {current}"), QwenEndpointChoice::Keep));
+    } else {
+        rows.push((format!("Keep current URL ({current})"), QwenEndpointChoice::Keep));
+    }
+    rows
+}
+
+/// The outcome of the endpoint picker.
+#[derive(Debug, PartialEq)]
+enum QwenEndpointPick {
+    /// A known Model Studio endpoint: its URL and API-key variable win.
+    Known(&'static providers::qwen::QwenEndpoint),
+    /// The user will type their own URL (the plain URL prompt that follows).
+    Custom,
+    /// Leave the provider's current URL as-is.
+    Keep,
+}
+
+/// What a selection in the endpoint picker means. Esc or a stale index is
+/// [`QwenEndpointPick::Keep`].
+fn qwen_endpoint_pick(choice: Option<usize>, rows: &[(String, QwenEndpointChoice)]) -> QwenEndpointPick {
+    match choice.and_then(|i| rows.get(i)).map(|(_, kind)| kind) {
+        Some(QwenEndpointChoice::Known(endpoint)) => QwenEndpointPick::Known(endpoint),
+        Some(QwenEndpointChoice::Custom) => QwenEndpointPick::Custom,
+        Some(QwenEndpointChoice::Keep) | None => QwenEndpointPick::Keep,
+    }
+}
+
+/// Fold a chosen Model Studio endpoint into a provider edit: set its base URL,
+/// and — when the endpoint's plan differs from the one an existing built-in
+/// plan variable names — switch that variable to the chosen plan's, so a Token
+/// Plan user is not left with the Standard `DASHSCOPE_API_KEY` (or vice versa).
+/// The retarget applies even when a literal key or command is the active
+/// source: a stale built-in plan variable sitting alongside it would otherwise
+/// be resurrected the moment the user switches the key source back to
+/// "Environment variable".
+///
+/// It only ever *rewrites an already-present* variable; it never *introduces*
+/// one where `api_key_env` was absent. Planting a plan variable alongside an
+/// active `api_key_command` would silently shadow that command at runtime,
+/// since [`providers::resolve`] ranks the environment variable above the
+/// command. A custom variable name is the user's own choice and is kept, and
+/// the literal/command fields themselves are never touched. (The endpoint
+/// picker separately seeds the "Environment variable" prompt from the chosen
+/// plan, so a user who switches to that source still lands on the right
+/// variable without one being persisted here.)
+fn apply_qwen_endpoint(config: &mut ProviderConfig, endpoint: &providers::qwen::QwenEndpoint) {
+    config.base_url = Some(endpoint.base_url.to_string());
+    if let Some(var) = &config.api_key_env {
+        // Retarget only a built-in plan variable; a custom name is the user's
+        // own choice. An absent variable is left absent (see above).
+        if providers::qwen::ENDPOINTS.iter().any(|e| e.plan.api_key_env() == var) {
+            config.api_key_env = Some(endpoint.plan.api_key_env().to_string());
+        }
+    }
 }
 
 /// The recently used specs to offer, most recent first: at most
@@ -497,8 +767,20 @@ async fn pick_model_from_provider(
     Ok(model_spec(name, &model))
 }
 
-/// Add a provider or edit an existing one. Returns its name.
-fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
+/// The result of adding/editing a provider: its name, plus a rebuild-failure
+/// notice to re-show through the renderer after the dialog's exit redraw (a
+/// plain `println!` is wiped by `frame_resize` in frame mode, and this warning
+/// — saved settings that no longer match the live client — must not be lost).
+struct ProviderEdit {
+    name: String,
+    rebuild_notice: Option<String>,
+}
+
+/// Add a provider or edit an existing one. Returns its name. When the edited
+/// provider is the one serving the current model, the live client is rebuilt
+/// so the running session immediately uses the new endpoint / key / model —
+/// the conversation is kept.
+async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     let (user, _) = agent.config().effective_providers();
     let all = providers::effective_providers(&user);
     let mut labels: Vec<String> = vec!["New provider".into()];
@@ -530,25 +812,69 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         _ => return Ok(None),
     };
     let current = all.get(&name).cloned().unwrap_or_default();
+    // Whether this provider can be pointed at Alibaba Cloud Model Studio: by
+    // its name (`qwen`) or by an already-configured Model Studio URL. A
+    // brand-new `qwen` entry has no URL of its own yet, so the picker's
+    // "current" row falls back to the preset's default endpoint.
+    let qwen_provider = is_qwen_provider(&name, &current);
+    let preset_url =
+        if name == "qwen" { providers::presets().remove(&name).and_then(|preset| preset.base_url) } else { None };
+    let current_url = current.base_url.clone().or(preset_url).unwrap_or_default();
 
     let kinds = [ProviderKind::Openai, ProviderKind::Anthropic, ProviderKind::GithubCopilot];
     let kind_labels = ["OpenAI-compatible (/chat/completions)", "Anthropic (/messages)", "GitHub Copilot (unofficial)"];
     let kind_default = kinds.iter().position(|k| Some(*k) == current.kind).unwrap_or(0);
     let kind = kinds[Select::new().with_prompt("API kind").items(&kind_labels).default(kind_default).interact()?];
 
+    // Model Studio exposes the same models through several plans and regions
+    // with different hostnames and API-key variables, so for a Qwen provider
+    // offer the whole plan × region matrix as a picker (still allowing a custom
+    // URL) instead of a bare URL prompt.
+    let mut chosen_endpoint: Option<&'static providers::qwen::QwenEndpoint> = None;
+    let mut force_url_prompt = false;
+    if qwen_provider {
+        let rows = qwen_endpoint_rows(&current_url);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| label.as_str()).collect();
+        // Default to "Keep current", the last row, so Enter (or Esc) leaves the
+        // endpoint untouched — matching the plain URL prompt's "keep" behavior.
+        let default = labels.len() - 1;
+        let picked = Select::new()
+            .with_prompt("Qwen / Model Studio endpoint")
+            .items(&labels)
+            .default(default)
+            .max_length(12)
+            .interact_opt()?;
+        match qwen_endpoint_pick(picked, &rows) {
+            QwenEndpointPick::Known(endpoint) => chosen_endpoint = Some(endpoint),
+            QwenEndpointPick::Custom => force_url_prompt = true,
+            QwenEndpointPick::Keep => {}
+        }
+    }
+
     let mut base_url = Input::<String>::new()
         .with_prompt("Base URL (e.g. http://merlin.local:8000/v1)")
         .allow_empty(kind == ProviderKind::GithubCopilot);
-    if let Some(url) = &current.base_url {
-        base_url = base_url.default(url.clone());
-    } else if kind == ProviderKind::GithubCopilot
-        && is_new
-        && !all.contains_key(&name)
-        && providers::github_copilot::domain() == "github.com"
-    {
-        base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
+    // A known endpoint sets the URL outright. A custom pick leaves the prompt
+    // empty so the typed URL wins instead of silently keeping the old one; any
+    // other pick falls back to the current/preset URL as a default.
+    if let Some(endpoint) = chosen_endpoint {
+        base_url = base_url.default(endpoint.base_url.to_string());
+    } else if !force_url_prompt {
+        if let Some(url) = &current.base_url {
+            base_url = base_url.default(url.clone());
+        } else if kind == ProviderKind::GithubCopilot
+            && is_new
+            && !all.contains_key(&name)
+            && providers::github_copilot::domain() == "github.com"
+        {
+            base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
+        }
     }
-    let base_url = base_url.interact_text()?.trim().trim_end_matches('/').to_string();
+    let base_url = if let Some(endpoint) = chosen_endpoint {
+        endpoint.base_url.to_string()
+    } else {
+        base_url.interact_text()?.trim().trim_end_matches('/').to_string()
+    };
 
     let sources = [
         "Environment variable (recommended)",
@@ -565,17 +891,34 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         };
     let mut updated =
         ProviderConfig { kind: Some(kind), base_url: Some(base_url).filter(|u| !u.is_empty()), ..current.clone() };
+    // Picking a known endpoint also retargets the API-key variable to its plan
+    // (overriding the preset's Standard `DASHSCOPE_API_KEY` for Token/Coding
+    // Plan). This happens BEFORE the key-source prompt so the prompt is seeded
+    // from the retargeted variable — and so a later explicit key-source choice
+    // (in particular "No key") stays authoritative instead of being overwritten.
+    if let Some(endpoint) = chosen_endpoint {
+        apply_qwen_endpoint(&mut updated, endpoint);
+    }
     match Select::new()
-        .with_prompt(format!("API key ({})", key_status(&current)))
+        .with_prompt(format!("API key ({})", key_status(&updated)))
         .items(&sources)
         .default(source_default)
         .interact()?
     {
         0 => {
             let mut input = Input::<String>::new().with_prompt("Variable name");
-            let suggested = current
+            // Seed from the (possibly retargeted) variable so accepting the
+            // default keeps the endpoint's plan variable rather than a stale
+            // `<NAME>_API_KEY` guess. When no variable is present yet, fall back
+            // to the chosen endpoint's plan variable (if any) before the
+            // `<NAME>_API_KEY` guess, so switching to this source still lands on
+            // the right plan without one being persisted alongside another key
+            // source (see `apply_qwen_endpoint`).
+            let suggested = updated
                 .api_key_env
                 .clone()
+                .filter(|v| !v.is_empty())
+                .or_else(|| chosen_endpoint.map(|e| e.plan.api_key_env().to_string()))
                 .unwrap_or_else(|| format!("{}_API_KEY", name.to_uppercase().replace('-', "_")));
             input = input.default(suggested);
             updated.api_key_env = Some(input.interact_text()?.trim().to_string());
@@ -623,7 +966,47 @@ fn edit_provider(agent: &mut Agent) -> Result<Option<String>> {
         format!("{kind:?}").to_lowercase(),
         updated.base_url.as_deref().unwrap_or("(from session token)")
     );
-    Ok(Some(name))
+    // Rebuild the live client when the edit touches the provider the session
+    // is actually using. That is broader than `provider_name() == name` (the
+    // provider the CURRENT client was built from): if the model spec is
+    // `work/foo` while `work` does not exist, the spec resolves to the default
+    // provider, so the old client names that default — yet adding `work` makes
+    // the SAME spec resolve to `work`. Rebuild when either side names the
+    // edited provider, or the next request would keep using the old endpoint.
+    // Resolve against the SAME table `Agent::client_for` builds from —
+    // `Config::effective_providers()` merges the legacy top-level credentials
+    // and flips a `mock` default to `openai` — not the raw provider table, or
+    // a bare model resolves to a different provider than the client uses and
+    // the guard rebuilds the wrong one.
+    let resolves_to_edited = {
+        let config = agent.config();
+        let (user, default_provider) = config.effective_providers();
+        // Overlay the built-in presets the way `Agent::client_for` does (via
+        // `providers::build_client` -> `resolve`), so a spec naming an
+        // unmodified preset (e.g. `anthropic/...`) resolves to that preset
+        // here too, not a spurious fallback to the default provider.
+        let providers = providers::effective_providers(&user);
+        providers::parse_model_spec(&config.model, &providers, &default_provider).0 == name
+    };
+    if agent.provider_name() == name || resolves_to_edited {
+        // The edited provider serves the current model: rebuild the client so
+        // the running session uses the new endpoint / key / model at once.
+        match agent.refresh_client().await {
+            Ok(()) => println!("Rebuilt the session's client for {name}."),
+            // A rebuild FAILURE — the one notice the user must not miss, since
+            // the saved settings no longer match the live client — is returned
+            // for `main` to re-show through the renderer after the dialog's
+            // exit redraw. It is NOT printed here: in frame mode a plain
+            // `println!` is wiped by `frame_resize`, and in legacy mode (where
+            // `frame_resize` is a no-op) printing here too would show the same
+            // warning twice — once inline and once via the retained notice.
+            Err(e) => {
+                let notice = format!("Provider {name} saved, but could not rebuild the client: {e:#}");
+                return Ok(Some(ProviderEdit { name, rebuild_notice: Some(notice) }));
+            }
+        }
+    }
+    Ok(Some(ProviderEdit { name, rebuild_notice: None }))
 }
 
 /// The user entry to store for an edited provider: the existing entry with
@@ -647,6 +1030,265 @@ fn diff_from(preset: &ProviderConfig, existing: &ProviderConfig, updated: &Provi
     entry
 }
 
+/// Set the temperature for the current model, its provider, or every model.
+/// A model that accepts no temperature can only use its default, so there is
+/// nothing to edit for it.
+fn edit_temperature(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
+    use crate::temperature::{MAX, Temperature};
+    let current = agent.temperature();
+    // Target the live client's provider/model, not `config.model`: after a
+    // provider's `default_model` is edited and the user declines to switch,
+    // the two diverge, and the menu (via `agent.temperature()`) reports the
+    // live model — so the edit must write to that same model, not the newly
+    // configured default.
+    let provider = agent.provider_name().to_string();
+    let model = agent.model_name().to_string();
+    if let Some(reason) = &current.fixed {
+        println!("{provider}/{model} always uses the model default: {reason}.");
+        return Ok(());
+    }
+    let scopes = [
+        format!("This model ({provider}/{model})"),
+        format!("All {provider} models"),
+        "All models (global)".to_string(),
+    ];
+    let scope = Select::new().with_prompt("Set the temperature for").items(&scopes).default(0).interact()?;
+    let config = agent.config();
+    let entry = config.providers.get(&provider);
+    let existing = match scope {
+        0 => entry.and_then(|p| p.models.get(&model)).and_then(|m| m.temperature),
+        1 => entry.and_then(|p| p.temperature),
+        _ => Some(config.temperature),
+    };
+    let unset_hint = if scope < 2 { ", empty to unset" } else { "" };
+    let text: String = Input::new()
+        .with_prompt(format!("Temperature (0-{MAX}, \"default\" for the model default{unset_hint})"))
+        .with_initial_text(existing.map(|t| t.to_string()).unwrap_or_default())
+        .allow_empty(scope < 2)
+        .validate_with(|s: &String| -> Result<(), String> {
+            if s.trim().is_empty() { Ok(()) } else { s.parse::<Temperature>().map(|_| ()) }
+        })
+        .interact_text()?;
+    let value =
+        if text.trim().is_empty() { None } else { Some(text.parse::<Temperature>().map_err(anyhow::Error::msg)?) };
+    let config = agent.config_mut();
+    match scope {
+        0 => {
+            let entry = config.providers.entry(provider.clone()).or_default();
+            match value {
+                Some(t) => entry.models.entry(model.clone()).or_default().temperature = Some(t),
+                None => {
+                    if let Some(settings) = entry.models.get_mut(&model) {
+                        settings.temperature = None;
+                    }
+                    if entry.models.get(&model).is_some_and(|m| *m == Default::default()) {
+                        entry.models.remove(&model);
+                    }
+                }
+            }
+            changes.model_temperatures.insert((provider, model));
+        }
+        1 => {
+            config.providers.entry(provider.clone()).or_default().temperature = value;
+            changes.provider_temperatures.insert(provider);
+        }
+        _ => {
+            if let Some(t) = value {
+                config.temperature = t;
+                changes.temperature = true;
+            }
+        }
+    }
+    let now = agent.temperature();
+    println!("Temperature for this model: {}", now.describe());
+    if let Some(warning) = now.warning {
+        println!("Note: {warning}");
+    }
+    Ok(())
+}
+
+/// A thinking level as a TOML value: `"default"`, `"off"` or the level name.
+fn thinking_item(t: &crate::thinking::Thinking) -> toml_edit::Item {
+    match t {
+        crate::thinking::Thinking::Default => toml_edit::value("default"),
+        other => toml_edit::value(other.to_string()),
+    }
+}
+
+/// A thinking-level editor choice: the value to set (`None` unsets) and its
+/// display label.
+type ThinkingChoice = (Option<crate::thinking::Thinking>, String);
+
+/// The `(choices, default index)` for the thinking-level editor. `scope` is
+/// 0 (this model), 1 (provider), or 2 (global); `model_levels` are the levels
+/// the current model takes, offered for every scope (a provider or global
+/// level is still sent to this model, so it must be one it takes). When the
+/// model has no known levels only `default`/`unset` are offered, since any
+/// level would be ignored until real choices are known. The default lands on
+/// `existing`, and a custom `existing` value absent from the standard
+/// choices is appended so merely confirming the editor preserves it instead of
+/// silently resetting the setting.
+fn thinking_choices(
+    scope: usize,
+    model_levels: &[String],
+    existing: &Option<crate::thinking::Thinking>,
+) -> Result<(Vec<ThinkingChoice>, usize)> {
+    use crate::thinking::Thinking;
+    // With no known levels, `thinking::resolve` ignores any chosen level and
+    // sends nothing, so offering the standard effort names here would only set
+    // a value that does nothing — and contradicts picking only from the model's
+    // supported levels. Offer just `default`/`unset` until `thinking_levels` or
+    // endpoint data supplies real choices. A custom `existing` is still kept
+    // below.
+    let levels: Vec<String> = model_levels.to_vec();
+    let mut choices: Vec<ThinkingChoice> = Vec::new();
+    if scope < 2 {
+        choices.push((None, "unset (use the broader setting)".into()));
+    }
+    choices.push((Some(Thinking::Default), "default (send no level; the model decides)".into()));
+    for level in &levels {
+        let value: Thinking = level.parse().map_err(anyhow::Error::msg)?;
+        choices.push((Some(value), level.clone()));
+    }
+    if let Some(value) = existing
+        && !choices.iter().any(|(choice, _)| choice.as_ref() == Some(value))
+    {
+        choices.push((Some(value.clone()), value.to_string()));
+    }
+    let default = choices.iter().position(|(value, _)| value == existing).unwrap_or(0);
+    Ok((choices, default))
+}
+
+/// Set the thinking level for the current model, its provider, or every
+/// model, picked from the levels the model supports.
+fn edit_thinking(agent: &mut Agent, changes: &mut Changes) -> Result<()> {
+    // The live client's provider/model, as for the temperature.
+    let provider = agent.provider_name().to_string();
+    let model = agent.model_name().to_string();
+    let current = agent.thinking();
+    let scopes = [
+        format!("This model ({provider}/{model})"),
+        format!("All {provider} models"),
+        "All models (global)".to_string(),
+    ];
+    let Some(scope) =
+        Select::new().with_prompt("Set the thinking level for").items(&scopes).default(0).interact_opt()?
+    else {
+        return Ok(());
+    };
+    // Offer the levels the current model supports for every scope: a provider
+    // or global level is still sent to this model, so it must be one it takes.
+    // (A model with no known levels is offered only `default`/`unset` — any
+    // level would be ignored until real choices are known — and a custom
+    // existing value is appended so confirming the editor keeps it.)
+    let model_levels = current.levels.clone();
+    let config = agent.config();
+    let entry = config.providers.get(&provider);
+    let existing = match scope {
+        0 => entry.and_then(|p| p.models.get(&model)).and_then(|m| m.thinking.clone()),
+        1 => entry.and_then(|p| p.thinking.clone()),
+        _ => Some(config.thinking.clone()),
+    };
+    let (mut choices, default) = thinking_choices(scope, &model_levels, &existing)?;
+    let labels: Vec<&str> = choices.iter().map(|(_, label)| label.as_str()).collect();
+    let Some(pick) = Select::new().with_prompt("Thinking level").items(&labels).default(default).interact_opt()? else {
+        return Ok(());
+    };
+    let value = choices.swap_remove(pick).0;
+    let config = agent.config_mut();
+    match scope {
+        0 => {
+            let entry = config.providers.entry(provider.clone()).or_default();
+            match value {
+                Some(t) => entry.models.entry(model.clone()).or_default().thinking = Some(t),
+                None => {
+                    if let Some(settings) = entry.models.get_mut(&model) {
+                        settings.thinking = None;
+                    }
+                    if entry.models.get(&model).is_some_and(|m| *m == Default::default()) {
+                        entry.models.remove(&model);
+                    }
+                }
+            }
+            changes.model_thinking.insert((provider, model));
+        }
+        1 => {
+            config.providers.entry(provider.clone()).or_default().thinking = value;
+            changes.provider_thinking.insert(provider);
+        }
+        _ => {
+            if let Some(t) = value {
+                config.thinking = t;
+                changes.thinking = true;
+            }
+        }
+    }
+    // The status bar shows the level.
+    agent.refresh_stats();
+    let now = agent.thinking();
+    println!("Thinking for this model: {}", now.describe());
+    if now.source == crate::thinking::Source::Session {
+        println!("Note: /thinking set a level for this session, which wins until /thinking reset.");
+    }
+    if let Some(warning) = now.warning {
+        println!("Note: {warning}");
+    }
+    Ok(())
+}
+
+/// A temperature as a TOML value: a number, or the string `"default"`.
+fn temperature_item(t: crate::temperature::Temperature) -> toml_edit::Item {
+    match t {
+        crate::temperature::Temperature::Default => toml_edit::value("default"),
+        crate::temperature::Temperature::Value(v) => toml_edit::value(v),
+    }
+}
+
+/// Set (or with `None`, remove) `key` in the table at `path`, creating the
+/// tables on the way as implicit ones (so `[providers.x.models."m"]` doesn't
+/// also write empty `[providers]` headers).
+fn set_nested(doc: &mut toml_edit::DocumentMut, path: &[&str], key: &str, value: Option<toml_edit::Item>) {
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    // Inside an inline table (`models = { … }`) new tables must be inline too.
+    let mut inline = false;
+    for segment in path {
+        if table.get(segment).and_then(toml_edit::Item::as_table_like).is_none() {
+            if value.is_none() {
+                return;
+            }
+            let new = if inline {
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(toml_edit::InlineTable::new()))
+            } else {
+                let mut new = toml_edit::Table::new();
+                new.set_implicit(true);
+                toml_edit::Item::Table(new)
+            };
+            table.insert(segment, new);
+        }
+        let item = table.get_mut(segment).expect("inserted above");
+        inline = item.is_inline_table();
+        table = item.as_table_like_mut().expect("checked above");
+    }
+    match value {
+        Some(mut item) => {
+            // `TableLike::insert` replaces the whole item, including its
+            // decoration, so editing an existing temperature would drop an
+            // attached comment (`temperature = 0.3 # tuned for this model`).
+            // Carry the old value's prefix/suffix over to keep it.
+            if let Some(toml_edit::Item::Value(old)) = table.get(key)
+                && let toml_edit::Item::Value(new) = &mut item
+            {
+                new.decor_mut().set_prefix(old.decor().prefix().cloned().unwrap_or_default());
+                new.decor_mut().set_suffix(old.decor().suffix().cloned().unwrap_or_default());
+            }
+            table.insert(key, item);
+        }
+        None => {
+            table.remove(key);
+        }
+    }
+}
+
 /// Write the changed keys into the config file, preserving its comments and
 /// anything else the user put there.
 fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
@@ -660,7 +1302,29 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         doc["model"] = toml_edit::value(config.model.as_str());
     }
     if changes.temperature {
-        doc["temperature"] = toml_edit::value(config.temperature);
+        // Reuse the decoration-preserving helper so editing the global
+        // temperature keeps an attached comment (`temperature = 0.2 # tuned`),
+        // matching the provider/model path.
+        set_nested(&mut doc, &[], "temperature", Some(temperature_item(config.temperature)));
+    }
+    for name in &changes.provider_temperatures {
+        let value = config.providers.get(name).and_then(|p| p.temperature);
+        set_nested(&mut doc, &["providers", name], "temperature", value.map(temperature_item));
+    }
+    for (name, model) in &changes.model_temperatures {
+        let value = config.providers.get(name).and_then(|p| p.models.get(model)).and_then(|m| m.temperature);
+        set_nested(&mut doc, &["providers", name, "models", model], "temperature", value.map(temperature_item));
+    }
+    if changes.thinking {
+        set_nested(&mut doc, &[], "thinking", Some(thinking_item(&config.thinking)));
+    }
+    for name in &changes.provider_thinking {
+        let value = config.providers.get(name).and_then(|p| p.thinking.as_ref());
+        set_nested(&mut doc, &["providers", name], "thinking", value.map(thinking_item));
+    }
+    for (name, model) in &changes.model_thinking {
+        let value = config.providers.get(name).and_then(|p| p.models.get(model)).and_then(|m| m.thinking.as_ref());
+        set_nested(&mut doc, &["providers", name, "models", model], "thinking", value.map(thinking_item));
     }
     if changes.max_tokens {
         doc["max_tokens"] = toml_edit::value(i64::from(config.max_tokens));
@@ -699,7 +1363,36 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
         }
         for name in &changes.providers {
             let Some(provider) = config.providers.get(name) else { continue };
+            // Replacing the whole provider table rebuilds it from scratch and
+            // drops every decoration. If this same provider's temperature (or a
+            // model's) was also edited in this session, the decoration-
+            // preserving `set_nested` edits above (e.g. a `# tuned` comment)
+            // would be discarded. Snapshot those temperature items' decorations
+            // first and reapply them after the replacement so their comments
+            // survive overlapping provider + temperature edits.
+            let mut saved: Vec<(Vec<&str>, &str, toml_edit::Decor)> = Vec::new();
+            let edits = [
+                ("temperature", &changes.provider_temperatures, &changes.model_temperatures),
+                ("thinking", &changes.provider_thinking, &changes.model_thinking),
+            ];
+            for (key, provider_edits, model_edits) in edits {
+                if provider_edits.contains(name)
+                    && let Some(d) = value_decor(&doc, &["providers", name], key)
+                {
+                    saved.push((vec!["providers", name], key, d));
+                }
+                for (p, model) in model_edits {
+                    if p == name
+                        && let Some(d) = value_decor(&doc, &["providers", name, "models", model], key)
+                    {
+                        saved.push((vec!["providers", name, "models", model], key, d));
+                    }
+                }
+            }
             doc["providers"][name.as_str()] = toml_edit::Item::Table(provider_table(provider)?);
+            for (path, key, decor) in saved {
+                set_value_decor(&mut doc, &path, key, decor);
+            }
         }
     }
     has_secret |= config.providers.values().any(|p| p.api_key.is_some());
@@ -716,6 +1409,34 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     }
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+/// The decoration (prefix/suffix, i.e. any attached comment) of the
+/// `temperature` value at `path`, if it is present as a plain value.
+fn value_decor(doc: &toml_edit::DocumentMut, path: &[&str], key: &str) -> Option<toml_edit::Decor> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    for segment in path {
+        table = table.get(segment)?.as_table_like()?;
+    }
+    match table.get(key)? {
+        toml_edit::Item::Value(v) => Some(v.decor().clone()),
+        _ => None,
+    }
+}
+
+/// Reapply a previously captured decoration to the `temperature` value at
+/// `path`, so a comment survives a whole-provider table replacement.
+fn set_value_decor(doc: &mut toml_edit::DocumentMut, path: &[&str], key: &str, decor: toml_edit::Decor) {
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for segment in path {
+        let Some(next) = table.get_mut(segment).and_then(toml_edit::Item::as_table_like_mut) else {
+            return;
+        };
+        table = next;
+    }
+    if let Some(toml_edit::Item::Value(v)) = table.get_mut(key) {
+        *v.decor_mut() = decor;
+    }
 }
 
 fn provider_table(provider: &ProviderConfig) -> Result<toml_edit::Table> {
@@ -754,6 +1475,53 @@ mod tests {
     }
 
     #[test]
+    fn thinking_choices_default_lands_on_the_existing_level() {
+        use crate::thinking::Thinking;
+        let levels = vec!["low".to_string(), "high".to_string()];
+
+        // A standard level is found among the model's choices.
+        let (choices, default) = thinking_choices(0, &levels, &Some(Thinking::Level("high".into()))).unwrap();
+        assert_eq!(choices[default].0, Some(Thinking::Level("high".into())));
+
+        // A custom level absent from the standard choices is appended and
+        // becomes the default, so confirming preserves it instead of resetting.
+        let (choices, default) = thinking_choices(2, &[], &Some(Thinking::Level("deep".into()))).unwrap();
+        assert_eq!(choices[default].0, Some(Thinking::Level("deep".into())));
+        assert!(choices.iter().any(|(v, label)| *v == Some(Thinking::Level("deep".into())) && label == "deep"));
+        assert_ne!(default, 0, "the default must not fall back to the first choice");
+
+        // No existing value: default is the first choice.
+        let (_, default) = thinking_choices(0, &levels, &None).unwrap();
+        assert_eq!(default, 0);
+    }
+
+    #[test]
+    fn thinking_choices_offer_the_models_levels_for_every_scope() {
+        // A model with its own level set (e.g. an on/off llama.cpp model).
+        let levels = vec!["off".to_string(), "on".to_string()];
+
+        // Provider and global scopes offer those levels too, not the standard
+        // effort names the model doesn't take.
+        for scope in [1, 2] {
+            let (choices, _) = thinking_choices(scope, &levels, &None).unwrap();
+            let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
+            assert!(labels.contains(&"on"), "scope {scope} must offer the model's levels: {labels:?}");
+            assert!(!labels.contains(&"high"), "scope {scope} must not offer unsupported effort names: {labels:?}");
+        }
+
+        // A model with no known levels offers only default/unset: any level
+        // would be ignored until real choices (thinking_levels or endpoint
+        // data) are known, so the standard effort names are not offered.
+        let (choices, _) = thinking_choices(1, &[], &None).unwrap();
+        let labels: Vec<&str> = choices.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(!labels.contains(&"high"), "empty model levels must not offer standard effort names: {labels:?}");
+        assert!(
+            labels.iter().all(|l| l.starts_with("unset") || l.starts_with("default")),
+            "only default/unset: {labels:?}"
+        );
+    }
+
+    #[test]
     fn provider_rows_list_recents_first_and_highlight_the_previous_model() {
         let all = providers(&["anthropic", "openai"]);
         let recent = specs(&["openai/gpt-5", "anthropic/claude"]);
@@ -788,6 +1556,51 @@ mod tests {
     }
 
     #[test]
+    fn edited_provider_resolution_detects_a_spec_that_newly_resolves_to_it() {
+        // Advisory: the rebuild guard `provider_name() == name` checks the
+        // provider the CURRENT client was built from. With `config.model =
+        // "work/foo"` while `work` is absent, that spec resolves to the
+        // DEFAULT provider — so the old guard skips the rebuild even though
+        // adding `work` makes the SAME spec resolve to `work`. The fix keys the
+        // rebuild off the post-edit resolution too; this pins that resolution.
+        let spec = "work/foo";
+        // Before `work` exists: the spec falls back to the default provider.
+        let before = providers(&["anthropic", "openai"]);
+        assert_eq!(providers::parse_model_spec(spec, &before, "anthropic").0, "anthropic");
+        // After `work` is added: the same spec now resolves to `work`.
+        let after = providers(&["anthropic", "openai", "work"]);
+        assert_eq!(providers::parse_model_spec(spec, &after, "anthropic").0, "work");
+        // So a rebuild is required when the edited provider is `work`, even
+        // though the running client's `provider_name()` is still "anthropic".
+        let edited = "work";
+        let old_guard_would_skip = "anthropic" == edited; // provider_name() == name
+        let resolves_to_edited = providers::parse_model_spec(spec, &after, "anthropic").0 == edited;
+        assert!(!old_guard_would_skip, "the old guard misses the resolution change");
+        assert!(resolves_to_edited, "the resolution check catches it");
+    }
+
+    #[test]
+    fn edited_provider_resolution_uses_the_effective_provider_table() {
+        // Advisory: the rebuild guard must resolve the model against the SAME
+        // table `Agent::client_for` builds from — `Config::effective_providers()`
+        // — not the raw `[providers]` table. With legacy top-level credentials
+        // and `default_provider = "mock"`, the effective default flips to
+        // `openai`, so a bare model actually uses `openai`: editing `mock` must
+        // NOT trigger a rebuild (the raw table would wrongly say it does).
+        let config = crate::config::Config {
+            api_key: Some("sk-test".to_string()), // legacy top-level credential
+            ..crate::config::Config::default()    // default_provider = "mock"
+        };
+        let (providers, default) = config.effective_providers();
+        assert_eq!(default, "openai", "legacy credentials flip a mock default to openai");
+        let providers: std::collections::BTreeMap<_, _> = providers.into_iter().collect();
+        // A bare model resolves to the EFFECTIVE default (openai), not mock.
+        assert_eq!(providers::parse_model_spec(&config.model, &providers, &default).0, "openai");
+        // So editing `mock` does not resolve to the edited provider — no rebuild.
+        assert_ne!(providers::parse_model_spec(&config.model, &providers, &default).0, "mock");
+    }
+
+    #[test]
     fn model_choice_maps_rows_to_steps() {
         let models = vec!["alpha".to_string(), "beta".to_string()];
         assert_eq!(model_choice(None, &models), Step::Back, "Esc steps back");
@@ -806,6 +1619,125 @@ mod tests {
     }
 
     #[test]
+    fn save_writes_provider_and_model_temperatures_in_place() {
+        use crate::temperature::Temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.1 # tuned for this provider\n\n[providers.kimi]\nmodels = { \"k3\" = { temperature = 0.5 } }\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config.temperature = Temperature::Default;
+        config.providers.get_mut("groq").unwrap().temperature = Some(Temperature::Value(0.4));
+        let anthropic = config.providers.entry("anthropic".into()).or_default();
+        anthropic.models.entry("claude".into()).or_default().temperature = Some(Temperature::Value(0.3));
+        // Unsetting inside an inline table removes just that key.
+        config.providers.get_mut("kimi").unwrap().models.get_mut("k3").unwrap().temperature = None;
+        let changes = Changes {
+            temperature: true,
+            provider_temperatures: ["groq".to_string()].into(),
+            model_temperatures: [("anthropic".to_string(), "claude".to_string()), ("kimi".into(), "k3".into())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("temperature = \"default\" # global tune"), "global comment kept: {text}");
+        // Replacing an existing value keeps its attached comment.
+        assert!(
+            text.contains("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider"),
+            "{text}"
+        );
+        assert!(text.contains("[providers.anthropic.models.claude]\ntemperature = 0.3"), "{text}");
+        assert!(!text.contains("[providers]\n") && !text.contains("[providers.anthropic]\n"), "implicit: {text}");
+        assert!(!text.contains("0.5"), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.temperature, Temperature::Default);
+        assert_eq!(reloaded.providers["groq"].temperature, Some(Temperature::Value(0.4)));
+        assert_eq!(reloaded.providers["anthropic"].models["claude"].temperature, Some(Temperature::Value(0.3)));
+        assert_eq!(reloaded.providers["kimi"].models["k3"].temperature, None);
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(2));
+    }
+
+    #[test]
+    fn save_writes_thinking_levels_in_place() {
+        use crate::thinking::Thinking;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "thinking = \"low\" # global\n\n[providers.groq]\nmax_retries = 2\nthinking = \"high\" # tuned\n\n[providers.groq.models.\"k3\"]\nthinking = \"max\"\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config.thinking = Thinking::Default;
+        // A provider edit in the same session must keep the thinking comment.
+        let groq = config.providers.get_mut("groq").unwrap();
+        groq.max_retries = Some(5);
+        groq.thinking = Some(Thinking::Off);
+        groq.models.get_mut("k3").unwrap().thinking = None;
+        config.providers.entry("anthropic".into()).or_default().models.entry("claude".into()).or_default().thinking =
+            Some(Thinking::Level("xhigh".into()));
+        let changes = Changes {
+            thinking: true,
+            providers: ["groq".to_string()].into(),
+            provider_thinking: ["groq".to_string()].into(),
+            model_thinking: [("groq".to_string(), "k3".to_string()), ("anthropic".into(), "claude".into())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("thinking = \"default\" # global"), "{text}");
+        assert!(text.contains("thinking = \"off\" # tuned"), "{text}");
+        assert!(text.contains("[providers.anthropic.models.claude]\nthinking = \"xhigh\""), "{text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.thinking, Thinking::Default);
+        assert_eq!(reloaded.providers["groq"].thinking, Some(Thinking::Off));
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(5));
+        assert!(reloaded.providers["groq"].models.get("k3").is_none_or(|m| m.thinking.is_none()), "{text}");
+        assert_eq!(reloaded.providers["anthropic"].models["claude"].thinking, Some(Thinking::Level("xhigh".into())));
+    }
+
+    #[test]
+    fn save_keeps_temperature_comments_when_the_provider_is_also_edited() {
+        use crate::temperature::Temperature;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[providers.groq]\nmax_retries = 2\ntemperature = 0.1 # tuned\n\n[providers.groq.models.\"k3\"]\ntemperature = 0.5 # per-model\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Edit the provider wholesale (a non-temperature field) *and* both its
+        // provider- and model-level temperatures in the same session.
+        config.providers.get_mut("groq").unwrap().max_retries = Some(5);
+        config.providers.get_mut("groq").unwrap().temperature = Some(Temperature::Value(0.4));
+        config.providers.get_mut("groq").unwrap().models.get_mut("k3").unwrap().temperature =
+            Some(Temperature::Value(0.6));
+        let changes = Changes {
+            providers: ["groq".to_string()].into(),
+            provider_temperatures: ["groq".to_string()].into(),
+            model_temperatures: [("groq".to_string(), "k3".to_string())].into(),
+            ..Default::default()
+        };
+        save(&config, &changes, &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The whole-provider replacement must not discard the temperature
+        // comments the in-place edits preserved.
+        assert!(text.contains("temperature = 0.4 # tuned"), "provider temp comment kept: {text}");
+        assert!(text.contains("temperature = 0.6 # per-model"), "model temp comment kept: {text}");
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.providers["groq"].max_retries, Some(5));
+        assert_eq!(reloaded.providers["groq"].temperature, Some(Temperature::Value(0.4)));
+        assert_eq!(reloaded.providers["groq"].models["k3"].temperature, Some(Temperature::Value(0.6)));
+    }
+
+    #[test]
     fn save_updates_only_changed_keys_and_keeps_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -816,7 +1748,7 @@ mod tests {
         .unwrap();
         let mut config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         config.model = "work/llama3".into();
-        config.temperature = 0.9;
+        config.temperature = crate::temperature::Temperature::Value(0.9);
         config.providers.insert(
             "work".into(),
             ProviderConfig {
@@ -879,5 +1811,256 @@ mod tests {
         let resolved = providers::resolve("openai/gpt", &[("openai".to_string(), entry)].into(), "openai").unwrap();
         assert_eq!(merged.api_key_env.as_deref(), Some(""));
         assert_eq!(resolved.api_key.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn qwen_endpoint_rows_offer_every_plan_region_plus_custom_and_keep() {
+        // A provider already on a known endpoint: that endpoint is the first row
+        // (so Enter keeps it) and is offered exactly once.
+        let rows = qwen_endpoint_rows(providers::qwen::default_endpoint().base_url);
+        assert_eq!(rows[0].1, QwenEndpointChoice::Known(providers::qwen::default_endpoint()));
+        assert!(rows[0].0.ends_with("(current)"), "current endpoint first: {:?}", rows[0].0);
+        assert_eq!(
+            rows.iter().filter(|(_, k)| matches!(k, QwenEndpointChoice::Known(_))).count(),
+            providers::qwen::ENDPOINTS.len(),
+            "every endpoint offered exactly once"
+        );
+        assert_eq!(rows.last().unwrap().1, QwenEndpointChoice::Keep);
+        assert!(rows.iter().any(|(_, k)| *k == QwenEndpointChoice::Custom));
+        // Every plan is offered, by label.
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+        for plan in [
+            providers::qwen::QwenPlan::Standard,
+            providers::qwen::QwenPlan::TokenPlan,
+            providers::qwen::QwenPlan::CodingPlan,
+        ] {
+            assert!(labels.iter().any(|l| l.contains(plan.label())), "{plan:?} missing from {labels:?}");
+        }
+        // A custom URL has no "(current)" known row; Keep names the URL instead.
+        let rows = qwen_endpoint_rows("https://my-gateway.example.com/v1");
+        assert_eq!(
+            rows.iter().filter(|(_, k)| matches!(k, QwenEndpointChoice::Known(_))).count(),
+            providers::qwen::ENDPOINTS.len()
+        );
+        assert!(rows.last().unwrap().0.contains("https://my-gateway.example.com/v1"));
+    }
+
+    #[test]
+    fn qwen_endpoint_pick_maps_rows_to_actions() {
+        let rows = qwen_endpoint_rows(providers::qwen::default_endpoint().base_url);
+        assert_eq!(qwen_endpoint_pick(None, &rows), QwenEndpointPick::Keep, "Esc keeps the endpoint");
+        assert_eq!(qwen_endpoint_pick(Some(0), &rows), QwenEndpointPick::Known(providers::qwen::default_endpoint()));
+        let custom = rows.iter().position(|(_, k)| *k == QwenEndpointChoice::Custom).unwrap();
+        assert_eq!(qwen_endpoint_pick(Some(custom), &rows), QwenEndpointPick::Custom);
+        assert_eq!(qwen_endpoint_pick(Some(rows.len() - 1), &rows), QwenEndpointPick::Keep);
+        assert_eq!(qwen_endpoint_pick(Some(999), &rows), QwenEndpointPick::Keep, "a stale index never panics");
+    }
+
+    #[test]
+    fn applying_an_endpoint_retargets_the_api_key_variable_to_its_plan() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A Standard variable is retargeted when the plan changes...
+        let mut config = ProviderConfig { api_key_env: Some("DASHSCOPE_API_KEY".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.base_url.as_deref(), Some(token_plan.base_url));
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // ...and a second switch moves it again, with no drift.
+        let coding_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::CodingPlan).unwrap();
+        apply_qwen_endpoint(&mut config, coding_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_CODING_PLAN_API_KEY"));
+        // A literal key, or a key command, is itself left alone — and no plan
+        // variable is *introduced* alongside it. Planting an `api_key_env`
+        // where none existed would persist a second key source that shadows an
+        // active command at runtime (`resolve()` ranks env above command).
+        let mut literal = ProviderConfig { api_key: Some("sk-sp-x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut literal, coding_plan);
+        assert_eq!(literal.api_key.as_deref(), Some("sk-sp-x"));
+        assert_eq!(literal.api_key_env, None);
+        let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut command, token_plan);
+        assert_eq!(command.api_key_command.as_deref(), Some("op read op://x"));
+        assert_eq!(command.api_key_env, None);
+        // A user's own variable name is respected, not clobbered — even when a
+        // literal key or command is the active source.
+        let mut custom = ProviderConfig { api_key_env: Some("MY_QWEN_KEY".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut custom, token_plan);
+        assert_eq!(custom.api_key_env.as_deref(), Some("MY_QWEN_KEY"));
+        assert_eq!(custom.base_url.as_deref(), Some(token_plan.base_url));
+        let mut custom_with_literal = ProviderConfig {
+            api_key: Some("sk-sp-y".into()),
+            api_key_env: Some("MY_QWEN_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut custom_with_literal, coding_plan);
+        assert_eq!(custom_with_literal.api_key_env.as_deref(), Some("MY_QWEN_KEY"));
+        assert_eq!(custom_with_literal.api_key.as_deref(), Some("sk-sp-y"));
+    }
+
+    #[test]
+    fn applying_an_endpoint_retargets_a_stale_plan_variable_behind_another_key_source() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The cited scenario: a literal-key override coexists with the preset's
+        // Standard `DASHSCOPE_API_KEY`. Picking Token Plan must retarget that
+        // stale built-in variable even though the literal key is the active
+        // source — otherwise switching the key source to "Environment
+        // variable" afterwards would seed the wrong plan's variable.
+        let mut config = ProviderConfig {
+            api_key: Some("sk-literal".into()),
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // The literal key itself is untouched: it stays the active source.
+        assert_eq!(config.api_key.as_deref(), Some("sk-literal"));
+        // Same for a command coexisting with another plan's variable.
+        let mut config = ProviderConfig {
+            api_key_command: Some("op read op://x".into()),
+            api_key_env: Some("BAILIAN_CODING_PLAN_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut config, token_plan);
+        assert_eq!(config.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        assert_eq!(config.api_key_command.as_deref(), Some("op read op://x"));
+    }
+
+    #[test]
+    fn applying_an_endpoint_never_introduces_a_variable_that_would_shadow_a_command() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A command-only provider (no `api_key_env` at all) must not gain a plan
+        // variable: `resolve()` ranks `api_key_env` above `api_key_command`, so
+        // a persisted-but-unused plan variable whose env happens to be set in
+        // the shell would silently shadow the command the user actually chose.
+        let mut command = ProviderConfig { api_key_command: Some("op read op://x".into()), ..Default::default() };
+        apply_qwen_endpoint(&mut command, token_plan);
+        assert_eq!(command.api_key_command.as_deref(), Some("op read op://x"));
+        assert_eq!(command.api_key_env, None, "no env variable may be planted alongside the command");
+        assert_eq!(command.base_url.as_deref(), Some(token_plan.base_url));
+        // An explicitly-cleared variable (empty-string sentinel) is preserved as
+        // cleared — it, too, must not be resurrected into a shadowing variable.
+        let mut cleared = ProviderConfig {
+            api_key_command: Some("op read op://x".into()),
+            api_key_env: Some(String::new()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut cleared, token_plan);
+        assert_eq!(cleared.api_key_env.as_deref(), Some(""), "a cleared variable stays cleared");
+    }
+
+    #[test]
+    fn the_picker_is_offered_for_qwen_providers_only() {
+        assert!(is_qwen_provider("qwen", &ProviderConfig::default()), "the named preset always qualifies");
+        let on_model_studio = ProviderConfig {
+            base_url: Some(providers::qwen::default_endpoint().base_url.into()),
+            ..Default::default()
+        };
+        assert!(is_qwen_provider("my-dashscope", &on_model_studio), "a configured Model Studio URL qualifies");
+        // A renamed provider on a Model Studio *workspace* host (not one of the
+        // eight exact matrix URLs) is recognised too.
+        let on_workspace = ProviderConfig {
+            base_url: Some("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1".into()),
+            ..Default::default()
+        };
+        assert!(is_qwen_provider("my-workspace", &on_workspace), "a Model Studio workspace host qualifies");
+        let elsewhere = ProviderConfig { base_url: Some("https://api.openai.com/v1".into()), ..Default::default() };
+        assert!(!is_qwen_provider("work", &elsewhere));
+        assert!(!is_qwen_provider("work", &ProviderConfig::default()), "a new unrelated provider is not qwen");
+    }
+
+    #[test]
+    fn editing_qwen_to_the_token_plan_stores_the_endpoint_and_key_variable() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let preset = providers::presets().remove("qwen").unwrap();
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The picker folds the endpoint into the edit, then `diff_from` records
+        // only what differs from the preset — both fields, in this case.
+        let mut updated = ProviderConfig {
+            base_url: preset.base_url.clone(),
+            api_key_env: preset.api_key_env.clone(),
+            ..preset.clone()
+        };
+        apply_qwen_endpoint(&mut updated, token_plan);
+        let entry = diff_from(&preset, &ProviderConfig::default(), &updated);
+        let user: std::collections::HashMap<String, ProviderConfig> =
+            [("qwen".to_string(), entry)].into_iter().collect();
+        let resolved = providers::resolve("qwen/qwen3.8-max", &user, "mock").unwrap();
+        assert_eq!(resolved.base_url, token_plan.base_url);
+        // The Token Plan variable is stored, NOT the preset's `DASHSCOPE_API_KEY`.
+        assert_eq!(
+            user.get("qwen").unwrap().api_key_env.as_deref(),
+            Some("BAILIAN_TOKEN_PLAN_API_KEY"),
+            "the stored override names the token-plan variable"
+        );
+    }
+
+    #[test]
+    fn applying_an_endpoint_before_the_key_prompt_keeps_no_key_authoritative() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // The edit flow retargets the endpoint's plan variable BEFORE the
+        // key-source prompt. A subsequent "No key" selection clears all three
+        // key fields and must NOT have the plan variable restored afterwards.
+        let mut updated = ProviderConfig {
+            base_url: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()),
+            api_key_env: Some("DASHSCOPE_API_KEY".into()),
+            ..Default::default()
+        };
+        apply_qwen_endpoint(&mut updated, token_plan);
+        assert_eq!(updated.api_key_env.as_deref(), Some("BAILIAN_TOKEN_PLAN_API_KEY"));
+        // ... then the user picks "No key" (the dialog clears all key fields):
+        updated.api_key = None;
+        updated.api_key_env = None;
+        updated.api_key_command = None;
+        // Nothing re-applies the endpoint after this, so "No key" wins.
+        assert_eq!(updated.api_key_env, None, "No key must stay authoritative");
+        assert_eq!(updated.api_key, None);
+        assert_eq!(updated.api_key_command, None);
+        // The endpoint's URL is still applied (only the key was cleared).
+        assert_eq!(updated.base_url.as_deref(), Some(token_plan.base_url));
+    }
+
+    #[test]
+    fn applying_an_endpoint_seeds_the_key_prompt_with_the_plan_variable() {
+        use providers::qwen::{ENDPOINTS, QwenPlan};
+        let token_plan = ENDPOINTS.iter().find(|e| e.plan == QwenPlan::TokenPlan).unwrap();
+        // A custom-named provider with no key yet: `apply_qwen_endpoint` plants
+        // nothing (it never introduces a variable), but the env-var prompt
+        // default still falls back to the chosen endpoint's plan variable (not a
+        // `<NAME>_API_KEY` guess), so accepting the default lands on the right
+        // variable — without one being persisted alongside another key source.
+        let mut updated = ProviderConfig {
+            base_url: Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1".into()),
+            ..Default::default()
+        };
+        let chosen_endpoint = Some(token_plan);
+        apply_qwen_endpoint(&mut updated, token_plan);
+        assert_eq!(updated.api_key_env, None, "nothing is planted into the config");
+        // This mirrors the prompt's seed computation in `configure_provider`.
+        let suggested = updated
+            .api_key_env
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| chosen_endpoint.map(|e| e.plan.api_key_env().to_string()))
+            .unwrap_or_else(|| "MYPROVIDER_API_KEY".to_string());
+        assert_eq!(suggested, "BAILIAN_TOKEN_PLAN_API_KEY", "the prompt is seeded from the chosen plan variable");
+    }
+
+    #[test]
+    fn a_successful_save_clears_an_earlier_save_failure_notice() {
+        // A failed save queues a "Could not save:" notice; a retry that succeeds
+        // in the same visit must drop it, or the exit redraw warns about a
+        // failure the retry already resolved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config::default();
+        let mut notices = vec!["Could not save: earlier disk error".to_string()];
+        let mut changes = Changes { model: true, ..Changes::default() };
+        save_and_report(&config, &mut changes, &path, &mut notices);
+        assert!(notices.iter().all(|n| !n.starts_with("Could not save:")), "stale save notice survived: {notices:?}");
+        assert!(path.exists(), "successful save did not write the config");
+        assert!(!changes.any(), "successful save must reset the change flags");
     }
 }

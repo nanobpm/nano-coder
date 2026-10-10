@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 
 mod acp;
 mod agent;
+mod attachment;
 mod bash;
+mod claude_hooks;
 mod commands;
 mod config;
 mod context;
@@ -24,6 +26,7 @@ mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod memory;
 mod mode;
 mod output;
 mod permissions;
@@ -33,16 +36,21 @@ mod question;
 mod queue;
 mod recents;
 mod reminders;
+mod resume;
 mod sandbox;
 mod session;
+mod session_index;
 mod settings;
 mod shell;
 mod skills;
 mod status;
+mod temperature;
+mod thinking;
 mod tools;
 mod trajectory;
 mod turn_commands;
 mod ui;
+mod vision;
 
 use agent::Agent;
 use config::ConfigManager;
@@ -232,8 +240,58 @@ fn apply_next_step_setting(
     }
 }
 
-/// Esc twice within this window cancels the running turn.
-const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+/// "Model set to …", plus a warning when the new model ignores a temperature
+/// configured for it.
+fn model_set_text(agent: &Agent) -> String {
+    let mut text = format!("Model set to {} (provider {})", agent.model_name(), agent.provider_name());
+    if let Some(warning) = agent.temperature().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    if let Some(warning) = agent.thinking().warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    text
+}
+
+/// `/thinking`: the level in effect, the levels the model takes, and how to
+/// change it.
+fn thinking_status_text(agent: &Agent) -> String {
+    let resolved = agent.thinking();
+    let mut out = vec![format!("Thinking: {}", resolved.describe())];
+    if resolved.levels.is_empty() {
+        out.push(format!(
+            "No thinking levels are known for {}; list them with thinking_levels in its provider or model settings.",
+            agent.model_name()
+        ));
+    } else {
+        out.push(format!("Levels for {}: {}", agent.model_name(), resolved.choices()));
+    }
+    if let Some(warning) = &resolved.warning {
+        out.push(format!("Warning: {warning}"));
+    }
+    out.push("(/thinking LEVEL sets it for this session; /thinking reset uses the config again)".to_string());
+    out.join("\n")
+}
+
+/// A `/thinking` argument: `reset` clears the session level (`None`).
+fn thinking_arg(arg: &str) -> std::result::Result<Option<thinking::Thinking>, String> {
+    if arg.trim().eq_ignore_ascii_case("reset") { Ok(None) } else { arg.trim().parse().map(Some) }
+}
+
+/// `/thinking ARG`: set or clear the session level; the reply says what
+/// the model will actually be sent.
+fn set_thinking_text(agent: &mut Agent, arg: &str) -> String {
+    match thinking_arg(arg) {
+        Ok(level) => agent.set_thinking(level),
+        Err(e) => return e,
+    }
+    let resolved = agent.thinking();
+    let mut text = format!("Thinking set to {}", resolved.describe());
+    if let Some(warning) = resolved.warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    text
+}
 
 /// Ctrl-C twice within this window exits the interactive CLI. Time-based (not
 /// "next line" based) so an interleaved keystroke or a queued/empty line
@@ -281,23 +339,25 @@ impl DoublePress {
     }
 }
 
-/// Detects a double Esc press.
-#[derive(Default)]
-struct DoubleEscape {
-    last: Option<std::time::Instant>,
-}
+/// Detects a double Esc press (the window lives in `lineedit` alongside the
+/// type). Shared with the idle prompt's clear gesture so the two cannot drift;
+/// `DoublePress` (Ctrl-C) has an extra deadline/disarm lifecycle, which the Esc
+/// gesture does not need.
+type DoubleEscape = lineedit::DoubleEscape;
 
-impl DoubleEscape {
-    /// Record a press at `now`; true when it completes a double press.
-    fn press(&mut self, now: std::time::Instant) -> bool {
-        match self.last.take() {
-            Some(last) if now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => true,
-            _ => {
-                self.last = Some(now);
-                false
-            }
-        }
-    }
+/// The terminal-owning state shared between the SIGWINCH resize task and a live
+/// renderer switch (`Terminal::renderer_switched`). Both must serialise against
+/// each other: a resize that passes its `is_frame()` check and then debounces
+/// must not draw while a transition is mid flip/clear/replay (on frame → legacy
+/// that would reprint the prompt before `replay_transcript`, placing history
+/// after it). `lock` is that serialisation point; the remaining fields are the
+/// state the two draw paths touch, grouped so `Terminal::start` stays lean.
+#[derive(Clone)]
+struct TransitionShared {
+    view: lineedit::SharedView,
+    status: Option<std::sync::Arc<status::StatusLine>>,
+    renderer: std::sync::Arc<ui::Renderer>,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 struct Terminal {
@@ -322,6 +382,12 @@ struct Terminal {
     recents: recents::SharedRecents,
     recents_path: std::path::PathBuf,
     renderer: std::sync::Arc<ui::Renderer>,
+    /// The renderer mode active when the session started; a live `renderer`
+    /// switch in `/settings` is detected against it.
+    renderer_before: crate::frame::RendererMode,
+    /// The status line, kept so a live renderer switch can re-anchor the
+    /// scroll region (legacy) or let the frame clear it (frame).
+    status: Option<std::sync::Arc<status::StatusLine>>,
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -360,11 +426,12 @@ impl InputGate {
 impl Terminal {
     fn start(
         config_path: std::path::PathBuf,
-        view: lineedit::SharedView,
-        renderer: std::sync::Arc<ui::Renderer>,
         recents: recents::SharedRecents,
         recents_path: std::path::PathBuf,
+        renderer_before: crate::frame::RendererMode,
+        transition: TransitionShared,
     ) -> Self {
+        let TransitionShared { view, status, renderer, lock: picker_lock } = transition;
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
         let lines = tx.clone();
@@ -431,9 +498,11 @@ impl Terminal {
             recents,
             recents_path,
             renderer,
+            renderer_before,
+            status,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            picker_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            picker_lock,
         }
     }
 
@@ -467,6 +536,145 @@ impl Terminal {
     fn sync_context(&mut self, agent: &Agent) {
         let context = self.view.lock().unwrap().context_handle();
         context.lock().unwrap().config = agent.config().clone();
+    }
+
+    /// Apply a live `renderer` switch from `/settings`: flip the app-owned
+    /// frame renderer, match the line editor's drawing path (frame hook vs
+    /// inline), re-anchor the status line / scroll region, and replay the
+    /// transcript into the now-active renderer. No-op when the mode is
+    /// unchanged. The transcript state is preserved across the flip, so the
+    /// conversation is simply re-emitted into whichever renderer is active.
+    ///
+    /// The whole flip/clear/replay runs under `picker_lock` — the same lock the
+    /// SIGWINCH resize task takes before drawing — so a resize cannot pass its
+    /// `is_frame()` check, finish debouncing mid-transition, and `view.resize()`
+    /// while the screen is being cleared/replayed (which on frame → legacy would
+    /// redraw the prompt before `replay_transcript`, placing history after it).
+    async fn renderer_switched(&mut self, agent: &mut Agent) {
+        let mode = agent.config().renderer;
+        if mode == self.renderer_before {
+            return;
+        }
+        // Serialize against the SIGWINCH resize task: hold the terminal-owning
+        // lock for the whole multi-step transition so no resize redraw can
+        // interleave with the mode flip, screen clear, and transcript replay.
+        let _transition_guard = self.picker_lock.lock().await;
+        self.renderer_before = mode;
+        let switching_to_frame = mode == crate::frame::RendererMode::Frame;
+        // Leaving frame mode: the frame's full redraws cleared the legacy
+        // scrollback, so the legacy transcript is gone — the conversation is
+        // replayed below, once legacy owns the screen again. The interactive
+        // prompt's current line is NOT in the conversation (it is recorded
+        // only when submitted), so replaying every user message cannot
+        // duplicate the line being edited.
+        //
+        // Entering frame mode: legacy output that exists only in renderer
+        // state (deferred notes, the collapsed thinking summary) must move
+        // into the frame transcript BEFORE the frame is activated — once it
+        // is, `drain_pending` (a legacy-state accessor) returns empty, and
+        // the frame's first full redraw clears the scrollback those notes
+        // were headed for.
+        let pending = if switching_to_frame { self.renderer.drain_pending() } else { Vec::new() };
+        // Whether a frame is ACTIVE right now (before the switch). Off a tty
+        // `set_mode(Frame)` leaves `is_frame()` false, so this — not the
+        // configured mode — tells whether the post-switch replay/cleanup is
+        // needed: with no frame ever active, legacy scrollback was never
+        // cleared and replaying would print the whole conversation again.
+        let frame_was_active = self.renderer.is_frame();
+        self.renderer.set_mode(mode);
+        let on = self.renderer.is_frame();
+        // Rebuild the frame hook to match: frame routes every edit through the
+        // single frame writer; legacy draws inline with its own command menu.
+        let renderer = self.renderer.clone();
+        let hook: Option<lineedit::EditHook> = on.then(|| {
+            let h: lineedit::EditHook =
+                std::sync::Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
+                    renderer.set_editor(line, cursor, queued, menu)
+                });
+            h
+        });
+        self.view.lock().unwrap().set_frame_mode(on, hook);
+        // Leaving an active frame: re-own the screen for legacy BEFORE the
+        // editor/status redraw below. The frame's last redraw is still
+        // visible (dropping it emits nothing), so this clears the screen and
+        // scrollback — the replay and the migrated frame-only items reprint
+        // everything — then re-pins the scroll region the frame's redraws
+        // reset, leaving the cursor on the last scrollable row. Doing it
+        // before `view.resize()` (not after) means there is no fresh prompt
+        // for the clear to wipe, and the replay can't start writing on the
+        // reserved status row. When no status line is installed (a TTY with
+        // `AGENTIC_NO_STATUS` or fewer than five rows) there is no region to
+        // re-pin, but the frame's display must STILL be cleared — skipping it
+        // would leave the replay writing over the stale frame copy.
+        if !on && frame_was_active {
+            match &self.status {
+                Some(status) => status.repin_scroll_region(),
+                None => crate::status::clear_display(),
+            }
+        }
+        // Re-anchor the scroll region (legacy) / let the frame re-own the
+        // screen (frame), and recompute the prompt at the current size.
+        if let Some(status) = &self.status {
+            status.resize();
+        }
+        if !on {
+            // The frame left the cursor on the bottom row and the editor's
+            // drawn state refers to rows the frame owned: reset it to the
+            // single prompt row the next loop print establishes, or the
+            // resize redraw would climb into the status row / frame content.
+            self.view.lock().unwrap().reset_drawing();
+        }
+        // Leaving an ACTIVE frame, skip the editor's resize redraw: it would
+        // reprint the inline prompt NOW, before `replay_transcript` below
+        // restores the history — the renderer still counts itself at a line
+        // start, so the first restored item lands after that prompt and the
+        // next loop print draws a second one. `reset_drawing` above already
+        // re-anchored the editor to the single prompt row, so replaying first
+        // and letting the next loop print the prompt keeps it where it
+        // belongs. Every other path (entering frame mode, or legacy with no
+        // frame ever active) still needs the redraw to recompute the prompt at
+        // the current size.
+        if on || !frame_was_active {
+            self.view.lock().unwrap().resize();
+        }
+        if on {
+            // A fresh frame starts empty, so the transcript must be rebuilt
+            // into it (its first full redraw clears scrollback and re-owns the
+            // screen). Seed the drained legacy output first so it lands ahead
+            // of the conversation, then replay the conversation as one batch:
+            // rendering per event would redo the whole transcript layout each
+            // time (O(events²) on a long session). The emitted events reach the
+            // installed sink (`Renderer::event`), which routes them into the
+            // now-active frame — no separate per-event tap is needed (a tap via
+            // `replay_event` would no-op here: it early-returns while the frame
+            // is active).
+            //
+            // DOCUMENTED LIMITATION: only `drain_pending` (deferred notes + the
+            // collapsed reasoning summary) migrates into the frame here.
+            // Transient legacy output that `print_block`/`print_raw` wrote
+            // straight to scrollback in legacy mode — `/help`, the banner, raw
+            // JSON exports — was never recorded, so it is erased when the
+            // frame's first redraw clears scrollback. Keeping a renderer-owned
+            // ordered transcript in BOTH modes and replaying it here without
+            // duplicating the conversation entries `replay_history` re-derives
+            // is a substantial redesign with real double-print hazards; we
+            // accept the incidental loss on a live legacy → frame switch.
+            self.renderer.push_items(pending);
+            self.renderer.frame_batch(|| agent.replay_history());
+        } else if frame_was_active {
+            // Legacy scrollback was cleared by the frame's redraws: reprint
+            // the visible transcript so it stays accessible. `set_mode`
+            // captured the frame's full transcript (in on-screen order), and
+            // `replay_transcript` reprints it now — AFTER the clear above, so
+            // nothing is erased. Replaying the captured transcript rather than
+            // `Agent::conversation` keeps the switch lossless: frame-only
+            // items, turns and plan updates stay in their shown order, the
+            // real pre-compaction turns are restored (the compacted
+            // conversation would print the synthetic summary as a user turn
+            // and drop the compacted-away turns), and the current plan prints
+            // exactly once (it is simply the last `Item::Plan`).
+            self.renderer.replay_transcript();
+        }
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
@@ -572,9 +780,16 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         println!();
     }
     renderer.begin_turn();
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Turn);
-    let mut escape = DoubleEscape::default();
-    let outcome = async {
+    let outcome = {
+        // The turn is a non-idle phase: the guard restores the idle `Prompt`
+        // mode on *every* exit path (including a future early `return`, `?`,
+        // or a panic unwinding the loop), not just the single explicit
+        // restore a hand-placed pair offers. It drops at the end of this
+        // block — after `end_turn`, before the steer drain below — preserving
+        // the exact ordering the manual `set_mode` pair had.
+        let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
+        let mut escape = DoubleEscape::default();
+        let outcome = async {
         // Grab the broker before the turn future borrows `agent` mutably.
         let questions = agent.questions();
         // What read-only commands typed mid-turn show (see `turn_commands`);
@@ -679,6 +894,9 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             TermInput::Queue(line) => (line, false),
                             _ => unreachable!(),
                         };
+                        // An accepted line supersedes any refusal hint still
+                        // showing from a rejected `/command`.
+                        renderer.clear_transient();
                         let text = line.trim();
                         match classify_steer_input(text, steer) {
                             SteerRoute::QueueCommand(op) => {
@@ -689,6 +907,14 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     Err(usage) => renderer.note(&format!("[{usage}]")),
                                 }
                             }
+                            SteerRoute::Thinking(Ok(level)) => {
+                                // The running turn sends it from its next model
+                                // call; `/thinking` afterwards shows what applies.
+                                let shown = level.as_ref().map_or("the config level".to_string(), |l| l.to_string());
+                                control.set_thinking(level);
+                                renderer.note(&format!("[thinking: {shown} — from the agent's next step]"));
+                            }
+                            SteerRoute::Thinking(Err(e)) => renderer.note(&format!("[thinking: {e}]")),
                             SteerRoute::DeferCommand => match turn_commands::timing(text) {
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
@@ -764,17 +990,18 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         }
     }
     .await;
-    renderer.end_turn();
-    // `/verbosity LEVEL` typed mid-turn set the global; keep the config copy
-    // (which `/settings` saves) in step, as the between-turns command does.
-    agent.config_mut().verbosity = ui::verbosity();
-    // A mid-turn `/model` switch updates the agent's config but not the shared
-    // editor context (the between-turns path refreshes it via
-    // `Terminal::model_switched`). Resync now the turn has returned so `/model`
-    // completion treats the newly switched model as `current`, matching the
-    // prompt-level switch.
-    terminal.sync_context(agent);
-    terminal.view.lock().unwrap().set_mode(lineedit::EditMode::Prompt);
+        renderer.end_turn();
+        // `/verbosity LEVEL` typed mid-turn set the global; keep the config copy
+        // (which `/settings` saves) in step, as the between-turns command does.
+        agent.config_mut().verbosity = ui::verbosity();
+        // A mid-turn `/model` switch updates the agent's config but not the shared
+        // editor context (the between-turns path refreshes it via
+        // `Terminal::model_switched`). Resync now the turn has returned so `/model`
+        // completion treats the newly switched model as `current`, matching the
+        // prompt-level switch.
+        terminal.sync_context(agent);
+        outcome
+    };
     // A steer typed as the turn finished queues behind what is already
     // waiting, unless the turn was cancelled. Drain it before propagating any
     // turn error too: `start_turn` does not clear pending steers, so a steer
@@ -806,8 +1033,35 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// clipboard/title writes) through the interactive picker. Dropping C0/C1
 /// control characters — including ESC (0x1B), which begins every such sequence —
 /// neutralises them while leaving ordinary printable text intact.
+///
+/// Line feeds (`\n`) are kept: a line feed is not an escape-initiating or
+/// cursor-moving control, and dropping it would corrupt multi-line text. The
+/// transcript replay in particular relies on `\n` surviving so a multi-line
+/// message replays as the same lines the frame showed, not one concatenated
+/// line. Callers that render a genuinely single-line field (a picker prompt,
+/// option label or description, a checklist title) must instead use
+/// [`sanitize_terminal_line`], which also drops `\n`: an embedded line feed
+/// there is not multi-line content to preserve but injected layout that would
+/// add an extra, unprefixed row or shift an interactive selector's cursor.
+///
+/// The Unicode line/paragraph separators U+2028/U+2029 are dropped too: they are
+/// not `char::is_control`, but terminals and this crate's own memory guards
+/// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
+/// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
+/// the filter.
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars().filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}').collect()
+}
+
+/// Like [`sanitize_terminal_text`], but for single-line fields: drops every
+/// control character, `\n` included, as well as the Unicode line/paragraph
+/// separators U+2028/U+2029 that a terminal folds into an extra row. Use it for
+/// model-controlled text rendered on one row — picker prompts, option
+/// labels/descriptions and plan titles — where a line feed is not multi-line
+/// content to keep but injected layout that would spill an unprefixed extra row
+/// or move an interactive selector's cursor.
+pub(crate) fn sanitize_terminal_line(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -816,11 +1070,11 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
         .options
         .iter()
         .map(|o| {
-            let label = sanitize_terminal_text(&o.label);
+            let label = sanitize_terminal_line(&o.label);
             if o.description.is_empty() {
                 label
             } else {
-                format!("{} — {}", label, sanitize_terminal_text(&o.description))
+                format!("{} — {}", label, sanitize_terminal_line(&o.description))
             }
         })
         .collect();
@@ -831,7 +1085,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
         None
     };
     let choice =
-        Select::new().with_prompt(sanitize_terminal_text(&q.question)).items(&labels).default(0).interact_opt()?;
+        Select::new().with_prompt(sanitize_terminal_line(&q.question)).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -1019,6 +1273,9 @@ enum SteerRoute {
     Ignore,
     /// A `/queue` edit — applied to the message queue even mid-turn.
     QueueCommand(std::result::Result<queue::QueueOp, String>),
+    /// `/thinking LEVEL` (or `reset`): applied from the agent's next step;
+    /// `None` clears the session level. An unknown level is the error.
+    Thinking(std::result::Result<Option<thinking::Thinking>, String>),
     /// A non-`/queue` slash command: deferred until the turn finishes.
     DeferCommand,
     /// Plain Enter: steer the running turn.
@@ -1035,6 +1292,8 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
         SteerRoute::Ignore
     } else if let Some(op) = queue_command(text) {
         SteerRoute::QueueCommand(op)
+    } else if let Some(arg) = text.strip_prefix("/thinking ").map(str::trim).filter(|a| !a.is_empty()) {
+        SteerRoute::Thinking(thinking_arg(arg))
     } else if text.starts_with('/') && commands::unescape_prompt(text).is_none() {
         SteerRoute::DeferCommand
     } else if steer {
@@ -1072,13 +1331,28 @@ async fn run_compaction(
 ) -> Result<Option<agent::CompactReport>> {
     let control = agent.control();
     let stats = agent.context_stats();
+    // Compaction is a non-idle phase: a `/compact` deferred from a turn runs
+    // here *after* the turn loop already restored `EditMode::Prompt` (see
+    // `run_interactive_turn`), while the persistent line reader stays
+    // outstanding. Left in `Prompt`, the idle "Esc Esc clears the input"
+    // gesture would erase a partially typed next message with the same presses
+    // that cancel the compaction — the destructive behaviour that guard exists
+    // to prevent. The `NonIdlePhase` guard marks the phase `Turn` so
+    // `escape_press` neither clears nor arms, and restores `Prompt` on *every*
+    // exit path when it drops (the Prompt→Turn→Prompt transitions bump the edit
+    // generation, so a stale pre-compaction arm cannot complete afterwards
+    // either).
+    let _phase = lineedit::NonIdlePhase::enter(&terminal.view);
     let compaction = agent.compact(mode, instructions);
     tokio::pin!(compaction);
     let mut escape = DoubleEscape::default();
-    loop {
+    // The loop only exits by resolving the compaction future; the guard above
+    // restores the idle `Prompt` mode when it drops at function exit, so there
+    // is no explicit restore to skip even if a future edit adds an early return.
+    let report = loop {
         tokio::select! {
             biased;
-            report = &mut compaction => return report,
+            report = &mut compaction => break report,
             input = terminal.recv() => match input {
                 TermInput::Interrupt => {
                     control.cancel();
@@ -1113,6 +1387,9 @@ async fn run_compaction(
                     if let TermInput::Line(line) = &other
                         && let Some(op) = queue_command(line.trim())
                     {
+                        // An accepted edit supersedes any refusal hint still
+                        // showing from a rejected `/command`.
+                        terminal.renderer.clear_transient();
                         match op {
                             Ok(op) => {
                                 let result = terminal.edit_queue(&op);
@@ -1121,12 +1398,217 @@ async fn run_compaction(
                             Err(usage) => terminal.renderer.note(&format!("[{usage}]")),
                         }
                     } else {
+                        // A non-empty accepted `Line`/`Queue` deferred until
+                        // compaction finishes still supersedes a refusal hint
+                        // from a rejected `/command`, matching the mid-turn
+                        // behaviour; a blank Enter leaves the hint untouched.
+                        if let TermInput::Line(line) | TermInput::Queue(line) = &other
+                            && !line.trim().is_empty()
+                        {
+                            terminal.renderer.clear_transient();
+                        }
                         terminal.queued.push_back(other);
                     }
                 }
             },
         }
+    };
+    // The `NonIdlePhase` guard restores the idle prompt when it drops here, so
+    // the next read's Esc Esc gesture is live again.
+    report
+}
+
+/// Parse the id from `/memory forget <id>` args, requiring a token boundary
+/// after `forget`: the next character must be whitespace (or end of args).
+/// Without it, `/memory forgetmem-…` would strip the `forget` prefix and treat
+/// `mem-…` as an id, deleting an entry instead of reporting an unknown command
+/// (Copilot finding, src/main.rs). Returns `None` when `args` is not a
+/// `forget` request at all, so the caller falls through to the
+/// unknown-argument branch.
+fn parse_forget_id(args: &str) -> Option<&str> {
+    let rest = args.strip_prefix("forget")?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) { Some(rest.trim()) } else { None }
+}
+
+/// `/memory` (list) and `/memory forget <id>`.
+fn memory_command(agent: &mut Agent, args: &str) -> String {
+    if agent.memory().is_none() {
+        // `memory()` is `None` for two distinct reasons: memory is genuinely
+        // off, or it is *enabled* but no per-user data directory is available
+        // and no `memory_dir` was configured (`memory_dir()` refuses the
+        // world-shared temp fallback). Telling the latter user to "set
+        // `memory = \"on\"`" is wrong — it already is — and leaves them unable
+        // to diagnose the real problem, so direct that case to `memory_dir`
+        // instead (Copilot finding, src/main.rs).
+        if agent.config().memory.enabled() {
+            return "Memory is enabled but no storage directory is available: this platform has \
+                    no per-user data directory and none was configured. Set `memory_dir` in \
+                    config to a directory you control."
+                .to_string();
+        }
+        return "Memory is off (set `memory = \"on\"` in config to enable it).".to_string();
     }
+    if let Some(id) = parse_forget_id(args) {
+        if id.is_empty() {
+            return "Usage: /memory forget <id>".to_string();
+        }
+        // Plan mode is read-only: the tool path already refuses `memory_forget`
+        // (the dispatch backstop in `run_memory_tool`), but this slash command
+        // reaches `Store::forget` directly and would otherwise delete the
+        // persistent scope file mid-plan, bypassing the no-modification
+        // guarantee. Gate it on the live mode the same way (Copilot finding,
+        // src/main.rs).
+        if agent.mode() == crate::mode::AgentMode::Plan {
+            return "Memory is read-only in plan mode; /memory forget cannot delete entries.".to_string();
+        }
+        if !agent.config().memory.writable() {
+            return "Memory is read-only in this session; /memory forget cannot delete entries.".to_string();
+        }
+        let (msg, ok) = match agent.memory().unwrap().forget(id) {
+            Ok(msg) => (msg, true),
+            Err(e) => (format!("{e}"), false),
+        };
+        // Rebuild the folded system prompt so the deleted memory stops appearing
+        // in the active session's index (it is captured at session start).
+        if ok {
+            agent.refresh_memory_index();
+        }
+        return msg;
+    }
+    if !args.is_empty() {
+        return format!("Unknown /memory argument {args:?}; use /memory or /memory forget <id>.");
+    }
+    let store = agent.memory().unwrap();
+    let entries = match store.all() {
+        Ok(entries) => entries,
+        Err(e) => return format!("Could not read memory: {e}"),
+    };
+    if entries.is_empty() {
+        // Branch on *effective* writability: in read-only mode (including
+        // headless/ACP runs) *and in Plan mode* the `memory_save` tool is
+        // unavailable, so pointing the user at it would describe an action the
+        // model cannot take. `config().memory.writable()` alone stays `On` in
+        // Plan mode, so use `memory_writable()`, which also gates on the live
+        // mode (Copilot finding, src/main.rs).
+        return if agent.memory_writable() {
+            format!(
+                "No memories yet. The model saves them with memory_save; files live under {}.",
+                store.root().display()
+            )
+        } else {
+            format!(
+                "No memories yet. Memory is read-only here, so the model cannot save them; files live under {}.",
+                store.root().display()
+            )
+        };
+    }
+    let mut out = vec![format!(
+        "{} memor{} (memory is {}; edit the files under {}{}):",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        agent.config().memory.as_str(),
+        store.root().display(),
+        if agent.memory_writable() { ", or /memory forget <id>" } else { "" }
+    )];
+    for (scope, entry) in &entries {
+        // Sanitise every interpolated field before it reaches the terminal: the
+        // JSONL is documented as human-editable, so a record can carry `\r`, ESC,
+        // or other control bytes that the legacy renderer would otherwise print
+        // verbatim (`print_block` → `println!`), enabling terminal escape
+        // sequences or forged list lines. The ID and evidence are single-line
+        // fields, so they use `sanitize_terminal_line`, which drops `\n` too:
+        // memory JSONL is human-editable and loaded without single-line
+        // validation (`memory.rs`), so an escaped newline must not inject an
+        // extra, unprefixed row into this listing. The text is already reduced
+        // to its first line below.
+        let mut line = format!(
+            "  {} [{}] ({}) {}",
+            scope.as_str(),
+            sanitize_terminal_line(&entry.id),
+            entry.created.format("%Y-%m-%d"),
+            sanitize_terminal_line(entry.text.lines().next().unwrap_or("").trim())
+        );
+        if let Some(evidence) = &entry.evidence {
+            line.push_str(&format!(" (check: {})", sanitize_terminal_line(evidence)));
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// `/resume [ID|last]`: switch this process to a saved session. Without an
+/// argument, pick one (or, without a terminal, list them).
+fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Result<()> {
+    if terminal.outstanding {
+        // A stdin read is pending (typed during a turn), so a picker would
+        // race it, and switching sessions mid-turn would orphan the turn.
+        terminal.renderer.print_block("/resume switches sessions: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    if !agent.config().persist_sessions {
+        terminal
+            .renderer
+            .print_block("Sessions aren't saved (persist_sessions = false), so there is nothing to resume");
+        return Ok(());
+    }
+    let dir = agent.config().session_dir();
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    let current = agent.session_id().map(str::to_string);
+    let id = match arg {
+        "" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+            let rows = resume::list_rows(&dir, &cwd, current.as_deref())?;
+            let text = if rows.is_empty() {
+                "No saved sessions for this directory".to_string()
+            } else {
+                format!("Saved sessions (switch with /resume ID):\n{}", rows.join("\n"))
+            };
+            terminal.renderer.print_block(&text);
+            return Ok(());
+        }
+        "" => {
+            let picked = resume::pick_outcome(&dir, &cwd, current.as_deref());
+            // The picker drew over the owned frame: repaint it fully, also on error.
+            terminal.renderer.frame_resize();
+            match picked? {
+                resume::Pick::Selected(id) => id,
+                // The picker already printed "No saved sessions to resume." to
+                // stderr. In frame mode the repaint above painted over it, so
+                // repeat it where the user can see it; with the legacy renderer
+                // frame_resize() is a no-op and the stderr notice is still on
+                // screen, so printing again would duplicate it. Keep
+                // "Session unchanged" for an actual Esc.
+                resume::Pick::Empty => {
+                    if terminal.renderer.is_frame() {
+                        terminal.renderer.print_block("No saved sessions to resume");
+                    }
+                    return Ok(());
+                }
+                resume::Pick::Cancelled => {
+                    terminal.renderer.print_block("Session unchanged");
+                    return Ok(());
+                }
+            }
+        }
+        "last" => resume::last(&dir, &cwd, current.as_deref())?,
+        id => id.to_string(),
+    };
+    if current.as_deref() == Some(id.as_str()) {
+        terminal.renderer.print_block(&format!("Already in session {id}"));
+        return Ok(());
+    }
+    if session::validate_id(&id).is_err() || !dir.join(format!("{id}.jsonl")).is_file() {
+        terminal.renderer.print_block(&format!("No saved session {id:?}: /resume without an ID lists them"));
+        return Ok(());
+    }
+    agent.load_session(&id)?;
+    terminal.renderer.clear_screen();
+    // As at startup with --resume: the frame renderer rebuilds the
+    // transcript from the loaded conversation; the legacy one starts clean.
+    if terminal.renderer.is_frame() {
+        agent.replay_history();
+    }
+    terminal.renderer.print_block(&format!("Resumed session {id} (resume later with --resume {id})"));
+    Ok(())
 }
 
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
@@ -1219,21 +1701,67 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let config = agent.config();
             terminal.renderer.print_block(&format!(
                 "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
-                config.model, config.temperature, config.max_tokens
+                config.model,
+                agent.temperature().describe(),
+                config.max_tokens
             ));
             Ok(true)
         }
         "/settings" => {
-            settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await?;
+            let renderer_before = agent.config().renderer;
+            // Capture the dialog result rather than `?`-returning it: when the
+            // user changed `renderer` and a LATER prompt errors or is
+            // cancelled, the config already records the new mode, so the
+            // switch must still be applied here — returning early would leave
+            // the renderer and editor in the old mode with no diff left to
+            // retrigger the switch on the next visit.
+            let (notices, outcome) =
+                settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
+            // A renderer switch in the settings dialog takes effect live: flip
+            // the frame renderer, the line editor's drawing path, and the
+            // scroll region, and replay the transcript into the new renderer.
+            if agent.config().renderer != renderer_before {
+                terminal.renderer_switched(agent).await;
+            }
+            // Re-show any notice the dialog retained (e.g. a client-rebuild
+            // failure) THROUGH the renderer, now that the redraw has run. The
+            // dialog does NOT print these itself (a plain `println!` would be
+            // wiped by `frame_resize` in frame mode, and would double-print in
+            // legacy); `print_block` captures the notice into the frame
+            // transcript (or prints inline in legacy) so it is shown exactly
+            // once. `run` returns the notices on EVERY exit — even a
+            // cancel/error at a later prompt — so a rebuild failure already
+            // recorded is never dropped.
+            for notice in &notices {
+                terminal.renderer.print_block(notice);
+            }
             // Each model switch made in the dialog was recorded into the recents
             // MRU as it happened, so here just refresh the config the line
             // editor's argument suggestions read (providers or the model may
             // have changed).
             terminal.sync_context(agent);
+            // Propagate a genuine dialog I/O failure only AFTER the renderer
+            // switch and notices above, so an errored exit still leaves the
+            // terminal in the new mode and shows what the dialog retained.
+            outcome?;
+            Ok(true)
+        }
+        _ if cmd == "/memory" || cmd.starts_with("/memory ") => {
+            terminal.renderer.print_block(&memory_command(agent, cmd.strip_prefix("/memory").unwrap_or("").trim()));
+            Ok(true)
+        }
+        "/hooks" => {
+            // The listing embeds config-derived commands, matchers, skip
+            // reasons and paths. In legacy renderer mode `print_block` writes
+            // straight to the terminal (`println!`), so an escaped
+            // terminal-control sequence in project settings would become active
+            // when `/hooks` is displayed. Sanitize before printing; the frame
+            // renderer's own filtering does not cover this path.
+            terminal.renderer.print_block(&sanitize_terminal_text(agent.claude_hooks_listing().trim_end()));
             Ok(true)
         }
         _ if let Some(op) = queue_command(cmd) => {
@@ -1291,11 +1819,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             if let Some(spec) = picked? {
                 agent.set_model(&spec).await?;
                 terminal.model_switched(agent, &before);
-                terminal.renderer.print_block(&format!(
-                    "Model set to {} (provider {})",
-                    agent.model_name(),
-                    agent.provider_name()
-                ));
+                terminal.renderer.print_block(&model_set_text(agent));
             } else {
                 terminal.renderer.print_block(&format!(
                     "Model unchanged: {} (provider {})",
@@ -1312,11 +1836,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             let before = format!("{}/{}", agent.provider_name(), agent.model_name());
             agent.set_model(arg).await?;
             terminal.model_switched(agent, &before);
-            terminal.renderer.print_block(&format!(
-                "Model set to {} (provider {})",
-                agent.model_name(),
-                agent.provider_name()
-            ));
+            terminal.renderer.print_block(&model_set_text(agent));
+            Ok(true)
+        }
+        _ if cmd == "/resume" || cmd.starts_with("/resume ") => {
+            resume_command(agent, cmd["/resume".len()..].trim(), terminal)?;
             Ok(true)
         }
         "/restart" => {
@@ -1330,6 +1854,15 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             } else {
                 terminal.renderer.print_block(&format!("Session: {id}"));
             }
+            Ok(true)
+        }
+        "/thinking" => {
+            terminal.renderer.print_block(&thinking_status_text(agent));
+            Ok(true)
+        }
+        _ if cmd.starts_with("/thinking ") => {
+            let text = set_thinking_text(agent, &cmd["/thinking ".len()..]);
+            terminal.renderer.print_block(&text);
             Ok(true)
         }
         _ if name == "/mode" && !arg.is_empty() => {
@@ -1445,12 +1978,16 @@ struct Args {
     login: Option<String>,
     list_models: Option<String>,
     model: Option<String>,
+    /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    list_sessions: bool,
+    all: bool,
     config: Option<std::path::PathBuf>,
     verbosity: Option<ui::Verbosity>,
     sandbox: Option<sandbox::SandboxMode>,
     allow: Vec<String>,
     deny: Vec<String>,
+    no_hooks: bool,
     trajectory: Option<String>,
     json: bool,
     markdown: bool,
@@ -1461,9 +1998,12 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("Usage: nano-coder [--acp] [--model provider/model] [--resume SESSION_ID] [--config PATH]");
+    println!(
+        "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
+    );
     println!("                  [--verbosity quiet|normal|verbose|debug]");
-    println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]...");
+    println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
+    println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot");
     println!("       nano-coder --list-models PROVIDER[/model]");
@@ -1486,22 +2026,31 @@ fn parse_args() -> Result<Args> {
             _ => {}
         }
     }
+    parse_args_from(env::args().skip(1))
+}
+
+/// Parse the argument stream (without the program name) into [`Args`].
+/// Split from [`parse_args`] so tests can drive it with a fixed argv.
+fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
     let mut args = Args {
         acp: false,
         login: None,
         list_models: None,
         model: None,
         resume: None,
+        list_sessions: false,
+        all: false,
         config: None,
         verbosity: None,
         sandbox: None,
         allow: Vec::new(),
         deny: Vec::new(),
+        no_hooks: false,
         trajectory: None,
         json: false,
         markdown: false,
     };
-    let mut iter = env::args().skip(1);
+    let mut iter = argv.into_iter().peekable();
     while let Some(arg) = iter.next() {
         let mut value = |name: &str| iter.next().ok_or_else(|| anyhow::anyhow!("{name} requires a value"));
         match arg.as_str() {
@@ -1509,7 +2058,15 @@ fn parse_args() -> Result<Args> {
             "--login" => args.login = Some(value("--login")?),
             "--list-models" => args.list_models = Some(value("--list-models")?),
             "--model" => args.model = Some(value("--model")?),
-            "--resume" => args.resume = Some(value("--resume")?),
+            // The ID is optional: without one, pick from the saved sessions.
+            // The attached `--resume=<id>` form is unambiguous and is the only
+            // way to name a dash-prefixed id: the separated form leaves any
+            // `-…` value in the stream (it looks like a flag), where it would
+            // be rejected as an unknown argument.
+            "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
+            _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
+            "--list-sessions" => args.list_sessions = true,
+            "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
             "--trajectory" => args.trajectory = Some(value("--trajectory")?),
             "--json" => args.json = true,
@@ -1520,6 +2077,7 @@ fn parse_args() -> Result<Args> {
             "--sandbox" => args.sandbox = Some(value("--sandbox")?.parse().map_err(|e: String| anyhow::anyhow!(e))?),
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
+            "--no-hooks" => args.no_hooks = true,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -1538,8 +2096,57 @@ fn parse_args() -> Result<Args> {
     if args.json && args.markdown {
         anyhow::bail!("--json and --markdown are mutually exclusive");
     }
-    if (args.json || args.markdown) && args.trajectory.is_none() {
-        anyhow::bail!("--json/--markdown require --trajectory <id>");
+    if args.markdown && args.trajectory.is_none() {
+        anyhow::bail!("--markdown requires --trajectory <id>");
+    }
+    if args.json && args.trajectory.is_none() && !args.list_sessions {
+        anyhow::bail!("--json requires --trajectory <id> or --list-sessions");
+    }
+    if args.all && !args.list_sessions {
+        anyhow::bail!("--all requires --list-sessions");
+    }
+    // `--list-sessions` and `--trajectory` select different, exclusive modes.
+    // The trajectory branch runs first, so accepting both would silently emit
+    // trajectory output and ignore the requested session list; reject it.
+    if args.list_sessions && args.trajectory.is_some() {
+        anyhow::bail!("--list-sessions and --trajectory are mutually exclusive");
+    }
+    // `--list-sessions` and `--resume` also select different, exclusive modes.
+    // The listing branch runs before the resume branch, so accepting both would
+    // silently print the session list and ignore the requested resume; reject
+    // it rather than let argument order-independent input pick an unrelated
+    // action.
+    if args.list_sessions && args.resume.is_some() {
+        anyhow::bail!("--list-sessions and --resume are mutually exclusive");
+    }
+    // `--list-sessions` likewise conflicts with the other top-level action
+    // modes. Dispatch runs `--login` before the listing, and the listing before
+    // `--list-models` and `--acp`, so accepting any of these pairs would
+    // silently perform one action and ignore the other; reject them.
+    if args.list_sessions && args.login.is_some() {
+        anyhow::bail!("--list-sessions and --login are mutually exclusive");
+    }
+    if args.list_sessions && args.list_models.is_some() {
+        anyhow::bail!("--list-sessions and --list-models are mutually exclusive");
+    }
+    if args.list_sessions && args.acp {
+        anyhow::bail!("--list-sessions and --acp are mutually exclusive");
+    }
+    // `--resume` likewise conflicts with the other exclusive action modes.
+    // Dispatch runs `--login`, then `--trajectory`, then `--list-models` before
+    // the resume branch, so accepting `--resume` with any of them would
+    // silently perform that action and ignore the requested resume; reject
+    // those pairs. `--acp` is the exception: an explicit `--resume <id>` is
+    // honoured in ACP mode (the session is loaded before serving requests), so
+    // only a bare picker `--resume` is rejected there (in `main`).
+    if args.resume.is_some() && args.login.is_some() {
+        anyhow::bail!("--resume and --login are mutually exclusive");
+    }
+    if args.resume.is_some() && args.trajectory.is_some() {
+        anyhow::bail!("--resume and --trajectory are mutually exclusive");
+    }
+    if args.resume.is_some() && args.list_models.is_some() {
+        anyhow::bail!("--resume and --list-models are mutually exclusive");
     }
     Ok(args)
 }
@@ -1547,7 +2154,9 @@ fn parse_args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Detect execution mode from command-line args
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+    // Before anything reads the config or data directories.
+    config::migrate_legacy_dirs();
 
     if let Some(provider) = &args.login {
         if provider != "github-copilot" {
@@ -1580,6 +2189,27 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    if args.list_sessions {
+        resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
+        return Ok(());
+    }
+    match args.resume.as_deref() {
+        Some("") if args.acp => anyhow::bail!("--resume needs a session ID with --acp"),
+        Some("") if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+            match resume::pick(&config.session_dir(), &cwd, None)? {
+                Some(id) => args.resume = Some(id),
+                None => return Ok(()),
+            }
+        }
+        Some("") => {
+            // No terminal to pick in: list what could be resumed.
+            resume::print_list(&config.session_dir(), &cwd, false, false)?;
+            return Ok(());
+        }
+        Some("last") => args.resume = Some(resume::last(&config.session_dir(), &cwd, None)?),
+        _ => {}
+    }
     if let Some(spec) = &args.list_models {
         let (user, default_provider) = config.effective_providers();
         let client = providers::build_lister(spec, &user, &default_provider)?;
@@ -1609,6 +2239,9 @@ async fn main() -> Result<()> {
     }
     config.permissions.allow.extend(args.allow.iter().cloned());
     config.permissions.deny.extend(args.deny.iter().cloned());
+    if args.no_hooks {
+        config.disable_hooks = true;
+    }
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
@@ -1620,9 +2253,13 @@ async fn main() -> Result<()> {
     // Register tools and hooks
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
+    agent.load_claude_hooks(std::path::Path::new(&cwd));
 
     if args.acp {
-        // ACP headless mode; sessions start with session/new or session/load
+        // ACP headless mode; sessions start with session/new or session/load.
+        // No human vets a memory save live here, so full memory is downgraded
+        // to read-only (the model can still consult earlier notes).
+        agent.restrict_memory_to_read_only();
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
@@ -1641,6 +2278,13 @@ async fn main() -> Result<()> {
         // instead of blocking in dialoguer while `Terminal` also reads stdin.
         let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
         agent.questions().set_interactive(interactive);
+        if !interactive {
+            // Piped stdin/stdout is a headless run (a script or agent fleet
+            // drives the CLI): like ACP, no human vets a memory save live, so
+            // downgrade full memory to read-only to uphold the headless
+            // guarantee that the model cannot persist memories unvetted.
+            agent.restrict_memory_to_read_only();
+        }
         match &args.resume {
             Some(id) => agent.load_session(id)?,
             None => {
@@ -1668,12 +2312,26 @@ async fn main() -> Result<()> {
         for file in agent.project_instruction_files() {
             banner.push(format!("Instructions: {file}"));
         }
+        for warning in agent.instruction_warnings() {
+            banner.push(format!("Instructions warning: {warning}"));
+        }
         let skills = agent.skills();
         if !skills.is_empty() {
             banner.push(format!("Skills: {}", skills.names().join(", ")));
         }
         for warning in &skills.warnings {
             banner.push(format!("Skills warning: {warning}"));
+        }
+        if let Some(notice) = agent.claude_hooks_notice() {
+            banner.push(notice);
+        }
+        if let Some(warning) = agent.temperature().warning {
+            banner.push(format!("Warning: {warning}"));
+        }
+        // A preconfigured thinking level that is adjusted or ignored warns too,
+        // not only when /thinking or a model switch surfaces it later.
+        if let Some(warning) = agent.thinking().warning {
+            banner.push(format!("Warning: {warning}"));
         }
         banner.push("Type /help for commands".to_string());
 
@@ -1749,16 +2407,35 @@ async fn main() -> Result<()> {
                 },
             ));
         }
+        // Serialises every terminal-owning operation that must not interleave
+        // with a multi-step renderer transition: the SIGWINCH resize task takes
+        // it before drawing, and `Terminal::renderer_switched` holds it across
+        // the flip/clear/replay. Created here (before `Terminal::start`) so both
+        // sides share one lock. The SIGWINCH task and `Terminal` each get a clone.
+        let transition = TransitionShared {
+            view: view.clone(),
+            status: status.clone(),
+            renderer: renderer.clone(),
+            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        };
         if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            let view = view.clone();
-            let status = status.clone();
-            let renderer = renderer.clone();
+            let transition = transition.clone();
             tokio::spawn(async move {
+                let TransitionShared { view, status, renderer, lock: transition_lock } = &transition;
                 // Debounce a burst of resizes (a window drag) into one render at
                 // the final size: after a resize, wait for ~40 ms of quiet.
                 let quiet = std::time::Duration::from_millis(40);
                 let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
+                    // Hold the transition lock from the `is_frame()` check through
+                    // the draw, so a renderer switch cannot flip the mode, clear
+                    // the screen, and replay the transcript in between (which would
+                    // let this redraw interleave with the transition — on frame →
+                    // legacy it would reprint the prompt before `replay_transcript`,
+                    // placing history after it). The lock is uncontended except
+                    // during that brief transition, so this costs nothing in the
+                    // common case.
+                    let _transition_guard = transition_lock.lock().await;
                     if !renderer.is_frame() {
                         // Legacy: re-anchor immediately, as before.
                         if let Some(status) = &status {
@@ -1802,11 +2479,13 @@ async fn main() -> Result<()> {
         // (the sink is installed) to reconstruct the transcript into
         // `FrameState`; `frame_event` populates user, assistant, tool and plan
         // items. Only in frame mode — the legacy renderer would dump the whole
-        // conversation inline, which it has never done on resume.
+        // conversation inline, which it has never done on resume. Batched into
+        // one render: per-event renders would redo the whole transcript layout
+        // for every replayed event.
         if frame_mode && args.resume.is_some() {
-            agent.replay_history();
+            renderer.frame_batch(|| agent.replay_history());
         }
-        let mut terminal = Terminal::start(config_path, view, renderer, recents, recents_path);
+        let mut terminal = Terminal::start(config_path, recents, recents_path, agent.config().renderer, transition);
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved
         // key or a queued/empty line cannot silently disarm it (see
@@ -1815,14 +2494,14 @@ async fn main() -> Result<()> {
         let mut separate = false;
         while running {
             if let Some(status) = &status
-                && !frame_mode
+                && !terminal.renderer.is_frame()
             {
                 status.draw();
             }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
                     let mut view = terminal.view.lock().unwrap();
-                    if frame_mode {
+                    if terminal.renderer.is_frame() {
                         // The frame renderer owns the screen: refresh the editor
                         // row (and thus the whole frame) instead of writing an
                         // inline prompt.
@@ -1885,12 +2564,25 @@ async fn main() -> Result<()> {
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        if frame_mode {
+                        if terminal.renderer.is_frame() {
                             terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
                         } else {
                             println!("\nMode: {mode} ({})", mode.describe());
                         }
                         prompt(&terminal, false);
+                    }
+                    TermInput::Escape => {
+                        // The input-clearing half of the gesture happens in
+                        // `lineedit::LineReader` (see `escape_press`), the only
+                        // place that sees every Esc. An Escape that surfaces
+                        // here means the buffer was already empty, so there is
+                        // nothing to clear. Consume it in place like the other
+                        // mid-line events (ToggleThinking/CycleMode) rather than
+                        // breaking out to the outer loop's `continue`, which
+                        // would restart the loop and re-emit `prompt()` — a
+                        // spurious redraw that contradicts the inert-empty
+                        // no-op contract. Staying in the inner loop keeps the
+                        // empty-buffer Esc a true zero-redraw no-op.
                     }
                     other => break other,
                 }
@@ -1908,7 +2600,14 @@ async fn main() -> Result<()> {
                     terminal.renderer.transient_note("(Ctrl-C again to exit)");
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_) => {
+                TermInput::Escape => {
+                    // Escape is now consumed in the inner event loop above (a
+                    // true no-op on an empty buffer), so it never breaks out to
+                    // here. This arm is retained only for match exhaustiveness,
+                    // mirroring the ToggleThinking/CycleMode/Rejected arm below.
+                    continue;
+                }
+                TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
                     continue;
                 }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
@@ -1927,7 +2626,7 @@ async fn main() -> Result<()> {
                     running = continue_running;
                 }
                 Err(e) => {
-                    if frame_mode {
+                    if terminal.renderer.is_frame() {
                         terminal.renderer.note(&format!("Error: {:#}", e));
                     } else {
                         eprintln!("Error: {:#}", e);
@@ -2026,6 +2725,117 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_terminal_text_strips_unicode_line_separators() {
+        // U+2028/U+2029 are not `char::is_control`, but a terminal folds them as
+        // line breaks, so a hand-edited `/memory` id/text/evidence value could
+        // otherwise render a forged extra row (Copilot finding, src/main.rs).
+        assert_eq!(sanitize_terminal_text("mem-evil\u{2028}forged row"), "mem-evilforged row");
+        assert_eq!(sanitize_terminal_text("head\u{2029}forged row"), "headforged row");
+        // Ordinary printable text (including non-ASCII) is left intact.
+        assert_eq!(sanitize_terminal_text("café — label"), "café — label");
+    }
+
+    #[test]
+    fn resume_attached_form_names_dash_prefixed_ids() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // The separated form still takes a following non-flag value…
+        assert_eq!(parse_args_from(argv(&["--resume", "sess-1"])).unwrap().resume.as_deref(), Some("sess-1"));
+        // …and no value means "pick one".
+        assert_eq!(parse_args_from(argv(&["--resume"])).unwrap().resume.as_deref(), Some(""));
+        // A dash-prefixed id is only addressable in the attached form: the
+        // separated form would leave `-sess` in the stream as an unknown flag.
+        assert_eq!(parse_args_from(argv(&["--resume=-sess"])).unwrap().resume.as_deref(), Some("-sess"));
+        assert!(parse_args_from(argv(&["--resume", "-sess"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_trajectory_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently running the
+        // trajectory branch and ignoring the requested session list.
+        assert!(parse_args_from(argv(&["--list-sessions", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--list-sessions", "--json"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_and_resume_are_mutually_exclusive() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--list-sessions"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        // …but combining them is rejected rather than silently printing the
+        // list and ignoring the requested resume, regardless of order or
+        // whether `--resume` carries an explicit id.
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "sess-1", "--list-sessions"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--resume"])).is_err());
+    }
+
+    #[test]
+    fn list_sessions_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // Each action mode on its own parses fine…
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        assert!(parse_args_from(argv(&["--acp"])).is_ok());
+        // …but combining `--list-sessions` with any of them is rejected rather
+        // than silently performing one action (login first, or the listing
+        // before `--list-models`/`--acp`) and ignoring the other.
+        assert!(parse_args_from(argv(&["--list-sessions", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-sessions", "--acp"])).is_err());
+        assert!(parse_args_from(argv(&["--acp", "--list-sessions"])).is_err());
+    }
+
+    #[test]
+    fn resume_conflicts_with_other_action_modes() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        // `--resume` (bare picker or explicit id) and each other action mode on
+        // their own parse fine…
+        assert!(parse_args_from(argv(&["--resume"])).is_ok());
+        assert!(parse_args_from(argv(&["--resume", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--login", "github-copilot"])).is_ok());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1"])).is_ok());
+        assert!(parse_args_from(argv(&["--list-models", "openai"])).is_ok());
+        // …but combining `--resume` with `--login`, `--trajectory`, or
+        // `--list-models` is rejected rather than silently running that mode
+        // (each dispatches before the resume branch) and ignoring the resume.
+        assert!(parse_args_from(argv(&["--resume", "--login", "github-copilot"])).is_err());
+        assert!(parse_args_from(argv(&["--login", "github-copilot", "--resume", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--trajectory", "sess-1"])).is_err());
+        assert!(parse_args_from(argv(&["--trajectory", "sess-1", "--resume"])).is_err());
+        assert!(parse_args_from(argv(&["--resume", "--list-models", "openai"])).is_err());
+        assert!(parse_args_from(argv(&["--list-models", "openai", "--resume=sess-1"])).is_err());
+        // `--acp` stays compatible with an explicit `--resume <id>` (the session
+        // is loaded before serving ACP requests); only a bare picker `--resume`
+        // is rejected there (in `main`, not parse_args).
+        assert!(parse_args_from(argv(&["--acp", "--resume", "sess-1"])).is_ok());
+    }
+
+    #[test]
+    fn sanitize_terminal_text_preserves_line_feeds() {
+        // Multi-line model/tool text must keep its line breaks: the transcript
+        // replay re-prints it as the lines the frame showed, so stripping `\n`
+        // would concatenate the lines. Other controls are still dropped.
+        assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
+        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
+    }
+
+    #[test]
+    fn sanitize_terminal_line_drops_line_feeds() {
+        // Single-line fields (picker prompts/labels, plan titles) must drop
+        // `\n` too: an embedded line feed there is injected layout that would
+        // spill an unprefixed extra row or move a selector's cursor, not
+        // multi-line content to keep. Other controls are dropped as well.
+        assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
+        assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
+    }
+
+    #[test]
     fn slash_escaped_lines_steer_or_queue_instead_of_deferring() {
         assert!(matches!(classify_steer_input("//usr/lib is big", true), SteerRoute::Steer));
         assert!(matches!(classify_steer_input("//usr/lib is big", false), SteerRoute::Enqueue));
@@ -2040,6 +2850,12 @@ mod tests {
         assert!(matches!(classify_steer_input("keep going", false), SteerRoute::Enqueue));
         // A regression that swapped these two would flip the feature's core
         // behaviour while still routing the same text — the pair above catches it.
+
+        // `/thinking LEVEL` applies from the agent's next step; `reset`
+        // clears the session level; a bare `/thinking` (show) waits.
+        assert!(matches!(classify_steer_input("/thinking off", true), SteerRoute::Thinking(Ok(Some(_)))));
+        assert!(matches!(classify_steer_input("/thinking reset", false), SteerRoute::Thinking(Ok(None))));
+        assert!(matches!(classify_steer_input("/thinking", true), SteerRoute::DeferCommand));
 
         // `/queue` edits run live regardless of the Enter vs Ctrl-Enter flag.
         assert!(matches!(classify_steer_input("/queue add hello", true), SteerRoute::QueueCommand(_)));
@@ -2124,5 +2940,111 @@ mod tests {
             "an untruncated max-turn response keeps the dimmed stop-note fallback"
         );
         ui::set_verbosity(ui::Verbosity::Normal);
+    }
+
+    #[test]
+    fn forget_id_requires_a_token_boundary() {
+        // A well-formed `forget` request yields the trimmed id.
+        assert_eq!(parse_forget_id("forget mem-abc"), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget  mem-abc  "), Some("mem-abc"));
+        assert_eq!(parse_forget_id("forget\tmem-abc"), Some("mem-abc"));
+        // `forget` alone is a forget request with an empty id (usage error).
+        assert_eq!(parse_forget_id("forget"), Some(""));
+        // No token boundary: `forgetmem-…` is NOT a forget request, so the
+        // caller reports an unknown argument instead of deleting `mem-…`
+        // (Copilot finding, src/main.rs).
+        assert_eq!(parse_forget_id("forgetmem-abc"), None);
+        assert_eq!(parse_forget_id("forgetful"), None);
+        // Unrelated args are not forget requests either.
+        assert_eq!(parse_forget_id(""), None);
+        assert_eq!(parse_forget_id("list"), None);
+    }
+
+    /// Minimal `LLMClient` for `memory_command` tests: the slash command never
+    /// calls the model, so a client that panics if it ever is suffices.
+    struct NoModel;
+
+    #[async_trait::async_trait]
+    impl crate::llm::LLMClient for NoModel {
+        async fn chat(&self, _: &crate::llm::ChatRequest<'_>) -> Result<crate::llm::LLMResponse> {
+            panic!("memory_command must not call the model")
+        }
+        fn model_name(&self) -> &str {
+            "none"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// A memory-enabled agent (user+project store under `dir`) for
+    /// `memory_command` tests.
+    fn memory_command_agent(dir: &std::path::Path) -> Agent {
+        let config = config::Config {
+            session_dir: Some(dir.join("sessions")),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory: config::MemoryMode::On,
+            memory_dir: Some(dir.join("memory")),
+            ..config::Config::default()
+        };
+        Agent::new(Box::new(NoModel), config)
+    }
+
+    #[test]
+    fn memory_forget_is_refused_in_plan_mode() {
+        // `/memory forget` reaches `Store::forget` directly, bypassing the tool
+        // dispatch that refuses `memory_forget` in Plan mode. It must gate on
+        // the live mode itself, or a mid-plan `/memory forget` would delete the
+        // persistent scope file despite Plan mode's read-only promise (Copilot
+        // finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+        let id = agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap().id;
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(msg.contains("plan mode"), "forget refused in plan mode: {msg}");
+        assert!(
+            agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "plan mode did not delete the entry"
+        );
+        // Leaving Plan mode lifts the gate: the same forget now succeeds.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, &format!("forget {id}"));
+        assert!(!msg.contains("plan mode"), "normal mode forgets: {msg}");
+        assert!(
+            !agent.memory().unwrap().all().unwrap().iter().any(|(_, e)| e.id == id),
+            "normal mode deleted the entry"
+        );
+    }
+
+    #[test]
+    fn memory_list_hints_gate_on_effective_plan_mode_writability() {
+        // In Plan mode the configured memory stays `On`, but `memory_save` is
+        // removed and `/memory forget` is refused. The `/memory` output must not
+        // advertise either: gate both the empty-list `memory_save` pointer and
+        // the populated-list `/memory forget <id>` hint on `memory_writable()`,
+        // which includes the live mode (Copilot finding, src/main.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = memory_command_agent(dir.path());
+
+        // Empty memory, Plan mode: no `memory_save` suggestion.
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("memory_save"), "plan-mode empty hint hides memory_save: {msg}");
+        // Normal mode restores the suggestion.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("memory_save"), "normal-mode empty hint offers memory_save: {msg}");
+
+        // Populated memory, Plan mode: no `/memory forget` hint.
+        agent.memory().unwrap().save(memory::Scope::User, "a fact to keep", None, None).unwrap();
+        agent.set_mode(crate::mode::AgentMode::Plan);
+        let msg = memory_command(&mut agent, "");
+        assert!(!msg.contains("/memory forget"), "plan-mode list hides forget hint: {msg}");
+        // Normal mode restores the hint.
+        agent.set_mode(crate::mode::AgentMode::Normal);
+        let msg = memory_command(&mut agent, "");
+        assert!(msg.contains("/memory forget"), "normal-mode list offers forget hint: {msg}");
     }
 }

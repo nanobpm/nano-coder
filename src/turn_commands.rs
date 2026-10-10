@@ -174,7 +174,6 @@ impl Snapshot {
             ("/plan", "") => block(plan.render(true, usize::MAX).trim_end().to_string()),
             ("/context", "") => block(self.context(stats)),
             ("/mode", "") => {
-                let current = stats.mode;
                 let mut out = vec![format!("Mode: {current} ({})", current.describe())];
                 for mode in crate::mode::AgentMode::ALL {
                     out.push(format!("  {:<8} {}", mode.to_string(), mode.describe()));
@@ -408,6 +407,7 @@ mod tests {
         }
     }
 
+    #[test]
     #[test]
     fn non_space_whitespace_routes_like_a_space() {
         // `timing` splits on any whitespace, so the dispatch and snapshot-output

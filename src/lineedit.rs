@@ -19,6 +19,67 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::status::StatusLine;
 
+/// Esc twice within this window acts as one gesture: it clears the idle
+/// prompt's input, and (read by the turn loop) cancels a running turn. Defined
+/// once so the two paths cannot drift apart.
+pub const DOUBLE_ESCAPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Detects a double Esc press within [`DOUBLE_ESCAPE_WINDOW`]. The window is
+/// time-based: a press landing after it starts a fresh pair rather than
+/// completing the old one, so an Esc used alone (readline/vi line-editing) does
+/// not half-trigger the gesture. Callers decide on the press that *completes*
+/// the pair, never on the first one.
+///
+/// A pair is also scoped to a single uninterrupted idle-prompt session: each
+/// armed press records the edit *generation* it was made in (see
+/// [`EditView::edit_generation`]), and a later press only completes the pair
+/// when the generation still matches. The reader is persistent and a single
+/// `read_line` stays outstanding across a Prompt→Turn→Prompt transition (an Esc
+/// is forwarded to the turn loop without returning), so a time-only pair could
+/// otherwise let one arm made before a turn complete with one Esc at the next
+/// prompt. The generation changes on every mode transition, invalidating such a
+/// stale arm even though the gesture's own `read_line` never reset it.
+#[derive(Default)]
+pub struct DoubleEscape {
+    last: Option<(std::time::Instant, u64)>,
+}
+
+impl DoubleEscape {
+    /// Record a press at `now` in edit generation `generation`; true when it
+    /// completes a double press. A press completes the pair only when the prior
+    /// arm is within [`DOUBLE_ESCAPE_WINDOW`] *and* was made in the same
+    /// generation, so a mode transition between the two presses starts a fresh
+    /// pair. The pair is consumed, so the next press starts a fresh one.
+    pub fn press_in(&mut self, now: std::time::Instant, generation: u64) -> bool {
+        match self.last.take() {
+            Some((last, armed_gen)) if armed_gen == generation && now.duration_since(last) <= DOUBLE_ESCAPE_WINDOW => {
+                true
+            }
+            _ => {
+                self.last = Some((now, generation));
+                false
+            }
+        }
+    }
+
+    /// Record a press at `now`; true when it completes a double press. For
+    /// detectors that are not scoped to an edit generation (e.g. the turn-loop
+    /// cancel, which uses this `DoubleEscape` type), which live for a single
+    /// purpose and never cross a prompt/turn boundary. The Ctrl-C exit gesture
+    /// is a *separate* `DoublePress` detector in `src/main.rs`, not a user of
+    /// this method.
+    pub fn press(&mut self, now: std::time::Instant) -> bool {
+        self.press_in(now, 0)
+    }
+
+    /// Forget any armed press, so the next one starts a fresh pair. Used at a
+    /// read/mode boundary: a pair is two presses at the same idle prompt, so a
+    /// press recorded before the boundary must never complete one after it.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Advance a wrap position by one input grapheme cluster, measured in terminal
 /// cells.
 ///
@@ -73,6 +134,11 @@ pub struct EditView {
     /// Cursor position as a character index into `line` (0..=chars).
     cursor: usize,
     mode: EditMode,
+    /// Bumped on every mode transition. The double-Esc detector records the
+    /// generation an Esc armed in, so an arm cannot survive a Prompt↔Turn
+    /// transition and complete at the next prompt: a pair must be two presses
+    /// at the same uninterrupted idle prompt.
+    edit_generation: u64,
     status: Option<Arc<StatusLine>>,
     /// Rows below the prompt used by the command menu.
     menu_rows: usize,
@@ -126,6 +192,7 @@ impl EditView {
             line: String::new(),
             cursor: 0,
             mode: EditMode::Prompt,
+            edit_generation: 0,
             status,
             menu_rows: 0,
             menu_hidden: false,
@@ -149,6 +216,37 @@ impl EditView {
         self.menu_enabled = false;
     }
 
+    /// Match the editor's drawing path to the renderer: `true` routes every
+    /// change through the frame hook (and disables the inline command menu,
+    /// which the frame draws instead); `false` restores the inline editor and
+    /// its menu. Used when a live `renderer` switch in `/settings` flips the
+    /// app-owned frame renderer on or off.
+    pub fn set_frame_mode(&mut self, on: bool, hook: Option<EditHook>) {
+        self.on_edit = on.then(|| hook.expect("a hook is required when enabling frame mode"));
+        // Only re-enable the inline editor/menu (which writes cursor/erase
+        // sequences straight to stdout) when both stdin and stdout are real
+        // terminals, matching `Terminal::start`'s `key_mode`. Off a tty the
+        // frame is never active, so a configured-renderer switch calls this
+        // with `on == false`; without this guard it would turn inline drawing
+        // on and the following `resize()` would spew escape sequences into
+        // redirected output.
+        use std::io::IsTerminal;
+        self.menu_enabled = !on && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    }
+
+    /// Forget where the last inline redraw left the prompt: the frame renderer
+    /// owned the screen and leaves the cursor on the bottom row, so the
+    /// recorded prompt span / cursor offset no longer match anything on
+    /// screen. Reset to "one prompt row, cursor on it" (the state the main
+    /// loop's next prompt print establishes) so the first inline redraw after
+    /// a frame → legacy switch clears and climbs within that row instead of
+    /// walking up into the status line or leftover frame content.
+    pub fn reset_drawing(&mut self) {
+        self.menu_rows = 0;
+        self.drawn_rows = 1;
+        self.drawn_cursor_row = 0;
+    }
+
     /// Redraw the editor: through the frame hook when set, else inline / on the
     /// status line as before.
     fn draw_edit(&mut self) {
@@ -170,6 +268,12 @@ impl EditView {
     }
 
     pub fn set_mode(&mut self, mode: EditMode) {
+        if mode != self.mode {
+            // A pair of Esc presses is scoped to one uninterrupted idle prompt;
+            // bumping the generation on every transition invalidates any arm
+            // made before this change so it cannot complete after it.
+            self.edit_generation = self.edit_generation.wrapping_add(1);
+        }
         self.mode = mode;
         if self.on_edit.is_some() {
             // The frame renderer owns the screen: refresh through the hook
@@ -699,6 +803,18 @@ impl EditView {
         self.mutated();
     }
 
+    /// Clear the input when it holds text, reporting whether it did. The idle
+    /// prompt's "Esc Esc clears the input" gesture goes through here rather than
+    /// `clear_line` so an empty buffer is a true no-op — no redraw and no
+    /// `history.edited()` — and the caller can tell it cleared nothing.
+    pub fn clear_input_if_any(&mut self) -> bool {
+        if self.line.is_empty() {
+            return false;
+        }
+        self.clear_line();
+        true
+    }
+
     /// Move the cursor, updating the status line or the terminal cursor.
     fn move_to(&mut self, idx: usize) {
         let idx = idx.min(self.line.chars().count());
@@ -1022,12 +1138,50 @@ enum Esc {
     Ignored,
 }
 
+/// Marks the view as a non-idle (`EditMode::Turn`) phase for the guard's
+/// lifetime, restoring `EditMode::Prompt` when it is dropped. Compaction runs
+/// on the still-outstanding prompt read (a `/compact` deferred from a turn
+/// executes after the turn loop already restored `Prompt`), so without this the
+/// idle "Esc Esc clears the input" gesture would erase a partially typed next
+/// message with the same presses that cancel the compaction. Bracketing the
+/// phase with a guard — rather than a hand-placed `set_mode(Turn)` / trailing
+/// `set_mode(Prompt)` pair — restores the idle prompt on *every* exit path
+/// (including a future early `return`, `?`, or panic that unwinds the loop),
+/// not just the single explicit one, and makes the transition directly
+/// testable without driving a whole async compaction.
+#[must_use = "dropping the guard immediately restores EditMode::Prompt"]
+pub struct NonIdlePhase {
+    view: SharedView,
+}
+
+impl NonIdlePhase {
+    /// Enter the non-idle phase: mark the view `Turn` now, restore `Prompt` on
+    /// drop. Each transition bumps the view's edit generation (see
+    /// [`EditView::set_mode`]), so a double-Esc arm made before the phase cannot
+    /// complete with a single press after it.
+    pub fn enter(view: &SharedView) -> Self {
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        Self { view: view.clone() }
+    }
+}
+
+impl Drop for NonIdlePhase {
+    fn drop(&mut self) {
+        self.view.lock().unwrap().set_mode(EditMode::Prompt);
+    }
+}
+
 /// Reads keys, carrying bytes that arrived past the end of a line (pastes)
 /// into the next read.
 #[derive(Default)]
 pub struct LineReader {
     pending: std::collections::VecDeque<u8>,
     utf8: Vec<u8>,
+    /// The idle prompt's "Esc Esc clears the input" gesture: the paired-press
+    /// detector. Lives here because `read_line` is the only place that sees
+    /// every Esc, and it must be per-reader so a held detector cannot leak
+    /// across readers.
+    escape: DoubleEscape,
     /// While set, the reader yields stdin instead of consuming it, so a
     /// foreground picker (a `question`/turn-cap prompt) can own the terminal
     /// without racing this reader for keystrokes.
@@ -1124,10 +1278,50 @@ impl LineReader {
         self.next_byte()
     }
 
+    /// Record an Esc press at `now` for the idle prompt's "Esc Esc clears the
+    /// input" gesture at `view`; true only when the press completes the double
+    /// press *and* that completed gesture cleared non-empty input. A completed
+    /// pair on an empty prompt still consumes the pair but returns `false`
+    /// (there is nothing to clear), so `false` does not by itself mean the pair
+    /// went uncompleted. A lone press (or a second one after
+    /// [`DOUBLE_ESCAPE_WINDOW`] has lapsed) arms the detector and leaves the
+    /// text alone, so an Esc used alone for line editing does not discard the
+    /// buffer.
+    ///
+    /// The gesture is scoped to the idle prompt (`EditMode::Prompt`) in both
+    /// directions: during a turn the input lives on the status line as the
+    /// *next* message, and an Esc there cancels or steers — so a Turn-mode
+    /// press must neither clear the text nor *arm* the detector. Arming on a
+    /// turn-time press would let one Esc at the next idle prompt complete the
+    /// pair and clear the buffer, when the gesture requires two presses there.
+    ///
+    /// The pair is also scoped to one *uninterrupted* idle prompt: the reader
+    /// is persistent and a single `read_line` stays outstanding across a
+    /// Prompt→Turn→Prompt transition (an Esc is forwarded without returning),
+    /// so the arm is tagged with the view's edit generation and only completes
+    /// while that generation is unchanged. An intervening turn bumps it, so an
+    /// arm made before the turn cannot complete with one Esc at the next prompt.
+    pub fn escape_press(&mut self, view: &SharedView, now: std::time::Instant) -> bool {
+        let mut view = view.lock().unwrap();
+        if view.mode != EditMode::Prompt {
+            return false;
+        }
+        if !self.escape.press_in(now, view.edit_generation) {
+            return false;
+        }
+        view.clear_input_if_any()
+    }
+
     /// Read one line. Ctrl-C, Ctrl-O and Esc go to `send` straight away; the
     /// return value is a `Key::Line` or `Key::Eof`.
     pub fn read_line(&mut self, view: &SharedView, send: &dyn Fn(Key)) -> Key {
         let _mode = KeyMode::enter();
+        // A double press is two Esc presses at the same idle prompt, so the
+        // detector must not carry an arm across a read boundary: this reader
+        // is persistent, and without the reset an Esc pressed in a previous
+        // read (e.g. mid-turn) could pair with a single Esc here and clear
+        // the buffer.
+        self.escape.reset();
         {
             // The inline menu writes escape sequences (IND scrolls, cursor
             // save/restore) straight to the terminal. Under the frame renderer
@@ -1258,8 +1452,22 @@ impl LineReader {
                                             None => return Key::Line(view.take() + "\n"),
                                         }
                                     }
-                                    Esc::Escape if menu => shared.lock().unwrap().hide_menu(),
-                                    Esc::Escape => send(Key::Escape),
+                                    Esc::Escape if menu => {
+                                        // Closing the menu is the first Esc of
+                                        // the idle clear gesture: record it
+                                        // before hiding the menu so a `/` line
+                                        // clears in two presses, not three
+                                        // (hide, then arm, then clear).
+                                        self.escape_press(shared, std::time::Instant::now());
+                                        shared.lock().unwrap().hide_menu();
+                                    }
+                                    Esc::Escape => {
+                                        // With the command menu already closed
+                                        // (above), Esc is the idle prompt's
+                                        // clear gesture (a no-op during a turn).
+                                        self.escape_press(shared, std::time::Instant::now());
+                                        send(Key::Escape);
+                                    }
                                     // Re-read as the byte legacy mode sends,
                                     // so every control key keeps one handler.
                                     Esc::Control(byte) => self.pending.push_front(byte),
@@ -1267,11 +1475,23 @@ impl LineReader {
                                 }
                             }
                         }
-                        None if menu => shared.lock().unwrap().hide_menu(),
-                        None => send(Key::Escape),
+                        None if menu => {
+                            // Same as the kitty Esc above: the menu-closing
+                            // press is the first half of the clear gesture,
+                            // not a wasted press.
+                            self.escape_press(shared, std::time::Instant::now());
+                            shared.lock().unwrap().hide_menu();
+                        }
+                        None => {
+                            // A lone Esc (no continuation): the idle clear
+                            // gesture, and the turn loop's cancel.
+                            self.escape_press(shared, std::time::Instant::now());
+                            send(Key::Escape);
+                        }
                         // Esc Esc typed faster than the wait: two presses.
                         Some(0x1b) => {
                             self.pending.push_front(0x1b);
+                            self.escape_press(shared, std::time::Instant::now());
                             send(Key::Escape);
                         }
                         // Alt-b / Alt-f: readline word jumps arrive as ESC b /
@@ -1468,6 +1688,7 @@ mod tests {
             line: line.into(),
             cursor: line.chars().count(),
             mode: EditMode::Turn,
+            edit_generation: 0,
             status: None,
             menu_rows: 0,
             menu_hidden: false,
@@ -1491,6 +1712,23 @@ mod tests {
         assert_eq!(view.line, "run a\u{a0}");
         view.erase_word();
         assert_eq!(view.line, "run ");
+    }
+
+    #[test]
+    fn reset_drawing_restores_the_single_prompt_row_baseline() {
+        // After the frame renderer owned the screen, the editor's drawn state
+        // refers to rows it no longer controls: a stale span would make the
+        // first inline redraw climb into the status line or leftover frame
+        // content. The reset restores the "one prompt row, cursor on it"
+        // baseline the next prompt print establishes.
+        let mut view = view("/settings");
+        view.menu_rows = 3;
+        view.drawn_rows = 5;
+        view.drawn_cursor_row = 2;
+        view.reset_drawing();
+        assert_eq!(view.menu_rows, 0);
+        assert_eq!(view.drawn_rows, 1);
+        assert_eq!(view.drawn_cursor_row, 0);
     }
 
     #[test]
@@ -2149,7 +2387,9 @@ mod tests {
             // Ctrl-A / Ctrl-U / Ctrl-W edit the line.
             assert_eq!(keys_sent(view, b"one two\x1b[119;5u\x1b[97;5uX\r"), ["-> line \"Xone \\n\""]);
         }
-        // At the prompt with the command menu open, Esc closes the menu first.
+        // At the prompt with the command menu open, Esc closes the menu and
+        // counts as the first half of the clear gesture, so the second Esc
+        // clears the line (Ctrl-U here is then a no-op).
         frame.lock().unwrap().mode = EditMode::Prompt;
         assert_eq!(keys_sent(&frame, b"/he\x1b[27u\x1b[27u\x1b[117;5u\r"), ["escape", "-> line \"\\n\""]);
     }
@@ -2284,6 +2524,307 @@ mod tests {
         assert_eq!(view.take(), "one\ntwo");
         assert!(view.line.is_empty());
         assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn clear_input_if_any_empties_a_non_empty_line() {
+        // The idle-prompt "Esc Esc clears the input" gesture clears through this
+        // helper. A non-empty buffer becomes empty with the cursor at home, in
+        // both render paths (the turn used the frame hook).
+        let mut plain = view("hello");
+        assert!(plain.clear_input_if_any(), "a non-empty line is cleared");
+        assert!(plain.line.is_empty());
+        assert_eq!(plain.cursor, 0);
+        // A multiline buffer (Ctrl-Enter newlines) clears whole.
+        let mut multiline = view("one\ntwo");
+        assert!(multiline.clear_input_if_any());
+        assert!(multiline.line.is_empty());
+        // Frame path: the clear still lands in the buffer.
+        let mut frame = view("hello");
+        frame.set_edit_hook(Arc::new(|_, _, _, _| {}));
+        assert!(frame.clear_input_if_any());
+        assert!(frame.line.is_empty());
+    }
+
+    #[test]
+    fn clear_input_if_any_is_an_inert_no_op_on_an_empty_line() {
+        // "only when there is text": an empty buffer must not be redrawn (or
+        // trip history), so the second Esc on an empty prompt does nothing.
+        // Pin both halves of "inert": the edit hook must not fire (no redraw)
+        // and a browsing history position must survive (no `history.edited()`).
+        let calls = Arc::new(Mutex::new(0usize));
+        let mut view = view("");
+        let counter = calls.clone();
+        view.on_edit = Some(Arc::new(move |_: &str, _: usize, _: usize, _: &[String]| {
+            *counter.lock().unwrap() += 1;
+        }));
+        // Enter a browsing state directly (keeping the buffer empty, the case
+        // under test): a stray `history.edited()` on the empty path would reset
+        // `position`, changing what the next Down returns.
+        view.history.record("earlier");
+        assert_eq!(view.history.up(""), Some("earlier"), "recall entered the browsing state");
+
+        *calls.lock().unwrap() = 0;
+        assert!(!view.clear_input_if_any(), "nothing to clear");
+        assert!(view.line.is_empty());
+        assert_eq!(view.cursor, 0);
+        assert_eq!(*calls.lock().unwrap(), 0, "the empty path triggers no redraw");
+        // Browsing position survived: Down past the newest entry still returns
+        // to the saved (empty) draft, which a `history.edited()` would have lost.
+        assert_eq!(view.history.down(), Some(""), "the browsing position was not reset by the no-op");
+    }
+
+    /// A prompt-mode reader with `line` in its buffer, drawing disabled.
+    fn prompt_reader(line: &str) -> (LineReader, SharedView) {
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        view.lock().unwrap().mode = EditMode::Prompt;
+        view.lock().unwrap().insert(line);
+        (LineReader::default(), view)
+    }
+
+    #[test]
+    fn double_escape_press_clears_a_non_empty_idle_input() {
+        // The idle prompt's gesture: with text in the buffer, a second Esc
+        // within the window clears it. A lone Esc (or a second one after the
+        // window has lapsed) leaves the text alone.
+        let (mut reader, view) = prompt_reader("half-typed prompt");
+        let t = std::time::Instant::now();
+        assert!(!reader.escape_press(&view, t), "the first Esc only arms the detector");
+        assert_eq!(view.lock().unwrap().line, "half-typed prompt", "one Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(400)), "the second completes it");
+        assert!(view.lock().unwrap().line.is_empty(), "the completing press clears the buffer");
+        // The paired press consumed the arm, so the next one starts over and
+        // does not clear the text typed since.
+        view.lock().unwrap().insert("again");
+        assert!(!reader.escape_press(&view, t + std::time::Duration::from_millis(500)));
+        assert_eq!(view.lock().unwrap().line, "again");
+        // Outside the window: the second press re-arms instead of completing.
+        assert!(!reader.escape_press(&view, t + std::time::Duration::from_millis(1600)));
+        assert_eq!(view.lock().unwrap().line, "again", "a slow second Esc does not clear");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(1700)));
+    }
+
+    #[test]
+    fn escape_clears_through_the_reader_and_only_when_there_is_text() {
+        // End to end through the key path at the prompt: two Esc bytes clear a
+        // non-empty buffer (in both render paths), while two Esc on an empty
+        // buffer leave it empty without error. Each Esc still reaches the turn
+        // loop as `Key::Escape`.
+        for frame in [false, true] {
+            let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+            if frame {
+                view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+            }
+            view.lock().unwrap().mode = EditMode::Prompt;
+            view.lock().unwrap().line = "draft".into();
+            view.lock().unwrap().cursor = 5;
+            let sent = Mutex::new(Vec::new());
+            let mut reader = LineReader::default();
+            reader.pending.extend(b"\x1b\x1b".iter());
+            let key = reader.read_line(&view, &|key| sent.lock().unwrap().push(key_name(&key)));
+            assert_eq!(sent.into_inner().unwrap(), ["escape", "escape"], "frame={frame}");
+            assert!(matches!(key, Key::Eof), "the pending buffer ends");
+            assert!(view.lock().unwrap().line.is_empty(), "two Esc cleared the input (frame={frame})");
+        }
+        // A lone Esc on an empty line leaves it empty (nothing to clear).
+        let (mut reader, view) = prompt_reader("");
+        assert!(!reader.escape_press(&view, std::time::Instant::now()));
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn escape_does_not_clear_the_input_during_a_turn() {
+        // The gesture is the idle prompt's: during a turn the typed text is the
+        // next message (steered with Enter), so Esc must not discard it.
+        let (mut reader, view) = prompt_reader("steer this");
+        view.lock().unwrap().mode = EditMode::Turn;
+        let t = std::time::Instant::now();
+        assert!(!reader.escape_press(&view, t));
+        assert!(!reader.escape_press(&view, t + std::time::Duration::from_millis(100)));
+        assert_eq!(view.lock().unwrap().line, "steer this", "Esc during a turn keeps the next message");
+    }
+
+    #[test]
+    fn escape_during_a_turn_does_not_arm_the_prompt_clear() {
+        // The reader is persistent, so a Turn-mode Esc must not arm the
+        // detector: otherwise one Esc at the next idle prompt would complete
+        // the pair and clear the buffer, when the gesture requires two
+        // presses at that prompt.
+        let (mut reader, view) = prompt_reader("next message");
+        let t = std::time::Instant::now();
+        view.lock().unwrap().mode = EditMode::Turn;
+        assert!(!reader.escape_press(&view, t), "a turn-time Esc is not the gesture's");
+        view.lock().unwrap().mode = EditMode::Prompt;
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "the first Esc at the idle prompt only arms; the turn-time press must not count"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "one idle Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two idle Esc presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn an_arm_does_not_survive_an_intervening_turn() {
+        // The reader is persistent and a single `read_line` stays outstanding
+        // across a Prompt→Turn→Prompt transition (an Esc is forwarded to the
+        // turn loop without returning), so `read_line`'s own reset never runs.
+        // An Esc armed at the idle prompt must not pair with one Esc at the
+        // *next* prompt after a turn ran in between: `set_mode` bumps the edit
+        // generation, invalidating the stale arm.
+        let (mut reader, view) = prompt_reader("draft");
+        let t = std::time::Instant::now();
+        // Arm at the idle prompt.
+        assert!(!reader.escape_press(&view, t), "the first Esc only arms");
+        // A queued turn runs on the same outstanding read, then we return to
+        // the prompt — within the double-Esc window.
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "one Esc after the turn must not complete the pre-turn arm"
+        );
+        assert_eq!(view.lock().unwrap().line, "draft", "the draft survives one post-turn Esc");
+        // Two fresh presses at the same prompt still clear.
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(200)), "two presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn escape_during_compaction_neither_clears_nor_arms() {
+        // A `/compact` deferred from a turn runs after the turn loop already
+        // restored `EditMode::Prompt`, on the same outstanding read. The
+        // compaction marks itself a non-idle (`Turn`) phase, so while a partial
+        // next message sits in the buffer an Esc pressed to cancel the
+        // compaction must neither clear that text nor arm the clear gesture —
+        // and the Prompt→Turn→Prompt transitions bump the edit generation, so
+        // an arm made before the compaction cannot complete with one Esc after.
+        let (mut reader, view) = prompt_reader("next message");
+        let t = std::time::Instant::now();
+        // Arm the gesture at the idle prompt before the turn/compaction.
+        assert!(!reader.escape_press(&view, t), "the first Esc only arms");
+        // Turn runs and ends (Prompt restored), then the deferred compaction
+        // marks itself Turn. Both transitions invalidate the pre-existing arm.
+        view.lock().unwrap().set_mode(EditMode::Turn);
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        view.lock().unwrap().set_mode(EditMode::Turn); // compaction runs
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "a compaction-time Esc is not the gesture's and does not complete the stale arm"
+        );
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(200)),
+            "a second compaction-time Esc still does not clear"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "the partial input survives compaction");
+        // Compaction finishes, restoring the idle prompt: the gesture is live
+        // again, but needs two fresh presses (the compaction-time ones did not arm it).
+        view.lock().unwrap().set_mode(EditMode::Prompt);
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(300)),
+            "the first idle Esc after compaction only re-arms"
+        );
+        assert_eq!(view.lock().unwrap().line, "next message", "one post-compaction Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(400)), "two idle presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn non_idle_phase_marks_turn_and_restores_prompt_on_drop() {
+        // The guard that brackets a compaction (`run_compaction`) must mark the
+        // view `Turn` for its lifetime and restore `Prompt` when it drops — and
+        // it must bump the edit generation on *both* transitions so a double-Esc
+        // arm made before the phase cannot complete with one press after it.
+        let (mut reader, view) = prompt_reader("draft");
+        assert_eq!(view.lock().unwrap().mode, EditMode::Prompt);
+        let gen_before = view.lock().unwrap().edit_generation;
+        // Arm the idle gesture, then enter the non-idle phase.
+        let t = std::time::Instant::now();
+        assert!(!reader.escape_press(&view, t), "the first idle Esc only arms");
+        {
+            let _phase = NonIdlePhase::enter(&view);
+            assert_eq!(view.lock().unwrap().mode, EditMode::Turn, "the phase marks Turn");
+            assert_ne!(
+                view.lock().unwrap().edit_generation,
+                gen_before,
+                "entering the phase bumps the edit generation"
+            );
+            // A press during the phase neither clears nor arms (Turn-mode early
+            // return), and the pre-phase arm is now stale.
+            assert!(
+                !reader.escape_press(&view, t + std::time::Duration::from_millis(50)),
+                "a phase-time Esc neither clears nor completes the stale arm"
+            );
+            assert_eq!(view.lock().unwrap().line, "draft", "the draft survives the phase");
+        }
+        // Dropping the guard restores the idle prompt, bumping the generation
+        // again so the stale arm still cannot complete.
+        assert_eq!(view.lock().unwrap().mode, EditMode::Prompt, "drop restores Prompt");
+        assert!(
+            !reader.escape_press(&view, t + std::time::Duration::from_millis(100)),
+            "the first idle Esc after the phase only re-arms; the pre-phase arm did not survive"
+        );
+        assert_eq!(view.lock().unwrap().line, "draft", "one post-phase Esc keeps the text");
+        assert!(reader.escape_press(&view, t + std::time::Duration::from_millis(150)), "two fresh idle presses clear");
+        assert!(view.lock().unwrap().line.is_empty());
+    }
+
+    #[test]
+    fn a_new_read_starts_a_fresh_escape_pair() {
+        // `read_line` resets the detector, so an Esc that ended one read
+        // cannot pair with the first Esc of the next: two Esc bytes split
+        // across reads leave the buffer alone, while two inside one read
+        // clear it.
+        let view = EditView::shared(None, Arc::new(Mutex::new(EditContext::default())));
+        view.lock().unwrap().mode = EditMode::Prompt;
+        view.lock().unwrap().line = "draft".into();
+        view.lock().unwrap().cursor = 5;
+        let sent = Mutex::new(Vec::new());
+        let send = |key: Key| sent.lock().unwrap().push(key_name(&key));
+        let mut reader = LineReader::default();
+        reader.pending.extend(b"\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof), "the pending buffer ends");
+        view.lock().unwrap().line = "draft".into();
+        reader.pending.extend(b"\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof));
+        assert_eq!(view.lock().unwrap().line, "draft", "Esc presses split across reads never pair");
+        reader.pending.extend(b"\x1b\x1b".iter());
+        assert!(matches!(reader.read_line(&view, &send), Key::Eof));
+        assert!(view.lock().unwrap().line.is_empty(), "two Esc in one read clear the input");
+        assert_eq!(sent.into_inner().unwrap(), ["escape", "escape", "escape", "escape"]);
+    }
+
+    #[test]
+    fn double_escape_clears_a_command_menu_line_in_two_presses() {
+        // The menu-closing Esc is the first half of the idle clear gesture, so
+        // a `/command` line (menu open) clears in two Esc presses, not three.
+        // This holds for the kitty-encoded Esc (`Esc::Escape if menu`) and the
+        // legacy bare Esc (`None if menu`) alike, in both render paths.
+        let context = Arc::new(Mutex::new(EditContext::default()));
+        for frame in [false, true] {
+            // Kitty Esc: two `CSI 27 u` close the menu then clear the line.
+            let view = EditView::shared(None, context.clone());
+            if frame {
+                view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+            }
+            view.lock().unwrap().mode = EditMode::Prompt;
+            assert_eq!(
+                keys_sent(&view, b"/he\x1b[27u\x1b[27u\r"),
+                ["escape", "-> line \"\\n\""],
+                "kitty Esc Esc clears the `/` line (frame={frame})"
+            );
+            assert!(view.lock().unwrap().line.is_empty(), "kitty clear (frame={frame})");
+
+            // Legacy bare Esc bytes: the same gesture via the `None if menu`
+            // path (the trailing Esc is lone, so it reaches that branch).
+            let view = EditView::shared(None, context.clone());
+            if frame {
+                view.lock().unwrap().set_edit_hook(Arc::new(|_, _, _, _| {}));
+            }
+            view.lock().unwrap().mode = EditMode::Prompt;
+            keys_sent(&view, b"/he\x1b\x1b");
+            assert!(view.lock().unwrap().line.is_empty(), "legacy clear (frame={frame})");
+        }
     }
 
     #[test]

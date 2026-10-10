@@ -9,13 +9,18 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use crate::llm::{ChatRequest, LLMClient, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall};
 
 pub struct MockLLMClient {
+    provider: String,
     model: String,
     call_count: AtomicI64,
 }
 
 impl MockLLMClient {
-    pub fn new(model: &str) -> Self {
-        Self { model: model.to_string(), call_count: AtomicI64::new(0) }
+    /// `provider` is the resolved provider's name, kept so temperature (and
+    /// any other provider-keyed) lookup reads the entry the client was built
+    /// from — a custom provider with `kind = "mock"` must resolve against its
+    /// own entry, not the built-in `mock` one.
+    pub fn new(provider: &str, model: &str) -> Self {
+        Self { provider: provider.to_string(), model: model.to_string(), call_count: AtomicI64::new(0) }
     }
 
     fn usage(completion_tokens: i64) -> Option<TokenUsage> {
@@ -155,6 +160,6 @@ impl LLMClient for MockLLMClient {
     }
 
     fn provider_name(&self) -> &str {
-        "mock"
+        &self.provider
     }
 }
