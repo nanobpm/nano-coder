@@ -15,6 +15,20 @@ pub const SUGGEST_MEMORY_AFTER: usize = 30;
 pub const REPEAT_WARN_AFTER: usize = 3;
 /// How often the repeat warning may fire in one turn before the hard stop.
 pub const REPEAT_MAX_WARNINGS: usize = 2;
+/// Consecutive repeats of the *current* key required before a hard stop, on top
+/// of the spent warning budget. The warning budget (`repeat_warnings`) is
+/// turn-global on purpose — a model that ignored two warnings on earlier
+/// streaks has shown it is not reading them, so a fresh streak need not re-earn
+/// the whole budget. But the budget alone must not hard-stop a *different* key
+/// the moment it first reaches `REPEAT_WARN_AFTER`: an `A,A,A` (warn), change,
+/// `B,B,B` (warn), change, `C,C,C` sequence would otherwise hard-stop `C` on its
+/// third occurrence even though `C` never ignored a warning (the generated
+/// summary would also falsely claim this call kept repeating after two
+/// warnings). Gating the hard stop on this many *consecutive* matches of the
+/// current key means an unrelated retry still cannot trip it prematurely. Set to
+/// `REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS` so a single sustained streak still
+/// hard-stops on exactly the call after its warnings are spent (issue #65).
+pub const REPEAT_HARD_STOP_AFTER: usize = REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS;
 
 /// Tools where repeating the same call is legitimate (waiting on a person):
 /// the loop detector never counts them. Only ever-available tools belong here.
@@ -236,11 +250,17 @@ impl Reminders {
                 "You have now made this same `{tool}` call {times} times in a row with {outcome}. Repeating it \
                  will not change anything. Change approach: try something different{escape}."
             ))
-        } else {
+        } else if self.repeat_count >= REPEAT_HARD_STOP_AFTER {
             RepeatVerdict::HardStop(format!(
                 "the model repeated the same `{tool}` call {times} times in a row with {outcome}, and kept \
                  repeating it after {REPEAT_MAX_WARNINGS} warnings to change approach"
             ))
+        } else {
+            // The turn's global warning budget is spent, but *this* key has not
+            // repeated enough on its own to hard-stop yet — it is a different
+            // call from the one(s) that earned the warnings, so stay silent
+            // until it genuinely loops `REPEAT_HARD_STOP_AFTER` times in a row.
+            RepeatVerdict::None
         }
     }
 }
@@ -663,6 +683,37 @@ mod tests {
         // …and the hard stop keeps firing while the loop continues.
         assert!(matches!(
             r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[]),
+            RepeatVerdict::HardStop(_)
+        ));
+    }
+
+    #[test]
+    fn a_fresh_streak_does_not_hard_stop_before_its_own_warnings() {
+        // The warning budget is turn-global, but a *different* key that reaches
+        // `REPEAT_WARN_AFTER` after the budget is spent must not hard-stop on its
+        // third occurrence — it never ignored a warning of its own (issue #65).
+        // `A,A,A` (warn), `B,B,B` (warn) spends the budget; `C,C,…` must stay
+        // silent until it genuinely loops `REPEAT_HARD_STOP_AFTER` times in a row.
+        let mut r = Reminders::default();
+        let warn = |r: &mut Reminders, cmd: &str| {
+            let mut last = RepeatVerdict::None;
+            for _ in 0..REPEAT_WARN_AFTER {
+                last = r.after_repeat_call("bash", &json!({"command": cmd}), None, false, "exit 1", &[]);
+            }
+            last
+        };
+        assert!(matches!(warn(&mut r, "cmd a"), RepeatVerdict::Warning(_)));
+        assert!(matches!(warn(&mut r, "cmd b"), RepeatVerdict::Warning(_)), "budget must be spent");
+        // Fresh key C: its first `REPEAT_HARD_STOP_AFTER - 1` consecutive repeats
+        // neither warn (budget spent) nor hard-stop (not enough of *this* key).
+        let mut verdicts = Vec::new();
+        for _ in 0..REPEAT_HARD_STOP_AFTER - 1 {
+            verdicts.push(r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", &[]));
+        }
+        assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "fresh key must not hard-stop early: {verdicts:?}");
+        // Only the `REPEAT_HARD_STOP_AFTER`-th consecutive C hard-stops.
+        assert!(matches!(
+            r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", &[]),
             RepeatVerdict::HardStop(_)
         ));
     }
