@@ -126,7 +126,10 @@ pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<Spill>) {
     let arguments = match validate(config, args) {
         Ok(arguments) => arguments,
         Err(message) => {
-            return (format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0), Vec::new());
+            return (
+                format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0),
+                Vec::new(),
+            );
         }
     };
     match execute(config, &arguments) {

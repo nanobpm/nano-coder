@@ -234,10 +234,7 @@ impl Reminders {
             return RepeatVerdict::None;
         }
         let key = repeat_key(tool, args, raw_args, ok, result, hashes);
-        let cmd = (tool == "bash")
-            .then(|| args.get("command").and_then(Value::as_str))
-            .flatten()
-            .map(str::to_string);
+        let cmd = (tool == "bash").then(|| args.get("command").and_then(Value::as_str)).flatten().map(str::to_string);
         // Same grouping key (tool + stripped base + error + output hash) is
         // necessary but, for a bash command, not sufficient: the stripped base
         // is identical when only a trailing diagnostic *argument* changed, so
@@ -298,7 +295,14 @@ impl Reminders {
 /// marker path) of each spilled capture (see [`ContentHashes`]); when it is
 /// non-empty the marker's volatile path is normalised *without* trusting any
 /// digest inside the rendered text.
-fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result: &str, hashes: ContentHashes) -> String {
+fn repeat_key(
+    tool: &str,
+    args: &Value,
+    raw_args: Option<&str>,
+    ok: bool,
+    result: &str,
+    hashes: ContentHashes,
+) -> String {
     let args = match raw_args {
         Some(raw) => raw.to_string(),
         None => normalised_args(tool, args),
@@ -606,9 +610,8 @@ fn stage_has_side_effect<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>)
         // `less -o FILE` / `-O FILE` / `--log-file=FILE` logs (or overwrites)
         // its input to a file, so it is not read-only. `o`/`O` may sit inside a
         // short-option cluster (e.g. `less -No/tmp/a`), not only at its start.
-        "less" => args.any(|a| {
-            short_cluster_contains(a, 'o') || short_cluster_contains(a, 'O') || a.starts_with("--log-file")
-        }),
+        "less" => args
+            .any(|a| short_cluster_contains(a, 'o') || short_cluster_contains(a, 'O') || a.starts_with("--log-file")),
         _ => false,
     }
 }
@@ -721,7 +724,18 @@ mod tests {
     }
 
     fn repeats(r: &mut Reminders, n: usize) -> Vec<RepeatVerdict> {
-        (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default())).collect()
+        (0..n)
+            .map(|_| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test"}),
+                    None,
+                    false,
+                    "exit 1",
+                    ContentHashes::default(),
+                )
+            })
+            .collect()
     }
 
     fn repeats_call(r: &mut Reminders, tool: &str, n: usize, ok: bool, result: &str) -> Vec<RepeatVerdict> {
@@ -791,7 +805,14 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("make test {i}")}), None, false, "x", ContentHashes::default()),
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("make test {i}")}),
+                    None,
+                    false,
+                    "x",
+                    ContentHashes::default()
+                ),
                 RepeatVerdict::None
             );
         }
@@ -799,7 +820,14 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, &format!("exit {i}"), ContentHashes::default()),
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test"}),
+                    None,
+                    false,
+                    &format!("exit {i}"),
+                    ContentHashes::default()
+                ),
                 RepeatVerdict::None
             );
         }
@@ -814,7 +842,14 @@ mod tests {
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::HardStop(_)));
         // …and the hard stop keeps firing while the loop continues.
         assert!(matches!(
-            r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default()),
+            r.after_repeat_call(
+                "bash",
+                &json!({"command": "make test"}),
+                None,
+                false,
+                "exit 1",
+                ContentHashes::default()
+            ),
             RepeatVerdict::HardStop(_)
         ));
     }
@@ -830,7 +865,14 @@ mod tests {
         let warn = |r: &mut Reminders, cmd: &str| {
             let mut last = RepeatVerdict::None;
             for _ in 0..REPEAT_WARN_AFTER {
-                last = r.after_repeat_call("bash", &json!({"command": cmd}), None, false, "exit 1", ContentHashes::default());
+                last = r.after_repeat_call(
+                    "bash",
+                    &json!({"command": cmd}),
+                    None,
+                    false,
+                    "exit 1",
+                    ContentHashes::default(),
+                );
             }
             last
         };
@@ -840,7 +882,14 @@ mod tests {
         // neither warn (budget spent) nor hard-stop (not enough of *this* key).
         let mut verdicts = Vec::new();
         for _ in 0..REPEAT_HARD_STOP_AFTER - 1 {
-            verdicts.push(r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", ContentHashes::default()));
+            verdicts.push(r.after_repeat_call(
+                "bash",
+                &json!({"command": "cmd c"}),
+                None,
+                false,
+                "exit 1",
+                ContentHashes::default(),
+            ));
         }
         assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "fresh key must not hard-stop early: {verdicts:?}");
         // Only the `REPEAT_HARD_STOP_AFTER`-th consecutive C hard-stops.
@@ -856,7 +905,14 @@ mod tests {
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|i| {
                 let suffix = if i == 1 { String::new() } else { " | wc -l".repeat(i - 1) };
-                r.after_repeat_call("bash", &json!({"command": format!("gh pr diff 1{suffix}")}), None, true, "1", ContentHashes::default())
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("gh pr diff 1{suffix}")}),
+                    None,
+                    true,
+                    "1",
+                    ContentHashes::default(),
+                )
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -873,7 +929,14 @@ mod tests {
         let mut r = Reminders::default();
         for q in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"] {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), None, true, "", ContentHashes::default()),
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("cat log | grep {q}")}),
+                    None,
+                    true,
+                    "",
+                    ContentHashes::default()
+                ),
                 RepeatVerdict::None,
                 "query {q} must not count as a repeat",
             );
@@ -960,7 +1023,9 @@ mod tests {
         let mut r = Reminders::default();
         let raw = format!("{prefix}same");
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
-            .map(|_| r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", ContentHashes::default()))
+            .map(|_| {
+                r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", ContentHashes::default())
+            })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -969,10 +1034,14 @@ mod tests {
     fn exempt_tools_and_start_turn_reset_the_detector() {
         for tool in REPEAT_EXEMPT_TOOLS {
             let mut r = Reminders::default();
-            assert!(
-                (0..REPEAT_WARN_AFTER + 1)
-                    .all(|_| r.after_repeat_call(tool, &json!({}), None, true, "ok", ContentHashes::default()) == RepeatVerdict::None)
-            );
+            assert!((0..REPEAT_WARN_AFTER + 1).all(|_| r.after_repeat_call(
+                tool,
+                &json!({}),
+                None,
+                true,
+                "ok",
+                ContentHashes::default()
+            ) == RepeatVerdict::None));
         }
         let mut r = Reminders::default();
         repeats(&mut r, REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS);
@@ -991,10 +1060,20 @@ mod tests {
         let mut r = Reminders::default();
         for _ in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default()),
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test"}),
+                    None,
+                    false,
+                    "exit 1",
+                    ContentHashes::default()
+                ),
                 RepeatVerdict::None
             );
-            assert_eq!(r.after_repeat_call("question", &json!({}), None, true, "ok", ContentHashes::default()), RepeatVerdict::None);
+            assert_eq!(
+                r.after_repeat_call("question", &json!({}), None, true, "ok", ContentHashes::default()),
+                RepeatVerdict::None
+            );
         }
     }
 
@@ -1016,10 +1095,22 @@ mod tests {
         // not change the fingerprint, or the detector would never fire on the
         // exact runaway case it exists to catch (issue #65).
         let mut r = Reminders::default();
-        let result =
-            |n: usize| format!("HEAD...40 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL");
+        let result = |n: usize| {
+            format!(
+                "HEAD...40 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL"
+            )
+        };
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
+            .map(|n| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result(n),
+                    ContentHashes::default(),
+                )
+            })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -1040,7 +1131,14 @@ mod tests {
         };
         // Each call returns different full content (different digest) even
         // though head, tail, byte count and the normalised spill path all match.
-        let digests = ["aa11aa11aa11aa11", "bb22bb22bb22bb22", "cc33cc33cc33cc33", "dd44dd44dd44dd44", "ee55ee55ee55ee55", "ff66ff66ff66ff66"];
+        let digests = [
+            "aa11aa11aa11aa11",
+            "bb22bb22bb22bb22",
+            "cc33cc33cc33cc33",
+            "dd44dd44dd44dd44",
+            "ee55ee55ee55ee55",
+            "ff66ff66ff66ff66",
+        ];
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER + 1)
             .map(|n| {
                 let digest = digests[n % digests.len()];
@@ -1060,7 +1158,16 @@ mod tests {
         // And identical digests (genuinely identical full output) still repeat.
         let mut r2 = Reminders::default();
         let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa11aa11aa11aa11", n), ContentHashes::default()))
+            .map(|n| {
+                r2.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result("aa11aa11aa11aa11", n),
+                    ContentHashes::default(),
+                )
+            })
             .collect();
         assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
     }
@@ -1079,7 +1186,9 @@ mod tests {
         // the genuine marker is ever rewritten out of band.
         let embedded = "note 9 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /tmp/nano-coder-9/bash-embedded.stdout...";
         let result = |outer: &str, n: usize| {
-            format!("{embedded}...40 bytes truncated (sha256:{outer}); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL")
+            format!(
+                "{embedded}...40 bytes truncated (sha256:{outer}); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL"
+            )
         };
         // Two genuinely different outputs (different real outer digests) whose
         // embedded text is identical must NOT be conflated into a repeat. The
@@ -1217,7 +1326,16 @@ mod tests {
         let mut r2 = Reminders::default();
         let sha = format!("{:064}", 7);
         let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|_| r2.after_repeat_call("read_file", &json!({"path": "pic.png"}), None, true, text, ContentHashes { attachments: &[&sha], ..Default::default() }))
+            .map(|_| {
+                r2.after_repeat_call(
+                    "read_file",
+                    &json!({"path": "pic.png"}),
+                    None,
+                    true,
+                    text,
+                    ContentHashes { attachments: &[&sha], ..Default::default() },
+                )
+            })
             .collect();
         assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
     }
@@ -1229,10 +1347,16 @@ mod tests {
         // name must not change the fingerprint, or the runaway never warns or
         // hard-stops (issue #65).
         let mut r = Reminders::default();
-        let result =
-            |n: usize| format!("HEAD...40 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL", suffix = if n == 1 { String::new() } else { format!("-{n}") });
+        let result = |n: usize| {
+            format!(
+                "HEAD...40 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL",
+                suffix = if n == 1 { String::new() } else { format!("-{n}") }
+            )
+        };
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), ContentHashes::default()))
+            .map(|n| {
+                r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), ContentHashes::default())
+            })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -1243,22 +1367,46 @@ mod tests {
         // collision `-N` suffix) all normalise to the same placeholder *inside
         // the marker*.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-3.stdout...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-99-2.stdout...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-3.stdout...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-99-2.stdout...y",
+                &[]
+            ),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-1.stderr...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-7.stderr...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-1.stderr...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-7.stderr...y",
+                &[]
+            ),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-abc123-read_file.txt...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-zz99-read_file.txt...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-abc123-read_file.txt...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-zz99-read_file.txt...y",
+                &[]
+            ),
         );
         // history_read spills as `history-<id>.txt`, with a collision `-N`
         // suffix on a repeat; those per-call names must also collapse (issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7.txt...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7-2.txt...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7.txt...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7-2.txt...y",
+                &[]
+            ),
         );
         // Genuinely different content is still distinguished.
         assert_ne!(normalise_spill_paths("alpha", &[]), normalise_spill_paths("beta", &[]));
@@ -1271,7 +1419,10 @@ mod tests {
         // distinct, or a changing result is conflated into a false repeat and
         // hard-stops the turn (issue #65).
         assert_ne!(normalise_spill_paths("created tool-a.txt", &[]), normalise_spill_paths("created tool-b.txt", &[]));
-        assert_ne!(normalise_spill_paths("wrote bash-1.stdout", &[]), normalise_spill_paths("wrote bash-2.stdout", &[]));
+        assert_ne!(
+            normalise_spill_paths("wrote bash-1.stdout", &[]),
+            normalise_spill_paths("wrote bash-2.stdout", &[])
+        );
         // Ordinary output that quotes `complete output in <name>.txt...` without
         // the `bytes truncated;` prefix is not a bounder marker and must not be
         // normalised, or a genuine change is erased into a false repeat.
@@ -1281,8 +1432,14 @@ mod tests {
         );
         // The tail after the marker is preserved, so differing tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-1.stdout...tailA", &[]),
-            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-2.stdout...tailB", &[]),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-1.stdout...tailA",
+                &[]
+            ),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-2.stdout...tailB",
+                &[]
+            ),
         );
         // A digest-less `N bytes truncated; complete output in <name>...` is NOT
         // a bounder marker — every real path-bearing marker carries its
@@ -1302,14 +1459,32 @@ mod tests {
         // survives in the hash and the runaway never warns or hard-stops (the
         // `\S+`-based match silently failed here; issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-3.stdout...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-9.stdout...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-3.stdout...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-9.stdout...y",
+                &[]
+            ),
         );
         let mut r = Reminders::default();
-        let result =
-            |n: usize| format!("HEAD...40 bytes truncated (sha256:1111111111111111); complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
+        let result = |n: usize| {
+            format!(
+                "HEAD...40 bytes truncated (sha256:1111111111111111); complete output in /a b/nano-coder/bash-{n}.stdout...TAIL"
+            )
+        };
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
+            .map(|n| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result(n),
+                    ContentHashes::default(),
+                )
+            })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -1323,16 +1498,28 @@ mod tests {
         // match would wrongly take at the directory's dots, leaving each
         // per-call basename in the hash so the runaway never fired — issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-3.stdout...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-4.stdout...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-3.stdout...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-4.stdout...y",
+                &[]
+            ),
         );
         // A session_dir whose segment ends in a spill *extension* (e.g.
         // `/tmp/cache.txt...v1`) must not stop the match at the directory's
         // `.txt...` either — only the generated `bash-`/`tool-` final component
         // terminates the path.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-3.stdout...y", &[]),
-            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-4.stdout...y", &[]),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-3.stdout...y",
+                &[]
+            ),
+            normalise_spill_paths(
+                "x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-4.stdout...y",
+                &[]
+            ),
         );
         // A session_dir whose segment *is itself* a generated-looking spill name
         // — `/tmp/tool-cache.txt...v1` or `/tmp/history-x.txt...v1` — must not be
@@ -1342,30 +1529,59 @@ mod tests {
         // match skips it (the finding this test pins).
         for dirseg in ["tool-cache.txt", "history-x.txt", "bash-0.stdout"] {
             assert_eq!(
-                normalise_spill_paths(&format!(
-                    "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
-                ), &[]),
-                normalise_spill_paths(&format!(
-                    "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
-                ), &[]),
+                normalise_spill_paths(
+                    &format!(
+                        "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
+                    ),
+                    &[]
+                ),
+                normalise_spill_paths(
+                    &format!(
+                        "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
+                    ),
+                    &[]
+                ),
                 "directory segment {dirseg} must not be taken as the spill basename",
             );
         }
         let mut r = Reminders::default();
-        let result =
-            |n: usize| format!("HEAD...40 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
+        let result = |n: usize| {
+            format!(
+                "HEAD...40 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL"
+            )
+        };
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
+            .map(|n| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result(n),
+                    ContentHashes::default(),
+                )
+            })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
         // A generated-looking directory segment is likewise collapsed end-to-end,
         // so an identical runaway under such a session_dir still warns.
         let mut r_dir = Reminders::default();
         let result_dir = |n: usize| {
-            format!("HEAD...40 bytes truncated (sha256:7777777777777777); complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL")
+            format!(
+                "HEAD...40 bytes truncated (sha256:7777777777777777); complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL"
+            )
         };
         let verdicts_dir: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r_dir.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result_dir(n), ContentHashes::default()))
+            .map(|n| {
+                r_dir.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result_dir(n),
+                    ContentHashes::default(),
+                )
+            })
             .collect();
         assert!(matches!(verdicts_dir.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts_dir:?}");
         // The terminator stops at the spill basename's own `...`; the tail after
@@ -1374,14 +1590,26 @@ mod tests {
         // the marker's complete-output digest already tells genuinely different
         // outputs apart), so a `...` in the tail does not erase a real change.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailA", &[]),
-            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailB", &[]),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailA",
+                &[]
+            ),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailB",
+                &[]
+            ),
         );
         // Even when the tail itself contains `...`, the extension anchor keeps the
         // match on the spill basename, so distinct tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...a...tailA", &[]),
-            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...b...tailB", &[]),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...a...tailA",
+                &[]
+            ),
+            normalise_spill_paths(
+                "h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...b...tailB",
+                &[]
+            ),
         );
     }
 
@@ -1408,7 +1636,8 @@ mod tests {
         // case is handled earlier via `reset_repeat`). They must *not* be exempt,
         // or an identical `Tool 'plan_add' not found` error loops forever.
         let mut r = Reminders::default();
-        let verdicts = repeats_call(&mut r, "plan_add", REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1, false, "not found");
+        let verdicts =
+            repeats_call(&mut r, "plan_add", REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1, false, "not found");
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::HardStop(_)), "{verdicts:?}");
     }
 
@@ -1446,10 +1675,7 @@ mod tests {
         // (here `sed`) and everything to its left stay in the base, so the loop
         // the PR exists to stop — a base with `sed`/`grep` that keeps appending
         // `| grep …` — still fingerprints stably (issue #65).
-        assert_eq!(
-            pipeline_key("cmd | sed s/x/y/ | grep foo | grep bar"),
-            pipeline_key("cmd | sed s/x/y/ | grep foo"),
-        );
+        assert_eq!(pipeline_key("cmd | sed s/x/y/ | grep foo | grep bar"), pipeline_key("cmd | sed s/x/y/ | grep foo"),);
         assert_eq!(pipeline_key("cmd | sed s/x/y/ | grep foo"), "cmd | sed s/x/y/");
         // `||`, quoted pipes and escaped pipes never split.
         assert_eq!(pipeline_key("make test || true"), "make test || true");
@@ -1542,7 +1768,14 @@ mod tests {
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
             .map(|n| {
                 let tail = " | grep foo".repeat(n + 1);
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), None, true, "same", ContentHashes::default())
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("cat log | sed s/a/b/{tail}")}),
+                    None,
+                    true,
+                    "same",
+                    ContentHashes::default(),
+                )
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -1569,4 +1802,3 @@ mod tests {
         }
     }
 }
-

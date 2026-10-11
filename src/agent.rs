@@ -2944,8 +2944,7 @@ impl Agent {
             if iteration > budget {
                 // Cap reached. Only normal mode in an interactive session asks
                 // to continue; anything else (auto, ACP/headless) stops.
-                let can_prompt =
-                    mode == crate::mode::AgentMode::Normal && self.questions.is_interactive();
+                let can_prompt = mode == crate::mode::AgentMode::Normal && self.questions.is_interactive();
                 if can_prompt {
                     match self.questions.cap().wait().await {
                         crate::question::CapDecision::Continue => {
@@ -3459,11 +3458,10 @@ impl Agent {
                     self.skills.load(&effective_call.arguments).map(Value::String)
                 } else if is_history_tool {
                     dispatched = true;
-                    self.run_history_tool_digest(effective_call)
-                        .map(|(text, spilled)| {
-                            spill_digests.extend(spilled);
-                            Value::String(text)
-                        })
+                    self.run_history_tool_digest(effective_call).map(|(text, spilled)| {
+                        spill_digests.extend(spilled);
+                        Value::String(text)
+                    })
                 } else if is_memory_tool {
                     dispatched = true;
                     self.run_memory_tool(effective_call).map(Value::String)
@@ -3616,11 +3614,9 @@ impl Agent {
                     // image returns identical metadata text while the bytes
                     // differ, so without the hashes the fifth changing image
                     // would be hard-stopped as an identical result (issue #65).
-                    let attachment_shas: Vec<&str> =
-                        attachments.iter().map(|a| a.sha256.as_str()).collect();
+                    let attachment_shas: Vec<&str> = attachments.iter().map(|a| a.sha256.as_str()).collect();
                     let spill_refs: Vec<&output::Spill> = spill_digests.iter().collect();
-                    let hashes =
-                        reminders::ContentHashes { attachments: &attachment_shas, spills: &spill_refs };
+                    let hashes = reminders::ContentHashes { attachments: &attachment_shas, spills: &spill_refs };
                     match self.reminders.after_repeat_call(
                         &tool_call.name,
                         &effective_call.arguments,
@@ -7945,7 +7941,8 @@ mod tests {
         // Distinct arguments, so the loop detector (issue #65) stays quiet and
         // only the stale-plan reminder fires.
         responses.extend(
-            (0..reminders::PLAN_STALE_AFTER).map(|i| call(&format!("c{i}"), "echo", json!({"text": format!("pong {i}")}))),
+            (0..reminders::PLAN_STALE_AFTER)
+                .map(|i| call(&format!("c{i}"), "echo", json!({"text": format!("pong {i}")}))),
         );
         responses.push(text("done"));
         let (mut agent, seen) = agent(responses, dir.path());

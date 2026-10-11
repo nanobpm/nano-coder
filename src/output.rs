@@ -38,12 +38,7 @@ pub struct Spill {
 /// text was truncated and spilled, so the caller can hand it to the loop
 /// detector **out of band** instead of the detector re-parsing the rendered
 /// marker (issue #65). The spill is `None` when nothing spilled.
-pub fn bound_and_spill_digest(
-    text: &str,
-    limit: usize,
-    dir: &std::path::Path,
-    name: &str,
-) -> (String, Option<Spill>) {
+pub fn bound_and_spill_digest(text: &str, limit: usize, dir: &std::path::Path, name: &str) -> (String, Option<Spill>) {
     if text.chars().count() <= limit {
         return (text.to_string(), None);
     }
@@ -189,7 +184,8 @@ mod tests {
     #[test]
     fn is_utf8_safe_and_mentions_path() {
         let text = "é".repeat(10);
-        let (bounded, truncated) = bound_parts(&text, Some(&text), 1000, 3, Some("/tmp/out"), Some(&content_digest(&text)));
+        let (bounded, truncated) =
+            bound_parts(&text, Some(&text), 1000, 3, Some("/tmp/out"), Some(&content_digest(&text)));
         assert!(truncated);
         assert_eq!(
             bounded,
