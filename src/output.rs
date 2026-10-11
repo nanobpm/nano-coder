@@ -26,7 +26,7 @@ pub fn bound_and_spill(text: &str, limit: usize, dir: &std::path::Path, name: &s
     }
     let saved = std::fs::create_dir_all(dir).ok().and_then(|()| reserve_and_write(dir, name, text));
     let display = saved.as_ref().map(|p| p.display().to_string());
-    bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref()).0
+    bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref(), Some(&content_digest(text))).0
 }
 
 /// Write `text` to a new file in `dir` derived from `name`, never clobbering an
@@ -53,13 +53,24 @@ fn reserve_and_write(dir: &std::path::Path, name: &str, text: &str) -> Option<st
 
 /// Bound a complete in-memory string to `limit` characters.
 pub fn bound_output(text: &str, limit: usize) -> (String, bool) {
-    bound_parts(text, None, text.len() as u64, limit, None)
+    bound_parts(text, None, text.len() as u64, limit, None, Some(&content_digest(text)))
 }
 
 /// Bound output given its `head` and, when the full text was not read, its
 /// `tail`. `full_size` is the complete size in bytes; `path` is where the
-/// complete output lives, if anywhere.
-pub fn bound_parts(head: &str, tail: Option<&str>, full_size: u64, limit: usize, path: Option<&str>) -> (String, bool) {
+/// complete output lives, if anywhere. `digest` is a hex SHA-256 of the
+/// *complete* output, when the caller has it (an in-memory string, or a file
+/// it streamed through the hasher); it is embedded in the marker so the loop
+/// detector's fingerprint can tell two bounded previews apart when their head,
+/// tail and byte count match but the truncated middle differs (issue #65).
+pub fn bound_parts(
+    head: &str,
+    tail: Option<&str>,
+    full_size: u64,
+    limit: usize,
+    path: Option<&str>,
+    digest: Option<&str>,
+) -> (String, bool) {
     let tail = match tail {
         Some(tail) => tail,
         None => {
@@ -73,11 +84,29 @@ pub fn bound_parts(head: &str, tail: Option<&str>, full_size: u64, limit: usize,
     let tail_part = take_tail(tail, limit - limit / 2);
     let skipped = full_size.saturating_sub((head_part.len() + tail_part.len()) as u64);
     let mut marker = format!("...{skipped} bytes truncated");
+    if let Some(digest) = digest {
+        marker.push_str(" (sha256:");
+        marker.push_str(digest);
+        marker.push(')');
+    }
     if let Some(path) = path {
         marker.push_str("; complete output in ");
         marker.push_str(path);
     }
     (format!("{head_part}{marker}...{tail_part}"), true)
+}
+
+/// Hex SHA-256 of a complete in-memory output, truncated to 16 hex chars (64
+/// bits) — enough to tell two bounded previews apart for the loop detector
+/// without bloating the marker. For the bounder's marker.
+pub fn content_digest(text: &str) -> String {
+    use sha2::Digest;
+    short_digest(sha2::Sha256::digest(text.as_bytes()))
+}
+
+/// The first 16 hex chars (64 bits) of a SHA-256 digest.
+pub(crate) fn short_digest(digest: impl AsRef<[u8]>) -> String {
+    digest.as_ref().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 fn take_head(text: &str, chars: usize) -> &str {
@@ -126,15 +155,18 @@ mod tests {
     fn keeps_head_and_tail() {
         let (bounded, truncated) = bound_output("abcdefghij", 4);
         assert!(truncated);
-        assert_eq!(bounded, "ab...6 bytes truncated...ij");
+        assert_eq!(bounded, format!("ab...6 bytes truncated (sha256:{})...ij", content_digest("abcdefghij")));
     }
 
     #[test]
     fn is_utf8_safe_and_mentions_path() {
         let text = "é".repeat(10);
-        let (bounded, truncated) = bound_parts(&text, Some(&text), 1000, 3, Some("/tmp/out"));
+        let (bounded, truncated) = bound_parts(&text, Some(&text), 1000, 3, Some("/tmp/out"), Some(&content_digest(&text)));
         assert!(truncated);
-        assert_eq!(bounded, "é...994 bytes truncated; complete output in /tmp/out...éé");
+        assert_eq!(
+            bounded,
+            format!("é...994 bytes truncated (sha256:{}); complete output in /tmp/out...éé", content_digest(&text))
+        );
     }
 
     #[test]
@@ -144,7 +176,14 @@ mod tests {
         assert!(!dir.path().join("a.txt").exists());
         let bounded = bound_and_spill("abcdefghij", 4, dir.path(), "b.txt");
         let path = dir.path().join("b.txt");
-        assert_eq!(bounded, format!("ab...6 bytes truncated; complete output in {}...ij", path.display()));
+        assert_eq!(
+            bounded,
+            format!(
+                "ab...6 bytes truncated (sha256:{}); complete output in {}...ij",
+                content_digest("abcdefghij"),
+                path.display()
+            )
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), "abcdefghij");
     }
 

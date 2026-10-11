@@ -241,7 +241,11 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     Ok(parts.join("\n"))
 }
 
-/// Read a capture file, reading only its head and tail when it is large.
+/// Read a capture file, reading only its head and tail when it is large. The
+/// returned digest is a hex SHA-256 of the *complete* file, computed by
+/// streaming the whole file through the hasher even when only the head and tail
+/// are kept, so the bounder's marker can distinguish two captures whose bounded
+/// head, tail and byte count match but whose truncated middle differs.
 fn read_bounded(path: &Path, limit: usize) -> Result<(String, bool), String> {
     let describe = |e: std::io::Error| format!("read {}: {e}", path.display());
     let mut file = File::open(path).map_err(describe)?;
@@ -251,24 +255,52 @@ fn read_bounded(path: &Path, limit: usize) -> Result<(String, bool), String> {
     if size <= window.saturating_mul(2) {
         let mut bytes = Vec::with_capacity(size as usize);
         file.read_to_end(&mut bytes).map_err(describe)?;
+        let digest = hex_sha256(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         if text.chars().count() <= limit {
             return Ok((text.into_owned(), false));
         }
-        return Ok(output::bound_parts(&text, Some(&text), size, limit, Some(&display)));
+        return Ok(output::bound_parts(&text, Some(&text), size, limit, Some(&display), Some(&digest)));
     }
     let mut head = vec![0; window as usize];
     file.read_exact(&mut head).map_err(describe)?;
     file.seek(SeekFrom::End(-(window as i64))).map_err(describe)?;
     let mut tail = Vec::with_capacity(window as usize);
     file.read_to_end(&mut tail).map_err(describe)?;
+    let digest = stream_sha256(path).map_err(describe)?;
     Ok(output::bound_parts(
         &String::from_utf8_lossy(&head),
         Some(&String::from_utf8_lossy(&tail)),
         size,
         limit,
         Some(&display),
+        Some(&digest),
     ))
+}
+
+/// Hex SHA-256 of an in-memory buffer, truncated to 16 hex chars (64 bits) to
+/// match the bounder's marker digest.
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    output::short_digest(sha2::Sha256::digest(bytes))
+}
+
+/// Hex SHA-256 of a file's complete contents, read in chunks so a large capture
+/// is hashed without being held in memory. Truncated to 16 hex chars (64 bits)
+/// to match the bounder's marker digest.
+fn stream_sha256(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    let mut file = File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(output::short_digest(hasher.finalize()))
 }
 
 #[cfg(test)]

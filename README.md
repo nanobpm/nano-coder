@@ -255,8 +255,10 @@ phases). Disable them with `--no-hooks`, or granularly via the
   `command`, optional `timeout_seconds` (default `bash_timeout_secs`, 600) and
   `max_output_length` (default 40,000, max 1,000,000 characters each for stdout and stderr).
   Returns stdout, then `Stderr:` and `Exit code: N` when relevant, or `(no output)`.
-  Long output keeps its head and tail with `...N bytes truncated; complete output in <path>...`;
-  the full capture stays in that file.
+  Long output keeps its head and tail with `...N bytes truncated (sha256:<digest>); complete output in <path>...`;
+  the full capture stays in that file. The digest is a SHA-256 of the complete output, so two
+  results whose bounded head, tail and byte count match but whose truncated middle differs are
+  still told apart.
 - `read_file` - Numbered lines of a text file; `path`, optional `offset` (1-based) and `limit`
   (default 2000 lines). Refuses binary files.
 - `write_file` - Create or overwrite a file (`path`, `content`), creating parent directories.
@@ -1065,8 +1067,11 @@ the result:
   fingerprint and genuinely different calls are never conflated. The result fingerprint
   ignores only the per-call spill filename in the output bounder's `complete output in …`
   marker (matched through its `...` terminator, so even a `session_dir` path with spaces is
-  normalised; not arbitrary output that merely resembles one), so identical runaway output
-  is still recognised while a changing result stays distinct. Enabled plan, outcome and
+  normalised; not arbitrary output that merely resembles one). The marker also carries a
+  `(sha256:<digest>)` of the *complete* output, so identical runaway output is still recognised
+  while a result that changes only in its truncated middle — invisible to the bounded head,
+  tail and byte count — stays distinct and is never hard-stopped as a false repeat. Enabled
+  plan, outcome and
   `question` calls break the streak (so only genuinely consecutive repeats count, and an
   interleaved such call makes the calls around it non-consecutive); when plan tools are
   *disabled* a repeated hallucinated `plan_*` call is itself detected rather than exempted.

@@ -249,16 +249,16 @@ fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result
 fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     static SPILL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SPILL.get_or_init(|| {
-        // The marker is `...<n> bytes truncated; complete output in <path>...`,
-        // where the path's own `...` is the terminator that precedes the tail.
-        // Anchor on the *complete* marker and the generated final path
-        // component, not on "the first/last `...`" or "the first extension" —
-        // all three are wrong:
-        //   * A bare `complete output in <path>...` match (no `bytes truncated;`
+        // The marker is `...<n> bytes truncated[ (sha256:<hex>)]; complete output
+        // in <path>...`, where the path's own `...` is the terminator that
+        // precedes the tail. Anchor on the *complete* marker and the generated
+        // final path component, not on "the first/last `...`" or "the first
+        // extension" — all three are wrong:
+        //   * A bare `complete output in <path>...` match (no `bytes truncated`
         //     prefix) also fires on *ordinary output* that merely quotes the
         //     phrase (`complete output in report-a.txt...`), normalising a
         //     result that is not a bounder marker and erasing a genuine change
-        //     into a false repeat. Require the `bytes truncated; ` prefix.
+        //     into a false repeat. Require the `bytes truncated` prefix.
         //   * A non-greedy `.+?(\.\.\.)` stops at the *first* `...`, so a
         //     `session_dir` that itself contains `...` (e.g. `/tmp/cache...v1`)
         //     leaves the per-call basename (`bash-3.stdout`) in the hash and the
@@ -279,8 +279,17 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         // newlines, so the match stays on the marker's own line and cannot run
         // past the tail into later output; the path may contain spaces (a `\S+`
         // match would silently fail on a session_dir with spaces).
+        //
+        // The marker carries an optional `(sha256:<hex>)` digest of the
+        // *complete* output between the byte count and `; complete output in`
+        // (see `bound_parts`). The capture keeps the byte count *and* that
+        // digest (group 1 ends just before `; complete output in`), so only the
+        // per-call path is normalised away: two full outputs whose bounded head,
+        // tail and byte count match but whose truncated middle differs carry
+        // different digests and so still produce different fingerprints
+        // (issue #65), while a genuinely identical output repeats.
         regex::Regex::new(
-            r"(bytes truncated; complete output in ).+?(?:bash|tool)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
+            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in .+?(?:bash|tool)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
         )
         .expect("spill-path regex is valid")
     });
@@ -679,6 +688,43 @@ mod tests {
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n)))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
+    }
+
+    #[test]
+    fn distinct_full_content_with_matching_bounded_preview_does_not_repeat() {
+        // The bounded preview keeps only the head, tail and byte count, so two
+        // *distinct* full outputs that differ only in the truncated middle
+        // (e.g. a changing fixed-size log) share that preview. The bounder
+        // embeds a sha256 of the complete output in the marker, so the
+        // fingerprint must still tell them apart and never warn or hard-stop
+        // active work that is actually progressing (issue #65).
+        let mut r = Reminders::default();
+        let result = |digest: &str, n: usize| {
+            format!(
+                "HEAD...40 bytes truncated (sha256:{digest}); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL"
+            )
+        };
+        // Each call returns different full content (different digest) even
+        // though head, tail, byte count and the normalised spill path all match.
+        let digests = ["aa", "bb", "cc", "dd", "ee", "ff"];
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER + 1)
+            .map(|n| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result(digests[n % digests.len()], n),
+                )
+            })
+            .collect();
+        assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "{verdicts:?}");
+        // And identical digests (genuinely identical full output) still repeat.
+        let mut r2 = Reminders::default();
+        let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa", n)))
+            .collect();
+        assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
     }
 
     #[test]
