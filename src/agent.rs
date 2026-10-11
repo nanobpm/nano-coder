@@ -3569,6 +3569,25 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(&reminders::wrap(ctx));
                 }
+                // Consume the one-time "look in history" hint *before* the loop
+                // detector fingerprints the result (issue #65). The hint is
+                // appended to only the first failed call, so a result that
+                // carries it is genuinely different — to the model — from the
+                // later identical failures. Fingerprinting after this append
+                // keeps that first call out of the identical-result streak, so
+                // the warning and hard stop fire at the documented thresholds
+                // rather than one call early. The detector's own warning text
+                // is still appended afterward, below.
+                if history::is_history_tool(&tool_call.name) {
+                    self.history_hint_pending = false;
+                } else if history::looks_failed(&tool_call.name, ok, &result_text)
+                    && self.history_hint_pending
+                    && self.history_tools_enabled()
+                {
+                    self.history_hint_pending = false;
+                    result_text.push_str("\n\n");
+                    result_text.push_str(history::FAILED_TOOL_HINT);
+                }
                 if self.config.reminders && (is_plan_tool || is_outcome_tool) {
                     // Plan and outcome calls are never counted by the loop
                     // detector, but they must still break a repeat streak so an
@@ -3624,16 +3643,6 @@ impl Agent {
                             loop_stop = Some(reason);
                         }
                     }
-                }
-                if history::is_history_tool(&tool_call.name) {
-                    self.history_hint_pending = false;
-                } else if history::looks_failed(&tool_call.name, ok, &result_text)
-                    && self.history_hint_pending
-                    && self.history_tools_enabled()
-                {
-                    self.history_hint_pending = false;
-                    result_text.push_str("\n\n");
-                    result_text.push_str(history::FAILED_TOOL_HINT);
                 }
                 // The display output (trajectory event, ACP) notes each attached
                 // image as `[image: path, WxH]`; the model-facing `result_text`

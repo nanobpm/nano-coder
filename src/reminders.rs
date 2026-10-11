@@ -277,7 +277,7 @@ impl Reminders {
         } else if self.repeat_count >= REPEAT_HARD_STOP_AFTER {
             RepeatVerdict::HardStop(format!(
                 "the model repeated the same `{tool}` call {times} times in a row with {outcome}, and kept \
-                 repeating it after {REPEAT_MAX_WARNINGS} warnings to change approach"
+                 repeating it after {REPEAT_MAX_WARNINGS} warnings already issued this turn to change approach"
             ))
         } else {
             // The turn's global warning budget is spent, but *this* key has not
@@ -293,7 +293,7 @@ impl Reminders {
 /// normalised arguments, whether the call failed, and a hash of the result.
 /// `raw_args`, when present, replaces the (empty) decoded arguments in the
 /// fingerprint — it carries the full malformed argument text so two distinct
-/// malformed payloads are not conflated (see `after_repeat_call_full`).
+/// malformed payloads are not conflated (see `after_repeat_call`).
 /// `hashes.spills` carries the bounder-supplied identity (digest + exact
 /// marker path) of each spilled capture (see [`ContentHashes`]); when it is
 /// non-empty the marker's volatile path is normalised *without* trusting any
@@ -725,6 +725,36 @@ mod tests {
         let verdicts = repeats(&mut r, REPEAT_WARN_AFTER * 2);
         assert!(verdicts[..REPEAT_WARN_AFTER - 1].iter().all(|v| *v == RepeatVerdict::None));
         assert!(matches!(verdicts[REPEAT_WARN_AFTER - 1], RepeatVerdict::Warning(_)));
+    }
+
+    #[test]
+    fn a_one_time_hint_on_the_first_failure_keeps_it_out_of_the_identical_streak() {
+        // The agent appends the one-time "look in history" hint to only the
+        // first failed call and fingerprints the result *after* that append
+        // (issue #65). A hint-bearing result is therefore genuinely different —
+        // to the model — from the later hint-free failures, so it must not be
+        // counted in the identical-result streak: the warning has to fire one
+        // call later than the plain all-identical case, at the documented
+        // threshold, rather than one call early.
+        let hint = crate::history::FAILED_TOOL_HINT;
+        let first = format!("exit 1\n\n{hint}");
+        let mut r = Reminders::default();
+        let args = json!({"command": "make test"});
+        let mut verdicts = vec![r.after_repeat_call("bash", &args, None, false, &first, ContentHashes::default())];
+        for _ in 0..REPEAT_WARN_AFTER {
+            verdicts.push(r.after_repeat_call("bash", &args, None, false, "exit 1", ContentHashes::default()));
+        }
+        // call 1 carries the hint (distinct key); the identical streak starts at
+        // call 2, so the warning lands on call `1 + REPEAT_WARN_AFTER`, not
+        // `REPEAT_WARN_AFTER`.
+        assert!(
+            verdicts[..REPEAT_WARN_AFTER].iter().all(|v| *v == RepeatVerdict::None),
+            "the hint-bearing first call must not shorten the streak: {verdicts:?}"
+        );
+        assert!(
+            matches!(verdicts[REPEAT_WARN_AFTER], RepeatVerdict::Warning(_)),
+            "warning must fire one call later: {verdicts:?}"
+        );
     }
 
     #[test]

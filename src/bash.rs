@@ -560,18 +560,23 @@ mod tests {
         // finish() freezes the digest at the 10_000-byte boundary...
         let (digest, frozen_len) = cap.finish().unwrap();
         assert_eq!(frozen_len, 10_000);
-        // ...then a background writer appends more.
-        f.write_all(&vec![b'Z'; 5_000]).unwrap();
+        // ...then a background writer appends more. The sentinel byte must be
+        // one that can appear in neither the A-filled frozen prefix nor the
+        // spill marker's own text — which embeds the capture's *path*, whose
+        // random tempdir component is alphanumeric — so use a non-alphanumeric
+        // byte (`~`); a letter/digit sentinel would collide with the path and
+        // flake (issue #65).
+        f.write_all(&vec![b'~'; 5_000]).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 15_000, "the file kept growing after finish");
         // read_bounded must honour the frozen boundary: the digest covers
-        // exactly the bytes read (the 10_000 A's), not the later Z's. Use a
+        // exactly the bytes read (the 10_000 A's), not the later `~`s. Use a
         // frozen length beyond the head window (4 * limit) so the marker's tail
         // is drawn from the frozen prefix, not the still-growing file.
         let (text, truncated) = read_bounded(&path, 1_000, &digest, frozen_len).unwrap();
         assert!(truncated, "10_000 bytes over a 1_000-char limit must spill");
         assert!(text.contains('A'), "{text}");
-        // No 'Z' byte from the late append appears in the head or tail.
-        assert!(!text.contains('Z'), "the late append must not be read: {text}");
+        // No `~` byte from the late append appears in the head or tail.
+        assert!(!text.contains('~'), "the late append must not be read: {text}");
         // The marker reports the frozen byte count, not the grown file's.
         assert!(text.contains("9000 bytes truncated"), "{text}");
         assert!(!text.contains("14000 bytes truncated"), "{text}");
