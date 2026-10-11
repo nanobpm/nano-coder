@@ -165,6 +165,11 @@ impl Reminders {
     /// (issue #65). Passing the full raw malformed text as `raw_args` keeps
     /// those argument changes visible in the fingerprint; a well-formed call
     /// passes `None` and fingerprints its decoded `args`.
+    /// `attachments` carries the content hashes of any image attachments on the
+    /// result, so a `read_file` of a *changing* image — whose `result` text is
+    /// only the metadata (MIME type, dimensions, encoded size) and so identical
+    /// across calls — is still told apart by the bytes the model actually
+    /// received (issue #65). Pass an empty slice for a text-only result.
     pub fn after_repeat_call(
         &mut self,
         tool: &str,
@@ -172,12 +177,13 @@ impl Reminders {
         raw_args: Option<&str>,
         ok: bool,
         result: &str,
+        attachments: &[&str],
     ) -> RepeatVerdict {
         if REPEAT_EXEMPT_TOOLS.contains(&tool) {
             self.reset_repeat();
             return RepeatVerdict::None;
         }
-        let key = repeat_key(tool, args, raw_args, ok, result);
+        let key = repeat_key(tool, args, raw_args, ok, result, attachments);
         let cmd = (tool == "bash")
             .then(|| args.get("command").and_then(Value::as_str))
             .flatten()
@@ -225,14 +231,23 @@ impl Reminders {
 /// `raw_args`, when present, replaces the (empty) decoded arguments in the
 /// fingerprint — it carries the full malformed argument text so two distinct
 /// malformed payloads are not conflated (see `after_repeat_call_full`).
-fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result: &str) -> String {
+fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result: &str, attachments: &[&str]) -> String {
     let args = match raw_args {
         Some(raw) => raw.to_string(),
         None => normalised_args(tool, args),
     };
     let result = normalise_spill_paths(result);
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(result.as_bytes());
+    // Fold each attachment's content hash into the result fingerprint, so a
+    // changing image (identical metadata text, different bytes) is told apart
+    // by what the model actually received (issue #65).
+    for sha in attachments {
+        hasher.update(b"\x00img:");
+        hasher.update(sha.as_bytes());
+    }
     let mut result_hash = [0u8; 8];
-    result_hash.copy_from_slice(&sha2::Sha256::digest(result.as_bytes())[..8]);
+    result_hash.copy_from_slice(&hasher.finalize()[..8]);
     format!("{tool}|{args}|err={ok:?}|out={:x?}", result_hash)
 }
 
@@ -269,10 +284,11 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         //     to the *last* `...`, which is in the bounded *tail* when the tail
         //     contains ellipses — both erase a genuine change.
         // The bounder only ever names the spill `bash-<n>.stdout`/`.stderr`
-        // (`bash.rs`) or `tool-<id>-<name>.txt` (`agent.rs`), all sanitised to a
+        // (`bash.rs`), `tool-<id>-<name>.txt` (`agent.rs`) or
+        // `history-<id>.txt` (`history.rs`), all sanitised to a
         // single extension dot (`sanitize` in `agent.rs` maps every other
         // character to `_`), so the generated final component matches
-        // `(?:bash|tool)-[\w-]*\.(?:stdout|stderr|txt)`. A non-greedy path up to
+        // `(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)`. A non-greedy path up to
         // that component crosses directory dots and `...` (a directory segment
         // never starts `bash-`/`tool-` *and* carries the extension) yet stops at
         // the spill's own terminator, leaving the tail intact. `.` excludes
@@ -289,7 +305,7 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         // different digests and so still produce different fingerprints
         // (issue #65), while a genuinely identical output repeats.
         regex::Regex::new(
-            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in .+?(?:bash|tool)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
+            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in .+?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
         )
         .expect("spill-path regex is valid")
     });
@@ -523,11 +539,11 @@ mod tests {
     }
 
     fn repeats(r: &mut Reminders, n: usize) -> Vec<RepeatVerdict> {
-        (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1")).collect()
+        (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[])).collect()
     }
 
     fn repeats_call(r: &mut Reminders, tool: &str, n: usize, ok: bool, result: &str) -> Vec<RepeatVerdict> {
-        (0..n).map(|_| r.after_repeat_call(tool, &json!({}), None, ok, result)).collect()
+        (0..n).map(|_| r.after_repeat_call(tool, &json!({}), None, ok, result, &[])).collect()
     }
 
     #[test]
@@ -543,7 +559,7 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("make test {i}")}), None, false, "x"),
+                r.after_repeat_call("bash", &json!({"command": format!("make test {i}")}), None, false, "x", &[]),
                 RepeatVerdict::None
             );
         }
@@ -551,7 +567,7 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, &format!("exit {i}")),
+                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, &format!("exit {i}"), &[]),
                 RepeatVerdict::None
             );
         }
@@ -566,7 +582,7 @@ mod tests {
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::HardStop(_)));
         // …and the hard stop keeps firing while the loop continues.
         assert!(matches!(
-            r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1"),
+            r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[]),
             RepeatVerdict::HardStop(_)
         ));
     }
@@ -577,7 +593,7 @@ mod tests {
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|i| {
                 let suffix = if i == 1 { String::new() } else { " | wc -l".repeat(i - 1) };
-                r.after_repeat_call("bash", &json!({"command": format!("gh pr diff 1{suffix}")}), None, true, "1")
+                r.after_repeat_call("bash", &json!({"command": format!("gh pr diff 1{suffix}")}), None, true, "1", &[])
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -594,7 +610,7 @@ mod tests {
         let mut r = Reminders::default();
         for q in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"] {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), None, true, ""),
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), None, true, "", &[]),
                 RepeatVerdict::None,
                 "query {q} must not count as a repeat",
             );
@@ -617,7 +633,7 @@ mod tests {
             // identical 300-char error preview, but a distinct raw payload.
             let raw = format!("{prefix}payload-{i}");
             assert_eq!(
-                r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON"),
+                r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", &[]),
                 RepeatVerdict::None,
                 "payload {i} must not count as a repeat",
             );
@@ -626,7 +642,7 @@ mod tests {
         let mut r = Reminders::default();
         let raw = format!("{prefix}same");
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
-            .map(|_| r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON"))
+            .map(|_| r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", &[]))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -637,7 +653,7 @@ mod tests {
             let mut r = Reminders::default();
             assert!(
                 (0..REPEAT_WARN_AFTER + 1)
-                    .all(|_| r.after_repeat_call(tool, &json!({}), None, true, "ok") == RepeatVerdict::None)
+                    .all(|_| r.after_repeat_call(tool, &json!({}), None, true, "ok", &[]) == RepeatVerdict::None)
             );
         }
         let mut r = Reminders::default();
@@ -657,10 +673,10 @@ mod tests {
         let mut r = Reminders::default();
         for _ in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1"),
+                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[]),
                 RepeatVerdict::None
             );
-            assert_eq!(r.after_repeat_call("question", &json!({}), None, true, "ok"), RepeatVerdict::None);
+            assert_eq!(r.after_repeat_call("question", &json!({}), None, true, "ok", &[]), RepeatVerdict::None);
         }
     }
 
@@ -685,7 +701,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n)))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -715,6 +731,7 @@ mod tests {
                     None,
                     true,
                     &result(digests[n % digests.len()], n),
+                    &[],
                 )
             })
             .collect();
@@ -722,9 +739,55 @@ mod tests {
         // And identical digests (genuinely identical full output) still repeat.
         let mut r2 = Reminders::default();
         let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa", n)))
+            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa", n), &[]))
             .collect();
         assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
+    }
+
+    #[test]
+    fn changing_image_attachment_does_not_repeat() {
+        // A `read_file` of a *changing* image returns identical metadata text
+        // (same MIME type, dimensions, encoded size) on every call while the
+        // attached bytes differ. The fingerprint must fold in each attachment's
+        // content hash, or the fifth changing image is hard-stopped as an
+        // identical result (issue #65).
+        let mut r = Reminders::default();
+        let text = "image/png 800x600, 12345 bytes";
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER + 1)
+            .map(|n| {
+                r.after_repeat_call(
+                    "read_file",
+                    &json!({"path": "pic.png"}),
+                    None,
+                    true,
+                    text,
+                    &[&format!("sha{n:064}")],
+                )
+            })
+            .collect();
+        assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "{verdicts:?}");
+        // An identical attachment (same bytes) on the identical text still repeats.
+        let mut r2 = Reminders::default();
+        let sha = format!("{:064}", 7);
+        let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|_| r2.after_repeat_call("read_file", &json!({"path": "pic.png"}), None, true, text, &[&sha]))
+            .collect();
+        assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
+    }
+
+    #[test]
+    fn identical_large_history_read_with_per_call_spill_paths_still_counts() {
+        // A repeated large `history_read` spills to `history-<id>.txt`, then
+        // `history-<id>-2.txt`, `-3.txt`, … on each repeat. The varying spill
+        // name must not change the fingerprint, or the runaway never warns or
+        // hard-stops (issue #65).
+        let mut r = Reminders::default();
+        let result =
+            |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL", suffix = if n == 1 { String::new() } else { format!("-{n}") });
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), &[]))
+            .collect();
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
 
     #[test]
@@ -743,6 +806,12 @@ mod tests {
         assert_eq!(
             normalise_spill_paths("x...3 bytes truncated; complete output in /t/tool-abc123-read_file.txt...y"),
             normalise_spill_paths("x...3 bytes truncated; complete output in /t/tool-zz99-read_file.txt...y"),
+        );
+        // history_read spills as `history-<id>.txt`, with a collision `-N`
+        // suffix on a repeat; those per-call names must also collapse (issue #65).
+        assert_eq!(
+            normalise_spill_paths("x...3 bytes truncated; complete output in /t/history-7.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated; complete output in /t/history-7-2.txt...y"),
         );
         // Genuinely different content is still distinguished.
         assert_ne!(normalise_spill_paths("alpha"), normalise_spill_paths("beta"));
@@ -784,7 +853,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated; complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n)))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -813,7 +882,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n)))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
         // The terminator stops at the spill extension's own `...`; the tail after
@@ -876,6 +945,7 @@ mod tests {
                     None,
                     true,
                     "",
+                    &[],
                 ),
                 RepeatVerdict::None,
             );
@@ -933,6 +1003,7 @@ mod tests {
                     None,
                     true,
                     "",
+                    &[],
                 ),
                 RepeatVerdict::None,
             );
@@ -949,7 +1020,7 @@ mod tests {
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
             .map(|n| {
                 let tail = " | grep foo".repeat(n + 1);
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), None, true, "same")
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), None, true, "same", &[])
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -969,6 +1040,7 @@ mod tests {
                     None,
                     true,
                     "",
+                    &[],
                 ),
                 RepeatVerdict::None,
             );

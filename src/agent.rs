@@ -3546,13 +3546,20 @@ impl Agent {
                     // — otherwise two malformed payloads that diverge only past
                     // the 300-character error preview collapse to one
                     // fingerprint and a genuinely-different retry is
-                    // hard-stopped as an identical repeat.
+                    // hard-stopped as an identical repeat. Pass each image
+                    // attachment's content hash too: a `read_file` of a changing
+                    // image returns identical metadata text while the bytes
+                    // differ, so without the hashes the fifth changing image
+                    // would be hard-stopped as an identical result (issue #65).
+                    let attachment_shas: Vec<&str> =
+                        attachments.iter().map(|a| a.sha256.as_str()).collect();
                     match self.reminders.after_repeat_call(
                         &tool_call.name,
                         &effective_call.arguments,
                         tool_call.invalid_arguments(),
                         ok,
                         &result_text,
+                        &attachment_shas,
                     ) {
                         reminders::RepeatVerdict::None => {}
                         reminders::RepeatVerdict::Warning(note) => {

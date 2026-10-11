@@ -1070,7 +1070,10 @@ the result:
   normalised; not arbitrary output that merely resembles one). The marker also carries a
   `(sha256:<digest>)` of the *complete* output, so identical runaway output is still recognised
   while a result that changes only in its truncated middle — invisible to the bounded head,
-  tail and byte count — stays distinct and is never hard-stopped as a false repeat. Enabled
+  tail and byte count — stays distinct and is never hard-stopped as a false repeat. The
+  fingerprint likewise folds in each attached image's content hash, so a `read_file` of a
+  changing image (whose result text is only the unchanging metadata) is told apart by the
+  bytes the model actually received. Enabled
   plan, outcome and
   `question` calls break the streak (so only genuinely consecutive repeats count, and an
   interleaved such call makes the calls around it non-consecutive); when plan tools are
