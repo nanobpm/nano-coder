@@ -268,7 +268,7 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         // in <path>...`, where the path's own `...` is the terminator that
         // precedes the tail. Anchor on the *complete* marker and the generated
         // final path component, not on "the first/last `...`" or "the first
-        // extension" — all three are wrong:
+        // extension" — all are wrong:
         //   * A bare `complete output in <path>...` match (no `bytes truncated`
         //     prefix) also fires on *ordinary output* that merely quotes the
         //     phrase (`complete output in report-a.txt...`), normalising a
@@ -280,32 +280,45 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         //     runaway never fires (issue #65).
         //   * A non-greedy `.+?\.(?:stdout|stderr|txt)` stops at the *first*
         //     extension, so a `session_dir` ending in one (`/tmp/cache.txt...v1`)
-        //     leaves `bash-3.stdout` in the hash; and a greedy `.+(\.\.\.)` runs
-        //     to the *last* `...`, which is in the bounded *tail* when the tail
-        //     contains ellipses — both erase a genuine change.
+        //     leaves `bash-3.stdout` in the hash.
+        //   * A non-greedy `.+?(?:bash|tool|history)-…` still stops at the first
+        //     *directory segment* that happens to look like a generated spill
+        //     name — a `session_dir` such as `/tmp/tool-cache.txt...v1` matches
+        //     `tool-cache.txt...` and leaves the real `bash-3.stdout` in the
+        //     hash, so identical runaway loops are never detected (the finding
+        //     this fix closes). A directory segment *can* start `bash-`/`tool-`/
+        //     `history-`, carry a spill extension, and be followed by `...`, so
+        //     "a directory never matches the generated pattern" is a false
+        //     assumption.
         // The bounder only ever names the spill `bash-<n>.stdout`/`.stderr`
         // (`bash.rs`), `tool-<id>-<name>.txt` (`agent.rs`) or
-        // `history-<id>.txt` (`history.rs`), all sanitised to a
-        // single extension dot (`sanitize` in `agent.rs` maps every other
-        // character to `_`), so the generated final component matches
-        // `(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)`. A non-greedy path up to
-        // that component crosses directory dots and `...` (a directory segment
-        // never starts `bash-`/`tool-` *and* carries the extension) yet stops at
-        // the spill's own terminator, leaving the tail intact. `.` excludes
-        // newlines, so the match stays on the marker's own line and cannot run
-        // past the tail into later output; the path may contain spaces (a `\S+`
-        // match would silently fail on a session_dir with spaces).
+        // `history-<id>.txt` (`history.rs`), all sanitised to a single extension
+        // dot (`sanitize` in `agent.rs` maps every other character to `_`), and
+        // it is always the *final* path component (joined under the spill dir).
+        // So match the generated component **greedily, at a path-separator
+        // boundary** — `(?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:…)` — which
+        // skips every earlier directory segment (even one that resembles a spill
+        // name) and anchors on the last `/`-separated component before the
+        // terminating `...`. `.` excludes newlines, so the match stays on the
+        // marker's own line; the path may contain spaces (a `\S+` match would
+        // silently fail on a session_dir with spaces).
         //
-        // The marker carries an optional `(sha256:<hex>)` digest of the
-        // *complete* output between the byte count and `; complete output in`
-        // (see `bound_parts`). The capture keeps the byte count *and* that
-        // digest (group 1 ends just before `; complete output in`), so only the
-        // per-call path is normalised away: two full outputs whose bounded head,
-        // tail and byte count match but whose truncated middle differs carry
-        // different digests and so still produce different fingerprints
-        // (issue #65), while a genuinely identical output repeats.
+        // Greedy matching is safe because the marker carries an optional
+        // `(sha256:<hex>)` digest of the *complete* output between the byte count
+        // and `; complete output in` (see `bound_parts`), and the capture keeps
+        // the byte count *and* that digest (group 1 ends just before
+        // `; complete output in`). Every path-bearing marker carries this digest
+        // (`bound_and_spill`/`bash.rs` always pass one), so two outputs that
+        // differ *anywhere* — truncated middle or bounded tail — carry different
+        // digests and already produce different fingerprints: the path match only
+        // has to collapse the volatile basename of *genuinely identical* outputs,
+        // whose tails are identical, so even if a greedy match reached a spill-
+        // looking token in the tail it would do so identically for both. A
+        // non-greedy match cannot fail *closed* here, but it can fail *open* on
+        // the directory-segment case above, so greedy-to-the-last-component is
+        // strictly more correct.
         regex::Regex::new(
-            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in .+?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
+            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in (?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
         )
         .expect("spill-path regex is valid")
     });
@@ -862,10 +875,10 @@ mod tests {
     fn spill_normalisation_handles_ellipsis_in_directory() {
         // The configurable `session_dir` may itself contain `...` (e.g.
         // `/tmp/cache...v1`). The terminator is the spill's own `...`, found by
-        // anchoring on the generated `bash-<n>.stdout` final component — not the
-        // first `...` (which a non-greedy match would wrongly take at the
-        // directory's dots, leaving each per-call basename in the hash so the
-        // runaway never fired — issue #65).
+        // anchoring on the generated `bash-<n>.stdout` final component at a
+        // path-separator boundary — not the first `...` (which a non-greedy
+        // match would wrongly take at the directory's dots, leaving each
+        // per-call basename in the hash so the runaway never fired — issue #65).
         assert_eq!(
             normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache...v1/bash-3.stdout...y"),
             normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache...v1/bash-4.stdout...y"),
@@ -878,6 +891,23 @@ mod tests {
             normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache.txt...v1/bash-3.stdout...y"),
             normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache.txt...v1/bash-4.stdout...y"),
         );
+        // A session_dir whose segment *is itself* a generated-looking spill name
+        // — `/tmp/tool-cache.txt...v1` or `/tmp/history-x.txt...v1` — must not be
+        // mistaken for the final component: a non-greedy match stopped at that
+        // directory's `tool-cache.txt...` and left the real per-call basename in
+        // the hash, so the runaway never fired. The greedy, separator-anchored
+        // match skips it (the finding this test pins).
+        for dirseg in ["tool-cache.txt", "history-x.txt", "bash-0.stdout"] {
+            assert_eq!(
+                normalise_spill_paths(&format!(
+                    "x...3 bytes truncated; complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
+                )),
+                normalise_spill_paths(&format!(
+                    "x...3 bytes truncated; complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
+                )),
+                "directory segment {dirseg} must not be taken as the spill basename",
+            );
+        }
         let mut r = Reminders::default();
         let result =
             |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
@@ -885,10 +915,21 @@ mod tests {
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
-        // The terminator stops at the spill extension's own `...`; the tail after
-        // it is preserved, so differing tails still distinguish the results — a
-        // greedy match to the *last* `...` would run into a tail that itself
-        // contains ellipses and erase a genuine change into a false repeat.
+        // A generated-looking directory segment is likewise collapsed end-to-end,
+        // so an identical runaway under such a session_dir still warns.
+        let mut r_dir = Reminders::default();
+        let result_dir = |n: usize| {
+            format!("HEAD...40 bytes truncated; complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL")
+        };
+        let verdicts_dir: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| r_dir.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result_dir(n), &[]))
+            .collect();
+        assert!(matches!(verdicts_dir.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts_dir:?}");
+        // The terminator stops at the spill basename's own `...`; the tail after
+        // it is preserved, so differing tails still distinguish the results. The
+        // greedy match anchors on the generated `bash-<n>.stdout` component (and
+        // the marker's complete-output digest already tells genuinely different
+        // outputs apart), so a `...` in the tail does not erase a real change.
         assert_ne!(
             normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...tailA"),
             normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...tailB"),
