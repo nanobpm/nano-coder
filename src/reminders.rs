@@ -194,15 +194,18 @@ fn repeat_key(tool: &str, args: &Value, ok: bool, result: &str) -> String {
 fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     static SPILL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SPILL.get_or_init(|| {
-        // The marker is `complete output in <path>...`, always terminated by the
-        // `...` that precedes the tail. Match the shortest run of characters up
-        // to that terminator and replace only it. Crucially this does *not* rely
-        // on the path being whitespace-free: a spill lives under the configurable
-        // `session_dir`, which may validly contain spaces, and a `\S+` match would
-        // silently fail there, leaving each per-call filename in the hash so the
-        // runaway never reaches a warning or hard stop (issue #65). `.` excludes
-        // newlines, so the match stays on the marker's own line.
-        regex::Regex::new(r"(complete output in ).+?(\.\.\.)").expect("spill-path regex is valid")
+        // The marker is `...<n> bytes truncated; complete output in <path>...`,
+        // where the path's own `...` is the terminator that precedes the tail.
+        // Identify that terminator as the *last* `...` on the marker's line — a
+        // greedy `.+` — never the first: the configurable `session_dir` may
+        // itself contain `...` (e.g. `/tmp/cache...v1`), and a non-greedy match
+        // would stop at those directory dots, leaving the per-call basename
+        // (`bash-3.stdout` vs `bash-4.stdout`) in the hash so the runaway never
+        // fires (issue #65). Nor does this rely on the path being
+        // whitespace-free: a `\S+` match would silently fail on a session_dir
+        // with spaces. `.` excludes newlines, so the match stays on the
+        // marker's own line and cannot run past the tail into later output.
+        regex::Regex::new(r"(complete output in ).+(\.\.\.)").expect("spill-path regex is valid")
     });
     re.replace_all(result, "${1}<spill>${2}")
 }
@@ -303,6 +306,11 @@ fn stage_writes_a_file<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -
         // file. A bare `-` means stdin, so it counts as a positional (otherwise
         // `uniq - OUT` would look like a single-positional read).
         "uniq" => args.filter(|a| *a == "-" || !a.starts_with('-')).count() >= 2,
+        // `less -o FILE` / `-O FILE` / `--log-file=FILE` logs (or overwrites)
+        // its input to a file, so it is not read-only.
+        "less" => args.any(|a| {
+            a == "-o" || a == "-O" || a.starts_with("-o") || a.starts_with("-O") || a.starts_with("--log-file")
+        }),
         _ => false,
     }
 }
@@ -569,6 +577,48 @@ mod tests {
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), true, &result(n)))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
+    }
+
+    #[test]
+    fn spill_normalisation_handles_ellipsis_in_directory() {
+        // The configurable `session_dir` may itself contain `...` (e.g.
+        // `/tmp/cache...v1`). The terminator is the path's *own* `...` (the last
+        // one on the marker's line), not the directory's dots — a non-greedy
+        // match stopped at the directory and left each per-call basename in the
+        // hash, so the runaway never fired (issue #65).
+        assert_eq!(
+            normalise_spill_paths("x; complete output in /tmp/cache...v1/bash-3.stdout...y"),
+            normalise_spill_paths("x; complete output in /tmp/cache...v1/bash-4.stdout...y"),
+        );
+        let mut r = Reminders::default();
+        let result =
+            |n: usize| format!("HEAD...truncated; complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), true, &result(n)))
+            .collect();
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
+        // The greedy terminator stops at the path's own `...`; the tail after it
+        // is preserved, so differing tails still distinguish the results.
+        assert_ne!(
+            normalise_spill_paths("h; complete output in /t/bash-1.stdout...tailA"),
+            normalise_spill_paths("h; complete output in /t/bash-1.stdout...tailB"),
+        );
+    }
+
+    #[test]
+    fn less_logfile_option_is_not_diagnostic() {
+        // `less -o FILE` / `-O FILE` / `--log-file=FILE` writes its input to a
+        // file, so it must stop the trailing-strip: two commands targeting
+        // different log files are genuinely distinct side effects and must never
+        // collapse into a false loop (and hard-stop before later writes run).
+        assert_ne!(pipeline_key("printf x | less -o /tmp/a"), pipeline_key("printf x | less -o /tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -O /tmp/a"), pipeline_key("printf x | less -O /tmp/b"));
+        assert_ne!(
+            pipeline_key("printf x | less --log-file=/tmp/a"),
+            pipeline_key("printf x | less --log-file=/tmp/b")
+        );
+        // Plain `less` (no logfile option) is still a read-only pager and strips.
+        assert_eq!(pipeline_key("printf x | less"), "printf x");
     }
 
     #[test]
