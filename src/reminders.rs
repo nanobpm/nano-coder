@@ -16,9 +16,14 @@ pub const REPEAT_WARN_AFTER: usize = 3;
 /// How often the repeat warning may fire in one turn before the hard stop.
 pub const REPEAT_MAX_WARNINGS: usize = 2;
 
-/// Tools where repeating the same call is legitimate (bookkeeping, waiting on
-/// a person): the loop detector never counts them.
-const REPEAT_EXEMPT_TOOLS: &[&str] = &["plan_add", "plan_update", "plan_show", "question"];
+/// Tools where repeating the same call is legitimate (waiting on a person):
+/// the loop detector never counts them. Only ever-available tools belong here.
+/// Plan tools are deliberately **not** listed: when `plan_tools` is enabled the
+/// agent already breaks the streak for them via `reset_repeat` (`is_plan_tool`
+/// in `agent.rs`), and when it is *disabled* the tool is unregistered, so an
+/// exemption would let repeated hallucinated `plan_*` calls (each returning the
+/// same `Tool '…' not found` error) loop forever undetected.
+const REPEAT_EXEMPT_TOOLS: &[&str] = &["question"];
 
 /// What the loop detector decided about the tool call just recorded.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -130,8 +135,9 @@ impl Reminders {
     /// the model sees; `ok` is whether the call succeeded.
     ///
     /// A call is a repeat when it matches the previous one on the tool, the
-    /// normalised arguments (for `bash`, the first pipeline stage — a loop
-    /// that appends `| wc -l`-style stages still matches), the error flag and
+    /// normalised arguments (for `bash`, the base command with any trailing run
+    /// of read-only diagnostic pipeline stages stripped — a loop that appends
+    /// `| wc -l`/`| grep …`-style stages still matches), the error flag and
     /// a hash of the result, so "same output again" counts even when the
     /// arguments drift. The warning fires at `REPEAT_WARN_AFTER` consecutive
     /// repeats and at most `REPEAT_MAX_WARNINGS` times per turn; once the
@@ -188,63 +194,116 @@ fn repeat_key(tool: &str, args: &Value, ok: bool, result: &str) -> String {
 fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     static SPILL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SPILL.get_or_init(|| {
-        // A spill path has no spaces and the marker is terminated by the `...`
-        // that precedes the tail, so match the shortest run of non-space
-        // characters up to that terminator and replace only it.
-        regex::Regex::new(r"(complete output in )\S+?(\.\.\.)").expect("spill-path regex is valid")
+        // The marker is `complete output in <path>...`, always terminated by the
+        // `...` that precedes the tail. Match the shortest run of characters up
+        // to that terminator and replace only it. Crucially this does *not* rely
+        // on the path being whitespace-free: a spill lives under the configurable
+        // `session_dir`, which may validly contain spaces, and a `\S+` match would
+        // silently fail there, leaving each per-call filename in the hash so the
+        // runaway never reaches a warning or hard stop (issue #65). `.` excludes
+        // newlines, so the match stays on the marker's own line.
+        regex::Regex::new(r"(complete output in ).+?(\.\.\.)").expect("spill-path regex is valid")
     });
     re.replace_all(result, "${1}<spill>${2}")
 }
 
 /// Pipeline stages a retry loop commonly *appends* to the same base command to
-/// inspect its output (`… | wc -l`, `… | head`). They only read their stdin and
-/// change nothing, so dropping them lets the detector see the repeat. Anything
-/// not on this list — notably writers like `tee` — is treated as behaviour
-/// changing and keeps the command distinct.
-const DIAGNOSTIC_STAGES: &[&str] =
-    &["wc", "head", "tail", "cat", "tac", "sort", "uniq", "nl", "cut", "tr", "rev", "fold", "column", "less", "more"];
+/// inspect its output (`… | wc -l`, `… | head`, `… | grep foo`). They only read
+/// their stdin and change nothing, so stripping a trailing run of them lets the
+/// detector see the stable base. Anything not on this list — notably writers
+/// like `tee` — is treated as behaviour changing and stops the stripping.
+const DIAGNOSTIC_STAGES: &[&str] = &[
+    "wc", "head", "tail", "cat", "tac", "sort", "uniq", "nl", "cut", "tr", "rev", "fold", "column", "less", "more",
+    "grep", "egrep", "fgrep",
+];
 
 /// The argument text a repeat match is based on. A bash loop often appends
 /// read-only diagnostic pipeline stages on each retry (`… | wc -l | head -1`),
-/// so byte-identical matching misses it; collapsing *those* stages exposes the
-/// stable intent. Stages that could change state (`… | tee a` vs `… | tee b`, a
-/// redirection, `||`, or anything we cannot split safely) are kept so distinct
-/// side effects are never conflated into a false loop. Other tools match on
-/// their arguments as given.
+/// so byte-identical matching misses it; stripping *those* trailing stages
+/// exposes the stable base command. Stages that could change state (`… | tee a`
+/// vs `… | tee b`, a redirection, a write option like `sort -o`, `||`, or a
+/// shell control construct) stop the stripping so distinct side effects are
+/// never conflated into a false loop. Other tools match on their arguments as
+/// given.
 fn normalised_args(tool: &str, args: &Value) -> String {
     if tool == "bash"
         && let Some(command) = args.get("command").and_then(Value::as_str)
     {
-        return pipeline_key(command).trim().to_string();
+        return pipeline_key(command);
     }
     args.to_string()
 }
 
-/// Collapse a bash command to the first pipeline stage **only** when every
-/// downstream stage is a recognised read-only diagnostic filter; otherwise keep
-/// the whole command. This catches `cmd`, `cmd | wc -l`, `cmd | wc -l | head`
-/// as one intent without conflating genuinely distinct side effects.
-fn pipeline_key(command: &str) -> &str {
+/// Strip the trailing run of read-only diagnostic pipeline stages from a bash
+/// command, keeping the stable base (which may itself contain non-diagnostic
+/// stages such as `sed`). `cmd`, `cmd | wc -l`, `cmd | sed … | grep a | grep b`
+/// all fingerprint by the same base intent, catching a loop that keeps appending
+/// inspection stages — without conflating genuinely distinct side effects, since
+/// stripping stops at the first non-diagnostic stage and leaves everything to its
+/// left intact.
+fn pipeline_key(command: &str) -> String {
     match split_pipeline(command) {
-        Some(stages) if stages.len() > 1 && stages[1..].iter().all(|s| is_diagnostic_stage(s)) => stages[0],
-        _ => command,
+        Some(stages) if stages.len() > 1 => {
+            let mut end = stages.len();
+            while end > 1 && is_diagnostic_stage(stages[end - 1]) {
+                end -= 1;
+            }
+            if end == stages.len() {
+                command.trim().to_string()
+            } else {
+                stages[..end].iter().map(|s| s.trim()).collect::<Vec<_>>().join(" | ")
+            }
+        }
+        _ => command.trim().to_string(),
     }
 }
 
-/// A pipeline stage that only reads its stdin: its command word is a known
-/// read-only filter and it carries no output redirection. Conservative on
-/// purpose — an unrecognised or writing stage returns `false`, so the caller
-/// keeps the full command and never issues a false hard stop.
+/// A pipeline stage that only reads its stdin and writes stdout, so appending or
+/// dropping it cannot change program state. Conservative on purpose — an
+/// unrecognised command, a shell control/substitution/redirection construct, or
+/// a command-specific *write* option returns `false`, so the caller keeps the
+/// full command and never issues a false hard stop.
 fn is_diagnostic_stage(stage: &str) -> bool {
-    // Any `>` (redirection/`tee`-style write) makes the stage behaviour
-    // changing. Treating a quoted `>` as writing too only makes us more
-    // conservative, which is the safe direction for a hard stop.
-    if stage.bytes().any(|b| b == b'>') {
+    let stage = stage.trim();
+    if stage.is_empty() {
         return false;
     }
-    match stage.split_whitespace().next() {
-        Some(cmd) => DIAGNOSTIC_STAGES.contains(&cmd),
-        None => false,
+    // Shell metacharacters that can redirect (`> <`), chain/background (`; &`),
+    // or substitute (`` ` ``, `$(`, `${`) a command make the stage potentially
+    // side-effecting; we cannot prove it is read-only, so keep the full command.
+    if stage.bytes().any(|b| matches!(b, b'>' | b'<' | b';' | b'&' | b'`' | b'\n'))
+        || stage.contains("$(")
+        || stage.contains("${")
+    {
+        return false;
+    }
+    let mut tokens = stage.split_whitespace();
+    let cmd = match tokens.next() {
+        Some(cmd) => cmd,
+        None => return false,
+    };
+    if !DIAGNOSTIC_STAGES.contains(&cmd) {
+        return false;
+    }
+    // Some read-only filters still carry a flag or positional that writes a
+    // file; those forms are not side-effect-free.
+    !stage_writes_a_file(cmd, tokens)
+}
+
+/// Whether an otherwise-diagnostic command invocation writes to a file through a
+/// command-specific option or positional (so collapsing two such calls would
+/// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`).
+fn stage_writes_a_file<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -> bool {
+    match cmd {
+        // `sort -o FILE` / `--output=FILE` writes its result to a file.
+        "sort" => {
+            args.any(|a| a == "-o" || a.starts_with("-o") || a == "--output" || a.starts_with("--output"))
+        }
+        // `uniq [INPUT [OUTPUT]]`: a second positional argument is an output
+        // file. A bare `-` means stdin, so it counts as a positional (otherwise
+        // `uniq - OUT` would look like a single-positional read).
+        "uniq" => args.filter(|a| *a == "-" || !a.starts_with('-')).count() >= 2,
+        _ => false,
     }
 }
 
@@ -340,6 +399,10 @@ mod tests {
 
     fn repeats(r: &mut Reminders, n: usize) -> Vec<RepeatVerdict> {
         (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), false, "exit 1")).collect()
+    }
+
+    fn repeats_call(r: &mut Reminders, tool: &str, n: usize, ok: bool, result: &str) -> Vec<RepeatVerdict> {
+        (0..n).map(|_| r.after_repeat_call(tool, &json!({}), ok, result)).collect()
     }
 
     #[test]
@@ -490,6 +553,36 @@ mod tests {
     }
 
     #[test]
+    fn spill_normalisation_handles_paths_with_spaces() {
+        // A spill lives under the configurable `session_dir`, which may contain
+        // spaces. The marker must still normalise, or each per-call filename
+        // survives in the hash and the runaway never warns or hard-stops (the
+        // `\S+`-based match silently failed here; issue #65).
+        assert_eq!(
+            normalise_spill_paths("x; complete output in /my dir/bash-3.stdout...y"),
+            normalise_spill_paths("x; complete output in /my dir/bash-9.stdout...y"),
+        );
+        let mut r = Reminders::default();
+        let result =
+            |n: usize| format!("HEAD...truncated; complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), true, &result(n)))
+            .collect();
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
+    }
+
+    #[test]
+    fn disabled_plan_tool_repeats_are_still_detected() {
+        // When `plan_tools` is disabled the plan tools are unregistered, so the
+        // model's hallucinated `plan_add` calls reach the detector (the enabled
+        // case is handled earlier via `reset_repeat`). They must *not* be exempt,
+        // or an identical `Tool 'plan_add' not found` error loops forever.
+        let mut r = Reminders::default();
+        let verdicts = repeats_call(&mut r, "plan_add", REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1, false, "not found");
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::HardStop(_)), "{verdicts:?}");
+    }
+
+    #[test]
     fn a_quoted_pipe_is_not_a_pipeline_boundary() {
         // `printf 'same|one' >/tmp/a` and `printf 'same|two' >/tmp/b` are
         // distinct side-effecting commands; a naive split('|') would normalise
@@ -513,9 +606,19 @@ mod tests {
 
     #[test]
     fn pipeline_key_only_collapses_read_only_diagnostic_stages() {
-        // Appended read-only filters collapse to the base command (a retry loop).
-        assert_eq!(pipeline_key("gh pr diff | wc -l"), "gh pr diff ");
-        assert_eq!(pipeline_key("cat big.log | head | tail -3"), "cat big.log ");
+        // Appended read-only filters strip to the base command (a retry loop).
+        assert_eq!(pipeline_key("gh pr diff | wc -l"), "gh pr diff");
+        assert_eq!(pipeline_key("cat big.log | head | tail -3"), "cat big.log");
+        assert_eq!(pipeline_key("cat big.log | grep foo | grep bar"), "cat big.log");
+        // Only the *trailing* diagnostic run is stripped: a non-diagnostic stage
+        // (here `sed`) and everything to its left stay in the base, so the loop
+        // the PR exists to stop — a base with `sed`/`grep` that keeps appending
+        // `| grep …` — still fingerprints stably (issue #65).
+        assert_eq!(
+            pipeline_key("cmd | sed s/x/y/ | grep foo | grep bar"),
+            pipeline_key("cmd | sed s/x/y/ | grep foo"),
+        );
+        assert_eq!(pipeline_key("cmd | sed s/x/y/ | grep foo"), "cmd | sed s/x/y/");
         // `||`, quoted pipes and escaped pipes never split.
         assert_eq!(pipeline_key("make test || true"), "make test || true");
         assert_eq!(pipeline_key("grep '|' file"), "grep '|' file");
@@ -527,6 +630,50 @@ mod tests {
         assert_eq!(pipeline_key("cat f | wc -l > /tmp/a"), "cat f | wc -l > /tmp/a");
         // An unrecognised downstream command is treated as behaviour changing.
         assert_eq!(pipeline_key("cat f | my-writer"), "cat f | my-writer");
+    }
+
+    #[test]
+    fn pipeline_key_keeps_stages_that_write_through_options_or_shell_control() {
+        // A first command word plus the absence of `>` is *not* enough to prove a
+        // stage is read-only: `sort -o FILE` writes a file, and a `;`-chained
+        // `touch` has a side effect. Collapsing these would let distinct
+        // side-effecting calls hard-stop each other and skip later writes.
+        assert_eq!(pipeline_key("printf x | sort -o /tmp/a"), "printf x | sort -o /tmp/a");
+        assert_eq!(pipeline_key("printf x | sort --output=/tmp/a"), "printf x | sort --output=/tmp/a");
+        assert_eq!(pipeline_key("printf x | uniq /in /out"), "printf x | uniq /in /out");
+        assert_eq!(pipeline_key("foo | cat ; touch /tmp/a"), "foo | cat ; touch /tmp/a");
+        assert_eq!(pipeline_key("foo | cat $(touch /tmp/a)"), "foo | cat $(touch /tmp/a)");
+        assert_eq!(pipeline_key("foo | cat > /tmp/a"), "foo | cat > /tmp/a");
+        // Distinct `sort -o` targets must never be conflated into a repeat.
+        let mut r = Reminders::default();
+        for i in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1 {
+            let letter = (b'a' + i as u8) as char;
+            assert_eq!(
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("printf x | sort -o /tmp/{letter}")}),
+                    true,
+                    "",
+                ),
+                RepeatVerdict::None,
+            );
+        }
+    }
+
+    #[test]
+    fn an_appended_diagnostic_suffix_loop_is_detected() {
+        // The runaway this PR targets: the same base command with an ever-growing
+        // tail of read-only inspection stages and an identical result each time.
+        // Stripping the trailing diagnostic run makes the keys equal, so the
+        // detector fires (issue #65).
+        let mut r = Reminders::default();
+        let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
+            .map(|n| {
+                let tail = " | grep foo".repeat(n + 1);
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), true, "same")
+            })
+            .collect();
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
 
     #[test]
