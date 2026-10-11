@@ -257,9 +257,10 @@ phases). Disable them with `--no-hooks`, or granularly via the
   Returns stdout, then `Stderr:` and `Exit code: N` when relevant, or `(no output)`.
   Long output keeps its head and tail with `...N bytes truncated (sha256:<digest>); complete output in <path>...`;
   the full capture stays in that file. The digest is the first 16 hex characters (64 bits) of a
-  SHA-256 over the capture's first 1 MiB — a truncated, bounded prefix, not the full `sha256sum`
-  value — so two results whose bounded head, tail and byte count match but whose content differs
-  are still told apart, without re-reading an unbounded capture after the command exits.
+  SHA-256 over the capture's complete content — a truncated prefix of the full `sha256sum` value,
+  hashed incrementally while the command runs (not re-read after it exits) — so two results whose
+  bounded head, tail and byte count match but whose content differs are still told apart, without
+  an unbounded post-exit reread of a multi-gigabyte capture.
 - `read_file` - Numbered lines of a text file; `path`, optional `offset` (1-based) and `limit`
   (default 2000 lines). Refuses binary files.
 - `write_file` - Create or overwrite a file (`path`, `content`), creating parent directories.

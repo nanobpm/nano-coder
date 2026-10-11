@@ -60,8 +60,9 @@ pub fn bound_output(text: &str, limit: usize) -> (String, bool) {
 /// `tail`. `full_size` is the complete size in bytes; `path` is where the
 /// complete output lives, if anywhere. `digest` is a hex SHA-256 distinguishing
 /// the output's content, when the caller has it (an in-memory string is hashed
-/// whole; a large capture file is hashed over a bounded prefix so the post-exit
-/// work stays O(1)). It is embedded in the marker so the loop detector's
+/// whole; a large capture file is hashed incrementally as the command writes it,
+/// so the digest still covers the complete content without an unbounded
+/// post-exit reread). It is embedded in the marker so the loop detector's
 /// fingerprint can tell two bounded previews apart when their head, tail and
 /// byte count match but their content differs (issue #65).
 pub fn bound_parts(

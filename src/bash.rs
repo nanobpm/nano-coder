@@ -19,13 +19,6 @@ use crate::output::{self, MAX_OUTPUT_LENGTH};
 use crate::sandbox::{self, SandboxConfig};
 use crate::tools::ToolDefinition;
 
-/// Upper bound on the bytes `stream_sha256` hashes of a capture file. The marker
-/// digest only has to distinguish two bounded previews whose head, tail and byte
-/// count all match, so a fixed-size prefix suffices — and capping it keeps the
-/// post-exit hashing pass O(HASH_CAP) instead of re-reading an unbounded capture
-/// after the process has already exited (issue #65).
-const HASH_CAP: u64 = 1024 * 1024; // 1 MiB
-
 pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
@@ -191,6 +184,13 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     let mut poll = Duration::from_millis(5);
     let cancelled = || config.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst));
     let mut was_cancelled = false;
+    // Digest the captures incrementally *while the command runs* (not in a single
+    // post-exit reread): a command emitting many gigabytes must not keep the tool
+    // blocked re-hashing the whole file after it exits, yet the digest must cover
+    // the *complete* content so two captures that differ only in a truncated
+    // middle stay distinct and are never hard-stopped as a false loop (issue #65).
+    let mut out_hash = CaptureHasher::open(&out_path).map_err(|e| format!("read {}: {e}", out_path.display()))?;
+    let mut err_hash = CaptureHasher::open(&err_path).map_err(|e| format!("read {}: {e}", err_path.display()))?;
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (status, false),
@@ -202,6 +202,11 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
                 break (status, !was_cancelled);
             }
             Ok(None) => {
+                // Consume whatever the command has appended so the post-exit
+                // catch-up never has to re-read more than one poll interval of
+                // output. Ignore read errors here; the final drain reports them.
+                let _ = out_hash.drain();
+                let _ = err_hash.drain();
                 std::thread::sleep(poll);
                 poll = (poll * 2).min(Duration::from_millis(50));
             }
@@ -209,8 +214,10 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
         }
     };
 
-    let (stdout, out_truncated) = read_bounded(&out_path, arguments.limit)?;
-    let (stderr, err_truncated) = read_bounded(&err_path, arguments.limit)?;
+    let out_digest = out_hash.finish().map_err(|e| format!("read {}: {e}", out_path.display()))?;
+    let err_digest = err_hash.finish().map_err(|e| format!("read {}: {e}", err_path.display()))?;
+    let (stdout, out_truncated) = read_bounded(&out_path, arguments.limit, &out_digest)?;
+    let (stderr, err_truncated) = read_bounded(&err_path, arguments.limit, &err_digest)?;
     let sandbox_denied = config.sandbox.active()
         && ["Operation not permitted", "Read-only file system", "Permission denied"]
             .iter()
@@ -249,13 +256,13 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
 }
 
 /// Read a capture file, reading only its head and tail when it is large. The
-/// returned digest is a hex SHA-256 of the file's first [`HASH_CAP`] bytes,
-/// computed by streaming that bounded prefix through the hasher even when only
-/// the head and tail are kept, so the bounder's marker can distinguish two
-/// captures whose bounded head, tail and byte count match but whose content
-/// differs. Hashing a bounded prefix — rather than the whole file — keeps the
-/// post-exit work O([`HASH_CAP`]) no matter how large the capture grew.
-fn read_bounded(path: &Path, limit: usize) -> Result<(String, bool), String> {
+/// `digest` — a hex SHA-256 of the capture's complete content, computed
+/// incrementally while the command ran (see [`CaptureHasher`]) — is embedded in
+/// the spill marker so the loop detector can distinguish two captures whose
+/// bounded head, tail and byte count match but whose (possibly truncated-away)
+/// content differs. The head/tail reads here stay O(window) regardless of how
+/// large the capture grew.
+fn read_bounded(path: &Path, limit: usize, digest: &str) -> Result<(String, bool), String> {
     let describe = |e: std::io::Error| format!("read {}: {e}", path.display());
     let mut file = File::open(path).map_err(describe)?;
     let size = file.metadata().map_err(describe)?.len();
@@ -264,60 +271,65 @@ fn read_bounded(path: &Path, limit: usize) -> Result<(String, bool), String> {
     if size <= window.saturating_mul(2) {
         let mut bytes = Vec::with_capacity(size as usize);
         file.read_to_end(&mut bytes).map_err(describe)?;
-        let digest = hex_sha256(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         if text.chars().count() <= limit {
             return Ok((text.into_owned(), false));
         }
-        return Ok(output::bound_parts(&text, Some(&text), size, limit, Some(&display), Some(&digest)));
+        return Ok(output::bound_parts(&text, Some(&text), size, limit, Some(&display), Some(digest)));
     }
     let mut head = vec![0; window as usize];
     file.read_exact(&mut head).map_err(describe)?;
     file.seek(SeekFrom::End(-(window as i64))).map_err(describe)?;
     let mut tail = Vec::with_capacity(window as usize);
     file.read_to_end(&mut tail).map_err(describe)?;
-    let digest = stream_sha256(path).map_err(describe)?;
     Ok(output::bound_parts(
         &String::from_utf8_lossy(&head),
         Some(&String::from_utf8_lossy(&tail)),
         size,
         limit,
         Some(&display),
-        Some(&digest),
+        Some(digest),
     ))
 }
 
-/// Hex SHA-256 of an in-memory buffer, truncated to 16 hex chars (64 bits) to
-/// match the bounder's marker digest.
-fn hex_sha256(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    output::short_digest(sha2::Sha256::digest(bytes))
+/// Digests a capture file's complete content incrementally, as the command
+/// appends to it, so the marker digest never costs an unbounded post-exit reread
+/// of a multi-gigabyte capture yet still covers every byte (issue #65). Each
+/// [`drain`](Self::drain) hashes only the bytes written since the previous call,
+/// so the work is spread across the command's lifetime and the final post-exit
+/// catch-up in [`finish`](Self::finish) is bounded by one poll interval of
+/// output. Truncated to 16 hex chars (64 bits) to match the bounder's marker.
+struct CaptureHasher {
+    file: File,
+    hasher: sha2::Sha256,
 }
 
-/// Hex SHA-256 of the first [`HASH_CAP`] bytes of a file, read in chunks so the
-/// pass is bounded and never holds the capture in memory. Truncated to 16 hex
-/// chars (64 bits) to match the bounder's marker digest.
-///
-/// The digest only has to distinguish two bounded previews whose head, tail and
-/// byte count all match; hashing a fixed-size *prefix* does that while keeping
-/// the post-exit work O([`HASH_CAP`]) regardless of capture size. Hashing the
-/// *whole* file instead re-read every byte after the process had already exited
-/// — with no timeout or cancellation check — so a command that emitted many
-/// gigabytes kept the tool blocked long after it exited or was killed, defeating
-/// `read_bounded`'s head/tail-only I/O (issue #65).
-fn stream_sha256(path: &Path) -> std::io::Result<String> {
-    use sha2::Digest;
-    let mut file = File::open(path)?.take(HASH_CAP);
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+impl CaptureHasher {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        use sha2::Digest;
+        Ok(Self { file: File::open(path)?, hasher: sha2::Sha256::new() })
     }
-    Ok(output::short_digest(hasher.finalize()))
+
+    /// Hash everything appended since the last drain. On a regular file a read
+    /// of 0 means "no more *yet*"; the kept file offset lets the next drain
+    /// resume at the newly written bytes.
+    fn drain(&mut self) -> std::io::Result<()> {
+        use sha2::Digest;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = self.file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.hasher.update(&buf[..n]);
+        }
+    }
+
+    fn finish(mut self) -> std::io::Result<String> {
+        use sha2::Digest;
+        self.drain()?; // final catch-up for bytes written since the last poll
+        Ok(output::short_digest(self.hasher.finalize()))
+    }
 }
 
 #[cfg(test)]
@@ -381,29 +393,54 @@ mod tests {
     }
 
     #[test]
-    fn marker_digest_is_bounded_to_a_fixed_prefix() {
-        // The marker digest must not require reading the *whole* capture after
-        // the process exits: it is computed from a bounded prefix so a multi-GB
-        // capture cannot keep the tool blocked post-exit (issue #65). Two
-        // captures that share the first HASH_CAP bytes but diverge afterwards
-        // therefore produce the *same* digest — proving the pass is bounded.
+    fn marker_digest_covers_the_complete_capture() {
+        // The marker digest must cover the *whole* capture — computed
+        // incrementally so a multi-GB capture never forces an unbounded
+        // post-exit reread (issue #65). Two captures that share an arbitrarily
+        // long head and tail but differ only in a truncated-away middle must
+        // therefore produce *different* digests, so genuinely changing output is
+        // never hard-stopped as a false loop.
         let dir = tempfile::tempdir().unwrap();
+        let big = 4 * 1024 * 1024; // larger than any single read chunk
+        let head = vec![b'h'; big];
+        let tail = vec![b't'; big];
+        let build = |mid: u8| {
+            let mut v = head.clone();
+            v.push(mid);
+            v.extend_from_slice(&tail);
+            v
+        };
         let a = dir.path().join("a.stdout");
         let b = dir.path().join("b.stdout");
-        let prefix = vec![b'x'; HASH_CAP as usize];
-        let mut fa = prefix.clone();
-        fa.extend_from_slice(b"AAA-tail-only-in-a");
-        let mut fb = prefix;
-        fb.extend_from_slice(b"BBB-tail-only-in-b");
-        fs::write(&a, &fa).unwrap();
-        fs::write(&b, &fb).unwrap();
-        // Same bounded prefix => same digest even though the tails differ.
-        assert_eq!(stream_sha256(&a).unwrap(), stream_sha256(&b).unwrap());
-        // A difference *inside* the prefix still changes the digest.
-        let mut fc = vec![b'y'; HASH_CAP as usize];
-        fc.extend_from_slice(b"AAA-tail-only-in-a");
-        let c = dir.path().join("c.stdout");
-        fs::write(&c, &fc).unwrap();
-        assert_ne!(stream_sha256(&a).unwrap(), stream_sha256(&c).unwrap());
+        fs::write(&a, build(b'A')).unwrap();
+        fs::write(&b, build(b'B')).unwrap();
+        let digest = |p: &Path| CaptureHasher::open(p).unwrap().finish().unwrap();
+        // Same head and tail, one differing middle byte => distinct digests.
+        assert_ne!(digest(&a), digest(&b));
+        // Identical content => identical digest (genuine repeats stay detectable).
+        let a2 = dir.path().join("a2.stdout");
+        fs::write(&a2, build(b'A')).unwrap();
+        assert_eq!(digest(&a), digest(&a2));
+    }
+
+    #[test]
+    fn incremental_digest_matches_a_whole_file_hash() {
+        // Draining in pieces as the file grows must yield the same digest as a
+        // single pass over the finished file: the loop detector relies on the
+        // marker digest being a stable function of the complete content.
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.stdout");
+        // Start empty, then append in two bursts while draining between them.
+        fs::write(&path, b"").unwrap();
+        let mut cap = CaptureHasher::open(&path).unwrap();
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write;
+        f.write_all(b"first burst of output\n").unwrap();
+        cap.drain().unwrap();
+        f.write_all(b"second burst, much longer").unwrap();
+        let incremental = cap.finish().unwrap();
+        let whole = output::short_digest(sha2::Sha256::digest(fs::read(&path).unwrap()));
+        assert_eq!(incremental, whole);
     }
 }

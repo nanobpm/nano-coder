@@ -747,6 +747,7 @@ impl Agent {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
         let policy = Policy::new(&config.permissions, &config.sandbox);
         let memory = Self::build_memory(&config);
+        let outcome_tool = config.outcome_tool;
         Self {
             policy,
             client,
@@ -782,7 +783,7 @@ impl Agent {
             instructions: None,
             skills: Skills::default(),
             plan: Plan::default(),
-            reminders: Reminders::default(),
+            reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
@@ -2260,7 +2261,7 @@ impl Agent {
         self.completed_outcomes.clear();
         self.pending_input = None;
         self.plan = Plan::default();
-        self.reminders = Reminders::default();
+        self.reminders = Reminders::new(self.config.outcome_tool);
         self.session = session;
         self.session_id = Some(id.clone());
         self.set_spill_dir(&id);
@@ -2341,7 +2342,7 @@ impl Agent {
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
         // Reminders belong to the session being left (`/resume` mid-process).
-        self.reminders = Reminders::default();
+        self.reminders = Reminders::new(self.config.outcome_tool);
         // `/thinking` is session-scoped, so the previous session's override
         // must not leak into the resumed one. Cleared here — after the staged
         // conversation and its repairs have committed — so a failed load leaves

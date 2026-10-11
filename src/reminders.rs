@@ -63,9 +63,21 @@ pub struct Reminders {
     /// Repeat warnings already fired this turn (capped, so the nudge cannot
     /// become a loop itself).
     repeat_warnings: usize,
+    /// Whether the `report_outcome` tool is offered this session. When it is
+    /// disabled (`outcome_tool = false` removes it from the model's tool list),
+    /// the repeat warning must not point the model at a tool it cannot call —
+    /// doing so just provokes "tool not found" calls (issue #65).
+    outcome_tool: bool,
 }
 
 impl Reminders {
+    /// Build knowing whether `report_outcome` is offered this session, so the
+    /// repeat warning only names it as an escape hatch when the model can
+    /// actually call it.
+    pub fn new(outcome_tool: bool) -> Self {
+        Self { outcome_tool, ..Self::default() }
+    }
+
     pub fn start_turn(&mut self) {
         self.this_turn = 0;
         self.repeat_count = 0;
@@ -212,10 +224,17 @@ impl Reminders {
         let outcome = if ok { "the same result" } else { "the same error" };
         if self.repeat_warnings < REPEAT_MAX_WARNINGS {
             self.repeat_warnings += 1;
+            // Only offer `report_outcome` as the escape hatch when it is
+            // actually available this session; otherwise keep the nudge
+            // actionable without naming a tool the model cannot call.
+            let escape = if self.outcome_tool {
+                ", or call report_outcome with status \"blocked\" and say what you tried"
+            } else {
+                ""
+            };
             RepeatVerdict::Warning(format!(
                 "You have now made this same `{tool}` call {times} times in a row with {outcome}. Repeating it \
-                 will not change anything. Change approach: try something different, or call report_outcome with \
-                 status \"blocked\" and say what you tried."
+                 will not change anything. Change approach: try something different{escape}."
             ))
         } else {
             RepeatVerdict::HardStop(format!(
@@ -581,6 +600,26 @@ mod tests {
         let verdicts = repeats(&mut r, REPEAT_WARN_AFTER * 2);
         assert!(verdicts[..REPEAT_WARN_AFTER - 1].iter().all(|v| *v == RepeatVerdict::None));
         assert!(matches!(verdicts[REPEAT_WARN_AFTER - 1], RepeatVerdict::Warning(_)));
+    }
+
+    #[test]
+    fn repeat_warning_only_names_report_outcome_when_it_is_offered() {
+        // With the outcome tool enabled the warning points at it as the escape
+        // hatch; with it disabled the warning must stay actionable without
+        // naming a tool the model cannot call (issue #65).
+        let warning = |outcome_tool: bool| {
+            let mut r = Reminders::new(outcome_tool);
+            match repeats(&mut r, REPEAT_WARN_AFTER).pop().unwrap() {
+                RepeatVerdict::Warning(w) => w,
+                other => panic!("expected a warning, got {other:?}"),
+            }
+        };
+        let enabled = warning(true);
+        assert!(enabled.contains("report_outcome"), "{enabled}");
+        assert!(enabled.contains("try something different"), "{enabled}");
+        let disabled = warning(false);
+        assert!(!disabled.contains("report_outcome"), "{disabled}");
+        assert!(disabled.contains("try something different"), "{disabled}");
     }
 
     #[test]
