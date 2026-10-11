@@ -2914,13 +2914,17 @@ impl Agent {
         let mut loop_stop: Option<String> = None;
         loop {
             iteration += 1;
-            // Recompute the headless safety-cap condition from the live mode:
-            // `TurnControl::mode` can change mid-turn, and a stale snapshot
-            // would leave a Normal→Auto switch unbounded (or an Auto→Normal
-            // switch ignoring the configured positive cap).
-            let headless_cap =
-                headless && (max_iterations == 0 || self.control.mode() == crate::mode::AgentMode::Auto);
-            let budget = match (self.control.mode(), max_iterations) {
+            // Snapshot the live mode *once* per iteration and derive every
+            // cap decision from it. `TurnControl::mode` can change mid-turn
+            // (Shift+Tab), and reading it twice — once for `headless_cap` and
+            // again inside the `budget` match — let a concurrent Normal⇄Auto
+            // switch make the two describe different modes, so `headless_cap`
+            // could be `false` while the `budget` match still took the
+            // unbounded Auto branch and slipped a call past the promised
+            // safety cap (issue #65).
+            let mode = self.control.mode();
+            let headless_cap = headless && (max_iterations == 0 || mode == crate::mode::AgentMode::Auto);
+            let budget = match (mode, max_iterations) {
                 _ if headless_cap => HEADLESS_SAFETY_CAP.saturating_add(granted_extra),
                 (crate::mode::AgentMode::Auto, _) | (_, 0) => usize::MAX,
                 _ => max_iterations.saturating_add(granted_extra),
@@ -2929,7 +2933,7 @@ impl Agent {
                 // Cap reached. Only normal mode in an interactive session asks
                 // to continue; anything else (auto, ACP/headless) stops.
                 let can_prompt =
-                    self.control.mode() == crate::mode::AgentMode::Normal && self.questions.is_interactive();
+                    mode == crate::mode::AgentMode::Normal && self.questions.is_interactive();
                 if can_prompt {
                     match self.questions.cap().wait().await {
                         crate::question::CapDecision::Continue => {

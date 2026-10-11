@@ -302,27 +302,39 @@ fn read_bounded(path: &Path, limit: usize, digest: &str) -> Result<(String, bool
 struct CaptureHasher {
     file: File,
     hasher: sha2::Sha256,
+    /// Total bytes hashed so far — equal to the file offset the next drain
+    /// resumes from, and the lower bound each drain stops relative to.
+    hashed: u64,
 }
 
 impl CaptureHasher {
     fn open(path: &Path) -> std::io::Result<Self> {
         use sha2::Digest;
-        Ok(Self { file: File::open(path)?, hasher: sha2::Sha256::new() })
+        Ok(Self { file: File::open(path)?, hasher: sha2::Sha256::new(), hashed: 0 })
     }
 
-    /// Hash everything appended since the last drain. On a regular file a read
-    /// of 0 means "no more *yet*"; the kept file offset lets the next drain
+    /// Hash everything appended since the last drain, but never past the file
+    /// length observed *at entry*. A high-throughput or backgrounded producer
+    /// can keep the capture growing so that every `read` returns data; draining
+    /// until a 0-length read could then monopolise the caller's poll loop
+    /// forever and starve the timeout / cancellation checks (issue #65).
+    /// Bounding each drain to the entry-time length guarantees it hands control
+    /// back after a finite amount of work; the kept offset lets the next drain
     /// resume at the newly written bytes.
     fn drain(&mut self) -> std::io::Result<()> {
         use sha2::Digest;
+        let target = self.file.metadata()?.len();
         let mut buf = [0u8; 65536];
-        loop {
-            let n = self.file.read(&mut buf)?;
+        while self.hashed < target {
+            let want = (target - self.hashed).min(buf.len() as u64) as usize;
+            let n = self.file.read(&mut buf[..want])?;
             if n == 0 {
-                return Ok(());
+                break; // truncated vs. the snapshot; next drain re-checks the length
             }
             self.hasher.update(&buf[..n]);
+            self.hashed += n as u64;
         }
+        Ok(())
     }
 
     fn finish(mut self) -> std::io::Result<String> {
@@ -439,6 +451,31 @@ mod tests {
         f.write_all(b"first burst of output\n").unwrap();
         cap.drain().unwrap();
         f.write_all(b"second burst, much longer").unwrap();
+        let incremental = cap.finish().unwrap();
+        let whole = output::short_digest(sha2::Sha256::digest(fs::read(&path).unwrap()));
+        assert_eq!(incremental, whole);
+    }
+
+    #[test]
+    fn drain_never_reads_past_the_length_seen_at_entry() {
+        // A producer that keeps appending must not trap `drain` in an unbounded
+        // read loop: each drain stops at the length observed when it started, so
+        // the poll loop always regains control to run the timeout / cancellation
+        // checks (issue #65). The kept offset makes the next drain resume at the
+        // delta, and the running digest still equals a single whole-file pass.
+        use sha2::Digest;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.stdout");
+        fs::write(&path, b"").unwrap();
+        let mut cap = CaptureHasher::open(&path).unwrap();
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&vec![b'x'; 10_000]).unwrap();
+        cap.drain().unwrap();
+        assert_eq!(cap.hashed, 10_000, "drain must consume exactly the entry-time length");
+        f.write_all(&vec![b'y'; 5_000]).unwrap();
+        cap.drain().unwrap();
+        assert_eq!(cap.hashed, 15_000, "the next drain resumes at the newly written delta");
         let incremental = cap.finish().unwrap();
         let whole = output::short_digest(sha2::Sha256::digest(fs::read(&path).unwrap()));
         assert_eq!(incremental, whole);

@@ -479,21 +479,33 @@ fn is_diagnostic_stage(stage: &str) -> bool {
 /// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`).
 fn stage_writes_a_file<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -> bool {
     match cmd {
-        // `sort -o FILE` / `--output=FILE` writes its result to a file.
-        "sort" => {
-            args.any(|a| a == "-o" || a.starts_with("-o") || a == "--output" || a.starts_with("--output"))
-        }
+        // `sort -o FILE` / `-oFILE` / `--output=FILE` writes its result to a
+        // file — including when `o` is buried in a short-option cluster such as
+        // `sort -ro/tmp/a` (`-r` then `-o/tmp/a`).
+        "sort" => args.any(|a| short_cluster_contains(a, 'o') || a.starts_with("--output")),
         // `uniq [INPUT [OUTPUT]]`: a second positional argument is an output
         // file. A bare `-` means stdin, so it counts as a positional (otherwise
         // `uniq - OUT` would look like a single-positional read).
         "uniq" => args.filter(|a| *a == "-" || !a.starts_with('-')).count() >= 2,
         // `less -o FILE` / `-O FILE` / `--log-file=FILE` logs (or overwrites)
-        // its input to a file, so it is not read-only.
+        // its input to a file, so it is not read-only. `o`/`O` may sit inside a
+        // short-option cluster (e.g. `less -No/tmp/a`), not only at its start.
         "less" => args.any(|a| {
-            a == "-o" || a == "-O" || a.starts_with("-o") || a.starts_with("-O") || a.starts_with("--log-file")
+            short_cluster_contains(a, 'o') || short_cluster_contains(a, 'O') || a.starts_with("--log-file")
         }),
         _ => false,
     }
+}
+
+/// Whether a short-option cluster (`-abc…`, a single `-` carrying several flags)
+/// contains `opt`. GNU-style tools let an argument-taking flag like `-o` sit
+/// anywhere in the cluster and consume the rest as its value (`sort -ro/tmp/a`),
+/// so a plain `token.starts_with("-o")` misses it. Conservative on purpose: a
+/// `--long` option is not a short cluster, and any appearance of `opt` after the
+/// leading `-` counts — over-matching only keeps the full command (never a false
+/// hard stop), which is the safe direction for this detector.
+fn short_cluster_contains(token: &str, opt: char) -> bool {
+    token.starts_with('-') && !token.starts_with("--") && token[1..].contains(opt)
 }
 
 /// Split a shell command into top-level pipeline stages, quote- and
@@ -1148,6 +1160,10 @@ mod tests {
         // side-effecting calls hard-stop each other and skip later writes.
         assert_eq!(pipeline_key("printf x | sort -o /tmp/a"), "printf x | sort -o /tmp/a");
         assert_eq!(pipeline_key("printf x | sort --output=/tmp/a"), "printf x | sort --output=/tmp/a");
+        // `-o` buried in a short-option cluster still writes a file: `sort
+        // -ro/tmp/a` is `-r` + `-o/tmp/a`, so distinct targets stay distinct.
+        assert_ne!(pipeline_key("printf x | sort -ro/tmp/a"), pipeline_key("printf x | sort -ro/tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -No/tmp/a"), pipeline_key("printf x | less -NO/tmp/b"));
         assert_eq!(pipeline_key("printf x | uniq /in /out"), "printf x | uniq /in /out");
         assert_eq!(pipeline_key("foo | cat ; touch /tmp/a"), "foo | cat ; touch /tmp/a");
         assert_eq!(pipeline_key("foo | cat $(touch /tmp/a)"), "foo | cat $(touch /tmp/a)");
