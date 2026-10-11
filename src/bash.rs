@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::output::{self, MAX_OUTPUT_LENGTH};
+use crate::output::{self, MAX_OUTPUT_LENGTH, Spill};
 use crate::sandbox::{self, SandboxConfig};
 use crate::tools::ToolDefinition;
 
@@ -35,10 +35,11 @@ pub struct BashConfig {
     /// When set, overrides `output_dir` (the agent's per-session spill dir).
     pub shared_output_dir: Option<Arc<std::sync::RwLock<PathBuf>>>,
     /// When set, each `run`/`run_digest` call replaces the contents with the
-    /// content digests of the captures it truncated and spilled, so the caller
-    /// (the agent's loop detector) gets the spills' identity **out of band**
-    /// instead of re-parsing the rendered markers (issue #65).
-    pub spill_digests: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// [`Spill`] identity (digest + exact marker path) of each capture it
+    /// truncated and spilled, so the caller (the agent's loop detector) gets
+    /// the spills' identity **out of band** instead of re-parsing the rendered
+    /// markers (issue #65).
+    pub spill_digests: Option<Arc<std::sync::Mutex<Vec<Spill>>>>,
 }
 
 impl Default for BashConfig {
@@ -117,11 +118,11 @@ pub fn run(config: &BashConfig, args: &Value) -> String {
     run_digest(config, args).0
 }
 
-/// [`run`], also returning the content digest of each capture that was
-/// truncated and spilled (stdout first, then stderr), so the caller can hand
-/// the loop detector the spills' identity **out of band** instead of the
-/// detector re-parsing the rendered markers (issue #65).
-pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<String>) {
+/// [`run`], also returning the [`Spill`] identity (digest + exact marker path)
+/// of each capture that was truncated and spilled (stdout first, then stderr),
+/// so the caller can hand the loop detector the spills' identity **out of
+/// band** instead of the detector re-parsing the rendered markers (issue #65).
+pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<Spill>) {
     let arguments = match validate(config, args) {
         Ok(arguments) => arguments,
         Err(message) => {
@@ -139,11 +140,11 @@ pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<String>) {
     }
 }
 
-/// The model-facing result text plus the digest of each spilled capture.
+/// The model-facing result text plus the identity of each spilled capture.
 struct Executed {
     text: String,
-    /// Content digest of each truncated capture (stdout, then stderr).
-    spills: Vec<String>,
+    /// The [`Spill`] identity of each truncated capture (stdout, then stderr).
+    spills: Vec<Spill>,
 }
 
 fn execute(config: &BashConfig, arguments: &Arguments) -> Result<Executed, String> {
@@ -247,10 +248,10 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<Executed, Strin
         }
     };
 
-    let out_digest = out_hash.finish().map_err(|e| format!("read {}: {e}", out_path.display()))?;
-    let err_digest = err_hash.finish().map_err(|e| format!("read {}: {e}", err_path.display()))?;
-    let (stdout, out_truncated) = read_bounded(&out_path, arguments.limit, &out_digest)?;
-    let (stderr, err_truncated) = read_bounded(&err_path, arguments.limit, &err_digest)?;
+    let (out_digest, out_len) = out_hash.finish().map_err(|e| format!("read {}: {e}", out_path.display()))?;
+    let (err_digest, err_len) = err_hash.finish().map_err(|e| format!("read {}: {e}", err_path.display()))?;
+    let (stdout, out_truncated) = read_bounded(&out_path, arguments.limit, &out_digest, out_len)?;
+    let (stderr, err_truncated) = read_bounded(&err_path, arguments.limit, &err_digest, err_len)?;
     let sandbox_denied = config.sandbox.active()
         && ["Operation not permitted", "Read-only file system", "Permission denied"]
             .iter()
@@ -268,14 +269,15 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<Executed, Strin
     if !stderr.is_empty() {
         parts.push(format!("Stderr:\n{stderr}"));
     }
-    // Hand the loop detector each spilled capture's digest out of band, so it
-    // never has to re-parse the rendered markers to tell two captures apart.
+    // Hand the loop detector each spilled capture's identity (digest + exact
+    // marker path) out of band, so it never has to re-parse the rendered
+    // markers to tell two captures apart.
     let mut spills = Vec::new();
     if out_truncated {
-        spills.push(out_digest.clone());
+        spills.push(Spill { digest: out_digest.clone(), path: out_path.display().to_string() });
     }
     if err_truncated {
-        spills.push(err_digest.clone());
+        spills.push(Spill { digest: err_digest.clone(), path: err_path.display().to_string() });
     }
     if was_cancelled {
         parts.push("Error: the turn was cancelled; the command was killed".into());
@@ -304,30 +306,37 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<Executed, Strin
 /// bounded head, tail and byte count match but whose (possibly truncated-away)
 /// content differs. The head/tail reads here stay O(window) regardless of how
 /// large the capture grew.
-fn read_bounded(path: &Path, limit: usize, digest: &str) -> Result<(String, bool), String> {
+///
+/// `frozen_len` is the capture length [`CaptureHasher::finish`] snapshotted and
+/// hashed. A background descendant can still be appending to the file, so this
+/// reads **only up to `frozen_len`** — never the live, still-growing length —
+/// keeping the digest, the byte count in the marker, and the head/tail the
+/// model sees all covering the same bytes (issue #65).
+fn read_bounded(path: &Path, limit: usize, digest: &str, frozen_len: u64) -> Result<(String, bool), String> {
     let describe = |e: std::io::Error| format!("read {}: {e}", path.display());
     let mut file = File::open(path).map_err(describe)?;
-    let size = file.metadata().map_err(describe)?.len();
     let window = (limit as u64).saturating_mul(4); // UTF-8 is at most 4 bytes per char.
     let display = path.display().to_string();
-    if size <= window.saturating_mul(2) {
-        let mut bytes = Vec::with_capacity(size as usize);
-        file.read_to_end(&mut bytes).map_err(describe)?;
+    if frozen_len <= window.saturating_mul(2) {
+        let mut bytes = Vec::with_capacity(frozen_len as usize);
+        file.take(frozen_len).read_to_end(&mut bytes).map_err(describe)?;
         let text = String::from_utf8_lossy(&bytes);
         if text.chars().count() <= limit {
             return Ok((text.into_owned(), false));
         }
-        return Ok(output::bound_parts(&text, Some(&text), size, limit, Some(&display), Some(digest)));
+        return Ok(output::bound_parts(&text, Some(&text), frozen_len, limit, Some(&display), Some(digest)));
     }
     let mut head = vec![0; window as usize];
     file.read_exact(&mut head).map_err(describe)?;
-    file.seek(SeekFrom::End(-(window as i64))).map_err(describe)?;
+    // The tail is the last `window` bytes of the *frozen* prefix, not of the
+    // (possibly still-growing) file.
+    file.seek(SeekFrom::Start(frozen_len - window)).map_err(describe)?;
     let mut tail = Vec::with_capacity(window as usize);
-    file.read_to_end(&mut tail).map_err(describe)?;
+    file.take(window).read_to_end(&mut tail).map_err(describe)?;
     Ok(output::bound_parts(
         &String::from_utf8_lossy(&head),
         Some(&String::from_utf8_lossy(&tail)),
-        size,
+        frozen_len,
         limit,
         Some(&display),
         Some(digest),
@@ -362,8 +371,9 @@ impl CaptureHasher {
     /// forever and starve the timeout / cancellation checks (issue #65).
     /// Bounding each drain to the entry-time length guarantees it hands control
     /// back after a finite amount of work; the kept offset lets the next drain
-    /// resume at the newly written bytes.
-    fn drain(&mut self) -> std::io::Result<()> {
+    /// resume at the newly written bytes. Returns the entry-time length the
+    /// drain stopped at.
+    fn drain(&mut self) -> std::io::Result<u64> {
         use sha2::Digest;
         let target = self.file.metadata()?.len();
         let mut buf = [0u8; 65536];
@@ -376,13 +386,21 @@ impl CaptureHasher {
             self.hasher.update(&buf[..n]);
             self.hashed += n as u64;
         }
-        Ok(())
+        Ok(target)
     }
 
-    fn finish(mut self) -> std::io::Result<String> {
+    /// Finalise the digest and return it with the **frozen** capture length it
+    /// covers. The module intentionally returns while background descendants
+    /// may still hold stdout/stderr (see
+    /// `kills_on_timeout_without_waiting_for_background_children`), so such a
+    /// writer can append after this final drain; the returned length is the
+    /// single boundary both the digest and the bounded read honour, so the
+    /// digest always covers exactly the bytes the model can see and a late
+    /// append can never desync the two (issue #65).
+    fn finish(mut self) -> std::io::Result<(String, u64)> {
         use sha2::Digest;
-        self.drain()?; // final catch-up for bytes written since the last poll
-        Ok(output::short_digest(self.hasher.finalize()))
+        let frozen = self.drain()?; // final catch-up for bytes written since the last poll
+        Ok((output::short_digest(self.hasher.finalize()), frozen))
     }
 }
 
@@ -468,7 +486,7 @@ mod tests {
         let b = dir.path().join("b.stdout");
         fs::write(&a, build(b'A')).unwrap();
         fs::write(&b, build(b'B')).unwrap();
-        let digest = |p: &Path| CaptureHasher::open(p).unwrap().finish().unwrap();
+        let digest = |p: &Path| CaptureHasher::open(p).unwrap().finish().unwrap().0;
         // Same head and tail, one differing middle byte => distinct digests.
         assert_ne!(digest(&a), digest(&b));
         // Identical content => identical digest (genuine repeats stay detectable).
@@ -493,7 +511,7 @@ mod tests {
         f.write_all(b"first burst of output\n").unwrap();
         cap.drain().unwrap();
         f.write_all(b"second burst, much longer").unwrap();
-        let incremental = cap.finish().unwrap();
+        let incremental = cap.finish().unwrap().0;
         let whole = output::short_digest(sha2::Sha256::digest(fs::read(&path).unwrap()));
         assert_eq!(incremental, whole);
     }
@@ -518,8 +536,47 @@ mod tests {
         f.write_all(&vec![b'y'; 5_000]).unwrap();
         cap.drain().unwrap();
         assert_eq!(cap.hashed, 15_000, "the next drain resumes at the newly written delta");
-        let incremental = cap.finish().unwrap();
+        let incremental = cap.finish().unwrap().0;
         let whole = output::short_digest(sha2::Sha256::digest(fs::read(&path).unwrap()));
         assert_eq!(incremental, whole);
+    }
+
+    #[test]
+    fn read_bounded_honours_the_frozen_length_not_the_growing_file() {
+        // The finding this closes (issue #65): the module intentionally returns
+        // while a background descendant may still hold the capture open, so such
+        // a writer can append after `finish()` snapshots the digest's length.
+        // `read_bounded` must read only up to that frozen length, so the digest,
+        // the marker's byte count, and the head/tail the model sees all cover
+        // the same bytes — a late append must never desync them.
+        use sha2::Digest;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.stdout");
+        fs::write(&path, b"").unwrap();
+        let cap = CaptureHasher::open(&path).unwrap();
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&vec![b'A'; 10_000]).unwrap();
+        // finish() freezes the digest at the 10_000-byte boundary...
+        let (digest, frozen_len) = cap.finish().unwrap();
+        assert_eq!(frozen_len, 10_000);
+        // ...then a background writer appends more.
+        f.write_all(&vec![b'Z'; 5_000]).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 15_000, "the file kept growing after finish");
+        // read_bounded must honour the frozen boundary: the digest covers
+        // exactly the bytes read (the 10_000 A's), not the later Z's. Use a
+        // frozen length beyond the head window (4 * limit) so the marker's tail
+        // is drawn from the frozen prefix, not the still-growing file.
+        let (text, truncated) = read_bounded(&path, 1_000, &digest, frozen_len).unwrap();
+        assert!(truncated, "10_000 bytes over a 1_000-char limit must spill");
+        assert!(text.contains('A'), "{text}");
+        // No 'Z' byte from the late append appears in the head or tail.
+        assert!(!text.contains('Z'), "the late append must not be read: {text}");
+        // The marker reports the frozen byte count, not the grown file's.
+        assert!(text.contains("9000 bytes truncated"), "{text}");
+        assert!(!text.contains("14000 bytes truncated"), "{text}");
+        // The digest matches the frozen prefix, not the grown file.
+        let frozen_prefix = output::short_digest(sha2::Sha256::digest(vec![b'A'; 10_000]));
+        assert_eq!(digest, frozen_prefix);
     }
 }

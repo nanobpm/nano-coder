@@ -14,22 +14,36 @@ pub fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nano-coder-{}", std::process::id()))
 }
 
+/// A spill's out-of-band identity, handed from the bounder to the loop
+/// detector so the detector never re-parses the rendered — model-influenceable
+/// — marker to tell two results apart (issue #65).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spill {
+    /// Hex SHA-256 (16 chars) of the complete spilled content.
+    pub digest: String,
+    /// The exact path string the rendered marker carries (`<dir>/<name>`), so
+    /// the detector can normalise *this* marker only and leave any other
+    /// marker-looking text (a digest-free look-alike in stderr or hook context)
+    /// untouched.
+    pub path: String,
+}
+
 /// Bound `text` to `limit` characters; when it is longer, save it whole in
 /// `dir` and point at that file from the truncation marker, so the model can
 /// search or page through the rest. The spill never overwrites an existing
 /// file: for a persisted session the recorded paths must stay valid, so if
 /// `name` is taken (a reused tool-call ID after a resume or provider retry) a
 /// fresh `stem-2.ext`, `stem-3.ext`, … is reserved instead. Also returns the
-/// complete content's digest when the text was truncated and spilled, so the
-/// caller can hand the spill's identity to the loop detector **out of band**
-/// instead of the detector re-parsing the rendered marker (issue #65). The
-/// digest is `None` when nothing spilled.
+/// spilled capture's [`Spill`] identity (digest + exact marker path) when the
+/// text was truncated and spilled, so the caller can hand it to the loop
+/// detector **out of band** instead of the detector re-parsing the rendered
+/// marker (issue #65). The spill is `None` when nothing spilled.
 pub fn bound_and_spill_digest(
     text: &str,
     limit: usize,
     dir: &std::path::Path,
     name: &str,
-) -> (String, Option<String>) {
+) -> (String, Option<Spill>) {
     if text.chars().count() <= limit {
         return (text.to_string(), None);
     }
@@ -37,7 +51,8 @@ pub fn bound_and_spill_digest(
     let display = saved.as_ref().map(|p| p.display().to_string());
     let digest = content_digest(text);
     let (bounded, _) = bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref(), Some(&digest));
-    (bounded, Some(digest))
+    let spill = display.map(|path| Spill { digest, path });
+    (bounded, spill)
 }
 
 /// Write `text` to a new file in `dir` derived from `name`, never clobbering an
@@ -194,8 +209,9 @@ mod tests {
             bounded,
             format!("ab...6 bytes truncated (sha256:{digest}); complete output in {}...ij", path.display())
         );
-        // The spill's digest is handed back out of band for the loop detector.
-        assert_eq!(spilled.as_deref(), Some(digest.as_str()));
+        // The spill's identity (digest + exact marker path) is handed back out
+        // of band for the loop detector.
+        assert_eq!(spilled, Some(Spill { digest, path: path.display().to_string() }));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "abcdefghij");
     }
 

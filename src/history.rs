@@ -328,11 +328,12 @@ pub fn search(path: &Path, args: &Value) -> Result<String> {
 }
 
 /// `history_read`: one message in full (bounded, with the whole spilled).
-/// Also returns the complete text's digest when it was truncated and spilled,
-/// so the caller can hand the spill's identity to the loop detector **out of
-/// band** instead of the detector re-parsing the rendered marker (issue #65).
-/// The digest is `None` when nothing spilled.
-pub fn read_digest(path: &Path, args: &Value, spill_dir: &Path) -> Result<(String, Option<String>)> {
+/// Also returns the spill's [`Spill`](crate::output::Spill) identity (digest +
+/// exact marker path) when it was truncated and spilled, so the caller can hand
+/// the spill's identity to the loop detector **out of band** instead of the
+/// detector re-parsing the rendered marker (issue #65). The spill is `None`
+/// when nothing spilled.
+pub fn read_digest(path: &Path, args: &Value, spill_dir: &Path) -> Result<(String, Option<crate::output::Spill>)> {
     let id = id_arg(args, "id")?.ok_or_else(|| anyhow!("id is required"))?;
     let limit = crate::output::parse_max_output_length(args.get("max_output_length")).map_err(|e| anyhow!(e))?;
     let messages = load(path)?;
