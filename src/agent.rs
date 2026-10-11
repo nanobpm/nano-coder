@@ -30,6 +30,8 @@ use crate::tools::ToolRegistry;
 const INTERRUPTED_TOOL_RESULT: &str =
     "Error: the harness stopped before this tool call completed; its outcome is unknown.";
 const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this tool call ran.";
+const LOOP_STOPPED_TOOL_RESULT: &str =
+    "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 
 /// Turn cap for a headless (non-interactive) session whose configured cap is
@@ -3286,6 +3288,17 @@ impl Agent {
                     self.emit(AgentEvent::ToolResult { call: tool_call, ok: false, output: CANCELLED_TOOL_RESULT });
                     continue;
                 }
+                if loop_stop.is_some() {
+                    // The loop detector hard-stopped on an earlier call in this
+                    // same batch (issue #65). Do not dispatch the rest — a
+                    // response full of repeated or side-effecting calls must not
+                    // keep running past the stop. Add a synthetic result per
+                    // skipped call (as cancellation does) so the conversation
+                    // still has exactly one result per tool call.
+                    self.push(Message::tool_error(&tool_call.id, &tool_call.name, LOOP_STOPPED_TOOL_RESULT))?;
+                    self.emit(AgentEvent::ToolResult { call: tool_call, ok: false, output: LOOP_STOPPED_TOOL_RESULT });
+                    continue;
+                }
                 // Trigger before_tool_call hook. Include the permission
                 // decision so observers can tell an allowed call from one the
                 // policy will deny (issue #92: `before_tool_call` fires before
@@ -3510,7 +3523,13 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(&reminders::wrap(ctx));
                 }
-                if self.config.reminders && !is_plan_tool && !is_outcome_tool {
+                if self.config.reminders && (is_plan_tool || is_outcome_tool) {
+                    // Plan and outcome calls are never counted by the loop
+                    // detector, but they must still break a repeat streak so an
+                    // interleaved plan/outcome call cannot mask otherwise
+                    // consecutive repeats (issue #65).
+                    self.reminders.reset_repeat();
+                } else if self.config.reminders {
                     if ok && tool_call.name == memory::SAVE_TOOL {
                         self.reminders.memory_saved();
                     }
@@ -4652,6 +4671,43 @@ mod tests {
         assert_eq!(tools.len(), reminders::REPEAT_WARN_AFTER + reminders::REPEAT_WARN_AFTER - 1);
         let turn2 = &tools[reminders::REPEAT_WARN_AFTER..];
         assert!(turn2.iter().all(|m| !m.content.contains("same `echo` call")), "fresh turn: {:?}", turn2[0].content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hard_stop_skips_the_rest_of_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        // One response that batches many identical calls. The detector hard-stops
+        // partway through the batch; the remaining calls must NOT be dispatched,
+        // yet each still needs exactly one (synthetic) result (issue #65).
+        let batch = reminders::REPEAT_WARN_AFTER + reminders::REPEAT_MAX_WARNINGS + 3;
+        let response = LLMResponse {
+            tool_calls: (1..=batch)
+                .map(|i| ToolCall {
+                    id: format!("c{i}"),
+                    name: "echo".into(),
+                    arguments: json!({"text": "pong"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let (mut agent, _seen) = agent(vec![response], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Blocked));
+        let tools: Vec<_> = agent.conversation().iter().filter(|m| m.role == Role::Tool).collect();
+        // Every call in the batch still has exactly one result.
+        assert_eq!(tools.len(), batch);
+        // Calls up to and including the hard stop ran (their result is the echo);
+        // every later call is skipped with a synthetic "not run" result.
+        let dispatched = reminders::REPEAT_WARN_AFTER + reminders::REPEAT_MAX_WARNINGS;
+        assert!(tools[..dispatched].iter().all(|m| m.content.contains("pong")), "earlier calls ran");
+        assert!(
+            tools[dispatched..].iter().all(|m| m.content.contains("this tool call was not run")),
+            "later calls skipped, not dispatched: {}",
+            tools[dispatched].content
+        );
     }
 
     /// `n` scripted responses whose `echo` calls all differ, so the loop

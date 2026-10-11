@@ -1053,9 +1053,11 @@ the result:
 - when the model repeats the same tool call — same tool, same (normalised) arguments, same
   result — three times in a row, telling it to change approach or report `blocked`. The
   warning fires at most twice per turn; if the model keeps repeating after that, the turn
-  ends with a `blocked` outcome instead of burning budget. For `bash`, the match is on the
+  ends with a `blocked` outcome instead of burning budget, and any remaining calls in the
+  same batch are skipped rather than run. For `bash`, the match is on the
   first pipeline stage, so appending `| wc -l`-style stages does not dodge it. Plan and
-  `question` calls are exempt (repeating them is legitimate).
+  `question` calls are exempt and break the streak, so only genuinely consecutive repeats
+  count (an interleaved exempt call makes the calls around it non-consecutive).
 
 Plan and outcome calls don't count. Set `reminders = false` to turn them off.
 

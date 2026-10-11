@@ -71,6 +71,17 @@ impl Reminders {
         self.suggested_memory = true;
     }
 
+    /// Break the current repeat streak without counting a call. Interleaved
+    /// calls the loop detector never counts — exempt tools, and the plan/outcome
+    /// calls the caller skips — use this so they are not *transparent* to the
+    /// streak: `bash A`, `question`, `bash A`, `question`, `bash A` is three
+    /// non-consecutive `bash A` calls, not three in a row, so only genuinely
+    /// consecutive calls can warn or hard-stop (issue #65).
+    pub fn reset_repeat(&mut self) {
+        self.repeat_count = 0;
+        self.repeat_key = None;
+    }
+
     /// Count a (non-plan) tool call and return any reminders for its result.
     /// `memory_writable`: `memory_save` is offered, so suggesting it is useful.
     pub fn after_tool_call(&mut self, plan: &Plan, memory_writable: bool) -> Vec<String> {
@@ -127,6 +138,7 @@ impl Reminders {
     /// warnings are spent, a further repeat is a hard stop.
     pub fn after_repeat_call(&mut self, tool: &str, args: &Value, ok: bool, result: &str) -> RepeatVerdict {
         if REPEAT_EXEMPT_TOOLS.contains(&tool) {
+            self.reset_repeat();
             return RepeatVerdict::None;
         }
         let key = repeat_key(tool, args, ok, result);
@@ -299,5 +311,31 @@ mod tests {
         let verdicts = repeats(&mut r, REPEAT_WARN_AFTER);
         assert!(verdicts[..REPEAT_WARN_AFTER - 1].iter().all(|v| *v == RepeatVerdict::None));
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)));
+    }
+
+    #[test]
+    fn an_interleaved_exempt_call_breaks_the_streak() {
+        // `bash A`, `question`, `bash A`, `question`, `bash A`, … — many `bash A`
+        // calls, but an exempt call sits between every pair, so none are
+        // consecutive and the detector must never warn or hard-stop (issue #65).
+        let mut r = Reminders::default();
+        for _ in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 2 {
+            assert_eq!(
+                r.after_repeat_call("bash", &json!({"command": "make test"}), false, "exit 1"),
+                RepeatVerdict::None
+            );
+            assert_eq!(r.after_repeat_call("question", &json!({}), true, "ok"), RepeatVerdict::None);
+        }
+    }
+
+    #[test]
+    fn reset_repeat_breaks_a_building_streak() {
+        // A plan/outcome call the caller skips routes through `reset_repeat`;
+        // it must restart the streak just like an interleaved exempt call.
+        let mut r = Reminders::default();
+        repeats(&mut r, REPEAT_WARN_AFTER - 1);
+        r.reset_repeat();
+        let verdicts = repeats(&mut r, REPEAT_WARN_AFTER - 1);
+        assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "{verdicts:?}");
     }
 }
