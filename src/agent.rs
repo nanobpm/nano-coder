@@ -3551,8 +3551,8 @@ impl Agent {
                         reminders::RepeatVerdict::HardStop(reason) => {
                             result_text.push_str("\n\n");
                             result_text.push_str(&reminders::wrap(
-                                "This repeated call is not being run again: the turn is ending as blocked. \
-                                 Do not retry it.",
+                                "This call already ran, but it has repeated too many times: the turn is ending \
+                                 as blocked and any further retries are being stopped. Do not retry it.",
                             ));
                             loop_stop = Some(reason);
                         }
