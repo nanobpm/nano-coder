@@ -177,13 +177,13 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
         .stderr(err_file)
         // Own process group so a timeout kills the whole pipeline.
         .process_group(0);
-    let mut child = command.spawn().map_err(|e| format!("spawn {}: {e}", config.shell))?;
-    drop(sandboxed);
-
-    let started = Instant::now();
-    let mut poll = Duration::from_millis(5);
-    let cancelled = || config.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst));
-    let mut was_cancelled = false;
+    // Open the capture readers *before* spawning the child. These opens are
+    // fallible; doing them after spawn would let a failure (`?`) return while
+    // the child keeps running outside timeout/cancellation supervision — a
+    // leaked process group. The capture files already exist (created above), so
+    // the readers can be opened up front, after which no fallible step stands
+    // between spawn and the supervision loop.
+    //
     // Digest the captures incrementally *while the command runs* (not in a single
     // post-exit reread): a command emitting many gigabytes must not keep the tool
     // blocked re-hashing the whole file after it exits, yet the digest must cover
@@ -191,6 +191,13 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     // middle stay distinct and are never hard-stopped as a false loop (issue #65).
     let mut out_hash = CaptureHasher::open(&out_path).map_err(|e| format!("read {}: {e}", out_path.display()))?;
     let mut err_hash = CaptureHasher::open(&err_path).map_err(|e| format!("read {}: {e}", err_path.display()))?;
+    let mut child = command.spawn().map_err(|e| format!("spawn {}: {e}", config.shell))?;
+    drop(sandboxed);
+
+    let started = Instant::now();
+    let mut poll = Duration::from_millis(5);
+    let cancelled = || config.cancel.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst));
+    let mut was_cancelled = false;
     let (status, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (status, false),
