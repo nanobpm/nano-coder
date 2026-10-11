@@ -32,6 +32,12 @@ const INTERRUPTED_TOOL_RESULT: &str =
 const CANCELLED_TOOL_RESULT: &str = "Error: the turn was cancelled before this tool call ran.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 
+/// Turn cap for a headless (non-interactive) session whose configured cap is
+/// unbounded — `max_iterations = 0`, or Auto mode, which disables the cap.
+/// With no human present nothing else stops a runaway turn, so the cap is a
+/// finite safety net instead (issue #65).
+const HEADLESS_SAFETY_CAP: usize = 300;
+
 /// Output room `request_max_tokens()` tries to keep free within the context
 /// window, and the reservation `over_threshold()` compacts against. It is a
 /// target, not a floor: when fewer tokens actually remain and pre-send
@@ -2883,20 +2889,28 @@ impl Agent {
 
         // A cap of 0 is unbounded.
         let max_iterations = self.config.max_iterations;
+        // …except in a headless session, where no human can stop a runaway:
+        // 0 (and Auto mode) fall back to a finite safety cap (issue #65).
+        let headless_cap = !self.questions.is_interactive()
+            && (max_iterations == 0 || self.control.mode() == crate::mode::AgentMode::Auto);
         let mut final_response = None;
         let mut last_content = String::new();
         let mut cancelled = false;
         let mut reported: Option<Outcome> = None;
 
         // The cap is mode-dependent and can be extended when the user says
-        // "keep going". Auto mode disables it; normal mode asks (interactive
-        // only); ACP/headless keeps the hard stop. Re-evaluated from the live
-        // mode each iteration so a mid-turn Shift+Tab changes cap behavior too.
+        // "keep going". Auto mode disables it (interactive only); normal mode
+        // asks (interactive only); ACP/headless keeps the hard stop.
+        // Re-evaluated from the live mode each iteration so a mid-turn
+        // Shift+Tab changes cap behavior too.
         let mut granted_extra = 0usize;
         let mut iteration = 0usize;
+        // Set by the loop detector when the turn must end blocked (issue #65).
+        let mut loop_stop: Option<String> = None;
         loop {
             iteration += 1;
             let budget = match (self.control.mode(), max_iterations) {
+                _ if headless_cap => HEADLESS_SAFETY_CAP.saturating_add(granted_extra),
                 (crate::mode::AgentMode::Auto, _) | (_, 0) => usize::MAX,
                 _ => max_iterations.saturating_add(granted_extra),
             };
@@ -3505,6 +3519,25 @@ impl Agent {
                         result_text.push_str("\n\n");
                         result_text.push_str(&reminders::wrap(&note));
                     }
+                    // Loop detector (issue #65): nudge the model when it
+                    // repeats an identical call, and end the turn blocked when
+                    // it keeps repeating after the warnings are spent.
+                    match self.reminders.after_repeat_call(&tool_call.name, &effective_call.arguments, ok, &result_text)
+                    {
+                        reminders::RepeatVerdict::None => {}
+                        reminders::RepeatVerdict::Warning(note) => {
+                            result_text.push_str("\n\n");
+                            result_text.push_str(&reminders::wrap(&note));
+                        }
+                        reminders::RepeatVerdict::HardStop(reason) => {
+                            result_text.push_str("\n\n");
+                            result_text.push_str(&reminders::wrap(
+                                "This repeated call is not being run again: the turn is ending as blocked. \
+                                 Do not retry it.",
+                            ));
+                            loop_stop = Some(reason);
+                        }
+                    }
                 }
                 if history::is_history_tool(&tool_call.name) {
                     self.history_hint_pending = false;
@@ -3530,6 +3563,18 @@ impl Agent {
                 self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &display_output });
             }
             self.refresh_stats();
+            if let Some(reason) = loop_stop.take() {
+                // The loop detector's hard stop: the model kept repeating one
+                // call after the warnings, so the turn ends here as `blocked`
+                // rather than burning budget until the turn cap (issue #65).
+                let outcome = Outcome { status: goal::Status::Blocked, summary: reason };
+                let response = outcome.response();
+                self.push(Message::assistant(&response))?;
+                self.emit_assistant_text(&response);
+                reported = Some(outcome);
+                final_response = Some(response);
+                break;
+            }
             if reported.is_some() {
                 // A reported outcome ends the turn like a tool-free answer, so it
                 // must pass the same Stop gate: a Stop hook may ask the agent to
@@ -4529,6 +4574,143 @@ mod tests {
         assert!(tool.attachments.is_empty());
         assert!(tool.content.contains("can't view images"), "hint: {}", tool.content);
         assert!(tool.content.contains("vision = true"), "names the fix: {}", tool.content);
+    }
+
+    /// `n` scripted responses that each repeat the same `echo` call.
+    fn echo_loop(n: usize) -> Vec<LLMResponse> {
+        (1..=n).map(|i| tool_call(&format!("c{i}"))).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identical_tool_calls_draw_a_loop_warning_on_the_third() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two identical calls, then the model moves on: no reminder at all.
+        let (mut quiet, _seen) = agent(vec![tool_call("c1"), tool_call("c2"), text("done")], dir.path());
+        quiet.new_session().unwrap();
+        quiet.run_turn(Some("in-1"), "go").await.unwrap();
+        let tools: Vec<_> = quiet.conversation().iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|m| !m.content.contains("<system-reminder>")), "no warning: {:?}", tools[1].content);
+
+        // The third identical call is warned about.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent2, _seen) =
+            agent(vec![tool_call("c1"), tool_call("c2"), tool_call("c3"), text("done")], dir.path());
+        agent2.new_session().unwrap();
+        agent2.run_turn(Some("in-1"), "go").await.unwrap();
+        let tools: Vec<_> = agent2.conversation().iter().filter(|m| m.role == Role::Tool).collect();
+        assert!(!tools[1].content.contains("<system-reminder>"), "second call is quiet: {}", tools[1].content);
+        assert!(tools[2].content.contains("same `echo` call 3 times"), "third call warns: {}", tools[2].content);
+        assert!(tools[2].content.contains("report_outcome"), "points at the way out: {}", tools[2].content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeat_loop_ends_the_turn_blocked_after_the_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(echo_loop(20), dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        // The turn stops itself right after the second warning (call 5 of the
+        // loop) instead of running the script dry.
+        assert_eq!(seen.lock().unwrap().len(), reminders::REPEAT_WARN_AFTER + reminders::REPEAT_MAX_WARNINGS);
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        let reported = outcome.outcome.expect("the harness reports the outcome");
+        assert_eq!(reported.status, goal::Status::Blocked);
+        assert!(reported.summary.contains("echo"), "names the stuck call: {}", reported.summary);
+        assert!(outcome.response.starts_with("Blocked:"), "{}", outcome.response);
+        let tools: Vec<_> = agent.conversation().iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), reminders::REPEAT_WARN_AFTER + reminders::REPEAT_MAX_WARNINGS);
+        assert!(
+            tools.last().unwrap().content.contains("turn is ending as blocked"),
+            "{}",
+            tools.last().unwrap().content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_loop_detector_resets_on_a_new_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        // Turn 1 loops until the warning fires and then stops; turn 2 repeats
+        // the same call twice and answers — below the fresh turn's threshold.
+        let mut responses = echo_loop(reminders::REPEAT_WARN_AFTER);
+        responses.push(text("first done"));
+        responses.extend(echo_loop(reminders::REPEAT_WARN_AFTER - 1));
+        responses.push(text("second done"));
+        let (mut agent, _seen) = agent(responses, dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        let warned = agent
+            .conversation()
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.contains("same `echo` call"))
+            .count();
+        assert_eq!(warned, 1, "one warning in the first turn");
+        // A new turn starts the count over: the same call twice more stays quiet.
+        let reply = agent.run_turn(Some("in-2"), "again").await.unwrap();
+        assert_eq!(reply.response, "second done");
+        let tools: Vec<_> = agent.conversation().iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), reminders::REPEAT_WARN_AFTER + reminders::REPEAT_WARN_AFTER - 1);
+        let turn2 = &tools[reminders::REPEAT_WARN_AFTER..];
+        assert!(turn2.iter().all(|m| !m.content.contains("same `echo` call")), "fresh turn: {:?}", turn2[0].content);
+    }
+
+    /// `n` scripted responses whose `echo` calls all differ, so the loop
+    /// detector stays out of the way of the turn-cap tests.
+    fn echo_stream(n: usize) -> Vec<LLMResponse> {
+        (1..=n)
+            .map(|i| LLMResponse {
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "echo".into(),
+                    arguments: json!({"text": format!("pong {i}")}),
+                    item_id: None,
+                    malformed_arguments: None,
+                }],
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_headless_turn_with_no_cap_stops_at_the_safety_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // max_iterations = 0 (unbounded) and a model that never stops calling.
+        let (mut agent, seen) = agent(echo_stream(HEADLESS_SAFETY_CAP + 10), dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
+        assert_eq!(seen.lock().unwrap().len(), HEADLESS_SAFETY_CAP);
+        assert!(outcome.outcome.is_none(), "a cap stop reports no outcome");
+        assert!(
+            outcome.response.contains(&format!("stopped after {HEADLESS_SAFETY_CAP} LLM calls")),
+            "{}",
+            outcome.response
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_mode_does_not_disable_the_cap_in_a_headless_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(echo_stream(HEADLESS_SAFETY_CAP + 10), dir.path());
+        agent.set_mode(crate::mode::AgentMode::Auto);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
+        assert_eq!(seen.lock().unwrap().len(), HEADLESS_SAFETY_CAP);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interactive_session_keeps_an_unbounded_zero_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(echo_loop(20), dir.path());
+        agent.questions().set_interactive(true);
+        agent.new_session().unwrap();
+        // With a human present, max_iterations = 0 stays unbounded — and the
+        // loop detector alone ends the repeat loop (blocked, not capped).
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(seen.lock().unwrap().len(), reminders::REPEAT_WARN_AFTER + reminders::REPEAT_MAX_WARNINGS);
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Blocked));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7595,16 +7777,20 @@ mod tests {
             call("p1", "plan_add", json!({"items": ["Find it", "Fix it"]})),
             call("p2", "plan_update", json!({"id": 1, "status": "in_progress"})),
         ];
-        responses.extend((0..reminders::PLAN_STALE_AFTER).map(|i| tool_call(&format!("c{i}"))));
+        // Distinct arguments, so the loop detector (issue #65) stays quiet and
+        // only the stale-plan reminder fires.
+        responses.extend(
+            (0..reminders::PLAN_STALE_AFTER).map(|i| call(&format!("c{i}"), "echo", json!({"text": format!("pong {i}")}))),
+        );
         responses.push(text("done"));
         let (mut agent, seen) = agent(responses, dir.path());
         agent.send_message("go").await.unwrap();
         let last = seen.lock().unwrap().last().unwrap().clone();
         let results: Vec<&Message> = last.iter().filter(|m| m.name.as_deref() == Some("echo")).collect();
-        assert!(results[..results.len() - 1].iter().all(|m| m.content == "pong"));
+        assert!(results[..results.len() - 1].iter().enumerate().all(|(i, m)| m.content == format!("pong {i}")));
         let reminded = &results.last().unwrap().content;
         assert!(
-            reminded.starts_with("pong\n\n<system-reminder>\n")
+            reminded.starts_with(&format!("pong {}\n\n<system-reminder>\n", reminders::PLAN_STALE_AFTER - 1))
                 && reminded.contains("#1 \"Find it\" is still in progress"),
             "{reminded}"
         );

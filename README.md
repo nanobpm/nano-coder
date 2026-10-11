@@ -383,7 +383,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
     base URL, key source (env var, shell command, or a literal key; the file is then
     written with mode 0600) and default model
   - temperature, max tokens, system prompt
-  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping
+  - **Turn cap** (`max_iterations`): LLM calls per input (0 = unbounded); a positive cap makes normal mode ask before stopping. In a headless (non-interactive) session an unbounded cap falls back to a 300-call safety net
   - **Context**: auto-compaction on/off, threshold, compaction mode, context-window override
   - **Verbosity**
   - **Save to config file**: writes only the keys you changed into the config file
@@ -399,7 +399,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going
   - **plan** - read-only: mutating tools (`bash`, `write_file`, `edit_file`) are gated, only analysis and output
-  - **auto** - no turn cap; a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
+  - **auto** - no turn cap (headless runs still get the 300-call safety cap); a `question` left unanswered for 15s is answered with "the user is away from the keyboard, make the best decision you can"
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
@@ -464,7 +464,7 @@ model = "anthropic/claude-sonnet-4-5"   # provider/model
 default_provider = "mock"               # used when the model has no known provider prefix
 temperature = 0.7                       # or "default" to send none (see Temperature below)
 max_tokens = 4096
-max_iterations = 0                      # LLM calls per user input (0 = unbounded)
+max_iterations = 0                      # LLM calls per user input (0 = unbounded; headless runs get a 300-call safety cap)
 system_prompt = "You are a helpful assistant with access to tools."
 bash_timeout_secs = 600
 persist_sessions = true
@@ -1049,7 +1049,13 @@ To turn plans off, set `plan_tools = false`.
 the result:
 - after 12 tool calls with no plan change while items are open, naming the item in progress
   (or the next one) and asking for `plan_update`; again every 12 calls;
-- once per session, after 10 tool calls in one turn with no plan, suggesting `plan_add`.
+- once per session, after 10 tool calls in one turn with no plan, suggesting `plan_add`;
+- when the model repeats the same tool call — same tool, same (normalised) arguments, same
+  result — three times in a row, telling it to change approach or report `blocked`. The
+  warning fires at most twice per turn; if the model keeps repeating after that, the turn
+  ends with a `blocked` outcome instead of burning budget. For `bash`, the match is on the
+  first pipeline stage, so appending `| wc -l`-style stages does not dodge it. Plan and
+  `question` calls are exempt (repeating them is legitimate).
 
 Plan and outcome calls don't count. Set `reminders = false` to turn them off.
 
