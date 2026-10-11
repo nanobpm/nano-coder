@@ -19,6 +19,13 @@ use crate::output::{self, MAX_OUTPUT_LENGTH};
 use crate::sandbox::{self, SandboxConfig};
 use crate::tools::ToolDefinition;
 
+/// Upper bound on the bytes `stream_sha256` hashes of a capture file. The marker
+/// digest only has to distinguish two bounded previews whose head, tail and byte
+/// count all match, so a fixed-size prefix suffices — and capping it keeps the
+/// post-exit hashing pass O(HASH_CAP) instead of re-reading an unbounded capture
+/// after the process has already exited (issue #65).
+const HASH_CAP: u64 = 1024 * 1024; // 1 MiB
+
 pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
@@ -242,10 +249,12 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
 }
 
 /// Read a capture file, reading only its head and tail when it is large. The
-/// returned digest is a hex SHA-256 of the *complete* file, computed by
-/// streaming the whole file through the hasher even when only the head and tail
-/// are kept, so the bounder's marker can distinguish two captures whose bounded
-/// head, tail and byte count match but whose truncated middle differs.
+/// returned digest is a hex SHA-256 of the file's first [`HASH_CAP`] bytes,
+/// computed by streaming that bounded prefix through the hasher even when only
+/// the head and tail are kept, so the bounder's marker can distinguish two
+/// captures whose bounded head, tail and byte count match but whose content
+/// differs. Hashing a bounded prefix — rather than the whole file — keeps the
+/// post-exit work O([`HASH_CAP`]) no matter how large the capture grew.
 fn read_bounded(path: &Path, limit: usize) -> Result<(String, bool), String> {
     let describe = |e: std::io::Error| format!("read {}: {e}", path.display());
     let mut file = File::open(path).map_err(describe)?;
@@ -285,12 +294,20 @@ fn hex_sha256(bytes: &[u8]) -> String {
     output::short_digest(sha2::Sha256::digest(bytes))
 }
 
-/// Hex SHA-256 of a file's complete contents, read in chunks so a large capture
-/// is hashed without being held in memory. Truncated to 16 hex chars (64 bits)
-/// to match the bounder's marker digest.
+/// Hex SHA-256 of the first [`HASH_CAP`] bytes of a file, read in chunks so the
+/// pass is bounded and never holds the capture in memory. Truncated to 16 hex
+/// chars (64 bits) to match the bounder's marker digest.
+///
+/// The digest only has to distinguish two bounded previews whose head, tail and
+/// byte count all match; hashing a fixed-size *prefix* does that while keeping
+/// the post-exit work O([`HASH_CAP`]) regardless of capture size. Hashing the
+/// *whole* file instead re-read every byte after the process had already exited
+/// — with no timeout or cancellation check — so a command that emitted many
+/// gigabytes kept the tool blocked long after it exited or was killed, defeating
+/// `read_bounded`'s head/tail-only I/O (issue #65).
 fn stream_sha256(path: &Path) -> std::io::Result<String> {
     use sha2::Digest;
-    let mut file = File::open(path)?;
+    let mut file = File::open(path)?.take(HASH_CAP);
     let mut hasher = sha2::Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -361,5 +378,32 @@ mod tests {
         let started = Instant::now();
         assert_eq!(run(&config, &json!({"command": "sleep 5 & echo done"})), "done\n");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn marker_digest_is_bounded_to_a_fixed_prefix() {
+        // The marker digest must not require reading the *whole* capture after
+        // the process exits: it is computed from a bounded prefix so a multi-GB
+        // capture cannot keep the tool blocked post-exit (issue #65). Two
+        // captures that share the first HASH_CAP bytes but diverge afterwards
+        // therefore produce the *same* digest — proving the pass is bounded.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.stdout");
+        let b = dir.path().join("b.stdout");
+        let prefix = vec![b'x'; HASH_CAP as usize];
+        let mut fa = prefix.clone();
+        fa.extend_from_slice(b"AAA-tail-only-in-a");
+        let mut fb = prefix;
+        fb.extend_from_slice(b"BBB-tail-only-in-b");
+        fs::write(&a, &fa).unwrap();
+        fs::write(&b, &fb).unwrap();
+        // Same bounded prefix => same digest even though the tails differ.
+        assert_eq!(stream_sha256(&a).unwrap(), stream_sha256(&b).unwrap());
+        // A difference *inside* the prefix still changes the digest.
+        let mut fc = vec![b'y'; HASH_CAP as usize];
+        fc.extend_from_slice(b"AAA-tail-only-in-a");
+        let c = dir.path().join("c.stdout");
+        fs::write(&c, &fc).unwrap();
+        assert_ne!(stream_sha256(&a).unwrap(), stream_sha256(&c).unwrap());
     }
 }

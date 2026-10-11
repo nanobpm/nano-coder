@@ -303,22 +303,27 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
         // marker's own line; the path may contain spaces (a `\S+` match would
         // silently fail on a session_dir with spaces).
         //
-        // Greedy matching is safe because the marker carries an optional
-        // `(sha256:<hex>)` digest of the *complete* output between the byte count
-        // and `; complete output in` (see `bound_parts`), and the capture keeps
-        // the byte count *and* that digest (group 1 ends just before
+        // Greedy matching is safe because the marker carries a mandatory
+        // `(sha256:<hex>)` digest distinguishing the output's content between the
+        // byte count and `; complete output in` (see `bound_parts`), and the
+        // capture keeps the byte count *and* that digest (group 1 ends just before
         // `; complete output in`). Every path-bearing marker carries this digest
-        // (`bound_and_spill`/`bash.rs` always pass one), so two outputs that
-        // differ *anywhere* — truncated middle or bounded tail — carry different
-        // digests and already produce different fingerprints: the path match only
-        // has to collapse the volatile basename of *genuinely identical* outputs,
-        // whose tails are identical, so even if a greedy match reached a spill-
-        // looking token in the tail it would do so identically for both. A
-        // non-greedy match cannot fail *closed* here, but it can fail *open* on
-        // the directory-segment case above, so greedy-to-the-last-component is
-        // strictly more correct.
+        // (`bound_and_spill`/`bash.rs` always pass one), so the digest is
+        // *required* here: it is what proves the text is a real bounder marker
+        // rather than ordinary output that merely quotes `N bytes truncated;
+        // complete output in <name>...`. Without it, two such ordinary results
+        // whose only difference is the quoted spill-looking name would normalise
+        // identically and hard-stop the turn on the fifth call (issue #65). Two
+        // outputs that differ *anywhere* — truncated middle or bounded tail —
+        // carry different digests and already produce different fingerprints:
+        // the path match only has to collapse the volatile basename of
+        // *genuinely identical* outputs, whose tails are identical, so even if a
+        // greedy match reached a spill-looking token in the tail it would do so
+        // identically for both. A non-greedy match cannot fail *closed* here,
+        // but it can fail *open* on the directory-segment case above, so
+        // greedy-to-the-last-component is strictly more correct.
         regex::Regex::new(
-            r"(bytes truncated(?: \(sha256:[0-9a-f]+\))?); complete output in (?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
+            r"(bytes truncated \(sha256:[0-9a-f]+\)); complete output in (?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
         )
         .expect("spill-path regex is valid")
     });
@@ -778,7 +783,7 @@ mod tests {
         // exact runaway case it exists to catch (issue #65).
         let mut r = Reminders::default();
         let result =
-            |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL");
+            |n: usize| format!("HEAD...40 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
@@ -862,7 +867,7 @@ mod tests {
         // hard-stops (issue #65).
         let mut r = Reminders::default();
         let result =
-            |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL", suffix = if n == 1 { String::new() } else { format!("-{n}") });
+            |n: usize| format!("HEAD...40 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL", suffix = if n == 1 { String::new() } else { format!("-{n}") });
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|n| r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), &[]))
             .collect();
@@ -875,22 +880,22 @@ mod tests {
         // collision `-N` suffix) all normalise to the same placeholder *inside
         // the marker*.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/bash-99-2.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-3.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-99-2.stdout...y"),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/bash-1.stderr...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/bash-7.stderr...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-1.stderr...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-7.stderr...y"),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/tool-abc123-read_file.txt...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/tool-zz99-read_file.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-abc123-read_file.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-zz99-read_file.txt...y"),
         );
         // history_read spills as `history-<id>.txt`, with a collision `-N`
         // suffix on a repeat; those per-call names must also collapse (issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/history-7.txt...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /t/history-7-2.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7-2.txt...y"),
         );
         // Genuinely different content is still distinguished.
         assert_ne!(normalise_spill_paths("alpha"), normalise_spill_paths("beta"));
@@ -913,8 +918,17 @@ mod tests {
         );
         // The tail after the marker is preserved, so differing tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...tailA"),
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-2.stdout...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-1.stdout...tailA"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-2.stdout...tailB"),
+        );
+        // A digest-less `N bytes truncated; complete output in <name>...` is NOT
+        // a bounder marker — every real path-bearing marker carries its
+        // `(sha256:…)` digest — so ordinary output that merely quotes the phrase
+        // is left untouched and stays distinct, never conflated into a false
+        // repeat that hard-stops the turn (issue #65).
+        assert_ne!(
+            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-1.stdout..."),
+            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-2.stdout..."),
         );
     }
 
@@ -925,12 +939,12 @@ mod tests {
         // survives in the hash and the runaway never warns or hard-stops (the
         // `\S+`-based match silently failed here; issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /my dir/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /my dir/bash-9.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-3.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-9.stdout...y"),
         );
         let mut r = Reminders::default();
         let result =
-            |n: usize| format!("HEAD...40 bytes truncated; complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
+            |n: usize| format!("HEAD...40 bytes truncated (sha256:1111111111111111); complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
@@ -946,16 +960,16 @@ mod tests {
         // match would wrongly take at the directory's dots, leaving each
         // per-call basename in the hash so the runaway never fired — issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache...v1/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache...v1/bash-4.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-3.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-4.stdout...y"),
         );
         // A session_dir whose segment ends in a spill *extension* (e.g.
         // `/tmp/cache.txt...v1`) must not stop the match at the directory's
         // `.txt...` either — only the generated `bash-`/`tool-` final component
         // terminates the path.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache.txt...v1/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated; complete output in /tmp/cache.txt...v1/bash-4.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-3.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-4.stdout...y"),
         );
         // A session_dir whose segment *is itself* a generated-looking spill name
         // — `/tmp/tool-cache.txt...v1` or `/tmp/history-x.txt...v1` — must not be
@@ -966,17 +980,17 @@ mod tests {
         for dirseg in ["tool-cache.txt", "history-x.txt", "bash-0.stdout"] {
             assert_eq!(
                 normalise_spill_paths(&format!(
-                    "x...3 bytes truncated; complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
+                    "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
                 )),
                 normalise_spill_paths(&format!(
-                    "x...3 bytes truncated; complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
+                    "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
                 )),
                 "directory segment {dirseg} must not be taken as the spill basename",
             );
         }
         let mut r = Reminders::default();
         let result =
-            |n: usize| format!("HEAD...40 bytes truncated; complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
+            |n: usize| format!("HEAD...40 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
             .collect();
@@ -985,7 +999,7 @@ mod tests {
         // so an identical runaway under such a session_dir still warns.
         let mut r_dir = Reminders::default();
         let result_dir = |n: usize| {
-            format!("HEAD...40 bytes truncated; complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL")
+            format!("HEAD...40 bytes truncated (sha256:7777777777777777); complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL")
         };
         let verdicts_dir: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|n| r_dir.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result_dir(n), &[]))
@@ -997,14 +1011,14 @@ mod tests {
         // the marker's complete-output digest already tells genuinely different
         // outputs apart), so a `...` in the tail does not erase a real change.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...tailA"),
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailA"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailB"),
         );
         // Even when the tail itself contains `...`, the extension anchor keeps the
         // match on the spill basename, so distinct tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...a...tailA"),
-            normalise_spill_paths("h...3 bytes truncated; complete output in /t/bash-1.stdout...b...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...a...tailA"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...b...tailB"),
         );
     }
 
