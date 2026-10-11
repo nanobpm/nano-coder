@@ -780,6 +780,23 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         println!();
     }
     renderer.begin_turn();
+    // Keep the prompt's busy spinner moving while the turn runs, even when no
+    // output arrives (frame renderer only; `tick` is a no-op otherwise).
+    // A picker (a question from the agent, the turn cap) holds `picker_lock`
+    // while it owns the terminal; skip ticks then rather than draw over it.
+    let spinner = renderer.is_frame().then(|| {
+        let renderer = renderer.clone();
+        let picker_lock = terminal.picker_lock();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ui::SPINNER_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Ok(_terminal) = picker_lock.try_lock() {
+                    renderer.tick();
+                }
+            }
+        })
+    });
     let outcome = {
         // The turn is a non-idle phase: the guard restores the idle `Prompt`
         // mode on *every* exit path (including a future early `return`, `?`,
@@ -990,6 +1007,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         }
     }
     .await;
+        // Stop the spinner before the prompt switches back to `›`.
+        if let Some(spinner) = &spinner {
+            spinner.abort();
+        }
         renderer.end_turn();
         // `/verbosity LEVEL` typed mid-turn set the global; keep the config copy
         // (which `/settings` saves) in step, as the between-turns command does.

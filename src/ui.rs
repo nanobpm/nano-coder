@@ -2,6 +2,38 @@
 //! events into streamed text, collapsible thinking and inline tool calls.
 
 use std::io::{self, IsTerminal, Write};
+
+/// Frames of the busy spinner drawn in place of the prompt glyph.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// How long each spinner frame shows; the frame is redrawn this often.
+pub const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The prompt glyph: a cyan spinner while a turn runs, a green `›` when the
+/// harness is waiting for the user.
+fn prompt_glyph(busy_since: Option<Instant>) -> String {
+    match busy_since {
+        Some(started) => {
+            let frame = (started.elapsed().as_millis() / SPINNER_INTERVAL.as_millis()) as usize % SPINNER.len();
+            format!("\x1b[38;5;117m{}\x1b[39m", SPINNER[frame])
+        }
+        None => "\x1b[38;5;114m›\x1b[39m".to_string(),
+    }
+}
+
+/// The dim hint after the cursor of an empty editor: whose turn it is.
+fn prompt_hint(busy_since: Option<Instant>) -> String {
+    match busy_since {
+        Some(started) => format!("working {} · Enter steers, Esc Esc cancels", elapsed_text(started.elapsed())),
+        None => "ready · type a message, /help for commands".to_string(),
+    }
+}
+
+/// `4s`, `1m 05s`: whole seconds of the running turn.
+fn elapsed_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
+}
+
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -265,6 +297,9 @@ struct FrameState {
     /// and only restamps on submission, so mirror that by refreshing this only
     /// at a turn boundary.
     prompt_stamp: String,
+    /// When the running turn started; `None` while the prompt waits for the
+    /// user. Drives the busy spinner in place of the `›` prompt glyph.
+    busy_since: Option<Instant>,
     /// A transient hint shown on the status bar (e.g. "(Ctrl-C again to
     /// exit)") instead of as a transcript item. Transient notes are
     /// cursor-relevant feedback: as a transcript item they would trigger a
@@ -295,6 +330,7 @@ impl Renderer {
             think: None,
             think_streamed: false,
             prompt_stamp: stamp(),
+            busy_since: None,
             transient: None,
             batch: false,
         }
@@ -538,8 +574,13 @@ impl Renderer {
         // matching the legacy prompt so switching renderers keeps the setting.
         // Use the stamp captured at prompt start (not `stamp()`), so it stays
         // fixed while the user types rather than ticking every render.
-        let prompt = format!("{}› ", fs.prompt_stamp);
+        let prompt = format!("{}{} ", fs.prompt_stamp, prompt_glyph(fs.busy_since));
         let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
+        // An empty editor says whose turn it is, after the cursor.
+        if fs.editor.0.is_empty() {
+            let hint = prompt_hint(fs.busy_since);
+            editor[0] = frame::fit_line(&format!("{} {DIM}{hint}{RESET}", editor[0]), width);
+        }
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
             editor.push(indicator);
         }
@@ -1066,6 +1107,10 @@ impl Renderer {
     pub fn begin_turn(&self) {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
+        if let Some(fs) = self.frame.lock().unwrap().as_mut() {
+            fs.busy_since = Some(Instant::now());
+            self.frame_render(fs);
+        }
         // Reset the truncation guard: it is raised only when a non-empty answer
         // delta is *actually* suppressed while quiet (see the quiet gate in
         // `event`), not merely because the turn starts quiet — a quiet turn
@@ -1102,6 +1147,17 @@ impl Renderer {
         self.touched_quiet.load(Ordering::Relaxed)
     }
 
+    /// Redraw the frame while a turn runs, so the busy spinner and elapsed
+    /// time move even when no output arrives (a long tool call or a model
+    /// still reading the prompt). A no-op at the prompt and in legacy mode.
+    pub fn tick(&self) {
+        if let Some(fs) = self.frame.lock().unwrap().as_mut()
+            && fs.busy_since.is_some()
+        {
+            self.frame_render(fs);
+        }
+    }
+
     pub fn end_turn(&self) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
@@ -1110,6 +1166,8 @@ impl Renderer {
             // the legacy editor, which restamps on submission) so the next
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
+            // Back to the user: the prompt glyph stops spinning.
+            fs.busy_since = None;
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
             self.frame_render(fs);
@@ -2136,6 +2194,53 @@ pub(crate) mod tests {
         // Clearing with no hint armed is a no-op (no redraw, no panic).
         r.clear_transient();
         assert_eq!(r.frame_transient(), None);
+    }
+
+    #[test]
+    fn the_prompt_spins_during_a_turn_and_shows_ready_after() {
+        let r = Renderer::frame_for_test();
+        let busy = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().busy_since;
+        assert_eq!(busy(&r), None);
+        r.begin_turn();
+        assert!(busy(&r).is_some(), "a turn marks the prompt busy");
+        r.tick();
+        r.end_turn();
+        assert_eq!(busy(&r), None, "the prompt is back to the user");
+    }
+
+    #[test]
+    fn prompt_glyph_and_hint_say_whose_turn_it_is() {
+        let idle = visible_width_text(&prompt_glyph(None));
+        assert_eq!(idle, "›");
+        assert!(prompt_hint(None).starts_with("ready"));
+        // The spinner frame follows the elapsed time.
+        let started = Instant::now() - SPINNER_INTERVAL * 3;
+        assert_eq!(visible_width_text(&prompt_glyph(Some(started))), SPINNER[3].to_string());
+        let started = Instant::now() - Duration::from_secs(65);
+        assert!(
+            prompt_hint(Some(started)).starts_with("working 1m 05s · Enter steers"),
+            "{}",
+            prompt_hint(Some(started))
+        );
+        assert_eq!(elapsed_text(Duration::from_secs(4)), "4s");
+    }
+
+    /// `text` without its ANSI colour codes.
+    fn visible_width_text(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]

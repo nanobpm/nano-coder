@@ -841,7 +841,9 @@ single writer, wrapped in synchronized-output markers so a half-drawn frame is n
 On a width change it re-renders the entire frame (clearing the screen and scrollback) instead
 of relying on the terminal's native reflow, and resizes are debounced (~40ms) so a drag
 settles on one clean redraw. The `/` command menu is drawn under the input editor as part of
-the frame. It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
+the frame. The prompt shows whose turn it is: a green `›` with a dim `ready` hint
+when nano-coder is waiting for you, and a spinner with `working 12s · Enter steers, Esc Esc
+cancels` while a turn runs (the hint shows while the input is empty). It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
 `/settings`) switches back to the scroll-region renderer, where the terminal owns the
 scrollback and reflows history itself on a resize, with the status line pinned to the bottom.
 
