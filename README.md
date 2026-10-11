@@ -1054,11 +1054,15 @@ the result:
   result — three times in a row, telling it to change approach or report `blocked`. The
   warning fires at most twice per turn; if the model keeps repeating after that, the turn
   ends with a `blocked` outcome instead of burning budget, and any remaining calls in the
-  same batch are skipped rather than run. For `bash`, the match is on the
-  first pipeline stage (parsed quote- and escape-aware, so a `|` inside quotes or a `||`
-  operator never splits a command), so appending `| wc -l`-style stages does not dodge it.
-  The result fingerprint ignores the per-call spill filename a large, truncated output is
-  written to, so identical runaway output is still recognised. Plan and
+  same batch are skipped rather than run. For `bash`, the match collapses appended
+  read-only diagnostic pipeline stages (`| wc -l`, `| head`, …) onto the base command
+  (parsed quote- and escape-aware, so a `|` inside quotes or a `||` operator never splits
+  a command), so adding `| wc -l`-style stages does not dodge it; a stage that could change
+  state (a writer like `tee`, a redirection, or an unrecognised command) keeps the command
+  distinct so genuinely different calls are never conflated. The result fingerprint ignores
+  only the per-call spill filename in the output bounder's `complete output in …` marker
+  (not arbitrary output that merely resembles one), so identical runaway output is still
+  recognised while a changing result stays distinct. Plan and
   `question` calls are exempt and break the streak, so only genuinely consecutive repeats
   count (an interleaved exempt call makes the calls around it non-consecutive).
 

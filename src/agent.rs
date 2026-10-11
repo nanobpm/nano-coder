@@ -4748,8 +4748,13 @@ mod tests {
     async fn auto_mode_does_not_disable_the_cap_in_a_headless_turn() {
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, seen) = agent(echo_stream(HEADLESS_SAFETY_CAP + 10), dir.path());
-        agent.set_mode(crate::mode::AgentMode::Auto);
+        // A positive configured cap (not 0) and Auto set *after* new_session()
+        // (which resets the mode to Normal) so the 300-call limit can only come
+        // from Auto's headless fallback, not from the `max_iterations == 0`
+        // path — otherwise a regression in the Auto branch would still pass.
+        agent.config.max_iterations = HEADLESS_SAFETY_CAP + 50;
         agent.new_session().unwrap();
+        agent.set_mode(crate::mode::AgentMode::Auto);
         let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
         assert_eq!(seen.lock().unwrap().len(), HEADLESS_SAFETY_CAP);

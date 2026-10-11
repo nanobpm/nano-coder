@@ -175,44 +175,88 @@ fn repeat_key(tool: &str, args: &Value, ok: bool, result: &str) -> String {
     format!("{tool}|{args}|err={ok:?}|out={:x?}", result_hash)
 }
 
-/// Strip the per-call spill filenames the output bounder injects before the
-/// result is hashed. A bounded result embeds a `complete output in …` path that
-/// is unique to the call (`bash-<n>.stdout`/`.stderr` from `bash.rs`, and
-/// `tool-<call-id>-<name>.txt` from `agent.rs`), so two *identical* large
-/// outputs would otherwise hash differently on every invocation and the loop
-/// detector would never warn or hard-stop — the exact runaway case this feature
-/// exists to catch (issue #65). Normalising the generated spill names to a
-/// stable placeholder makes identical content fingerprint identically.
+/// Strip the per-call spill filename the output bounder injects before the
+/// result is hashed. A bounded result embeds a `complete output in <path>…`
+/// marker whose path is unique to the call (`bash-<n>.stdout`/`.stderr` from
+/// `bash.rs`, `tool-<call-id>-<name>.txt` from `agent.rs`), so two *identical*
+/// large outputs would otherwise hash differently on every invocation and the
+/// loop detector would never warn or hard-stop — the exact runaway case this
+/// feature exists to catch (issue #65). Only the path *inside that marker* is
+/// normalised, never arbitrary output: genuine content that merely resembles a
+/// spill name (e.g. `created tool-a.txt` vs `created tool-b.txt`) must stay
+/// distinct, or a changing result would be conflated into a false repeat.
 fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     static SPILL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SPILL.get_or_init(|| {
-        regex::Regex::new(r"(?:bash-\d+(?:-\d+)?\.std(?:out|err)|tool-\S+?\.txt)")
-            .expect("spill-path regex is valid")
+        // A spill path has no spaces and the marker is terminated by the `...`
+        // that precedes the tail, so match the shortest run of non-space
+        // characters up to that terminator and replace only it.
+        regex::Regex::new(r"(complete output in )\S+?(\.\.\.)").expect("spill-path regex is valid")
     });
-    re.replace_all(result, "<spill>")
+    re.replace_all(result, "${1}<spill>${2}")
 }
 
+/// Pipeline stages a retry loop commonly *appends* to the same base command to
+/// inspect its output (`… | wc -l`, `… | head`). They only read their stdin and
+/// change nothing, so dropping them lets the detector see the repeat. Anything
+/// not on this list — notably writers like `tee` — is treated as behaviour
+/// changing and keeps the command distinct.
+const DIAGNOSTIC_STAGES: &[&str] =
+    &["wc", "head", "tail", "cat", "tac", "sort", "uniq", "nl", "cut", "tr", "rev", "fold", "column", "less", "more"];
+
 /// The argument text a repeat match is based on. A bash loop often appends
-/// pipeline stages on each retry (`… | wc -l | head -1`), so byte-identical
-/// matching misses it; the first pipeline stage is the stable intent. Other
-/// tools match on their arguments as given.
+/// read-only diagnostic pipeline stages on each retry (`… | wc -l | head -1`),
+/// so byte-identical matching misses it; collapsing *those* stages exposes the
+/// stable intent. Stages that could change state (`… | tee a` vs `… | tee b`, a
+/// redirection, `||`, or anything we cannot split safely) are kept so distinct
+/// side effects are never conflated into a false loop. Other tools match on
+/// their arguments as given.
 fn normalised_args(tool: &str, args: &Value) -> String {
     if tool == "bash"
         && let Some(command) = args.get("command").and_then(Value::as_str)
     {
-        return first_pipeline_stage(command).trim().to_string();
+        return pipeline_key(command).trim().to_string();
     }
     args.to_string()
 }
 
-/// Return the first pipeline stage of a shell command, quote- and escape-aware.
-/// A naive `split('|')` also splits `|` inside quotes and the `||` operator, so
-/// `printf 'a|b'` or `x || y` would be truncated and distinct side-effecting
-/// commands could normalise to the same prefix — a false loop detection. We
-/// only cut at a genuine, unquoted pipe operator; on `||` (or any command we
-/// cannot split safely) we fall back to the whole command.
-fn first_pipeline_stage(command: &str) -> &str {
+/// Collapse a bash command to the first pipeline stage **only** when every
+/// downstream stage is a recognised read-only diagnostic filter; otherwise keep
+/// the whole command. This catches `cmd`, `cmd | wc -l`, `cmd | wc -l | head`
+/// as one intent without conflating genuinely distinct side effects.
+fn pipeline_key(command: &str) -> &str {
+    match split_pipeline(command) {
+        Some(stages) if stages.len() > 1 && stages[1..].iter().all(|s| is_diagnostic_stage(s)) => stages[0],
+        _ => command,
+    }
+}
+
+/// A pipeline stage that only reads its stdin: its command word is a known
+/// read-only filter and it carries no output redirection. Conservative on
+/// purpose — an unrecognised or writing stage returns `false`, so the caller
+/// keeps the full command and never issues a false hard stop.
+fn is_diagnostic_stage(stage: &str) -> bool {
+    // Any `>` (redirection/`tee`-style write) makes the stage behaviour
+    // changing. Treating a quoted `>` as writing too only makes us more
+    // conservative, which is the safe direction for a hard stop.
+    if stage.bytes().any(|b| b == b'>') {
+        return false;
+    }
+    match stage.split_whitespace().next() {
+        Some(cmd) => DIAGNOSTIC_STAGES.contains(&cmd),
+        None => false,
+    }
+}
+
+/// Split a shell command into top-level pipeline stages, quote- and
+/// escape-aware. A naive `split('|')` also splits `|` inside quotes and the
+/// `||` operator. Returns `None` when the command contains `||` (logical OR,
+/// not a pipeline) so the caller keeps the whole command rather than cutting it
+/// at a meaningless boundary.
+fn split_pipeline(command: &str) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
+    let mut stages = Vec::new();
+    let mut start = 0;
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
@@ -228,17 +272,19 @@ fn first_pipeline_stage(command: &str) -> &str {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             b'|' if !in_single && !in_double => {
-                // `||` is logical OR, not a pipeline: do not split there.
+                // `||` is logical OR, not a pipeline: refuse to split.
                 if bytes.get(i + 1) == Some(&b'|') {
-                    return command;
+                    return None;
                 }
-                return &command[..i];
+                stages.push(&command[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
-    command
+    stages.push(&command[start..]);
+    Some(stages)
 }
 
 #[cfg(test)]
@@ -411,7 +457,8 @@ mod tests {
     #[test]
     fn spill_path_normalisation_collapses_per_call_names() {
         // bash stdout/stderr spills and tool-<id>-<name>.txt spills (including a
-        // collision `-N` suffix) all normalise to the same placeholder.
+        // collision `-N` suffix) all normalise to the same placeholder *inside
+        // the marker*.
         assert_eq!(
             normalise_spill_paths("x; complete output in /t/bash-3.stdout...y"),
             normalise_spill_paths("x; complete output in /t/bash-99-2.stdout...y"),
@@ -429,12 +476,26 @@ mod tests {
     }
 
     #[test]
+    fn spill_normalisation_only_touches_the_marker_not_arbitrary_output() {
+        // Output that merely *looks* like a spill name but is not the bounder's
+        // `complete output in …` marker must stay distinct, or a changing result
+        // is conflated into a false repeat and hard-stops the turn (issue #65).
+        assert_ne!(normalise_spill_paths("created tool-a.txt"), normalise_spill_paths("created tool-b.txt"));
+        assert_ne!(normalise_spill_paths("wrote bash-1.stdout"), normalise_spill_paths("wrote bash-2.stdout"));
+        // The tail after the marker is preserved, so differing tails stay distinct.
+        assert_ne!(
+            normalise_spill_paths("h...complete output in /t/bash-1.stdout...tailA"),
+            normalise_spill_paths("h...complete output in /t/bash-2.stdout...tailB"),
+        );
+    }
+
+    #[test]
     fn a_quoted_pipe_is_not_a_pipeline_boundary() {
         // `printf 'same|one' >/tmp/a` and `printf 'same|two' >/tmp/b` are
         // distinct side-effecting commands; a naive split('|') would normalise
         // both to `printf 'same` and, with identical empty output, falsely flag
         // a loop and hard-stop the turn (issue #65).
-        assert_eq!(first_pipeline_stage("printf 'same|one' >/tmp/a"), "printf 'same|one' >/tmp/a");
+        assert_eq!(pipeline_key("printf 'same|one' >/tmp/a"), "printf 'same|one' >/tmp/a");
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1 {
             let letter = (b'a' + i as u8) as char;
@@ -451,12 +512,39 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_stage_is_quote_escape_and_operator_aware() {
-        // A real pipe splits; `||`, quoted pipes and escaped pipes do not.
-        assert_eq!(first_pipeline_stage("gh pr diff | wc -l"), "gh pr diff ");
-        assert_eq!(first_pipeline_stage("make test || true"), "make test || true");
-        assert_eq!(first_pipeline_stage("grep '|' file"), "grep '|' file");
-        assert_eq!(first_pipeline_stage(r"echo a \| b"), r"echo a \| b");
-        assert_eq!(first_pipeline_stage(r#"echo "x|y" | cat"#), r#"echo "x|y" "#);
+    fn pipeline_key_only_collapses_read_only_diagnostic_stages() {
+        // Appended read-only filters collapse to the base command (a retry loop).
+        assert_eq!(pipeline_key("gh pr diff | wc -l"), "gh pr diff ");
+        assert_eq!(pipeline_key("cat big.log | head | tail -3"), "cat big.log ");
+        // `||`, quoted pipes and escaped pipes never split.
+        assert_eq!(pipeline_key("make test || true"), "make test || true");
+        assert_eq!(pipeline_key("grep '|' file"), "grep '|' file");
+        assert_eq!(pipeline_key(r"echo a \| b"), r"echo a \| b");
+        // A downstream stage with side effects keeps the whole command: `tee`
+        // and redirections write distinct state, so the commands are not repeats.
+        assert_eq!(pipeline_key("printf x | tee /tmp/a"), "printf x | tee /tmp/a");
+        assert_eq!(pipeline_key("printf x | tee /tmp/b"), "printf x | tee /tmp/b");
+        assert_eq!(pipeline_key("cat f | wc -l > /tmp/a"), "cat f | wc -l > /tmp/a");
+        // An unrecognised downstream command is treated as behaviour changing.
+        assert_eq!(pipeline_key("cat f | my-writer"), "cat f | my-writer");
+    }
+
+    #[test]
+    fn distinct_side_effecting_pipelines_do_not_hard_stop() {
+        // Five `… | tee <different file>` calls are genuinely distinct (each
+        // writes a different file); they must not be conflated into a repeat.
+        let mut r = Reminders::default();
+        for i in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1 {
+            let letter = (b'a' + i as u8) as char;
+            assert_eq!(
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("printf x | tee /tmp/{letter}")}),
+                    true,
+                    "",
+                ),
+                RepeatVerdict::None,
+            );
+        }
     }
 }
