@@ -3540,9 +3540,20 @@ impl Agent {
                     }
                     // Loop detector (issue #65): nudge the model when it
                     // repeats an identical call, and end the turn blocked when
-                    // it keeps repeating after the warnings are spent.
-                    match self.reminders.after_repeat_call(&tool_call.name, &effective_call.arguments, ok, &result_text)
-                    {
+                    // it keeps repeating after the warnings are spent. A
+                    // malformed call carries `arguments = {}`, so pass the full
+                    // raw argument text as the fingerprint's argument component
+                    // — otherwise two malformed payloads that diverge only past
+                    // the 300-character error preview collapse to one
+                    // fingerprint and a genuinely-different retry is
+                    // hard-stopped as an identical repeat.
+                    match self.reminders.after_repeat_call(
+                        &tool_call.name,
+                        &effective_call.arguments,
+                        tool_call.invalid_arguments(),
+                        ok,
+                        &result_text,
+                    ) {
                         reminders::RepeatVerdict::None => {}
                         reminders::RepeatVerdict::Warning(note) => {
                             result_text.push_str("\n\n");
