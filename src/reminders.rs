@@ -577,19 +577,28 @@ fn is_diagnostic_stage(stage: &str) -> bool {
         return false;
     }
     // Some read-only filters still carry a flag or positional that writes a
-    // file; those forms are not side-effect-free.
-    !stage_writes_a_file(cmd, tokens)
+    // file or runs an arbitrary helper; those forms are not side-effect-free.
+    !stage_has_side_effect(cmd, tokens)
 }
 
-/// Whether an otherwise-diagnostic command invocation writes to a file through a
+/// Whether an otherwise-diagnostic command invocation has a side effect — it
+/// writes to a file, or executes an arbitrary helper program — through a
 /// command-specific option or positional (so collapsing two such calls would
-/// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`).
-fn stage_writes_a_file<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -> bool {
+/// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`, or
+/// `sort --compress-program=./a` vs `sort --compress-program=./b`).
+fn stage_has_side_effect<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -> bool {
     match cmd {
         // `sort -o FILE` / `-oFILE` / `--output=FILE` writes its result to a
         // file — including when `o` is buried in a short-option cluster such as
-        // `sort -ro/tmp/a` (`-r` then `-o/tmp/a`).
-        "sort" => args.any(|a| short_cluster_contains(a, 'o') || a.starts_with("--output")),
+        // `sort -ro/tmp/a` (`-r` then `-o/tmp/a`). `sort --compress-program=PROG`
+        // executes an arbitrary helper when temporary files are spilled, so a
+        // changed helper is new side-effecting work even when the sorted output
+        // stays identical; reject it too. (`--compress-program` is long-only, so
+        // both `--compress-program=PROG` and `--compress-program PROG` present it
+        // as a token starting with that prefix.)
+        "sort" => args.any(|a| {
+            short_cluster_contains(a, 'o') || a.starts_with("--output") || a.starts_with("--compress-program")
+        }),
         // `uniq [INPUT [OUTPUT]]`: a second positional argument is an output
         // file. A bare `-` means stdin, so it counts as a positional (otherwise
         // `uniq - OUT` would look like a single-positional read).
@@ -1467,6 +1476,22 @@ mod tests {
         // -ro/tmp/a` is `-r` + `-o/tmp/a`, so distinct targets stay distinct.
         assert_ne!(pipeline_key("printf x | sort -ro/tmp/a"), pipeline_key("printf x | sort -ro/tmp/b"));
         assert_ne!(pipeline_key("printf x | less -No/tmp/a"), pipeline_key("printf x | less -NO/tmp/b"));
+        // `sort --compress-program=PROG` runs an arbitrary helper on spilled
+        // temp files, so a changed helper is new side-effecting work even when
+        // the sorted output is identical — keep the full command (both the
+        // `=`-joined and space-separated forms) and never conflate helpers.
+        assert_eq!(
+            pipeline_key("printf x | sort --compress-program=/tmp/a"),
+            "printf x | sort --compress-program=/tmp/a"
+        );
+        assert_eq!(
+            pipeline_key("printf x | sort --compress-program /tmp/a"),
+            "printf x | sort --compress-program /tmp/a"
+        );
+        assert_ne!(
+            pipeline_key("printf x | sort --compress-program=/tmp/a"),
+            pipeline_key("printf x | sort --compress-program=/tmp/b"),
+        );
         assert_eq!(pipeline_key("printf x | uniq /in /out"), "printf x | uniq /in /out");
         assert_eq!(pipeline_key("foo | cat ; touch /tmp/a"), "foo | cat ; touch /tmp/a");
         assert_eq!(pipeline_key("foo | cat $(touch /tmp/a)"), "foo | cat $(touch /tmp/a)");
@@ -1479,6 +1504,24 @@ mod tests {
                 r.after_repeat_call(
                     "bash",
                     &json!({"command": format!("printf x | sort -o /tmp/{letter}")}),
+                    None,
+                    true,
+                    "",
+                    ContentHashes::default(),
+                ),
+                RepeatVerdict::None,
+            );
+        }
+        // Likewise, an ever-growing pipeline that keeps identical sorted output
+        // but swaps in a different `--compress-program` helper each round is
+        // doing new side-effecting work and must never be hard-stopped.
+        let mut r = Reminders::default();
+        for i in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 1 {
+            let letter = (b'a' + i as u8) as char;
+            assert_eq!(
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": format!("printf x | sort -S1K --compress-program=/tmp/{letter}")}),
                     None,
                     true,
                     "",
