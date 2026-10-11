@@ -176,13 +176,12 @@ struct State {
     /// Width of the current streamed answer's stamp, so continuation lines
     /// can be indented to align under it.
     stream_pad: usize,
-    /// Notes held back until the streamed line they would interrupt ends.
-    deferred: Vec<String>,
-    /// Raw payloads (e.g. `/trajectory --json`) held back until the streamed
-    /// line they would interrupt ends. Kept separate from `deferred` because
-    /// these are emitted verbatim — no stamp, no DIM — so the export stays
-    /// byte-exact.
-    deferred_raw: Vec<String>,
+    /// Output held back until the streamed line it would interrupt ends, in
+    /// submission order. Notes are stamped and dimmed; raw payloads (e.g.
+    /// `/trajectory --json`) go out verbatim — no stamp, no DIM — so the
+    /// export stays byte-exact. One ordered queue keeps a raw export queued
+    /// between two notes from leapfrogging them at `end_turn`.
+    deferred: Vec<Deferred>,
     /// The dropped frame's full transcript, in original on-screen order,
     /// captured by `set_mode(Legacy)` for `replay_transcript` to reprint after
     /// the post-switch screen+scrollback clear. Replaying THIS — not the
@@ -191,6 +190,12 @@ struct State {
     /// turns instead of the synthetic summary. Byte-exact `Raw` exports ride
     /// along in order; they are printed after the clear, so they survive it.
     transcript: Vec<crate::frame::StampedItem>,
+}
+
+/// A held-back line of output: a dimmed note, or a verbatim raw payload.
+enum Deferred {
+    Note(String),
+    Raw(String),
 }
 
 pub struct Renderer {
@@ -775,7 +780,15 @@ impl Renderer {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
             }
-            AgentEvent::Context => {}
+            // The mid-turn `/model <spec>` note is printed when the command is
+            // typed; the event exists so the sink records the recents MRU.
+            AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
+            // A mid-turn `/model <spec>` that could not be applied: surface the
+            // error in the transcript so the failed switch is never silent.
+            AgentEvent::ModelSwitchFailed { spec, error } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Note(format!("⚠ model switch to {spec} failed: {error}"))));
+            }
         }
         // Batched (a history replay): the caller renders once at the end —
         // rendering here would redo the whole transcript layout per event.
@@ -819,7 +832,18 @@ impl Renderer {
             return Vec::new();
         }
         let mut state = self.state.lock().unwrap();
-        let mut items: Vec<Item> = std::mem::take(&mut state.deferred).into_iter().map(Item::Note).collect();
+        // Only notes move to the frame; raw exports stay queued (in order) and
+        // are emitted verbatim by the normal deferred flush.
+        let (notes, raws): (Vec<Deferred>, Vec<Deferred>) =
+            std::mem::take(&mut state.deferred).into_iter().partition(|d| matches!(d, Deferred::Note(_)));
+        state.deferred = raws;
+        let mut items: Vec<Item> = notes
+            .into_iter()
+            .filter_map(|d| match d {
+                Deferred::Note(n) => Some(Item::Note(n)),
+                Deferred::Raw(_) => None,
+            })
+            .collect();
         // Borrow the cached reasoning, don't take it: `last_thinking` is the
         // legacy Ctrl-O cache, and clearing it here means a legacy → frame →
         // legacy round trip with no intervening turn leaves Ctrl-O reporting
@@ -890,7 +914,7 @@ impl Renderer {
         // leaves the cursor mid-line with `streamed_text` false, and printing
         // now would prefix the JSON/Markdown with the partial thinking line.
         if !state.at_line_start {
-            state.deferred_raw.push(text.to_string());
+            state.deferred.push(Deferred::Raw(text.to_string()));
             return;
         }
         // Write through `out` (not a bare `println!`) while retaining the state
@@ -1003,7 +1027,14 @@ impl Renderer {
                 state.at_line_start = last == '\n';
             }
             if state.at_line_start && !state.deferred.is_empty() && state.thinking.is_none() {
-                let notes: String = state.deferred.drain(..).map(|n| format!("{DIM}{n}{RESET}\n")).collect();
+                let notes: String = state
+                    .deferred
+                    .drain(..)
+                    .map(|d| match d {
+                        Deferred::Note(n) => format!("{DIM}{n}{RESET}\n"),
+                        Deferred::Raw(r) => format!("{r}\n"),
+                    })
+                    .collect();
                 let _ = stdout.write_all(notes.as_bytes());
                 let _ = stdout.flush();
             }
@@ -1094,14 +1125,17 @@ impl Renderer {
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
         self.newline(&mut state);
-        for note in std::mem::take(&mut state.deferred) {
-            self.out(&mut state, &format!("{DIM}{note}{RESET}\n"));
-        }
-        // Raw exports queued mid-turn go out verbatim (no stamp/DIM), each on
-        // its own line, so the payload stays byte-exact.
-        for raw in std::mem::take(&mut state.deferred_raw) {
-            self.out(&mut state, &raw);
-            self.out(&mut state, "\n");
+        // Everything queued mid-turn goes out in submission order: notes
+        // stamped and dimmed, raw exports verbatim (no stamp/DIM), each on its
+        // own line, so payloads stay byte-exact without reordering.
+        for item in std::mem::take(&mut state.deferred) {
+            match item {
+                Deferred::Note(note) => self.out(&mut state, &format!("{DIM}{note}{RESET}\n")),
+                Deferred::Raw(raw) => {
+                    self.out(&mut state, &raw);
+                    self.out(&mut state, "\n");
+                }
+            }
         }
         state.in_turn = false;
         state.streamed_text = false;
@@ -1119,7 +1153,7 @@ impl Renderer {
         }
         let mut state = self.state.lock().unwrap();
         if state.streamed_text && !state.at_line_start {
-            state.deferred.push(format!("{}{DIM}{text}", stamp()));
+            state.deferred.push(Deferred::Note(format!("{}{DIM}{text}", stamp())));
             return;
         }
         self.note_now(&mut state, text);
@@ -1188,7 +1222,10 @@ impl Renderer {
             // switching a quiet session to frame clears scrollback and rebuilds
             // only assistant replies, losing every earlier user message.
             if verbosity() == Verbosity::Quiet
-                && !matches!(event, AgentEvent::AssistantMessage { .. } | AgentEvent::Context)
+                && !matches!(
+                    event,
+                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context | AgentEvent::ModelSwitchFailed { .. }
+                )
                 && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
                 return;
@@ -1202,6 +1239,14 @@ impl Renderer {
             status.draw();
         }
         if verbosity() == Verbosity::Quiet {
+            // A failed mid-turn `/model` switch is user-facing in every
+            // verbosity — quiet suppresses streamed output, not warnings.
+            if let AgentEvent::ModelSwitchFailed { spec, error } = event {
+                let mut state = self.state.lock().unwrap();
+                self.newline(&mut state);
+                self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+                return;
+            }
             // Mark the truncation guard only when a non-empty answer delta is
             // actually suppressed here: those deltas never reach the terminal,
             // so if the turn later ends at a louder level the live stream is
@@ -1288,6 +1333,16 @@ impl Renderer {
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
                 if !state.streamed_text && !text.is_empty() {
+                    // This non-streamed message is the full, authoritative
+                    // answer and is printed here in its entirety. Drop any
+                    // truncation signal left by an earlier suppressed segment
+                    // (or by this answer's own quiet-suppressed deltas, which
+                    // never set `streamed_text`) so turn-end reconciliation does
+                    // not reprint — and thus duplicate — what we just printed.
+                    // When the answer instead streamed live (`streamed_text`),
+                    // that live stream may be incomplete, so the guard is left
+                    // set for the reprint.
+                    self.touched_quiet.store(false, Ordering::Relaxed);
                     self.newline(&mut state);
                     self.out(&mut state, &stamp_block(text));
                 }
@@ -1380,6 +1435,15 @@ impl Renderer {
                 self.out(&mut state, &format!("{}{DIM}⟳ context compacted{RESET}\n", stamp()));
             }
             AgentEvent::UserMessage { .. } | AgentEvent::Context | AgentEvent::Compacted => {}
+            // The mid-turn `/model <spec>` note is printed when the command
+            // is typed; the event exists so the sink records the recents MRU.
+            AgentEvent::ModelSwitched { .. } => {}
+            // A mid-turn `/model <spec>` that could not be applied: surface the
+            // error inline so the failed switch is never silent.
+            AgentEvent::ModelSwitchFailed { spec, error } => {
+                self.newline(&mut state);
+                self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+            }
         }
     }
 
@@ -2167,6 +2231,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn non_streamed_final_message_clears_an_earlier_suppressed_segments_guard() {
+        // `report_outcome` synthesizes the final answer and emits only an
+        // `AssistantMessage` (no preceding `TextDelta`). If an earlier tool-loop
+        // response was suppressed while quiet, that non-streamed final message is
+        // printed in full by the louder `AssistantMessage` arm — so the stale
+        // guard from the earlier segment must be cleared, or turn-end
+        // reconciliation reprints (duplicates) the just-printed answer.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        // Earlier tool-loop response suppressed while quiet, then it closes.
+        r.event(&AgentEvent::TextDelta { text: "intermediate" });
+        assert!(r.answer_may_be_truncated(), "the suppressed intermediate delta flags truncation");
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "intermediate" });
+
+        // Switch louder; the final answer arrives as a non-streamed message.
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m2", text: "final answer" });
+        assert!(!r.answer_may_be_truncated(), "a non-streamed final message printed in full must not be reprinted");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn fully_quiet_final_answer_closed_by_a_louder_message_is_not_reprinted() {
+        // The whole final answer streams while quiet (every delta suppressed, so
+        // `streamed_text` stays false), then the user switches louder and the
+        // terminating `AssistantMessage` arrives. The louder arm prints the full
+        // text in place, so the guard must be cleared — reprinting would
+        // duplicate the answer just printed.
+        let _lock = verbosity_lock();
+        let r = Renderer::legacy_for_test();
+
+        set_verbosity(Verbosity::Quiet);
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "final answer" }); // suppressed while quiet
+        assert!(r.answer_may_be_truncated(), "the suppressed final delta flags truncation");
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "final answer" });
+        assert!(
+            !r.answer_may_be_truncated(),
+            "a non-streamed message that printed the full answer must not be reprinted"
+        );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
     fn quiet_assistant_message_closes_legacy_stream() {
         // A message streams at normal, then verbosity switches to quiet before
         // its terminating `AssistantMessage` arrives. The quiet gate must close
@@ -2212,9 +2324,11 @@ pub(crate) mod tests {
         r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
         assert!(!r.state.lock().unwrap().at_line_start, "a thinking delta leaves the cursor mid-line");
         r.turn_raw("{\"k\":1}");
-        assert_eq!(
-            r.state.lock().unwrap().deferred_raw,
-            vec!["{\"k\":1}".to_string()],
+        assert!(
+            matches!(
+                r.state.lock().unwrap().deferred.as_slice(),
+                [Deferred::Raw(payload)] if payload == "{\"k\":1}"
+            ),
             "a raw export during mid-line reasoning must be deferred"
         );
         set_verbosity(Verbosity::Normal);
@@ -2228,9 +2342,11 @@ pub(crate) mod tests {
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "partial answer" });
         r.turn_raw("{\"k\":1}");
-        assert_eq!(
-            r.state.lock().unwrap().deferred_raw,
-            vec!["{\"k\":1}".to_string()],
+        assert!(
+            matches!(
+                r.state.lock().unwrap().deferred.as_slice(),
+                [Deferred::Raw(payload)] if payload == "{\"k\":1}"
+            ),
             "a raw export during a half-streamed answer must be deferred"
         );
         set_verbosity(Verbosity::Normal);
@@ -2246,10 +2362,31 @@ pub(crate) mod tests {
         r.begin_turn();
         assert!(r.state.lock().unwrap().at_line_start);
         r.turn_raw("{\"k\":1}");
-        assert!(
-            r.state.lock().unwrap().deferred_raw.is_empty(),
-            "a raw export at a line boundary must not be deferred"
-        );
+        assert!(r.state.lock().unwrap().deferred.is_empty(), "a raw export at a line boundary must not be deferred");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn deferred_notes_and_raw_exports_keep_submission_order() {
+        // A raw export queued between two notes must not leapfrog them at
+        // end_turn: one ordered queue drains note, raw, note.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::legacy_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "partial answer" });
+        r.note("first");
+        r.turn_raw("{\"k\":1}");
+        r.note("second");
+        let deferred = std::mem::take(&mut r.state.lock().unwrap().deferred);
+        let kinds: Vec<&str> = deferred
+            .iter()
+            .map(|d| match d {
+                Deferred::Note(_) => "note",
+                Deferred::Raw(_) => "raw",
+            })
+            .collect();
+        assert_eq!(kinds, ["note", "raw", "note"], "deferred output keeps submission order");
         set_verbosity(Verbosity::Normal);
     }
 
@@ -2341,6 +2478,26 @@ pub(crate) mod tests {
         // reasoning cache too, or the prior session's thinking stays expandable.
         r.clear_screen();
         assert!(r.cached_last_thinking().is_empty(), "reasoning survived /restart");
+    }
+
+    #[test]
+    fn frame_quiet_preserves_a_model_switch_failure() {
+        // A failed mid-turn `/model` switch is user-facing in every verbosity.
+        // In frame mode the quiet gate returns before `frame_event` for all but
+        // a few events; `ModelSwitchFailed` must be exempt so the warning still
+        // lands in the transcript instead of being silently dropped — exactly
+        // the mode where the legacy path explicitly preserves it.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Quiet);
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ModelSwitchFailed { spec: "broken/x", error: "no base_url" });
+        set_verbosity(Verbosity::Normal);
+        let note = r
+            .frame_items()
+            .iter()
+            .filter(|i| matches!(&i.item, Item::Note(t) if t.contains("broken/x") && t.contains("no base_url")))
+            .count();
+        assert_eq!(note, 1, "the switch failure must survive the frame quiet gate: {:?}", r.frame_items());
     }
 
     #[test]

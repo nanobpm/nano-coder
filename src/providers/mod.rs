@@ -15,7 +15,11 @@ pub mod qwen;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -293,7 +297,110 @@ pub struct ResolvedProvider {
     pub replay_reasoning: bool,
 }
 
+/// Check that `spec` names a known provider with a usable `kind`, model, and
+/// endpoint, against an already-resolved `providers` map — **without side
+/// effects**. Unlike [`resolve_cancellable`], it never runs an `api_key_command`
+/// subprocess or builds a client, so it is safe to call synchronously on the
+/// UI thread (e.g. when a `/model <spec>` is typed mid-turn) to report an
+/// unbuildable spec immediately instead of letting it fail silently later. It
+/// returns the same errors `resolve` would for these cases; the api-key path
+/// is intentionally not checked here (that is the apply-time safety net's job).
+pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, default_provider: &str) -> Result<()> {
+    let (name, model) = parse_model_spec(spec, providers, default_provider);
+    let config = providers.get(name).ok_or_else(|| {
+        anyhow!(
+            "unknown provider {name:?} for model {spec:?}; known providers: {}",
+            providers.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    let kind = config.kind.ok_or_else(|| anyhow!("provider {name:?} has no `kind` (openai, anthropic, or mock)"))?;
+    model
+        .map(str::to_string)
+        .or_else(|| config.default_model.clone())
+        .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
+    match (kind, &config.base_url) {
+        // Mock derives (or does not need) an endpoint, so any/no base_url is
+        // fine. Copilot derives its endpoint from the session token *unless
+        // overridden*; a present non-empty override is used verbatim by
+        // `GithubCopilotClient::api_base`, so it must be validated like any
+        // other HTTP endpoint — otherwise a malformed override passes
+        // queue-time validation, replaces the working client, and fails only
+        // on the next request. A real HTTP provider must carry a usable one.
+        //
+        // The emptiness guard here must match `api_base`'s `configured.is_empty()`
+        // test exactly: that is the string that decides "derive vs use the
+        // override". A trimming guard (`!url.trim().is_empty()`) would exempt a
+        // whitespace-only override (`"   "`) from validation while `api_base`
+        // still treats it as present and uses it verbatim — reopening the
+        // fail-open gap. Using `!url.is_empty()` routes any present-but-whitespace
+        // override into `validate_http_base_url`, which rejects it.
+        (ProviderKind::Mock, _) => {}
+        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => validate_http_base_url(name, url)?,
+        (ProviderKind::GithubCopilot, _) => {}
+        (_, Some(url)) => validate_http_base_url(name, url)?,
+        (_, None) => bail!("provider {name:?} has no base_url"),
+    }
+    Ok(())
+}
+
+/// A configured HTTP(S) provider endpoint must be a real, absolute http(s)
+/// URL. Requests are built as `format!("{base_url}{path}")` (see
+/// [`HttpTransport::post_json`]), so an empty or malformed `base_url` is not
+/// caught by `Some(_)`/`HttpTransport::new`; it only fails later while building
+/// the request URL — by which point a mid-turn switch has already replaced the
+/// working client and lost the current model. Validating it here (shared by
+/// [`validate_spec`] and [`resolve_cancellable`]) rejects the bad endpoint at queue time
+/// and preserves the queue-time bad-endpoint guarantee.
+fn validate_http_base_url(provider: &str, base_url: &str) -> Result<()> {
+    if base_url.trim().is_empty() {
+        bail!("provider {provider:?} has an empty base_url");
+    }
+    // `resolve` stores `base_url` verbatim (only `trim_end_matches('/')`), but
+    // `reqwest::Url::parse` silently strips leading/trailing whitespace and C0
+    // control characters while validating. That mismatch is a fail-open gap: a
+    // value like " http://host/v1" or "http://host\n" parses here yet is kept
+    // raw and only breaks later in `format!("{base_url}{path}")`. A real
+    // endpoint never contains whitespace or control characters, so reject any —
+    // validating the exact string that will be used downstream.
+    if let Some(bad) = base_url.chars().find(|c| c.is_whitespace() || c.is_control()) {
+        bail!(
+            "provider {provider:?} base_url {base_url:?} must not contain whitespace or control characters (found {bad:?})"
+        );
+    }
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|e| anyhow!("provider {provider:?} has a malformed base_url {base_url:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("provider {provider:?} base_url {base_url:?} must be http(s), not {:?}", parsed.scheme());
+    }
+    // Request endpoints are formed by string-appending a path to `base_url`
+    // (`format!("{base_url}{path}")`), so a query or fragment makes the result
+    // unusable: `https://host/v1?token=x` becomes
+    // `https://host/v1?token=x/chat/completions`, putting the API path in the
+    // query, and a fragment is never sent. Reject both so a base_url that
+    // passes validation is actually usable downstream.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("provider {provider:?} base_url {base_url:?} must not contain a query or fragment");
+    }
+    Ok(())
+}
+
+/// Test-only convenience wrapper over [`resolve_cancellable`] with no cancel
+/// flag; production builds go through `build_client` → `resolve_cancellable`.
+#[cfg(test)]
 pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provider: &str) -> Result<ResolvedProvider> {
+    resolve_cancellable(spec, user, default_provider, None)
+}
+
+/// Like the test-only `resolve` wrapper, but a running `api_key_command` honours `cancel`: when the
+/// flag flips the child process is killed and the build fails fast, so a hung
+/// key command can never wedge a cancellable caller (e.g. a mid-turn `/model`
+/// switch). `cancel` is `None` for build paths with no turn to cancel against.
+pub fn resolve_cancellable(
+    spec: &str,
+    user: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<ResolvedProvider> {
     let providers = effective_providers(user);
     let (name, model) = parse_model_spec(spec, &providers, default_provider);
     let config = providers.get(name).ok_or_else(|| {
@@ -308,11 +415,23 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     let base_url = match (kind, &config.base_url) {
-        // Copilot derives its endpoint from the session token unless overridden.
-        (ProviderKind::Mock | ProviderKind::GithubCopilot, url) => {
-            url.clone().unwrap_or_default().trim_end_matches('/').to_string()
+        // Mock needs no endpoint. Copilot derives its endpoint from the
+        // session token unless overridden; a present non-empty override is used
+        // verbatim by `GithubCopilotClient::api_base`, so validate it like any
+        // other HTTP endpoint (sharing the queue-time bad-endpoint guarantee)
+        // before storing it. The emptiness guard must match `api_base`'s
+        // `is_empty()` test (not a trimming one) so a whitespace-only override
+        // is validated (and rejected) rather than exempted here yet used there.
+        (ProviderKind::Mock, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => {
+            validate_http_base_url(name, url)?;
+            url.trim_end_matches('/').to_string()
         }
-        (_, Some(url)) => url.trim_end_matches('/').to_string(),
+        (ProviderKind::GithubCopilot, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        (_, Some(url)) => {
+            validate_http_base_url(name, url)?;
+            url.trim_end_matches('/').to_string()
+        }
         (_, None) => bail!("provider {name:?} has no base_url"),
     };
     let api_key = match (&config.api_key, &config.api_key_env) {
@@ -322,7 +441,7 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
     };
     let api_key = match (api_key, &config.api_key_command) {
         (Some(key), _) => Some(key),
-        (None, Some(command)) => Some(run_key_command(name, command)?),
+        (None, Some(command)) => Some(run_key_command(name, command, cancel)?),
         (None, None) => None,
     };
     let extra_body = match &config.extra_body {
@@ -366,22 +485,257 @@ pub fn resolve(spec: &str, user: &HashMap<String, ProviderConfig>, default_provi
     })
 }
 
-fn run_key_command(provider: &str, command: &str) -> Result<String> {
-    let output = std::process::Command::new("sh")
+/// Upper bound on how long an `api_key_command` may run before it is killed.
+/// A key lookup should be near-instant; without a bound a command that hangs
+/// (e.g. a credential helper waiting on a prompt that never comes) would freeze
+/// every client build — and, for a mid-turn `/model` switch, wedge the turn —
+/// indefinitely. Generous enough for a real network round-trip, short enough
+/// that a genuine hang is recovered from.
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Poll granularity while waiting for the key command to exit.
+const KEY_COMMAND_POLL: Duration = Duration::from_millis(50);
+/// Grace period, measured from the leader's exit, to wait for stdout to reach
+/// natural EOF before giving up. A well-behaved command (even one that
+/// backgrounds a short-lived writer) closes stdout within this window; if a
+/// descendant is still holding stdout open past it, we FAIL CLOSED rather than
+/// accept a possibly-truncated key (see `run_key_command_bounded`).
+const KEY_COMMAND_DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// Poll granularity for the nonblocking reader threads while a pipe has no data
+/// available yet. Short so a stop signal is observed (and the thread joined)
+/// promptly even when a descendant holds the pipe open.
+const KEY_COMMAND_READER_POLL: Duration = Duration::from_millis(10);
+
+fn run_key_command(provider: &str, command: &str, cancel: Option<&Arc<AtomicBool>>) -> Result<String> {
+    run_key_command_bounded(provider, command, KEY_COMMAND_TIMEOUT, cancel)
+}
+
+/// Why the key-command wait loop stopped. Distinguishing these lets us fail
+/// *closed* — a key is accepted only on `Success` (natural stdout EOF) — while
+/// still giving each failure an accurate, actionable message.
+enum KeyCommandOutcome {
+    /// The leader exited AND stdout reached natural EOF: every writer closed the
+    /// pipe voluntarily, so the captured bytes are the complete key.
+    Success(std::process::ExitStatus),
+    /// The `cancel` flag was observed.
+    Cancelled,
+    /// The overall `timeout` elapsed while the leader was still running.
+    TimedOut,
+    /// The leader exited but a descendant kept stdout open past the drain grace,
+    /// so EOF — and therefore the key's completeness — can never be confirmed.
+    StdoutHeldOpen,
+}
+
+/// Does the leader identified by `pid` have an exit status waiting, WITHOUT
+/// reaping it? Uses `waitid(WNOWAIT)` so the zombie stays reapable (and keeps
+/// its PID/PGID reserved) until we reap it ourselves. This is what lets us
+/// `killpg` the group *before* reaping on the failure paths: the group leader
+/// is still a member, so its numeric PGID cannot have been recycled by an
+/// unrelated process group — closing the post-reap `killpg` PID-reuse window.
+fn leader_has_exited(pid: u32) -> bool {
+    // SAFETY: zeroed `siginfo_t` is a valid all-zero struct; `waitid` fills it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT | libc::WNOHANG)
+    };
+    // rc == 0 with `si_signo == 0` means "no state change yet" (WNOHANG); a
+    // non-zero `si_signo` (SIGCHLD) means the child has a status waiting. A
+    // negative rc (e.g. ECHILD) is treated as "not yet" — the time bounds in the
+    // wait loop still fire, so we can never hang on it.
+    rc == 0 && info.si_signo != 0
+}
+
+/// Run `command` to produce an api key, bounded by `timeout` and by `cancel`.
+///
+/// The child is spawned (not `output()`-ed) so it can be killed, and stdout and
+/// stderr are drained on dedicated threads so a command that writes more than a
+/// pipe buffer cannot deadlock against the wait loop.
+///
+/// **Fail-closed.** A key is accepted only when stdout reaches *natural* EOF —
+/// i.e. every process holding the write end (the `sh` leader and any descendant
+/// that inherited the pipe) closed it voluntarily. That is the only state in
+/// which the captured bytes are known to be the complete key: a shell can print
+/// a prefix and leave a backgrounded/escaped writer to print the remainder
+/// later, so accepting whatever was buffered after a mere grace period would
+/// authenticate with a truncated credential. If the leader exits but a
+/// descendant keeps stdout open past `KEY_COMMAND_DRAIN_GRACE`, we do NOT force
+/// EOF and take the prefix; we return an actionable error naming the cause.
+///
+/// **Bounded, and leak-free.** The child runs in its own process group
+/// (`process_group(0)`). The reader threads use nonblocking reads and watch a
+/// `stop` flag, so even a descendant that *escapes* the group
+/// (`setsid`/`setpgid`) and holds the pipe open forever cannot wedge them: at
+/// the deadline we set `stop`, the readers return, and we `join` them — no
+/// detached, permanently-blocked threads. On every failure path we `killpg` the
+/// group and reap, and we do so while the leader is still unreaped (either alive
+/// or a `WNOWAIT`-observed zombie), so the signalled PGID is always still in use
+/// by the leader — never a recycled one. The success path reaps with a plain
+/// `wait` (the leader has already exited) and never signals the group.
+fn run_key_command_bounded(
+    provider: &str,
+    command: &str,
+    timeout: Duration,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<String> {
+    use std::os::fd::AsRawFd;
+
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Own process group so a kill reaches descendants, not just the shell.
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("provider {provider:?}: running api_key_command {command:?}"))?;
-    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || key.is_empty() {
-        bail!(
-            "provider {provider:?}: api_key_command {command:?} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Cooperative stop for the reader threads: set at the deadline so a reader
+    // blocked on a pipe an escapee holds open returns instead of leaking.
+    let stop = Arc::new(AtomicBool::new(false));
+    // Natural-EOF signals, observed live by the wait loop. Only stdout's gates
+    // acceptance (the key channel), but both are tracked for completeness.
+    let stdout_eof = Arc::new(AtomicBool::new(false));
+    let stderr_eof = Arc::new(AtomicBool::new(false));
+
+    // Each reader owns its buffer and returns it on join; it sets `eof` only on
+    // a genuine EOF (`read` -> Ok(0)). Nonblocking reads let it poll the `stop`
+    // flag, so it is always joinable within `KEY_COMMAND_READER_POLL` of a stop
+    // even when a process-group escapee holds the write end open forever.
+    fn spawn_pipe_reader<P: Read + AsRawFd + Send + 'static>(
+        pipe: Option<P>,
+        stop: Arc<AtomicBool>,
+        eof: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let Some(mut pipe) = pipe else {
+                eof.store(true, Ordering::SeqCst);
+                return buf;
+            };
+            // Make the pipe nonblocking so `read` returns WouldBlock instead of
+            // parking the thread forever on a descendant that never writes/closes.
+            let fd = pipe.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => {
+                        eof.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::SeqCst) {
+                            // Told to stop and no EOF: leave `eof` false so the
+                            // wait loop fails closed rather than accepting this.
+                            break;
+                        }
+                        std::thread::sleep(KEY_COMMAND_READER_POLL);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            buf
+        })
     }
-    Ok(key)
+    let stdout_reader = spawn_pipe_reader(stdout_pipe, stop.clone(), stdout_eof.clone());
+    let stderr_reader = spawn_pipe_reader(stderr_pipe, stop.clone(), stderr_eof.clone());
+
+    // Kill the whole process group (not just the `sh` leader) and reap. Only
+    // ever called while the leader is still UNREAPED — alive, or a zombie
+    // observed via `leader_has_exited` (`WNOWAIT`) — so the leader is still a
+    // member of its group and the signalled PGID cannot have been recycled.
+    fn kill_group_and_reap(child: &mut std::process::Child) {
+        // SAFETY: killpg only signals the child's own process group.
+        unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        let _ = child.wait();
+    }
+
+    let start = Instant::now();
+    let mut leader_exit_at: Option<Instant> = None;
+    let outcome = loop {
+        // Observe the leader's exit WITHOUT reaping it, so a later `killpg` on a
+        // failure path still targets a group the (zombie) leader keeps reserved.
+        if leader_exit_at.is_none() && leader_has_exited(child.id()) {
+            leader_exit_at = Some(Instant::now());
+        }
+        let cancelled = cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        let timed_out = start.elapsed() >= timeout;
+        let stdout_eofed = stdout_eof.load(Ordering::SeqCst);
+
+        // Cancellation wins over everything, even with a key already buffered.
+        if cancelled {
+            kill_group_and_reap(&mut child);
+            break KeyCommandOutcome::Cancelled;
+        }
+        if let Some(exit_at) = leader_exit_at {
+            if stdout_eofed {
+                // Natural stdout EOF AND the leader has exited: the key is
+                // complete. Reap the already-exited leader (returns at once);
+                // no group signal is needed on this path.
+                let status = child
+                    .wait()
+                    .with_context(|| format!("provider {provider:?}: waiting on api_key_command {command:?}"))?;
+                break KeyCommandOutcome::Success(status);
+            }
+            // Leader exited but a descendant still holds stdout open: fail closed
+            // once the drain grace (or the overall timeout) elapses.
+            if exit_at.elapsed() >= KEY_COMMAND_DRAIN_GRACE || timed_out {
+                kill_group_and_reap(&mut child);
+                break KeyCommandOutcome::StdoutHeldOpen;
+            }
+        } else if timed_out {
+            // The leader itself is still running at the deadline: a genuine hang.
+            kill_group_and_reap(&mut child);
+            break KeyCommandOutcome::TimedOut;
+        }
+        std::thread::sleep(KEY_COMMAND_POLL);
+    };
+
+    // Release the readers (a descendant may still hold a pipe open) and join
+    // them — no detached, permanently-blocked threads leak.
+    stop.store(true, Ordering::SeqCst);
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    match outcome {
+        KeyCommandOutcome::Cancelled => {
+            bail!("provider {provider:?}: api_key_command {command:?} cancelled")
+        }
+        KeyCommandOutcome::TimedOut => {
+            bail!("provider {provider:?}: api_key_command {command:?} timed out after {}s", timeout.as_secs())
+        }
+        KeyCommandOutcome::StdoutHeldOpen => {
+            let stderr_tail = String::from_utf8_lossy(&stderr);
+            let stderr_tail = stderr_tail.trim();
+            let detail = if stderr_tail.is_empty() { String::new() } else { format!(": {stderr_tail}") };
+            bail!(
+                "provider {provider:?}: api_key_command {command:?} left a background process \
+                 holding stdout open past the {}ms drain grace, so its output could not be \
+                 confirmed complete; the key was not accepted{detail}",
+                KEY_COMMAND_DRAIN_GRACE.as_millis()
+            )
+        }
+        KeyCommandOutcome::Success(status) => {
+            let key = String::from_utf8_lossy(&stdout).trim().to_string();
+            if !status.success() || key.is_empty() {
+                bail!(
+                    "provider {provider:?}: api_key_command {command:?} failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&stderr).trim()
+                );
+            }
+            Ok(key)
+        }
+    }
 }
 
 /// Build a client for a model spec.
@@ -405,7 +759,20 @@ pub fn build_client(
     user: &HashMap<String, ProviderConfig>,
     default_provider: &str,
 ) -> Result<Box<dyn LLMClient>> {
-    let resolved = resolve(spec, user, default_provider)?;
+    build_client_cancellable(spec, user, default_provider, None)
+}
+
+/// Like [`build_client`], but a running `api_key_command` honours `cancel`: the
+/// child is killed and the build fails fast when the flag flips, so a mid-turn
+/// `/model` switch whose key command hangs cannot wedge the turn. `cancel` is
+/// `None` for build paths with no turn to cancel against.
+pub fn build_client_cancellable(
+    spec: &str,
+    user: &HashMap<String, ProviderConfig>,
+    default_provider: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<Box<dyn LLMClient>> {
+    let resolved = resolve_cancellable(spec, user, default_provider, cancel)?;
     Ok(match resolved.kind {
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
@@ -415,6 +782,7 @@ pub fn build_client(
 }
 
 /// Shared JSON-over-HTTP transport with retries.
+#[derive(Clone)]
 pub(crate) struct HttpTransport {
     client: reqwest::Client,
     provider: ResolvedProvider,
@@ -897,6 +1265,264 @@ mod key_command_tests {
         let err = resolve("cmd/m", &with_command("echo nope >&2; exit 3"), "mock").unwrap_err();
         assert!(format!("{err:#}").contains("nope"), "{err:#}");
     }
+
+    #[test]
+    fn bounded_key_command_returns_the_trimmed_key() {
+        let key = run_key_command_bounded("cmd", "printf '  sk-ok\\n'", Duration::from_secs(5), None).unwrap();
+        assert_eq!(key, "sk-ok");
+    }
+
+    #[test]
+    fn bounded_key_command_times_out_and_kills_a_hung_command() {
+        // A command that never exits must not block forever: the timeout fires,
+        // the child is killed, and the error names the timeout — all promptly.
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_timeout_kills_descendants_holding_the_pipes() {
+        // Regression: `sleep 30; printf sk` makes `sh` FORK `sleep` (rather than
+        // exec-replacing itself), so `sleep` inherits the stdout/stderr pipes.
+        // Killing only the `sh` leader would leave `sleep` holding them open and
+        // the reader-thread joins would block for the full 30s — defeating the
+        // timeout. Killing the whole process group tears `sleep` down too, so
+        // the pipes hit EOF and the call returns promptly.
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30; printf sk", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_kills_descendants_holding_the_pipes() {
+        // As above, but via the cancel path: the forked `sleep` must be torn
+        // down with the group so the reader joins do not block out the long
+        // timeout.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err =
+            run_key_command_bounded("cmd", "sleep 30; printf sk", Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the join: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_fails_closed_when_leader_exits_but_descendant_holds_stdout() {
+        // Fail-closed (human decision B): `printf sk; sleep 30 &` writes the key
+        // in the foreground and the leader exits immediately, but the
+        // backgrounded in-group `sleep` keeps stdout open past the drain grace.
+        // stdout therefore never reaches NATURAL EOF, so the captured prefix
+        // cannot be confirmed complete and MUST NOT be accepted as a key. The
+        // call fails promptly with an actionable error naming the cause.
+        let start = Instant::now();
+        let err =
+            run_key_command_bounded("cmd", "printf sk; sleep 30 &", Duration::from_millis(100), None).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "descendant blocked the return: {:?}", start.elapsed());
+        let msg = format!("{err:#}");
+        assert!(msg.contains("holding stdout open"), "{msg}");
+        assert!(msg.contains("key was not accepted"), "{msg}");
+    }
+
+    #[test]
+    fn bounded_key_command_fails_closed_when_descendant_holds_pipe_before_the_key() {
+        // The adversarial-finding shape made fail-closed: the key is printed in
+        // the foreground AFTER a backgrounded descendant that keeps stdout open
+        // past the bound. Because a descendant could still print the REMAINDER
+        // of the key later, stdout EOF is never confirmed and the (possibly
+        // truncated) buffer must NOT be accepted.
+        let start = Instant::now();
+        let err =
+            run_key_command_bounded("cmd", "sleep 30 & printf sk-good", Duration::from_millis(100), None).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "backgrounded descendant blocked the return: {:?}",
+            start.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("holding stdout open"), "{msg}");
+        assert!(msg.contains("key was not accepted"), "{msg}");
+    }
+
+    #[test]
+    fn bounded_key_command_fails_closed_when_no_key_was_captured() {
+        // A backgrounded descendant that holds stdout open but where the leader
+        // produced NO key must fail: stdout never reaches natural EOF, so there
+        // is nothing that can be confirmed complete. Fails promptly with the
+        // actionable held-open error rather than hanging on the descendant.
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30 &", Duration::from_millis(100), None).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "backgrounded descendant blocked the return: {:?}",
+            start.elapsed()
+        );
+        assert!(format!("{err:#}").contains("holding stdout open"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_applies_after_the_leader_exits() {
+        // As above, but via the cancel path with a long timeout: the leader
+        // exits immediately while the backgrounded `sleep` holds the pipes, so
+        // only the cancel flag can end the wait — and it must do so promptly by
+        // killing the whole process group.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30 & printf sk", Duration::from_secs(600), Some(&cancel))
+            .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "backgrounded descendant blocked the join: {:?}",
+            start.elapsed()
+        );
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_backgrounded_success_returns_the_key() {
+        // A backgrounded writer that FINISHES promptly must still yield its
+        // key: the leader exits immediately, the pipes hit EOF once the
+        // short-lived background `printf` closes them, and the call returns the
+        // key without waiting for any timeout.
+        let start = Instant::now();
+        let key = run_key_command_bounded("cmd", "printf sk-ok &", Duration::from_secs(5), None).unwrap();
+        assert_eq!(key, "sk-ok");
+        assert!(start.elapsed() < Duration::from_secs(4), "took the slow path: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn bounded_key_command_honours_cancellation_and_kills_the_child() {
+        // With the cancel flag already set, a hung command is killed and the
+        // build fails fast with a cancellation error rather than waiting out
+        // the (here, long) timeout.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "cancelled slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancelled_mid_flight_is_killed() {
+        // Flag starts clear and flips from another thread while the command is
+        // running: the wait loop observes it, kills the child, and fails fast.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", "sleep 30", Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(10), "cancelled slowly: {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_drains_large_output_without_deadlock() {
+        // A command that writes more than a pipe buffer (64KiB) must not
+        // deadlock the wait loop: the reader threads drain concurrently, so the
+        // command exits and the (trimmed) key comes back intact.
+        let key = run_key_command_bounded(
+            "cmd",
+            "printf 'sk-'; yes x | head -c 200000 | tr -d '\\n'",
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        assert!(key.starts_with("sk-x"), "unexpected key prefix: {}", &key[..key.len().min(8)]);
+        assert!(key.len() > 64 * 1024, "drained well past a pipe buffer without deadlock: {} bytes", key.len());
+    }
+
+    /// An `sh` fragment that backgrounds a descendant which *escapes* the
+    /// child's process group (a new session via `setsid`) and holds the
+    /// inherited stdout pipe open for ~30s. Because it leaves the group,
+    /// `killpg(child_group)` cannot reach it, so its reader thread never hits
+    /// EOF — the exact shape of the Copilot finding. Returns `None` when no
+    /// tool to create a new session is available, so the test skips rather than
+    /// failing on a bare CI image.
+    fn pgroup_escapee_holding_stdout() -> Option<&'static str> {
+        fn have(tool: &str) -> bool {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {tool}"))
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if have("setsid") {
+            Some("setsid sleep 30 &")
+        } else if have("perl") {
+            Some("perl -e 'use POSIX; POSIX::setsid(); sleep 30' &")
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn bounded_key_command_fails_closed_on_process_group_escapee_holding_stdout() {
+        // Fail-closed (human decision B): the key is printed in the foreground,
+        // then a descendant ESCAPES the process group (`setsid`) and holds
+        // stdout open past the timeout. `killpg` cannot force EOF on an escapee,
+        // so stdout never reaches NATURAL EOF and the captured prefix cannot be
+        // confirmed complete. The call must fail promptly with the actionable
+        // held-open error rather than accept a possibly-truncated credential —
+        // and it must not hang (the nonblocking readers are joined at the stop).
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let cmd = format!("printf sk-escape; {escapee}");
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", &cmd, Duration::from_millis(100), None).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the return: {:?}",
+            start.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("holding stdout open"), "{msg}");
+        assert!(msg.contains("key was not accepted"), "{msg}");
+    }
+
+    #[test]
+    fn bounded_key_command_fails_closed_on_keyless_process_group_escapee() {
+        // Same escapee shape but with NO key printed: stdout never reaches EOF,
+        // so the call fails promptly with the held-open error rather than
+        // hanging on the escapee's still-open pipe.
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", escapee, Duration::from_millis(100), None).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the timeout: {:?}",
+            start.elapsed()
+        );
+        assert!(format!("{err:#}").contains("holding stdout open"), "{err:#}");
+    }
+
+    #[test]
+    fn bounded_key_command_cancel_applies_despite_process_group_escapee() {
+        // The cancel path must also not hang on a process-group escapee: the
+        // leader exits immediately while the escapee holds the pipe, and only
+        // the cancel flag can end the wait — promptly, without a reader join.
+        let Some(escapee) = pgroup_escapee_holding_stdout() else {
+            return;
+        };
+        let cmd = format!("printf sk; {escapee}");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let err = run_key_command_bounded("cmd", &cmd, Duration::from_secs(600), Some(&cancel)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "process-group escapee blocked the cancel: {:?}",
+            start.elapsed()
+        );
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+    }
 }
 
 #[cfg(test)]
@@ -987,6 +1613,166 @@ mod tests {
         assert_eq!(
             parse_model_spec("meta-llama/llama-4", &providers, "together"),
             ("together", Some("meta-llama/llama-4"))
+        );
+    }
+
+    #[test]
+    fn validate_spec_matches_resolve_for_the_buildable_cases() {
+        let providers = effective_providers(&HashMap::new());
+        // A buildable spec passes validation and also resolves.
+        assert!(validate_spec("mock/anything", &providers, "mock").is_ok());
+        assert!(resolve("mock/anything", &HashMap::new(), "mock").is_ok());
+        // A provider that cannot build a client (openai kind, no base_url) is
+        // rejected the same way by both, so queue-time validation never queues
+        // a spec that would only fail (silently, pre-fix) at the next model call.
+        let mut user = HashMap::new();
+        user.insert(
+            "broken".to_string(),
+            ProviderConfig { kind: Some(ProviderKind::Openai), default_model: Some("m".into()), ..Default::default() },
+        );
+        let providers = effective_providers(&user);
+        let err = validate_spec("broken/x", &providers, "mock").unwrap_err().to_string();
+        assert!(err.contains("base_url"), "{err}");
+        assert!(resolve("broken/x", &user, "mock").is_err());
+    }
+
+    #[test]
+    fn validate_spec_rejects_a_provider_without_a_model() {
+        // A user provider with a kind and base_url but no default model, and a
+        // bare spec that supplies none, must be rejected (not silently queued).
+        let mut user = HashMap::new();
+        user.insert(
+            "bare".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some("http://localhost:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        let providers = effective_providers(&user);
+        let err = validate_spec("bare", &providers, "mock").unwrap_err().to_string();
+        assert!(err.contains("no model"), "{err}");
+    }
+
+    #[test]
+    fn validate_spec_rejects_an_empty_or_malformed_base_url() {
+        // An HTTP provider whose base_url is *present* but empty/whitespace,
+        // unparseable, or non-http(s) must be rejected at queue time by BOTH
+        // `validate_spec` and `resolve`: `Some(_)` and `HttpTransport::new`
+        // accept it, so without parsing it a mid-turn switch would replace the
+        // working client and only fail later while building the request URL
+        // (losing the current model). Each variant is its own occurrence of the
+        // same fail-open class.
+        let mut user = HashMap::new();
+        for (name, url) in [
+            ("empty", "   "),
+            ("bad", "not a url"),
+            ("ftp", "ftp://host/v1"),
+            ("nohost", "http://"),
+            // Leading/trailing whitespace and control characters are stripped
+            // by the URL parser but kept verbatim by `resolve`, so they must be
+            // rejected too — otherwise they pass validation yet break later at
+            // request-build time (same fail-open class).
+            ("lead_space", " http://host/v1"),
+            ("trail_newline", "http://host/v1\n"),
+            ("inner_tab", "http://ho\tst/v1"),
+            ("control", "http://host/v1\u{0001}"),
+            // A query or fragment makes the string-appended request URL
+            // unusable (the API path lands in the query / the fragment is
+            // dropped), so both must be rejected too — same fail-open class.
+            ("query", "https://host/v1?token=x"),
+            ("fragment", "https://host/v1#frag"),
+        ] {
+            user.insert(
+                name.to_string(),
+                ProviderConfig {
+                    kind: Some(ProviderKind::Openai),
+                    default_model: Some("m".into()),
+                    base_url: Some(url.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let providers = effective_providers(&user);
+        for name in [
+            "empty",
+            "bad",
+            "ftp",
+            "nohost",
+            "lead_space",
+            "trail_newline",
+            "inner_tab",
+            "control",
+            "query",
+            "fragment",
+        ] {
+            let spec = format!("{name}/x");
+            assert!(validate_spec(&spec, &providers, "mock").is_err(), "validate_spec accepted {name}");
+            assert!(resolve(&spec, &user, "mock").is_err(), "resolve accepted {name}");
+        }
+        // A well-formed endpoint still passes both, unchanged.
+        let mut ok = HashMap::new();
+        ok.insert(
+            "good".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                default_model: Some("m".into()),
+                base_url: Some("http://localhost:9/v1".into()),
+                ..Default::default()
+            },
+        );
+        let providers = effective_providers(&ok);
+        assert!(validate_spec("good/x", &providers, "mock").is_ok());
+        assert!(resolve("good/x", &ok, "mock").is_ok());
+    }
+
+    #[test]
+    fn copilot_endpoint_override_is_validated_when_present() {
+        // A GitHub Copilot provider derives its endpoint from the session token
+        // when `base_url` is absent/empty, but a *present non-empty* override is
+        // used verbatim by `GithubCopilotClient::api_base`. Both `validate_spec`
+        // and `resolve` must reject a malformed override (rather than exempting
+        // every Copilot base_url), or a bad override passes queue-time
+        // validation and only fails on the next request.
+        for (name, url) in [
+            ("malformed", "not a url"),
+            ("non-http", "ftp://host/v1"),
+            ("query", "https://host/v1?token=x"),
+            ("whitespace", " https://host/v1"),
+            // A whitespace-only override is *not* empty to `api_base`'s
+            // `configured.is_empty()` test, so it is used verbatim
+            // (`format!("{}{}", "   ", path)` -> a broken endpoint). It must be
+            // rejected here too, not exempted by a trimming guard — otherwise it
+            // passes queue-time validation and fails only on the next request.
+            ("whitespace-only", "   "),
+        ] {
+            let mut user = HashMap::new();
+            user.insert(
+                "github-copilot".to_string(),
+                ProviderConfig { base_url: Some(url.into()), ..Default::default() },
+            );
+            let providers = effective_providers(&user);
+            let spec = "github-copilot/gpt-4.1";
+            assert!(
+                validate_spec(spec, &providers, "github-copilot").is_err(),
+                "validate_spec accepted {name} override"
+            );
+            assert!(resolve(spec, &user, "github-copilot").is_err(), "resolve accepted {name} override");
+        }
+        // A well-formed override passes both, and an absent/empty override still
+        // derives from the session token (no validation, no error).
+        let mut user = HashMap::new();
+        user.insert(
+            "github-copilot".to_string(),
+            ProviderConfig { base_url: Some("https://copilot.example.com/v1".into()), ..Default::default() },
+        );
+        let providers = effective_providers(&user);
+        assert!(validate_spec("github-copilot/gpt-4.1", &providers, "github-copilot").is_ok());
+        let resolved = resolve("github-copilot/gpt-4.1", &user, "github-copilot").unwrap();
+        assert_eq!(resolved.base_url, "https://copilot.example.com/v1");
+        // Absent override -> derived (empty stored base_url), valid.
+        assert!(
+            validate_spec("github-copilot/gpt-4.1", &effective_providers(&HashMap::new()), "github-copilot").is_ok()
         );
     }
 

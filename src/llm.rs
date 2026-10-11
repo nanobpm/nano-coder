@@ -611,6 +611,10 @@ pub trait LLMClient: Send + Sync {
     ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
         (self.detect_context_window().await, self.detect_thinking_levels().await, self.detect_vision().await)
     }
+    /// A boxed clone, for work that outlives the caller's borrow — e.g. the
+    /// agent probing the context window in a background task after a mid-turn
+    /// `/model` switch, so the probe never blocks the next model call.
+    fn clone_boxed(&self) -> Box<dyn LLMClient>;
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
     /// The provider API kind this client speaks. `None` for test doubles that

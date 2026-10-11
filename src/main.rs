@@ -174,17 +174,26 @@ enum TermInput {
     Rejected(String),
 }
 
-/// Apply `/mode NAME` or `/verbosity LEVEL` typed during a turn through
-/// shared state (the agent reads its mode from `TurnControl` at each step;
-/// verbosity is global). Returns the note to show.
+/// Apply `/mode NAME`, `/verbosity LEVEL` or `/model SPEC` typed during a
+/// turn through shared state (the agent reads its mode and a requested model
+/// from `TurnControl` at each step; verbosity is global). Returns the note to
+/// show.
 fn apply_next_step_setting(
     cmd: &str,
     control: &agent::TurnControl,
     stats: &context::SharedStats,
     renderer: &ui::Renderer,
+    snapshot: &turn_commands::Snapshot,
 ) -> String {
-    if let Some(arg) = cmd.strip_prefix("/mode ") {
-        match arg.trim().parse::<mode::AgentMode>() {
+    // Split the command from its argument on ANY whitespace, exactly as
+    // `turn_commands::timing` classifies it (shared `split_cmd`). Matching on an
+    // ASCII space only (e.g. `strip_prefix("/model ")`) would mishandle a tab-
+    // or newline-separated line: `timing` routes `/model\tmock/x` here as
+    // `NextStep`, but a space-only split would then fail to recognise it and
+    // report "not a setting" instead of queuing the switch.
+    let (name, arg) = turn_commands::split_cmd(cmd);
+    match name {
+        "/mode" => match arg.parse::<mode::AgentMode>() {
             Ok(mode) => {
                 control.set_mode(mode);
                 // As for Shift+Tab mid-turn: refresh the status line now.
@@ -193,9 +202,8 @@ fn apply_next_step_setting(
                 format!("Mode set to {mode} ({}); applies from the agent's next step", mode.describe())
             }
             Err(e) => e,
-        }
-    } else if let Some(arg) = cmd.strip_prefix("/verbosity ") {
-        match arg.trim().parse::<ui::Verbosity>() {
+        },
+        "/verbosity" => match arg.parse::<ui::Verbosity>() {
             Ok(level) => {
                 // The agent's config copy is synced when the turn ends. Route
                 // through the renderer so a mid-turn change reconciles the
@@ -204,9 +212,31 @@ fn apply_next_step_setting(
                 format!("Verbosity set to {level} ({}); /settings saves it", level.describe())
             }
             Err(e) => e,
+        },
+        "/model" => {
+            let spec = arg;
+            if spec.is_empty() {
+                // The bare picker owns the keyboard, so it waits for the turn;
+                // `timing` agrees, so this is only a backstop.
+                return format!("[{cmd}: waits for the turn to finish]");
+            }
+            // The agent applies the switch just before its next model call
+            // (`Agent::apply_model_request`), so this is safe in the middle of a
+            // tool loop: the history is provider-neutral. Validate the spec now,
+            // against the turn-start providers (they do not change during a turn),
+            // so an unbuildable spec is reported immediately and is never queued —
+            // a dead request must not sit on the control and leak into later turns.
+            // A spec that passes here almost always builds at apply time; the rare
+            // late failure (e.g. a failing api-key command) is surfaced then via
+            // `AgentEvent::ModelSwitchFailed` and the request is dropped, not
+            // retried.
+            if let Err(e) = snapshot.validate_model_spec(spec) {
+                return format!("[{cmd}: {e}]");
+            }
+            control.set_model(spec);
+            format!("Model switch to {spec} queued; applies at the next model call (the history carries over)")
         }
-    } else {
-        format!("[{cmd}: not a setting]")
+        _ => format!("[{cmd}: not a setting]"),
     }
 }
 
@@ -923,7 +953,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     }
                                 }
                                 turn_commands::Timing::NextStep => {
-                                    renderer.note(&apply_next_step_setting(text, &control, &stats, &renderer));
+                                    renderer.note(&apply_next_step_setting(text, &control, &stats, &renderer, &snapshot));
                                 }
                                 turn_commands::Timing::AfterTurn => {
                                     renderer.note(&format!("[waits for the turn to finish: {text}]"));
@@ -966,6 +996,12 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         agent.config_mut().verbosity = ui::verbosity();
         outcome
     };
+    // A mid-turn `/model` switch updates the agent's config but not the shared
+    // editor context (the between-turns path refreshes it via
+    // `Terminal::model_switched`). Resync now the turn has returned so `/model`
+    // completion treats the newly switched model as `current`, matching the
+    // prompt-level switch.
+    terminal.sync_context(agent);
     // A steer typed as the turn finished queues behind what is already
     // waiting, unless the turn was cancelled. Drain it before propagating any
     // turn error too: `start_turn` does not clear pending steers, so a steer
@@ -1576,8 +1612,18 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
 }
 
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
+    // Split name from argument on ANY whitespace, the same rule `timing` and
+    // `Snapshot::output` use, so a tab/newline-separated form (e.g.
+    // `/trajectory\t--json`) dispatches identically to its space-separated twin
+    // instead of being silently dropped by an ASCII-space `starts_with`.
+    let (name, arg) = turn_commands::split_cmd(cmd);
     match cmd {
-        "/trajectory" if !terminal.outstanding && terminal.renderer.is_frame() && io::stdin().is_terminal() => {
+        _ if name == "/trajectory"
+            && arg.is_empty()
+            && !terminal.outstanding
+            && terminal.renderer.is_frame()
+            && io::stdin().is_terminal() =>
+        {
             // Page a trajectory that doesn't fit on screen. The pager owns the
             // screen until it exits; force a full redraw so the frame
             // renderer's next differential render isn't diffed against what
@@ -1608,7 +1654,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         // "unexpected arguments" backstop. Between turns there is no need to
         // restrict which forms run — that restriction (see `timing`) exists
         // only to decide what is safe *mid-turn*.
-        _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
+        _ if name == "/trajectory" => {
             let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
             match turn_commands::Snapshot::capture(agent)
                 .output(cmd, &stats, agent.plan())
@@ -1639,8 +1685,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/exit" | "/quit" => Ok(false),
-        _ if cmd == "/compact" || cmd.starts_with("/compact ") => {
-            let (mode, focus) = commands::parse_compact_args(&cmd["/compact".len()..]);
+        _ if name == "/compact" => {
+            let (mode, focus) = commands::parse_compact_args(arg);
             let focus = focus.map(str::to_string);
             terminal.renderer.print_block("Compacting...");
             match run_compaction(agent, mode, focus.as_deref(), terminal).await? {
@@ -1704,8 +1750,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             outcome?;
             Ok(true)
         }
-        _ if cmd == "/memory" || cmd.starts_with("/memory ") => {
-            terminal.renderer.print_block(&memory_command(agent, cmd.strip_prefix("/memory").unwrap_or("").trim()));
+        _ if name == "/memory" => {
+            terminal.renderer.print_block(&memory_command(agent, arg));
             Ok(true)
         }
         "/hooks" => {
@@ -1732,7 +1778,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        "/model" if terminal.outstanding => {
+        _ if name == "/model" && arg.is_empty() && terminal.outstanding => {
             // Typed during a turn: a stdin read is still pending, so an
             // interactive picker would race it for keystrokes.
             terminal.renderer.print_block(&format!(
@@ -1743,7 +1789,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             ));
             Ok(true)
         }
-        "/model" if !io::stdin().is_terminal() || !io::stderr().is_terminal() => {
+        _ if name == "/model" && arg.is_empty() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) => {
             // The picker reads keystrokes from stdin and draws on stderr, so it
             // needs both to be terminals; piped input/output just gets the
             // current model.
@@ -1755,7 +1801,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             ));
             Ok(true)
         }
-        "/model" => {
+        _ if name == "/model" && arg.is_empty() => {
             // Capture the model actually in use (resolved by the live
             // client) before switching, so a provider-default edit made in the
             // same session cannot rewrite which model we record leaving.
@@ -1780,18 +1826,18 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with("/model ") => {
+        _ if name == "/model" && !arg.is_empty() => {
             // Capture the model actually in use (resolved by the live
             // client) before switching, so a provider-default edit made in the
             // same session cannot rewrite which model we record leaving.
             let before = format!("{}/{}", agent.provider_name(), agent.model_name());
-            agent.set_model(cmd["/model ".len()..].trim()).await?;
+            agent.set_model(arg).await?;
             terminal.model_switched(agent, &before);
             terminal.renderer.print_block(&model_set_text(agent));
             Ok(true)
         }
-        _ if cmd == "/resume" || cmd.starts_with("/resume ") => {
-            resume_command(agent, cmd["/resume".len()..].trim(), terminal)?;
+        _ if name == "/resume" => {
+            resume_command(agent, arg, terminal)?;
             Ok(true)
         }
         "/restart" => {
@@ -1807,17 +1853,17 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        "/thinking" => {
+        _ if name == "/thinking" && arg.is_empty() => {
             terminal.renderer.print_block(&thinking_status_text(agent));
             Ok(true)
         }
-        _ if cmd.starts_with("/thinking ") => {
-            let text = set_thinking_text(agent, &cmd["/thinking ".len()..]);
+        _ if name == "/thinking" => {
+            let text = set_thinking_text(agent, arg);
             terminal.renderer.print_block(&text);
             Ok(true)
         }
-        _ if cmd.starts_with("/mode ") => {
-            match cmd["/mode ".len()..].parse::<mode::AgentMode>() {
+        _ if name == "/mode" && !arg.is_empty() => {
+            match arg.parse::<mode::AgentMode>() {
                 Ok(m) => {
                     agent.set_mode(m);
                     terminal.renderer.print_block(&format!("Mode set to {m} ({})", m.describe()));
@@ -1826,8 +1872,8 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             }
             Ok(true)
         }
-        _ if cmd.starts_with("/verbosity ") => {
-            match cmd["/verbosity ".len()..].parse::<ui::Verbosity>() {
+        _ if name == "/verbosity" && !arg.is_empty() => {
+            match arg.parse::<ui::Verbosity>() {
                 Ok(level) => {
                     ui::set_verbosity(level);
                     agent.config_mut().verbosity = level;
@@ -2296,20 +2342,6 @@ async fn main() -> Result<()> {
         }));
         let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
         ui::install(renderer.clone());
-        let sink = renderer.clone();
-        agent.set_event_sink(Box::new(move |_, event| sink.event(event)));
-        agent.set_streaming(true);
-        agent.refresh_stats();
-        let frame_mode = renderer.is_frame();
-        // Emit the startup banner now the renderer exists. In frame mode seed it
-        // into the owned transcript via `print_block` so the first full redraw
-        // (which clears the scrollback) cannot erase it; in legacy mode print it
-        // inline, with the trailing blank line the banner has always had.
-        if frame_mode {
-            renderer.print_block(&banner.join("\n"));
-        } else {
-            println!("{}\n", banner.join("\n"));
-        }
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = {
             let mut loaded = recents::load(&recents_path);
@@ -2325,6 +2357,36 @@ async fn main() -> Result<()> {
             }
             Arc::new(Mutex::new(loaded))
         };
+        {
+            let sink = renderer.clone();
+            let recents = recents.clone();
+            let recents_path = recents_path.clone();
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+                sink.event(event);
+                // A `/model <spec>` typed mid-turn is applied by the agent
+                // itself, so the between-turns `run_command` arm never runs:
+                // record the switch in the recents MRU here instead, as
+                // `Terminal::model_switched` does for a switch at the prompt.
+                if let agent::AgentEvent::ModelSwitched { spec, previous } = event {
+                    let mut recents = recents.lock().unwrap();
+                    recents.record(previous);
+                    recents.record(spec);
+                    recents::save(&recents_path, &recents);
+                }
+            }));
+        }
+        agent.set_streaming(true);
+        agent.refresh_stats();
+        let frame_mode = renderer.is_frame();
+        // Emit the startup banner now the renderer exists. In frame mode seed it
+        // into the owned transcript via `print_block` so the first full redraw
+        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // inline, with the trailing blank line the banner has always had.
+        if frame_mode {
+            renderer.print_block(&banner.join("\n"));
+        } else {
+            println!("{}\n", banner.join("\n"));
+        }
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),
@@ -2805,6 +2867,35 @@ mod tests {
         assert!(matches!(classify_steer_input("", false), SteerRoute::Ignore));
     }
 
+    #[test]
+    fn next_step_setting_accepts_any_whitespace_separator() {
+        // Regression: `turn_commands::timing` splits the command from its arg on
+        // ANY whitespace, so `/model\tmock/x` is routed here as `NextStep`. The
+        // dispatch must parse the separator the same way — a space-only match
+        // (the old `strip_prefix("/model ")`) reported "not a setting" for a
+        // tab- or newline-separated line, silently dropping the switch.
+        let control = agent::TurnControl::default();
+        let stats: context::SharedStats = std::sync::Arc::new(std::sync::Mutex::new(context::ContextStats::default()));
+        let renderer = ui::Renderer::legacy_for_test();
+        let snapshot = turn_commands::Snapshot::default();
+
+        // Every NextStep command, separated by a tab rather than a space.
+        for sep in ["\t", "\n", "\u{0b}", "  "] {
+            let note = apply_next_step_setting(&format!("/mode{sep}plan"), &control, &stats, &renderer, &snapshot);
+            assert!(note.starts_with("Mode set to"), "tab/space `/mode` not recognised: {note:?}");
+        }
+        // And it still matches the ordinary single-space form.
+        let note = apply_next_step_setting("/mode plan", &control, &stats, &renderer, &snapshot);
+        assert!(note.starts_with("Mode set to"), "space `/mode` regressed: {note:?}");
+
+        // A genuinely unknown command is still reported as not a setting, and a
+        // name that only shares a prefix (`/modex`) must not match `/mode`.
+        assert!(apply_next_step_setting("/nope arg", &control, &stats, &renderer, &snapshot).contains("not a setting"));
+        assert!(
+            apply_next_step_setting("/modex plan", &control, &stats, &renderer, &snapshot).contains("not a setting")
+        );
+    }
+
     /// A max-turn response whose streamed answer was quiet-suppressed must be
     /// reprinted in full (the truncation repair), not reduced to its dimmed
     /// stop-note line by the max-turn fallback.
@@ -2868,6 +2959,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::llm::LLMClient for NoModel {
+        fn clone_boxed(&self) -> Box<dyn crate::llm::LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, _: &crate::llm::ChatRequest<'_>) -> Result<crate::llm::LLMResponse> {
             panic!("memory_command must not call the model")
         }

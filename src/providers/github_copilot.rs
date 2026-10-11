@@ -11,6 +11,7 @@
 //! it checks. It is only used when explicitly selected.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -353,14 +354,16 @@ pub struct GithubCopilotClient {
     transport: HttpTransport,
     oauth: String,
     endpoints: Endpoints,
-    session: tokio::sync::Mutex<Option<SessionToken>>,
-    /// The `/models` response the probes read (window, thinking levels), so
-    /// they share one request.
-    /// The `/models` list, keyed by the `api_base` it was fetched from. A
-    /// session-token force-refresh (after a 401) can move us to a different
-    /// proxy endpoint; keying on `api_base` re-fetches then instead of serving
-    /// the previous endpoint's stale list, levels and window.
-    models_cache: tokio::sync::Mutex<Option<(String, Value)>>,
+    /// The cached session token, shared across clones (`clone_boxed`) so a
+    /// freshly built client and its clone reuse one OAuth-to-session exchange
+    /// instead of each performing their own on first use.
+    session: Arc<tokio::sync::Mutex<Option<SessionToken>>>,
+    /// The `/models` list the probes read (window, thinking levels, vision),
+    /// keyed by the `api_base` it was fetched from. A session-token
+    /// force-refresh (after a 401) can move us to a different proxy endpoint;
+    /// keying on `api_base` re-fetches then instead of serving the previous
+    /// endpoint's stale list. Shared across clones like `session`.
+    models_cache: Arc<tokio::sync::Mutex<Option<(String, Value)>>>,
 }
 
 impl GithubCopilotClient {
@@ -424,8 +427,8 @@ impl GithubCopilotClient {
             transport: HttpTransport::new(provider)?,
             oauth,
             endpoints,
-            session: tokio::sync::Mutex::new(None),
-            models_cache: tokio::sync::Mutex::new(None),
+            session: Arc::new(tokio::sync::Mutex::new(None)),
+            models_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -450,6 +453,22 @@ impl GithubCopilotClient {
 
 #[async_trait]
 impl LLMClient for GithubCopilotClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        // Share the session-token cache (`Arc<tokio::sync::Mutex<_>>`) with the
+        // clone: a newly built client and its clone otherwise start with empty
+        // caches, so the background context-window probe and the immediately
+        // following model call would each perform a separate, often concurrent
+        // OAuth-to-session exchange on every mid-turn switch. Sharing the cache
+        // means the probe's exchange is reused by the chat call.
+        Box::new(Self {
+            transport: self.transport.clone(),
+            oauth: self.oauth.clone(),
+            endpoints: self.endpoints.clone(),
+            session: self.session.clone(),
+            models_cache: self.models_cache.clone(),
+        })
+    }
+
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let provider = self.transport.provider();
         let api = copilot_api_for_model(&provider.model);

@@ -12,6 +12,7 @@ use crate::llm::{
 };
 use crate::thinking::Request;
 
+#[derive(Clone)]
 pub struct OpenAiClient {
     transport: HttpTransport,
 }
@@ -422,6 +423,10 @@ pub(crate) async fn stream_chat(
 
 #[async_trait]
 impl LLMClient for OpenAiClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        Box::new(self.clone())
+    }
+
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let body = self.build_body(request);
         let api_key = self.transport.provider().api_key.clone();

@@ -15,22 +15,33 @@ use crate::context::ContextStats;
 use crate::plan::Plan;
 use crate::providers::ProviderConfig;
 
+/// Split a trimmed `/…` command line into its name and trimmed argument on the
+/// first run of whitespace. Every dispatch, timing, and snapshot-output path
+/// must use this one rule so a tab- or newline-separated line (e.g.
+/// `/trajectory\t--json`) is classified and rendered identically to its
+/// space-separated form — a space-only `starts_with("/trajectory ")` would
+/// disagree with `timing` and silently drop the command.
+pub fn split_cmd(cmd: &str) -> (&str, &str) {
+    cmd.split_once(char::is_whitespace).map(|(n, a)| (n, a.trim())).unwrap_or((cmd, ""))
+}
+
 /// When a command can run relative to a turn in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timing {
     /// Read-only: runs straight away from the snapshot and live stats.
     Immediate,
     /// A setting the agent reads at its next step (`/mode NAME`,
-    /// `/verbosity LEVEL`): applied straight away through shared state.
+    /// `/verbosity LEVEL`, `/model SPEC`): applied straight away through
+    /// shared state.
     NextStep,
-    /// Changes the conversation, owns the keyboard, or switches the client:
-    /// waits for the turn to finish.
+    /// Changes the conversation, owns the keyboard, or waits on the in-flight
+    /// request: waits for the turn to finish.
     AfterTurn,
 }
 
 /// When `cmd` (a trimmed `/…` line) can run during a turn.
 pub fn timing(cmd: &str) -> Timing {
-    let (name, arg) = cmd.split_once(char::is_whitespace).map(|(n, a)| (n, a.trim())).unwrap_or((cmd, ""));
+    let (name, arg) = split_cmd(cmd);
     match (name, arg) {
         ("/help" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/context", "") => Timing::Immediate,
         // Only the supported export forms run early; anything else defers so
@@ -40,6 +51,12 @@ pub fn timing(cmd: &str) -> Timing {
         // Without an argument these just show the current value.
         ("/mode" | "/verbosity", "") => Timing::Immediate,
         ("/mode" | "/verbosity", _) => Timing::NextStep,
+        // A model switch is queued on the turn's control and applied just
+        // before the agent's next model call, so a switch in the middle of a
+        // tool loop is fine (the history is provider-neutral). The bare
+        // `/model` picker owns the keyboard, so it still waits for the turn.
+        ("/model", "") => Timing::AfterTurn,
+        ("/model", _) => Timing::NextStep,
         _ => Timing::AfterTurn,
     }
 }
@@ -127,20 +144,36 @@ impl Snapshot {
         }
     }
 
+    /// Validate a `/model <spec>` typed mid-turn against the turn-start
+    /// providers, without side effects (see `providers::validate_spec`), so an
+    /// unbuildable spec is reported the moment it is typed instead of failing
+    /// silently at the next model call. The providers do not change during a
+    /// turn, so the turn-start snapshot is authoritative. Returns the error
+    /// message to show, or `Ok(())` if the spec builds.
+    pub fn validate_model_spec(&self, spec: &str) -> Result<(), String> {
+        crate::providers::validate_spec(spec, &self.providers, &self.default_provider).map_err(|e| e.to_string())
+    }
+
     /// The output of a read-only command (see [`timing`]), or `None` for any
     /// other command. `stats` and `plan` are the live values.
     pub fn output(&self, cmd: &str, stats: &ContextStats, plan: &Plan) -> Option<Output> {
         let block = |text: String| Some(Output::Block(text));
-        match cmd {
-            "/help" => block(crate::commands::help_text()),
-            "/tools" => block(self.tools(stats.mode, stats.history_available)),
-            "/skills" => block(self.skills.clone()),
-            "/providers" => block(self.providers()),
-            "/session" => block(self.session.clone()),
-            "/plan" if plan.is_empty() => block("No plan yet. The agent makes one with the plan_add tool.".into()),
-            "/plan" => block(plan.render(true, usize::MAX).trim_end().to_string()),
-            "/context" => block(self.context(stats)),
-            "/mode" => {
+        // Split on any whitespace, exactly as `timing` classifies the line, so
+        // a tab/newline-separated form routes to the same arm its
+        // space-separated twin would.
+        let (name, arg) = split_cmd(cmd);
+        match (name, arg) {
+            ("/help", "") => block(crate::commands::help_text()),
+            ("/tools", "") => block(self.tools(stats.mode, stats.history_available)),
+            ("/skills", "") => block(self.skills.clone()),
+            ("/providers", "") => block(self.providers()),
+            ("/session", "") => block(self.session.clone()),
+            ("/plan", "") if plan.is_empty() => {
+                block("No plan yet. The agent makes one with the plan_add tool.".into())
+            }
+            ("/plan", "") => block(plan.render(true, usize::MAX).trim_end().to_string()),
+            ("/context", "") => block(self.context(stats)),
+            ("/mode", "") => {
                 let current = stats.mode;
                 let mut out = vec![format!("Mode: {current} ({})", current.describe())];
                 for mode in crate::mode::AgentMode::ALL {
@@ -149,7 +182,7 @@ impl Snapshot {
                 out.push("(Shift+Tab cycles; /mode NAME sets it directly)".to_string());
                 block(out.join("\n"))
             }
-            "/verbosity" => {
+            ("/verbosity", "") => {
                 let current = crate::ui::verbosity();
                 let mut out = vec![format!("Verbosity: {current} ({})", current.describe())];
                 for level in crate::ui::Verbosity::ALL {
@@ -157,9 +190,7 @@ impl Snapshot {
                 }
                 block(out.join("\n"))
             }
-            _ if cmd == "/trajectory" || cmd.starts_with("/trajectory ") => {
-                Some(self.trajectory(cmd["/trajectory".len()..].trim()))
-            }
+            ("/trajectory", _) => Some(self.trajectory(arg)),
             _ => None,
         }
     }
@@ -300,9 +331,12 @@ mod tests {
         for cmd in ["/mode plan", "/verbosity quiet", "/mode  auto "] {
             assert_eq!(timing(cmd), Timing::NextStep, "{cmd}");
         }
-        for cmd in
-            ["/compact", "/compact --smart", "/restart", "/settings", "/model", "/model mock/x", "/exit", "/quit"]
-        {
+        // `/model SPEC` applies at the agent's next model call, even in the
+        // middle of a tool loop; the bare picker still waits for the turn.
+        for cmd in ["/model mock/x", "/model  anthropic/claude-x "] {
+            assert_eq!(timing(cmd), Timing::NextStep, "{cmd}");
+        }
+        for cmd in ["/compact", "/compact --smart", "/restart", "/settings", "/model", "/exit", "/quit"] {
             assert_eq!(timing(cmd), Timing::AfterTurn, "{cmd}");
         }
         // A read-only command given arguments it doesn't take is not run early.
@@ -371,6 +405,29 @@ mod tests {
                 panic!("{cmd}")
             };
             assert!(note.contains("Session persistence is disabled"), "{note}");
+        }
+    }
+
+    #[test]
+    fn non_space_whitespace_routes_like_a_space() {
+        // `timing` splits on any whitespace, so the dispatch and snapshot-output
+        // paths must too: a tab/newline-separated form has to classify and
+        // render identically to its space-separated twin, never fall through an
+        // ASCII-space-only `starts_with` guard (issue: whitespace handling
+        // differs between command paths).
+        assert_eq!(split_cmd("/trajectory\t--json"), ("/trajectory", "--json"));
+        assert_eq!(split_cmd("/model\nmock/x"), ("/model", "mock/x"));
+        assert_eq!(split_cmd("/help"), ("/help", ""));
+        assert_eq!(timing("/trajectory\t--json"), timing("/trajectory --json"));
+        assert_eq!(timing("/model\tmock/x"), Timing::NextStep);
+        let snapshot = Snapshot::default();
+        let stats = ContextStats::default();
+        for (tabbed, spaced) in [("/trajectory\t--json", "/trajectory --json"), ("/trajectory\t", "/trajectory")] {
+            assert_eq!(
+                snapshot.output(tabbed, &stats, &Plan::default()),
+                snapshot.output(spaced, &stats, &Plan::default()),
+                "{tabbed:?} must render like {spaced:?}",
+            );
         }
     }
 

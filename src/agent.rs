@@ -238,6 +238,13 @@ struct ControlInner {
     cancelled: Arc<AtomicBool>,
     cancel_tx: tokio::sync::watch::Sender<bool>,
     mode: Mutex<crate::mode::AgentMode>,
+    /// A `/model <spec>` typed mid-turn: the agent applies it just before its
+    /// next model call (see `Agent::apply_model_request`).
+    model: Mutex<Option<String>>,
+    /// Fired whenever `set_model` queues/replaces a request, so an in-flight
+    /// build of a now-stale spec can be cancelled immediately rather than
+    /// waited out (see `Agent::apply_model_request`).
+    model_tx: tokio::sync::watch::Sender<u64>,
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
@@ -262,6 +269,8 @@ impl Default for TurnControl {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_tx: tokio::sync::watch::channel(false).0,
                 mode: Mutex::new(crate::mode::AgentMode::default()),
+                model: Mutex::new(None),
+                model_tx: tokio::sync::watch::channel(0u64).0,
                 plan: Mutex::new(crate::plan::Plan::default()),
                 thinking: Mutex::new(None),
             }),
@@ -318,6 +327,29 @@ impl TurnControl {
         *self.inner.thinking.lock().unwrap() = thinking;
     }
 
+    /// Ask the running turn to switch to `spec` (`provider/model`) at its next
+    /// model call; a later request replaces an earlier unapplied one.
+    pub fn set_model(&self, spec: &str) {
+        *self.inner.model.lock().unwrap() = Some(spec.to_string());
+        // Notify any in-flight build of a now-stale spec so it cancels and the
+        // loop rebuilds the newest spec immediately (see `apply_model_request`).
+        self.inner.model_tx.send_modify(|generation| *generation += 1);
+    }
+
+    /// The `/model <spec>` requested mid-turn, if any; the agent takes it once
+    /// as it applies the switch.
+    pub fn take_model_request(&self) -> Option<String> {
+        self.inner.model.lock().unwrap().take()
+    }
+
+    /// Whether a `/model <spec>` request is currently queued, without consuming
+    /// it. Used to detect a newer request that arrived while an earlier one was
+    /// still being applied, so a now-stale built client is discarded instead of
+    /// installed (see `Agent::apply_model_request`).
+    pub fn has_model_request(&self) -> bool {
+        self.inner.model.lock().unwrap().is_some()
+    }
+
     /// Advance to the next mode in the Shift+Tab cycle; returns it.
     pub fn cycle_mode(&self) -> crate::mode::AgentMode {
         let mut mode = self.inner.mode.lock().unwrap();
@@ -343,6 +375,21 @@ impl TurnControl {
     pub async fn cancelled(&self) {
         let mut rx = self.inner.cancel_tx.subscribe();
         let _ = rx.wait_for(|cancelled| *cancelled).await;
+    }
+
+    /// Resolves once a newer `/model` request is queued after the returned
+    /// generation is captured. Used to cancel an in-flight build of a spec that
+    /// a newer request has just superseded. The caller passes the `watch`
+    /// generation snapshot taken *before* it started building, so a request that
+    /// landed during the build is observed immediately.
+    pub async fn model_request_changed(&self, mut rx: tokio::sync::watch::Receiver<u64>) {
+        let _ = rx.changed().await;
+    }
+
+    /// Subscribe to `/model` request notifications; the returned receiver's
+    /// current value is the generation at subscribe time.
+    pub fn model_request_rx(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.model_tx.subscribe()
     }
 
     fn start_turn(&self) {
@@ -392,6 +439,23 @@ pub enum AgentEvent<'a> {
     /// The task plan changed (or is being replayed).
     Plan {
         plan: &'a Plan,
+    },
+    /// The agent switched models mid-turn (a `/model <spec>` typed during the
+    /// turn, applied at the next model call). Both specs are in canonical
+    /// `provider/model` form, ready for the UI to record in the recents MRU;
+    /// `previous` is the model switched away from.
+    ModelSwitched {
+        spec: &'a str,
+        previous: &'a str,
+    },
+    /// A `/model <spec>` typed mid-turn could not be applied: the spec did not
+    /// build (unknown provider, missing model/endpoint, or a failing api-key
+    /// command). The turn keeps running on the current model; the request is
+    /// dropped rather than re-queued, so it cannot silently leak into later
+    /// turns. The UI prints `error` as a note.
+    ModelSwitchFailed {
+        spec: &'a str,
+        error: &'a str,
     },
 }
 
@@ -459,7 +523,7 @@ struct CompactionRecord {
 }
 
 /// Receives events with the active session ID.
-pub type EventSink = Box<dyn Fn(Option<&str>, &AgentEvent) + Send + Sync>;
+pub type EventSink = std::sync::Arc<dyn Fn(Option<&str>, &AgentEvent) + Send + Sync>;
 
 /// Result of the `SessionStart`/`UserPromptSubmit` hooks for a fresh prompt.
 enum ClaudePromptHook {
@@ -513,12 +577,23 @@ pub struct Agent {
     calibration: Option<(usize, usize)>,
     /// Window learned from a context-overflow error (until the model changes).
     learned_window: Option<usize>,
-    /// Window reported by the endpoint (see `detect_context_window`).
-    detected_window: Option<DetectedWindow>,
+    /// Window reported by the endpoint (see `detect_context_window`). Shared
+    /// and locked because a mid-turn `/model` switch probes in a background
+    /// task (see `detect_context_window_for_switch`), which publishes here
+    /// when it lands.
+    detected_window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
+    /// Monotonic switch counter, bumped on every model change (see
+    /// `detect_context_window_for_switch`). A background window probe captures
+    /// the generation it was spawned under and discards its result if a later
+    /// switch has since bumped it, so a slow probe for a superseded model can
+    /// never overwrite the current model's detected window.
+    detect_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Thinking levels reported by the endpoint (see `detect_context_window`).
-    reported_thinking: Option<crate::thinking::Reported>,
+    /// Shared for the same reason as `detected_window`.
+    reported_thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
     /// Vision capability reported by the endpoint (see `detect_context_window`).
-    reported_vision: Option<crate::vision::Vision>,
+    /// Shared for the same reason as `detected_window`.
+    reported_vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -628,6 +703,37 @@ const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     providers::openai::MAX_PROBE_CHAIN as u64 * providers::openai::PROBE_TIMEOUT.as_secs() + 2,
 );
 
+/// The shared slots a background capability probe publishes into (see
+/// `Agent::detect_context_window_for_switch`).
+struct DetectSlots {
+    window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
+    thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
+    vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
+}
+
+/// What a background capability probe found.
+struct Detected {
+    window: Option<DetectedWindow>,
+    thinking: Option<crate::thinking::Reported>,
+    vision: Option<crate::vision::Vision>,
+}
+
+#[cfg(test)]
+impl Detected {
+    /// A probe that reported only a window.
+    fn window(window: DetectedWindow) -> Self {
+        Detected { window: Some(window), thinking: None, vision: None }
+    }
+}
+
+#[cfg(test)]
+impl DetectSlots {
+    /// Slots around an existing window slot, with fresh thinking/vision slots.
+    fn window(window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>) -> Self {
+        DetectSlots { window, thinking: Default::default(), vision: Default::default() }
+    }
+}
+
 impl Agent {
     pub fn new(client: Box<dyn LLMClient>, config: Config) -> Self {
         let conversation = vec![Message { timestamp: Some(session::now()), ..Message::system(&config.system_prompt) }];
@@ -659,9 +765,10 @@ impl Agent {
             stats: SharedStats::default(),
             calibration: None,
             learned_window: None,
-            detected_window: None,
-            reported_thinking: None,
-            reported_vision: None,
+            detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reported_vision: std::sync::Arc::new(std::sync::Mutex::new(None)),
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -792,8 +899,20 @@ impl Agent {
     }
 
     fn client_for(config: &Config, spec: &str) -> Result<Box<dyn LLMClient>> {
+        Self::client_for_cancellable(config, spec, None)
+    }
+
+    /// Like [`Agent::client_for`], but a running `api_key_command` honours
+    /// `cancel`: the child process is killed and the build fails fast when the
+    /// flag flips, so a mid-turn `/model` switch whose key command hangs cannot
+    /// wedge the turn.
+    fn client_for_cancellable(
+        config: &Config,
+        spec: &str,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Result<Box<dyn LLMClient>> {
         let (providers, default_provider) = config.effective_providers();
-        providers::build_client(spec, &providers, &default_provider)
+        providers::build_client_cancellable(spec, &providers, &default_provider, cancel)
     }
 
     pub fn tools(&self) -> &ToolRegistry {
@@ -1058,7 +1177,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_thinking.as_ref(),
+            self.reported_thinking.lock().unwrap().as_ref(),
         );
         // A fixed budget must stay below the output cap. Always check, even
         // when an earlier adjustment already warned: a level fitted down (e.g.
@@ -1105,11 +1224,18 @@ impl Agent {
     /// (An unknown provider prefix is not such a failure — `parse_model_spec`
     /// falls back to the default provider — so it does not trigger this path.)
     pub async fn set_model(&mut self, spec: &str) -> Result<()> {
-        let previous = std::mem::replace(&mut self.config.model, spec.to_string());
-        if let Err(e) = self.refresh_client().await {
-            self.config.model = previous;
-            return Err(e);
-        }
+        // A direct switch supersedes any still-unapplied mid-turn `/model`
+        // request: one queued during the final in-flight call of a prior turn
+        // outlives that turn, and without clearing it the first call of the
+        // next turn would consume the stale request and silently switch away
+        // from the model this direct switch just selected. Consume it *before*
+        // the fallible build below: if the new client fails to build we return
+        // at the `?`, and a request left queued here would then fire on the
+        // next turn even though the user's latest intent was this failed spec.
+        self.control.take_model_request();
+        let client = Self::build_client_off_runtime(&self.config, spec).await?;
+        self.config.model = spec.to_string();
+        self.install_client(client).await;
         Ok(())
     }
 
@@ -1120,23 +1246,205 @@ impl Agent {
     /// endpoint, key, or model the current spec resolves to) and on model
     /// switches.
     pub async fn refresh_client(&mut self) -> Result<()> {
-        self.client = Self::client_for(&self.config, &self.config.model)?;
-        self.calibration = None;
-        self.learned_window = None;
-        self.detected_window = None;
-        self.reported_thinking = None;
-        self.compact_floor = 0;
-        self.detect_context_window().await;
+        let spec = self.config.model.clone();
+        let client = Self::build_client_off_runtime(&self.config, &spec).await?;
+        self.install_client(client).await;
         Ok(())
     }
 
+    /// Build a client for `spec` on the blocking pool.
+    ///
+    /// `client_for` → `build_client` → `resolve` can run an `api_key_command`
+    /// as a child process. `set_model`/`refresh_client` are awaited from the
+    /// async TUI/ACP command loops (between turns), so running that inline
+    /// freezes the runtime for the command's full duration, stalling the
+    /// UI/event loop. Offloading keeps the runtime responsive while the key
+    /// command runs — the same pattern `apply_model_request` uses for the
+    /// mid-turn switch.
+    async fn build_client_off_runtime(config: &Config, spec: &str) -> Result<Box<dyn LLMClient>> {
+        let config_for_build = config.clone();
+        let spec_for_build = spec.to_string();
+        tokio::task::spawn_blocking(move || Self::client_for(&config_for_build, &spec_for_build))
+            .await
+            .map_err(|join| anyhow::anyhow!("building client for {spec:?} panicked: {join}"))?
+    }
+
+    /// Install a freshly built client and reset the client-tied state, then
+    /// detect the new model's window / thinking levels / vision (blocking).
+    async fn install_client(&mut self, client: Box<dyn LLMClient>) {
+        self.client = client;
+        self.calibration = None;
+        self.learned_window = None;
+        *self.detected_window.lock().unwrap() = None;
+        *self.reported_thinking.lock().unwrap() = None;
+        self.compact_floor = 0;
+        self.detect_context_window().await;
+    }
+
+    /// Apply a `/model <spec>` typed mid-turn (queued on the `TurnControl`),
+    /// so the switch takes effect at the next model call. Switching in the
+    /// middle of a tool loop is fine: the conversation history is
+    /// provider-neutral. The spec is validated at queue time (see
+    /// `providers::validate_spec`), so by the time it reaches here it almost
+    /// always builds; if the client still fails to build (e.g. an api-key
+    /// command that fails only now), the request is **dropped** — not
+    /// re-queued — and the error is surfaced via `AgentEvent::ModelSwitchFailed`
+    /// so the user is told and the dead request cannot leak into later turns.
+    /// A successful switch emits `AgentEvent::ModelSwitched` so the UI can
+    /// record it in the recents MRU while the turn holds the agent.
+    ///
+    /// Two races are handled: (1) if a newer `/model` request is queued while
+    /// an earlier one is still building, the stale client is discarded and the
+    /// newest spec is built instead, so the next model call never lands on a
+    /// superseded spec; (2) if the turn is cancelled while a key command is
+    /// building (or hanging), the build is killed and the switch is abandoned
+    /// rather than blocking the turn.
+    ///
+    /// Returns `true` when the turn was cancelled (the switch was abandoned),
+    /// so the caller must **stop before issuing the next model call**. Just
+    /// abandoning the switch is not enough: the caller otherwise falls through
+    /// into `compact_with` or the chat `select!`, where a cancellation that is
+    /// already pending still races an immediately-ready model future — so one
+    /// call could still land on the old model after the user cancelled.
+    #[must_use]
+    async fn apply_model_request(&mut self) -> bool {
+        // Loop so that a newer `/model` request arriving while an earlier one
+        // is being built is honoured: each pass builds exactly one spec, then
+        // re-checks the slot and rebuilds the newest if it was superseded.
+        loop {
+            // Don't start (or keep) switching for a turn the user cancelled;
+            // the pending request stays queued for the next turn's first call.
+            // Signal the caller to stop before it reaches a model call.
+            if self.control.is_cancelled() {
+                return true;
+            }
+            let Some(spec) = self.control.take_model_request() else { return false };
+            // Record the model actually in use (resolved by the live client)
+            // before switching, so a provider-default edit made in the same
+            // session cannot rewrite which model we record leaving. Both specs
+            // go out canonical, so the recents MRU never re-parses them.
+            let (user, default_provider) = self.config.effective_providers();
+            let all = providers::effective_providers(&user);
+            let previous = crate::recents::canonical(
+                &format!("{}/{}", self.client.provider_name(), self.client.model_name()),
+                &all,
+                &default_provider,
+            );
+            // `client_for` → `build_client` → `resolve` can run an
+            // `api_key_command` as a child process. `apply_model_request` is
+            // awaited from the async `run_turn` loop, so running that inline
+            // freezes the worker for the command's full duration (or
+            // indefinitely if it hangs), stalling streaming and cancel/other
+            // input. Offload the blocking build to the blocking thread pool and
+            // await it, so the runtime stays responsive while the key command
+            // runs. The build honours a cancel flag: on cancel it kills the
+            // key-command child and fails fast, and we race the await against
+            // `control.cancelled()` below so the turn returns promptly instead
+            // of blocking on a hung command.
+            //
+            // The flag the build polls must be a **build-local** token, not the
+            // turn-wide cancel flag. On cancel we drop `handle` below, but a
+            // dropped `spawn_blocking` task keeps running — so the key-command
+            // worker outlives this call. If it polled the turn-wide flag,
+            // `run_turn` could return and the next turn's `start_turn()` would
+            // reset that flag back to `false` before the worker's 50 ms poll
+            // observed the cancel, letting the supposedly-killed helper run on
+            // until its 120 s timeout. A token private to this build can never
+            // be reset by the next turn, so once we set it the worker reliably
+            // kills its child.
+            let config_for_build = self.config.clone();
+            let spec_for_build = spec.clone();
+            let build_cancel = Arc::new(AtomicBool::new(false));
+            let cancel_for_build = build_cancel.clone();
+            let control = self.control.clone();
+            // Subscribe to `/model` request notifications BEFORE spawning the
+            // build, so a newer request that lands while this build runs is
+            // observed by the `select!` below (the receiver's generation is
+            // captured now; `changed()` fires on the next `set_model`).
+            let model_rx = self.control.model_request_rx();
+            let handle = tokio::task::spawn_blocking(move || {
+                Self::client_for_cancellable(&config_for_build, &spec_for_build, Some(&cancel_for_build))
+            });
+            let built = tokio::select! {
+                joined = handle => match joined {
+                    Ok(result) => result,
+                    Err(join) => Err(anyhow::anyhow!("building client for {spec:?} panicked: {join}")),
+                },
+                _ = control.cancelled() => {
+                    // Cancelled mid-build: set the build-local token so the
+                    // still-running blocking build observes it, kills its
+                    // key-command child, and unblocks — even though we drop its
+                    // handle here and the next turn will reset the turn-wide
+                    // cancel flag. Then stop waiting and abort the switch rather
+                    // than install a client for a turn the user just cancelled.
+                    // The request has been consumed, so it will not fire into
+                    // the next turn. Signal the caller to stop before its next
+                    // model call.
+                    build_cancel.store(true, Ordering::SeqCst);
+                    return true;
+                }
+                _ = control.model_request_changed(model_rx) => {
+                    // A newer `/model` request superseded this spec while it was
+                    // still building. Cancel the stale build (its key-command
+                    // child is killed via the build-local token) and loop at once
+                    // to build the newest spec, instead of waiting out a slow or
+                    // hung build for a spec that is already outdated.
+                    build_cancel.store(true, Ordering::SeqCst);
+                    continue;
+                }
+            };
+            // A newer `/model` request can arrive while the build above is
+            // awaited. The spec we just built is then stale: installing it would
+            // point the next model call at the superseded spec even though the
+            // newer command was acked for that call. Discard this client
+            // (success or failure) and loop to build the newest queued spec.
+            if self.control.has_model_request() {
+                continue;
+            }
+            // Cancellation can also land as the build finishes (the `select!`
+            // may pick the completed build over `cancelled()`); don't install a
+            // client for a turn the user just cancelled. Signal the caller to
+            // stop before its next model call.
+            if self.control.is_cancelled() {
+                return true;
+            }
+            match built {
+                Ok(client) => {
+                    self.client = client;
+                    self.config.model = spec.clone();
+                    self.calibration = None;
+                    self.learned_window = None;
+                    *self.detected_window.lock().unwrap() = None;
+                    self.compact_floor = 0;
+                    self.detect_context_window_for_switch();
+                    let spec = crate::recents::canonical(&spec, &all, &default_provider);
+                    self.emit(AgentEvent::ModelSwitched { spec: &spec, previous: &previous });
+                }
+                Err(e) => {
+                    // The spec passed queue-time validation but the client still
+                    // failed to build. Drop the request (do not re-queue it,
+                    // which would retry the same failure every step and leak
+                    // into the next turn) and tell the user; the turn stays on
+                    // the current model.
+                    let error = e.to_string();
+                    self.emit(AgentEvent::ModelSwitchFailed { spec: &spec, error: &error });
+                }
+            }
+            return false;
+        }
+    }
+
     /// Ask the endpoint for the model's context window (unless config sets
-    /// it) and the thinking levels it supports. Both are probed together so a
-    /// server whose window and thinking detections read the same response
+    /// it) and the thinking levels and vision capability it supports. All are
+    /// probed together so a server whose detections read the same response
     /// (OpenAI-compatible `/models`, llama.cpp `/props`, Ollama `/api/show`)
-    /// is not queried twice serially.
+    /// is not queried several times serially.
     pub async fn detect_context_window(&mut self) {
-        self.detected_window = None;
+        // Bump the generation so any in-flight background probe from an earlier
+        // mid-turn switch (see `detect_context_window_for_switch`) is discarded
+        // and cannot overwrite what this blocking detect establishes.
+        self.detect_generation.fetch_add(1, Ordering::SeqCst);
+        *self.detected_window.lock().unwrap() = None;
         if self.configured_window().is_some() {
             // The configured window wins, so the window half of the combined
             // probe is discarded — running it anyway can only hurt: a
@@ -1150,15 +1458,15 @@ impl Agent {
         }
         let probe = self.client.detect_capabilities();
         let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
-        self.detected_window = window;
-        self.reported_thinking = thinking;
+        *self.detected_window.lock().unwrap() = window;
+        *self.reported_thinking.lock().unwrap() = thinking;
         // Vision is derived from the same probe responses `detect_capabilities`
         // already fetched, so it costs no extra round trip. Storing the report
         // is always the right move: a `vision = false` override discards it at
         // resolution time, but `true`/none keep it (`true` forces the capability
         // on yet preserves the endpoint's reported limits), so keeping it here
         // lets `resolve` apply those limits on the default path too.
-        self.reported_vision = vision;
+        *self.reported_vision.lock().unwrap() = vision;
         self.refresh_stats();
     }
 
@@ -1178,8 +1486,8 @@ impl Agent {
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_and_vision();
         let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
-        self.reported_thinking = thinking;
-        self.reported_vision = vision;
+        *self.reported_thinking.lock().unwrap() = thinking;
+        *self.reported_vision.lock().unwrap() = vision;
         self.refresh_stats();
     }
 
@@ -1206,7 +1514,7 @@ impl Agent {
             self.client.kind(),
             &provider,
             self.model_name(),
-            self.reported_vision.as_ref(),
+            self.reported_vision.lock().unwrap().as_ref(),
         )
     }
 
@@ -1317,6 +1625,141 @@ impl Agent {
         Ok(Some((text, vec![attachment])))
     }
 
+    /// Window (and thinking-level / vision) detection after a mid-turn
+    /// `/model` switch (see `apply_model_request`). Unlike [`Agent::detect_context_window`] this
+    /// never blocks the agent loop on the probe: when the new spec carries a
+    /// configured window (`context_window` in config or on the provider entry)
+    /// that value is authoritative, so the HTTP probe is skipped outright;
+    /// otherwise the probe runs in the background and the stats refresh it
+    /// triggers lands whenever the endpoint answers. Either way the new
+    /// model's fallback stats are published immediately so the status line and
+    /// `/context` reflect the switch at once rather than showing the previous
+    /// model's provider/window until (or unless) the probe lands. The next
+    /// model call goes out immediately, with the model-name fallback window
+    /// until the probe (if any) reports.
+    fn detect_context_window_for_switch(&mut self) {
+        // Bump the generation *before* clearing the slot so any in-flight probe
+        // for the previous model is already invalidated: its `finish_detect`
+        // re-reads the generation under the slot lock and discards a stale
+        // result rather than clobbering this model's window.
+        let generation = self.detect_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.detected_window.lock().unwrap() = None;
+        // The previous model's reports must not leak onto the new one; until
+        // the background probe lands, the built-in assumptions apply.
+        *self.reported_thinking.lock().unwrap() = None;
+        *self.reported_vision.lock().unwrap() = None;
+        // Publish the new model's fallback stats (provider/model name + the
+        // model-name or default window) right away, so a slow or `None` probe
+        // cannot leave the UI on the previous model's window.
+        self.refresh_stats();
+        // A configured window is authoritative, so only the thinking levels
+        // and vision are probed then (see `detect_thinking`).
+        let configured = self.configured_window().is_some();
+        let probe = self.client.clone_boxed();
+        let slots = DetectSlots {
+            window: self.detected_window.clone(),
+            thinking: self.reported_thinking.clone(),
+            vision: self.reported_vision.clone(),
+        };
+        let sink = self.event_sink.clone();
+        let stats = self.stats.clone();
+        let current = self.detect_generation.clone();
+        tokio::spawn(async move {
+            let (detected, thinking, vision) = if configured {
+                let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe.detect_thinking_and_vision())
+                    .await
+                    .ok()
+                    .unwrap_or_default();
+                (None, thinking, vision)
+            } else {
+                tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default()
+            };
+            Self::finish_detect(
+                Detected { window: detected, thinking, vision },
+                generation,
+                current,
+                slots,
+                sink,
+                stats,
+            );
+        });
+    }
+
+    /// Publish a finished background probe's result: store the window (and
+    /// the thinking-level / vision reports) and
+    /// refresh the stats, emitting `AgentEvent::Context` through the sink so
+    /// the UI picks the window up whenever the probe lands. A failed or timed
+    /// out probe publishes nothing — the model-name fallback window stays.
+    /// A result whose `generation` no longer matches `current` is discarded:
+    /// a later model switch has superseded this probe, so its window must not
+    /// overwrite the newer model's. The stats update is also conservative: a
+    /// fresher source (a configured window a later switch picked) is never
+    /// overwritten. A learned window (from a context overflow) is normally
+    /// fresher too, but a probe reporting a *stricter* (smaller) window is
+    /// allowed to replace it: the slot already stores the detected window, so
+    /// `context_window_with_source()` would otherwise start using the smaller
+    /// value while `/context` and the status line kept reporting the larger
+    /// learned one — leaving the two permanently inconsistent.
+    fn finish_detect(
+        detected: Detected,
+        generation: u64,
+        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        slots: DetectSlots,
+        sink: Option<EventSink>,
+        stats: SharedStats,
+    ) {
+        let Detected { window: detected, thinking, vision } = detected;
+        {
+            // Check the generation under the window slot lock so a switch
+            // racing this completion either bumps it before we read (we
+            // discard) or clears the slots after we write (it then refreshes to
+            // its own fallback). The window lock is held while the thinking
+            // and vision reports are written too, so all three land together.
+            let mut slot = slots.window.lock().unwrap();
+            if current.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            *slots.thinking.lock().unwrap() = thinking;
+            *slots.vision.lock().unwrap() = vision;
+            if let Some(detected) = &detected {
+                *slot = Some(detected.clone());
+            }
+        }
+        let Some(detected) = detected else {
+            if let Some(sink) = sink {
+                sink(None, &AgentEvent::Context);
+            }
+            return;
+        };
+        let (window, source) = (detected.tokens, format!("reported by the endpoint ({})", detected.source));
+        {
+            let mut stats = stats.lock().unwrap();
+            // Re-check: a switch may have superseded us between the two locks.
+            if current.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if stats.window_source.starts_with("reported by the endpoint")
+                || stats.window_source == "known for the model name"
+                || stats.window_source == "default"
+                // A learned window is fresher, but a probe that reports a
+                // *stricter* (smaller-or-equal) limit must replace it: the slot
+                // already holds the detected window, and
+                // `context_window_with_source()` prefers the detected value
+                // whenever `learned < detected` is false — equality included.
+                // Refusing on equality would leave `/context` and the status
+                // line reporting "learned" while the agent internally uses the
+                // endpoint source, so allow equality here too.
+                || (stats.window_source == "learned from a context-overflow error" && window <= stats.window)
+            {
+                stats.window = window;
+                stats.window_source = source;
+            }
+        }
+        if let Some(sink) = sink {
+            sink(None, &AgentEvent::Context);
+        }
+    }
+
     /// `context_window` from config or the provider entry.
     fn configured_window(&self) -> Option<(usize, &'static str)> {
         let (user, default_provider) = self.config.effective_providers();
@@ -1351,7 +1794,7 @@ impl Agent {
     /// so the output reservation must count against it again.
     fn context_cap(&self) -> ContextCap {
         if self.configured_window().is_none()
-            && let Some(detected) = &self.detected_window
+            && let Some(detected) = self.detected_window.lock().unwrap().as_ref()
             && self.learned_window.is_none_or(|learned| learned >= detected.tokens)
         {
             return detected.cap;
@@ -1374,7 +1817,7 @@ impl Agent {
     /// is not sized against the prompt-only cap and pushed past the learned
     /// total again.
     fn combined_window(&self) -> Option<usize> {
-        let advertised = self.detected_window.as_ref().and_then(|d| d.total_tokens);
+        let advertised = self.detected_window.lock().unwrap().as_ref().and_then(|d| d.total_tokens);
         match (advertised, self.learned_window) {
             (Some(advertised), Some(learned)) => Some(advertised.min(learned)),
             (Some(advertised), None) => Some(advertised),
@@ -1389,7 +1832,7 @@ impl Agent {
         let (_, model) = providers::context_window(&self.config.model, &user, &default_provider);
         let (window, source) = if let Some((window, source)) = self.configured_window() {
             (window, source.to_string())
-        } else if let Some(detected) = &self.detected_window {
+        } else if let Some(detected) = &*self.detected_window.lock().unwrap() {
             (detected.tokens, format!("reported by the endpoint ({})", detected.source))
         } else if let Some(window) =
             context::window_for_model(&model).or_else(|| context::window_for_model(self.client.model_name()))
@@ -2485,6 +2928,15 @@ impl Agent {
                 break;
             }
             self.absorb_steers()?;
+            // A `/model <spec>` typed mid-turn applies here, so the request
+            // built below goes to the new model. If the turn was cancelled
+            // while the switch was building, stop before the threshold
+            // compaction or chat call below — otherwise one call could still
+            // land on the old model after the user cancelled.
+            if self.apply_model_request().await {
+                cancelled = true;
+                break;
+            }
 
             // Refresh the mode note on the system prompt before rebuilding the
             // tools, so a mid-turn Shift+Tab keeps the prompt and the available
@@ -2507,6 +2959,10 @@ impl Agent {
             self.hooks.trigger(&ctx);
 
             if self.over_threshold() {
+                // The threshold compaction is itself a model call; `compact_logged`
+                // applies any `/model` queued since the top of the iteration
+                // before summarizing, so the summary never goes out on the model
+                // the user just switched away from.
                 self.compact_logged(CompactTrigger::Threshold, self.config.compaction_mode, None).await?;
                 if self.control.is_cancelled() {
                     cancelled = true;
@@ -2516,8 +2972,10 @@ impl Agent {
 
             let mut overflow_retried = false;
             // Reset per attempt, so the recorded duration is the request that
-            // produced the response, not earlier overflowed attempts.
-            let mut request_started;
+            // produced the response, not earlier overflowed attempts. Seeded so
+            // an early cancel break (before the first attempt sets it) leaves it
+            // defined; that path discards the response and never reads it.
+            let mut request_started = Instant::now();
             // The values of the attempt that produced the response, carried
             // out of the retry loop for the trajectory. Re-resolved per
             // attempt (below), so these are what the successful request
@@ -2526,6 +2984,15 @@ impl Agent {
             let mut sent_thinking = None;
             let response = loop {
                 self.set_activity(Activity::Thinking);
+                // Every attempt is a model call (and the overflow branch below
+                // compacts with one more), so a `/model` queued while the
+                // previous attempt or compaction was in flight applies here,
+                // before the request is built — never after it. If the turn was
+                // cancelled while the switch was building, stop before the chat
+                // call below rather than issuing it on the old model.
+                if self.apply_model_request().await {
+                    break None;
+                }
                 // Re-resolved every retry iteration, not just once before the
                 // loop: an overflow retry compacts (below), which shrinks the
                 // estimated context and so grows `request_max_tokens()`, and
@@ -2652,8 +3119,13 @@ impl Agent {
                 refresh.tick().await; // discard the immediate first tick
                 let result = loop {
                     tokio::select! {
-                        response = &mut call => break Some(response),
+                        // Prefer cancellation: a cancel that is already pending
+                        // when this request is in flight must win over an
+                        // immediately-ready model future, so a cancelled turn
+                        // never processes one more call on the (old) model.
+                        biased;
                         () = control.cancelled() => break None,
+                        response = &mut call => break Some(response),
                         _ = refresh.tick(), if meter_live => {
                             let rate = rate_meter.lock().unwrap().sample(Instant::now());
                             if let Some(rate) = rate {
@@ -2704,7 +3176,17 @@ impl Agent {
                         let estimate = self.estimate_context_tokens().0;
                         self.learned_window =
                             Some(context::limit_from_error(&message).unwrap_or(estimate * 9 / 10).max(1_000));
+                        // Publish the just-learned window to the shared stats
+                        // before the awaited compaction below: mid-turn
+                        // `/context` renders exclusively from `SharedStats`, so
+                        // without this refresh it keeps showing the old window
+                        // and source for the whole client build and compaction.
+                        self.refresh_stats();
                         eprintln!("[agent] context overflow ({message}); compacting and retrying");
+                        // The overflow compaction is a model call too;
+                        // `compact_logged` applies a `/model` queued while the
+                        // overflowing request was in flight before the summary
+                        // goes out on the old model.
                         let compacted =
                             self.compact_logged(CompactTrigger::Overflow, self.config.compaction_mode, None).await?;
                         if compacted.is_none() || self.control.is_cancelled() {
@@ -3228,6 +3710,20 @@ impl Agent {
         instructions: Option<&str>,
     ) -> Result<Option<CompactReport>> {
         self.set_activity(Activity::Compacting);
+        // Compaction summarizes via a model call (`compact_with`), so a
+        // `/model` queued but not yet applied — e.g. one typed during a turn's
+        // final in-flight call, which `run_turn` never reaches a hook to apply,
+        // followed by a manual `/compact` — must take effect before that call.
+        // Applying here is the single choke point for *every* trigger (manual,
+        // threshold, overflow), so no compaction path can summarize on the
+        // model the user just switched away from. Idempotent: a no-op when the
+        // caller already drained the slot before calling in. If the turn was
+        // cancelled while the switch was building, stop before the summary call
+        // rather than issuing it on the old model.
+        if self.apply_model_request().await {
+            self.refresh_stats();
+            return Ok(None);
+        }
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
@@ -3387,8 +3883,13 @@ impl Agent {
         // whole response for providers configured with `stream = false`).
         let discard = |_: StreamEvent<'_>| {};
         let result = tokio::select! {
-            result = self.client.chat_stream(&request, &discard) => result,
+            // Prefer cancellation: a cancel already pending when the summary
+            // request is issued must win over an immediately-ready model
+            // future, so a cancelled compaction never lands a call on the
+            // model the user just switched away from.
+            biased;
             () = control.cancelled() => return Ok(None),
+            result = self.client.chat_stream(&request, &discard) => result,
         };
         let mut truncated = false;
         let (summary, fallback) = match result {
@@ -3602,6 +4103,7 @@ fn sanitize(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::llm::{LLMResponse, ToolCall};
+    use crate::recents;
     use crate::tools::ToolDefinition;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -3646,7 +4148,7 @@ mod tests {
             Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "gpt-4o-mini")), Config::default());
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if let AgentEvent::UserMessage { text } = event {
                 seen_sink.lock().unwrap().push(text.to_string());
             }
@@ -3678,7 +4180,7 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if let AgentEvent::UserMessage { text } = event {
                 seen_sink.lock().unwrap().push(text.to_string());
             }
@@ -3736,7 +4238,7 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if let AgentEvent::UserMessage { text } = event {
                 seen_sink.lock().unwrap().push(text.to_string());
             }
@@ -3878,6 +4380,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Scripted {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone the scripted client")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             self.seen.lock().unwrap().push(request.messages.to_vec());
             Ok(self.responses.lock().unwrap().remove(0))
@@ -4208,6 +4713,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Kindless {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
             unreachable!("no chat in this test")
         }
@@ -5106,6 +5614,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Budgeted {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             let summary = request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT);
             self.seen.lock().unwrap().push((request.max_tokens, summary));
@@ -5172,6 +5683,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Claude {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             self.seen.lock().unwrap().push((request.temperature, request.thinking.clone()));
             Ok(text("ok"))
@@ -5195,6 +5709,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for ClaudeWithTool {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             self.seen.lock().unwrap().push((request.temperature, request.thinking.clone()));
             Ok(self.responses.lock().unwrap().remove(0))
@@ -5292,7 +5809,7 @@ mod tests {
         let stats = agent.context_stats();
         let shown = Arc::new(Mutex::new(Vec::new()));
         let (shown_sink, shown_stats) = (shown.clone(), stats.clone());
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if matches!(event, AgentEvent::Context) {
                 shown_sink.lock().unwrap().push(shown_stats.lock().unwrap().thinking.clone());
             }
@@ -5537,6 +6054,9 @@ mod tests {
         struct Fable;
         #[async_trait]
         impl LLMClient for Fable {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!("no chat in this test")
             }
@@ -5580,6 +6100,9 @@ mod tests {
         struct OldClaude;
         #[async_trait]
         impl LLMClient for OldClaude {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!("no chat in this test")
             }
@@ -5605,6 +6128,9 @@ mod tests {
         struct OldClaude;
         #[async_trait]
         impl LLMClient for OldClaude {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!("no chat in this test")
             }
@@ -5658,6 +6184,9 @@ mod tests {
         struct OldClaude;
         #[async_trait]
         impl LLMClient for OldClaude {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, _request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!("no chat in this test")
             }
@@ -5710,7 +6239,7 @@ mod tests {
         let window = 24_000;
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 40_000, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5738,7 +6267,7 @@ mod tests {
         // trigger, yet close enough that the reservation caps `max_tokens`.
         let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], detected, 36_000, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: detected,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5771,7 +6300,7 @@ mod tests {
         // combined window, so `max_tokens` is capped to the combined room.
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5802,7 +6331,7 @@ mod tests {
         let combined = 102_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5837,7 +6366,7 @@ mod tests {
         let prompt_window = 100_000;
         let (mut agent, seen) = budgeted_agent(vec![text("SUMMARY"), text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5872,7 +6401,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -5907,7 +6436,7 @@ mod tests {
         let learned = 110_000;
         let (mut agent, seen) = budgeted_agent(vec![text("done")], prompt_window, 0, dir.path());
         agent.config_mut().context_window = None;
-        agent.detected_window = Some(DetectedWindow {
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
             tokens: prompt_window,
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
@@ -6058,7 +6587,7 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_sink = seen.clone();
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if let AgentEvent::UserMessage { text } = event {
                 seen_sink.lock().unwrap().push(text.to_string());
             }
@@ -6080,6 +6609,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for StreamOnlySummary {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             if request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT) {
                 anyhow::bail!("error sending request: idle connection dropped")
@@ -6129,6 +6661,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Fallible {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone the fallible client")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             self.seen.lock().unwrap().push(request.messages.to_vec());
             self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
@@ -6197,6 +6732,9 @@ mod tests {
         }
         #[async_trait]
         impl LLMClient for ToolSpy {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("tests never clone the tool-spy client")
+            }
             async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 self.tools_seen.lock().unwrap().push(request.tools.iter().map(|t| t.name.clone()).collect());
                 self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
@@ -6271,6 +6809,9 @@ mod tests {
         }
         #[async_trait]
         impl LLMClient for ThinkingSpy {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 self.seen.lock().unwrap().push((request.thinking.clone(), request.max_tokens));
                 self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
@@ -6350,6 +6891,9 @@ mod tests {
         struct Reports;
         #[async_trait]
         impl LLMClient for Reports {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                Box::new(Reports)
+            }
             async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!()
             }
@@ -6370,7 +6914,7 @@ mod tests {
         agent.config_mut().context_window = Some(32_000);
         agent.detect_context_window().await;
         assert_eq!(agent.context_window_with_source(), (32_000, "context_window in config".into()));
-        assert!(agent.detected_window.is_none(), "no probe when config sets the window");
+        assert!(agent.detected_window.lock().unwrap().is_none(), "no probe when config sets the window");
     }
 
     #[tokio::test]
@@ -6386,6 +6930,9 @@ mod tests {
         }
         #[async_trait]
         impl LLMClient for Probes {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
             async fn chat(&self, _: &ChatRequest<'_>) -> Result<LLMResponse> {
                 unreachable!()
             }
@@ -6417,11 +6964,11 @@ mod tests {
         agent.detect_context_window().await;
         assert_eq!(*calls.lock().unwrap(), ["thinking"], "the discarded window half is not probed");
         assert_eq!(
-            agent.reported_thinking.as_ref().map(|r| r.levels.as_slice()),
+            agent.reported_thinking.lock().unwrap().as_ref().map(|r| r.levels.as_slice()),
             Some(["off".to_string(), "on".to_string()].as_slice()),
             "the thinking levels are still probed"
         );
-        assert!(agent.detected_window.is_none(), "the configured window stands");
+        assert!(agent.detected_window.lock().unwrap().is_none(), "the configured window stands");
     }
 
     #[test]
@@ -6458,7 +7005,7 @@ mod tests {
         // compaction early); the estimate must instead recompute the whole
         // conversation to mirror the real newest-N wire plan.
         let (mut agent, _) = agent(vec![], std::path::Path::new("/nonexistent"));
-        agent.reported_vision = Some(crate::vision::Vision {
+        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -6503,7 +7050,7 @@ mod tests {
         // than `KEEP_RECENT_TOKENS` intends.
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _) = agent(vec![text("SUMMARY"), text("done")], dir.path());
-        agent.reported_vision = Some(crate::vision::Vision {
+        *agent.reported_vision.lock().unwrap() = Some(crate::vision::Vision {
             max_images: 1,
             max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES,
             media_types: Vec::new(),
@@ -6565,7 +7112,7 @@ mod tests {
         agent.set_streaming(true);
         let names = Arc::new(Mutex::new(Vec::new()));
         let sink = names.clone();
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             let name = match event {
                 AgentEvent::ThinkingDelta { text } => format!("thinking-delta:{text}"),
                 AgentEvent::TextDelta { text } => format!("text-delta:{text}"),
@@ -6606,7 +7153,7 @@ mod tests {
         let stats = agent.context_stats();
         let observed = Arc::new(Mutex::new(None::<f64>));
         let (obs, st) = (observed.clone(), stats.clone());
-        agent.set_event_sink(Box::new(move |_, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
             if matches!(event, AgentEvent::Context)
                 && let Some(rate) = st.lock().unwrap().tokens_per_sec
             {
@@ -7080,7 +7627,7 @@ mod tests {
     fn record_events(agent: &mut Agent) -> Arc<Mutex<Vec<Value>>> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
-        agent.set_event_sink(Box::new(move |session_id, event| {
+        agent.set_event_sink(std::sync::Arc::new(move |session_id, event| {
             if let Some(mut update) = crate::acp::update_for(event) {
                 update["sessionId"] = json!(session_id);
                 sink.lock().unwrap().push(update);
@@ -7197,6 +7744,9 @@ mod tests {
 
     #[async_trait]
     impl LLMClient for Interfering {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone the interfering client")
+        }
         async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
             let call = {
                 let mut seen = self.seen.lock().unwrap();
@@ -7224,6 +7774,18 @@ mod tests {
         on_call: impl Fn(usize, &TurnControl) + Send + Sync + 'static,
         hang_on: Option<usize>,
     ) -> (Agent, Seen) {
+        interfering_with(responses, dir, on_call, hang_on, |config| config)
+    }
+
+    /// As [`interfering`], but lets a test tweak the agent `Config` (e.g. to
+    /// register a provider that cannot build a client).
+    fn interfering_with(
+        responses: Vec<LLMResponse>,
+        dir: &std::path::Path,
+        on_call: impl Fn(usize, &TurnControl) + Send + Sync + 'static,
+        hang_on: Option<usize>,
+        config: impl FnOnce(Config) -> Config,
+    ) -> (Agent, Seen) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let client = Interfering {
             responses: Mutex::new(responses),
@@ -7233,10 +7795,13 @@ mod tests {
             hang_on,
         };
         let slot = Arc::new(client);
-        let config = Config { session_dir: Some(dir.to_path_buf()), ..Config::default() };
+        let config = config(Config { session_dir: Some(dir.to_path_buf()), ..Config::default() });
         struct Shared(Arc<Interfering>);
         #[async_trait]
         impl LLMClient for Shared {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                Box::new(Shared(self.0.clone()))
+            }
             async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
                 self.0.chat(request).await
             }
@@ -7254,6 +7819,765 @@ mod tests {
             Box::new(|args| Ok(json!(args["text"].as_str().unwrap_or("").to_string()))),
         );
         (agent, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_during_tool_call_applies_at_the_next_model_call() {
+        // `/model <spec>` typed mid-turn (here: while the first response's
+        // tool call is still being dispatched) is applied before the next
+        // model call, in the middle of the tool loop.
+        let dir = tempfile::tempdir().unwrap();
+        // The recents MRU the `ModelSwitched` event feeds (as
+        // `Terminal::model_switched` does for a switch at the prompt).
+        let recents = Arc::new(Mutex::new(recents::Recents::default()));
+        let recents_path = dir.path().join("recent-models.json");
+        let (mut agent, _) = interfering(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/switched");
+                }
+            },
+            None,
+        );
+        {
+            let slot = recents.clone();
+            let path = recents_path.clone();
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+                if let AgentEvent::ModelSwitched { spec, previous } = event {
+                    let mut recents = slot.lock().unwrap();
+                    recents.record(previous);
+                    recents.record(spec);
+                    recents::save(&path, &recents);
+                }
+            }));
+        }
+        agent.new_session().unwrap();
+        let before = format!("{}/{}", agent.provider_name(), agent.model_name());
+        let outcome = agent.run_turn(Some("in-1"), "do it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // The answer came from the mock client the turn switched to.
+        assert!(outcome.response.starts_with("Based on the echo tool result: "), "{}", outcome.response);
+        // The turn's second model call went to the new model.
+        assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
+        assert_eq!(agent.model_name(), "switched");
+        assert_eq!(agent.config().model, "mock/switched");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // Both sides of the switch were recorded, newest first.
+        let models = recents.lock().unwrap().models().to_vec();
+        let previous = recents::canonical(&before, &Default::default(), "mock");
+        assert_eq!(models, ["mock/switched".to_string(), previous]);
+        assert!(recents_path.exists(), "the MRU was persisted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_newer_model_request_during_a_slow_build_supersedes_the_stale_one() {
+        // A `/model` switch whose client build is slow (here: a provider whose
+        // `api_key_command` sleeps) can be superseded by a newer `/model`
+        // request arriving while that build is still in flight. The agent must
+        // install the newest spec, not the stale one it happened to finish
+        // building: otherwise the next model call would land on a superseded
+        // model even though the newer command was acked for it.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    // Queue the slow-building switch, then — from another
+                    // thread, while that build sleeps — queue a newer switch.
+                    control.set_model("slow/x");
+                    let newer = control.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        newer.set_model("mock/final");
+                    });
+                }
+            },
+            None,
+            |mut config| {
+                config.providers.insert(
+                    "slow".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        // Build takes ~1s, so the newer request above is queued
+                        // well before it finishes and the stale-check catches it.
+                        api_key_command: Some("sleep 1; printf sk".to_string()),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        let switched = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let slot = switched.clone();
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+                if let AgentEvent::ModelSwitched { spec, .. } = event {
+                    slot.lock().unwrap().push(spec.to_string());
+                }
+            }));
+        }
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "do it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // The newest spec won; the stale `slow/x` was discarded, never installed.
+        assert_eq!(agent.provider_name(), "mock", "the newest switch took effect");
+        assert_eq!(agent.model_name(), "final");
+        assert_eq!(agent.config().model, "mock/final");
+        assert_eq!(agent.control().take_model_request(), None, "both requests consumed");
+        let switched = switched.lock().unwrap();
+        assert_eq!(
+            switched.as_slice(),
+            ["mock/final".to_string()],
+            "only the newest switch was announced: {switched:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_to_an_unbuildable_spec_drops_the_request_and_reports_it() {
+        // A `/model <spec>` that passes queue-time validation but whose client
+        // still fails to build at the next model call must not fail silently:
+        // the turn finishes on the current model, the dead request is dropped
+        // (not re-queued, so it cannot leak into the next turn and retry
+        // forever), and a `ModelSwitchFailed` event is emitted so the user is
+        // told. Here the apply-time failure is a provider whose
+        // `api_key_command` fails: the spec is fully valid — kind, model and
+        // base_url all present — so `validate_spec` accepts it at queue time
+        // (it never runs the command) and only building the client surfaces
+        // the failure, exercising the advertised
+        // validation-passes/apply-fails path.
+        let dir = tempfile::tempdir().unwrap();
+        // Two model calls (a tool call, then the final text) so the switch is
+        // applied between them — a single final-answer call would end the turn
+        // before `apply_model_request` ever runs.
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("flaky/x");
+                }
+            },
+            None,
+            |mut config| {
+                // Syntactically valid, endpoint configured; only the key
+                // lookup fails, and that happens at apply time.
+                config.providers.insert(
+                    "flaky".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        api_key_command: Some("exit 1".to_string()),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        let failures = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        {
+            let slot = failures.clone();
+            agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+                if let AgentEvent::ModelSwitchFailed { spec, error } = event {
+                    slot.lock().unwrap().push((spec.to_string(), error.to_string()));
+                }
+            }));
+        }
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(agent.provider_name(), "test", "unchanged");
+        assert_eq!(agent.model_name(), "interfering", "unchanged");
+        // The request was consumed and dropped, not re-parked, so the next turn
+        // does not silently retry the bad spec on the old model.
+        assert_eq!(agent.control().take_model_request(), None, "the dead request was dropped");
+        // The failure was surfaced to the UI, naming the spec.
+        let failures = failures.lock().unwrap();
+        assert_eq!(failures.len(), 1, "one failure reported: {failures:?}");
+        assert_eq!(failures[0].0, "flaky/x");
+        assert!(failures[0].1.contains("api_key_command"), "error explains the failure: {}", failures[0].1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_direct_model_switch_supersedes_a_stale_queued_request() {
+        // A `/model` queued during a prior turn's final in-flight call is not
+        // consumed before that turn ends, so it outlives the turn on the
+        // `TurnControl`. A later direct (prompt-level) switch via
+        // `Agent::set_model` must supersede it: otherwise the first model call
+        // of the next turn would consume the stale request and silently switch
+        // away from the model the direct switch just selected.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.control().set_model("mock/stale");
+        agent.set_model("mock/direct").await.unwrap();
+        assert_eq!(agent.config().model, "mock/direct");
+        assert_eq!(agent.model_name(), "direct", "the direct switch took effect");
+        assert_eq!(
+            agent.control().take_model_request(),
+            None,
+            "the stale queued request was cleared, not left to fire next turn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_direct_model_switch_still_clears_a_stale_queued_request() {
+        // The stale-request clear must happen *before* the fallible client
+        // build, not after it. A `/model B` whose client fails to build returns
+        // at the `?`; if the stale mid-turn request A were cleared only after a
+        // successful build, a failed B would leave A queued and the next turn's
+        // first call would silently switch to the superseded A. Clearing up
+        // front means a failed direct switch leaves no stale request behind.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![],
+            dir.path(),
+            |_, _| {},
+            None,
+            |mut config| {
+                // Syntactically valid, endpoint configured; only the key lookup
+                // fails, so the client fails to build at `set_model` time.
+                config.providers.insert(
+                    "flaky".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("m".to_string()),
+                        base_url: Some("http://localhost:9/v1".to_string()),
+                        api_key_command: Some("exit 1".to_string()),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        agent.new_session().unwrap();
+        agent.control().set_model("mock/leftover");
+        agent.set_model("flaky/x").await.expect_err("the unbuildable client fails the switch");
+        assert_eq!(
+            agent.control().take_model_request(),
+            None,
+            "the stale request was cleared before the failed build, not left to fire next turn"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime() {
+        // `set_model` builds the new client, and building it can run an
+        // `api_key_command` as a child process. That build must be offloaded to
+        // the blocking pool (as `apply_model_request` does), not run inline on
+        // the async executor: the between-turn `/model` switch is awaited from
+        // the single-threaded TUI/ACP event loops, so an inline blocking build
+        // would freeze the whole UI for the command's duration. Proof: on a
+        // single-threaded runtime a concurrently-spawned async task keeps
+        // ticking while the key command sleeps; if the build ran inline it would
+        // monopolise the only executor thread and the ticker would not advance.
+        use std::sync::atomic::AtomicUsize;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent_with_slow_key_command(dir.path());
+        agent.new_session().unwrap();
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        agent.set_model("slowmock/x").await.unwrap();
+        ticker.abort();
+
+        assert_eq!(agent.model_name(), "x", "the switch took effect");
+        assert_eq!(agent.config().model, "slowmock/x");
+        // The key command sleeps ~300ms; at 10ms ticks the async ticker would
+        // advance many times if (and only if) the executor stayed free. Require
+        // several to rule out the inline-blocking regression without being
+        // flaky about exact scheduling.
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 5,
+            "the runtime kept scheduling other tasks while the key command ran (ticks={}): a stall means the \
+             blocking client build ran inline on the executor instead of spawn_blocking",
+            ticks.load(Ordering::SeqCst),
+        );
+    }
+
+    fn agent_with_slow_key_command(dir: &std::path::Path) -> (Agent, Seen) {
+        let (mut agent, seen) = agent(vec![text("done")], dir);
+        // A Mock provider needs no endpoint and builds instantly, so the only
+        // slow part of the client build is its `api_key_command` child process —
+        // isolating exactly the blocking work `set_model` must offload.
+        agent.config.providers.insert(
+            "slowmock".to_string(),
+            crate::providers::ProviderConfig {
+                kind: Some(crate::providers::ProviderKind::Mock),
+                default_model: Some("m".to_string()),
+                api_key_command: Some("sleep 0.3; printf sk".to_string()),
+                ..Default::default()
+            },
+        );
+        (agent, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_during_a_call_applies_before_threshold_compaction() {
+        // Threshold auto-compaction is itself a model call, so a `/model`
+        // queued while the triggering call was in flight must apply to the
+        // summarization request — not after it. The mock client panics if it
+        // is ever asked to chat, so the switch provably happened first.
+        let dir = tempfile::tempdir().unwrap();
+        let big = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "b1".into(),
+                name: "big".into(),
+                arguments: json!({}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let (mut agent, _) = interfering_with(
+            vec![big, text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/summarizer");
+                }
+            },
+            None,
+            |config| config,
+        );
+        // A tiny window with a low threshold forces compaction on the second
+        // iteration, right after the big tool result lands.
+        agent.config.context_window = Some(3_000);
+        agent.config.auto_compact_threshold = 0.5;
+        agent.tools().register(
+            ToolDefinition::new("big", "big", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("x".repeat(8_000)))),
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(agent.provider_name(), "mock", "switched before the compaction call");
+        assert_eq!(agent.model_name(), "summarizer");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_during_an_overflow_applies_to_the_compaction_and_retry() {
+        // A `/model` typed while an overflowing request is in flight must be
+        // consumed before the overflow compaction's summarization call, and
+        // the retried request must go to the new model too — never the old
+        // one. The switch target is an unreachable OpenAI endpoint, so any
+        // call that reaches it fails to connect. The summary and the retry
+        // both go to the new client (the switch is consumed before the
+        // summary), so the turn fails to connect rather than completing on
+        // the old model — proving the switch was not deferred past the
+        // compaction.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), tool_call("c2")],
+            dir.path(),
+            |_, _| {},
+            None,
+            |mut config| {
+                config.providers.insert(
+                    "flaky".to_string(),
+                    crate::providers::ProviderConfig {
+                        kind: Some(crate::providers::ProviderKind::Openai),
+                        default_model: Some("x".to_string()),
+                        base_url: Some("http://127.0.0.1:9/v1".to_string()),
+                        // Fail fast: no retries, a short timeout, so the test
+                        // does not wait out the default backoff schedule.
+                        max_retries: Some(0),
+                        timeout_secs: Some(2),
+                        ..Default::default()
+                    },
+                );
+                config
+            },
+        );
+        // The second call overflows; while it is "in flight" the user queues
+        // the switch. The compaction summary and the retry both go to the new
+        // client (the switch is consumed before the summary), so the turn
+        // fails to connect there.
+        let ok_tool: std::result::Result<LLMResponse, String> = Ok(tool_call("c1"));
+        let overflow: std::result::Result<LLMResponse, String> =
+            Err("HTTP 400: maximum context length is 4096 tokens.".to_string());
+        let summary: std::result::Result<LLMResponse, String> = Ok(text("SUMMARY"));
+        let control = agent.control();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        struct OverflowThenSummary {
+            results: Mutex<Vec<std::result::Result<LLMResponse, String>>>,
+            seen: Seen,
+            control: TurnControl,
+        }
+        #[async_trait]
+        impl LLMClient for OverflowThenSummary {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("the probe is never spawned for a configured provider")
+            }
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.seen.lock().unwrap().push(request.messages.to_vec());
+                if self.seen.lock().unwrap().len() == 2 {
+                    // The overflowing call is in flight now: queue the switch.
+                    self.control.set_model("flaky/x");
+                }
+                self.results.lock().unwrap().remove(0).map_err(|e| anyhow::anyhow!(e))
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+        agent.client = Box::new(OverflowThenSummary {
+            results: Mutex::new(vec![ok_tool, overflow, summary]),
+            seen: seen.clone(),
+            control,
+        });
+        agent.new_session().unwrap();
+        let error = agent.run_turn(Some("in-1"), "hi").await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(!message.contains("maximum context length"), "the retry did not overflow on the old client: {message}");
+        assert_eq!(agent.provider_name(), "flaky", "switched before the overflow retry");
+        assert_eq!(agent.model_name(), "x");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // The old client served only the tool call and the overflowing call;
+        // the compaction summary and the retry both went to the new client
+        // (which is why the turn fails to connect).
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "tool, overflow — everything after the switch left on the new client");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_switch_queued_before_manual_compaction_applies_to_the_summary() {
+        // A `/model` typed during a turn's final in-flight call stays queued:
+        // `run_turn` returns without reaching another apply hook. If the next
+        // command is `/compact`, `Agent::compact` summarizes with a model call,
+        // which must go to the newly selected model — not the one the user just
+        // switched away from. Only the turn's two calls are scripted; a summary
+        // left on the old client would pop an empty queue and panic, so a green
+        // test proves the switch was applied before the summary.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![tool_call("c1"), text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        // The still-queued mid-turn switch, left pending after the final call.
+        agent.control().set_model("mock/summarizer");
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.summarized > 0, "the summary call actually ran");
+        assert_eq!(agent.provider_name(), "mock", "switch applied before the summary call");
+        assert_eq!(agent.model_name(), "summarizer");
+        assert_eq!(agent.control().take_model_request(), None, "the request was consumed");
+        // The old scripted client served only the turn's two calls, never the
+        // summary (which went to the new client).
+        assert_eq!(seen.lock().unwrap().len(), 2, "the summary did not go to the old client");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_apply_model_request_signals_the_caller_and_keeps_the_request() {
+        // A `/model` queued mid-turn plus a cancel that is already pending must
+        // not install the new client, and `apply_model_request` must report the
+        // cancellation so the caller stops before its next model call —
+        // otherwise one call still lands on the (old) model after the user
+        // cancelled. The request stays queued for the next turn's first call.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let (provider, model) = (agent.provider_name().to_string(), agent.model_name().to_string());
+        agent.control().set_model("mock/summarizer");
+        agent.control().cancel();
+        assert!(agent.apply_model_request().await, "a cancelled turn signals the caller to stop");
+        assert_eq!(agent.provider_name(), provider, "the switch did not apply");
+        assert_eq!(agent.model_name(), model);
+        assert!(agent.control().has_model_request(), "the request stays queued for the next turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset() {
+        // A `/model` switch cancelled *while its api_key_command child is still
+        // building* must kill that child. `apply_model_request` drops the
+        // blocking build's `JoinHandle` on cancel, but a dropped
+        // `spawn_blocking` task keeps running, so the key-command worker
+        // outlives the call. If the worker polled the turn-wide cancel flag,
+        // the next turn's `start_turn()` would reset it to `false` before the
+        // worker's 50 ms poll saw the cancel, and the supposedly-killed helper
+        // would run on until its 120 s timeout. The build-local token the fix
+        // uses cannot be reset by the next turn, so the child is killed and the
+        // marker its command would touch never appears.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("LEAKED");
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.config.providers.insert(
+            "slowmock".to_string(),
+            crate::providers::ProviderConfig {
+                kind: Some(crate::providers::ProviderKind::Mock),
+                default_model: Some("m".to_string()),
+                // Sleeps, then (only if not killed) touches the marker. A
+                // killed process group never reaches the `touch`.
+                api_key_command: Some(format!("sleep 1; touch {}", marker.display())),
+                ..Default::default()
+            },
+        );
+        let control = agent.control().clone();
+        control.set_model("slowmock/x");
+        // Run the build on a task so we can cancel it mid-build (it blocks in
+        // the key command's `sleep`), exercising the dropped-handle path rather
+        // than the pre-build cancel guard.
+        let build = tokio::spawn(async move { agent.apply_model_request().await });
+        // Let the blocking build spawn and enter the key command's sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        control.cancel();
+        assert!(build.await.unwrap(), "the cancelled build signals the caller to stop");
+        // Simulate the next turn resetting the turn-wide cancel flag before the
+        // detached worker's next poll — the exact sequence that let a
+        // supposedly-cancelled helper survive when the build observed the
+        // turn-wide flag instead of a build-local token.
+        control.cancel_flag().store(false, Ordering::SeqCst);
+        // Well past both the worker's 50 ms poll and the command's 1 s sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "the cancelled key-command child was killed via the build-local token, not left running \
+             past the turn-wide flag reset to touch the marker",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_compaction_does_not_issue_the_summary_call() {
+        // A cancel pending when compaction would summarize must stop before the
+        // model call rather than race an immediately-ready response onto the
+        // old model (the `biased;` select plus the caller guard). Only the
+        // turn's two calls are scripted; a summary call would pop an empty
+        // queue and panic, so a green test proves none was issued.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![tool_call("c1"), text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("ping").await.unwrap();
+        agent.control().cancel();
+        let report = agent.compact_logged(CompactTrigger::Manual, CompactionMode::Standard, None).await.unwrap();
+        assert!(report.is_none(), "a cancelled compaction summarizes nothing");
+        assert_eq!(seen.lock().unwrap().len(), 2, "no summary call was issued on cancel");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_turn_model_switch_with_a_configured_window_skips_the_probe() {
+        // A mid-turn `/model` switch must not stall the agent loop on the
+        // context-window probe. When the new spec carries a configured window
+        // (here: `context_window` on the provider entry) that value is
+        // authoritative, so the HTTP probe is skipped outright and the next
+        // model call goes out immediately.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/probed");
+                }
+            },
+            None,
+            |mut config| {
+                // A `context_window` on the provider entry is authoritative, so
+                // the switch must not probe the endpoint at all.
+                config.providers.insert(
+                    "mock".to_string(),
+                    crate::providers::ProviderConfig { context_window: Some(111_111), ..Default::default() },
+                );
+                config
+            },
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
+        assert_eq!(agent.model_name(), "probed");
+        // The configured window won immediately, with no endpoint probe.
+        let (window, source) = agent.context_window_with_source();
+        assert_eq!(window, 111_111, "{source}");
+        assert_eq!(source, "provider context_window");
+        assert!(agent.detected_window.lock().unwrap().is_none(), "a configured window skips the endpoint probe");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_turn_model_switch_without_a_configured_window_probes_in_the_background() {
+        // With no configured window the probe still runs, but in a background
+        // task so the next model call is not delayed by it; the result is
+        // published (and the stats refreshed) whenever it lands.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = interfering_with(
+            vec![tool_call("c1"), text("done")],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.set_model("mock/probed");
+                }
+            },
+            None,
+            |config| config,
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(agent.provider_name(), "mock", "switched mid-turn");
+        // The mock client reports no window, so the background probe publishes
+        // nothing and the model-name fallback stays in effect.
+        assert!(agent.detected_window.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stale_background_probe_is_discarded_after_a_later_switch() {
+        // A window probe spawned for one model can finish after the user has
+        // already switched to another. It must not overwrite the newer model's
+        // window: `finish_detect` discards any result whose generation no
+        // longer matches the live one.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(5));
+        let stats = SharedStats::default();
+        stats.lock().unwrap().window_source = "known for the model name".to_string();
+
+        // Probe spawned under generation 3 lands after the generation moved to 5.
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(999, "stale")),
+            3,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        assert!(slot.lock().unwrap().is_none(), "a stale probe must not write the window slot");
+        assert_eq!(stats.lock().unwrap().window, 0, "a stale probe must not touch the shared stats");
+
+        // A probe for the live generation publishes normally.
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(4096, "fresh")),
+            5,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().tokens, 4096, "the live probe writes the slot");
+        assert_eq!(stats.lock().unwrap().window, 4096, "the live probe refreshes the stats");
+        assert!(stats.lock().unwrap().window_source.starts_with("reported by the endpoint"));
+    }
+
+    #[test]
+    fn a_background_probe_refines_a_default_window_source() {
+        // When the new model has no known window the fallback source is
+        // "default"; a later endpoint probe must still be allowed to refine it
+        // (the conservative stats gate exempts "default", not just the
+        // model-name fallback).
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        stats.lock().unwrap().window_source = "default".to_string();
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(8192, "max_model_len")),
+            1,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        assert_eq!(stats.lock().unwrap().window, 8192, "a probe must refine a default-source window");
+    }
+
+    #[test]
+    fn a_stricter_probe_replaces_a_learned_window_stat() {
+        // A probe can land after an overflow has published a learned window.
+        // The slot already stores the detected window, so `context_window_with_source()`
+        // starts using the smaller value; the shared stats must follow, or `/context`
+        // and the status line keep reporting the larger learned window indefinitely.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 200_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(128_000, "max_model_len")),
+            1,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 128_000, "a stricter detected window must replace the learned stat");
+        assert!(s.window_source.starts_with("reported by the endpoint"));
+    }
+
+    #[test]
+    fn a_looser_probe_does_not_replace_a_learned_window_stat() {
+        // A learned window reflects a real overflow, so a probe reporting a
+        // *larger* window must not loosen it: the learned limit is the binding one.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 100_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(200_000, "max_model_len")),
+            1,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 100_000, "a looser detected window must not replace the learned stat");
+        assert_eq!(s.window_source, "learned from a context-overflow error");
+    }
+
+    #[test]
+    fn an_equal_probe_replaces_a_learned_window_stat_source() {
+        // When the detected window equals the learned one,
+        // `context_window_with_source()` prefers the detected slot (the
+        // `learned < window` guard is false on equality), so the shared stats
+        // must follow and relabel the source. Otherwise `/context` keeps saying
+        // "learned" while the agent internally reports the endpoint source.
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(Mutex::new(None));
+        let current = Arc::new(AtomicU64::new(1));
+        let stats = SharedStats::default();
+        {
+            let mut s = stats.lock().unwrap();
+            s.window = 128_000;
+            s.window_source = "learned from a context-overflow error".to_string();
+        }
+        Agent::finish_detect(
+            Detected::window(DetectedWindow::total(128_000, "max_model_len")),
+            1,
+            current.clone(),
+            DetectSlots::window(slot.clone()),
+            None,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.window, 128_000, "the window is unchanged on equality");
+        assert!(
+            s.window_source.starts_with("reported by the endpoint"),
+            "an equal detected window relabels the source to match context_window_with_source: {}",
+            s.window_source
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
