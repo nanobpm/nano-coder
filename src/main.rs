@@ -789,6 +789,12 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         let picker_lock = terminal.picker_lock();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(ui::SPINNER_INTERVAL);
+            // Skip missed ticks: the default `Burst` replays every 100 ms tick
+            // a delayed task fell behind on, turning one slow frame render (or
+            // a busy runtime) into a redraw storm. The spinner frame is
+            // derived from elapsed time, so skipping straight to the current
+            // tick loses no animation state.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 if let Ok(_terminal) = picker_lock.try_lock() {
