@@ -54,6 +54,12 @@ pub struct Reminders {
     repeat_count: usize,
     /// Fingerprint of the last counted call (see `repeat_key`).
     repeat_key: Option<String>,
+    /// The raw `bash` command of the last counted call, if any. Lets the
+    /// detector tell an appended/identical read-only diagnostic tail (a real
+    /// loop) from a *changed* diagnostic argument that strips to the same base
+    /// (`is_diagnostic_extension`), so the latter is not conflated into a false
+    /// repeat (issue #65).
+    repeat_cmd: Option<String>,
     /// Repeat warnings already fired this turn (capped, so the nudge cannot
     /// become a loop itself).
     repeat_warnings: usize,
@@ -64,6 +70,7 @@ impl Reminders {
         self.this_turn = 0;
         self.repeat_count = 0;
         self.repeat_key = None;
+        self.repeat_cmd = None;
         self.repeat_warnings = 0;
     }
 
@@ -85,6 +92,7 @@ impl Reminders {
     pub fn reset_repeat(&mut self) {
         self.repeat_count = 0;
         self.repeat_key = None;
+        self.repeat_cmd = None;
     }
 
     /// Count a (non-plan) tool call and return any reminders for its result.
@@ -139,7 +147,11 @@ impl Reminders {
     /// of read-only diagnostic pipeline stages stripped — a loop that appends
     /// `| wc -l`/`| grep …`-style stages still matches), the error flag and
     /// a hash of the result, so "same output again" counts even when the
-    /// arguments drift. The warning fires at `REPEAT_WARN_AFTER` consecutive
+    /// arguments drift. For `bash` the match additionally requires the two raw
+    /// commands to be a diagnostic *extension* of one another, so a changed
+    /// diagnostic argument that strips to the same base (`… | grep alpha` then
+    /// `… | grep beta`) is a fresh inspection that breaks the streak rather than
+    /// a false repeat. The warning fires at `REPEAT_WARN_AFTER` consecutive
     /// repeats and at most `REPEAT_MAX_WARNINGS` times per turn; once the
     /// warnings are spent, a further repeat is a hard stop.
     pub fn after_repeat_call(&mut self, tool: &str, args: &Value, ok: bool, result: &str) -> RepeatVerdict {
@@ -148,8 +160,27 @@ impl Reminders {
             return RepeatVerdict::None;
         }
         let key = repeat_key(tool, args, ok, result);
-        self.repeat_count = if self.repeat_key.as_deref() == Some(key.as_str()) { self.repeat_count + 1 } else { 1 };
+        let cmd = (tool == "bash")
+            .then(|| args.get("command").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string);
+        // Same grouping key (tool + stripped base + error + output hash) is
+        // necessary but, for a bash command, not sufficient: the stripped base
+        // is identical when only a trailing diagnostic *argument* changed, so
+        // require the raw commands to be a diagnostic extension of one another
+        // before counting a repeat. A non-bash call has no command and matches
+        // on the key alone.
+        let is_repeat = self.repeat_key.as_deref() == Some(key.as_str())
+            && match (&self.repeat_cmd, &cmd) {
+                (Some(prev), Some(cur)) => is_diagnostic_extension(prev, cur),
+                (None, None) => true,
+                // A bash/non-bash transition that still shares a key is not a
+                // genuine repeat of the same call.
+                _ => false,
+            };
+        self.repeat_count = if is_repeat { self.repeat_count + 1 } else { 1 };
         self.repeat_key = Some(key);
+        self.repeat_cmd = cmd;
         if self.repeat_count < REPEAT_WARN_AFTER {
             return RepeatVerdict::None;
         }
@@ -196,16 +227,30 @@ fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     let re = SPILL.get_or_init(|| {
         // The marker is `...<n> bytes truncated; complete output in <path>...`,
         // where the path's own `...` is the terminator that precedes the tail.
-        // Identify that terminator as the *last* `...` on the marker's line — a
-        // greedy `.+` — never the first: the configurable `session_dir` may
-        // itself contain `...` (e.g. `/tmp/cache...v1`), and a non-greedy match
-        // would stop at those directory dots, leaving the per-call basename
-        // (`bash-3.stdout` vs `bash-4.stdout`) in the hash so the runaway never
-        // fires (issue #65). Nor does this rely on the path being
-        // whitespace-free: a `\S+` match would silently fail on a session_dir
-        // with spaces. `.` excludes newlines, so the match stays on the
-        // marker's own line and cannot run past the tail into later output.
-        regex::Regex::new(r"(complete output in ).+(\.\.\.)").expect("spill-path regex is valid")
+        // Anchor on the spill *basename*, not on "the first `...`" or "the last
+        // `...`" — both are wrong:
+        //   * A non-greedy `.+?(\.\.\.)` stops at the *first* `...`, so a
+        //     `session_dir` that itself contains `...` (e.g. `/tmp/cache...v1`)
+        //     leaves the per-call basename (`bash-3.stdout`) in the hash and the
+        //     runaway never fires (issue #65).
+        //   * A greedy `.+(\.\.\.)` runs to the *last* `...`, which is in the
+        //     bounded *tail* when the tail contains ellipses, so two results
+        //     with the same spill but different tails
+        //     (`…bash-1.stdout...tailA` vs `…tailB`) both collapse to
+        //     `<spill>...` and a genuine change is erased into a false repeat.
+        // The bounder only ever names the spill `bash-<n>.stdout`/`.stderr`
+        // (`bash.rs`) or `tool-<id>-<name>.txt` (`agent.rs`), all sanitised to a
+        // single extension dot (`sanitize` in `agent.rs` maps every other
+        // character to `_`), so the terminator is the *first* `...` that follows
+        // a `.stdout`/`.stderr`/`.txt` extension. A non-greedy path up to that
+        // extension crosses directory dots (they carry no such extension) yet
+        // stops at the spill's own terminator, leaving the tail intact. `.`
+        // excludes newlines, so the match stays on the marker's own line and
+        // cannot run past the tail into later output; the path may contain
+        // spaces (a `\S+` match would silently fail on a session_dir with
+        // spaces).
+        regex::Regex::new(r"(complete output in ).+?\.(?:stdout|stderr|txt)(\.\.\.)")
+            .expect("spill-path regex is valid")
     });
     re.replace_all(result, "${1}<spill>${2}")
 }
@@ -227,7 +272,11 @@ const DIAGNOSTIC_STAGES: &[&str] = &[
 /// vs `… | tee b`, a redirection, a write option like `sort -o`, `||`, or a
 /// shell control construct) stop the stripping so distinct side effects are
 /// never conflated into a false loop. Other tools match on their arguments as
-/// given.
+/// given. This base is only a *grouping* key: a changed diagnostic argument
+/// (`… | grep alpha` vs `… | grep beta`) strips to the same base, so the
+/// detector additionally requires consecutive commands to be a diagnostic
+/// *extension* of one another (`is_diagnostic_extension`) before counting a
+/// repeat, keeping genuinely different inspections distinct (issue #65).
 fn normalised_args(tool: &str, args: &Value) -> String {
     if tool == "bash"
         && let Some(command) = args.get("command").and_then(Value::as_str)
@@ -243,7 +292,8 @@ fn normalised_args(tool: &str, args: &Value) -> String {
 /// all fingerprint by the same base intent, catching a loop that keeps appending
 /// inspection stages — without conflating genuinely distinct side effects, since
 /// stripping stops at the first non-diagnostic stage and leaves everything to its
-/// left intact.
+/// left intact. (Distinct *arguments* on a stripped stage are separated by the
+/// detector's `is_diagnostic_extension` check, not here.)
 fn pipeline_key(command: &str) -> String {
     match split_pipeline(command) {
         Some(stages) if stages.len() > 1 => {
@@ -259,6 +309,32 @@ fn pipeline_key(command: &str) -> String {
         }
         _ => command.trim().to_string(),
     }
+}
+
+/// Whether `b` is the same bash command as `a` with only read-only diagnostic
+/// stages appended or repeated — i.e. one stage list is a prefix of the other
+/// and every *extra* trailing stage is a diagnostic filter. This is what lets
+/// the detector treat an ever-growing inspection tail (`cmd`, `cmd | wc -l`,
+/// `cmd | wc -l | head`) as the *same* looping step, while a call that **changes**
+/// a diagnostic stage's argument (`… | grep alpha` then `… | grep beta`) is a
+/// genuinely different inspection — not a prefix of the previous command — and
+/// so breaks the streak instead of being conflated into a false repeat that
+/// hard-stops a model still changing its query (issue #65). Commands that cannot
+/// be split into a pipeline (`||`, etc.) must match exactly.
+fn is_diagnostic_extension(a: &str, b: &str) -> bool {
+    let (sa, sb) = match (split_pipeline(a), split_pipeline(b)) {
+        (Some(sa), Some(sb)) => (sa, sb),
+        _ => return a.trim() == b.trim(),
+    };
+    let (short, long) = if sa.len() <= sb.len() { (&sa, &sb) } else { (&sb, &sa) };
+    // Every shared stage must be byte-identical (modulo surrounding space)...
+    if short.iter().zip(long.iter()).any(|(x, y)| x.trim() != y.trim()) {
+        return false;
+    }
+    // ...and every extra trailing stage in the longer command must be a
+    // read-only diagnostic, so appending a *writer* or a new base stage is not
+    // treated as the same step.
+    long[short.len()..].iter().all(|s| is_diagnostic_stage(s))
 }
 
 /// A pipeline stage that only reads its stdin and writes stdout, so appending or
@@ -467,6 +543,24 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_diagnostic_stages_query_is_not_a_repeat() {
+        // A model iterating *different* inspections of the same file — `cat log |
+        // grep alpha`, `… | grep beta`, … — is exploring, not looping, even when
+        // every grep finds nothing and the bounded output is identically empty.
+        // Stripping the grep stage would conflate them all to `cat log` and hard
+        // stop the turn on the fifth call (issue #65); the content argument keeps
+        // them distinct.
+        let mut r = Reminders::default();
+        for q in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"] {
+            assert_eq!(
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), true, ""),
+                RepeatVerdict::None,
+                "query {q} must not count as a repeat",
+            );
+        }
+    }
+
+    #[test]
     fn exempt_tools_and_start_turn_reset_the_detector() {
         for tool in REPEAT_EXEMPT_TOOLS {
             let mut r = Reminders::default();
@@ -582,10 +676,11 @@ mod tests {
     #[test]
     fn spill_normalisation_handles_ellipsis_in_directory() {
         // The configurable `session_dir` may itself contain `...` (e.g.
-        // `/tmp/cache...v1`). The terminator is the path's *own* `...` (the last
-        // one on the marker's line), not the directory's dots — a non-greedy
-        // match stopped at the directory and left each per-call basename in the
-        // hash, so the runaway never fired (issue #65).
+        // `/tmp/cache...v1`). The terminator is the spill's own `...`, found by
+        // anchoring on its `.stdout`/`.stderr`/`.txt` extension — not the first
+        // `...` (which a non-greedy match would wrongly take at the directory's
+        // dots, leaving each per-call basename in the hash so the runaway never
+        // fired — issue #65).
         assert_eq!(
             normalise_spill_paths("x; complete output in /tmp/cache...v1/bash-3.stdout...y"),
             normalise_spill_paths("x; complete output in /tmp/cache...v1/bash-4.stdout...y"),
@@ -597,11 +692,19 @@ mod tests {
             .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), true, &result(n)))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
-        // The greedy terminator stops at the path's own `...`; the tail after it
-        // is preserved, so differing tails still distinguish the results.
+        // The terminator stops at the spill extension's own `...`; the tail after
+        // it is preserved, so differing tails still distinguish the results — a
+        // greedy match to the *last* `...` would run into a tail that itself
+        // contains ellipses and erase a genuine change into a false repeat.
         assert_ne!(
             normalise_spill_paths("h; complete output in /t/bash-1.stdout...tailA"),
             normalise_spill_paths("h; complete output in /t/bash-1.stdout...tailB"),
+        );
+        // Even when the tail itself contains `...`, the extension anchor keeps the
+        // match on the spill basename, so distinct tails stay distinct.
+        assert_ne!(
+            normalise_spill_paths("h; complete output in /t/bash-1.stdout...a...tailA"),
+            normalise_spill_paths("h; complete output in /t/bash-1.stdout...b...tailB"),
         );
     }
 
