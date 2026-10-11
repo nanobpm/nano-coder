@@ -2892,9 +2892,11 @@ impl Agent {
         // A cap of 0 is unbounded.
         let max_iterations = self.config.max_iterations;
         // …except in a headless session, where no human can stop a runaway:
-        // 0 (and Auto mode) fall back to a finite safety cap (issue #65).
-        let headless_cap = !self.questions.is_interactive()
-            && (max_iterations == 0 || self.control.mode() == crate::mode::AgentMode::Auto);
+        // 0 (and Auto mode) fall back to a finite safety cap (issue #65). This
+        // is re-evaluated from the *live* mode each iteration (below), not
+        // snapshotted here, so a mid-turn mode switch (Normal ⇄ Auto) moves the
+        // safety cap with it instead of leaving the Auto branch unbounded.
+        let headless = !self.questions.is_interactive();
         let mut final_response = None;
         let mut last_content = String::new();
         let mut cancelled = false;
@@ -2911,6 +2913,12 @@ impl Agent {
         let mut loop_stop: Option<String> = None;
         loop {
             iteration += 1;
+            // Recompute the headless safety-cap condition from the live mode:
+            // `TurnControl::mode` can change mid-turn, and a stale snapshot
+            // would leave a Normal→Auto switch unbounded (or an Auto→Normal
+            // switch ignoring the configured positive cap).
+            let headless_cap =
+                headless && (max_iterations == 0 || self.control.mode() == crate::mode::AgentMode::Auto);
             let budget = match (self.control.mode(), max_iterations) {
                 _ if headless_cap => HEADLESS_SAFETY_CAP.saturating_add(granted_extra),
                 (crate::mode::AgentMode::Auto, _) | (_, 0) => usize::MAX,
@@ -4774,6 +4782,31 @@ mod tests {
         agent.new_session().unwrap();
         agent.set_mode(crate::mode::AgentMode::Auto);
         let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
+        assert_eq!(seen.lock().unwrap().len(), HEADLESS_SAFETY_CAP);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_to_auto_mid_turn_keeps_the_headless_safety_cap() {
+        // The safety cap must follow the *live* mode, not a pre-loop snapshot:
+        // a headless turn that starts in Normal (interactive-looking, unbounded
+        // under the snapshot) and is switched to Auto mid-turn must still stop at
+        // the 300-call safety cap rather than run unbounded (issue #65).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(echo_stream(HEADLESS_SAFETY_CAP + 10), dir.path());
+        // A positive configured cap above the safety cap, so the Normal snapshot
+        // is unbounded-at-300 only via the live-mode recompute, not the
+        // `max_iterations == 0` path.
+        agent.config.max_iterations = HEADLESS_SAFETY_CAP + 50;
+        let control = agent.control();
+        agent.new_session().unwrap();
+        // Flip Normal → Auto after the first model call is in flight.
+        let switcher = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            control.set_mode(crate::mode::AgentMode::Auto);
+        });
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        switcher.await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::MaxTurnRequests);
         assert_eq!(seen.lock().unwrap().len(), HEADLESS_SAFETY_CAP);
     }

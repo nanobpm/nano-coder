@@ -351,7 +351,18 @@ fn normalised_args(tool: &str, args: &Value) -> String {
     if tool == "bash"
         && let Some(command) = args.get("command").and_then(Value::as_str)
     {
-        return pipeline_key(command);
+        // Normalise only the volatile `command` (stripping its trailing
+        // read-only diagnostic pipeline stages) while *retaining* the rest of
+        // the argument object. `timeout_seconds` and `max_output_length` change
+        // execution, so a retry that adjusts either must not fingerprint the
+        // same as the unadjusted call — otherwise a model progressively raising
+        // a timeout against an identical result is conflated into a loop and
+        // hard-stopped on the fifth attempt (issue #65).
+        let mut rest = args.clone();
+        if let Some(map) = rest.as_object_mut() {
+            map.remove("command");
+        }
+        return format!("{}|{rest}", pipeline_key(command));
     }
     args.to_string()
 }
@@ -628,6 +639,61 @@ mod tests {
                 "query {q} must not count as a repeat",
             );
         }
+    }
+
+    #[test]
+    fn changing_execution_arguments_is_not_a_repeat() {
+        // The bash fingerprint normalises only the volatile `command`; the rest
+        // of the argument object is retained. A model progressively raising
+        // `timeout_seconds` (or `max_output_length`) against an identical result
+        // is adjusting execution, not looping — dropping those arguments would
+        // conflate every retry into the same fingerprint and hard-stop it on the
+        // fifth call (issue #65).
+        let mut r = Reminders::default();
+        for t in [10, 20, 40, 80, 160, 320, 640] {
+            assert_eq!(
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test", "timeout_seconds": t}),
+                    None,
+                    true,
+                    "ok",
+                    &[]
+                ),
+                RepeatVerdict::None,
+                "timeout {t} must not count as a repeat",
+            );
+        }
+        let mut r = Reminders::default();
+        for m in [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000] {
+            assert_eq!(
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test", "max_output_length": m}),
+                    None,
+                    true,
+                    "ok",
+                    &[]
+                ),
+                RepeatVerdict::None,
+                "max_output_length {m} must not count as a repeat",
+            );
+        }
+        // …but the *same* execution arguments retried verbatim are still a loop.
+        let mut r = Reminders::default();
+        let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
+            .map(|_| {
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "make test", "timeout_seconds": 30}),
+                    None,
+                    true,
+                    "ok",
+                    &[],
+                )
+            })
+            .collect();
+        assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
 
     #[test]
