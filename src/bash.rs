@@ -34,6 +34,11 @@ pub struct BashConfig {
     pub sandbox: SandboxConfig,
     /// When set, overrides `output_dir` (the agent's per-session spill dir).
     pub shared_output_dir: Option<Arc<std::sync::RwLock<PathBuf>>>,
+    /// When set, each `run`/`run_digest` call replaces the contents with the
+    /// content digests of the captures it truncated and spilled, so the caller
+    /// (the agent's loop detector) gets the spills' identity **out of band**
+    /// instead of re-parsing the rendered markers (issue #65).
+    pub spill_digests: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl Default for BashConfig {
@@ -46,6 +51,7 @@ impl Default for BashConfig {
             cancel: None,
             sandbox: SandboxConfig::default(),
             shared_output_dir: None,
+            spill_digests: None,
         }
     }
 }
@@ -108,19 +114,39 @@ fn validate(config: &BashConfig, args: &Value) -> Result<Arguments, String> {
 
 /// Execute a bash tool call and return the model-facing result text.
 pub fn run(config: &BashConfig, args: &Value) -> String {
+    run_digest(config, args).0
+}
+
+/// [`run`], also returning the content digest of each capture that was
+/// truncated and spilled (stdout first, then stderr), so the caller can hand
+/// the loop detector the spills' identity **out of band** instead of the
+/// detector re-parsing the rendered markers (issue #65).
+pub fn run_digest(config: &BashConfig, args: &Value) -> (String, Vec<String>) {
     let arguments = match validate(config, args) {
         Ok(arguments) => arguments,
         Err(message) => {
-            return format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0);
+            return (format!("Error: {}", output::bound_output(&message, output::DEFAULT_MAX_OUTPUT_LENGTH).0), Vec::new());
         }
     };
     match execute(config, &arguments) {
-        Ok(text) => text,
-        Err(message) => format!("Error: {message}"),
+        Ok(done) => {
+            if let Some(slot) = &config.spill_digests {
+                *slot.lock().unwrap() = done.spills.clone();
+            }
+            (done.text, done.spills)
+        }
+        Err(message) => (format!("Error: {message}"), Vec::new()),
     }
 }
 
-fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String> {
+/// The model-facing result text plus the digest of each spilled capture.
+struct Executed {
+    text: String,
+    /// Content digest of each truncated capture (stdout, then stderr).
+    spills: Vec<String>,
+}
+
+fn execute(config: &BashConfig, arguments: &Arguments) -> Result<Executed, String> {
     let output_dir = match &config.shared_output_dir {
         Some(shared) => shared.read().unwrap().clone(),
         None => config.output_dir.clone(),
@@ -242,6 +268,15 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
     if !stderr.is_empty() {
         parts.push(format!("Stderr:\n{stderr}"));
     }
+    // Hand the loop detector each spilled capture's digest out of band, so it
+    // never has to re-parse the rendered markers to tell two captures apart.
+    let mut spills = Vec::new();
+    if out_truncated {
+        spills.push(out_digest.clone());
+    }
+    if err_truncated {
+        spills.push(err_digest.clone());
+    }
     if was_cancelled {
         parts.push("Error: the turn was cancelled; the command was killed".into());
     } else if timed_out {
@@ -257,9 +292,9 @@ fn execute(config: &BashConfig, arguments: &Arguments) -> Result<String, String>
         parts.push(format!("Terminated by signal {signal}"));
     }
     if parts.is_empty() {
-        return Ok("(no output)".into());
+        return Ok(Executed { text: "(no output)".into(), spills });
     }
-    Ok(parts.join("\n"))
+    Ok(Executed { text: parts.join("\n"), spills })
 }
 
 /// Read a capture file, reading only its head and tail when it is large. The

@@ -91,6 +91,7 @@ fn register_builtin_tools(agent: &mut Agent) {
         cancel: Some(agent.control().cancel_flag()),
         sandbox: agent.config().sandbox.clone(),
         shared_output_dir: Some(agent.spill_dir_handle()),
+        spill_digests: Some(agent.spill_digests_handle()),
         ..Default::default()
     };
     agent.tools().register(bash::definition(), Box::new(move |args| Ok(json!(bash::run(&bash_config, &args)))));

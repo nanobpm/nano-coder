@@ -19,14 +19,25 @@ pub fn spill_dir() -> std::path::PathBuf {
 /// search or page through the rest. The spill never overwrites an existing
 /// file: for a persisted session the recorded paths must stay valid, so if
 /// `name` is taken (a reused tool-call ID after a resume or provider retry) a
-/// fresh `stem-2.ext`, `stem-3.ext`, … is reserved instead.
-pub fn bound_and_spill(text: &str, limit: usize, dir: &std::path::Path, name: &str) -> String {
+/// fresh `stem-2.ext`, `stem-3.ext`, … is reserved instead. Also returns the
+/// complete content's digest when the text was truncated and spilled, so the
+/// caller can hand the spill's identity to the loop detector **out of band**
+/// instead of the detector re-parsing the rendered marker (issue #65). The
+/// digest is `None` when nothing spilled.
+pub fn bound_and_spill_digest(
+    text: &str,
+    limit: usize,
+    dir: &std::path::Path,
+    name: &str,
+) -> (String, Option<String>) {
     if text.chars().count() <= limit {
-        return text.to_string();
+        return (text.to_string(), None);
     }
     let saved = std::fs::create_dir_all(dir).ok().and_then(|()| reserve_and_write(dir, name, text));
     let display = saved.as_ref().map(|p| p.display().to_string());
-    bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref(), Some(&content_digest(text))).0
+    let digest = content_digest(text);
+    let (bounded, _) = bound_parts(text, Some(text), text.len() as u64, limit, display.as_deref(), Some(&digest));
+    (bounded, Some(digest))
 }
 
 /// Write `text` to a new file in `dir` derived from `name`, never clobbering an
@@ -174,18 +185,17 @@ mod tests {
     #[test]
     fn spills_long_output_to_a_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(bound_and_spill("short", 10, dir.path(), "a.txt"), "short");
+        assert_eq!(bound_and_spill_digest("short", 10, dir.path(), "a.txt"), ("short".to_string(), None));
         assert!(!dir.path().join("a.txt").exists());
-        let bounded = bound_and_spill("abcdefghij", 4, dir.path(), "b.txt");
+        let (bounded, spilled) = bound_and_spill_digest("abcdefghij", 4, dir.path(), "b.txt");
         let path = dir.path().join("b.txt");
+        let digest = content_digest("abcdefghij");
         assert_eq!(
             bounded,
-            format!(
-                "ab...6 bytes truncated (sha256:{}); complete output in {}...ij",
-                content_digest("abcdefghij"),
-                path.display()
-            )
+            format!("ab...6 bytes truncated (sha256:{digest}); complete output in {}...ij", path.display())
         );
+        // The spill's digest is handed back out of band for the loop detector.
+        assert_eq!(spilled.as_deref(), Some(digest.as_str()));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "abcdefghij");
     }
 
@@ -193,12 +203,12 @@ mod tests {
     fn spill_never_overwrites_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         // First long result claims the base name.
-        let first = bound_and_spill("abcdefghij", 4, dir.path(), "tool-x.txt");
+        let (first, _) = bound_and_spill_digest("abcdefghij", 4, dir.path(), "tool-x.txt");
         assert!(first.contains("tool-x.txt"));
         assert_eq!(std::fs::read_to_string(dir.path().join("tool-x.txt")).unwrap(), "abcdefghij");
         // A second result reusing the same name (e.g. a retried tool-call ID)
         // must not clobber the first: it reserves a fresh suffixed name.
-        let second = bound_and_spill("klmnopqrst", 4, dir.path(), "tool-x.txt");
+        let (second, _) = bound_and_spill_digest("klmnopqrst", 4, dir.path(), "tool-x.txt");
         assert!(second.contains("tool-x-2.txt"));
         assert_eq!(std::fs::read_to_string(dir.path().join("tool-x.txt")).unwrap(), "abcdefghij");
         assert_eq!(std::fs::read_to_string(dir.path().join("tool-x-2.txt")).unwrap(), "klmnopqrst");

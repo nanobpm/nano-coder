@@ -51,6 +51,23 @@ pub enum RepeatVerdict {
     HardStop(String),
 }
 
+/// Out-of-band content identity for one tool call's result, supplied by the
+/// producer rather than parsed out of the rendered text (issue #65).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ContentHashes<'a> {
+    /// Content hashes of any image attachments on the result: a `read_file` of
+    /// a *changing* image returns identical metadata text while the bytes
+    /// differ, so the fingerprint must fold these in to tell the calls apart.
+    pub attachments: &'a [&'a str],
+    /// The bounder-supplied content digest of each capture it truncated and
+    /// spilled while producing this result (`bash::run_digest`,
+    /// `output::bound_and_spill_digest`, `history::read_digest`). Carrying the
+    /// digest out of band is what lets the fingerprint normalise the marker's
+    /// volatile per-call path without trusting a digest parsed out of the
+    /// rendered — model-influenceable — text.
+    pub spills: &'a [&'a str],
+}
+
 /// Wrap reminder text in `<system-reminder>` tags.
 pub fn wrap(text: &str) -> String {
     format!("<system-reminder>\n{text}\n</system-reminder>")
@@ -191,11 +208,15 @@ impl Reminders {
     /// (issue #65). Passing the full raw malformed text as `raw_args` keeps
     /// those argument changes visible in the fingerprint; a well-formed call
     /// passes `None` and fingerprints its decoded `args`.
-    /// `attachments` carries the content hashes of any image attachments on the
-    /// result, so a `read_file` of a *changing* image — whose `result` text is
-    /// only the metadata (MIME type, dimensions, encoded size) and so identical
-    /// across calls — is still told apart by the bytes the model actually
-    /// received (issue #65). Pass an empty slice for a text-only result.
+    /// `hashes` carries the out-of-band content identity for the result (see
+    /// [`ContentHashes`]): the content hash of each image attachment, and the
+    /// bounder-supplied digest of each spilled capture. Passing the spill digest
+    /// out of band is what lets the fingerprint normalise the marker's volatile
+    /// per-call path without ever trusting a digest parsed out of the rendered —
+    /// model-influenceable — text: an embedded look-alike marker in the output
+    /// can no longer hide the genuine marker's digest behind a greedy regex
+    /// match (issue #65). Pass `ContentHashes::default()` for a plain text
+    /// result with no attachments and no known spill.
     pub fn after_repeat_call(
         &mut self,
         tool: &str,
@@ -203,13 +224,13 @@ impl Reminders {
         raw_args: Option<&str>,
         ok: bool,
         result: &str,
-        attachments: &[&str],
+        hashes: ContentHashes,
     ) -> RepeatVerdict {
         if REPEAT_EXEMPT_TOOLS.contains(&tool) {
             self.reset_repeat();
             return RepeatVerdict::None;
         }
-        let key = repeat_key(tool, args, raw_args, ok, result, attachments);
+        let key = repeat_key(tool, args, raw_args, ok, result, hashes);
         let cmd = (tool == "bash")
             .then(|| args.get("command").and_then(Value::as_str))
             .flatten()
@@ -270,20 +291,32 @@ impl Reminders {
 /// `raw_args`, when present, replaces the (empty) decoded arguments in the
 /// fingerprint — it carries the full malformed argument text so two distinct
 /// malformed payloads are not conflated (see `after_repeat_call_full`).
-fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result: &str, attachments: &[&str]) -> String {
+/// `hashes.spills` carries the bounder-supplied digest of each spilled capture
+/// (see [`ContentHashes`]); when it is non-empty the marker's volatile path is
+/// normalised *without* trusting any digest inside the rendered text.
+fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result: &str, hashes: ContentHashes) -> String {
     let args = match raw_args {
         Some(raw) => raw.to_string(),
         None => normalised_args(tool, args),
     };
-    let result = normalise_spill_paths(result);
+    let result = normalise_spill_paths(result, hashes.spills);
     let mut hasher = sha2::Sha256::new();
     hasher.update(result.as_bytes());
     // Fold each attachment's content hash into the result fingerprint, so a
     // changing image (identical metadata text, different bytes) is told apart
     // by what the model actually received (issue #65).
-    for sha in attachments {
+    for sha in hashes.attachments {
         hasher.update(b"\x00img:");
         hasher.update(sha.as_bytes());
+    }
+    // Fold each bounder-supplied spill digest in too: the digest is the
+    // complete capture's identity, so two bounded previews whose head, tail
+    // and byte count match but whose truncated-away content differs are told
+    // apart without the fingerprint ever parsing the marker's digest out of
+    // the rendered (model-influenceable) text (issue #65).
+    for digest in hashes.spills {
+        hasher.update(b"\x00spill:");
+        hasher.update(digest.as_bytes());
     }
     let mut result_hash = [0u8; 8];
     result_hash.copy_from_slice(&hasher.finalize()[..8]);
@@ -300,67 +333,133 @@ fn repeat_key(tool: &str, args: &Value, raw_args: Option<&str>, ok: bool, result
 /// normalised, never arbitrary output: genuine content that merely resembles a
 /// spill name (e.g. `created tool-a.txt` vs `created tool-b.txt`) must stay
 /// distinct, or a changing result would be conflated into a false repeat.
-fn normalise_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
+///
+/// `spills` is the bounder-supplied digest of each capture it spilled while
+/// producing this result (see `after_repeat_call`). When it is non-empty the
+/// normaliser knows the marker is genuine and rewrites it with a
+/// **non-greedy, digest-free** pattern — the spill's identity rides in
+/// `spills`, so nothing here trusts a digest parsed out of the rendered text,
+/// and a non-greedy match can never span from an embedded look-alike marker
+/// across the genuine one (the greedy-match hole this closes, issue #65).
+/// When it is empty (a caller that does not thread the bounder's digest
+/// through) the normaliser falls back to the stricter digest-requiring greedy
+/// pattern, which still tells two previews apart by the digest inside the
+/// marker.
+fn normalise_spill_paths<'a>(result: &'a str, spills: &[&'a str]) -> std::borrow::Cow<'a, str> {
+    if !spills.is_empty() {
+        return normalise_known_spill_paths(result);
+    }
+    normalise_rendered_spill_paths(result)
+}
+
+/// Normalise the spill marker when the bounder has already identified the
+/// spill out of band (`spills` is non-empty): the marker is genuine, so only
+/// its volatile path needs collapsing — its identity (the content digest)
+/// rides in `spills`, never in the rendered text. Two rewrites run in order:
+///
+/// 1. strip the marker's `(sha256:<hex>)` digest, turning the genuine marker
+///    into its digest-free form (`bytes truncated; complete output in …`);
+/// 2. collapse the now-digest-free marker's per-call path with a **non-greedy**
+///    match.
+///
+/// Both steps are safe against the embedded-marker attack (issue #65):
+///
+/// * step 2 is non-greedy, so it can never span from an embedded look-alike
+///   marker across the genuine one (the greedy-match hole this closes);
+/// * step 2 is digest-free, so it can never *start* on a genuine
+///   digest-carrying marker that step 1 did not rewrite — every real marker
+///   carries `(sha256:<hex>)` between the byte count and `; complete output
+///   in`, which the digest-free pattern does not match. The only digest-free
+///   markers are the ones step 1 just produced (and digest-free look-alike
+///   content, which is not a bounder marker and carries no identity anyway).
+///
+/// The basename is a single extension component: the bounder only ever names
+/// the spill `bash-<n>.stdout`/`.stderr` (`bash.rs`), `tool-<id>-<name>.txt`
+/// (`agent.rs`) or `history-<id>.txt` (`history.rs`), all sanitised to a
+/// single extension dot (`sanitize` in `agent.rs` maps every other character
+/// to `_`), and `reserve_and_write` suffixes a collision onto the *stem*
+/// (`bash-3-2.stdout`), so the basename always carries exactly one dot.
+fn normalise_known_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    static DIGEST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static KNOWN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Step 1: drop the digest from the genuine marker (non-greedy, so it stays
+    // inside the one marker).
+    let stripped = DIGEST
+        .get_or_init(|| {
+            regex::Regex::new(r"bytes truncated \(sha256:[0-9a-f]+\); complete output in")
+                .expect("spill-digest regex is valid")
+        })
+        .replace_all(result, "bytes truncated; complete output in");
+    // Step 2: collapse the volatile path of the (now digest-free) marker.
+    let re = KNOWN.get_or_init(|| {
+        regex::Regex::new(
+            r"(bytes truncated); complete output in (?:.+?[/\\])?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
+        )
+        .expect("known-spill-path regex is valid")
+    });
+    match stripped {
+        Cow::Borrowed(s) => re.replace_all(s, "${1}<spill>${2}"),
+        Cow::Owned(s) => Cow::Owned(re.replace_all(&s, "${1}<spill>${2}").into_owned()),
+    }
+}
+
+/// Normalise the spill marker from the rendered text alone, for a caller that
+/// does not thread the bounder's digest through. The marker is
+/// `...<n> bytes truncated[ (sha256:<hex>)]; complete output in <path>...`,
+/// where the path's own `...` is the terminator that precedes the tail. Anchor
+/// on the *complete* marker and the generated final path component, not on
+/// "the first/last `...`" or "the first extension" — all are wrong:
+///
+/// * A bare `complete output in <path>...` match (no `bytes truncated` prefix)
+///   also fires on *ordinary output* that merely quotes the phrase (`complete
+///   output in report-a.txt...`), normalising a result that is not a bounder
+///   marker and erasing a genuine change into a false repeat. Require the
+///   `bytes truncated` prefix.
+/// * A non-greedy `.+?(\.\.\.)` stops at the *first* `...`, so a `session_dir`
+///   that itself contains `...` (e.g. `/tmp/cache...v1`) leaves the per-call
+///   basename (`bash-3.stdout`) in the hash and the runaway never fires
+///   (issue #65).
+/// * A non-greedy `.+?\.(?:stdout|stderr|txt)` stops at the *first* extension,
+///   so a `session_dir` ending in one (`/tmp/cache.txt...v1`) leaves
+///   `bash-3.stdout` in the hash.
+/// * A non-greedy `.+?(?:bash|tool|history)-…` still stops at the first
+///   *directory segment* that happens to look like a generated spill name — a
+///   `session_dir` such as `/tmp/tool-cache.txt...v1` matches
+///   `tool-cache.txt...` and leaves the real `bash-3.stdout` in the hash, so
+///   identical runaway loops are never detected. A directory segment *can*
+///   start `bash-`/`tool-`/`history-`, carry a spill extension, and be
+///   followed by `...`, so "a directory never matches the generated pattern"
+///   is a false assumption.
+///
+/// The bounder only ever names the spill `bash-<n>.stdout`/`.stderr`
+/// (`bash.rs`), `tool-<id>-<name>.txt` (`agent.rs`) or `history-<id>.txt`
+/// (`history.rs`), all sanitised to a single extension dot (`sanitize` in
+/// `agent.rs` maps every other character to `_`), and it is always the *final*
+/// path component (joined under the spill dir). So match the generated
+/// component **greedily, at a path-separator boundary** —
+/// `(?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:…)` — which skips every
+/// earlier directory segment (even one that resembles a spill name) and
+/// anchors on the last `/`-separated component before the terminating `...`.
+/// `.` excludes newlines, so the match stays on the marker's own line; the
+/// path may contain spaces (a `\S+` match would silently fail on a session_dir
+/// with spaces).
+///
+/// The digest is *required* here: it is what proves the text is a real bounder
+/// marker rather than ordinary output that merely quotes `N bytes truncated;
+/// complete output in <name>...`. Without it, two such ordinary results whose
+/// only difference is the quoted spill-looking name would normalise
+/// identically and hard-stop the turn on the fifth call (issue #65).
+///
+/// This greedy parse is only a fallback: a one-line result that *embeds* a
+/// valid-looking marker before the genuine outer marker can still let the
+/// greedy middle span both, keeping the embedded digest and erasing the outer
+/// one. That is exactly why the primary path (`normalise_known_spill_paths`)
+/// takes the spill's identity from the bounder out of band instead of parsing
+/// it from untrusted rendered text (issue #65).
+fn normalise_rendered_spill_paths(result: &str) -> std::borrow::Cow<'_, str> {
     static SPILL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SPILL.get_or_init(|| {
-        // The marker is `...<n> bytes truncated[ (sha256:<hex>)]; complete output
-        // in <path>...`, where the path's own `...` is the terminator that
-        // precedes the tail. Anchor on the *complete* marker and the generated
-        // final path component, not on "the first/last `...`" or "the first
-        // extension" — all are wrong:
-        //   * A bare `complete output in <path>...` match (no `bytes truncated`
-        //     prefix) also fires on *ordinary output* that merely quotes the
-        //     phrase (`complete output in report-a.txt...`), normalising a
-        //     result that is not a bounder marker and erasing a genuine change
-        //     into a false repeat. Require the `bytes truncated` prefix.
-        //   * A non-greedy `.+?(\.\.\.)` stops at the *first* `...`, so a
-        //     `session_dir` that itself contains `...` (e.g. `/tmp/cache...v1`)
-        //     leaves the per-call basename (`bash-3.stdout`) in the hash and the
-        //     runaway never fires (issue #65).
-        //   * A non-greedy `.+?\.(?:stdout|stderr|txt)` stops at the *first*
-        //     extension, so a `session_dir` ending in one (`/tmp/cache.txt...v1`)
-        //     leaves `bash-3.stdout` in the hash.
-        //   * A non-greedy `.+?(?:bash|tool|history)-…` still stops at the first
-        //     *directory segment* that happens to look like a generated spill
-        //     name — a `session_dir` such as `/tmp/tool-cache.txt...v1` matches
-        //     `tool-cache.txt...` and leaves the real `bash-3.stdout` in the
-        //     hash, so identical runaway loops are never detected (the finding
-        //     this fix closes). A directory segment *can* start `bash-`/`tool-`/
-        //     `history-`, carry a spill extension, and be followed by `...`, so
-        //     "a directory never matches the generated pattern" is a false
-        //     assumption.
-        // The bounder only ever names the spill `bash-<n>.stdout`/`.stderr`
-        // (`bash.rs`), `tool-<id>-<name>.txt` (`agent.rs`) or
-        // `history-<id>.txt` (`history.rs`), all sanitised to a single extension
-        // dot (`sanitize` in `agent.rs` maps every other character to `_`), and
-        // it is always the *final* path component (joined under the spill dir).
-        // So match the generated component **greedily, at a path-separator
-        // boundary** — `(?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:…)` — which
-        // skips every earlier directory segment (even one that resembles a spill
-        // name) and anchors on the last `/`-separated component before the
-        // terminating `...`. `.` excludes newlines, so the match stays on the
-        // marker's own line; the path may contain spaces (a `\S+` match would
-        // silently fail on a session_dir with spaces).
-        //
-        // Greedy matching is safe because the marker carries a mandatory
-        // `(sha256:<hex>)` digest distinguishing the output's content between the
-        // byte count and `; complete output in` (see `bound_parts`), and the
-        // capture keeps the byte count *and* that digest (group 1 ends just before
-        // `; complete output in`). Every path-bearing marker carries this digest
-        // (`bound_and_spill`/`bash.rs` always pass one), so the digest is
-        // *required* here: it is what proves the text is a real bounder marker
-        // rather than ordinary output that merely quotes `N bytes truncated;
-        // complete output in <name>...`. Without it, two such ordinary results
-        // whose only difference is the quoted spill-looking name would normalise
-        // identically and hard-stop the turn on the fifth call (issue #65). Two
-        // outputs that differ *anywhere* — truncated middle or bounded tail —
-        // carry different digests and already produce different fingerprints:
-        // the path match only has to collapse the volatile basename of
-        // *genuinely identical* outputs, whose tails are identical, so even if a
-        // greedy match reached a spill-looking token in the tail it would do so
-        // identically for both. A non-greedy match cannot fail *closed* here,
-        // but it can fail *open* on the directory-segment case above, so
-        // greedy-to-the-last-component is strictly more correct.
         regex::Regex::new(
             r"(bytes truncated \(sha256:[0-9a-f]+\)); complete output in (?:.+[/\\])?(?:bash|tool|history)-[\w-]*\.(?:stdout|stderr|txt)(\.\.\.)",
         )
@@ -619,11 +718,11 @@ mod tests {
     }
 
     fn repeats(r: &mut Reminders, n: usize) -> Vec<RepeatVerdict> {
-        (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[])).collect()
+        (0..n).map(|_| r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default())).collect()
     }
 
     fn repeats_call(r: &mut Reminders, tool: &str, n: usize, ok: bool, result: &str) -> Vec<RepeatVerdict> {
-        (0..n).map(|_| r.after_repeat_call(tool, &json!({}), None, ok, result, &[])).collect()
+        (0..n).map(|_| r.after_repeat_call(tool, &json!({}), None, ok, result, ContentHashes::default())).collect()
     }
 
     #[test]
@@ -659,7 +758,7 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("make test {i}")}), None, false, "x", &[]),
+                r.after_repeat_call("bash", &json!({"command": format!("make test {i}")}), None, false, "x", ContentHashes::default()),
                 RepeatVerdict::None
             );
         }
@@ -667,7 +766,7 @@ mod tests {
         let mut r = Reminders::default();
         for i in 0..REPEAT_WARN_AFTER * 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, &format!("exit {i}"), &[]),
+                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, &format!("exit {i}"), ContentHashes::default()),
                 RepeatVerdict::None
             );
         }
@@ -682,7 +781,7 @@ mod tests {
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::HardStop(_)));
         // …and the hard stop keeps firing while the loop continues.
         assert!(matches!(
-            r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[]),
+            r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default()),
             RepeatVerdict::HardStop(_)
         ));
     }
@@ -698,7 +797,7 @@ mod tests {
         let warn = |r: &mut Reminders, cmd: &str| {
             let mut last = RepeatVerdict::None;
             for _ in 0..REPEAT_WARN_AFTER {
-                last = r.after_repeat_call("bash", &json!({"command": cmd}), None, false, "exit 1", &[]);
+                last = r.after_repeat_call("bash", &json!({"command": cmd}), None, false, "exit 1", ContentHashes::default());
             }
             last
         };
@@ -708,12 +807,12 @@ mod tests {
         // neither warn (budget spent) nor hard-stop (not enough of *this* key).
         let mut verdicts = Vec::new();
         for _ in 0..REPEAT_HARD_STOP_AFTER - 1 {
-            verdicts.push(r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", &[]));
+            verdicts.push(r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", ContentHashes::default()));
         }
         assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "fresh key must not hard-stop early: {verdicts:?}");
         // Only the `REPEAT_HARD_STOP_AFTER`-th consecutive C hard-stops.
         assert!(matches!(
-            r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", &[]),
+            r.after_repeat_call("bash", &json!({"command": "cmd c"}), None, false, "exit 1", ContentHashes::default()),
             RepeatVerdict::HardStop(_)
         ));
     }
@@ -724,7 +823,7 @@ mod tests {
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
             .map(|i| {
                 let suffix = if i == 1 { String::new() } else { " | wc -l".repeat(i - 1) };
-                r.after_repeat_call("bash", &json!({"command": format!("gh pr diff 1{suffix}")}), None, true, "1", &[])
+                r.after_repeat_call("bash", &json!({"command": format!("gh pr diff 1{suffix}")}), None, true, "1", ContentHashes::default())
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -741,7 +840,7 @@ mod tests {
         let mut r = Reminders::default();
         for q in ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"] {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), None, true, "", &[]),
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | grep {q}")}), None, true, "", ContentHashes::default()),
                 RepeatVerdict::None,
                 "query {q} must not count as a repeat",
             );
@@ -765,7 +864,7 @@ mod tests {
                     None,
                     true,
                     "ok",
-                    &[]
+                    ContentHashes::default()
                 ),
                 RepeatVerdict::None,
                 "timeout {t} must not count as a repeat",
@@ -780,7 +879,7 @@ mod tests {
                     None,
                     true,
                     "ok",
-                    &[]
+                    ContentHashes::default()
                 ),
                 RepeatVerdict::None,
                 "max_output_length {m} must not count as a repeat",
@@ -796,7 +895,7 @@ mod tests {
                     None,
                     true,
                     "ok",
-                    &[],
+                    ContentHashes::default(),
                 )
             })
             .collect();
@@ -819,7 +918,7 @@ mod tests {
             // identical 300-char error preview, but a distinct raw payload.
             let raw = format!("{prefix}payload-{i}");
             assert_eq!(
-                r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", &[]),
+                r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", ContentHashes::default()),
                 RepeatVerdict::None,
                 "payload {i} must not count as a repeat",
             );
@@ -828,7 +927,7 @@ mod tests {
         let mut r = Reminders::default();
         let raw = format!("{prefix}same");
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
-            .map(|_| r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", &[]))
+            .map(|_| r.after_repeat_call("bash", &json!({}), Some(&raw), false, "malformed JSON", ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -839,7 +938,7 @@ mod tests {
             let mut r = Reminders::default();
             assert!(
                 (0..REPEAT_WARN_AFTER + 1)
-                    .all(|_| r.after_repeat_call(tool, &json!({}), None, true, "ok", &[]) == RepeatVerdict::None)
+                    .all(|_| r.after_repeat_call(tool, &json!({}), None, true, "ok", ContentHashes::default()) == RepeatVerdict::None)
             );
         }
         let mut r = Reminders::default();
@@ -859,10 +958,10 @@ mod tests {
         let mut r = Reminders::default();
         for _ in 0..REPEAT_WARN_AFTER + REPEAT_MAX_WARNINGS + 2 {
             assert_eq!(
-                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", &[]),
+                r.after_repeat_call("bash", &json!({"command": "make test"}), None, false, "exit 1", ContentHashes::default()),
                 RepeatVerdict::None
             );
-            assert_eq!(r.after_repeat_call("question", &json!({}), None, true, "ok", &[]), RepeatVerdict::None);
+            assert_eq!(r.after_repeat_call("question", &json!({}), None, true, "ok", ContentHashes::default()), RepeatVerdict::None);
         }
     }
 
@@ -887,7 +986,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -917,7 +1016,7 @@ mod tests {
                     None,
                     true,
                     &result(digests[n % digests.len()], n),
-                    &[],
+                    ContentHashes { spills: &digests[n % digests.len()..][..1], ..Default::default() },
                 )
             })
             .collect();
@@ -925,9 +1024,78 @@ mod tests {
         // And identical digests (genuinely identical full output) still repeat.
         let mut r2 = Reminders::default();
         let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa", n), &[]))
+            .map(|n| r2.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result("aa", n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
+    }
+
+    #[test]
+    fn an_embedded_marker_cannot_hide_the_outer_spill_digest() {
+        // The finding this closes (issue #65): a one-line result that *embeds*
+        // a valid-looking marker before the genuine outer spill marker. With
+        // the digest carried out of band (`spills`), the fingerprint must key
+        // on that real digest — never on a digest the greedy regex would have
+        // parsed out of the rendered text — so two outputs with *different*
+        // genuine outer digests are told apart even when their embedded text
+        // (and so the old greedy match) is identical.
+        let embedded = "note 9 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /tmp/nano-coder-9/bash-1.stdout...";
+        let result = |outer: &str, n: usize| {
+            format!("{embedded}...40 bytes truncated (sha256:{outer}); complete output in /tmp/nano-coder-9/bash-{n}.stdout...TAIL")
+        };
+        // Two genuinely different outputs (different real outer digests) whose
+        // embedded text is identical must NOT be conflated into a repeat.
+        let mut r = Reminders::default();
+        let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER + 1)
+            .map(|n| {
+                let outer = format!("{n:016x}");
+                r.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result(&outer, n),
+                    ContentHashes { spills: &[&outer], ..Default::default() },
+                )
+            })
+            .collect();
+        assert!(verdicts.iter().all(|v| *v == RepeatVerdict::None), "{verdicts:?}");
+        // And a genuinely identical output (same real outer digest each call,
+        // only the per-call spill filename varies) still repeats.
+        let mut r2 = Reminders::default();
+        let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
+            .map(|n| {
+                r2.after_repeat_call(
+                    "bash",
+                    &json!({"command": "cat big.log"}),
+                    None,
+                    true,
+                    &result("ffffffffffffffff", n),
+                    ContentHashes { spills: &["ffffffffffffffff"], ..Default::default() },
+                )
+            })
+            .collect();
+        assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
+    }
+
+    #[test]
+    fn a_known_spill_marker_is_normalised_without_its_digest() {
+        // With the digest supplied out of band, the marker's volatile path is
+        // collapsed by the non-greedy, digest-free pattern: the digest is
+        // stripped from the text (its identity rides in `spills`), and the
+        // per-call filename no longer reaches the hash.
+        let a = normalise_spill_paths(
+            "h...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-1.stdout...t",
+            &["aaaaaaaaaaaaaaaa"],
+        );
+        let b = normalise_spill_paths(
+            "h...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-9.stdout...t",
+            &["aaaaaaaaaaaaaaaa"],
+        );
+        assert_eq!(a, b);
+        // The digest-free rewrite cannot collide with a genuine digest-carrying
+        // marker: the digest-free pattern does not match `(sha256:…)`.
+        assert!(a.contains("<spill>"), "{a}");
+        assert!(!a.contains("aaaaaaaaaaaaaaaa"), "{a}");
     }
 
     #[test]
@@ -947,7 +1115,7 @@ mod tests {
                     None,
                     true,
                     text,
-                    &[&format!("sha{n:064}")],
+                    ContentHashes { attachments: &[&format!("sha{n:064}")], ..Default::default() },
                 )
             })
             .collect();
@@ -956,7 +1124,7 @@ mod tests {
         let mut r2 = Reminders::default();
         let sha = format!("{:064}", 7);
         let verdicts2: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|_| r2.after_repeat_call("read_file", &json!({"path": "pic.png"}), None, true, text, &[&sha]))
+            .map(|_| r2.after_repeat_call("read_file", &json!({"path": "pic.png"}), None, true, text, ContentHashes { attachments: &[&sha], ..Default::default() }))
             .collect();
         assert!(matches!(verdicts2.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts2:?}");
     }
@@ -971,7 +1139,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /tmp/nano-coder-9/history-3{suffix}.txt...TAIL", suffix = if n == 1 { String::new() } else { format!("-{n}") });
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), &[]))
+            .map(|n| r.after_repeat_call("history_read", &json!({"id": 3}), None, true, &result(n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -982,25 +1150,25 @@ mod tests {
         // collision `-N` suffix) all normalise to the same placeholder *inside
         // the marker*.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-99-2.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-3.stdout...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:aaaaaaaaaaaaaaaa); complete output in /t/bash-99-2.stdout...y", &[]),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-1.stderr...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-7.stderr...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-1.stderr...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:bbbbbbbbbbbbbbbb); complete output in /t/bash-7.stderr...y", &[]),
         );
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-abc123-read_file.txt...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-zz99-read_file.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-abc123-read_file.txt...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:cccccccccccccccc); complete output in /t/tool-zz99-read_file.txt...y", &[]),
         );
         // history_read spills as `history-<id>.txt`, with a collision `-N`
         // suffix on a repeat; those per-call names must also collapse (issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7.txt...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7-2.txt...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7.txt...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:dddddddddddddddd); complete output in /t/history-7-2.txt...y", &[]),
         );
         // Genuinely different content is still distinguished.
-        assert_ne!(normalise_spill_paths("alpha"), normalise_spill_paths("beta"));
+        assert_ne!(normalise_spill_paths("alpha", &[]), normalise_spill_paths("beta", &[]));
     }
 
     #[test]
@@ -1009,19 +1177,19 @@ mod tests {
         // `...N bytes truncated; complete output in …` marker must stay
         // distinct, or a changing result is conflated into a false repeat and
         // hard-stops the turn (issue #65).
-        assert_ne!(normalise_spill_paths("created tool-a.txt"), normalise_spill_paths("created tool-b.txt"));
-        assert_ne!(normalise_spill_paths("wrote bash-1.stdout"), normalise_spill_paths("wrote bash-2.stdout"));
+        assert_ne!(normalise_spill_paths("created tool-a.txt", &[]), normalise_spill_paths("created tool-b.txt", &[]));
+        assert_ne!(normalise_spill_paths("wrote bash-1.stdout", &[]), normalise_spill_paths("wrote bash-2.stdout", &[]));
         // Ordinary output that quotes `complete output in <name>.txt...` without
         // the `bytes truncated;` prefix is not a bounder marker and must not be
         // normalised, or a genuine change is erased into a false repeat.
         assert_ne!(
-            normalise_spill_paths("see complete output in report-a.txt... done"),
-            normalise_spill_paths("see complete output in report-b.txt... done"),
+            normalise_spill_paths("see complete output in report-a.txt... done", &[]),
+            normalise_spill_paths("see complete output in report-b.txt... done", &[]),
         );
         // The tail after the marker is preserved, so differing tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-1.stdout...tailA"),
-            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-2.stdout...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-1.stdout...tailA", &[]),
+            normalise_spill_paths("h...3 bytes truncated (sha256:eeeeeeeeeeeeeeee); complete output in /t/bash-2.stdout...tailB", &[]),
         );
         // A digest-less `N bytes truncated; complete output in <name>...` is NOT
         // a bounder marker — every real path-bearing marker carries its
@@ -1029,8 +1197,8 @@ mod tests {
         // is left untouched and stays distinct, never conflated into a false
         // repeat that hard-stops the turn (issue #65).
         assert_ne!(
-            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-1.stdout..."),
-            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-2.stdout..."),
+            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-1.stdout...", &[]),
+            normalise_spill_paths("wrote 3 bytes truncated; complete output in /tmp/bash-2.stdout...", &[]),
         );
     }
 
@@ -1041,14 +1209,14 @@ mod tests {
         // survives in the hash and the runaway never warns or hard-stops (the
         // `\S+`-based match silently failed here; issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-9.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-3.stdout...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:1111111111111111); complete output in /my dir/bash-9.stdout...y", &[]),
         );
         let mut r = Reminders::default();
         let result =
             |n: usize| format!("HEAD...40 bytes truncated (sha256:1111111111111111); complete output in /a b/nano-coder/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
     }
@@ -1062,16 +1230,16 @@ mod tests {
         // match would wrongly take at the directory's dots, leaving each
         // per-call basename in the hash so the runaway never fired — issue #65).
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-4.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-3.stdout...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-4.stdout...y", &[]),
         );
         // A session_dir whose segment ends in a spill *extension* (e.g.
         // `/tmp/cache.txt...v1`) must not stop the match at the directory's
         // `.txt...` either — only the generated `bash-`/`tool-` final component
         // terminates the path.
         assert_eq!(
-            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-3.stdout...y"),
-            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-4.stdout...y"),
+            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-3.stdout...y", &[]),
+            normalise_spill_paths("x...3 bytes truncated (sha256:3333333333333333); complete output in /tmp/cache.txt...v1/bash-4.stdout...y", &[]),
         );
         // A session_dir whose segment *is itself* a generated-looking spill name
         // — `/tmp/tool-cache.txt...v1` or `/tmp/history-x.txt...v1` — must not be
@@ -1083,10 +1251,10 @@ mod tests {
             assert_eq!(
                 normalise_spill_paths(&format!(
                     "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-3.stdout...y"
-                )),
+                ), &[]),
                 normalise_spill_paths(&format!(
                     "x...3 bytes truncated (sha256:4444444444444444); complete output in /tmp/{dirseg}...v1/bash-4.stdout...y"
-                )),
+                ), &[]),
                 "directory segment {dirseg} must not be taken as the spill basename",
             );
         }
@@ -1094,7 +1262,7 @@ mod tests {
         let result =
             |n: usize| format!("HEAD...40 bytes truncated (sha256:2222222222222222); complete output in /tmp/cache...v1/bash-{n}.stdout...TAIL");
         let verdicts: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), &[]))
+            .map(|n| r.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result(n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
         // A generated-looking directory segment is likewise collapsed end-to-end,
@@ -1104,7 +1272,7 @@ mod tests {
             format!("HEAD...40 bytes truncated (sha256:7777777777777777); complete output in /tmp/tool-cache.txt...v1/bash-{n}.stdout...TAIL")
         };
         let verdicts_dir: Vec<_> = (1..=REPEAT_WARN_AFTER)
-            .map(|n| r_dir.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result_dir(n), &[]))
+            .map(|n| r_dir.after_repeat_call("bash", &json!({"command": "cat big.log"}), None, true, &result_dir(n), ContentHashes::default()))
             .collect();
         assert!(matches!(verdicts_dir.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts_dir:?}");
         // The terminator stops at the spill basename's own `...`; the tail after
@@ -1113,14 +1281,14 @@ mod tests {
         // the marker's complete-output digest already tells genuinely different
         // outputs apart), so a `...` in the tail does not erase a real change.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailA"),
-            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailA", &[]),
+            normalise_spill_paths("h...3 bytes truncated (sha256:5555555555555555); complete output in /t/bash-1.stdout...tailB", &[]),
         );
         // Even when the tail itself contains `...`, the extension anchor keeps the
         // match on the spill basename, so distinct tails stay distinct.
         assert_ne!(
-            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...a...tailA"),
-            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...b...tailB"),
+            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...a...tailA", &[]),
+            normalise_spill_paths("h...3 bytes truncated (sha256:6666666666666666); complete output in /t/bash-1.stdout...b...tailB", &[]),
         );
     }
 
@@ -1168,7 +1336,7 @@ mod tests {
                     None,
                     true,
                     "",
-                    &[],
+                    ContentHashes::default(),
                 ),
                 RepeatVerdict::None,
             );
@@ -1230,7 +1398,7 @@ mod tests {
                     None,
                     true,
                     "",
-                    &[],
+                    ContentHashes::default(),
                 ),
                 RepeatVerdict::None,
             );
@@ -1247,7 +1415,7 @@ mod tests {
         let verdicts: Vec<_> = (0..REPEAT_WARN_AFTER)
             .map(|n| {
                 let tail = " | grep foo".repeat(n + 1);
-                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), None, true, "same", &[])
+                r.after_repeat_call("bash", &json!({"command": format!("cat log | sed s/a/b/{tail}")}), None, true, "same", ContentHashes::default())
             })
             .collect();
         assert!(matches!(verdicts.last().unwrap(), RepeatVerdict::Warning(_)), "{verdicts:?}");
@@ -1267,10 +1435,11 @@ mod tests {
                     None,
                     true,
                     "",
-                    &[],
+                    ContentHashes::default(),
                 ),
                 RepeatVerdict::None,
             );
         }
     }
 }
+

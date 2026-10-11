@@ -642,6 +642,11 @@ pub struct Agent {
     /// Where truncated tool output is kept whole (per session when persisted);
     /// shared with the bash tool.
     spill_dir: Arc<RwLock<std::path::PathBuf>>,
+    /// The content digests of the captures the most recent bash call truncated
+    /// and spilled, published by the bash tool so the loop detector gets each
+    /// spill's identity **out of band** rather than re-parsing the rendered
+    /// marker (issue #65).
+    spill_digests: Arc<std::sync::Mutex<Vec<String>>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
     /// Session-log size when the current turn began; the session-index update
@@ -787,6 +792,7 @@ impl Agent {
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
+            spill_digests: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_history_calls: 0,
             turn_log_offset: None,
             history_available: false,
@@ -2157,6 +2163,12 @@ impl Agent {
         self.spill_dir.clone()
     }
 
+    /// Slot the bash tool publishes each call's spilled-capture digests into,
+    /// so the loop detector reads them out of band (issue #65).
+    pub fn spill_digests_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+        self.spill_digests.clone()
+    }
+
     fn spill_dir(&self) -> std::path::PathBuf {
         self.spill_dir.read().unwrap().clone()
     }
@@ -3407,6 +3419,14 @@ impl Agent {
                 // a real dispatch (issue #92 scopes PostToolUse to tools that
                 // ran, including ones that then errored).
                 let mut dispatched = false;
+                // Each bounder spill's content digest, collected out of band at
+                // the point the result was produced (the bash capture reader via
+                // the shared slot, the `history_read` bound, or the generic
+                // tool-result bound below), so the loop detector's fingerprint
+                // can normalise the marker's volatile per-call path without ever
+                // trusting a digest parsed out of the rendered —
+                // model-influenceable — text (issue #65).
+                let mut spill_digests: Vec<String> = Vec::new();
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -3438,7 +3458,11 @@ impl Agent {
                     self.skills.load(&effective_call.arguments).map(Value::String)
                 } else if is_history_tool {
                     dispatched = true;
-                    self.run_history_tool(effective_call).map(Value::String)
+                    self.run_history_tool_digest(effective_call)
+                        .map(|(text, spilled)| {
+                            spill_digests.extend(spilled);
+                            Value::String(text)
+                        })
                 } else if is_memory_tool {
                     dispatched = true;
                     self.run_memory_tool(effective_call).map(Value::String)
@@ -3510,10 +3534,18 @@ impl Agent {
                     result_text.push_str(&nested);
                 }
                 // bash, read_file and load_skill bound their own output (and bash keeps the whole).
+                // A bash call publishes its spilled captures' digests into the
+                // shared slot (see `BashConfig::spill_digests`); take them so
+                // the loop detector gets each spill's identity out of band.
+                if tool_call.name == "bash" {
+                    spill_digests.extend(std::mem::take(&mut *self.spill_digests.lock().unwrap()));
+                }
                 if !matches!(tool_call.name.as_str(), "bash" | "read_file" | history::READ_TOOL) && !is_skill_tool {
                     let name = format!("tool-{}-{}.txt", sanitize(&tool_call.id), sanitize(&tool_call.name));
-                    result_text =
-                        output::bound_and_spill(&result_text, self.tool_output_limit, &self.spill_dir(), &name);
+                    let (bounded, spilled) =
+                        output::bound_and_spill_digest(&result_text, self.tool_output_limit, &self.spill_dir(), &name);
+                    result_text = bounded;
+                    spill_digests.extend(spilled);
                 }
                 // Claude Code PostToolUse hooks: add context for the model, or
                 // block with feedback. Combined with any PreToolUse context.
@@ -3566,13 +3598,16 @@ impl Agent {
                     // would be hard-stopped as an identical result (issue #65).
                     let attachment_shas: Vec<&str> =
                         attachments.iter().map(|a| a.sha256.as_str()).collect();
+                    let spill_sha_refs: Vec<&str> = spill_digests.iter().map(String::as_str).collect();
+                    let hashes =
+                        reminders::ContentHashes { attachments: &attachment_shas, spills: &spill_sha_refs };
                     match self.reminders.after_repeat_call(
                         &tool_call.name,
                         &effective_call.arguments,
                         tool_call.invalid_arguments(),
                         ok,
                         &result_text,
-                        &attachment_shas,
+                        hashes,
                     ) {
                         reminders::RepeatVerdict::None => {}
                         reminders::RepeatVerdict::Warning(note) => {
@@ -4108,7 +4143,10 @@ impl Agent {
         }
     }
 
-    fn run_history_tool(&mut self, call: &ToolCall) -> Result<String> {
+    /// Run a `history_search`/`history_read` call, also returning the digest of
+    /// the spill a `history_read` produced, so the loop detector gets the
+    /// spill's identity out of band (issue #65).
+    fn run_history_tool_digest(&mut self, call: &ToolCall) -> Result<(String, Option<String>)> {
         let path = self.session_path().ok_or_else(|| anyhow::anyhow!("no session log"))?.to_path_buf();
         self.turn_history_calls += 1;
         let read = call.name == history::READ_TOOL;
@@ -4117,9 +4155,9 @@ impl Agent {
             if read { stats.history_reads += 1 } else { stats.history_searches += 1 }
         }
         if read {
-            history::read(&path, &call.arguments, &self.spill_dir())
+            history::read_digest(&path, &call.arguments, &self.spill_dir())
         } else {
-            history::search(&path, &call.arguments)
+            history::search(&path, &call.arguments).map(|text| (text, None))
         }
     }
 
