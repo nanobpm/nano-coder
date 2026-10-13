@@ -849,12 +849,16 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // Yield stdin to the picker so the line reader does not
                         // race it for the answer keystrokes.
                         let gate = terminal.suspend_input();
+                        // The picker's clock is the user's, not the agent's:
+                        // stop counting working time while it owns the terminal.
+                        let work = WorkClock::pause(&renderer);
                         // `prompt_question` owns the gate: it clears it while
                         // holding the picker lock — immediately, or once a
                         // timed-out auto-answer worker frees stdin — so the
                         // reader never resumes while a dialoguer is still active.
                         let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
+                        drop(work);
                         // The picker wrote over the owned frame via dialoguer;
                         // force a full redraw so the next differential render
                         // isn't computed against stale screen coordinates. If an
@@ -871,8 +875,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         continue;
                     }
                     let gate = terminal.suspend_input();
+                    let work = WorkClock::pause(&renderer);
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
+                    drop(work);
                     // Repaint after the dialoguer picker clobbered the frame,
                     // deferred behind the picker lock so it never races an
                     // orphaned worker still parked on stdin (see above).
@@ -1141,6 +1147,33 @@ fn deferred_frame_resize(renderer: &std::sync::Arc<ui::Renderer>, picker_lock: s
         let _guard = picker_lock.lock_owned().await;
         renderer.frame_resize();
     });
+}
+
+/// Suspends the turn's working-time count for the lifetime of the guard, while
+/// someone else owns the terminal (a `question` from the agent, the turn cap).
+///
+/// A question is answered by the user, and the wait is not the agent working,
+/// so it must not inflate the `working 12s` count on the prompt. The guard
+/// brackets the picker call itself, so it also covers a picker waiting for the
+/// `picker_lock` that an earlier orphaned auto-answer worker still holds — that
+/// wait is a picker's, not the agent's either. Dropping the guard counts working
+/// time again.
+struct WorkClock {
+    renderer: std::sync::Arc<ui::Renderer>,
+}
+
+impl WorkClock {
+    /// Stop counting working time until the returned guard drops.
+    fn pause(renderer: &std::sync::Arc<ui::Renderer>) -> Self {
+        renderer.pause_work();
+        Self { renderer: renderer.clone() }
+    }
+}
+
+impl Drop for WorkClock {
+    fn drop(&mut self) {
+        self.renderer.resume_work();
+    }
 }
 
 /// Render a pending `question` and return the answer, plus an optional handle
@@ -3070,5 +3103,26 @@ mod tests {
         agent.set_mode(crate::mode::AgentMode::Normal);
         let msg = memory_command(&mut agent, "");
         assert!(msg.contains("/memory forget"), "normal-mode list offers forget hint: {msg}");
+    }
+
+    #[test]
+    fn the_work_clock_guard_brackets_a_picker() {
+        // The guard the question/cap pickers hold: the clock only counts while
+        // it is not held, and it is harmless when no turn is running (the
+        // picker paths run at the prompt too, and in legacy mode).
+        let renderer = ui::Renderer::frame_for_test();
+        renderer.begin_turn();
+        assert_eq!(renderer.work_paused_for_test(), Some(false), "a running turn counts working time");
+        {
+            let _work = WorkClock::pause(&renderer);
+            // While a picker holds the terminal the turn is still displayed, but
+            // the count is frozen: the wait is the user's, not the agent's.
+            assert_eq!(renderer.work_paused_for_test(), Some(true), "a picker pauses the working clock");
+        }
+        assert_eq!(renderer.work_paused_for_test(), Some(false), "dropping the guard resumes the working clock");
+        renderer.end_turn();
+        assert_eq!(renderer.work_paused_for_test(), None, "no turn, no clock");
+        // Idle/legacy: the guard is a no-op, not a panic.
+        let _work = WorkClock::pause(&renderer);
     }
 }

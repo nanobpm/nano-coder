@@ -8,12 +8,61 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 /// How long each spinner frame shows; the frame is redrawn this often.
 pub const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The turn's working clock: when the turn started, and how much of it was
+/// spent waiting for the user.
+///
+/// The count shown on the prompt is working time, not wall time: while a picker
+/// (the `question` tool, the turn cap) owns the terminal the clock is paused, so
+/// a question the user takes minutes to answer does not inflate the time the
+/// agent was said to be working. [`Clock::pause`] banks the run since the start
+/// and [`Clock::resume`] restarts from now, which keeps the interruption out of
+/// the total while it stays visible on the screen (a frozen spinner and a
+/// frozen `working 12s`) instead of the prompt flipping to `ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Clock {
+    /// When the current working run began (`None`: paused).
+    since: Option<Instant>,
+    /// Whole spans already completed by earlier runs of this turn.
+    banked: Duration,
+}
+
+impl Clock {
+    /// Start the clock at `now`.
+    fn started(now: Instant) -> Self {
+        Self { since: Some(now), banked: Duration::ZERO }
+    }
+
+    /// Working time so far at `now`: the banked spans plus the running one.
+    fn elapsed(&self, now: Instant) -> Duration {
+        match self.since {
+            Some(since) => self.banked + now.saturating_duration_since(since),
+            None => self.banked,
+        }
+    }
+
+    /// Stop counting: bank the run since the start. Idempotent, so overlapping
+    /// pauses (a nested picker) never bank the same span twice.
+    fn pause(&mut self, now: Instant) {
+        if let Some(since) = self.since.take() {
+            self.banked += now.saturating_duration_since(since);
+        }
+    }
+
+    /// Resume counting from `now`, keeping the banked spans.
+    fn resume(&mut self, now: Instant) {
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+}
+
 /// The prompt glyph: a cyan spinner while a turn runs, a green `›` when the
-/// harness is waiting for the user.
-fn prompt_glyph(busy_since: Option<Instant>) -> String {
-    match busy_since {
-        Some(started) => {
-            let frame = (started.elapsed().as_millis() / SPINNER_INTERVAL.as_millis()) as usize % SPINNER.len();
+/// harness is waiting for the user. A paused clock keeps its spinner: the turn
+/// still owns the prompt, it is just not accruing working time.
+fn prompt_glyph(busy: Option<(&Clock, Instant)>) -> String {
+    match busy {
+        Some((clock, now)) => {
+            let frame = (clock.elapsed(now).as_millis() / SPINNER_INTERVAL.as_millis()) as usize % SPINNER.len();
             format!("\x1b[38;5;117m{}\x1b[39m", SPINNER[frame])
         }
         None => "\x1b[38;5;114m›\x1b[39m".to_string(),
@@ -21,9 +70,9 @@ fn prompt_glyph(busy_since: Option<Instant>) -> String {
 }
 
 /// The dim hint after the cursor of an empty editor: whose turn it is.
-fn prompt_hint(busy_since: Option<Instant>) -> String {
-    match busy_since {
-        Some(started) => format!("working {} · Enter steers, Esc Esc cancels", elapsed_text(started.elapsed())),
+fn prompt_hint(busy: Option<(&Clock, Instant)>) -> String {
+    match busy {
+        Some((clock, now)) => format!("working {} · Enter steers, Esc Esc cancels", elapsed_text(clock.elapsed(now))),
         None => "ready · type a message, /help for commands".to_string(),
     }
 }
@@ -297,9 +346,10 @@ struct FrameState {
     /// and only restamps on submission, so mirror that by refreshing this only
     /// at a turn boundary.
     prompt_stamp: String,
-    /// When the running turn started; `None` while the prompt waits for the
-    /// user. Drives the busy spinner in place of the `›` prompt glyph.
-    busy_since: Option<Instant>,
+    /// The running turn's working clock; `None` while the prompt waits for the
+    /// user. Drives the busy spinner in place of the `›` prompt glyph, and
+    /// pauses while a picker owns the terminal (see [`Clock`]).
+    busy: Option<Clock>,
     /// A transient hint shown on the status bar (e.g. "(Ctrl-C again to
     /// exit)") instead of as a transcript item. Transient notes are
     /// cursor-relevant feedback: as a transcript item they would trigger a
@@ -355,7 +405,7 @@ impl Renderer {
             think: None,
             think_streamed: false,
             prompt_stamp: stamp(),
-            busy_since: None,
+            busy: None,
             transient: None,
             batch: false,
             transcript_version: 0,
@@ -609,15 +659,18 @@ impl Renderer {
                 lines
             }
         };
+        // One `now` for the whole frame, so the glyph and the hint cannot
+        // disagree about the elapsed second around a boundary.
+        let now = Instant::now();
         // Prefix the editor prompt with the timestamp when timestamps are on,
         // matching the legacy prompt so switching renderers keeps the setting.
         // Use the stamp captured at prompt start (not `stamp()`), so it stays
         // fixed while the user types rather than ticking every render.
-        let prompt = format!("{}{} ", fs.prompt_stamp, prompt_glyph(fs.busy_since));
+        let prompt = format!("{}{} ", fs.prompt_stamp, prompt_glyph(fs.busy.as_ref().map(|c| (c, now))));
         let mut editor = frame::editor_lines(&prompt, &fs.editor.0, fs.editor.1, width);
         // An empty editor says whose turn it is, after the cursor.
         if fs.editor.0.is_empty() {
-            let hint = prompt_hint(fs.busy_since);
+            let hint = prompt_hint(fs.busy.as_ref().map(|c| (c, now)));
             editor[0] = frame::fit_line(&format!("{} {DIM}{hint}{RESET}", editor[0]), width);
         }
         if let Some(indicator) = frame::queue_indicator(fs.queued, width) {
@@ -1168,7 +1221,7 @@ impl Renderer {
         // A turn starting supersedes any transient prompt-level hint.
         self.clear_transient();
         if let Some(fs) = self.frame.lock().unwrap().as_mut() {
-            fs.busy_since = Some(Instant::now());
+            fs.busy = Some(Clock::started(Instant::now()));
             self.frame_render(fs);
         }
         // Reset the truncation guard: it is raised only when a non-empty answer
@@ -1212,9 +1265,37 @@ impl Renderer {
     /// still reading the prompt). A no-op at the prompt and in legacy mode.
     pub fn tick(&self) {
         if let Some(fs) = self.frame.lock().unwrap().as_mut()
-            && fs.busy_since.is_some()
+            && fs.busy.is_some()
         {
             self.frame_render(fs);
+        }
+    }
+
+    /// Stop counting working time: a picker (the `question` tool, the turn cap)
+    /// now owns the terminal, and the time it takes the user to answer is not
+    /// the agent working. The turn still owns the prompt — the spinner and
+    /// `working 12s` stay on screen, held at their last drawn values — so this
+    /// paints nothing: the caller is about to hand the terminal to another
+    /// writer (`dialoguer`), which must stay the only one. A no-op at the
+    /// prompt and in legacy mode.
+    pub fn pause_work(&self) {
+        let Some(mut frame) = self.frame.lock().ok() else { return };
+        if let Some(fs) = frame.as_mut()
+            && let Some(busy) = fs.busy.as_mut()
+        {
+            busy.pause(Instant::now());
+        }
+    }
+
+    /// Count working time again after [`Self::pause_work`], when the picker has
+    /// returned the terminal. Idempotent, so a resume with no matching pause
+    /// leaves a running clock alone.
+    pub fn resume_work(&self) {
+        let Some(mut frame) = self.frame.lock().ok() else { return };
+        if let Some(fs) = frame.as_mut()
+            && let Some(busy) = fs.busy.as_mut()
+        {
+            busy.resume(Instant::now());
         }
     }
 
@@ -1227,7 +1308,7 @@ impl Renderer {
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
             // Back to the user: the prompt glyph stops spinning.
-            fs.busy_since = None;
+            fs.busy = None;
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
             self.frame_render(fs);
@@ -1899,7 +1980,7 @@ pub(crate) mod tests {
         /// Build a frame-mode renderer regardless of tty, for driving
         /// `frame_event` in tests. Rendering writes to stdout (captured by the
         /// test harness).
-        fn frame_for_test() -> Arc<Self> {
+        pub(crate) fn frame_for_test() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(State { at_line_start: true, ..Default::default() }),
                 status: None,
@@ -1909,6 +1990,14 @@ pub(crate) mod tests {
                 answer_segment_closed: AtomicBool::new(false),
                 frame: Mutex::new(Some(Self::fresh_frame())),
             })
+        }
+
+        /// Whether a frame-mode renderer's working clock is running (`Some(true)`),
+        /// paused by a picker (`Some(false)`) or absent because no turn is up
+        /// (`None`). Test hook for the picker guard.
+        #[cfg(test)]
+        pub(crate) fn work_paused_for_test(&self) -> Option<bool> {
+            self.frame.lock().unwrap().as_ref().and_then(|fs| fs.busy.map(|clock| clock.since.is_none()))
         }
 
         /// Build a legacy (non-frame) renderer for driving the legacy `event`
@@ -2261,13 +2350,68 @@ pub(crate) mod tests {
     #[test]
     fn the_prompt_spins_during_a_turn_and_shows_ready_after() {
         let r = Renderer::frame_for_test();
-        let busy = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().busy_since;
+        let busy = |r: &Renderer| r.frame.lock().unwrap().as_ref().unwrap().busy;
         assert_eq!(busy(&r), None);
         r.begin_turn();
         assert!(busy(&r).is_some(), "a turn marks the prompt busy");
         r.tick();
         r.end_turn();
         assert_eq!(busy(&r), None, "the prompt is back to the user");
+    }
+
+    #[test]
+    fn waiting_for_user_input_does_not_count_as_working_time() {
+        // A turn that asks a question: the time between `pause_work` (the
+        // picker taking the terminal) and `resume_work` (the answer arriving)
+        // is the user's, not the agent's, so it stays out of the count while
+        // the turn keeps the prompt.
+        let t0 = Instant::now();
+        let mut clock = Clock::started(t0);
+        assert_eq!(clock.elapsed(t0 + Duration::from_secs(3)), Duration::from_secs(3));
+        clock.pause(t0 + Duration::from_secs(3));
+        // The user deliberates for a minute; the frozen count does not move.
+        assert_eq!(clock.elapsed(t0 + Duration::from_secs(63)), Duration::from_secs(3));
+        clock.resume(t0 + Duration::from_secs(63));
+        // Working resumes from the banked 3s, not from the wall clock.
+        assert_eq!(clock.elapsed(t0 + Duration::from_secs(65)), Duration::from_secs(5));
+        clock.pause(t0 + Duration::from_secs(65));
+        // The visible text is the working time too, not wall time.
+        assert_eq!(elapsed_text(clock.elapsed(t0 + Duration::from_secs(300))), "5s");
+    }
+
+    #[test]
+    fn pausing_and_resuming_the_work_clock_is_idempotent() {
+        // Overlapping pickers must not bank the same span twice, and a resume
+        // with no pause must not restart a running clock.
+        let t0 = Instant::now();
+        let mut clock = Clock::started(t0);
+        clock.pause(t0 + Duration::from_secs(2));
+        clock.pause(t0 + Duration::from_secs(9));
+        assert_eq!(clock.banked, Duration::from_secs(2), "a second pause must not bank the same span twice");
+        clock.resume(t0 + Duration::from_secs(9));
+        clock.resume(t0 + Duration::from_secs(30));
+        assert_eq!(clock.since, Some(t0 + Duration::from_secs(9)), "a second resume must not restart the clock");
+        assert_eq!(clock.elapsed(t0 + Duration::from_secs(31)), Duration::from_secs(24));
+    }
+
+    #[test]
+    fn a_paused_work_clock_freezes_the_prompt_and_resumes() {
+        let r = Renderer::frame_for_test();
+        r.begin_turn();
+        let elapsed = |r: &Renderer| {
+            let frame = r.frame.lock().unwrap();
+            frame.as_ref().unwrap().busy.unwrap().elapsed(Instant::now())
+        };
+        // A pause stops the count: no time passes into it while the picker owns
+        // the terminal, and the prompt keeps its spinner (the turn is still up).
+        r.pause_work();
+        std::thread::sleep(Duration::from_millis(15));
+        let frozen = elapsed(&r);
+        assert!(frozen < Duration::from_millis(10), "a paused clock banks no wait: {frozen:?}");
+        assert!(r.frame.lock().unwrap().as_ref().unwrap().busy.is_some(), "the prompt still shows the working turn");
+        r.resume_work();
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(elapsed(&r) > frozen, "resuming counts working time again");
     }
 
     #[test]
@@ -2315,17 +2459,20 @@ pub(crate) mod tests {
 
     #[test]
     fn prompt_glyph_and_hint_say_whose_turn_it_is() {
-        let idle = visible_width_text(&prompt_glyph(None));
-        assert_eq!(idle, "›");
+        assert_eq!(visible_width_text(&prompt_glyph(None)), "›");
         assert!(prompt_hint(None).starts_with("ready"));
-        // The spinner frame follows the elapsed time.
-        let started = Instant::now() - SPINNER_INTERVAL * 3;
-        assert_eq!(visible_width_text(&prompt_glyph(Some(started))), SPINNER[3].to_string());
-        let started = Instant::now() - Duration::from_secs(65);
+        // The spinner frame follows the WORKING time, so a paused clock holds
+        // its frame instead of spinning on while the user reads the question.
+        let now = Instant::now();
+        let clock = Clock::started(now - SPINNER_INTERVAL * 3);
+        assert_eq!(visible_width_text(&prompt_glyph(Some((&clock, now)))), SPINNER[3].to_string());
+        let mut paused = Clock::started(now - Duration::from_secs(65));
+        paused.pause(now);
+        assert_eq!(visible_width_text(&prompt_glyph(Some((&paused, now)))), SPINNER[0].to_string());
         assert!(
-            prompt_hint(Some(started)).starts_with("working 1m 05s · Enter steers"),
+            prompt_hint(Some((&paused, now))).starts_with("working 1m 05s · Enter steers"),
             "{}",
-            prompt_hint(Some(started))
+            prompt_hint(Some((&paused, now)))
         );
         assert_eq!(elapsed_text(Duration::from_secs(4)), "4s");
     }
