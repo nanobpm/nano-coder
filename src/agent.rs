@@ -5978,6 +5978,11 @@ mod tests {
     /// An agent with `window` tokens of context, `max_tokens = 16384`, a
     /// threshold high enough that only the output reservation can trigger
     /// compaction, and a `big` tool returning `chars` characters.
+    ///
+    /// Memory is off and its directory is pinned under `dir`: the default store
+    /// lives in the user's real data directory, so leaving it enabled would leak
+    /// the machine's own memories into the system prompt and with them into the
+    /// token estimates these tests assert on.
     fn budgeted_agent(
         responses: Vec<LLMResponse>,
         window: usize,
@@ -5990,6 +5995,8 @@ mod tests {
             session_dir: Some(dir.to_path_buf()),
             project_instructions: false,
             skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            memory_dir: Some(dir.join("memory")),
+            memory: crate::config::MemoryMode::Off,
             context_window: Some(window),
             auto_compact_threshold: 0.99,
             max_tokens: 16_384,
