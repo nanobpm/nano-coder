@@ -1150,7 +1150,8 @@ fn deferred_frame_resize(renderer: &std::sync::Arc<ui::Renderer>, picker_lock: s
 }
 
 /// Suspends the turn's working-time count for the lifetime of the guard, while
-/// someone else owns the terminal (a `question` from the agent, the turn cap).
+/// the turn is blocked waiting for a picker (a `question` from the agent, the
+/// turn cap).
 ///
 /// A question is answered by the user, and the wait is not the agent working,
 /// so it must not inflate the `working 12s` count on the prompt. The guard

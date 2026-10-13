@@ -848,9 +848,9 @@ settles on one clean redraw. The `/` command menu is drawn under the input edito
 the frame. The prompt shows whose turn it is: a green `›` with a dim `ready` hint
 when nano-coder is waiting for you, and a spinner with `working 12s · Enter steers, Esc Esc
 cancels` while a turn runs (the hint shows while the input is empty). The `working` count is
-working time, not wall time: while a picker owns the terminal — the agent asking a question,
-or the turn-cap prompt — the clock pauses, so the time you spend answering does not inflate
-it. It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
+working time, not wall time: while the turn is blocked waiting for a picker — the agent
+asking a question, or the turn-cap prompt — the clock pauses, so the time you spend
+answering does not inflate it. It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
 `/settings`) switches back to the scroll-region renderer, where the terminal owns the
 scrollback and reflows history itself on a resize, with the status line pinned to the bottom.
 

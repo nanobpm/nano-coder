@@ -11,13 +11,14 @@ pub const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// The turn's working clock: when the turn started, and how much of it was
 /// spent waiting for the user.
 ///
-/// The count shown on the prompt is working time, not wall time: while a picker
-/// (the `question` tool, the turn cap) owns the terminal the clock is paused, so
-/// a question the user takes minutes to answer does not inflate the time the
-/// agent was said to be working. [`Clock::pause`] banks the run since the start
-/// and [`Clock::resume`] restarts from now, which keeps the interruption out of
-/// the total while it stays visible on the screen (a frozen spinner and a
-/// frozen `working 12s`) instead of the prompt flipping to `ready`.
+/// The count shown on the prompt is working time, not wall time: while the
+/// turn is blocked waiting for a picker (the `question` tool, the turn cap)
+/// the clock is paused, so a question the user takes minutes to answer does
+/// not inflate the time the agent was said to be working. [`Clock::pause`]
+/// banks the run since the start and [`Clock::resume`] restarts from now,
+/// which keeps the interruption out of the total while it stays visible on
+/// the screen (a frozen spinner and a frozen `working 12s`) instead of the
+/// prompt flipping to `ready`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Clock {
     /// When the current working run began (`None`: paused).
@@ -348,7 +349,7 @@ struct FrameState {
     prompt_stamp: String,
     /// The running turn's working clock; `None` while the prompt waits for the
     /// user. Drives the busy spinner in place of the `›` prompt glyph, and
-    /// pauses while a picker owns the terminal (see [`Clock`]).
+    /// pauses while the turn is blocked waiting for a picker (see [`Clock`]).
     busy: Option<Clock>,
     /// A transient hint shown on the status bar (e.g. "(Ctrl-C again to
     /// exit)") instead of as a transcript item. Transient notes are
@@ -1271,13 +1272,13 @@ impl Renderer {
         }
     }
 
-    /// Stop counting working time: a picker (the `question` tool, the turn cap)
-    /// now owns the terminal, and the time it takes the user to answer is not
-    /// the agent working. The turn still owns the prompt — the spinner and
-    /// `working 12s` stay on screen, held at their last drawn values — so this
-    /// paints nothing: the caller is about to hand the terminal to another
-    /// writer (`dialoguer`), which must stay the only one. A no-op at the
-    /// prompt and in legacy mode.
+    /// Stop counting working time: the turn is now blocked waiting for a
+    /// picker (the `question` tool, the turn cap), and the time it takes the
+    /// user to answer is not the agent working. The turn still owns the
+    /// prompt — the spinner and `working 12s` stay on screen, held at their
+    /// last drawn values — so this paints nothing: the caller is about to
+    /// hand the terminal to another writer (`dialoguer`), which must stay
+    /// the only one. A no-op at the prompt and in legacy mode.
     pub fn pause_work(&self) {
         let Some(mut frame) = self.frame.lock().ok() else { return };
         if let Some(fs) = frame.as_mut()
@@ -1992,9 +1993,9 @@ pub(crate) mod tests {
             })
         }
 
-        /// Whether a frame-mode renderer's working clock is running (`Some(true)`),
-        /// paused by a picker (`Some(false)`) or absent because no turn is up
-        /// (`None`). Test hook for the picker guard.
+        /// Whether a frame-mode renderer's working clock is paused by a picker
+        /// (`Some(true)`), running (`Some(false)`) or absent because no turn is
+        /// up (`None`). Test hook for the picker guard.
         #[cfg(test)]
         pub(crate) fn work_paused_for_test(&self) -> Option<bool> {
             self.frame.lock().unwrap().as_ref().and_then(|fs| fs.busy.map(|clock| clock.since.is_none()))
@@ -2402,12 +2403,16 @@ pub(crate) mod tests {
             let frame = r.frame.lock().unwrap();
             frame.as_ref().unwrap().busy.unwrap().elapsed(Instant::now())
         };
-        // A pause stops the count: no time passes into it while the picker owns
-        // the terminal, and the prompt keeps its spinner (the turn is still up).
+        // A pause stops the count: the frozen value stays exactly what was
+        // banked at the pause, however long the picker keeps the terminal, and
+        // the prompt keeps its spinner (the turn is still up). Compare against
+        // the value captured right after pausing rather than a wall-clock
+        // bound: `begin_turn` renders before the pause, so a slow or preempted
+        // CI worker can legitimately bank more than any fixed threshold.
         r.pause_work();
-        std::thread::sleep(Duration::from_millis(15));
         let frozen = elapsed(&r);
-        assert!(frozen < Duration::from_millis(10), "a paused clock banks no wait: {frozen:?}");
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(elapsed(&r), frozen, "a paused clock banks no wait");
         assert!(r.frame.lock().unwrap().as_ref().unwrap().busy.is_some(), "the prompt still shows the working turn");
         r.resume_work();
         std::thread::sleep(Duration::from_millis(15));
