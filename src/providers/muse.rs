@@ -141,23 +141,64 @@ fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    // Write to a private temporary file in the same directory, then atomically
+    // rename it over `muse.json`. A `truncate(true)` on the live file would
+    // destroy the saved credentials before the replacement is written, so a
+    // mid-write failure (e.g. a full filesystem during an automatic refresh)
+    // leaves empty or partial JSON and the next client treats the user as
+    // logged out. The rename is atomic, so a reader sees either the old or the
+    // new file, never a torn one.
+    let tmp = path.with_extension("json.tmp");
+    let write_result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).with_context(|| format!("open {}", tmp.display()))?;
+        std::io::Write::write_all(&mut file, serde_json::to_string_pretty(credentials)?.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // Best-effort cleanup so a failed write never leaves a stray temp file.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
+    // `create + mode(0o600)` only sets permissions at creation; a `muse.json`
+    // restored or copied in with mode 0644 keeps it across the rename only if
+    // we do not tighten it here. Force 0600 on the final file so OAuth tokens
+    // and the API key are never left readable by other users.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
     }
-    let mut file = options.open(&path).with_context(|| format!("open {}", path.display()))?;
-    std::io::Write::write_all(&mut file, serde_json::to_string_pretty(credentials)?.as_bytes())?;
     Ok(path)
 }
 
 /// Fold a refreshed OAuth grant back into the stored credentials file so the
 /// rotated access/refresh tokens survive a restart. Best-effort: a write
 /// failure must not break an otherwise-working session.
-fn persist_rotated(grant: &OauthGrant) {
+///
+/// `prior` is the grant as it was *before* this refresh. If another process ran
+/// `--login muse` for a different account while this client stayed open, the
+/// credentials file now belongs to that newer login; folding our rotated tokens
+/// into it would clobber the new login's OAuth fields and silently switch the
+/// saved account back to ours on the next remint. The refresh token is the
+/// stable identity anchor across access-token rotations, so when the on-disk
+/// refresh token no longer matches the one we refreshed from, a newer login has
+/// replaced the original and we skip persistence entirely.
+fn persist_rotated(grant: &OauthGrant, prior: &OauthGrant) {
     let Some(mut credentials) = load_credentials() else { return };
+    if !same_login(&credentials, prior) {
+        return;
+    }
     credentials.oauth_token = grant.access_token.clone();
     if grant.refresh_token.is_some() {
         credentials.refresh_token = grant.refresh_token.clone();
@@ -166,6 +207,15 @@ fn persist_rotated(grant: &OauthGrant) {
         credentials.expires_at = grant.expires_at;
     }
     let _ = save_credentials(&credentials);
+}
+
+/// True when the on-disk credentials still belong to the login that `prior`
+/// (the pre-refresh grant) came from. The refresh token is the stable identity
+/// anchor across access-token rotations: a `--login muse` for another account
+/// writes a fresh refresh token, so a mismatch means a newer login has replaced
+/// the original and the stale refresh must not overwrite it.
+fn same_login(credentials: &StoredCredentials, prior: &OauthGrant) -> bool {
+    credentials.refresh_token == prior.refresh_token
 }
 
 fn with_client_headers(
@@ -514,7 +564,7 @@ impl MuseClient {
             let mut grant = grant.lock().await;
             if let Some(renewed) = refresh_grant(self.transport.http(), &self.endpoints, &grant).await {
                 if self.persist {
-                    persist_rotated(&renewed);
+                    persist_rotated(&renewed, &grant);
                 }
                 *grant = renewed;
             }
@@ -917,7 +967,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let provider = resolve(&format!("muse/{model}"), &user, "mock").unwrap();
+        let mut provider = resolve(&format!("muse/{model}"), &user, "mock").unwrap();
+        // `resolve` inherits a real `META_API_KEY` from the environment into
+        // `api_key`; on a configured developer machine that makes `session_key`
+        // take the direct-key early return and bypass the injected OAuth grant,
+        // so the mint/refresh assertions below never run. Clear it: these
+        // fixtures exercise the OAuth path specifically. (The explicit
+        // direct-key test keeps its own `api_key`.)
+        provider.api_key = None;
         let endpoints = Endpoints::for_bases(base, base);
         MuseClient::with_endpoints(provider, Some(grant("oauth-tok")), endpoints, None, false).unwrap()
     }
@@ -1074,6 +1131,35 @@ mod tests {
         .unwrap();
         assert_eq!(creds.api_key.as_deref(), Some("key"));
         assert_eq!(creds.refresh_token, None);
+    }
+
+    #[test]
+    fn persist_rotated_only_writes_for_the_same_login() {
+        // F2: a stale OAuth refresh must not fold its tokens into a credentials
+        // file a newer `--login muse` (another account) has since written. The
+        // refresh token is the identity anchor: a match persists, a mismatch
+        // (the newer login's fresh token) skips the write.
+        let creds = |rt: Option<&str>| StoredCredentials {
+            oauth_token: "tok".into(),
+            refresh_token: rt.map(str::to_string),
+            expires_at: None,
+            api_key: Some("key".into()),
+            api_base: None,
+            created_at: Utc::now(),
+        };
+        let grant = |rt: Option<&str>| OauthGrant {
+            access_token: "acc".into(),
+            refresh_token: rt.map(str::to_string),
+            expires_at: None,
+        };
+        // Same login (the refresh token survived the rotation): persist.
+        assert!(same_login(&creds(Some("rt-1")), &grant(Some("rt-1"))));
+        // A newer login wrote a different refresh token: skip.
+        assert!(!same_login(&creds(Some("rt-2")), &grant(Some("rt-1"))));
+        // A grant with no refresh token only matches a file that also has none.
+        assert!(same_login(&creds(None), &grant(None)));
+        assert!(!same_login(&creds(Some("rt-1")), &grant(None)));
+        assert!(!same_login(&creds(None), &grant(Some("rt-1"))));
     }
 
     #[test]
@@ -1288,7 +1374,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let provider = resolve("muse/muse-spark-1.3", &user, "mock").unwrap();
+        let mut provider = resolve("muse/muse-spark-1.3", &user, "mock").unwrap();
+        // As in `client_model`: drop any `META_API_KEY` inherited from the
+        // environment so the catalog request authenticates via the injected
+        // OAuth grant (minting a key) rather than a direct key.
+        provider.api_key = None;
         let client = MuseClient::with_endpoints(
             provider,
             Some(grant("oauth-tok")),
