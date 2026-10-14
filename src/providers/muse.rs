@@ -40,8 +40,9 @@ pub const DEFAULT_MINT_BASE: &str = "https://api.meta.ai";
 /// OpenAI-compatible chat endpoint, used when a provider entry carries no
 /// `base_url` override and no minted base url.
 pub const DEFAULT_API_BASE: &str = "https://api.meta.ai/v1";
-/// `x-api-version` sent on the key-mint request.
-pub const MINT_API_VERSION: &str = "1.0.0";
+/// `x-api-version` the Muse wire protocol sends on every endpoint: the OIDC
+/// device authorization and token poll, the key mint, and the model catalog.
+pub const MUSE_API_VERSION: &str = "1.0.0";
 
 /// OpenAI Chat Completions path, relative to the (minted) API base.
 const CHAT_PATH: &str = "/chat/completions";
@@ -170,6 +171,7 @@ pub async fn login() -> Result<PathBuf> {
     let client_id = client_id();
     let device: Value = with_client_headers(http.post(&endpoints.device_authorization), &Default::default())
         .header("Accept", "application/json")
+        .header("x-api-version", MUSE_API_VERSION)
         .form(&[("client_id", client_id.as_str())])
         .send()
         .await?
@@ -197,6 +199,7 @@ pub async fn login() -> Result<PathBuf> {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         let poll: Value = with_client_headers(http.post(&endpoints.token), &Default::default())
             .header("Accept", "application/json")
+            .header("x-api-version", MUSE_API_VERSION)
             .form(&[
                 ("client_id", client_id.as_str()),
                 ("device_code", device_code.as_str()),
@@ -209,7 +212,8 @@ pub async fn login() -> Result<PathBuf> {
         if let Some(token) = poll.get("access_token").and_then(Value::as_str) {
             let expires_at = poll.get("expires_in").and_then(Value::as_i64).map(|secs| Utc::now().timestamp() + secs);
             // Prove the account can actually mint a key before reporting success.
-            let minted = mint(&http, &endpoints, token).await?;
+            // Interactive login onboards: this may be a first-time account.
+            let minted = mint(&http, &endpoints, token, true).await?;
             let credentials = StoredCredentials {
                 oauth_token: token.to_string(),
                 refresh_token: poll.get("refresh_token").and_then(Value::as_str).map(str::to_string),
@@ -250,13 +254,15 @@ pub struct MintedKey {
     pub base_url: String,
 }
 
-/// Exchange a Muse OAuth access token for a Meta API key.
-pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) -> Result<MintedKey> {
+/// Exchange a Muse OAuth access token for a Meta API key. `onboard` is `true`
+/// only for the interactive `--login muse` mint (which may be a first-time
+/// account that must be onboarded); the silent 401 re-mints pass `false`.
+pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str, onboard: bool) -> Result<MintedKey> {
     let response = with_client_headers(http.post(&endpoints.mint), &Default::default())
         .header("Accept", "application/json")
-        .header("x-api-version", MINT_API_VERSION)
+        .header("x-api-version", MUSE_API_VERSION)
         .bearer_auth(oauth)
-        .json(&serde_json::json!({ "onboard": false }))
+        .json(&serde_json::json!({ "onboard": onboard }))
         .send()
         .await
         .context("Muse key mint")?;
@@ -297,7 +303,7 @@ pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) ->
 fn mint_refusal(status: u16, value: &Value, raw: &str) -> String {
     let field = |name: &str| value.get(name).and_then(Value::as_str).filter(|s| !s.is_empty());
     let detail = field("detail").or_else(|| field("title"));
-    let action = field("action_url");
+    let action = field("action_url").or_else(|| field("require_payment_action_url"));
     let payment = value.get("require_payment").and_then(Value::as_bool).unwrap_or(false);
     let mut message = match detail {
         Some(detail) => format!("Muse key mint refused (HTTP {status}): {detail}"),
@@ -393,7 +399,7 @@ impl MuseClient {
             return Ok(current.clone());
         }
         let oauth = self.oauth.as_deref().ok_or_else(|| anyhow!("no Muse credentials"))?;
-        let minted = mint(self.transport.http(), &self.endpoints, oauth).await?;
+        let minted = mint(self.transport.http(), &self.endpoints, oauth, false).await?;
         let fresh = SessionKey { api_key: minted.api_key, base_url: minted.base_url, refresh_at: i64::MAX };
         *session = Some(fresh.clone());
         Ok(fresh)
@@ -417,7 +423,8 @@ impl MuseClient {
         }
         let mut request = with_client_headers(request, &self.transport.provider().headers)
             .bearer_auth(&session.api_key)
-            .header("Accept", "application/json");
+            .header("Accept", "application/json")
+            .header("x-api-version", MUSE_API_VERSION);
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
@@ -495,6 +502,29 @@ fn is_hidden_row(row: &Value) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("hidden"))
 }
 
+/// Whether a catalog row is an image-*generation* model (Muse's
+/// `supports_image_generation`), as opposed to a chat model that accepts image
+/// *input*. The catalog has no Copilot-style `capabilities.supports.vision`
+/// schema; its image flag describes generation, not input.
+fn is_image_generation_row(row: &Value) -> bool {
+    row.get("supports_image_generation")
+        .or_else(|| row.get("supportsImageGeneration"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// A Muse chat model's vision support. Muse chat models accept image input, but
+/// the catalog carries no vision schema (its image flag is generation-only), so
+/// a normal chat row is reported vision-capable with default limits while an
+/// image-*generation* or hidden row reports no input vision. A configured
+/// `vision = false` override still wins over this in `vision::resolve`.
+fn muse_vision(row: &Value) -> Option<crate::vision::Vision> {
+    if is_image_generation_row(row) || is_hidden_row(row) {
+        return None;
+    }
+    Some(crate::vision::Vision::capable())
+}
+
 fn positive(row: &Value, keys: &[&str]) -> Option<usize> {
     keys.iter().find_map(|k| row.get(*k).and_then(Value::as_u64)).filter(|&n| n > 0).map(|n| n as usize)
 }
@@ -505,15 +535,20 @@ fn context_limit(row: &Value) -> Option<usize> {
     positive(row, &["context_limit", "contextLimit", "context_window", "contextWindow", "max_context_window_tokens"])
 }
 
-/// A row's reasoning-effort tiers: Muse's `reasoning_effort_variants` (`[{tier}]`
-/// or `["low", …]`), else a flat `reasoning_effort` list.
+/// A row's reasoning-effort tiers: Muse's `reasoning_effort_variants` (`[{tier}]`,
+/// `[{effort}]`, or `["low", …]`), else a flat `reasoning_effort` list. Muse's
+/// object shape carries the level under `effort` (e.g. `{ "effort": "high" }`).
 fn effort_levels(row: &Value) -> Option<Vec<String>> {
     let raw = ["reasoning_effort_variants", "reasoningEffortVariants", "reasoning_effort", "reasoningEffort"]
         .iter()
         .find_map(|k| row.get(*k).and_then(Value::as_array))?;
     let levels: Vec<String> = raw
         .iter()
-        .filter_map(|v| v.as_str().or_else(|| v.get("tier").and_then(Value::as_str)))
+        .filter_map(|v| {
+            v.as_str().or_else(|| {
+                ["tier", "effort"].iter().find_map(|k| v.get(*k).and_then(Value::as_str))
+            })
+        })
         .map(|level| match level.trim().to_ascii_lowercase().as_str() {
             "none" => "off".to_string(),
             other => other.to_string(),
@@ -620,7 +655,7 @@ impl LLMClient for MuseClient {
     async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let entry = self.model_entry(PROBE_TIMEOUT).await?;
-            crate::vision::Vision::from_model_entry(&entry)
+            muse_vision(&entry)
         })
         .await
         .ok()
@@ -639,7 +674,7 @@ impl LLMClient for MuseClient {
             let thinking = Reported::from_model_entry(&entry).or_else(|| {
                 effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
             });
-            let vision = crate::vision::Vision::from_model_entry(&entry);
+            let vision = muse_vision(&entry);
             Some((window, thinking, vision))
         })
         .await
@@ -654,7 +689,7 @@ impl LLMClient for MuseClient {
             let thinking = Reported::from_model_entry(&entry).or_else(|| {
                 effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
             });
-            let vision = crate::vision::Vision::from_model_entry(&entry);
+            let vision = muse_vision(&entry);
             Some((thinking, vision))
         })
         .await
@@ -904,6 +939,9 @@ mod tests {
         assert_eq!(effort_levels(&tiers), Some(vec!["low".to_string(), "high".to_string()]));
         let camel = json!({ "reasoningEffortVariants": ["none", "medium"] });
         assert_eq!(effort_levels(&camel), Some(vec!["off".to_string(), "medium".to_string()]));
+        // Muse's object shape carries the level under `effort` (e.g. `{ "effort": "high" }`).
+        let effort = json!({ "reasoning_effort_variants": [{ "effort": "low" }, { "effort": "high" }] });
+        assert_eq!(effort_levels(&effort), Some(vec!["low".to_string(), "high".to_string()]));
         assert_eq!(effort_levels(&json!({})), None);
     }
 
@@ -998,7 +1036,7 @@ mod tests {
         let (mint_srv, _) =
             test_server::serve(vec![(200, "", json!({ "api_key": "minted-key" }).to_string())]).await;
         let endpoints = Endpoints { mint: format!("{mint_srv}/muse-code/key"), ..endpoints };
-        let minted = mint(&http, &endpoints, "oauth-tok").await.unwrap();
+        let minted = mint(&http, &endpoints, "oauth-tok", false).await.unwrap();
         assert_eq!(minted.api_key, "minted-key");
         assert_eq!(minted.base_url, DEFAULT_API_BASE);
     }
@@ -1017,7 +1055,7 @@ mod tests {
                 mint: format!("{mint_srv}/muse-code/key"),
                 ..Endpoints::for_bases("http://unused", "http://unused")
             };
-            let err = mint(&http, &endpoints, "oauth-tok").await.unwrap_err();
+            let err = mint(&http, &endpoints, "oauth-tok", false).await.unwrap_err();
             assert!(err.to_string().contains("--login muse"), "{err}");
         }
     }
@@ -1148,5 +1186,63 @@ mod tests {
         .unwrap();
         let models = client.list_models().await.unwrap();
         assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn mint_sends_api_version_and_onboard_flag() {
+        // The Muse wire protocol sends `x-api-version` on the mint, and the
+        // interactive login onboards (`onboard: true`) while a silent re-mint
+        // does not.
+        let http = reqwest::Client::new();
+        for (onboard, want) in [(true, "true"), (false, "false")] {
+            let (mint_srv, log) =
+                test_server::serve(vec![(200, "", json!({ "api_key": "k", "base_url": "http://x" }).to_string())]).await;
+            let endpoints = Endpoints {
+                mint: format!("{mint_srv}/muse-code/key"),
+                ..Endpoints::for_bases("http://unused", "http://unused")
+            };
+            mint(&http, &endpoints, "oauth-tok", onboard).await.unwrap();
+            let captured = log.lock().unwrap();
+            let req = &captured[0];
+            assert!(req.headers.contains("x-api-version: 1.0.0"), "{}", req.headers);
+            assert_eq!(req.body.get("onboard").and_then(Value::as_bool).map(|b| b.to_string()), Some(want.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_sends_api_version_header() {
+        let body = json!({ "data": [{ "model_id": "muse-spark-1.3" }] }).to_string();
+        let (catalog, log) = test_server::serve(vec![(200, "", body)]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        client.list_models().await.unwrap();
+        let captured = log.lock().unwrap();
+        assert!(captured[0].headers.contains("x-api-version: 1.0.0"), "{}", captured[0].headers);
+    }
+
+    #[test]
+    fn mint_refusal_relays_the_payment_remediation_url() {
+        // Muse may return the remediation link as `require_payment_action_url`
+        // rather than `action_url`; both must surface in the message.
+        let value = json!({ "require_payment": true, "require_payment_action_url": "https://accountscenter.meta.com/muse_code" });
+        let message = mint_refusal(402, &value, &value.to_string());
+        assert!(message.contains("https://accountscenter.meta.com/muse_code"), "{message}");
+    }
+
+    #[test]
+    fn muse_vision_treats_chat_rows_as_image_capable() {
+        // Muse chat models accept image input; the catalog carries no vision
+        // schema, so a normal chat row is vision-capable while an
+        // image-generation or hidden row is not.
+        assert!(muse_vision(&json!({ "model_id": "muse-spark-1.3" })).is_some());
+        assert!(muse_vision(&json!({ "model_id": "muse-image-1.0", "supports_image_generation": true })).is_none());
+        assert!(muse_vision(&json!({ "model_id": "muse-internal-x", "visibility": "hidden" })).is_none());
     }
 }

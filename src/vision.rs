@@ -24,7 +24,7 @@ pub struct Vision {
 
 impl Vision {
     /// A vision-capable model with no specific limits reported.
-    fn capable() -> Self {
+    pub(crate) fn capable() -> Self {
         Vision { max_images: 1, max_image_bytes: crate::attachment::DEFAULT_MAX_BYTES, media_types: Vec::new() }
     }
 
