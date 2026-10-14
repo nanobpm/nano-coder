@@ -148,10 +148,19 @@ fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
     // leaves empty or partial JSON and the next client treats the user as
     // logged out. The rename is atomic, so a reader sees either the old or the
     // new file, never a torn one.
-    let tmp = path.with_extension("json.tmp");
+    //
+    // The temp name is unique per save (`process::id()` + a random suffix) and
+    // exclusively created (`create_new`). A fixed `muse.json.tmp` is shared by
+    // every concurrent writer: two processes that open it before either renames
+    // write to the *same* inode, so after the first rename the second keeps
+    // writing into the live credentials file, leaves invalid JSON, and then
+    // fails its own rename — `load_credentials()` treats the saved login as
+    // missing (Copilot finding). A unique, exclusively-created temp file means
+    // each save writes a private inode and cleans up only the file it created.
+    let tmp = path.with_extension(format!("json.tmp.{}.{:08x}", std::process::id(), fastrand::u32(..)));
     let write_result = (|| -> Result<()> {
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -166,6 +175,8 @@ fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
     })();
     if write_result.is_err() {
         // Best-effort cleanup so a failed write never leaves a stray temp file.
+        // `tmp` is unique to this save, so this never removes another writer's
+        // in-flight temp file.
         let _ = std::fs::remove_file(&tmp);
     }
     write_result?;
