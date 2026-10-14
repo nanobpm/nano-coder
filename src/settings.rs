@@ -979,10 +979,18 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     let entry = diff_from(&preset, &existing, &updated);
     let config = agent.config_mut();
     config.providers.insert(name.clone(), entry);
+    // An empty URL means the endpoint is derived, and the source differs by
+    // kind: Copilot derives it from the session token, Muse from the API key
+    // minted at login. Label the source accordingly so the confirmation does
+    // not report the wrong one.
+    let derived_source = match kind {
+        ProviderKind::Muse => "(from minted key)",
+        _ => "(from session token)",
+    };
     println!(
         "Provider {name}: {} {}",
         format!("{kind:?}").to_lowercase(),
-        updated.base_url.as_deref().unwrap_or("(from session token)")
+        updated.base_url.as_deref().unwrap_or(derived_source)
     );
     // Rebuild the live client when the edit touches the provider the session
     // is actually using. That is broader than `provider_name() == name` (the

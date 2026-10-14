@@ -379,6 +379,10 @@ pub fn wire(kind: Option<ProviderKind>, model: &str) -> Wire {
     match kind {
         Some(ProviderKind::Anthropic) => Wire::AnthropicMessages,
         Some(ProviderKind::GithubCopilot) => crate::providers::github_copilot::wire_for_model(model),
+        // Muse always speaks the Responses API (see `providers::muse`), so its
+        // thinking override/drop analysis must check the Responses `reasoning`
+        // field, not the Chat Completions `reasoning_effort` field.
+        Some(ProviderKind::Muse) => Wire::Responses,
         _ => Wire::ChatCompletions,
     }
 }
@@ -1574,6 +1578,44 @@ mod tests {
         let r =
             resolve(&Thinking::Default, Some(&high), Some(ProviderKind::Openai), &none, "anthropic/claude-sonnet-4.5");
         assert_eq!((r.wire, r.request()), (Wire::ChatCompletions, Some(Request::Effort("high".into()))));
+    }
+
+    #[test]
+    fn muse_is_analysed_as_a_responses_wire() {
+        // Muse always speaks the Responses API (see `providers::muse`), so
+        // `thinking::wire` must classify it as Responses: the generated control
+        // lives under `reasoning.effort`, and an `extra_body` override/drop is
+        // recognised by the Responses `reasoning` key, not the Chat Completions
+        // `reasoning_effort` field. Muse has no builtin thinking profile, so
+        // give the model the effort tiers its catalog reports via
+        // `thinking_levels`.
+        let muse = Some(ProviderKind::Muse);
+        let p = provider(r#"thinking_levels = ["low", "medium", "high"]"#);
+        let r = resolve(&Thinking::Default, Some(&level("high")), muse, &p, "muse-spark-1.3");
+        assert_eq!((r.wire, r.request()), (Wire::Responses, Some(Request::Effort("high".into()))));
+
+        // A summary-only `reasoning` option is unrelated, so the requested
+        // effort still emits; one that carries `effort` displaces it.
+        let p = provider(
+            "thinking_levels = [\"low\", \"medium\", \"high\"]\nextra_body = { reasoning = { summary = \"auto\" } }",
+        );
+        let r = resolve(&Thinking::Default, Some(&level("high")), muse, &p, "muse-spark-1.3");
+        assert!(!r.overridden, "a summary-only reasoning option is not a thinking override");
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
+        let p = provider(
+            "thinking_levels = [\"low\", \"medium\", \"high\"]\nextra_body = { reasoning = { effort = \"low\" } }",
+        );
+        let r = resolve(&Thinking::Default, Some(&level("high")), muse, &p, "muse-spark-1.3");
+        assert!(r.overridden, "an effort-bearing reasoning overrides the generated effort");
+        assert_eq!(r.extra_body_override.as_deref(), Some("reasoning"));
+        assert_eq!(r.request(), None, "the generated control is suppressed by the override");
+        // A Chat Completions `reasoning_effort` key is NOT a Muse thinking
+        // control: it does not override the Responses `reasoning` control.
+        let p =
+            provider("thinking_levels = [\"low\", \"medium\", \"high\"]\nextra_body = { reasoning_effort = \"low\" }");
+        let r = resolve(&Thinking::Default, Some(&level("high")), muse, &p, "muse-spark-1.3");
+        assert!(!r.overridden, "a Chat Completions reasoning_effort is not a Responses thinking control");
+        assert_eq!(r.request(), Some(Request::Effort("high".into())));
     }
 
     #[test]

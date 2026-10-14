@@ -714,8 +714,10 @@ images.
 Whether a model can see images comes from, in order: a `vision = true|false` override
 (global, `[providers.<name>]`, or `[providers.<name>.models."<model>"]`, like `thinking`);
 what the endpoint reports (GitHub Copilot `/models` `capabilities.supports.vision` and its
-`limits.vision`, Meta Muse Code's catalog, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
-`modalities.vision`); and a built-in assumption for current Anthropic and OpenAI model
+`limits.vision`, Ollama `/api/show`'s `vision` capability, llama.cpp `/props`
+`modalities.vision`); a provider assumption (Meta Muse Code's catalog has no vision
+schema, so every visible, non-image-generation chat model is treated as vision-capable);
+and a built-in assumption for current Anthropic and OpenAI model
 families. A model that can't see images gets the text error with a hint to switch models
 or set `vision = true`:
 
