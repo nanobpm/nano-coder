@@ -162,6 +162,13 @@ pub fn load_credentials() -> Option<StoredCredentials> {
     load_credentials_in(None)
 }
 
+/// `load_credentials` rooted at an explicit data dir, so a synthetic login
+/// never touches the user's real `muse.json`. Crate-private: production passes
+/// `None` for the platform data dir; tests pass a tempdir.
+pub(crate) fn load_credentials_in_dir(data_dir: Option<&Path>) -> Option<StoredCredentials> {
+    load_credentials_in(data_dir)
+}
+
 fn load_credentials_in(data_dir: Option<&Path>) -> Option<StoredCredentials> {
     let text = std::fs::read_to_string(credentials_path_in(data_dir)?).ok()?;
     serde_json::from_str(&text).ok()

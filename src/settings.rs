@@ -58,32 +58,52 @@ impl Changes {
     }
 }
 
-/// How a provider's API key is found, for display. For a GitHub Copilot
-/// provider whose env var is unset this reads the stored-credentials file, so
-/// call it only when the status is actually shown (e.g. `/providers`, the
-/// settings dialog), not on a hot path like per-turn snapshot capture.
+/// How a provider's API key is found, for display. For a GitHub Copilot or
+/// Muse provider without a usable env-var key this reads the stored-credentials
+/// file, so call it only when the status is actually shown (e.g. `/providers`,
+/// the settings dialog), not on a hot path like per-turn snapshot capture.
 pub fn key_status(provider: &ProviderConfig) -> String {
+    key_status_in(provider, None)
+}
+
+/// `key_status` with the credentials directory overridable by tests; production
+/// passes `None` for the platform data dir.
+fn key_status_in(provider: &ProviderConfig, data_dir: Option<&Path>) -> String {
     let env_var = provider.api_key_env.as_ref().filter(|v| !v.is_empty());
     match (&provider.api_key, env_var, &provider.api_key_command) {
         (Some(_), _, _) => "key set".to_string(),
         (None, Some(var), _) if env::var(var).is_ok_and(|v| !v.is_empty()) => format!("${var} set"),
         (None, _, Some(command)) => format!("key from `{command}`"),
-        (None, Some(var), None) if provider.kind == Some(ProviderKind::GithubCopilot) => {
-            if providers::github_copilot::load_credentials().is_some() {
-                "logged in (unofficial)".to_string()
-            } else {
-                format!("${var} missing; --login github-copilot")
-            }
+        (None, var, None) => stored_login_status(provider, var, data_dir),
+    }
+}
+
+/// The status for a provider with no literal key and no key command: a stored
+/// interactive login when one exists, else the missing-credential hint. The env
+/// var may be set-but-empty, absent, or not configured at all — a custom
+/// `kind = "muse"`/`github-copilot` provider without `api_key_env` still loads
+/// its stored login (e.g. `MuseClient::new` reads `muse.json`), so the stored
+/// credential is recognised regardless of the env-var setting.
+fn stored_login_status(provider: &ProviderConfig, env_var: Option<&String>, data_dir: Option<&Path>) -> String {
+    let (stored, login): (bool, Option<&str>) = match provider.kind {
+        Some(ProviderKind::GithubCopilot) => (
+            providers::github_copilot::load_credentials_in_dir(data_dir).is_some(),
+            Some("--login github-copilot"),
+        ),
+        Some(ProviderKind::Muse) => {
+            (providers::muse::load_credentials_in_dir(data_dir).is_some(), Some("--login muse"))
         }
-        (None, Some(var), None) if provider.kind == Some(ProviderKind::Muse) => {
-            if providers::muse::load_credentials().is_some() {
-                "logged in (unofficial)".to_string()
-            } else {
-                format!("${var} missing; --login muse")
-            }
+        _ => (false, None),
+    };
+    if stored {
+        "logged in (unofficial)".to_string()
+    } else {
+        match (env_var, login) {
+            (Some(var), Some(hint)) => format!("${var} missing; {hint}"),
+            (Some(var), None) => format!("${var} missing"),
+            (None, Some(hint)) => format!("not logged in; {hint}"),
+            (None, None) => "no key".to_string(),
         }
-        (None, Some(var), None) => format!("${var} missing"),
-        (None, None, None) => "no key".to_string(),
     }
 }
 
@@ -1665,6 +1685,84 @@ mod tests {
         // A non-derived kind has no source label.
         let openai = ProviderConfig { kind: Some(ProviderKind::Openai), ..Default::default() };
         assert_eq!(derived_endpoint_source(&openai), "-");
+    }
+
+    /// Write a stored Muse login into `dir` and return it (as the credentials
+    /// data dir). A synthetic login never touches the user's real `muse.json`.
+    fn muse_login_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = serde_json::json!({
+            "oauth_token": "tok",
+            "refresh_token": "refresh",
+            "api_key": "minted-key",
+            "api_base": "https://api.meta.ai/v1",
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        std::fs::write(dir.path().join("muse.json"), credentials.to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn key_status_recognises_a_stored_muse_login_without_api_key_env() {
+        // Regression for the review finding: a custom `kind = "muse"` provider
+        // with NO `api_key_env` still loads `muse.json` in `MuseClient::new`, so
+        // it must report the stored login — not "no key".
+        let dir = muse_login_dir();
+        let muse = ProviderConfig { kind: Some(ProviderKind::Muse), ..Default::default() };
+        assert_eq!(key_status_in(&muse, Some(dir.path())), "logged in (unofficial)");
+    }
+
+    #[test]
+    fn key_status_shows_the_muse_login_hint_when_no_env_var_and_not_logged_in() {
+        // Same provider shape, but no stored login: the hint names the login
+        // flow (there is no env var to report as missing).
+        let dir = tempfile::tempdir().unwrap();
+        let muse = ProviderConfig { kind: Some(ProviderKind::Muse), ..Default::default() };
+        assert_eq!(key_status_in(&muse, Some(dir.path())), "not logged in; --login muse");
+    }
+
+    #[test]
+    fn key_status_recognises_a_stored_muse_login_with_an_empty_api_key_env() {
+        // An explicitly empty `api_key_env` is treated as absent: the stored
+        // login is still recognised.
+        let dir = muse_login_dir();
+        let muse = ProviderConfig { kind: Some(ProviderKind::Muse), api_key_env: Some(String::new()), ..Default::default() };
+        assert_eq!(key_status_in(&muse, Some(dir.path())), "logged in (unofficial)");
+    }
+
+    #[test]
+    fn key_status_recognises_a_stored_muse_login_with_an_unset_api_key_env() {
+        // The pre-existing lane: a configured-but-unset env var with a stored
+        // login still reports the login (not `$VAR missing`).
+        let dir = muse_login_dir();
+        let muse = ProviderConfig {
+            kind: Some(ProviderKind::Muse),
+            api_key_env: Some("NANO_CODER_TEST_MUSE_UNSET".into()),
+            ..Default::default()
+        };
+        assert_eq!(key_status_in(&muse, Some(dir.path())), "logged in (unofficial)");
+    }
+
+    #[test]
+    fn key_status_keeps_the_env_var_hint_when_a_muse_login_is_absent() {
+        // With a configured env var but no stored login, the hint still names
+        // the missing var alongside the login flow.
+        let dir = tempfile::tempdir().unwrap();
+        let muse = ProviderConfig {
+            kind: Some(ProviderKind::Muse),
+            api_key_env: Some("NANO_CODER_TEST_MUSE_UNSET".into()),
+            ..Default::default()
+        };
+        assert_eq!(key_status_in(&muse, Some(dir.path())), "$NANO_CODER_TEST_MUSE_UNSET missing; --login muse");
+    }
+
+    #[test]
+    fn key_status_reports_no_key_for_a_non_login_provider_without_credentials() {
+        // A provider with no unofficial login flow (e.g. openai) and no key at
+        // all still reports "no key".
+        let dir = tempfile::tempdir().unwrap();
+        let openai = ProviderConfig { kind: Some(ProviderKind::Openai), ..Default::default() };
+        assert_eq!(key_status_in(&openai, Some(dir.path())), "no key");
     }
 
     #[test]

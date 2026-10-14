@@ -10,7 +10,7 @@
 //! your organisation's Copilot policy, and it can break when GitHub changes what
 //! it checks. It is only used when explicitly selected.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -195,11 +195,32 @@ pub struct StoredCredentials {
 }
 
 pub fn credentials_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("github-copilot.json"))
+    credentials_path_in(None)
+}
+
+/// `credentials_path` rooted at `data_dir` when given, else the platform data
+/// dir. Tests pass an explicit tempdir so a synthetic login never touches the
+/// user's real `github-copilot.json`.
+fn credentials_path_in(data_dir: Option<&Path>) -> Option<PathBuf> {
+    match data_dir {
+        Some(d) => Some(d.join("github-copilot.json")),
+        None => dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("github-copilot.json")),
+    }
 }
 
 pub fn load_credentials() -> Option<StoredCredentials> {
-    let text = std::fs::read_to_string(credentials_path()?).ok()?;
+    load_credentials_in(None)
+}
+
+/// `load_credentials` rooted at an explicit data dir, so a synthetic login
+/// never touches the user's real `github-copilot.json`. Crate-private:
+/// production passes `None` for the platform data dir; tests pass a tempdir.
+pub(crate) fn load_credentials_in_dir(data_dir: Option<&Path>) -> Option<StoredCredentials> {
+    load_credentials_in(data_dir)
+}
+
+fn load_credentials_in(data_dir: Option<&Path>) -> Option<StoredCredentials> {
+    let text = std::fs::read_to_string(credentials_path_in(data_dir)?).ok()?;
     serde_json::from_str(&text).ok()
 }
 
