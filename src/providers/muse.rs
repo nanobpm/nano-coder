@@ -493,13 +493,23 @@ fn model_id(row: &Value) -> Option<&str> {
     ["id", "model_id", "modelId"].iter().find_map(|k| row.get(*k).and_then(Value::as_str))
 }
 
-/// Whether a catalog row is explicitly hidden (`visibility: "hidden"`). Muse's
-/// picker never offers these internal/disabled rows, so neither should we.
+/// Whether a catalog row is explicitly hidden. Muse marks internal/disabled
+/// rows with the namespaced boolean `metadata["muse-code"].is_hidden` (the
+/// official SDK fixture shape); a compatibility top-level `visibility:
+/// "hidden"` is also honoured. Muse's picker never offers these rows, so
+/// neither should we.
 fn is_hidden_row(row: &Value) -> bool {
-    ["visibility", "Visibility"]
+    let namespaced = row
+        .get("metadata")
+        .and_then(|m| m.get("muse-code"))
+        .and_then(|m| m.get("is_hidden"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let visibility = ["visibility", "Visibility"]
         .iter()
         .find_map(|k| row.get(*k).and_then(Value::as_str))
-        .is_some_and(|v| v.eq_ignore_ascii_case("hidden"))
+        .is_some_and(|v| v.eq_ignore_ascii_case("hidden"));
+    namespaced || visibility
 }
 
 /// Whether a catalog row is an image-*generation* model (Muse's
@@ -1170,6 +1180,7 @@ mod tests {
             "data": [
                 { "model_id": "muse-spark-1.3" },
                 { "model_id": "muse-internal-x", "visibility": "hidden" },
+                { "model_id": "muse-internal-y", "metadata": { "muse-code": { "is_hidden": true } } },
                 { "model_id": "muse-image-1.0", "supports_image_generation": true }
             ]
         })
@@ -1244,5 +1255,6 @@ mod tests {
         assert!(muse_vision(&json!({ "model_id": "muse-spark-1.3" })).is_some());
         assert!(muse_vision(&json!({ "model_id": "muse-image-1.0", "supports_image_generation": true })).is_none());
         assert!(muse_vision(&json!({ "model_id": "muse-internal-x", "visibility": "hidden" })).is_none());
+        assert!(muse_vision(&json!({ "model_id": "muse-internal-y", "metadata": { "muse-code": { "is_hidden": true } } })).is_none());
     }
 }
