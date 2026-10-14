@@ -542,7 +542,7 @@ Built-in presets:
 | `ollama` | openai | `http://localhost:11434/v1` | — |
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
-| `muse` | muse | from minted key | `META_API_KEY` or `--login` (unofficial, see below) |
+| `muse` | muse | from minted key (`--login`); default Meta API endpoint (`META_API_KEY`) | `META_API_KEY` or `--login` (unofficial, see below) |
 | `mock` | mock | — | — |
 
 `kind = "openai"` means OpenAI Chat Completions, which also covers vLLM, LM Studio,

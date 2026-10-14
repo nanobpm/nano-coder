@@ -313,6 +313,25 @@ pub struct ResolvedProvider {
     pub replay_reasoning: bool,
 }
 
+/// Whether this provider+model pair reasons over the Responses API and so (1)
+/// needs its reasoning items replayed across tool calls and (2) rejects a
+/// non-default `temperature`.
+///
+/// For GitHub Copilot this is model-dependent, so it defers to the Copilot
+/// catalog ([`github_copilot::is_reasoning_model`]). Muse is always routed
+/// through the Responses helper and always sends `reasoning.effort`, so every
+/// Muse model reasons — independent of the Copilot-only catalog, which no
+/// `muse-*` id matches. A single predicate keeps the replay default
+/// (`resolve`) and the temperature drop (`openai_responses::build_body_*`) from
+/// drifting apart.
+pub(crate) fn reasons_over_responses(kind: ProviderKind, model_id: &str) -> bool {
+    match kind {
+        ProviderKind::GithubCopilot => github_copilot::is_reasoning_model(model_id),
+        ProviderKind::Muse => true,
+        _ => false,
+    }
+}
+
 /// Check that `spec` names a known provider with a usable `kind`, model, and
 /// endpoint, against an already-resolved `providers` map — **without side
 /// effects**. Unlike [`resolve_cancellable`], it never runs an `api_key_command`
@@ -473,12 +492,11 @@ pub fn resolve_cancellable(
         None => Default::default(),
     };
     let defaults = RetryPolicy::default();
-    // Copilot reasoning models (Responses-routed GPT‑5+/Grok/…) require their
-    // reasoning items replayed across tool calls, so replay defaults on for
-    // them; a user config value still overrides this.
-    let replay_reasoning = config
-        .replay_reasoning
-        .unwrap_or_else(|| kind == ProviderKind::GithubCopilot && github_copilot::is_reasoning_model(&model));
+    // Reasoning models routed over the Responses API (Copilot's GPT‑5+/Grok/…,
+    // and every Muse model) require their reasoning items replayed across tool
+    // calls, so replay defaults on for them; a user config value still
+    // overrides this.
+    let replay_reasoning = config.replay_reasoning.unwrap_or_else(|| reasons_over_responses(kind, &model));
     Ok(ResolvedProvider {
         name: name.to_string(),
         kind,
@@ -1850,6 +1868,18 @@ mod tests {
             ProviderConfig { replay_reasoning: Some(false), ..Default::default() },
         );
         assert!(!resolve("github-copilot/gpt-6-astra", &off, "mock").unwrap().replay_reasoning);
+    }
+
+    #[test]
+    fn muse_defaults_to_reasoning_replay() {
+        let user = HashMap::new();
+        // Every Muse model is Responses-routed and reasons, so replay defaults
+        // on even though the Copilot-only catalog matches no `muse-*` id.
+        assert!(resolve("muse/muse-spark-1.3", &user, "muse").unwrap().replay_reasoning);
+        // An explicit config value still overrides the reasoning default.
+        let mut off = HashMap::new();
+        off.insert("muse".to_string(), ProviderConfig { replay_reasoning: Some(false), ..Default::default() });
+        assert!(!resolve("muse/muse-spark-1.3", &off, "muse").unwrap().replay_reasoning);
     }
 
     #[test]

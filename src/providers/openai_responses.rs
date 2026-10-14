@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use super::github_copilot::is_reasoning_model;
-use super::{HttpTransport, StreamAction};
+use super::{HttpTransport, StreamAction, reasons_over_responses};
 use crate::llm::{ChatRequest, LLMResponse, Role, StreamEvent, StreamSink, TokenUsage, ToolCall, report_whole};
 use crate::thinking::Request;
 
@@ -132,10 +131,12 @@ pub(crate) fn build_body_with_plan(
             .collect();
     }
     if let Some(temperature) = request.temperature {
-        // Reasoning models (GPT‑5+, Grok, …) reject a non-default `temperature`
-        // and fail the request before generating, so omit it for them; the
-        // agent always supplies a value, so this is the only place to drop it.
-        if !is_reasoning_model(&provider.model) {
+        // Reasoning models (Copilot's GPT‑5+/Grok/…, and every Muse model)
+        // reject a non-default `temperature` and fail the request before
+        // generating, so omit it for them; the agent always supplies a value,
+        // so this is the only place to drop it. The check is kind-aware: the
+        // Copilot catalog alone matches no `muse-*` id.
+        if !reasons_over_responses(provider.kind, &provider.model) {
             body["temperature"] = json!(temperature);
         }
     }
@@ -504,6 +505,11 @@ mod tests {
     fn copilot_transport(model: &str) -> HttpTransport {
         let user: HashMap<String, ProviderConfig> = HashMap::new();
         HttpTransport::new(resolve(&format!("github-copilot/{model}"), &user, "mock").unwrap()).unwrap()
+    }
+
+    fn muse_transport(model: &str) -> HttpTransport {
+        let user: HashMap<String, ProviderConfig> = HashMap::new();
+        HttpTransport::new(resolve(&format!("muse/{model}"), &user, "muse").unwrap()).unwrap()
     }
 
     fn replay_transport() -> HttpTransport {
@@ -878,6 +884,72 @@ mod tests {
         let body = build_body(&copilot_transport("gpt-4.1"), &request);
         assert!(body.get("include").is_none());
         assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn muse_reasoning_round_trips_and_suppresses_temperature() {
+        // Muse is Responses-routed and reasons on every model, so it must
+        // default to replaying reasoning items and dropping a custom
+        // temperature — the same invariants the Copilot reasoning models keep,
+        // which the Copilot-only catalog alone cannot see for a `muse-*` id.
+        let transport = muse_transport("muse-spark-1.3");
+        assert!(transport.provider().replay_reasoning, "Muse must default to reasoning replay");
+
+        // Parse a reasoning + function-call turn, preserving the raw item.
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "plan" }],
+            "encrypted_content": "enc",
+        });
+        let value = json!({
+            "status": "completed",
+            "output": [
+                reasoning.clone(),
+                { "type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}" }
+            ]
+        });
+        let response = parse_response(&value, transport.provider().replay_reasoning).unwrap();
+        assert_eq!(response.thinking_blocks, vec![reasoning.clone()]);
+
+        // The next turn replays that item immediately before its function call,
+        // keeps server-side state off, and drops the custom temperature.
+        let messages = vec![
+            Message::user("go"),
+            Message {
+                thinking_blocks: response.thinking_blocks.clone(),
+                ..Message::assistant_with_tools(
+                    "",
+                    vec![ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        arguments: json!({}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    }],
+                )
+            },
+            Message::tool_result("c1", "bash", "ok"),
+        ];
+        let body = build_body(
+            &transport,
+            &ChatRequest {
+                messages: &messages,
+                tools: &[],
+                temperature: Some(0.7),
+                max_tokens: None,
+                thinking: None,
+                vision: None,
+                attachments_dir: None,
+            },
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["store"], json!(false));
+        assert!(body.get("temperature").is_none(), "Muse reasoning model kept temperature: {body}");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1], reasoning);
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
     }
 
     #[test]

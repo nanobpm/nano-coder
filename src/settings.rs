@@ -87,6 +87,25 @@ pub fn key_status(provider: &ProviderConfig) -> String {
     }
 }
 
+/// The endpoint-source label for a provider whose `base_url` is empty (derived
+/// rather than configured). Copilot derives from the session token. Muse
+/// derives from the minted key for a stored `--login` credential, but a
+/// direct-key source (`META_API_KEY`, or a literal/command key) never mints and
+/// falls back to the default Meta API endpoint — so the label distinguishes the
+/// two rather than reporting "from minted key" beside a direct key.
+pub fn derived_endpoint_source(provider: &ProviderConfig) -> String {
+    match provider.kind {
+        Some(ProviderKind::GithubCopilot) => "(from session token)".to_string(),
+        Some(ProviderKind::Muse) => {
+            let direct_key = provider.api_key.is_some()
+                || provider.api_key_command.is_some()
+                || provider.api_key_env.as_ref().is_some_and(|v| !v.is_empty() && env::var(v).is_ok_and(|k| !k.is_empty()));
+            if direct_key { "(from API key)".to_string() } else { "(from minted key)".to_string() }
+        }
+        _ => "-".to_string(),
+    }
+}
+
 /// How the turn cap appears in the settings list. A finite cap notes that
 /// normal mode asks before stopping; an unbounded cap (0) never reaches that
 /// prompt, so the suffix is omitted to avoid contradicting the loop behavior.
@@ -980,17 +999,15 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     let config = agent.config_mut();
     config.providers.insert(name.clone(), entry);
     // An empty URL means the endpoint is derived, and the source differs by
-    // kind: Copilot derives it from the session token, Muse from the API key
-    // minted at login. Label the source accordingly so the confirmation does
-    // not report the wrong one.
-    let derived_source = match kind {
-        ProviderKind::Muse => "(from minted key)",
-        _ => "(from session token)",
-    };
+    // kind and credential: Copilot derives it from the session token, Muse from
+    // the key minted at login — but a Muse direct key (`META_API_KEY`/literal)
+    // never mints and uses the default Meta API endpoint. Label the source
+    // accordingly so the confirmation does not report the wrong one.
+    let derived_source = derived_endpoint_source(&updated);
     println!(
         "Provider {name}: {} {}",
         format!("{kind:?}").to_lowercase(),
-        updated.base_url.as_deref().unwrap_or(derived_source)
+        updated.base_url.as_deref().unwrap_or(&derived_source)
     );
     // Rebuild the live client when the edit touches the provider the session
     // is actually using. That is broader than `provider_name() == name` (the
@@ -1624,6 +1641,30 @@ mod tests {
         assert_eq!(providers::parse_model_spec(&config.model, &providers, &default).0, "openai");
         // So editing `mock` does not resolve to the edited provider — no rebuild.
         assert_ne!(providers::parse_model_spec(&config.model, &providers, &default).0, "mock");
+    }
+
+    #[test]
+    fn derived_endpoint_source_distinguishes_muse_credential_lanes() {
+        // Copilot always derives from the session token.
+        let copilot = ProviderConfig { kind: Some(ProviderKind::GithubCopilot), ..Default::default() };
+        assert_eq!(derived_endpoint_source(&copilot), "(from session token)");
+        // A Muse stored login (no direct key) derives from the minted key.
+        let muse_login = ProviderConfig { kind: Some(ProviderKind::Muse), ..Default::default() };
+        assert_eq!(derived_endpoint_source(&muse_login), "(from minted key)");
+        // A Muse literal key never mints: it falls back to the default endpoint.
+        let muse_literal =
+            ProviderConfig { kind: Some(ProviderKind::Muse), api_key: Some("sk-meta".into()), ..Default::default() };
+        assert_eq!(derived_endpoint_source(&muse_literal), "(from API key)");
+        // A Muse key command is likewise a direct (non-minted) credential.
+        let muse_command = ProviderConfig {
+            kind: Some(ProviderKind::Muse),
+            api_key_command: Some("op read meta".into()),
+            ..Default::default()
+        };
+        assert_eq!(derived_endpoint_source(&muse_command), "(from API key)");
+        // A non-derived kind has no source label.
+        let openai = ProviderConfig { kind: Some(ProviderKind::Openai), ..Default::default() };
+        assert_eq!(derived_endpoint_source(&openai), "-");
     }
 
     #[test]

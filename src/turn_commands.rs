@@ -224,11 +224,7 @@ impl Snapshot {
         for (name, provider) in &self.providers {
             let kind = provider.kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "?".into());
             let key = crate::settings::key_status(provider);
-            let url = provider.base_url.clone().unwrap_or_else(|| match provider.kind {
-                Some(crate::providers::ProviderKind::GithubCopilot) => "(from session token)".into(),
-                Some(crate::providers::ProviderKind::Muse) => "(from minted key)".into(),
-                _ => "-".into(),
-            });
+            let url = provider.base_url.clone().unwrap_or_else(|| crate::settings::derived_endpoint_source(provider));
             out.push(format!("  {name:<14} {kind:<14} {url:<55} {key}"));
         }
         out.join("\n")
