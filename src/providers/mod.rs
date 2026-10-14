@@ -9,6 +9,7 @@
 pub mod anthropic;
 pub mod github_copilot;
 pub mod mock;
+pub mod muse;
 pub mod openai;
 pub mod openai_responses;
 pub mod qwen;
@@ -43,6 +44,10 @@ pub enum ProviderKind {
     /// authenticated the way VS Code does (see `github_copilot`).
     #[serde(alias = "copilot")]
     GithubCopilot,
+    /// UNOFFICIAL: Meta Muse Code's OpenAI-compatible endpoint using a Muse Code
+    /// subscription, authenticated the way the `muse` CLI does (see `muse`).
+    #[serde(alias = "muse-code")]
+    Muse,
     /// Offline scripted client for demos and tests.
     Mock,
 }
@@ -218,6 +223,17 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
         },
     );
     add(
+        "muse",
+        // The endpoint is minted alongside the API key on login; an empty
+        // `base_url` here means "use the minted one" (see `muse::api_base`).
+        ProviderConfig {
+            kind: Some(Muse),
+            api_key_env: Some("META_API_KEY".into()),
+            default_model: Some("muse-spark-1.3".into()),
+            ..Default::default()
+        },
+    );
+    add(
         "qwen",
         // The endpoint (host and API-key variable) is derived from the Qwen
         // plan/region table in `qwen`, so a new Model Studio region appears
@@ -321,11 +337,12 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
     match (kind, &config.base_url) {
         // Mock derives (or does not need) an endpoint, so any/no base_url is
         // fine. Copilot derives its endpoint from the session token *unless
-        // overridden*; a present non-empty override is used verbatim by
-        // `GithubCopilotClient::api_base`, so it must be validated like any
-        // other HTTP endpoint — otherwise a malformed override passes
-        // queue-time validation, replaces the working client, and fails only
-        // on the next request. A real HTTP provider must carry a usable one.
+        // overridden*, and Muse from the minted key *unless overridden*; a
+        // present non-empty override is used verbatim by their `api_base`, so it
+        // must be validated like any other HTTP endpoint — otherwise a malformed
+        // override passes queue-time validation, replaces the working client, and
+        // fails only on the next request. A real HTTP provider must carry a
+        // usable one.
         //
         // The emptiness guard here must match `api_base`'s `configured.is_empty()`
         // test exactly: that is the string that decides "derive vs use the
@@ -335,8 +352,10 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         // fail-open gap. Using `!url.is_empty()` routes any present-but-whitespace
         // override into `validate_http_base_url`, which rejects it.
         (ProviderKind::Mock, _) => {}
-        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => validate_http_base_url(name, url)?,
-        (ProviderKind::GithubCopilot, _) => {}
+        (ProviderKind::GithubCopilot | ProviderKind::Muse, Some(url)) if !url.is_empty() => {
+            validate_http_base_url(name, url)?
+        }
+        (ProviderKind::GithubCopilot | ProviderKind::Muse, _) => {}
         (_, Some(url)) => validate_http_base_url(name, url)?,
         (_, None) => bail!("provider {name:?} has no base_url"),
     }
@@ -416,18 +435,21 @@ pub fn resolve_cancellable(
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     let base_url = match (kind, &config.base_url) {
         // Mock needs no endpoint. Copilot derives its endpoint from the
-        // session token unless overridden; a present non-empty override is used
-        // verbatim by `GithubCopilotClient::api_base`, so validate it like any
-        // other HTTP endpoint (sharing the queue-time bad-endpoint guarantee)
-        // before storing it. The emptiness guard must match `api_base`'s
-        // `is_empty()` test (not a trimming one) so a whitespace-only override
-        // is validated (and rejected) rather than exempted here yet used there.
+        // session token unless overridden, and Muse from the minted key unless
+        // overridden; a present non-empty override is used verbatim by their
+        // `api_base`, so validate it like any other HTTP endpoint (sharing the
+        // queue-time bad-endpoint guarantee) before storing it. The emptiness
+        // guard must match `api_base`'s `is_empty()` test (not a trimming one) so
+        // a whitespace-only override is validated (and rejected) rather than
+        // exempted here yet used there.
         (ProviderKind::Mock, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
-        (ProviderKind::GithubCopilot, Some(url)) if !url.is_empty() => {
+        (ProviderKind::GithubCopilot | ProviderKind::Muse, Some(url)) if !url.is_empty() => {
             validate_http_base_url(name, url)?;
             url.trim_end_matches('/').to_string()
         }
-        (ProviderKind::GithubCopilot, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        (ProviderKind::GithubCopilot | ProviderKind::Muse, url) => {
+            url.clone().unwrap_or_default().trim_end_matches('/').to_string()
+        }
         (_, Some(url)) => {
             validate_http_base_url(name, url)?;
             url.trim_end_matches('/').to_string()
@@ -777,6 +799,7 @@ pub fn build_client_cancellable(
         ProviderKind::Openai => Box::new(openai::OpenAiClient::new(resolved)?),
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
         ProviderKind::GithubCopilot => Box::new(github_copilot::GithubCopilotClient::new(resolved)?),
+        ProviderKind::Muse => Box::new(muse::MuseClient::new(resolved)?),
         ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.name, &resolved.model)),
     })
 }
@@ -1773,6 +1796,42 @@ mod tests {
         // Absent override -> derived (empty stored base_url), valid.
         assert!(
             validate_spec("github-copilot/gpt-4.1", &effective_providers(&HashMap::new()), "github-copilot").is_ok()
+        );
+    }
+
+    #[test]
+    fn muse_endpoint_override_is_validated_when_present() {
+        // Muse mirrors Copilot: it derives its endpoint from the minted key when
+        // `base_url` is absent/empty, but a present non-empty override is used
+        // verbatim, so both `validate_spec` and `resolve` must reject a malformed
+        // one rather than exempting every Muse base_url.
+        for (name, url) in [
+            ("malformed", "not a url"),
+            ("non-http", "ftp://host/v1"),
+            ("query", "https://host/v1?token=x"),
+            ("whitespace-only", "   "),
+        ] {
+            let mut user = HashMap::new();
+            user.insert("muse".to_string(), ProviderConfig { base_url: Some(url.into()), ..Default::default() });
+            let providers = effective_providers(&user);
+            let spec = "muse/muse-spark-1.3";
+            assert!(validate_spec(spec, &providers, "muse").is_err(), "validate_spec accepted {name} override");
+            assert!(resolve(spec, &user, "muse").is_err(), "resolve accepted {name} override");
+        }
+        // A well-formed override passes both; an absent one still derives.
+        let mut user = HashMap::new();
+        user.insert(
+            "muse".to_string(),
+            ProviderConfig { base_url: Some("https://api.meta.ai/v1".into()), ..Default::default() },
+        );
+        let providers = effective_providers(&user);
+        assert!(validate_spec("muse/muse-spark-1.3", &providers, "muse").is_ok());
+        let resolved = resolve("muse/muse-spark-1.3", &user, "muse").unwrap();
+        assert_eq!(resolved.base_url, "https://api.meta.ai/v1");
+        assert_eq!(resolved.kind, ProviderKind::Muse);
+        assert!(
+            validate_spec("muse/muse-spark-1.3", &effective_providers(&HashMap::new()), "muse").is_ok(),
+            "the built-in muse preset derives its endpoint"
         );
     }
 

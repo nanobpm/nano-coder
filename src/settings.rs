@@ -75,6 +75,13 @@ pub fn key_status(provider: &ProviderConfig) -> String {
                 format!("${var} missing; --login github-copilot")
             }
         }
+        (None, Some(var), None) if provider.kind == Some(ProviderKind::Muse) => {
+            if providers::muse::load_credentials().is_some() {
+                "logged in (unofficial)".to_string()
+            } else {
+                format!("${var} missing; --login muse")
+            }
+        }
         (None, Some(var), None) => format!("${var} missing"),
         (None, None, None) => "no key".to_string(),
     }
@@ -821,8 +828,13 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
         if name == "qwen" { providers::presets().remove(&name).and_then(|preset| preset.base_url) } else { None };
     let current_url = current.base_url.clone().or(preset_url).unwrap_or_default();
 
-    let kinds = [ProviderKind::Openai, ProviderKind::Anthropic, ProviderKind::GithubCopilot];
-    let kind_labels = ["OpenAI-compatible (/chat/completions)", "Anthropic (/messages)", "GitHub Copilot (unofficial)"];
+    let kinds = [ProviderKind::Openai, ProviderKind::Anthropic, ProviderKind::GithubCopilot, ProviderKind::Muse];
+    let kind_labels = [
+        "OpenAI-compatible (/chat/completions)",
+        "Anthropic (/messages)",
+        "GitHub Copilot (unofficial)",
+        "Muse Code (unofficial)",
+    ];
     let kind_default = kinds.iter().position(|k| Some(*k) == current.kind).unwrap_or(0);
     let kind = kinds[Select::new().with_prompt("API kind").items(&kind_labels).default(kind_default).interact()?];
 
@@ -853,7 +865,9 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
 
     let mut base_url = Input::<String>::new()
         .with_prompt("Base URL (e.g. http://merlin.local:8000/v1)")
-        .allow_empty(kind == ProviderKind::GithubCopilot);
+        // Copilot derives its endpoint from the session token, and Muse from the
+        // API key minted at login, so an empty URL means "use the derived one".
+        .allow_empty(matches!(kind, ProviderKind::GithubCopilot | ProviderKind::Muse));
     // A known endpoint sets the URL outright. A custom pick leaves the prompt
     // empty so the typed URL wins instead of silently keeping the old one; any
     // other pick falls back to the current/preset URL as a default.
@@ -868,6 +882,8 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             && providers::github_copilot::domain() == "github.com"
         {
             base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
+        } else if kind == ProviderKind::Muse && is_new && !all.contains_key(&name) {
+            base_url = base_url.default(providers::muse::DEFAULT_API_BASE.to_string());
         }
     }
     let base_url = if let Some(endpoint) = chosen_endpoint {

@@ -2064,7 +2064,7 @@ fn print_help() {
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
-    println!("       nano-coder --login github-copilot");
+    println!("       nano-coder --login github-copilot|muse");
     println!("       nano-coder --list-models PROVIDER[/model]");
     println!("       nano-coder --version");
 }
@@ -2218,11 +2218,19 @@ async fn main() -> Result<()> {
     config::migrate_legacy_dirs();
 
     if let Some(provider) = &args.login {
-        if provider != "github-copilot" {
-            anyhow::bail!("--login supports only github-copilot (other providers use API keys)");
+        match provider.as_str() {
+            "github-copilot" => {
+                let path = providers::github_copilot::login().await?;
+                println!("Saved GitHub Copilot credentials to {}", path.display());
+            }
+            "muse" => {
+                let path = providers::muse::login().await?;
+                println!("Saved Muse Code credentials to {}", path.display());
+            }
+            other => anyhow::bail!(
+                "unknown provider {other:?} for --login; supported: github-copilot, muse (other providers use API keys)"
+            ),
         }
-        let path = providers::github_copilot::login().await?;
-        println!("Saved GitHub Copilot credentials to {}", path.display());
         return Ok(());
     }
 

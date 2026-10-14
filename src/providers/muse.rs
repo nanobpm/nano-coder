@@ -1,0 +1,880 @@
+//! UNOFFICIAL Meta Muse Code provider.
+//!
+//! Uses a Muse Code subscription by authenticating the way the `muse` CLI does:
+//! an RFC 8628 device-code login against `auth.meta.com` with Muse's public
+//! OAuth client id, a **mint** of that OAuth token for a short-lived Meta API
+//! key (`POST {mint}/muse-code/key`), and model calls carrying Muse's client
+//! headers against the OpenAI-compatible Meta API (`https://api.meta.ai/v1`).
+//!
+//! This is not a Meta-sanctioned integration: it may conflict with Meta's terms
+//! or your organisation's policy, and it can break when Meta changes what it
+//! checks. It is only used when explicitly selected.
+//!
+//! Model calls speak plain OpenAI Chat Completions; the catalog (`GET
+//! {mint}/muse-code/models`) is only read for the window / thinking levels /
+//! vision probes and for `--list-models`.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::openai;
+use super::retry::ApiError;
+use super::{HttpTransport, ProviderKind, ResolvedProvider};
+use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, StreamSink, report_whole};
+use crate::thinking::{Format, Reported};
+
+/// Muse Code's public OAuth app client id. The `muse` CLI hardcodes this; Meta
+/// login does not use dynamic client registration (the DCR paths in the binary
+/// are for MCP servers only).
+pub const DEFAULT_CLIENT_ID: &str = "1031625952748946";
+/// OAuth/device-code host.
+pub const DEFAULT_AUTH_BASE: &str = "https://auth.meta.com";
+/// Meta API host that serves the key-mint and the model catalog.
+pub const DEFAULT_MINT_BASE: &str = "https://api.meta.ai";
+/// OpenAI-compatible chat endpoint, used when a provider entry carries no
+/// `base_url` override and no minted base url.
+pub const DEFAULT_API_BASE: &str = "https://api.meta.ai/v1";
+/// `x-api-version` sent on the key-mint request.
+pub const MINT_API_VERSION: &str = "1.0.0";
+
+/// OpenAI Chat Completions path, relative to the (minted) API base.
+const CHAT_PATH: &str = "/chat/completions";
+
+/// Per-request timeout for the capability probes, matching the other providers
+/// so a stalled catalog call cannot consume the whole startup/model-switch
+/// budget.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Client identity headers the `muse` CLI sends on catalog requests. A provider
+/// entry's own `headers` (given to `with_client_headers`) override any of these
+/// case-insensitively.
+const CLIENT_HEADERS: [(&str, &str); 2] =
+    [("User-Agent", "muse-build/1.4.7 (non-interactive; macos-aarch64; nano-coder)"), ("x-client-id", "tbh:exec")];
+
+fn env_base(var: &str, default: &str) -> String {
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// OAuth/device-code host (override with `MUSE_AUTH_BASE_URL`, e.g. to point a
+/// test at a local server).
+pub fn auth_base() -> String {
+    env_base("MUSE_AUTH_BASE_URL", DEFAULT_AUTH_BASE)
+}
+
+/// Meta API host serving the key mint and the catalog (override with
+/// `MUSE_MINT_BASE_URL`).
+pub fn mint_base() -> String {
+    env_base("MUSE_MINT_BASE_URL", DEFAULT_MINT_BASE)
+}
+
+fn client_id() -> String {
+    std::env::var("MUSE_CLIENT_ID").ok().filter(|id| !id.is_empty()).unwrap_or_else(|| DEFAULT_CLIENT_ID.into())
+}
+
+#[derive(Debug, Clone)]
+pub struct Endpoints {
+    /// RFC 8628 device-authorization endpoint.
+    pub device_authorization: String,
+    /// RFC 8628 device-token endpoint (polled).
+    pub token: String,
+    /// Key-mint endpoint (`POST`, bearer OAuth token).
+    pub mint: String,
+    /// Model-catalog endpoint (`GET`, bearer API key).
+    pub catalog: String,
+}
+
+impl Endpoints {
+    pub fn for_bases(auth_base: &str, mint_base: &str) -> Self {
+        Self {
+            device_authorization: format!("{auth_base}/oidc/device/authorization/"),
+            token: format!("{auth_base}/oidc/device/token/"),
+            mint: format!("{mint_base}/muse-code/key"),
+            catalog: format!("{mint_base}/muse-code/models"),
+        }
+    }
+}
+
+/// Muse credentials saved by `--login muse`: the OAuth token plus the API key
+/// that was minted from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredCredentials {
+    pub oauth_token: String,
+    /// Refresh token, when the device grant returned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Unix expiry (seconds) of the OAuth access token, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// The minted Meta API key used as a bearer for model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// The `base_url` the mint reported for the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+pub fn credentials_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("muse.json"))
+}
+
+pub fn load_credentials() -> Option<StoredCredentials> {
+    let text = std::fs::read_to_string(credentials_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
+    let path = credentials_path().ok_or_else(|| anyhow!("no local data directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).with_context(|| format!("open {}", path.display()))?;
+    std::io::Write::write_all(&mut file, serde_json::to_string_pretty(credentials)?.as_bytes())?;
+    Ok(path)
+}
+
+fn with_client_headers(
+    mut builder: reqwest::RequestBuilder,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> reqwest::RequestBuilder {
+    for (name, value) in CLIENT_HEADERS {
+        if !overrides.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+}
+
+/// Interactive device-code login; mints an API key and saves both, returning
+/// the credential file path.
+pub async fn login() -> Result<PathBuf> {
+    let endpoints = Endpoints::for_bases(&auth_base(), &mint_base());
+    let http = reqwest::Client::new();
+    let client_id = client_id();
+    let device: Value = with_client_headers(http.post(&endpoints.device_authorization), &Default::default())
+        .header("Accept", "application/json")
+        .form(&[("client_id", client_id.as_str())])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let field = |name: &str| device.get(name).and_then(Value::as_str).map(str::to_string);
+    let (Some(device_code), Some(user_code), Some(uri)) =
+        (field("device_code"), field("user_code"), field("verification_uri"))
+    else {
+        bail!("unexpected device code response: {device}");
+    };
+    let mut interval = device.get("interval").and_then(Value::as_u64).unwrap_or(5).max(1);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(device.get("expires_in").and_then(Value::as_u64).unwrap_or(900));
+
+    eprintln!("UNOFFICIAL: this signs in as the Muse Code CLI; use at your own risk.");
+    eprintln!("Open {uri} and enter code: {user_code}");
+    eprintln!("Waiting for authorization...");
+
+    loop {
+        if std::time::Instant::now() > deadline {
+            bail!("device code expired before authorization");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let poll: Value = with_client_headers(http.post(&endpoints.token), &Default::default())
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("device_code", device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(token) = poll.get("access_token").and_then(Value::as_str) {
+            let expires_at = poll.get("expires_in").and_then(Value::as_i64).map(|secs| Utc::now().timestamp() + secs);
+            // Prove the account can actually mint a key before reporting success.
+            let minted = mint(&http, &endpoints, token).await?;
+            let credentials = StoredCredentials {
+                oauth_token: token.to_string(),
+                refresh_token: poll.get("refresh_token").and_then(Value::as_str).map(str::to_string),
+                expires_at,
+                api_key: Some(minted.api_key),
+                api_base: Some(minted.base_url),
+                created_at: Utc::now(),
+            };
+            let path = save_credentials(&credentials)?;
+            eprintln!("Logged in; Muse API endpoint {}", credentials.api_base.as_deref().unwrap_or(DEFAULT_API_BASE));
+            return Ok(path);
+        }
+        match poll.get("error").and_then(Value::as_str) {
+            Some("authorization_pending") => {}
+            Some("slow_down") => {
+                interval = poll.get("interval").and_then(Value::as_u64).unwrap_or(interval + 5);
+            }
+            Some(other) => {
+                bail!("login failed: {other}: {}", poll.get("error_description").and_then(Value::as_str).unwrap_or(""))
+            }
+            None => bail!("unexpected token response: {poll}"),
+        }
+    }
+}
+
+/// A minted Meta API key plus the endpoint it is valid for.
+#[derive(Debug, Clone)]
+pub struct MintedKey {
+    pub api_key: String,
+    pub base_url: String,
+}
+
+/// Exchange a Muse OAuth access token for a Meta API key.
+pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) -> Result<MintedKey> {
+    let response = with_client_headers(http.post(&endpoints.mint), &Default::default())
+        .header("Accept", "application/json")
+        .header("x-api-version", MINT_API_VERSION)
+        .bearer_auth(oauth)
+        .json(&serde_json::json!({ "onboard": false }))
+        .send()
+        .await
+        .context("Muse key mint")?;
+    let status = response.status().as_u16();
+    let text = response.text().await?;
+    if !(200..300).contains(&status) {
+        bail!(
+            "Muse key mint failed (HTTP {status}): {}. Run `nano-coder --login muse` or set META_API_KEY.",
+            text.chars().take(300).collect::<String>()
+        );
+    }
+    let value: Value = serde_json::from_str(&text).context("Muse key mint response")?;
+    let api_key = value
+        .get("api_key")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("mint response missing api_key or base_url"))?;
+    let base_url = value
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| anyhow!("mint response missing api_key or base_url"))?;
+    Ok(MintedKey { api_key, base_url })
+}
+
+fn is_unauthorized(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.downcast_ref::<ApiError>().is_some_and(|api| api.status == 401))
+}
+
+/// A live credential: either a minted API key (from `--login muse`) or the
+/// `META_API_KEY` passed in as the provider's `api_key`.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionKey {
+    api_key: String,
+    base_url: String,
+    refresh_at: i64,
+}
+
+pub struct MuseClient {
+    transport: HttpTransport,
+    /// OAuth token to mint with. `None` when `META_API_KEY` supplied the key, so
+    /// there is nothing to mint.
+    oauth: Option<String>,
+    endpoints: Endpoints,
+    /// The cached minted key, shared across clones (`clone_boxed`) so a freshly
+    /// built client and its clone reuse one mint instead of each performing
+    /// their own on first use.
+    session: Arc<tokio::sync::Mutex<Option<SessionKey>>>,
+    /// The catalog list the probes read, keyed by the `api_base` it was fetched
+    /// from. Shared across clones like `session`.
+    models_cache: Arc<tokio::sync::Mutex<Option<(String, Value)>>>,
+}
+
+impl MuseClient {
+    pub fn new(provider: ResolvedProvider) -> Result<Self> {
+        // `META_API_KEY` arrives as the provider's `api_key` (see the preset's
+        // `api_key_env`); a stored login carries the OAuth token to mint with,
+        // plus the key it already minted (reused here, then re-minted on a 401).
+        let stored = provider.api_key.is_none().then(load_credentials).flatten();
+        let oauth = stored.as_ref().map(|c| c.oauth_token.clone());
+        if provider.api_key.is_none() && oauth.is_none() {
+            bail!("not logged in to Muse Code: run `nano-coder --login muse` or set META_API_KEY");
+        }
+        let seeded = stored.and_then(|c| {
+            let api_key = c.api_key?;
+            let base_url = c.api_base.unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+            Some(SessionKey { api_key, base_url, refresh_at: i64::MAX })
+        });
+        Self::with_endpoints(provider, oauth, Endpoints::for_bases(&auth_base(), &mint_base()), seeded)
+    }
+
+    pub fn with_endpoints(
+        provider: ResolvedProvider,
+        oauth: Option<String>,
+        endpoints: Endpoints,
+        session: Option<SessionKey>,
+    ) -> Result<Self> {
+        Ok(Self {
+            transport: HttpTransport::new(provider)?,
+            oauth,
+            endpoints,
+            session: Arc::new(tokio::sync::Mutex::new(session)),
+            models_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    /// The key to authenticate model calls with. `META_API_KEY` (if set) is used
+    /// outright; otherwise the OAuth token is minted for a short-lived key, with
+    /// a cached copy reused until a margin before its expiry.
+    async fn session_key(&self, force: bool) -> Result<SessionKey> {
+        if let Some(key) = &self.transport.provider().api_key {
+            return Ok(SessionKey {
+                api_key: key.clone(),
+                base_url: self.configured_base().unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
+                refresh_at: i64::MAX,
+            });
+        }
+        let mut session = self.session.lock().await;
+        if !force
+            && let Some(current) = session.as_ref()
+            && Utc::now().timestamp() < current.refresh_at
+        {
+            return Ok(current.clone());
+        }
+        let oauth = self.oauth.as_deref().ok_or_else(|| anyhow!("no Muse credentials"))?;
+        let minted = mint(self.transport.http(), &self.endpoints, oauth).await?;
+        let fresh = SessionKey { api_key: minted.api_key, base_url: minted.base_url, refresh_at: i64::MAX };
+        *session = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    fn configured_base(&self) -> Option<String> {
+        let configured = &self.transport.provider().base_url;
+        (!configured.is_empty()).then(|| configured.clone())
+    }
+
+    fn api_base(&self, session: &SessionKey) -> String {
+        self.configured_base().unwrap_or_else(|| session.base_url.clone())
+    }
+
+    async fn catalog_json(&self, session: &SessionKey, timeout: Option<std::time::Duration>) -> Result<Value> {
+        let mut request =
+            with_client_headers(self.transport.http().get(&self.endpoints.catalog), &self.transport.provider().headers)
+                .bearer_auth(&session.api_key)
+                .header("Accept", "application/json");
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let value: Value = response.json().await?;
+        if !status.is_success() {
+            bail!("listing Muse models failed (HTTP {status}): {value}");
+        }
+        Ok(value)
+    }
+
+    /// The current model's catalog row, from the cached list (fetched with
+    /// `timeout` the first time). The cache is keyed on the minted `api_base`,
+    /// mirroring the Copilot provider.
+    async fn model_entry(&self, timeout: std::time::Duration) -> Option<Value> {
+        let session = self.session_key(false).await.ok()?;
+        let api_base = self.api_base(&session);
+        let mut cache = self.models_cache.lock().await;
+        if cache.as_ref().map(|(base, _)| base.as_str()) != Some(api_base.as_str()) {
+            *cache = Some((api_base, self.catalog_json(&session, Some(timeout)).await.ok()?));
+        }
+        let model = &self.transport.provider().model;
+        catalog_rows(&cache.as_ref()?.1).into_iter().find(|row| model_id(row) == Some(model.as_str())).cloned()
+    }
+}
+
+/// The rows of a Muse catalog response. The exact envelope is not documented;
+/// we accept a bare array or an object with a `data`/`models`/`rows` array.
+fn catalog_rows(value: &Value) -> Vec<&Value> {
+    for key in ["data", "models", "rows"] {
+        if let Some(rows) = value.get(key).and_then(Value::as_array) {
+            return rows.iter().collect();
+        }
+    }
+    value.as_array().map(|rows| rows.iter().collect()).unwrap_or_default()
+}
+
+/// A catalog row's model id, under either the OpenAI-style `id` or Muse's
+/// `model_id`.
+fn model_id(row: &Value) -> Option<&str> {
+    ["id", "model_id", "modelId"].iter().find_map(|k| row.get(*k).and_then(Value::as_str))
+}
+
+fn positive(row: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter().find_map(|k| row.get(*k).and_then(Value::as_u64)).filter(|&n| n > 0).map(|n| n as usize)
+}
+
+/// A row's context window: Muse's `context_limit` (snake or camel), falling back
+/// to OpenAI-shaped `max_context_window_tokens`.
+fn context_limit(row: &Value) -> Option<usize> {
+    positive(row, &["context_limit", "contextLimit", "context_window", "contextWindow", "max_context_window_tokens"])
+}
+
+/// A row's reasoning-effort tiers: Muse's `reasoning_effort_variants` (`[{tier}]`
+/// or `["low", …]`), else a flat `reasoning_effort` list.
+fn effort_levels(row: &Value) -> Option<Vec<String>> {
+    let raw = ["reasoning_effort_variants", "reasoningEffortVariants", "reasoning_effort", "reasoningEffort"]
+        .iter()
+        .find_map(|k| row.get(*k).and_then(Value::as_array))?;
+    let levels: Vec<String> = raw
+        .iter()
+        .filter_map(|v| v.as_str().or_else(|| v.get("tier").and_then(Value::as_str)))
+        .map(|level| match level.trim().to_ascii_lowercase().as_str() {
+            "none" => "off".to_string(),
+            other => other.to_string(),
+        })
+        .filter(|level| !level.is_empty())
+        .collect();
+    (!levels.is_empty()).then_some(levels)
+}
+
+#[async_trait]
+impl LLMClient for MuseClient {
+    fn clone_boxed(&self) -> Box<dyn LLMClient> {
+        Box::new(Self {
+            transport: self.transport.clone(),
+            oauth: self.oauth.clone(),
+            endpoints: self.endpoints.clone(),
+            session: self.session.clone(),
+            models_cache: self.models_cache.clone(),
+        })
+    }
+
+    async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+        let body = {
+            let plan = request.attachment_plan();
+            openai::build_body_with_plan(&self.transport, request, &plan)
+        };
+        let overrides = self.transport.provider().headers.clone();
+        let mut force_refresh = false;
+        loop {
+            let session = self.session_key(force_refresh).await?;
+            let url = format!("{}{CHAT_PATH}", self.api_base(&session));
+            let result = self
+                .transport
+                .post_json_to(&url, &body, |builder| {
+                    with_client_headers(builder, &overrides).bearer_auth(&session.api_key)
+                })
+                .await;
+            match result {
+                Ok(value) => return openai::parse_response(&value, self.transport.provider().replay_reasoning),
+                // The key was revoked or expired early: mint once more, then fail.
+                Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn chat_stream(&self, request: &ChatRequest<'_>, sink: StreamSink<'_>) -> Result<LLMResponse> {
+        if !self.transport.provider().stream {
+            let response = self.chat(request).await?;
+            report_whole(sink, &response);
+            return Ok(response);
+        }
+        // One attachment plan for the body, scoped so the non-`Send` plan is
+        // dropped before the retry loop's awaits.
+        let body = {
+            let plan = request.attachment_plan();
+            openai::build_body_with_plan(&self.transport, request, &plan)
+        };
+        let overrides = self.transport.provider().headers.clone();
+        let mut force_refresh = false;
+        loop {
+            let session = self.session_key(force_refresh).await?;
+            let url = format!("{}{CHAT_PATH}", self.api_base(&session));
+            let auth = |builder: reqwest::RequestBuilder| {
+                with_client_headers(builder, &overrides).bearer_auth(&session.api_key)
+            };
+            let result = openai::stream_chat(&self.transport, &url, body.clone(), auth, sink).await;
+            match result {
+                Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
+                other => return other,
+            }
+        }
+    }
+
+    async fn detect_context_window(&self) -> Option<DetectedWindow> {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            context_limit(&entry).map(|tokens| DetectedWindow {
+                tokens,
+                source: "Muse /muse-code/models context_limit".to_string(),
+                cap: ContextCap::Total,
+                total_tokens: None,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn detect_thinking_levels(&self) -> Option<Reported> {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            // Prefer the documented Copilot-style shape if the endpoint returns
+            // it; otherwise read Muse's flat `reasoning_effort_variants`.
+            Reported::from_model_entry(&entry).or_else(|| {
+                effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn detect_vision(&self) -> Option<crate::vision::Vision> {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            crate::vision::Vision::from_model_entry(&entry)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<Reported>, Option<crate::vision::Vision>) {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            let window = context_limit(&entry).map(|tokens| DetectedWindow {
+                tokens,
+                source: "Muse /muse-code/models context_limit".to_string(),
+                cap: ContextCap::Total,
+                total_tokens: None,
+            });
+            let thinking = Reported::from_model_entry(&entry).or_else(|| {
+                effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
+            });
+            let vision = crate::vision::Vision::from_model_entry(&entry);
+            Some((window, thinking, vision))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    async fn detect_thinking_and_vision(&self) -> (Option<Reported>, Option<crate::vision::Vision>) {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            let thinking = Reported::from_model_entry(&entry).or_else(|| {
+                effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
+            });
+            let vision = crate::vision::Vision::from_model_entry(&entry);
+            Some((thinking, vision))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let session = self.session_key(false).await?;
+        let value = self.catalog_json(&session, None).await?;
+        let mut models: Vec<String> = catalog_rows(&value)
+            .into_iter()
+            .filter_map(|row| {
+                let id = model_id(row)?;
+                // Hide image-generation models from the chat model list when the
+                // row says so (Muse marks them with `supports_image_generation`).
+                let image = row
+                    .get("supports_image_generation")
+                    .or_else(|| row.get("supportsImageGeneration"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (!image).then(|| id.to_string())
+            })
+            .collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
+    fn model_name(&self) -> &str {
+        &self.transport.provider().model
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.transport.provider().name
+    }
+
+    fn kind(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Muse)
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.transport.provider().base_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::Message;
+    use crate::providers::{ProviderConfig, ProviderKind, resolve, test_server};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn client_model(base: &str, model: &str) -> MuseClient {
+        let mut user = HashMap::new();
+        user.insert(
+            "muse".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Muse),
+                base_url: Some(base.to_string()),
+                retry_initial_backoff_ms: Some(1),
+                ..Default::default()
+            },
+        );
+        let provider = resolve(&format!("muse/{model}"), &user, "mock").unwrap();
+        let endpoints = Endpoints::for_bases(base, base);
+        MuseClient::with_endpoints(provider, Some("oauth-tok".into()), endpoints, None).unwrap()
+    }
+
+    fn mint_body(base: &str) -> String {
+        json!({ "api_key": "minted-key", "base_url": base }).to_string()
+    }
+
+    /// Endpoints with the mint and the catalog on separate hosts, as in
+    /// production (mint on `api.meta.ai`, catalog also there — but tests need
+    /// distinct scripted servers).
+    fn endpoints(mint_base: &str, catalog_base: &str) -> Endpoints {
+        Endpoints {
+            device_authorization: format!("{mint_base}/oidc/device/authorization/"),
+            token: format!("{mint_base}/oidc/device/token/"),
+            mint: format!("{mint_base}/muse-code/key"),
+            catalog: format!("{catalog_base}/muse-code/models"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mints_and_calls_chat_completions() {
+        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        let (mint_srv, mint_log) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        // The provider base_url is the API server; the mint returns a base that
+        // is ignored because the provider carries an explicit base_url.
+        let client = client_model(&api, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            client.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &mint_srv),
+            None,
+        )
+        .unwrap();
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        assert_eq!(client.chat(&request).await.unwrap().content, "hi");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/chat/completions");
+        assert_eq!(api_log[0].body["model"], "muse-spark-1.3");
+        assert!(api_log[0].body.get("messages").is_some());
+        let headers = api_log[0].headers.to_lowercase();
+        assert!(headers.contains("authorization: bearer minted-key"), "{headers}");
+        assert!(headers.contains("x-client-id: tbh:exec"), "{headers}");
+        // The mint was called with the OAuth token and the pinned api version.
+        let mint_log = mint_log.lock().unwrap();
+        assert_eq!(mint_log[0].path, "/muse-code/key");
+        assert_eq!(mint_log[0].body["onboard"], false);
+        let mint_headers = mint_log[0].headers.to_lowercase();
+        assert!(mint_headers.contains("authorization: bearer oauth-tok"), "{mint_headers}");
+        assert!(mint_headers.contains("x-api-version: 1.0.0"), "{mint_headers}");
+    }
+
+    #[tokio::test]
+    async fn uses_a_literal_api_key_without_minting() {
+        // `META_API_KEY` arrives as the provider's `api_key`; the client must
+        // use it directly and never touch the mint endpoint.
+        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let provider = {
+            let mut user = HashMap::new();
+            user.insert(
+                "muse".to_string(),
+                ProviderConfig {
+                    kind: Some(ProviderKind::Muse),
+                    base_url: Some(api.clone()),
+                    api_key: Some("env-key".into()),
+                    retry_initial_backoff_ms: Some(1),
+                    ..Default::default()
+                },
+            );
+            resolve("muse/muse-spark-1.3", &user, "mock").unwrap()
+        };
+        // `new` (not `with_endpoints`): with a literal key it must not need the
+        // OAuth/mint endpoints at all.
+        let client = MuseClient::new(provider).unwrap();
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        assert_eq!(client.chat(&request).await.unwrap().content, "hi");
+        let api_log = api_log.lock().unwrap();
+        assert_eq!(api_log[0].path, "/chat/completions");
+        assert!(api_log[0].headers.to_lowercase().contains("authorization: bearer env-key"));
+    }
+
+    #[tokio::test]
+    async fn reuses_a_stored_minted_key_without_minting_again() {
+        // A `--login muse` writes the minted key to disk; the client seeds its
+        // session from it, so the first call doesn't need the mint endpoint.
+        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (mint_srv, mint_log) = test_server::serve(vec![(500, "", "should not be called".into())]).await;
+        let provider = client_model(&api, "muse-spark-1.3");
+        let seeded =
+            SessionKey { api_key: "stored-key".into(), base_url: "http://unused".into(), refresh_at: i64::MAX };
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &mint_srv),
+            Some(seeded),
+        )
+        .unwrap();
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        assert_eq!(client.chat(&request).await.unwrap().content, "hi");
+        assert!(mint_log.lock().unwrap().is_empty(), "the seeded key must skip the mint");
+        assert!(api_log.lock().unwrap()[0].headers.to_lowercase().contains("authorization: bearer stored-key"));
+    }
+
+    #[test]
+    fn parses_stored_credentials() {
+        let creds: StoredCredentials = serde_json::from_value(json!({
+            "oauth_token": "tok",
+            "api_key": "key",
+            "api_base": "https://api.meta.ai/v1",
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(creds.api_key.as_deref(), Some("key"));
+        assert_eq!(creds.refresh_token, None);
+    }
+
+    #[test]
+    fn parses_the_catalog_envelope_tolerantly() {
+        // Bare array, `data`, and `models` envelopes all yield rows.
+        let bare = json!([{ "model_id": "muse-spark-1.3", "context_limit": 131072 }]);
+        assert_eq!(catalog_rows(&bare).len(), 1);
+        let data = json!({ "data": [{ "id": "a" }, { "id": "b" }] });
+        assert_eq!(catalog_rows(&data).len(), 2);
+        let models = json!({ "models": [{ "model_id": "c" }] });
+        assert_eq!(catalog_rows(&models).len(), 1);
+        assert_eq!(model_id(&models["models"][0]), Some("c"));
+        assert_eq!(model_id(&json!({ "id": "d" })), Some("d"));
+        assert_eq!(context_limit(&json!({ "context_limit": 131072 })), Some(131072));
+        assert_eq!(context_limit(&json!({ "contextLimit": 200000 })), Some(200000));
+        assert_eq!(context_limit(&json!({ "context_limit": 0 })), None);
+    }
+
+    #[test]
+    fn reads_effort_variants_in_both_shapes() {
+        let tiers = json!({ "reasoning_effort_variants": [{ "tier": "low" }, { "tier": "high" }] });
+        assert_eq!(effort_levels(&tiers), Some(vec!["low".to_string(), "high".to_string()]));
+        let camel = json!({ "reasoningEffortVariants": ["none", "medium"] });
+        assert_eq!(effort_levels(&camel), Some(vec!["off".to_string(), "medium".to_string()]));
+        assert_eq!(effort_levels(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn lists_models_hiding_image_generation() {
+        let body = json!({
+            "data": [
+                { "model_id": "muse-spark-1.3" },
+                { "model_id": "muse-image-1.0", "supports_image_generation": true },
+                { "model_id": "muse-spark-1.3" }
+            ]
+        })
+        .to_string();
+        let (catalog, log) = test_server::serve(vec![(200, "", body)]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+        assert_eq!(log.lock().unwrap()[0].path, "/muse-code/models");
+    }
+
+    #[tokio::test]
+    async fn remints_once_after_a_401() {
+        let ok = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let (mint_srv, mint_log) =
+            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
+                .await;
+        let (api, api_log) = test_server::serve(vec![
+            (401, "", json!({ "error": { "code": "invalid_api_key", "message": "expired" } }).to_string()),
+            (200, "", ok.into()),
+        ])
+        .await;
+        let client = client_model(&api, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            client.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &mint_srv),
+            None,
+        )
+        .unwrap();
+        let messages = vec![Message::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        assert_eq!(client.chat(&request).await.unwrap().content, "ok");
+        // A 401 minted a fresh key and retried: two mint calls, two chat calls.
+        assert_eq!(mint_log.lock().unwrap().len(), 2);
+        assert_eq!(api_log.lock().unwrap().len(), 2);
+    }
+}
