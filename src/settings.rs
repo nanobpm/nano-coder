@@ -882,9 +882,11 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             && providers::github_copilot::domain() == "github.com"
         {
             base_url = base_url.default(providers::github_copilot::DEFAULT_API_BASE.to_string());
-        } else if kind == ProviderKind::Muse && is_new && !all.contains_key(&name) {
-            base_url = base_url.default(providers::muse::DEFAULT_API_BASE.to_string());
         }
+        // Muse is deliberately left empty: a default would become an explicit
+        // override that `MuseClient::api_base` prefers over the account-specific
+        // `base_url` the mint returns, defeating the derived-endpoint behavior.
+        // Users who need an override can still type one.
     }
     let base_url = if let Some(endpoint) = chosen_endpoint {
         endpoint.base_url.to_string()
