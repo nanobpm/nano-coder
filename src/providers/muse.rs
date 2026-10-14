@@ -14,7 +14,7 @@
 //! catalog (`GET {mint}/muse-code/models`) is only read for the window /
 //! thinking levels / vision probes and for `--list-models`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -127,17 +127,52 @@ pub struct StoredCredentials {
     pub created_at: chrono::DateTime<Utc>,
 }
 
+impl StoredCredentials {
+    /// The OAuth grant these credentials seed a client with: the access token to
+    /// mint with, plus the refresh token and expiry needed to renew it.
+    fn grant(&self) -> OauthGrant {
+        OauthGrant {
+            access_token: self.oauth_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// The platform credentials path (`muse.json` in the data dir). Used by tests;
+/// production code paths take `credentials_path_in` (via `load`/`save`) so the
+/// directory can be overridden.
+#[cfg(test)]
 pub fn credentials_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("muse.json"))
+    credentials_path_in(None)
+}
+
+/// `credentials_path` rooted at `data_dir` when given, else the platform data
+/// dir. Tests pass an explicit tempdir so a synthetic login never touches the
+/// user's real `muse.json`, and — being threaded through the call, not a
+/// process-global — parallel tests never interfere.
+fn credentials_path_in(data_dir: Option<&Path>) -> Option<PathBuf> {
+    match data_dir {
+        Some(d) => Some(d.join("muse.json")),
+        None => dirs::data_local_dir().map(|d| crate::config::app_dir(&d).join("muse.json")),
+    }
 }
 
 pub fn load_credentials() -> Option<StoredCredentials> {
-    let text = std::fs::read_to_string(credentials_path()?).ok()?;
+    load_credentials_in(None)
+}
+
+fn load_credentials_in(data_dir: Option<&Path>) -> Option<StoredCredentials> {
+    let text = std::fs::read_to_string(credentials_path_in(data_dir)?).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
-    let path = credentials_path().ok_or_else(|| anyhow!("no local data directory"))?;
+    save_credentials_in(credentials, None)
+}
+
+fn save_credentials_in(credentials: &StoredCredentials, data_dir: Option<&Path>) -> Result<PathBuf> {
+    let path = credentials_path_in(data_dir).ok_or_else(|| anyhow!("no local data directory"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -205,8 +240,8 @@ fn save_credentials(credentials: &StoredCredentials) -> Result<PathBuf> {
 /// stable identity anchor across access-token rotations, so when the on-disk
 /// refresh token no longer matches the one we refreshed from, a newer login has
 /// replaced the original and we skip persistence entirely.
-fn persist_rotated(grant: &OauthGrant, prior: &OauthGrant) {
-    let Some(mut credentials) = load_credentials() else { return };
+fn persist_rotated(grant: &OauthGrant, prior: &OauthGrant, data_dir: Option<&Path>) {
+    let Some(mut credentials) = load_credentials_in(data_dir) else { return };
     if !same_login(&credentials, prior) {
         return;
     }
@@ -217,7 +252,7 @@ fn persist_rotated(grant: &OauthGrant, prior: &OauthGrant) {
     if grant.expires_at.is_some() {
         credentials.expires_at = grant.expires_at;
     }
-    let _ = save_credentials(&credentials);
+    let _ = save_credentials_in(&credentials, data_dir);
 }
 
 /// True when the on-disk credentials still belong to the login that `prior`
@@ -227,6 +262,59 @@ fn persist_rotated(grant: &OauthGrant, prior: &OauthGrant) {
 /// the original and the stale refresh must not overwrite it.
 fn same_login(credentials: &StoredCredentials, prior: &OauthGrant) -> bool {
     credentials.refresh_token == prior.refresh_token
+}
+
+/// Adopt a renewed grant another Muse client already persisted, so this client
+/// does not refresh with a token that rotation invalidated. Separately
+/// constructed clients (the background title task builds its own at
+/// `src/agent.rs:889`) hold independent in-memory grants over the one shared
+/// `muse.json`: when one client refreshes first it rotates the refresh token
+/// (and, on a rotating server, invalidates the predecessor), leaving a peer
+/// still holding the stale grant. If that peer then refreshes with the
+/// invalidated token the refresh fails, and the fallback mint uses the expired
+/// access token, so its requests keep failing even though renewed credentials
+/// are already on disk.
+///
+/// The reload keys on the access token, which every rotation changes: when the
+/// on-disk token differs from ours, another writer renewed the grant and we
+/// take the file's copy instead of refreshing again. To never switch accounts,
+/// the file's grant is adopted only when it is unambiguously the same login —
+/// the refresh token (the stable identity anchor, as in [`same_login`]) still
+/// matches ours — *and* strictly fresher (a later expiry, or a non-expiring
+/// grant replacing an expiring one), which also stops a *stale* file from a
+/// peer that has not yet persisted being adopted over a fresher in-memory
+/// grant.
+///
+/// A peer that rotated the refresh token writes a refresh token we no longer
+/// hold; that case is *not* adopted here (we cannot distinguish it from a
+/// different account's login), so we fall through and refresh — which the
+/// server accepts when it keeps the old refresh token valid across an
+/// access-token renewal, the common case. Returns `None` when there is nothing
+/// newer to take (we are the first to refresh, or the file is unreadable / a
+/// different login), leaving the caller to refresh as before.
+fn reload_renewed_grant(grant: &OauthGrant, data_dir: Option<&Path>) -> Option<OauthGrant> {
+    let on_disk = load_credentials_in(data_dir)?.grant();
+    // A different access token is the signal that a rotation happened; without
+    // it the file holds the same grant we already have.
+    if on_disk.access_token == grant.access_token {
+        return None;
+    }
+    // Same login only when the refresh token still matches (the stable identity
+    // anchor), and only adopt a strictly fresher grant.
+    if on_disk.refresh_token != grant.refresh_token || !is_fresher(&on_disk, grant) {
+        return None;
+    }
+    Some(on_disk)
+}
+
+/// True when `candidate` outlives `prior`: a later expiry, or a non-expiring
+/// grant replacing an expiring one.
+fn is_fresher(candidate: &OauthGrant, prior: &OauthGrant) -> bool {
+    match (candidate.expires_at, prior.expires_at) {
+        (Some(new), Some(old)) => new > old,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 fn with_client_headers(
@@ -502,6 +590,11 @@ pub struct MuseClient {
     /// test constructor (`with_endpoints`), so a synthetic grant never
     /// overwrites the user's saved `muse.json`.
     persist: bool,
+    /// The directory the credentials file lives in. `None` for the platform
+    /// data dir; tests set a tempdir so a synthetic login never touches the
+    /// user's real `muse.json` (threaded through the client, not a
+    /// process-global, so parallel tests never interfere).
+    credentials_dir: Option<PathBuf>,
 }
 
 impl MuseClient {
@@ -535,6 +628,19 @@ impl MuseClient {
         session: Option<SessionKey>,
         persist: bool,
     ) -> Result<Self> {
+        Self::with_credentials_dir(provider, oauth, endpoints, session, persist, None)
+    }
+
+    /// `with_endpoints` plus an explicit credentials directory (tests pass a
+    /// tempdir; production passes `None` for the platform data dir).
+    fn with_credentials_dir(
+        provider: ResolvedProvider,
+        oauth: Option<Arc<tokio::sync::Mutex<OauthGrant>>>,
+        endpoints: Endpoints,
+        session: Option<SessionKey>,
+        persist: bool,
+        credentials_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             transport: HttpTransport::new(provider)?,
             oauth,
@@ -542,6 +648,7 @@ impl MuseClient {
             session: Arc::new(tokio::sync::Mutex::new(session)),
             models_cache: Arc::new(tokio::sync::Mutex::new(None)),
             persist,
+            credentials_dir,
         })
     }
 
@@ -573,9 +680,21 @@ impl MuseClient {
         // which surfaces the real error if it is truly dead.
         let access_token = {
             let mut grant = grant.lock().await;
+            if grant.needs_refresh() {
+                // Coordinate with the other clients sharing this login: a peer
+                // (e.g. the background title task's own client) may already have
+                // refreshed and persisted a rotated grant, invalidating the
+                // refresh token we hold. Adopt that renewed grant instead of
+                // refreshing with the dead token.
+                if self.persist
+                    && let Some(renewed) = reload_renewed_grant(&grant, self.credentials_dir.as_deref())
+                {
+                    *grant = renewed;
+                }
+            }
             if let Some(renewed) = refresh_grant(self.transport.http(), &self.endpoints, &grant).await {
                 if self.persist {
-                    persist_rotated(&renewed, &grant);
+                    persist_rotated(&renewed, &grant, self.credentials_dir.as_deref());
                 }
                 *grant = renewed;
             }
@@ -770,6 +889,7 @@ impl LLMClient for MuseClient {
             session: self.session.clone(),
             models_cache: self.models_cache.clone(),
             persist: self.persist,
+            credentials_dir: self.credentials_dir.clone(),
         })
     }
 
@@ -1171,6 +1291,95 @@ mod tests {
         assert!(same_login(&creds(None), &grant(None)));
         assert!(!same_login(&creds(Some("rt-1")), &grant(None)));
         assert!(!same_login(&creds(None), &grant(Some("rt-1"))));
+    }
+
+    #[test]
+    fn freshness_tracks_renewal() {
+        let grant = |acc: &str, rt: Option<&str>, exp: Option<i64>| OauthGrant {
+            access_token: acc.into(),
+            refresh_token: rt.map(str::to_string),
+            expires_at: exp,
+        };
+        let now = Utc::now().timestamp();
+        // Fresher: a later expiry, or a non-expiring grant replacing an expiring
+        // one. An equal/earlier expiry or a missing candidate expiry is not.
+        assert!(is_fresher(&grant("b", None, Some(now + 100)), &grant("a", None, Some(now))));
+        assert!(is_fresher(&grant("b", None, None), &grant("a", None, Some(now))));
+        assert!(!is_fresher(&grant("b", None, Some(now)), &grant("a", None, Some(now))));
+        assert!(!is_fresher(&grant("b", None, Some(now)), &grant("a", None, None)));
+    }
+
+    #[tokio::test]
+    async fn stale_client_adopts_a_peers_renewed_grant() {
+        // Two independently constructed clients share one login. The first
+        // refreshes and persists a renewed grant; the second, still holding the
+        // now-stale grant, must adopt the renewed one from disk instead of
+        // refreshing with the dead token. Both clients point at an isolated
+        // tempdir credentials file (threaded through, not a process-global), so
+        // parallel tests never interfere.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = || Some(dir.path().to_path_buf());
+        let now = Utc::now().timestamp();
+        // The original login on disk: a stale access token both clients loaded.
+        save_credentials_in(
+            &StoredCredentials {
+                oauth_token: "expired-tok".into(),
+                refresh_token: Some("refresh-tok".into()),
+                expires_at: Some(now - 10),
+                api_key: None,
+                api_base: None,
+                created_at: Utc::now(),
+            },
+            data_dir().as_deref(),
+        )
+        .unwrap();
+        // Client 1 refreshes: the token endpoint renews the access token (the
+        // refresh token is unchanged — the common case) and `persist_rotated`
+        // writes the renewed grant back.
+        let rotated = json!({ "access_token": "fresh-tok", "expires_in": 3600 });
+        let (auth_srv, _auth_log) = test_server::serve(vec![(200, "", rotated.to_string())]).await;
+        let (mint_srv, mint_log) =
+            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))]).await;
+        let endpoints = |token: &str| Endpoints {
+            token: format!("{token}/oidc/device/token/"),
+            ..Endpoints::for_bases(token, &mint_srv)
+        };
+        let provider = client_model("http://unused", "muse-spark-1.3");
+        let client1 = MuseClient::with_credentials_dir(
+            provider.transport.provider().clone(),
+            Some(stale_grant()),
+            endpoints(&auth_srv),
+            None,
+            true,
+            data_dir(),
+        )
+        .unwrap();
+        client1.session_key(false).await.unwrap();
+        // Client 1 renewed the access token and persisted it (refresh token kept).
+        let on_disk = load_credentials_in(data_dir().as_deref()).unwrap();
+        assert_eq!(on_disk.oauth_token, "fresh-tok");
+        assert_eq!(on_disk.refresh_token.as_deref(), Some("refresh-tok"));
+        // Client 2 is built independently, still holding the *original* stale
+        // grant (its refresh token is now invalidated on the server). Point its
+        // token endpoint at a server that would fail the refresh, so the only
+        // way it gets a working token is by adopting client 1's renewed grant.
+        let (dead_auth, dead_log) = test_server::serve(vec![(400, "", "{}".into())]).await;
+        let client2 = MuseClient::with_credentials_dir(
+            provider.transport.provider().clone(),
+            Some(stale_grant()),
+            endpoints(&dead_auth),
+            None,
+            true,
+            data_dir(),
+        )
+        .unwrap();
+        let session = client2.session_key(false).await.unwrap();
+        assert_eq!(session.api_key, "minted-key");
+        // Client 2 adopted the renewed grant: its mint carried the fresh access
+        // token, and it never needed the (failing) refresh endpoint.
+        let mint_log = mint_log.lock().unwrap();
+        assert!(mint_log[1].headers.to_lowercase().contains("authorization: bearer fresh-tok"), "{}", mint_log[1].headers);
+        assert!(dead_log.lock().unwrap().is_empty(), "client 2 must not refresh with the invalidated token");
     }
 
     #[test]
