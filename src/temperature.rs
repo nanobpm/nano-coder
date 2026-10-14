@@ -214,7 +214,7 @@ pub fn fixed_reason(kind: Option<ProviderKind>, provider: &ProviderConfig, model
     if provider.drop_params.as_ref().is_some_and(|d| d.iter().any(|p| p == "temperature")) {
         return Some("the provider drops temperature (drop_params)".to_string());
     }
-    if kind == Some(ProviderKind::GithubCopilot) && crate::providers::github_copilot::is_reasoning_model(model) {
+    if kind.is_some_and(|kind| crate::providers::reasons_over_responses(kind, model)) {
         return Some(format!("{model} is a reasoning model and rejects a custom temperature"));
     }
     None
@@ -423,6 +423,26 @@ mod tests {
             warning.contains("0.5") && warning.contains("ignored"),
             "the ignored provider value is reported: {warning}"
         );
+    }
+
+    #[test]
+    fn muse_reasoning_models_ignore_a_configured_temperature() {
+        // Muse is always Responses-routed and always sends `reasoning.effort`,
+        // so a configured temperature is never sent — `fixed_reason` must say so
+        // (via `reasons_over_responses`) rather than report it as effective.
+        let global = Temperature::Value(0.7);
+        let p = provider("[models.\"muse-spark-1.3\"]\ntemperature = 0.3\n");
+        let r = resolve(global, Some(ProviderKind::Muse), &p, "muse-spark-1.3");
+        assert_eq!((r.value(), r.source), (None, Source::Required));
+        assert!(r.fixed.as_deref().unwrap().contains("reasoning model"), "{:?}", r.fixed);
+        // The model-level number is reported as ignored, not silently sent.
+        let warning = r.warning.unwrap();
+        assert!(warning.contains("0.3") && warning.contains("ignored"), "{warning}");
+        // A provider-level Muse temperature is likewise ignored.
+        let p = provider("temperature = 0.5\n");
+        let r = resolve(global, Some(ProviderKind::Muse), &p, "muse-spark-1.3");
+        assert_eq!(r.value(), None);
+        assert!(r.warning.as_deref().unwrap().contains("0.5"), "{:?}", r.warning);
     }
 
     #[test]

@@ -354,21 +354,21 @@ pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str, on
     let text = response.text().await?;
     let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
-        bail!("{}", mint_refusal(status, &value, &text));
+        bail!("{}", mint_refusal(status, &value));
     }
     let api_key = value
         .get("api_key")
         .and_then(Value::as_str)
         .filter(|k| !k.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value, &text)))?;
+        .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value)))?;
     // A 2xx can still carry the account gate (`is_subs_active` / `require_payment`)
     // alongside a key. An inactive subscription must not proceed through the
     // metered lane, so reject it before the key is stored or used.
     let inactive = value.get("is_subs_active").and_then(Value::as_bool) == Some(false);
     let payment = value.get("require_payment").and_then(Value::as_bool).unwrap_or(false);
     if inactive || payment {
-        bail!("{}", mint_refusal(status, &value, &text));
+        bail!("{}", mint_refusal(status, &value));
     }
     // A successful mint may omit `base_url`; fall back to the default API base.
     let base_url = value
@@ -384,14 +384,20 @@ pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str, on
 /// onboarding problem comes back as a structured body (`detail`/`title`,
 /// `action_url`, `require_payment`), which is far more useful than "missing
 /// api_key" — see the `MintedKey` fields in the Muse binary.
-fn mint_refusal(status: u16, value: &Value, raw: &str) -> String {
+///
+/// The raw body is never copied into the message: a refused mint can still
+/// carry `api_key` (a 2xx with the account gate set — see
+/// `mint_rejects_an_inactive_subscription_even_with_a_key`), and echoing it
+/// would leak the bearer key into terminal output and captured logs. When no
+/// structured `detail`/`title` is present, fall back to a generic reason.
+fn mint_refusal(status: u16, value: &Value) -> String {
     let field = |name: &str| value.get(name).and_then(Value::as_str).filter(|s| !s.is_empty());
     let detail = field("detail").or_else(|| field("title"));
     let action = field("action_url").or_else(|| field("require_payment_action_url"));
     let payment = value.get("require_payment").and_then(Value::as_bool).unwrap_or(false);
     let mut message = match detail {
         Some(detail) => format!("Muse key mint refused (HTTP {status}): {detail}"),
-        None => format!("Muse key mint failed (HTTP {status}): {}", raw.chars().take(300).collect::<String>()),
+        None => format!("Muse key mint failed (HTTP {status}): no usable API key in the response"),
     };
     if payment && detail.is_none() {
         message.push_str(": a payment method or Muse Code subscription is required");
@@ -430,6 +436,11 @@ pub struct MuseClient {
     /// The catalog list the probes read, keyed by the `api_base` it was fetched
     /// from. Shared across clones like `session`.
     models_cache: Arc<tokio::sync::Mutex<Option<(String, Value)>>>,
+    /// Whether a token refresh writes the rotated grant back to the stored
+    /// credentials file. `true` for a real client (`new`); `false` for the
+    /// test constructor (`with_endpoints`), so a synthetic grant never
+    /// overwrites the user's saved `muse.json`.
+    persist: bool,
 }
 
 impl MuseClient {
@@ -453,7 +464,7 @@ impl MuseClient {
             let base_url = c.api_base.unwrap_or_else(|| DEFAULT_API_BASE.to_string());
             Some(SessionKey { api_key, base_url, refresh_at: i64::MAX })
         });
-        Self::with_endpoints(provider, oauth, Endpoints::for_bases(&auth_base(), &mint_base()), seeded)
+        Self::with_endpoints(provider, oauth, Endpoints::for_bases(&auth_base(), &mint_base()), seeded, true)
     }
 
     pub(crate) fn with_endpoints(
@@ -461,6 +472,7 @@ impl MuseClient {
         oauth: Option<Arc<tokio::sync::Mutex<OauthGrant>>>,
         endpoints: Endpoints,
         session: Option<SessionKey>,
+        persist: bool,
     ) -> Result<Self> {
         Ok(Self {
             transport: HttpTransport::new(provider)?,
@@ -468,6 +480,7 @@ impl MuseClient {
             endpoints,
             session: Arc::new(tokio::sync::Mutex::new(session)),
             models_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            persist,
         })
     }
 
@@ -500,7 +513,9 @@ impl MuseClient {
         let access_token = {
             let mut grant = grant.lock().await;
             if let Some(renewed) = refresh_grant(self.transport.http(), &self.endpoints, &grant).await {
-                persist_rotated(&renewed);
+                if self.persist {
+                    persist_rotated(&renewed);
+                }
                 *grant = renewed;
             }
             grant.access_token.clone()
@@ -693,6 +708,7 @@ impl LLMClient for MuseClient {
             endpoints: self.endpoints.clone(),
             session: self.session.clone(),
             models_cache: self.models_cache.clone(),
+            persist: self.persist,
         })
     }
 
@@ -903,7 +919,7 @@ mod tests {
         );
         let provider = resolve(&format!("muse/{model}"), &user, "mock").unwrap();
         let endpoints = Endpoints::for_bases(base, base);
-        MuseClient::with_endpoints(provider, Some(grant("oauth-tok")), endpoints, None).unwrap()
+        MuseClient::with_endpoints(provider, Some(grant("oauth-tok")), endpoints, None, false).unwrap()
     }
 
     /// A non-expiring OAuth grant for tests: no refresh token, no expiry, so
@@ -945,6 +961,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &mint_srv),
             None,
+            false,
         )
         .unwrap();
         let messages = vec![Message::user("hello")];
@@ -1028,6 +1045,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &mint_srv),
             Some(seeded),
+            false,
         )
         .unwrap();
         let messages = vec![Message::user("hello")];
@@ -1104,6 +1122,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         let models = client.list_models().await.unwrap();
@@ -1123,14 +1142,30 @@ mod tests {
             "is_subs_active": false,
             "can_subscribe": true
         });
-        let message = mint_refusal(402, &body, &body.to_string());
+        let message = mint_refusal(402, &body);
         assert!(message.contains("Muse Code requires a payment method"), "{message}");
         assert!(message.contains("accountscenter.meta.com/muse_code"), "{message}");
         assert!(message.contains("--login muse"), "{message}");
         // A bare 401 with an unhelpful body still names the gate.
         let bare = json!({ "require_payment": true });
-        let message = mint_refusal(401, &bare, "{}");
+        let message = mint_refusal(401, &bare);
         assert!(message.contains("subscription is required"), "{message}");
+    }
+
+    #[test]
+    fn mint_refusal_never_leaks_the_api_key() {
+        // A refused mint can still carry `api_key` (a 2xx with the account gate
+        // set). The fallback message must not echo the response body, or the
+        // bearer key would leak into terminal output and captured logs.
+        let body = json!({ "api_key": "secret-bearer-key", "is_subs_active": false });
+        let message = mint_refusal(200, &body);
+        assert!(!message.contains("secret-bearer-key"), "{message}");
+        assert!(message.contains("no usable API key"), "{message}");
+        // A structured `detail` is surfaced, but the key is still not.
+        let detailed = json!({ "api_key": "secret-bearer-key", "detail": "subscription inactive" });
+        let message = mint_refusal(200, &detailed);
+        assert!(message.contains("subscription inactive"), "{message}");
+        assert!(!message.contains("secret-bearer-key"), "{message}");
     }
 
     #[tokio::test]
@@ -1150,6 +1185,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &mint_srv),
             None,
+            false,
         )
         .unwrap();
         let messages = vec![Message::user("hello")];
@@ -1198,6 +1234,8 @@ mod tests {
             };
             let err = mint(&http, &endpoints, "oauth-tok", false).await.unwrap_err();
             assert!(err.to_string().contains("--login muse"), "{err}");
+            // The rejected key must not leak into the error message.
+            assert!(!err.to_string().contains("\"k\""), "{err}");
         }
     }
 
@@ -1220,6 +1258,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         let models = client.list_models().await.unwrap();
@@ -1255,6 +1294,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         client.list_models().await.unwrap();
@@ -1295,6 +1335,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         let models = client.list_models().await.unwrap();
@@ -1324,6 +1365,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         let models = client.list_models().await.unwrap();
@@ -1352,6 +1394,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         let models = client.list_models().await.unwrap();
@@ -1393,6 +1436,7 @@ mod tests {
             Some(grant("oauth-tok")),
             endpoints(&mint_srv, &catalog),
             None,
+            false,
         )
         .unwrap();
         client.list_models().await.unwrap();
@@ -1405,7 +1449,7 @@ mod tests {
         // Muse may return the remediation link as `require_payment_action_url`
         // rather than `action_url`; both must surface in the message.
         let value = json!({ "require_payment": true, "require_payment_action_url": "https://accountscenter.meta.com/muse_code" });
-        let message = mint_refusal(402, &value, &value.to_string());
+        let message = mint_refusal(402, &value);
         assert!(message.contains("https://accountscenter.meta.com/muse_code"), "{message}");
     }
 
@@ -1442,7 +1486,7 @@ mod tests {
             ..Endpoints::for_bases(&auth_srv, &mint_srv)
         };
         let provider = client_model("http://unused", "muse-spark-1.3");
-        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(stale_grant()), endpoints, None).unwrap();
+        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(stale_grant()), endpoints, None, false).unwrap();
         let session = client.session_key(false).await.unwrap();
         assert_eq!(session.api_key, "minted-key");
         // The refresh hit the token endpoint (the captured `body` is not parsed
@@ -1452,6 +1496,33 @@ mod tests {
         // ...and the mint used the refreshed access token.
         let mint_log = mint_log.lock().unwrap();
         assert!(mint_log[0].headers.to_lowercase().contains("authorization: bearer fresh-tok"), "{}", mint_log[0].headers);
+    }
+
+    #[tokio::test]
+    async fn synthetic_grant_refresh_does_not_touch_the_saved_credentials() {
+        // A test client (`with_endpoints`, `persist: false`) refreshing a stale
+        // grant must renew it in memory but never rewrite the user's real
+        // `muse.json`. Snapshot the file (or its absence) and assert it is
+        // byte-for-byte unchanged after the refresh.
+        let before = credentials_path().and_then(|p| std::fs::read(&p).ok());
+        let refreshed = json!({ "access_token": "fresh-tok", "refresh_token": "refresh-tok-2", "expires_in": 3600 });
+        let (auth_srv, _) = test_server::serve(vec![(200, "", refreshed.to_string())]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let endpoints = Endpoints {
+            token: format!("{auth_srv}/oidc/device/token/"),
+            ..Endpoints::for_bases(&auth_srv, &mint_srv)
+        };
+        let provider = client_model("http://unused", "muse-spark-1.3");
+        let grant = stale_grant();
+        let client =
+            MuseClient::with_endpoints(provider.transport.provider().clone(), Some(grant.clone()), endpoints, None, false)
+                .unwrap();
+        client.session_key(false).await.unwrap();
+        // The refresh happened in memory...
+        assert_eq!(grant.lock().await.access_token, "fresh-tok");
+        // ...but the stored credentials file is untouched.
+        let after = credentials_path().and_then(|p| std::fs::read(&p).ok());
+        assert_eq!(before, after, "the saved Muse credentials must not be rewritten by a synthetic grant");
     }
 
     #[tokio::test]
@@ -1465,7 +1536,7 @@ mod tests {
             ..Endpoints::for_bases("http://127.0.0.1:1", &mint_srv)
         };
         let provider = client_model("http://unused", "muse-spark-1.3");
-        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(grant("oauth-tok")), endpoints, None).unwrap();
+        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(grant("oauth-tok")), endpoints, None, false).unwrap();
         let session = client.session_key(false).await.unwrap();
         assert_eq!(session.api_key, "minted-key");
         assert!(mint_log.lock().unwrap()[0].headers.to_lowercase().contains("authorization: bearer oauth-tok"));
