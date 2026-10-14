@@ -264,12 +264,21 @@ pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) ->
         .filter(|k| !k.is_empty())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value, &text)))?;
+    // A 2xx can still carry the account gate (`is_subs_active` / `require_payment`)
+    // alongside a key. An inactive subscription must not proceed through the
+    // metered lane, so reject it before the key is stored or used.
+    let inactive = value.get("is_subs_active").and_then(Value::as_bool) == Some(false);
+    let payment = value.get("require_payment").and_then(Value::as_bool).unwrap_or(false);
+    if inactive || payment {
+        bail!("{}", mint_refusal(status, &value, &text));
+    }
+    // A successful mint may omit `base_url`; fall back to the default API base.
     let base_url = value
         .get("base_url")
         .and_then(Value::as_str)
         .map(|u| u.trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
-        .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value, &text)))?;
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
     Ok(MintedKey { api_key, base_url })
 }
 
@@ -342,7 +351,7 @@ impl MuseClient {
         Self::with_endpoints(provider, oauth, Endpoints::for_bases(&auth_base(), &mint_base()), seeded)
     }
 
-    pub fn with_endpoints(
+    pub(crate) fn with_endpoints(
         provider: ResolvedProvider,
         oauth: Option<String>,
         endpoints: Endpoints,
@@ -392,10 +401,15 @@ impl MuseClient {
     }
 
     async fn catalog_json(&self, session: &SessionKey, timeout: Option<std::time::Duration>) -> Result<Value> {
-        let mut request =
-            with_client_headers(self.transport.http().get(&self.endpoints.catalog), &self.transport.provider().headers)
-                .bearer_auth(&session.api_key)
-                .header("Accept", "application/json");
+        let mut request = self.transport.http().get(&self.endpoints.catalog);
+        // Apply the provider's configured headers first, then the Muse client
+        // defaults for any header the config did not override.
+        for (name, value) in &self.transport.provider().headers {
+            request = request.header(name, value);
+        }
+        let mut request = with_client_headers(request, &self.transport.provider().headers)
+            .bearer_auth(&session.api_key)
+            .header("Accept", "application/json");
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
@@ -403,21 +417,43 @@ impl MuseClient {
         let status = response.status();
         let value: Value = response.json().await?;
         if !status.is_success() {
-            bail!("listing Muse models failed (HTTP {status}): {value}");
+            // Return an ApiError so a 401 is recognised for the one-time remint.
+            return Err(ApiError::from_body(status.as_u16(), &value.to_string()).into());
         }
         Ok(value)
     }
 
     /// The current model's catalog row, from the cached list (fetched with
     /// `timeout` the first time). The cache is keyed on the minted `api_base`,
-    /// mirroring the Copilot provider.
+    /// mirroring the Copilot provider. A 401 from the catalog remints the key
+    /// once and retries, so an expired seeded key does not silently lose the
+    /// capability probes.
     async fn model_entry(&self, timeout: std::time::Duration) -> Option<Value> {
-        let session = self.session_key(false).await.ok()?;
-        let api_base = self.api_base(&session);
-        let mut cache = self.models_cache.lock().await;
-        if cache.as_ref().map(|(base, _)| base.as_str()) != Some(api_base.as_str()) {
-            *cache = Some((api_base, self.catalog_json(&session, Some(timeout)).await.ok()?));
+        let mut session = self.session_key(false).await.ok()?;
+        let mut reminted = false;
+        loop {
+            let api_base = self.api_base(&session);
+            let cached = {
+                let cache = self.models_cache.lock().await;
+                cache.as_ref().map(|(base, _)| base.as_str()) == Some(api_base.as_str())
+            };
+            if cached {
+                break;
+            }
+            match self.catalog_json(&session, Some(timeout)).await {
+                Ok(value) => {
+                    *self.models_cache.lock().await = Some((api_base, value));
+                    break;
+                }
+                // A 401 means the seeded/minted key expired: remint once and retry.
+                Err(e) if !reminted && is_unauthorized(&e) => {
+                    session = self.session_key(true).await.ok()?;
+                    reminted = true;
+                }
+                Err(_) => return None,
+            }
         }
+        let cache = self.models_cache.lock().await;
         let model = &self.transport.provider().model;
         catalog_rows(&cache.as_ref()?.1).into_iter().find(|row| model_id(row) == Some(model.as_str())).cloned()
     }
@@ -609,8 +645,19 @@ impl LLMClient for MuseClient {
     }
 
     async fn list_models(&self) -> Result<Vec<String>> {
-        let session = self.session_key(false).await?;
-        let value = self.catalog_json(&session, None).await?;
+        let mut session = self.session_key(false).await?;
+        let mut reminted = false;
+        let value = loop {
+            match self.catalog_json(&session, None).await {
+                Ok(value) => break value,
+                // A 401 means the seeded/minted key expired: remint once and retry.
+                Err(e) if !reminted && is_unauthorized(&e) => {
+                    session = self.session_key(true).await?;
+                    reminted = true;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let mut models: Vec<String> = catalog_rows(&value)
             .into_iter()
             .filter_map(|row| {
@@ -918,5 +965,100 @@ mod tests {
         // A 401 minted a fresh key and retried: two mint calls, two chat calls.
         assert_eq!(mint_log.lock().unwrap().len(), 2);
         assert_eq!(api_log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mint_defaults_base_url_when_omitted() {
+        // A successful mint may omit `base_url`; the client falls back to the
+        // default API base rather than failing the login.
+        let endpoints = Endpoints::for_bases("http://unused", "http://unused");
+        let http = reqwest::Client::new();
+        let (mint_srv, _) =
+            test_server::serve(vec![(200, "", json!({ "api_key": "minted-key" }).to_string())]).await;
+        let endpoints = Endpoints { mint: format!("{mint_srv}/muse-code/key"), ..endpoints };
+        let minted = mint(&http, &endpoints, "oauth-tok").await.unwrap();
+        assert_eq!(minted.api_key, "minted-key");
+        assert_eq!(minted.base_url, DEFAULT_API_BASE);
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_an_inactive_subscription_even_with_a_key() {
+        // A 2xx carrying the account gate must not proceed through the metered
+        // lane just because a key is present.
+        let http = reqwest::Client::new();
+        for gate in [
+            json!({ "api_key": "k", "base_url": "http://x", "is_subs_active": false }),
+            json!({ "api_key": "k", "base_url": "http://x", "require_payment": true }),
+        ] {
+            let (mint_srv, _) = test_server::serve(vec![(200, "", gate.to_string())]).await;
+            let endpoints = Endpoints {
+                mint: format!("{mint_srv}/muse-code/key"),
+                ..Endpoints::for_bases("http://unused", "http://unused")
+            };
+            let err = mint(&http, &endpoints, "oauth-tok").await.unwrap_err();
+            assert!(err.to_string().contains("--login muse"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_remints_once_after_a_401() {
+        // A catalog request that meets an expired key remints once and retries,
+        // so `--list-models` recovers instead of failing until a chat happens.
+        let body = json!({ "data": [{ "model_id": "muse-spark-1.3" }] }).to_string();
+        let (catalog, catalog_log) = test_server::serve(vec![
+            (401, "", json!({ "error": { "message": "expired" } }).to_string()),
+            (200, "", body),
+        ])
+        .await;
+        let (mint_srv, mint_log) =
+            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
+                .await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+        // First catalog call 401s, the remint produces a fresh key, retry succeeds.
+        assert_eq!(mint_log.lock().unwrap().len(), 2);
+        assert_eq!(catalog_log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn catalog_applies_configured_provider_headers() {
+        // A configured `User-Agent` override must reach the catalog request (and
+        // suppress the Muse default), not be dropped.
+        let body = json!({ "data": [{ "model_id": "muse-spark-1.3" }] }).to_string();
+        let (catalog, catalog_log) = test_server::serve(vec![(200, "", body)]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let mut user = HashMap::new();
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("User-Agent".to_string(), "custom-agent/9".to_string());
+        user.insert(
+            "muse".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Muse),
+                base_url: Some(catalog.clone()),
+                headers,
+                retry_initial_backoff_ms: Some(1),
+                ..Default::default()
+            },
+        );
+        let provider = resolve("muse/muse-spark-1.3", &user, "mock").unwrap();
+        let client = MuseClient::with_endpoints(
+            provider,
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        client.list_models().await.unwrap();
+        let sent = catalog_log.lock().unwrap()[0].headers.to_lowercase();
+        assert!(sent.contains("user-agent: custom-agent/9"), "{sent}");
+        assert!(!sent.contains("muse-build/"), "{sent}");
     }
 }
