@@ -225,7 +225,7 @@ pub async fn login() -> Result<PathBuf> {
         match poll.get("error").and_then(Value::as_str) {
             Some("authorization_pending") => {}
             Some("slow_down") => {
-                interval = poll.get("interval").and_then(Value::as_u64).unwrap_or(interval + 5);
+                interval = slow_down_interval(interval, poll.get("interval").and_then(Value::as_u64));
             }
             Some(other) => {
                 bail!("login failed: {other}: {}", poll.get("error_description").and_then(Value::as_str).unwrap_or(""))
@@ -233,6 +233,14 @@ pub async fn login() -> Result<PathBuf> {
             None => bail!("unexpected token response: {poll}"),
         }
     }
+}
+
+/// RFC 8628 §3.5: every `slow_down` response must raise the device-token
+/// polling interval by at least five seconds. Clamp the server-advertised value
+/// so a smaller (or missing) one cannot *reduce* the interval and get us
+/// rate-limited on the next poll.
+fn slow_down_interval(current: u64, advertised: Option<u64>) -> u64 {
+    advertised.unwrap_or(0).max(current + 5)
 }
 
 /// A minted Meta API key plus the endpoint it is valid for.
@@ -415,12 +423,14 @@ impl MuseClient {
         }
         let response = request.send().await?;
         let status = response.status();
-        let value: Value = response.json().await?;
+        let text = response.text().await?;
         if !status.is_success() {
-            // Return an ApiError so a 401 is recognised for the one-time remint.
-            return Err(ApiError::from_body(status.as_u16(), &value.to_string()).into());
+            // Classify the status *before* parsing: a 401 (or any error) with an
+            // empty or non-JSON body must still surface as `ApiError` so the
+            // one-time remint recognises it, rather than a serde error.
+            return Err(ApiError::from_body(status.as_u16(), &text).into());
         }
-        Ok(value)
+        Ok(serde_json::from_str(&text)?)
     }
 
     /// The current model's catalog row, from the cached list (fetched with
@@ -474,6 +484,15 @@ fn catalog_rows(value: &Value) -> Vec<&Value> {
 /// `model_id`.
 fn model_id(row: &Value) -> Option<&str> {
     ["id", "model_id", "modelId"].iter().find_map(|k| row.get(*k).and_then(Value::as_str))
+}
+
+/// Whether a catalog row is explicitly hidden (`visibility: "hidden"`). Muse's
+/// picker never offers these internal/disabled rows, so neither should we.
+fn is_hidden_row(row: &Value) -> bool {
+    ["visibility", "Visibility"]
+        .iter()
+        .find_map(|k| row.get(*k).and_then(Value::as_str))
+        .is_some_and(|v| v.eq_ignore_ascii_case("hidden"))
 }
 
 fn positive(row: &Value, keys: &[&str]) -> Option<usize> {
@@ -662,14 +681,17 @@ impl LLMClient for MuseClient {
             .into_iter()
             .filter_map(|row| {
                 let id = model_id(row)?;
-                // Hide image-generation models from the chat model list when the
-                // row says so (Muse marks them with `supports_image_generation`).
+                // Skip rows the picker would never offer: image-generation
+                // models and explicitly hidden/internal rows. Muse marks the
+                // former with `supports_image_generation` and the latter with
+                // `visibility: "hidden"`.
                 let image = row
                     .get("supports_image_generation")
                     .or_else(|| row.get("supportsImageGeneration"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                (!image).then(|| id.to_string())
+                let hidden = is_hidden_row(row);
+                (!image && !hidden).then(|| id.to_string())
             })
             .collect();
         models.sort();
@@ -1060,5 +1082,71 @@ mod tests {
         let sent = catalog_log.lock().unwrap()[0].headers.to_lowercase();
         assert!(sent.contains("user-agent: custom-agent/9"), "{sent}");
         assert!(!sent.contains("muse-build/"), "{sent}");
+    }
+
+    #[test]
+    fn slow_down_never_reduces_the_poll_interval() {
+        // RFC 8628: a slow_down must raise the interval by >= 5s. A smaller or
+        // missing advertised value must not shrink it.
+        assert_eq!(slow_down_interval(5, Some(2)), 10);
+        assert_eq!(slow_down_interval(5, None), 10);
+        assert_eq!(slow_down_interval(5, Some(5)), 10);
+        // A larger advertised value is honoured.
+        assert_eq!(slow_down_interval(5, Some(30)), 30);
+        assert_eq!(slow_down_interval(5, Some(10)), 10);
+    }
+
+    #[tokio::test]
+    async fn catalog_remints_on_a_401_with_a_non_json_body() {
+        // A 401 with an empty/non-JSON error body must still be classified as
+        // ApiError(401) so the one-time remint runs, not swallowed as a parse
+        // error that aborts --list-models.
+        let body = json!({ "data": [{ "model_id": "muse-spark-1.3" }] }).to_string();
+        let (catalog, catalog_log) = test_server::serve(vec![
+            (401, "", "Unauthorized".to_string()),
+            (200, "", body),
+        ])
+        .await;
+        let (mint_srv, mint_log) =
+            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
+                .await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+        assert_eq!(mint_log.lock().unwrap().len(), 2);
+        assert_eq!(catalog_log.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lists_models_excludes_hidden_rows() {
+        // Muse marks internal/disabled rows `visibility: "hidden"`; its picker
+        // skips them, so --list-models must too (alongside image rows).
+        let body = json!({
+            "data": [
+                { "model_id": "muse-spark-1.3" },
+                { "model_id": "muse-internal-x", "visibility": "hidden" },
+                { "model_id": "muse-image-1.0", "supports_image_generation": true }
+            ]
+        })
+        .to_string();
+        let (catalog, _) = test_server::serve(vec![(200, "", body)]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some("oauth-tok".into()),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
     }
 }
