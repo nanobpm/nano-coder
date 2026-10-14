@@ -10,9 +10,9 @@
 //! or your organisation's policy, and it can break when Meta changes what it
 //! checks. It is only used when explicitly selected.
 //!
-//! Model calls speak plain OpenAI Chat Completions; the catalog (`GET
-//! {mint}/muse-code/models`) is only read for the window / thinking levels /
-//! vision probes and for `--list-models`.
+//! Model calls speak the OpenAI Responses API (`POST {base}/responses`); the
+//! catalog (`GET {mint}/muse-code/models`) is only read for the window /
+//! thinking levels / vision probes and for `--list-models`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::openai;
+use super::openai_responses;
 use super::retry::ApiError;
 use super::{HttpTransport, ProviderKind, ResolvedProvider};
 use crate::llm::{ChatRequest, ContextCap, DetectedWindow, LLMClient, LLMResponse, StreamSink, report_whole};
@@ -44,8 +44,10 @@ pub const DEFAULT_API_BASE: &str = "https://api.meta.ai/v1";
 /// device authorization and token poll, the key mint, and the model catalog.
 pub const MUSE_API_VERSION: &str = "1.0.0";
 
-/// OpenAI Chat Completions path, relative to the (minted) API base.
-const CHAT_PATH: &str = "/chat/completions";
+/// OpenAI Responses path, relative to the (minted) API base. Muse's model API
+/// speaks the Responses wire protocol (`POST {base}/responses`), not Chat
+/// Completions.
+const CHAT_PATH: &str = "/responses";
 
 /// Per-request timeout for the capability probes, matching the other providers
 /// so a stalled catalog call cannot consume the whole startup/model-switch
@@ -627,13 +629,23 @@ fn is_image_generation_row(row: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a catalog row is a *Contributor* model (a `-contributor` id, e.g.
+/// `muse-spark-1.3-contributor`). Muse selects Contributor mode per request with
+/// the `x-tbh-contributor-mode` header and distinct data-use terms; this
+/// provider never sends that header or asks the user to opt in, so it must not
+/// offer Contributor rows as ordinary models. Exclude them from the picker until
+/// explicit Contributor-mode catalog/request handling (and its consent) exists.
+fn is_contributor_row(row: &Value) -> bool {
+    model_id(row).is_some_and(|id| id.to_ascii_lowercase().contains("contributor"))
+}
+
 /// A Muse chat model's vision support. Muse chat models accept image input, but
 /// the catalog carries no vision schema (its image flag is generation-only), so
 /// a normal chat row is reported vision-capable with default limits while an
 /// image-*generation* or hidden row reports no input vision. A configured
 /// `vision = false` override still wins over this in `vision::resolve`.
 fn muse_vision(row: &Value) -> Option<crate::vision::Vision> {
-    if is_image_generation_row(row) || is_hidden_row(row) {
+    if is_image_generation_row(row) || is_hidden_row(row) || is_contributor_row(row) {
         return None;
     }
     Some(crate::vision::Vision::capable())
@@ -687,7 +699,7 @@ impl LLMClient for MuseClient {
     async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
         let body = {
             let plan = request.attachment_plan();
-            openai::build_body_with_plan(&self.transport, request, &plan)
+            openai_responses::build_body_with_plan(&self.transport, request, &plan)
         };
         let overrides = self.transport.provider().headers.clone();
         let mut force_refresh = false;
@@ -701,7 +713,9 @@ impl LLMClient for MuseClient {
                 })
                 .await;
             match result {
-                Ok(value) => return openai::parse_response(&value, self.transport.provider().replay_reasoning),
+                Ok(value) => {
+                    return openai_responses::parse_response(&value, self.transport.provider().replay_reasoning)
+                }
                 // The key was revoked or expired early: mint once more, then fail.
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
                 Err(e) => return Err(e),
@@ -719,7 +733,7 @@ impl LLMClient for MuseClient {
         // dropped before the retry loop's awaits.
         let body = {
             let plan = request.attachment_plan();
-            openai::build_body_with_plan(&self.transport, request, &plan)
+            openai_responses::build_body_with_plan(&self.transport, request, &plan)
         };
         let overrides = self.transport.provider().headers.clone();
         let mut force_refresh = false;
@@ -729,7 +743,7 @@ impl LLMClient for MuseClient {
             let auth = |builder: reqwest::RequestBuilder| {
                 with_client_headers(builder, &overrides).bearer_auth(&session.api_key)
             };
-            let result = openai::stream_chat(&self.transport, &url, body.clone(), auth, sink).await;
+            let result = openai_responses::stream(&self.transport, &url, body.clone(), auth, sink).await;
             match result {
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
                 other => return other,
@@ -831,8 +845,10 @@ impl LLMClient for MuseClient {
             .filter_map(|row| {
                 let id = model_id(row)?;
                 // Skip rows the picker would never offer: image-generation
-                // models and explicitly hidden/internal rows. Muse marks the
-                // former with `supports_image_generation` and the latter with
+                // models, explicitly hidden/internal rows, and Contributor rows
+                // (which need a per-request `x-tbh-contributor-mode` opt-in this
+                // provider never sends). Muse marks the first with
+                // `supports_image_generation` and the second with
                 // `visibility: "hidden"`.
                 let image = row
                     .get("supports_image_generation")
@@ -840,7 +856,8 @@ impl LLMClient for MuseClient {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let hidden = is_hidden_row(row);
-                (!image && !hidden).then(|| id.to_string())
+                let contributor = is_contributor_row(row);
+                (!image && !hidden && !contributor).then(|| id.to_string())
             })
             .collect();
         models.sort();
@@ -899,6 +916,11 @@ mod tests {
         json!({ "api_key": "minted-key", "base_url": base }).to_string()
     }
 
+    /// A successful Responses-API reply (`POST {base}/responses`): an `output`
+    /// list with one `message` item carrying an `output_text` part.
+    const RESPONSES_OK: &str =
+        r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"status":"completed"}"#;
+
     /// Endpoints with the mint and the catalog on separate hosts, as in
     /// production (mint on `api.meta.ai`, catalog also there — but tests need
     /// distinct scripted servers).
@@ -912,10 +934,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mints_and_calls_chat_completions() {
-        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+    async fn mints_and_calls_the_responses_api() {
         let (mint_srv, mint_log) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
-        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (api, api_log) = test_server::serve(vec![(200, "", RESPONSES_OK.into())]).await;
         // The provider base_url is the API server; the mint returns a base that
         // is ignored because the provider carries an explicit base_url.
         let client = client_model(&api, "muse-spark-1.3");
@@ -938,9 +959,11 @@ mod tests {
         };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let api_log = api_log.lock().unwrap();
-        assert_eq!(api_log[0].path, "/chat/completions");
+        assert_eq!(api_log[0].path, "/responses");
         assert_eq!(api_log[0].body["model"], "muse-spark-1.3");
-        assert!(api_log[0].body.get("messages").is_some());
+        // Responses bodies carry `input`, not Chat Completions `messages`.
+        assert!(api_log[0].body.get("input").is_some());
+        assert!(api_log[0].body.get("messages").is_none());
         let headers = api_log[0].headers.to_lowercase();
         assert!(headers.contains("authorization: bearer minted-key"), "{headers}");
         assert!(headers.contains("x-client-id: tbh:exec"), "{headers}");
@@ -957,8 +980,7 @@ mod tests {
     async fn uses_a_literal_api_key_without_minting() {
         // `META_API_KEY` arrives as the provider's `api_key`; the client must
         // use it directly and never touch the mint endpoint.
-        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
-        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (api, api_log) = test_server::serve(vec![(200, "", RESPONSES_OK.into())]).await;
         let provider = {
             let mut user = HashMap::new();
             user.insert(
@@ -988,7 +1010,7 @@ mod tests {
         };
         assert_eq!(client.chat(&request).await.unwrap().content, "hi");
         let api_log = api_log.lock().unwrap();
-        assert_eq!(api_log[0].path, "/chat/completions");
+        assert_eq!(api_log[0].path, "/responses");
         assert!(api_log[0].headers.to_lowercase().contains("authorization: bearer env-key"));
     }
 
@@ -996,8 +1018,7 @@ mod tests {
     async fn reuses_a_stored_minted_key_without_minting_again() {
         // A `--login muse` writes the minted key to disk; the client seeds its
         // session from it, so the first call doesn't need the mint endpoint.
-        let ok = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
-        let (api, api_log) = test_server::serve(vec![(200, "", ok.into())]).await;
+        let (api, api_log) = test_server::serve(vec![(200, "", RESPONSES_OK.into())]).await;
         let (mint_srv, mint_log) = test_server::serve(vec![(500, "", "should not be called".into())]).await;
         let provider = client_model(&api, "muse-spark-1.3");
         let seeded =
@@ -1114,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn remints_once_after_a_401() {
-        let ok = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let ok = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"status":"completed"}"#;
         let (mint_srv, mint_log) =
             test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
                 .await;
@@ -1307,6 +1328,37 @@ mod tests {
         .unwrap();
         let models = client.list_models().await.unwrap();
         assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn lists_models_excludes_contributor_rows() {
+        // Contributor models (`…-contributor`) need a per-request
+        // `x-tbh-contributor-mode` opt-in with distinct data-use terms that this
+        // provider never sends, so the picker must not offer them as ordinary
+        // models.
+        let body = json!({
+            "data": [
+                { "model_id": "muse-spark-1.3" },
+                { "model_id": "muse-spark-1.3-contributor" },
+                { "model_id": "muse-spark-1.3-Contributor" }
+            ]
+        })
+        .to_string();
+        let (catalog, _) = test_server::serve(vec![(200, "", body)]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
+        let provider = client_model(&catalog, "muse-spark-1.3");
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some(grant("oauth-tok")),
+            endpoints(&mint_srv, &catalog),
+            None,
+        )
+        .unwrap();
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
+        // A contributor row reports no input vision either, matching the other
+        // non-picker rows.
+        assert!(muse_vision(&json!({ "model_id": "muse-spark-1.3-contributor" })).is_none());
     }
 
     #[tokio::test]

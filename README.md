@@ -793,8 +793,9 @@ The `muse` provider uses a Meta Muse Code subscription by authenticating **as th
 does**: an RFC 8628 device-code login against `auth.meta.com` with Muse's public OAuth client
 id, a *mint* of that OAuth token for a short-lived Meta API key
 (`POST https://api.meta.ai/muse-code/key`), and model calls carrying Muse's client headers
-against the OpenAI-compatible Meta API at `https://api.meta.ai/v1`. Model calls are plain
-Chat Completions. Like the Copilot provider this is **not a Meta-sanctioned integration**: it
+against the OpenAI-compatible Meta API at `https://api.meta.ai/v1`. Model calls use the
+OpenAI Responses API (`POST {base}/responses`). Like the Copilot provider this is **not a
+Meta-sanctioned integration**: it
 may breach Meta's terms or your organisation's policy, it can break without notice, and
 misuse could get an account flagged. It is never used unless you select it.
 
