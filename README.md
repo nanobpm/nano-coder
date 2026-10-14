@@ -798,15 +798,26 @@ Chat Completions. Like the Copilot provider this is **not a Meta-sanctioned inte
 may breach Meta's terms or your organisation's policy, it can break without notice, and
 misuse could get an account flagged. It is never used unless you select it.
 
+The login only establishes *who you are*; your plan is checked at the mint, which returns the
+key plus your account state (`is_subs_active`, `subs_tier_name`, `require_payment`,
+`subs_usage`). So a subscription works through the same `--login muse`: the device flow
+completes, the mint confirms the plan, and calls are served against it. If the mint refuses —
+the account isn't enabled for the Model API, or no payment method/subscription is on it — the
+provider relays Meta's own message and the URL to fix it (`dev.meta.ai` to onboard,
+`accountscenter.meta.com/muse_code` to subscribe), and a lapsed subscription makes calls stop
+until you renew and log in again.
+
 ```bash
 nano-coder --login muse                    # interactive; saves the OAuth token + minted key (0600)
 nano-coder --list-models muse
 nano-coder --model muse/muse-spark-1.3
 ```
 
-Headless workers can't do the device flow; set `META_API_KEY` to a Meta API key instead (it
-takes priority over a stored login; the minted key and OAuth token live in
-`<data dir>/nano-coder/muse.json`). `MUSE_AUTH_BASE_URL` and `MUSE_MINT_BASE_URL` point the
+Headless workers can't do the device flow; set `META_API_KEY` to a Meta API key instead. Note
+this is **a different credential lane from the subscription**: a raw key is metered/PAYG and
+carries no Muse Code plan, so it will not draw on a subscription (use `--login muse` for
+that). `META_API_KEY` takes priority over a stored login; the minted key and OAuth token live
+in `<data dir>/nano-coder/muse.json`. `MUSE_AUTH_BASE_URL` and `MUSE_MINT_BASE_URL` point the
 login and mint at other hosts.
 
 ### Retries

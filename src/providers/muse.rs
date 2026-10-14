@@ -254,26 +254,46 @@ pub async fn mint(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) ->
         .context("Muse key mint")?;
     let status = response.status().as_u16();
     let text = response.text().await?;
+    let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !(200..300).contains(&status) {
-        bail!(
-            "Muse key mint failed (HTTP {status}): {}. Run `nano-coder --login muse` or set META_API_KEY.",
-            text.chars().take(300).collect::<String>()
-        );
+        bail!("{}", mint_refusal(status, &value, &text));
     }
-    let value: Value = serde_json::from_str(&text).context("Muse key mint response")?;
     let api_key = value
         .get("api_key")
         .and_then(Value::as_str)
         .filter(|k| !k.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("mint response missing api_key or base_url"))?;
+        .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value, &text)))?;
     let base_url = value
         .get("base_url")
         .and_then(Value::as_str)
         .map(|u| u.trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty())
-        .ok_or_else(|| anyhow!("mint response missing api_key or base_url"))?;
+        .ok_or_else(|| anyhow!("{}", mint_refusal(status, &value, &text)))?;
     Ok(MintedKey { api_key, base_url })
+}
+
+/// Turn a refused/empty mint into an actionable message. A subscription or
+/// onboarding problem comes back as a structured body (`detail`/`title`,
+/// `action_url`, `require_payment`), which is far more useful than "missing
+/// api_key" — see the `MintedKey` fields in the Muse binary.
+fn mint_refusal(status: u16, value: &Value, raw: &str) -> String {
+    let field = |name: &str| value.get(name).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let detail = field("detail").or_else(|| field("title"));
+    let action = field("action_url");
+    let payment = value.get("require_payment").and_then(Value::as_bool).unwrap_or(false);
+    let mut message = match detail {
+        Some(detail) => format!("Muse key mint refused (HTTP {status}): {detail}"),
+        None => format!("Muse key mint failed (HTTP {status}): {}", raw.chars().take(300).collect::<String>()),
+    };
+    if payment && detail.is_none() {
+        message.push_str(": a payment method or Muse Code subscription is required");
+    }
+    if let Some(action) = action {
+        message.push_str(&format!(" — {action}"));
+    }
+    message.push_str(". Run `nano-coder --login muse` again once fixed (or set META_API_KEY).");
+    message
 }
 
 fn is_unauthorized(err: &anyhow::Error) -> bool {
@@ -841,6 +861,28 @@ mod tests {
         let models = client.list_models().await.unwrap();
         assert_eq!(models, vec!["muse-spark-1.3".to_string()]);
         assert_eq!(log.lock().unwrap()[0].path, "/muse-code/models");
+    }
+
+    #[test]
+    fn mint_refusal_surfaces_the_subscription_gate() {
+        // A subscription/payment problem comes back as a structured body; the
+        // message must point at the fix, not at a missing api_key.
+        let body = json!({
+            "title": "Payment Required",
+            "detail": "Muse Code requires a payment method",
+            "require_payment": true,
+            "action_url": "https://accountscenter.meta.com/muse_code/?ep=no_payg",
+            "is_subs_active": false,
+            "can_subscribe": true
+        });
+        let message = mint_refusal(402, &body, &body.to_string());
+        assert!(message.contains("Muse Code requires a payment method"), "{message}");
+        assert!(message.contains("accountscenter.meta.com/muse_code"), "{message}");
+        assert!(message.contains("--login muse"), "{message}");
+        // A bare 401 with an unhelpful body still names the gate.
+        let bare = json!({ "require_payment": true });
+        let message = mint_refusal(401, &bare, "{}");
+        assert!(message.contains("subscription is required"), "{message}");
     }
 
     #[tokio::test]
