@@ -402,6 +402,7 @@ mod tests {
             summarized: Some((3, 5)),
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
+            continuation: None,
             recorded_at: now(),
         };
         log.append(&replace).unwrap();

@@ -1135,6 +1135,7 @@ mod tests {
             summarized: Some((2, 6)),
             mode: Some(CompactionMode::Smart),
             model: Some("copilot/gpt".into()),
+            continuation: None,
             recorded_at: now(),
         });
         let traj = Trajectory::from_records(&recs);

@@ -87,6 +87,16 @@ pub struct Message {
     /// (issue #114). Not sent to providers as content; log only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_initiated: bool,
+    /// Marks *which* kind of automatic follow-up this `auto_initiated` user
+    /// message is: `true` only for a truncated-output continuation reminder
+    /// (the "your reply was cut off, continue" nudge), `false` for a Claude
+    /// Stop-hook re-prompt. Recovery's backward scan steps over continuation
+    /// reminders to rebuild a cut-off answer, but must STOP at a Stop-hook
+    /// re-prompt — that begins a *new* answer segment, so scanning past it
+    /// would concatenate the previous segment's discarded chunks onto the
+    /// fresh reply (issue #114). Log only; not sent to providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuation: bool,
     /// Provider-specific reasoning blocks that must be replayed with this
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -141,6 +151,7 @@ impl Message {
             tool_calls: vec![],
             is_error: false,
             auto_initiated: false,
+            continuation: false,
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
@@ -194,6 +205,16 @@ impl Message {
     /// (issue #114).
     pub fn auto_initiated(mut self) -> Self {
         self.auto_initiated = true;
+        self
+    }
+
+    /// Mark this (user-role) reminder as a truncated-output *continuation*
+    /// reminder specifically (implies `auto_initiated`), so recovery can tell
+    /// it apart from a Stop-hook re-prompt and rebuild the cut-off answer
+    /// across it (issue #114).
+    pub fn continuation(mut self) -> Self {
+        self.auto_initiated = true;
+        self.continuation = true;
         self
     }
 }
