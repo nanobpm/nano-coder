@@ -1996,9 +1996,21 @@ impl Agent {
     /// turn-wide count (issue #114). Cleared (`None`) when no continuation is
     /// in flight.
     fn sync_pending_continuation(&mut self, continued_answer: &str, truncated_continuations: usize) {
+        // Snapshot the current conversation length before the `&mut` borrow:
+        // it is the new replay boundary (see below).
+        let boundary = self.conversation.len();
         if let Some(pending) = self.pending_input.as_mut() {
             pending.continuation = (!continued_answer.is_empty() || truncated_continuations > 0)
                 .then(|| (continued_answer.to_string(), truncated_continuations));
+            // Advance the replay boundary in lockstep with the snapshot. The
+            // snapshot now accounts for *every* message logged so far, so a
+            // same-Agent retry (a provider error leaves the turn pending and the
+            // same input id is re-run on this live Agent) must replay only the
+            // messages logged *after* this point. Leaving the boundary stale
+            // would re-replay chunks and reminders already folded into the
+            // snapshot — duplicating the answer prefix and double-counting the
+            // continuation budget (issue #114).
+            pending.continuation_base = Some(boundary);
         }
     }
 
@@ -5430,6 +5442,91 @@ mod tests {
         let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "one two three");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot_twice() {
+        // A transient provider error leaves the turn pending with its in-flight
+        // continuation snapshot synced into the live pending input. Retrying the
+        // same input id on the *same* Agent must replay only the messages logged
+        // *after* that snapshot — never the chunk/reminder already folded into
+        // it — or the answer prefix duplicates and the continuation budget is
+        // double-spent, cutting the turn off at `MaxTokens` a chunk early (issue
+        // #114).
+        struct ErrorThenScript {
+            calls: Mutex<usize>,
+            seen: Seen,
+        }
+        #[async_trait]
+        impl LLMClient for ErrorThenScript {
+            fn clone_boxed(&self) -> Box<dyn LLMClient> {
+                unimplemented!("test double is never cloned")
+            }
+            async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+                self.seen.lock().unwrap().push(request.messages.to_vec());
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let n = *calls;
+                    *calls += 1;
+                    n
+                };
+                match n {
+                    // First attempt: one chunk cut off at the output limit
+                    // (schedules a single continuation).
+                    0 => Ok(cut_text("one ", 50)),
+                    // A transient provider error — not an output-cap or overflow
+                    // rejection — so the turn fails and is left pending.
+                    1 => anyhow::bail!("provider glitch"),
+                    // The same-Agent retry: two more cut-off chunks, then a clean
+                    // finish. With the budget counted once (count 1 restored),
+                    // both fit before the cap; counted twice (count 2) the second
+                    // would overrun it.
+                    2 => Ok(cut_text("two ", 50)),
+                    3 => Ok(cut_text("three ", 50)),
+                    _ => Ok(text("four")),
+                }
+            }
+            fn model_name(&self) -> &str {
+                "scripted"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+            fn kind(&self) -> Option<providers::ProviderKind> {
+                Some(providers::ProviderKind::Openai)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(ErrorThenScript { calls: Mutex::new(0), seen: seen.clone() }), config);
+        agent.new_session().unwrap();
+
+        // First attempt schedules one continuation, then the provider errors and
+        // the turn is left pending on this live Agent.
+        let first = agent.run_turn(Some("in-1"), "go").await;
+        assert!(first.is_err(), "the provider error fails the first attempt: {first:?}");
+
+        // Same-Agent retry of the same input id. With the snapshot's replay
+        // boundary advanced in lockstep, recovery restores exactly one spent
+        // continuation (count 1, prefix "one "), so the retry has room for two
+        // more cut-off chunks ("two ", "three ") before the clean finish.
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::EndTurn,
+            "the budget is spent once, so the turn is not cut short at MaxTokens"
+        );
+        assert_eq!(
+            outcome.response, "one two three four",
+            "the recovered prefix is counted once, not doubled into a premature stop"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
