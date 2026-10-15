@@ -595,15 +595,21 @@ pub trait LLMClient: Send + Sync {
     async fn detect_vision(&self) -> Option<crate::vision::Vision> {
         None
     }
-    /// The thinking levels and vision capability the endpoint reports, probed
-    /// together but **without** the context-window follow-ups. Used when the
-    /// window is already configured, so the window probe would be discarded
-    /// anyway (and running it can add an unwanted follow-up like LM Studio's
-    /// `/api/v0/models`). A provider whose thinking and vision detections read
+    /// The thinking levels, vision capability **and** published output-token
+    /// limit the endpoint reports, probed together but **without** the
+    /// context-window follow-ups. Used when the window is already configured, so
+    /// the window probe would be discarded anyway (and running it can add an
+    /// unwanted follow-up like LM Studio's `/api/v0/models`). The output limit
+    /// is kept because it is a separate budget from the window — a configured
+    /// window must not suppress it (issue #114) — and a provider that reads it
+    /// from the same `/models` entry as thinking/vision returns it here for no
+    /// extra round trip. A provider whose thinking and vision detections read
     /// the same endpoint response (llama.cpp `/props`, Ollama `/api/show`)
     /// overrides this to fetch it once rather than probing twice serially.
-    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
-        (self.detect_thinking_levels().await, self.detect_vision().await)
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
+        (self.detect_thinking_levels().await, self.detect_vision().await, None)
     }
     /// The window, thinking levels and vision capability the endpoint reports,
     /// probed together.

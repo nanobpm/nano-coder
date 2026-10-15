@@ -480,7 +480,9 @@ impl LLMClient for OpenAiClient {
         detect_capabilities(&self.transport).await
     }
 
-    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
         detect_thinking_and_vision(&self.transport).await
     }
 
@@ -697,31 +699,34 @@ pub(crate) async fn detect_capabilities(
 /// skipped since the window is discarded here.
 pub(crate) async fn detect_thinking_and_vision(
     transport: &HttpTransport,
-) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
     let provider = transport.provider();
     let base = provider.base_url.as_str();
     let root = base.strip_suffix("/v1").unwrap_or(base);
     let model = provider.model.as_str();
     let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
     let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    // The `/models` entry can carry the model's output cap even when the window
+    // comes from config; surface it so a configured window never suppresses it.
+    let max_output = entry.and_then(output_limit_in_entry);
     match identify(&provider.name, root, entry) {
         Server::LlamaCpp => {
             let url = format!("{root}/props?model={}", urlencode(model));
             let props = probe(transport, reqwest::Method::GET, &url, None).await;
             let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
             let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
-            (thinking, vision)
+            (thinking, vision, max_output)
         }
         Server::Ollama => {
             let url = format!("{root}/api/show");
             let show = probe(transport, reqwest::Method::POST, &url, Some(json!({ "model": model }))).await;
             let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
             let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
-            (thinking, vision)
+            (thinking, vision, max_output)
         }
         // These servers report neither thinking nor vision from their own
         // endpoints; the built-in assumption or a config override decides.
-        Server::LmStudio | Server::Other => (None, None),
+        Server::LmStudio | Server::Other => (None, None, max_output),
     }
 }
 
@@ -823,19 +828,7 @@ fn model_entry<'a>(models: &'a Value, model: &str) -> Option<&'a Value> {
 }
 
 fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
-    // Some OpenAI-compatible endpoints publish the model's own output cap
-    // alongside the context window (e.g. OpenRouter's
-    // `top_provider.max_completion_tokens`). Read it best-effort so a request
-    // defaults `max_tokens` to the model's real limit instead of an arbitrary
-    // low fallback; `None` when nothing is published.
-    let max_output = [
-        "/max_output_tokens",
-        "/max_completion_tokens",
-        "/top_provider/max_completion_tokens",
-        "/top_provider/max_output_tokens",
-    ]
-    .iter()
-    .find_map(|pointer| entry.pointer(pointer).and_then(as_tokens));
+    let max_output = output_limit_in_entry(entry);
     [
         "/max_model_len",
         "/loaded_context_length",
@@ -855,6 +848,24 @@ fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
             max_output_tokens: max_output,
         })
     })
+}
+
+/// The model's own published output-token cap from its `/models` entry, if any.
+/// Some OpenAI-compatible endpoints publish it alongside the context window
+/// (e.g. OpenRouter's `top_provider.max_completion_tokens`). Read best-effort so
+/// an unset `max_tokens` defaults to the model's real limit instead of an
+/// arbitrary fallback; `None` when nothing is published. Kept separate from
+/// [`window_in_entry`] so the configured-window probe path, which skips the
+/// window, can still surface this limit (issue #114).
+fn output_limit_in_entry(entry: &Value) -> Option<usize> {
+    [
+        "/max_output_tokens",
+        "/max_completion_tokens",
+        "/top_provider/max_completion_tokens",
+        "/top_provider/max_output_tokens",
+    ]
+    .iter()
+    .find_map(|pointer| entry.pointer(pointer).and_then(as_tokens))
 }
 
 fn as_tokens(value: &Value) -> Option<usize> {
@@ -1829,7 +1840,7 @@ mod tests {
             },
         )]);
         let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
-        let (thinking, vision) = OpenAiClient::new(resolved).unwrap().detect_thinking_and_vision().await;
+        let (thinking, vision, _max_output) = OpenAiClient::new(resolved).unwrap().detect_thinking_and_vision().await;
         let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
         (thinking, vision, paths)
     }

@@ -637,6 +637,14 @@ pub struct Agent {
     /// Vision capability reported by the endpoint (see `detect_context_window`).
     /// Shared for the same reason as `detected_window`.
     reported_vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
+    /// The model's own maximum output tokens as published by the endpoint,
+    /// captured on **both** probe paths — the default combined probe and the
+    /// configured-window path (which skips the window follow-up but still reads
+    /// the shared `/models` entry that carries this limit). Kept separate from
+    /// `detected_window` so a configured context window — which clears the
+    /// detected window — never discards the discovered output limit (issue
+    /// #114). Shared for the same reason as `detected_window`.
+    reported_max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
     /// Context size right after the last compaction; auto-compaction waits
     /// for real growth past it so an incompressible context is not
     /// re-summarized on every call.
@@ -757,6 +765,7 @@ struct DetectSlots {
     window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>,
     thinking: std::sync::Arc<std::sync::Mutex<Option<crate::thinking::Reported>>>,
     vision: std::sync::Arc<std::sync::Mutex<Option<crate::vision::Vision>>>,
+    max_output: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 /// What a background capability probe found.
@@ -764,13 +773,16 @@ struct Detected {
     window: Option<DetectedWindow>,
     thinking: Option<crate::thinking::Reported>,
     vision: Option<crate::vision::Vision>,
+    /// The model's published output-token limit, kept separate from `window`
+    /// so a configured window (which carries none) never discards it (#114).
+    max_output: Option<usize>,
 }
 
 #[cfg(test)]
 impl Detected {
     /// A probe that reported only a window.
     fn window(window: DetectedWindow) -> Self {
-        Detected { window: Some(window), thinking: None, vision: None }
+        Detected { window: Some(window), thinking: None, vision: None, max_output: None }
     }
 }
 
@@ -778,7 +790,7 @@ impl Detected {
 impl DetectSlots {
     /// Slots around an existing window slot, with fresh thinking/vision slots.
     fn window(window: std::sync::Arc<std::sync::Mutex<Option<DetectedWindow>>>) -> Self {
-        DetectSlots { window, thinking: Default::default(), vision: Default::default() }
+        DetectSlots { window, thinking: Default::default(), vision: Default::default(), max_output: Default::default() }
     }
 }
 
@@ -818,6 +830,7 @@ impl Agent {
             detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reported_vision: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reported_max_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
             compact_floor: 0,
             streaming: false,
             instructions: None,
@@ -1495,6 +1508,7 @@ impl Agent {
         // and cannot overwrite what this blocking detect establishes.
         self.detect_generation.fetch_add(1, Ordering::SeqCst);
         *self.detected_window.lock().unwrap() = None;
+        *self.reported_max_output.lock().unwrap() = None;
         if self.configured_window().is_some() {
             // The configured window wins, so the window half of the combined
             // probe is discarded — running it anyway can only hurt: a
@@ -1508,6 +1522,9 @@ impl Agent {
         }
         let probe = self.client.detect_capabilities();
         let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        // Capture the published output limit separately so it survives even
+        // when a later configured window clears the detected window (issue #114).
+        *self.reported_max_output.lock().unwrap() = window.as_ref().and_then(|w| w.max_output_tokens);
         *self.detected_window.lock().unwrap() = window;
         *self.reported_thinking.lock().unwrap() = thinking;
         // Vision is derived from the same probe responses `detect_capabilities`
@@ -1535,9 +1552,12 @@ impl Agent {
     /// limits), mirroring `detect_context_window` on the default path.
     async fn detect_thinking(&mut self) {
         let probe = self.client.detect_thinking_and_vision();
-        let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (thinking, vision, max_output) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         *self.reported_thinking.lock().unwrap() = thinking;
         *self.reported_vision.lock().unwrap() = vision;
+        // The output limit is a separate budget from the window, so keep it even
+        // though the configured window wins over the probed one (issue #114).
+        *self.reported_max_output.lock().unwrap() = max_output;
         self.refresh_stats();
     }
 
@@ -1698,6 +1718,7 @@ impl Agent {
         // the background probe lands, the built-in assumptions apply.
         *self.reported_thinking.lock().unwrap() = None;
         *self.reported_vision.lock().unwrap() = None;
+        *self.reported_max_output.lock().unwrap() = None;
         // Publish the new model's fallback stats (provider/model name + the
         // model-name or default window) right away, so a slow or `None` probe
         // cannot leave the UI on the previous model's window.
@@ -1710,22 +1731,28 @@ impl Agent {
             window: self.detected_window.clone(),
             thinking: self.reported_thinking.clone(),
             vision: self.reported_vision.clone(),
+            max_output: self.reported_max_output.clone(),
         };
         let sink = self.event_sink.clone();
         let stats = self.stats.clone();
         let current = self.detect_generation.clone();
         tokio::spawn(async move {
-            let (detected, thinking, vision) = if configured {
-                let (thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe.detect_thinking_and_vision())
-                    .await
-                    .ok()
-                    .unwrap_or_default();
-                (None, thinking, vision)
+            let (detected, thinking, vision, max_output) = if configured {
+                let (thinking, vision, max_output) =
+                    tokio::time::timeout(DETECT_TIMEOUT, probe.detect_thinking_and_vision())
+                        .await
+                        .ok()
+                        .unwrap_or_default();
+                (None, thinking, vision, max_output)
             } else {
-                tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default()
+                let (window, thinking, vision) =
+                    tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default();
+                // Carry the window's published output limit forward separately.
+                let max_output = window.as_ref().and_then(|w| w.max_output_tokens);
+                (window, thinking, vision, max_output)
             };
             Self::finish_detect(
-                Detected { window: detected, thinking, vision },
+                Detected { window: detected, thinking, vision, max_output },
                 generation,
                 current,
                 slots,
@@ -1758,7 +1785,7 @@ impl Agent {
         sink: Option<EventSink>,
         stats: SharedStats,
     ) {
-        let Detected { window: detected, thinking, vision } = detected;
+        let Detected { window: detected, thinking, vision, max_output } = detected;
         {
             // Check the generation under the window slot lock so a switch
             // racing this completion either bumps it before we read (we
@@ -1771,6 +1798,9 @@ impl Agent {
             }
             *slots.thinking.lock().unwrap() = thinking;
             *slots.vision.lock().unwrap() = vision;
+            // Published output limit lands with the rest; kept even when the
+            // window slot stays empty (configured-window path) (issue #114).
+            *slots.max_output.lock().unwrap() = max_output;
             if let Some(detected) = &detected {
                 *slot = Some(detected.clone());
             }
@@ -1889,13 +1919,31 @@ impl Agent {
         if let Some(limit) = self.detected_max_output() {
             return limit as i64;
         }
+        // No endpoint-published limit: before the large unknown-model fallback,
+        // honour a known output cap for this model (e.g. native OpenAI
+        // `gpt-4o-mini`, whose 16,384 cap `/models` does not expose). Sending
+        // the 32,768 fallback to such a model with a short prompt would exceed
+        // its real cap and be rejected (issue #114). Check the live client's
+        // model name as well as the configured one so a `/model` switch counts.
+        if let Some(limit) = context::output_limit_for_model(&self.config.model)
+            .or_else(|| context::output_limit_for_model(self.client.model_name()))
+        {
+            return limit as i64;
+        }
         DEFAULT_MAX_OUTPUT_TOKENS
     }
 
     /// The model's own maximum output tokens as reported by the endpoint's
     /// capabilities probe, if any. `None` when unconfigured and unpublished.
+    /// Read from the standalone report (populated on *both* the default and the
+    /// configured-window probe paths), falling back to the detected window's
+    /// copy, so a configured context window never suppresses the discovered
+    /// output limit (issue #114).
     fn detected_max_output(&self) -> Option<usize> {
-        self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens)
+        self.reported_max_output
+            .lock()
+            .unwrap()
+            .or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
     }
 
     /// The effective `max_tokens` the next request would send before the
@@ -2984,6 +3032,15 @@ impl Agent {
         // `MaxTokens`, not a clean `EndTurn`).
         let mut truncated_continuations = 0usize;
         let mut max_tokens_hit = false;
+        // Contiguous answer text carried across output-limit continuations, so
+        // the final response is the *whole* reply, not just its last chunk. A
+        // reply cut off at the limit is pushed, re-prompted, and continued in a
+        // fresh assistant message; `final_response` (legacy quiet mode, ACP)
+        // would otherwise show only the tail. Accumulated only across length
+        // cut-offs and reset whenever a new answer segment begins — a steer, a
+        // Stop-hook re-prompt, or any tool run (whose dropped tool-call markup
+        // must not leak into the text answer) (issue #114).
+        let mut continued_answer = String::new();
 
         // The cap is mode-dependent and can be extended when the user says
         // "keep going". Auto mode disables it (interactive only); normal mode
@@ -3359,6 +3416,9 @@ impl Agent {
                 // A steer that arrived while the answer was being written gets
                 // a reply in this turn rather than being left for the next.
                 if iteration < budget && self.control.has_steers() && !self.control.is_cancelled() {
+                    // A steer starts a new answer; drop any accumulated cut-off
+                    // chunks so the steer's reply is not prefixed by the old one.
+                    continued_answer.clear();
                     last_content = response.content.clone();
                     continue;
                 }
@@ -3369,6 +3429,8 @@ impl Agent {
                     && let Some(reason) = self.run_claude_stop_hooks()
                 {
                     self.push(Message::user(&reminders::wrap(&reason)))?;
+                    // The Stop-hook reply is a fresh answer, not a continuation.
+                    continued_answer.clear();
                     last_content = response.content.clone();
                     continue;
                 }
@@ -3388,6 +3450,9 @@ impl Agent {
                         truncated_continuations += 1;
                         let tokens = response.usage.as_ref().map_or(0, |u| u.completion_tokens);
                         self.push(Message::user(&reminders::wrap(&truncated_continuation_note(tokens))))?;
+                        // Keep this cut-off chunk so the finished answer is the
+                        // whole reply, not just the final continuation's tail.
+                        continued_answer.push_str(&response.content);
                         last_content = response.content.clone();
                         continue;
                     }
@@ -3396,10 +3461,19 @@ impl Agent {
                     // turn reports `MaxTokens` rather than a clean `EndTurn`.
                     max_tokens_hit = true;
                 }
-                final_response = Some(response.content.clone());
+                // Prepend any chunks carried across output-limit continuations so
+                // the final response is the contiguous answer, not its tail.
+                final_response = Some(if continued_answer.is_empty() {
+                    response.content.clone()
+                } else {
+                    format!("{continued_answer}{}", response.content)
+                });
                 break;
             }
 
+            // Tool calls begin a new answer segment: the dropped tool-call markup
+            // must not bleed into a later text answer, so reset the accumulator.
+            continued_answer.clear();
             last_content = response.content.clone();
             self.push(trajectory(Message::assistant_with_tools(&response.content, response.tool_calls.clone())))?;
             self.emit_assistant_text(&response.content);
@@ -4910,7 +4984,9 @@ mod tests {
         agent.new_session().unwrap();
         let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
-        assert_eq!(outcome.response, "all done");
+        // The second reply *completes* the first rather than replacing it, so
+        // the final response is the whole answer, not just its tail (issue #114).
+        assert_eq!(outcome.response, "half a fileall done");
         // The model got a "cut off" continuation note as a user message before
         // the second call, mentioning the token count.
         let second = &seen.lock().unwrap()[1];
@@ -4937,6 +5013,35 @@ mod tests {
         // The cap bounds the number of continuations: one initial call plus
         // `MAX_TRUNCATED_CONTINUATIONS` re-prompts.
         assert_eq!(seen.lock().unwrap().len(), MAX_TRUNCATED_CONTINUATIONS + 1);
+        // Even giving up, the final response stitches the accumulated chunks
+        // rather than returning only the last cut-off tail (issue #114).
+        assert_eq!(outcome.response, "still going".repeat(MAX_TRUNCATED_CONTINUATIONS + 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn output_limit_continuations_accumulate_the_whole_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two cut-offs then a clean finish: the final response stitches all
+        // three contiguous chunks, not just the last one (issue #114).
+        let (mut agent, _seen) = agent(vec![cut_text("one ", 100), cut_text("two ", 100), text("three")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one two three");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_run_resets_the_continuation_accumulator() {
+        let dir = tempfile::tempdir().unwrap();
+        // A cut-off text chunk is accumulated, but then the model runs a tool —
+        // a new answer segment begins, so the earlier chunk (and any dropped
+        // tool-call markup) must not prefix the final answer (issue #114).
+        let (mut agent, _seen) =
+            agent(vec![cut_text("stale partial", 100), tool_call("c1"), text("fresh answer")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh answer");
     }
 
     /// `n` scripted responses whose `echo` calls all differ, so the loop
@@ -6776,12 +6881,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished() {
-        // No configured limit and no published one: the fallback is used, far
-        // above the old 4096 default, still clamped to the context window.
+    async fn an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback() {
+        // gpt-4o / gpt-4o-mini cap output at 16,384 but do not publish it via
+        // `/models`. With no configured or detected limit the automatic default
+        // must honour that known cap, not the large unknown-model fallback that
+        // the API would reject for a short prompt (issue #114).
         let dir = tempfile::tempdir().unwrap();
         let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
         agent.config_mut().max_tokens = 0;
+        assert!(agent.detected_max_output().is_none(), "no endpoint-published limit in this test");
+        agent.config_mut().model = "gpt-4o-mini".into();
+        assert_eq!(agent.effective_max_tokens(), 16_384);
+        // An unknown model still gets the large fallback, unchanged.
+        agent.config_mut().model = "some-unlisted-model".into();
+        assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_configured_window_preserves_the_probed_output_limit() {
+        // With a configured context window the window probe is skipped and the
+        // detected window stays empty, but the endpoint's published output limit
+        // lives in its own slot so the automatic max_tokens still honours it
+        // instead of collapsing to the large fallback (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        // The configured-window probe path leaves the detected window empty.
+        assert!(agent.detected_window.lock().unwrap().is_none());
+        // ...yet the output limit it read from the shared `/models` entry stands.
+        *agent.reported_max_output.lock().unwrap() = Some(16_000);
+        assert_eq!(agent.detected_max_output(), Some(16_000));
+        assert_eq!(agent.effective_max_tokens(), 16_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished() {
+        // No configured limit, no published one, and no *known* cap for the
+        // model name: the large fallback is used, far above the old 4096
+        // default, still clamped to the context window (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        agent.config_mut().model = "some-unlisted-model".into();
         assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(DEFAULT_MAX_OUTPUT_TOKENS > 4096);
     }

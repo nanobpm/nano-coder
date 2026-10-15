@@ -733,12 +733,21 @@ impl LLMClient for GithubCopilotClient {
     /// `model_entry` caches only a successful response, a failed `/models` probe
     /// would then be fetched — and waited out — twice. Deriving both from one
     /// bounded `model_entry` call matches `detect_capabilities`.
-    async fn detect_thinking_and_vision(&self) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    async fn detect_thinking_and_vision(
+        &self,
+    ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let entry = self.model_entry(PROBE_TIMEOUT).await?;
             let thinking = crate::thinking::Reported::from_model_entry(&entry);
             let vision = crate::vision::Vision::from_model_entry(&entry);
-            Some((thinking, vision))
+            // The shared `/models` entry carries the output cap too; surface it
+            // so a configured context window never suppresses it (issue #114).
+            let max_output = entry
+                .pointer("/capabilities/limits/max_output_tokens")
+                .and_then(|v| v.as_u64())
+                .filter(|&n| n > 0)
+                .map(|n| n as usize);
+            Some((thinking, vision, max_output))
         })
         .await
         .ok()
@@ -1336,14 +1345,15 @@ mod tests {
         // `detect_thinking_and_vision`; both must come from a single `/models`
         // fetch, not one serial probe each.
         let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
-            "limits": { "max_prompt_tokens": 111 },
+            "limits": { "max_prompt_tokens": 111, "max_output_tokens": 16_000 },
             "supports": { "reasoning_effort": ["none", "low", "high"], "vision": true } } }] });
         let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (thinking, vision) = client.detect_thinking_and_vision().await;
+        let (thinking, vision, max_output) = client.detect_thinking_and_vision().await;
         assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
         assert!(vision.is_some(), "vision derived from the same shared /models entry");
+        assert_eq!(max_output, Some(16_000), "output limit comes from the same shared /models entry");
         assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
     }
 
@@ -1355,8 +1365,8 @@ mod tests {
         let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (thinking, vision) = client.detect_thinking_and_vision().await;
-        assert_eq!((thinking, vision), (None, None));
+        let (thinking, vision, max_output) = client.detect_thinking_and_vision().await;
+        assert_eq!((thinking, vision, max_output), (None, None, None));
         assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the vision probe");
     }
 

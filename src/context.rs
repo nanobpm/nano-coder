@@ -307,6 +307,24 @@ pub fn window_for_model(model: &str) -> Option<usize> {
     table.iter().find(|(needle, _)| m.contains(needle)).map(|(_, window)| *window)
 }
 
+/// A known maximum output-token cap for a model whose endpoint does **not**
+/// publish one (issue #114). The automatic `max_tokens` default prefers the
+/// endpoint-published limit; when none is published it must not blindly send
+/// the large [`DEFAULT_MAX_OUTPUT_TOKENS`](crate::agent) fallback, which exceeds
+/// the real output cap of several supported models — native OpenAI `gpt-4o` /
+/// `gpt-4o-mini`, for instance, allow 16,384 output tokens but do not expose
+/// that through `/models`, so an unset `max_tokens` with a short prompt would
+/// otherwise send an over-cap request the API rejects. Only well-established
+/// caps are listed; an unknown model still falls back to the large default.
+pub fn output_limit_for_model(model: &str) -> Option<usize> {
+    let m = model.to_lowercase();
+    // Most specific needles first: substring matching must resolve, e.g.,
+    // `gpt-4-turbo` before the broader `gpt-4` family would, and never let a
+    // narrow cap shadow a larger one by accident.
+    let table: &[(&str, usize)] = &[("gpt-4o", 16_384), ("gpt-4-turbo", 4_096), ("gpt-3.5", 4_096)];
+    table.iter().find(|(needle, _)| m.contains(needle)).map(|(_, limit)| *limit)
+}
+
 /// Does this provider error say the request did not fit the context window?
 pub fn is_context_overflow(error: &str) -> bool {
     let e = error.to_lowercase();
@@ -575,5 +593,19 @@ mod tests {
         assert_eq!(window_for_model("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(window_for_model("gpt-4.1-mini"), Some(1_047_576));
         assert_eq!(window_for_model("llama3"), None);
+    }
+
+    #[test]
+    fn model_output_limits() {
+        // Known caps for models whose endpoint does not publish one (issue #114).
+        assert_eq!(output_limit_for_model("gpt-4o"), Some(16_384));
+        assert_eq!(output_limit_for_model("gpt-4o-mini"), Some(16_384));
+        assert_eq!(output_limit_for_model("GPT-4O-MINI"), Some(16_384), "case-insensitive");
+        assert_eq!(output_limit_for_model("gpt-4-turbo"), Some(4_096));
+        assert_eq!(output_limit_for_model("gpt-3.5-turbo"), Some(4_096));
+        // Models with large or unknown caps keep the large fallback (None here).
+        assert_eq!(output_limit_for_model("gpt-4.1"), None);
+        assert_eq!(output_limit_for_model("claude-sonnet-4-5"), None);
+        assert_eq!(output_limit_for_model("some-unlisted-model"), None);
     }
 }
