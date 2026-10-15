@@ -243,8 +243,10 @@ pub struct Steer {
 }
 
 /// Why a turn ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum StopReason {
+    #[default]
     EndTurn,
     Cancelled,
     MaxTurnRequests,
@@ -264,6 +266,13 @@ impl StopReason {
             StopReason::MaxTurnRequests => "max_turn_requests",
             StopReason::MaxTokens => "max_tokens",
         }
+    }
+
+    /// Whether this is the default clean finish. Used to keep the session log
+    /// quiet: only a non-`EndTurn` stop reason is serialized on a `TurnEnd`
+    /// record, and older records without the field restore to `EndTurn`.
+    pub(crate) fn is_end_turn(&self) -> bool {
+        matches!(self, StopReason::EndTurn)
     }
 }
 
@@ -604,6 +613,11 @@ pub struct Agent {
     completed_inputs: HashMap<String, String>,
     /// Outcomes reported by completed inputs, by input ID.
     completed_outcomes: HashMap<String, Outcome>,
+    /// Non-`EndTurn` stop reasons of completed inputs, by input ID, so a
+    /// redelivered input replays how its turn actually ended — e.g. a truncated
+    /// `MaxTokens` turn — instead of a clean `EndTurn` (issue #114). Clean turns
+    /// are absent.
+    completed_stop_reasons: HashMap<String, StopReason>,
     /// An input that was accepted but whose turn never finished (crash, kill, or error).
     pending_input: Option<PendingInput>,
     input_counter: u64,
@@ -620,6 +634,13 @@ pub struct Agent {
     calibration: Option<(usize, usize)>,
     /// Window learned from a context-overflow error (until the model changes).
     learned_window: Option<usize>,
+    /// Output-token cap learned from an output-limit rejection error, used
+    /// until the model changes. With automatic `max_tokens` an unlisted model
+    /// whose real cap is below `DEFAULT_MAX_OUTPUT_TOKENS` would otherwise be
+    /// rejected every request until a background `/model`-switch probe lands;
+    /// learning the cap from the first rejection lets the retry succeed without
+    /// blocking the switch on the probe (issue #114).
+    learned_max_output: Option<usize>,
     /// Window reported by the endpoint (see `detect_context_window`). Shared
     /// and locked because a mid-turn `/model` switch probes in a background
     /// task (see `detect_context_window_for_switch`), which publishes here
@@ -816,6 +837,7 @@ impl Agent {
             session_id: None,
             completed_inputs: HashMap::new(),
             completed_outcomes: HashMap::new(),
+            completed_stop_reasons: HashMap::new(),
             pending_input: None,
             input_counter: 0,
             event_sink: None,
@@ -826,6 +848,7 @@ impl Agent {
             stats: SharedStats::default(),
             calibration: None,
             learned_window: None,
+            learned_max_output: None,
             detected_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
             detect_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reported_thinking: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1338,6 +1361,7 @@ impl Agent {
         self.client = client;
         self.calibration = None;
         self.learned_window = None;
+        self.learned_max_output = None;
         *self.detected_window.lock().unwrap() = None;
         *self.reported_thinking.lock().unwrap() = None;
         self.compact_floor = 0;
@@ -1477,6 +1501,7 @@ impl Agent {
                     self.config.model = spec.clone();
                     self.calibration = None;
                     self.learned_window = None;
+                    self.learned_max_output = None;
                     *self.detected_window.lock().unwrap() = None;
                     self.compact_floor = 0;
                     self.detect_context_window_for_switch();
@@ -1920,6 +1945,19 @@ impl Agent {
     /// falling back to a large built-in value when none is published (issue
     /// #114). Never the old arbitrary 4096 default, which cut long replies off.
     fn output_token_base(&self) -> i64 {
+        let base = self.output_token_base_uncapped();
+        // A cap learned from an earlier output-limit rejection is an observed
+        // hard ceiling for this model; never send above it, even over a
+        // configured value, so the request stays valid until the model changes
+        // (issue #114).
+        match self.learned_max_output {
+            Some(cap) => base.min(cap as i64),
+            None => base,
+        }
+    }
+
+    /// `output_token_base` before the learned-cap clamp.
+    fn output_token_base_uncapped(&self) -> i64 {
         let configured = self.config.max_tokens;
         if configured > 0 {
             return i64::from(configured);
@@ -2396,6 +2434,7 @@ impl Agent {
         self.control.set_thinking(None);
         self.completed_inputs.clear();
         self.completed_outcomes.clear();
+        self.completed_stop_reasons.clear();
         self.pending_input = None;
         self.plan = Plan::default();
         self.reminders = Reminders::new(self.config.outcome_tool);
@@ -2476,6 +2515,7 @@ impl Agent {
         }
         self.completed_inputs = restored.completed;
         self.completed_outcomes = restored.outcomes;
+        self.completed_stop_reasons = restored.stop_reasons;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
         // Reminders belong to the session being left (`/resume` mid-process).
@@ -2904,7 +2944,12 @@ impl Agent {
             && let Some(response) = self.completed_inputs.get(id)
         {
             eprintln!("[agent] input {id:?} already processed; returning recorded response");
-            return Ok(end_turn((response.clone(), self.completed_outcomes.get(id).cloned())));
+            let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
+            return Ok(TurnOutcome {
+                response: response.clone(),
+                stop_reason,
+                outcome: self.completed_outcomes.get(id).cloned(),
+            });
         }
         self.control.start_turn();
         self.reminders.start_turn();
@@ -2918,6 +2963,10 @@ impl Agent {
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // Where a resumed turn's input sits, so after the replay shortcuts
+        // below we can rebuild any in-flight output-limit continuation state
+        // from the messages logged before the interrupt (issue #114).
+        let resume_position = resuming.as_ref().map(|pending| pending.position);
         let input_id = match input_id {
             Some(id) => id.to_string(),
             None => {
@@ -2957,11 +3006,17 @@ impl Agent {
                     self.conversation.len() > pending.position + 1
                         && m.role == Role::Assistant
                         && m.tool_calls.is_empty()
+                        // A length-truncated final assistant message is NOT a
+                        // finished turn: its continuation was cut off by the
+                        // interrupt, so fall through and resume the turn (the
+                        // seeding below rebuilds the partial answer) instead of
+                        // replaying it as a clean `EndTurn` (issue #114).
+                        && !crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
                 }) {
                     // The final answer was recorded but the turn end was not.
                     let response = last.content.clone();
                     let outcome = Outcome::reported_in(&self.conversation[pending.position..]);
-                    return self.finish_turn(input_id, response, outcome).map(end_turn);
+                    return self.finish_turn(input_id, response, outcome, StopReason::EndTurn).map(end_turn);
                 } else if self.config.outcome_tool
                     && self.conversation.last().is_some_and(|m| m.role == Role::Tool)
                     && let Some(outcome) = Outcome::reported_in(&self.conversation[pending.position..])
@@ -2969,7 +3024,7 @@ impl Agent {
                     // The outcome was reported but the answer it implies was not recorded.
                     let response = outcome.response();
                     self.push(Message::assistant(&response))?;
-                    return self.finish_turn(input_id, response, Some(outcome)).map(end_turn);
+                    return self.finish_turn(input_id, response, Some(outcome), StopReason::EndTurn).map(end_turn);
                 }
                 if let Some(ctx) = self.take_session_start_context() {
                     self.push(Message::user(&reminders::wrap(&ctx)))?;
@@ -2998,7 +3053,7 @@ impl Agent {
                         };
                         self.push(Message::assistant(&reason))?;
                         self.emit_assistant_text(&reason);
-                        return self.finish_turn(input_id, reason, None).map(end_turn);
+                        return self.finish_turn(input_id, reason, None, StopReason::EndTurn).map(end_turn);
                     }
                     ClaudePromptHook::Proceed(extra) => extra,
                 };
@@ -3054,7 +3109,52 @@ impl Agent {
         // must not leak into the text answer) (issue #114).
         let mut continued_answer = String::new();
 
-        // The cap is mode-dependent and can be extended when the user says
+        // Rebuild in-flight output-limit continuation state after a resume
+        // (issue #114). A turn cut off mid-continuation has already logged one
+        // or more length-truncated assistant chunks (each followed by an
+        // auto-initiated continuation reminder). Without this, the resumed turn
+        // starts with an empty `continued_answer` and a zero continuation
+        // count, so the earlier chunks are dropped from the final answer and the
+        // re-prompt budget resets. Scan the trailing run of truncated assistant
+        // messages logged before the interrupt, seed the accumulator and count
+        // from them, and — if the turn was cut off before the last chunk's
+        // continuation reminder was logged — re-push that reminder so the model
+        // actually continues.
+        if let Some(start) = resume_position.filter(|&s| s <= self.conversation.len()) {
+            let msgs = &self.conversation[start..];
+            let last_is_truncated_assistant = msgs.last().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && m.tool_calls.is_empty()
+                    && crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
+            });
+            let mut chunks: Vec<String> = Vec::new();
+            let mut idx = msgs.len();
+            loop {
+                // Step over a trailing auto-initiated continuation reminder.
+                if idx > 0 && msgs[idx - 1].role == Role::User && msgs[idx - 1].auto_initiated {
+                    idx -= 1;
+                }
+                if idx > 0
+                    && msgs[idx - 1].role == Role::Assistant
+                    && msgs[idx - 1].tool_calls.is_empty()
+                    && crate::llm::stop_reason_is_length(msgs[idx - 1].stop_reason.as_deref())
+                {
+                    chunks.push(msgs[idx - 1].content.clone());
+                    idx -= 1;
+                } else {
+                    break;
+                }
+            }
+            if !chunks.is_empty() {
+                chunks.reverse();
+                continued_answer = chunks.concat();
+                truncated_continuations = chunks.len();
+                if last_is_truncated_assistant {
+                    self.push(Message::user(&reminders::wrap(&truncated_continuation_note(0))).auto_initiated())?;
+                }
+            }
+        }
+
         // "keep going". Auto mode disables it (interactive only); normal mode
         // asks (interactive only); ACP/headless keeps the hard stop.
         // Re-evaluated from the live mode each iteration so a mid-turn
@@ -3150,6 +3250,10 @@ impl Agent {
             }
 
             let mut overflow_retried = false;
+            // Whether this attempt already retried after learning the model's
+            // real output-token cap from a rejection (issue #114); bounds the
+            // retry to one so a persistent rejection still surfaces.
+            let mut max_output_retried = false;
             // Reset per attempt, so the recorded duration is the request that
             // produced the response, not earlier overflowed attempts. Seeded so
             // an early cancel break (before the first attempt sets it) leaves it
@@ -3345,6 +3449,37 @@ impl Agent {
                     }
                     Some(Err(e)) => {
                         let message = format!("{e:#}");
+                        // An output-token-limit rejection: the configured or
+                        // fallback `max_tokens` exceeds the model's real output
+                        // cap. This is common right after a `/model` switch —
+                        // the background capability probe that would publish the
+                        // real cap has not landed yet, so automatic `max_tokens`
+                        // falls back to the large default and the request is
+                        // rejected. Learn the cap from the error and retry once
+                        // at the lower value rather than failing the turn, so the
+                        // switch never has to block on the probe (issue #114).
+                        if !max_output_retried
+                            && context::is_output_cap_error(&message)
+                            && !context::is_context_overflow(&message)
+                        {
+                            max_output_retried = true;
+                            let base = self.output_token_base_uncapped();
+                            let learned = context::output_cap_from_error(&message)
+                                .map(|c| c as i64)
+                                .unwrap_or((base / 2).max(1_024))
+                                .max(256);
+                            // Only act when this actually lowers the request;
+                            // otherwise the rejection is about something else
+                            // and retrying would just repeat it.
+                            if learned < base {
+                                self.learned_max_output = Some(learned as usize);
+                                self.refresh_stats();
+                                eprintln!(
+                                    "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
+                                );
+                                continue;
+                            }
+                        }
                         if overflow_retried || !context::is_context_overflow(&message) {
                             self.set_activity(Activity::Idle);
                             return Err(e);
@@ -3897,7 +4032,7 @@ impl Agent {
             }
         };
         let outcome = reported.filter(|_| stop_reason == StopReason::EndTurn);
-        let (response, outcome) = self.finish_turn(input_id, response, outcome)?;
+        let (response, outcome) = self.finish_turn(input_id, response, outcome, stop_reason)?;
         Ok(TurnOutcome { response, stop_reason, outcome })
     }
 
@@ -3906,12 +4041,14 @@ impl Agent {
         input_id: String,
         response: String,
         outcome: Option<Outcome>,
+        stop_reason: StopReason,
     ) -> Result<(String, Option<Outcome>)> {
         if let Some(log) = &mut self.session {
             log.append(&Record::TurnEnd {
                 input_id: input_id.clone(),
                 response: response.clone(),
                 outcome: outcome.clone(),
+                stop_reason,
                 history_calls: self.turn_history_calls,
                 recorded_at: session::now(),
             })?;
@@ -3932,6 +4069,11 @@ impl Agent {
             Some(outcome) => self.completed_outcomes.insert(input_id.clone(), outcome.clone()),
             None => self.completed_outcomes.remove(&input_id),
         };
+        if stop_reason.is_end_turn() {
+            self.completed_stop_reasons.remove(&input_id);
+        } else {
+            self.completed_stop_reasons.insert(input_id.clone(), stop_reason);
+        }
         self.completed_inputs.insert(input_id, response.clone());
         self.pending_input = None;
         Ok((response, outcome))
@@ -5058,8 +5200,198 @@ mod tests {
         assert_eq!(outcome.response, "fresh answer");
     }
 
-    /// `n` scripted responses whose `echo` calls all differ, so the loop
-    /// detector stays out of the way of the turn-cap tests.
+    /// An assistant message cut off at the output-token limit, as recorded in a
+    /// session log (its `stop_reason` is `length`).
+    fn truncated_assistant(content: &str) -> Message {
+        Message { stop_reason: Some("length".into()), ..Message::assistant(content) }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redelivering_a_truncated_turn_replays_its_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // A turn that gives up at the continuation cap ends `MaxTokens`.
+        let cuts: Vec<LLMResponse> = (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("more", 50)).collect();
+        let (mut agent, seen) = agent(cuts, dir.path());
+        agent.new_session().unwrap();
+        let first = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(first.stop_reason, StopReason::MaxTokens);
+        seen.lock().unwrap().clear();
+        // Redelivering the same input ID returns the recorded truncated stop
+        // reason without calling the model, rather than a clean `EndTurn`
+        // (issue #114).
+        let replay = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(replay.stop_reason, StopReason::MaxTokens);
+        assert_eq!(replay.response, first.response);
+        assert!(seen.lock().unwrap().is_empty(), "a recorded turn is not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_turns_stop_reason_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cuts: Vec<LLMResponse> = (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("more", 50)).collect();
+        let (mut first, _) = agent(cuts, dir.path());
+        let id = first.new_session().unwrap();
+        assert_eq!(first.run_turn(Some("in-1"), "go").await.unwrap().stop_reason, StopReason::MaxTokens);
+        // The persisted `TurnEnd` carries the truncated stop reason.
+        drop(first);
+        let (_, restored) = SessionLog::open(dir.path(), &id).unwrap();
+        assert_eq!(restored.stop_reasons.get("in-1"), Some(&StopReason::MaxTokens));
+
+        // After a reload, redelivering the input still reports `MaxTokens` from
+        // the log, not a clean `EndTurn`, without calling the model (issue #114).
+        let (mut second, seen) = agent(vec![], dir.path());
+        second.load_session(&id).unwrap();
+        let replay = second.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(replay.stop_reason, StopReason::MaxTokens);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_a_logged_continuation_reminder_stitches_the_prefix() {
+        // Interrupt case (a): the turn was cut off at the output limit AND its
+        // continuation reminder was logged before the crash. The resume must
+        // continue the turn and prepend the saved prefix, not start empty
+        // (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-a",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+                Record::Message(Box::new(
+                    Message::user(&reminders::wrap(&truncated_continuation_note(50))).auto_initiated(),
+                )),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-a").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done");
+        // The model was called once to continue — the already-logged reminder is
+        // not duplicated.
+        let request = &seen.lock().unwrap()[0];
+        let reminders = request.iter().filter(|m| m.auto_initiated).count();
+        assert_eq!(reminders, 1, "the existing reminder is reused, not re-pushed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_before_a_logged_continuation_reminder_re_prompts_and_stitches() {
+        // Interrupt case (b): the turn was cut off at the output limit but the
+        // crash landed before its continuation reminder was logged. The resume
+        // must re-push the reminder so the model continues, and still prepend the
+        // saved prefix (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-b",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-b").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "partial done");
+        // A continuation reminder was synthesized so the model actually continues.
+        let request = &seen.lock().unwrap()[0];
+        let note = request.iter().rev().find(|m| m.auto_initiated).expect("a continuation reminder");
+        assert!(note.content.contains("cut off"), "{}", note.content);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_final_assistant_is_not_replayed_as_a_clean_finish() {
+        // A length-truncated trailing assistant message must NOT be treated as a
+        // finished turn by the resume replay shortcut: the turn resumes and
+        // continues instead of completing with a clean `EndTurn` (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        crashed_session(
+            dir.path(),
+            "cut-final",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("partial "))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.load_session("cut-final").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        // The model was called (the turn continued) rather than short-circuited.
+        assert!(!seen.lock().unwrap().is_empty(), "the truncated turn resumed with a model call");
+        assert_eq!(outcome.response, "partial done");
+    }
+
+    /// A client that rejects any request whose `max_tokens` exceeds `cap`
+    /// (mirroring a provider's output-limit rejection), then serves `response`.
+    struct OutputCapClient {
+        cap: i64,
+        seen_max_tokens: Arc<Mutex<Vec<i64>>>,
+        response: Mutex<Option<LLMResponse>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for OutputCapClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            let max_tokens = request.max_tokens.unwrap_or(0);
+            self.seen_max_tokens.lock().unwrap().push(max_tokens);
+            if max_tokens > self.cap {
+                anyhow::bail!(
+                    "max_tokens: {max_tokens} > {}, which is the maximum allowed number of output tokens",
+                    self.cap
+                );
+            }
+            Ok(self.response.lock().unwrap().take().unwrap_or_default())
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_output_limit_rejection_is_learned_and_retried() {
+        // Automatic `max_tokens` sends the large default to a model whose real
+        // output cap `/models` never published (e.g. a freshly switched model
+        // whose background probe has not landed). The rejection must be learned
+        // and the request retried at the real cap, not fail the turn (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = OutputCapClient {
+            cap: 8_000,
+            seen_max_tokens: seen.clone(),
+            response: Mutex::new(Some(text("recovered"))),
+        };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "recovered");
+        let sent = seen.lock().unwrap().clone();
+        // First attempt sent the over-cap default and was rejected; the retry
+        // sent a value within the learned cap.
+        assert_eq!(sent.len(), 2, "one rejected attempt, then one retry: {sent:?}");
+        assert!(sent[0] > 8_000, "first attempt sent the over-cap default: {}", sent[0]);
+        assert!(sent[1] <= 8_000, "retry sent within the learned cap: {}", sent[1]);
+    }
+
     fn echo_stream(n: usize) -> Vec<LLMResponse> {
         (1..=n)
             .map(|i| LLMResponse {

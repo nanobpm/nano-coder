@@ -54,6 +54,13 @@ pub enum Record {
         /// Reported with `report_outcome` during the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<crate::goal::Outcome>,
+        /// Why the turn stopped. Omitted for a clean `EndTurn` (the common
+        /// case) to keep logs small; older records without it restore to
+        /// `EndTurn`. A truncated turn (`MaxTokens`) is persisted so a
+        /// redelivered input replays the truncated stop reason instead of
+        /// reporting a clean finish (issue #114).
+        #[serde(default, skip_serializing_if = "crate::agent::StopReason::is_end_turn")]
+        stop_reason: crate::agent::StopReason,
         /// `history_search` / `history_read` calls made during the turn.
         #[serde(default, skip_serializing_if = "is_zero")]
         history_calls: u32,
@@ -117,6 +124,11 @@ pub struct Restored {
     pub completed: HashMap<String, String>,
     /// Outcomes reported by completed inputs, by input ID.
     pub outcomes: HashMap<String, crate::goal::Outcome>,
+    /// Non-`EndTurn` stop reasons for completed inputs, by input ID, so a
+    /// redelivered input replays how its turn actually ended (e.g. a truncated
+    /// `MaxTokens` turn) instead of a clean finish (issue #114). Clean turns are
+    /// absent (treated as `EndTurn`).
+    pub stop_reasons: HashMap<String, crate::agent::StopReason>,
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
@@ -428,7 +440,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 originals.push((*message).clone());
                 restored.conversation.push(*message);
             }
-            Record::TurnEnd { input_id, response, outcome, .. } => {
+            Record::TurnEnd { input_id, response, outcome, stop_reason, .. } => {
                 if restored.pending_input.as_ref().is_some_and(|p| p.id == input_id) {
                     restored.pending_input = None;
                 }
@@ -436,6 +448,16 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                     Some(outcome) => restored.outcomes.insert(input_id.clone(), outcome),
                     None => restored.outcomes.remove(&input_id),
                 };
+                // Replay the persisted stop reason so a redelivered input that
+                // truncated (`MaxTokens`) is not reported as a clean finish.
+                // Older records deserialize `stop_reason` as `EndTurn`, so this
+                // overwrites to the default for a clean turn and keeps the map
+                // honest when an ID is reused (issue #114).
+                if stop_reason.is_end_turn() {
+                    restored.stop_reasons.remove(&input_id);
+                } else {
+                    restored.stop_reasons.insert(input_id.clone(), stop_reason);
+                }
                 restored.completed.insert(input_id, response);
             }
             Record::Replace { mut messages, pending_position, summarized, mode, .. } => {
@@ -520,9 +542,45 @@ mod tests {
             input_id: id.into(),
             response: "hello".into(),
             outcome: None,
+            stop_reason: crate::agent::StopReason::EndTurn,
             history_calls: 0,
             recorded_at: now(),
         }
+    }
+
+    #[test]
+    fn turn_end_persists_a_truncated_stop_reason_and_defaults_old_records() {
+        // A truncated (`MaxTokens`) turn persists its stop reason so a resume
+        // replays it; a clean turn omits the field, and an older record without
+        // it restores to `EndTurn` (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "sr").unwrap();
+        log.append(&input("in-1")).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("hi")))).unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("partial")))).unwrap();
+        log.append(&Record::TurnEnd {
+            input_id: "in-1".into(),
+            response: "partial".into(),
+            outcome: None,
+            stop_reason: crate::agent::StopReason::MaxTokens,
+            history_calls: 0,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+
+        let (_, restored) = SessionLog::open(dir.path(), "sr").unwrap();
+        assert_eq!(restored.stop_reasons.get("in-1"), Some(&crate::agent::StopReason::MaxTokens));
+
+        // A clean `EndTurn` is omitted from the serialized record…
+        let clean = serde_json::to_string(&turn_end("in-1")).unwrap();
+        assert!(!clean.contains("stop_reason"), "a clean stop reason is not serialized: {clean}");
+        // …and an older record with no `stop_reason` field restores to `EndTurn`.
+        let old: Record =
+            serde_json::from_str(r#"{"type":"turn_end","data":{"input_id":"in-9","response":"ok","recorded_at":"2026-01-01T00:00:00+00:00"}}"#)
+                .unwrap();
+        let Record::TurnEnd { stop_reason, .. } = old else { panic!("expected a TurnEnd") };
+        assert_eq!(stop_reason, crate::agent::StopReason::EndTurn);
     }
 
     #[test]

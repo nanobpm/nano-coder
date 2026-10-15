@@ -356,6 +356,50 @@ pub fn limit_from_error(error: &str) -> Option<usize> {
     patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
 }
 
+/// Does this provider error say the request's `max_tokens` exceeded the model's
+/// **output-token** cap (as opposed to the prompt overflowing the context
+/// window)? With automatic `max_tokens` the agent falls back to the large
+/// `DEFAULT_MAX_OUTPUT_TOKENS` for a model whose endpoint publishes no output
+/// limit; a model whose real cap is smaller rejects every request until a
+/// background capability probe lands, so this lets the agent learn the cap from
+/// the rejection and retry (issue #114). Deliberately narrow — it must not
+/// match a context-window overflow, which has its own recovery path.
+pub fn is_output_cap_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    [
+        "maximum allowed number of output tokens",
+        "maximum number of output tokens",
+        "maximum output tokens",
+        "max_output_tokens",
+        "completion tokens",
+        "max_tokens is too large",
+        "max_tokens too large",
+        "max_tokens must be less than or equal to",
+        "max_tokens: ",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
+}
+
+/// The output-token cap stated in an output-cap rejection error, if any.
+pub fn output_cap_from_error(error: &str) -> Option<usize> {
+    let patterns = [
+        // Anthropic: "max_tokens: 32768 > 8192, which is the maximum …".
+        r"(?i)max_tokens:\s*\d+\s*>\s*(\d+)",
+        // OpenAI: "supports at most 16384 completion tokens".
+        r"(?i)at most (\d+) completion tokens",
+        // "maximum allowed number of output tokens is 8192".
+        r"(?i)output tokens(?: for [^ ]+)? is (\d+)",
+        r"(?i)maximum output tokens (?:is|of) (\d+)",
+        // Azure/Copilot: "max_tokens must be less than or equal to 4096".
+        r"(?i)max_tokens must be less than or equal to (\d+)",
+        // "max_tokens is too large: 32768. … at most 16384 …" already covered;
+        // a bare "maximum of 16384 output tokens".
+        r"(?i)maximum of (\d+) (?:completion|output) tokens",
+    ];
+    patterns.iter().find_map(|p| Regex::new(p).ok()?.captures(error)?.get(1)?.as_str().parse().ok())
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -560,6 +604,23 @@ mod tests {
             assert_eq!(limit_from_error(error), Some(limit), "{error}");
         }
         assert!(!is_context_overflow("HTTP 401: invalid api key"));
+    }
+
+    #[test]
+    fn detects_output_cap_errors_and_their_limits() {
+        // Real provider shapes for an over-cap `max_tokens` (issue #114).
+        let anthropic = "HTTP 400: max_tokens: 32768 > 8192, which is the maximum allowed number of output tokens for claude-3-5-haiku";
+        let openai = "HTTP 400: max_tokens is too large: 32768. This model supports at most 16384 completion tokens";
+        let azure = "HTTP 400: max_tokens must be less than or equal to 4096";
+        for (error, cap) in [(anthropic, 8_192), (openai, 16_384), (azure, 4_096)] {
+            assert!(is_output_cap_error(error), "{error}");
+            assert_eq!(output_cap_from_error(error), Some(cap), "{error}");
+        }
+        // A context-window overflow is NOT an output-cap error: it has its own
+        // recovery path and must not be misrouted.
+        let overflow = "HTTP 400: This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.";
+        assert!(!is_output_cap_error(overflow), "{overflow}");
+        assert!(!is_output_cap_error("HTTP 401: invalid api key"));
     }
 
     #[test]
