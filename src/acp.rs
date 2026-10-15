@@ -394,7 +394,10 @@ async fn handle_inner(agent: &mut Agent, msg: &Value) -> Option<Value> {
                             // The level sent to the model (null: none, the model decides).
                             "thinking": thinking_value(&agent.thinking()),
                             "thinking_source": agent.thinking().source.label(),
-                            "max_tokens": config.max_tokens,
+                            // The effective value sent to the model: the
+                            // configured override, else the model's published
+                            // output limit, else the built-in fallback.
+                            "max_tokens": agent.effective_max_tokens(),
                             "system_prompt": config.system_prompt,
                             "session_id": agent.session_id(),
                         }

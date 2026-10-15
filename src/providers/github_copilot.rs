@@ -620,6 +620,7 @@ impl LLMClient for GithubCopilotClient {
             };
             let prompt = limit("max_prompt_tokens");
             let combined = limit("max_context_window_tokens");
+            let max_output = limit("max_output_tokens");
             match (prompt, combined) {
                 // `max_prompt_tokens` caps the prompt alone: output tokens do not
                 // consume it. Keep the larger `max_context_window_tokens` too —
@@ -631,6 +632,7 @@ impl LLMClient for GithubCopilotClient {
                     source: "Copilot /models max_prompt_tokens".to_string(),
                     cap: ContextCap::Prompt,
                     total_tokens: combined,
+                    max_output_tokens: max_output,
                 }),
                 // `max_context_window_tokens` alone is the full window.
                 (None, Some(tokens)) => Some(DetectedWindow {
@@ -638,6 +640,7 @@ impl LLMClient for GithubCopilotClient {
                     source: "Copilot /models max_context_window_tokens".to_string(),
                     cap: ContextCap::Total,
                     total_tokens: None,
+                    max_output_tokens: max_output,
                 }),
                 (None, None) => None,
             }
@@ -688,6 +691,7 @@ impl LLMClient for GithubCopilotClient {
             };
             let prompt = limit("max_prompt_tokens");
             let combined = limit("max_context_window_tokens");
+            let max_output = limit("max_output_tokens");
             let window = match (prompt, combined) {
                 // `max_prompt_tokens` caps the prompt alone: output tokens do not
                 // consume it. Keep the larger `max_context_window_tokens` too —
@@ -699,6 +703,7 @@ impl LLMClient for GithubCopilotClient {
                     source: "Copilot /models max_prompt_tokens".to_string(),
                     cap: ContextCap::Prompt,
                     total_tokens: combined,
+                    max_output_tokens: max_output,
                 }),
                 // `max_context_window_tokens` alone is the full window.
                 (None, Some(tokens)) => Some(DetectedWindow {
@@ -706,6 +711,7 @@ impl LLMClient for GithubCopilotClient {
                     source: "Copilot /models max_context_window_tokens".to_string(),
                     cap: ContextCap::Total,
                     total_tokens: None,
+                    max_output_tokens: max_output,
                 }),
                 (None, None) => None,
             };
@@ -1295,6 +1301,20 @@ mod tests {
         assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
         assert!(vision.is_some(), "vision derived from the same shared /models entry");
         assert_eq!(api_log.lock().unwrap().len(), 1, "one shared /models fetch");
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_reads_the_models_output_limit() {
+        // The model's own output limit is read from the same `/models`
+        // capabilities so an unset `max_tokens` can default to it instead of an
+        // arbitrary small value (issue #114).
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_prompt_tokens": 111, "max_output_tokens": 16_000 } } }] });
+        let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, _thinking, _vision) = client.detect_capabilities().await;
+        assert_eq!(window.unwrap().max_output_tokens, Some(16_000));
     }
 
     #[tokio::test]

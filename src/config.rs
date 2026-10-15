@@ -24,6 +24,12 @@ pub struct Config {
     /// provider or model sets its own. Unset: endpoint detection, then a
     /// built-in assumption for current Anthropic / OpenAI families.
     pub vision: Option<bool>,
+    /// Maximum output tokens per request. `0` (the default) means "unset": the
+    /// request defaults to the model's own published output limit (e.g. GitHub
+    /// Copilot's `/models` `capabilities.limits.max_output_tokens`), falling
+    /// back to a large built-in value when the endpoint publishes none. A
+    /// non-zero value is an explicit override. Always clamped to the context
+    /// window before it is sent.
     pub max_tokens: i32,
     pub system_prompt: String,
     /// Legacy: applied to `default_provider` (which becomes `openai` if it was `mock`).
@@ -146,7 +152,7 @@ impl Default for Config {
             temperature: crate::temperature::Temperature::Value(0.7),
             thinking: crate::thinking::Thinking::Default,
             vision: None,
-            max_tokens: 4096,
+            max_tokens: 0,
             system_prompt: "You are a helpful assistant with access to tools.".to_string(),
             api_key: None,
             base_url: None,
@@ -559,7 +565,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(config.max_tokens, 4096);
+        assert_eq!(config.max_tokens, 0);
         assert_eq!(config.providers["work"].headers["X-Team"], "nwf");
         let (providers, default) = config.effective_providers();
         assert_eq!(default, "mock");

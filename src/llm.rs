@@ -116,6 +116,12 @@ pub struct Message {
     /// model)`. Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Assistant messages: the provider stop reason for the request that
+    /// produced this message (`end_turn`, `length`/`max_tokens`, …). Recorded
+    /// in the session log so a turn cut off at the output-token limit is
+    /// diagnosable after the fact; not sent to providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 impl Message {
@@ -136,6 +142,7 @@ impl Message {
             duration_ms: None,
             temperature: None,
             thinking_level: None,
+            stop_reason: None,
         }
     }
 
@@ -651,12 +658,24 @@ pub struct DetectedWindow {
     /// prompt + output past this window, so it is enforced as a second limit.
     /// `None` for a `Total` cap, where `tokens` already is the combined window.
     pub total_tokens: Option<usize>,
+    /// The model's own maximum output tokens, when the endpoint publishes it
+    /// (GitHub Copilot's `capabilities.limits.max_output_tokens`). Used as the
+    /// default `max_tokens` when the user configured none, so a request is not
+    /// capped at an arbitrary low default below what the model allows. `None`
+    /// when the endpoint publishes no output limit.
+    pub max_output_tokens: Option<usize>,
 }
 
 impl DetectedWindow {
     /// A window that caps the whole request, prompt + output.
     pub fn total(tokens: usize, source: impl Into<String>) -> Self {
-        DetectedWindow { tokens, source: source.into(), cap: ContextCap::Total, total_tokens: None }
+        DetectedWindow {
+            tokens,
+            source: source.into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: None,
+        }
     }
 }
 

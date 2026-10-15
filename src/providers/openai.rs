@@ -823,6 +823,19 @@ fn model_entry<'a>(models: &'a Value, model: &str) -> Option<&'a Value> {
 }
 
 fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
+    // Some OpenAI-compatible endpoints publish the model's own output cap
+    // alongside the context window (e.g. OpenRouter's
+    // `top_provider.max_completion_tokens`). Read it best-effort so a request
+    // defaults `max_tokens` to the model's real limit instead of an arbitrary
+    // low fallback; `None` when nothing is published.
+    let max_output = [
+        "/max_output_tokens",
+        "/max_completion_tokens",
+        "/top_provider/max_completion_tokens",
+        "/top_provider/max_output_tokens",
+    ]
+    .iter()
+    .find_map(|pointer| entry.pointer(pointer).and_then(as_tokens));
     [
         "/max_model_len",
         "/loaded_context_length",
@@ -839,6 +852,7 @@ fn window_in_entry(entry: &Value) -> Option<DetectedWindow> {
             source: format!("/models {}", pointer.trim_start_matches('/').replace('/', ".")),
             cap: crate::llm::ContextCap::Total,
             total_tokens: None,
+            max_output_tokens: max_output,
         })
     })
 }

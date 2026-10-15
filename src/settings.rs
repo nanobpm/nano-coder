@@ -138,6 +138,13 @@ fn turn_cap_label(max_iterations: usize) -> String {
     }
 }
 
+/// Settings label for `max_tokens`: `0` means "unset", shown as the effective
+/// value (the model's own output limit, or the built-in fallback) it resolves
+/// to; a non-zero value is shown as the explicit override it is.
+fn max_tokens_label(configured: i32, effective: i64) -> String {
+    if configured > 0 { configured.to_string() } else { format!("auto ({effective})") }
+}
+
 /// The settings dialog. `recents` is the shared most-recently-used model MRU:
 /// the model picker reads a fresh snapshot each time it opens, and every switch
 /// made here is recorded into it immediately (and persisted to `recents_path`),
@@ -168,7 +175,7 @@ pub async fn run(
             "Add or edit a provider".to_string(),
             format!("Temperature      {}", agent.temperature().describe()),
             format!("Thinking         {}", agent.thinking().describe()),
-            format!("Max tokens       {}", config.max_tokens),
+            format!("Max tokens       {}", max_tokens_label(config.max_tokens, agent.effective_max_tokens())),
             format!("Turn cap         {}", turn_cap_label(config.max_iterations)),
             "System prompt".to_string(),
             format!(

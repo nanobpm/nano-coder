@@ -1765,7 +1765,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 "model: {}\ntemperature: {}\nmax_tokens: {}\n(read-only: run /settings again at the prompt to edit)",
                 config.model,
                 agent.temperature().describe(),
-                config.max_tokens
+                if config.max_tokens > 0 {
+                    config.max_tokens.to_string()
+                } else {
+                    format!("auto ({})", agent.effective_max_tokens())
+                }
             ));
             Ok(true)
         }

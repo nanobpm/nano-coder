@@ -40,6 +40,35 @@ pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 /// finite safety net instead (issue #65).
 const HEADLESS_SAFETY_CAP: usize = 300;
 
+/// How many times a turn re-prompts a model whose reply was cut off at the
+/// output-token limit before giving up and ending the turn with a `MaxTokens`
+/// stop reason. Keeps a model that keeps overrunning from looping forever while
+/// still giving it a few chances to continue in smaller pieces.
+const MAX_TRUNCATED_CONTINUATIONS: usize = 3;
+
+/// Fallback `max_tokens` when the user configured none and the endpoint
+/// published no output limit. Much larger than the old arbitrary 4096 default,
+/// which cut long replies (whole-file writes) off mid-call; still an explicit
+/// value, since Anthropic requires one and some OpenAI-compatible proxies apply
+/// a small default when it is omitted.
+const DEFAULT_MAX_OUTPUT_TOKENS: i64 = 32_768;
+
+/// The nudge sent when a reply was cut off at the output-token limit, asking the
+/// model to continue in smaller pieces rather than ending the turn.
+fn truncated_continuation_note(completion_tokens: i64) -> String {
+    let at = if completion_tokens > 0 {
+        format!(" at the output-token limit ({completion_tokens} tokens)")
+    } else {
+        " at the output-token limit".to_string()
+    };
+    format!(
+        "Your previous reply was cut off{at}; any tool call in it was not run. \
+         Continue from where you left off, and write large outputs in smaller pieces \
+         (e.g. `write_file` a skeleton, then `edit_file` to fill it in) so each reply \
+         fits within the limit."
+    )
+}
+
 /// Output room `request_max_tokens()` tries to keep free within the context
 /// window, and the reservation `over_threshold()` compacts against. It is a
 /// target, not a floor: when fewer tokens actually remain and pre-send
@@ -219,6 +248,11 @@ pub enum StopReason {
     EndTurn,
     Cancelled,
     MaxTurnRequests,
+    /// The model's reply was cut off at the output-token limit and kept being
+    /// cut off across the continuation cap, so the turn ended without a clean
+    /// finish. Distinct from `EndTurn` so callers (ACP) can tell a truncated
+    /// turn apart from a finished one.
+    MaxTokens,
 }
 
 impl StopReason {
@@ -228,6 +262,7 @@ impl StopReason {
             StopReason::EndTurn => "end_turn",
             StopReason::Cancelled => "cancelled",
             StopReason::MaxTurnRequests => "max_turn_requests",
+            StopReason::MaxTokens => "max_tokens",
         }
     }
 }
@@ -1841,6 +1876,36 @@ impl Agent {
         }
     }
 
+    /// The base `max_tokens` for the next request before the context-window
+    /// clamp: an explicit configured value overrides everything; otherwise the
+    /// model's own published output limit (from the endpoint's capabilities),
+    /// falling back to a large built-in value when none is published (issue
+    /// #114). Never the old arbitrary 4096 default, which cut long replies off.
+    fn output_token_base(&self) -> i64 {
+        let configured = self.config.max_tokens;
+        if configured > 0 {
+            return i64::from(configured);
+        }
+        if let Some(limit) = self.detected_max_output() {
+            return limit as i64;
+        }
+        DEFAULT_MAX_OUTPUT_TOKENS
+    }
+
+    /// The model's own maximum output tokens as reported by the endpoint's
+    /// capabilities probe, if any. `None` when unconfigured and unpublished.
+    fn detected_max_output(&self) -> Option<usize> {
+        self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens)
+    }
+
+    /// The effective `max_tokens` the next request would send before the
+    /// context-window clamp: the configured override, else the model's own
+    /// published output limit, else the built-in fallback. For display and ACP
+    /// reporting (the raw `config.max_tokens` is `0` when unset).
+    pub fn effective_max_tokens(&self) -> i64 {
+        self.output_token_base()
+    }
+
     /// The context window and where it came from, for `/context`.
     pub fn context_window_with_source(&self) -> (usize, String) {
         let (user, default_provider) = self.config.effective_providers();
@@ -2914,6 +2979,11 @@ impl Agent {
         let mut last_content = String::new();
         let mut cancelled = false;
         let mut reported: Option<Outcome> = None;
+        // How many times this turn re-prompted a reply cut off at the output
+        // limit, and whether it ultimately gave up on one (so the turn ends
+        // `MaxTokens`, not a clean `EndTurn`).
+        let mut truncated_continuations = 0usize;
+        let mut max_tokens_hit = false;
 
         // The cap is mode-dependent and can be extended when the user says
         // "keep going". Auto mode disables it (interactive only); normal mode
@@ -3263,6 +3333,9 @@ impl Agent {
                 thinking_level: (sent_thinking.effective != crate::thinking::Thinking::Default
                     || sent_thinking.source != crate::thinking::Source::Global)
                     .then(|| sent_thinking.describe()),
+                // Recorded so a turn cut off at the output-token limit is
+                // diagnosable from the session log (issue #114).
+                stop_reason: response.stop_reason.clone(),
                 ..message
             };
 
@@ -3298,6 +3371,30 @@ impl Agent {
                     self.push(Message::user(&reminders::wrap(&reason)))?;
                     last_content = response.content.clone();
                     continue;
+                }
+                // A reply cut off at the output-token limit is not a finished
+                // answer: the model stopped because it ran out of room, and any
+                // tool call it was emitting was dropped before it could be
+                // parsed (issue #114). Nudge it to continue in smaller pieces
+                // rather than ending the turn as if it were done. Capped so a
+                // model that keeps overrunning cannot loop forever; past the cap
+                // the turn ends with a distinct `MaxTokens` stop reason so
+                // callers can tell this apart from a clean finish.
+                if crate::llm::stop_reason_is_length(response.stop_reason.as_deref()) {
+                    if iteration < budget
+                        && !self.control.is_cancelled()
+                        && truncated_continuations < MAX_TRUNCATED_CONTINUATIONS
+                    {
+                        truncated_continuations += 1;
+                        let tokens = response.usage.as_ref().map_or(0, |u| u.completion_tokens);
+                        self.push(Message::user(&reminders::wrap(&truncated_continuation_note(tokens))))?;
+                        last_content = response.content.clone();
+                        continue;
+                    }
+                    // The continuation cap is spent, or the turn cannot continue
+                    // (cancelled / iteration budget). End, but flag it so the
+                    // turn reports `MaxTokens` rather than a clean `EndTurn`.
+                    max_tokens_hit = true;
                 }
                 final_response = Some(response.content.clone());
                 break;
@@ -3692,13 +3789,15 @@ impl Agent {
 
         let stop_reason = if cancelled || (final_response.is_none() && self.control.is_cancelled()) {
             StopReason::Cancelled
+        } else if max_tokens_hit {
+            StopReason::MaxTokens
         } else if final_response.is_some() {
             StopReason::EndTurn
         } else {
             StopReason::MaxTurnRequests
         };
         let response = match stop_reason {
-            StopReason::EndTurn => final_response.unwrap_or_default(),
+            StopReason::EndTurn | StopReason::MaxTokens => final_response.unwrap_or_default(),
             StopReason::Cancelled => CANCELLED_RESPONSE.to_string(),
             StopReason::MaxTurnRequests => {
                 // `iteration` was incremented past the cap before the loop
@@ -3785,7 +3884,7 @@ impl Agent {
         // rejected.
         let reserved = match self.context_cap() {
             ContextCap::Total => {
-                (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
+                (self.output_token_base().max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(window)
             }
             ContextCap::Prompt => output_margin(window),
         };
@@ -3800,7 +3899,7 @@ impl Agent {
         let limit = match self.combined_window() {
             Some(combined) if self.context_cap() == ContextCap::Prompt => {
                 let combined_reserved =
-                    (self.config.max_tokens.max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
+                    (self.output_token_base().max(0) as usize).min(MIN_OUTPUT_RESERVE) + output_margin(combined);
                 limit.min(combined.saturating_sub(combined_reserved) as f64)
             }
             _ => limit,
@@ -3822,7 +3921,7 @@ impl Agent {
     /// combined window still bounds prompt + output, so `max_tokens` is capped to
     /// the room left in *that* window rather than sent unchanged.
     fn request_max_tokens(&self) -> i64 {
-        let configured = self.config.max_tokens.max(1) as usize;
+        let configured = self.output_token_base().max(1) as usize;
         let (tokens, _) = self.estimate_context_tokens();
         if self.context_cap() == ContextCap::Prompt {
             // The prompt cap does not consume output tokens; only the combined
@@ -3956,7 +4055,7 @@ impl Agent {
             None => summarized.to_vec(),
         };
 
-        let output_budget = context::summary_output_budget(window, self.config.max_tokens as i64);
+        let output_budget = context::summary_output_budget(window, self.output_token_base());
         // The transcript and the summary's own output share the request budget.
         // Against a total/combined cap the prompt and output must fit together,
         // so the output budget is carved out of the window. A prompt-only cap
@@ -4783,6 +4882,61 @@ mod tests {
             "later calls skipped, not dispatched: {}",
             tools[dispatched].content
         );
+    }
+
+    /// A text response cut off at the output-token limit (`stop_reason:
+    /// length`), carrying `completion_tokens` in its usage.
+    fn cut_text(content: &str, completion_tokens: i64) -> LLMResponse {
+        LLMResponse {
+            content: content.into(),
+            stop_reason: Some("length".into()),
+            usage: Some(crate::llm::TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens,
+                total_tokens: completion_tokens,
+                aic: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_cut_off_at_the_output_limit_continues_instead_of_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        // First reply is cut off at the output limit with no tool call; the turn
+        // must not end there — it nudges the model to continue, then ends clean
+        // on the finished second reply.
+        let (mut agent, seen) = agent(vec![cut_text("half a file", 4096), text("all done")], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "all done");
+        // The model got a "cut off" continuation note as a user message before
+        // the second call, mentioning the token count.
+        let second = &seen.lock().unwrap()[1];
+        let note = second.iter().rev().find(|m| m.role == Role::User).unwrap();
+        assert!(note.content.contains("cut off"), "{}", note.content);
+        assert!(note.content.contains("4096"), "{}", note.content);
+        // The truncated assistant message records its stop reason in the log.
+        let cut = agent.conversation().iter().find(|m| m.content == "half a file").unwrap();
+        assert_eq!(cut.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every reply is cut off at the output limit. The turn re-prompts up to
+        // the cap, then gives up with `MaxTokens` rather than a clean `EndTurn`.
+        let cuts: Vec<LLMResponse> =
+            (0..MAX_TRUNCATED_CONTINUATIONS + 1).map(|_| cut_text("still going", 100)).collect();
+        let (mut agent, seen) = agent(cuts, dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+        assert_eq!(outcome.stop_reason.as_acp(), "max_tokens");
+        // The cap bounds the number of continuations: one initial call plus
+        // `MAX_TRUNCATED_CONTINUATIONS` re-prompts.
+        assert_eq!(seen.lock().unwrap().len(), MAX_TRUNCATED_CONTINUATIONS + 1);
     }
 
     /// `n` scripted responses whose `echo` calls all differ, so the loop
@@ -6580,6 +6734,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_defaults_to_the_models_published_output_limit() {
+        // No configured `max_tokens` (0 = unset): the request defaults to the
+        // model's own output limit reported by the endpoint, not an arbitrary
+        // small number. A configured value overrides it, and the context clamp
+        // still applies in both cases.
+        let dir = tempfile::tempdir().unwrap();
+        let window = 200_000;
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        agent.config_mut().context_window = None;
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+            tokens: window,
+            source: "Copilot /models max_context_window_tokens".into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: Some(64_000),
+        });
+        assert_eq!(agent.effective_max_tokens(), 64_000);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        // The roomy window leaves the published limit unclamped.
+        assert_eq!(seen.lock().unwrap()[0], (Some(64_000), false));
+
+        // A configured value overrides the published limit.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = budgeted_agent(vec![big_call("b1"), text("done")], window, 4_000, dir.path());
+        agent.config_mut().context_window = None;
+        *agent.detected_window.lock().unwrap() = Some(DetectedWindow {
+            tokens: window,
+            source: "Copilot /models max_context_window_tokens".into(),
+            cap: ContextCap::Total,
+            total_tokens: None,
+            max_output_tokens: Some(64_000),
+        });
+        // budgeted_agent configures max_tokens = 16_384.
+        assert_eq!(agent.effective_max_tokens(), 16_384);
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "go").await.unwrap();
+        assert_eq!(seen.lock().unwrap()[0], (Some(16_384), false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished() {
+        // No configured limit and no published one: the fallback is used, far
+        // above the old 4096 default, still clamped to the context window.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _seen) = budgeted_agent(vec![text("done")], 200_000, 4_000, dir.path());
+        agent.config_mut().max_tokens = 0;
+        assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+        assert!(DEFAULT_MAX_OUTPUT_TOKENS > 4096);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn prompt_only_window_does_not_shrink_max_tokens() {
         // A prompt-only window (GitHub Copilot's `max_prompt_tokens`) caps the
         // prompt alone, so the output reservation is not carved out of it: even
@@ -6594,6 +6801,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         agent.run_turn(Some("in-1"), "go").await.unwrap();
@@ -6622,6 +6830,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
@@ -6655,6 +6864,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(combined),
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         agent.run_turn(Some("in-1"), &"w".repeat(384_000)).await.unwrap();
@@ -6686,6 +6896,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(combined),
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         // Compactable history: a large earlier exchange. The running prompt is
@@ -6721,6 +6932,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.new_session().unwrap();
         // A ~98.5K-token prompt: over the margin-protected limit (98K) but under
@@ -6756,6 +6968,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: Some(advertised),
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
@@ -6791,6 +7004,7 @@ mod tests {
             source: "Copilot /models max_prompt_tokens".into(),
             cap: ContextCap::Prompt,
             total_tokens: None,
+            max_output_tokens: None,
         });
         agent.learned_window = Some(learned);
         agent.new_session().unwrap();
