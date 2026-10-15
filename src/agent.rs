@@ -626,6 +626,12 @@ pub struct Agent {
     /// status-line update, to interleave a mid-update `/thinking` change.
     #[cfg(test)]
     after_thinking_snapshot: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Test-only hook fired right after a length-truncated chunk schedules its
+    /// continuation reminder, to interleave a steer landing *between*
+    /// continuation requests — after the post-response steer check, before the
+    /// next iteration absorbs it (issue #114).
+    #[cfg(test)]
+    after_continuation_scheduled: Option<Box<dyn Fn() + Send + Sync>>,
     message_counter: u64,
     control: TurnControl,
     stats: SharedStats,
@@ -843,6 +849,8 @@ impl Agent {
             event_sink: None,
             #[cfg(test)]
             after_thinking_snapshot: None,
+            #[cfg(test)]
+            after_continuation_scheduled: None,
             message_counter: 0,
             control: TurnControl::default(),
             stats: SharedStats::default(),
@@ -1939,45 +1947,47 @@ impl Agent {
         }
     }
 
-    /// Rebuild the contiguous answer text and continuation count from a
-    /// trailing run of length-truncated assistant messages in `msgs` (the
-    /// conversation tail for the turn being recovered). Each truncated chunk is
-    /// followed by a continuation reminder; the scan walks back over that
-    /// alternating run, stepping over only *continuation* reminders — it stops
-    /// at any other message, including a Stop-hook re-prompt (also
-    /// `auto_initiated` but a fresh answer segment, not part of this run), a
-    /// steer, or a tool run (issue #114). Returns the concatenated chunks in
-    /// forward order, how many chunks that run holds, and whether the run ends
-    /// on a truncated assistant message whose reminder was never logged.
-    fn truncated_prefix(msgs: &[Message]) -> (String, usize, bool) {
-        let ends_on_truncated = msgs.last().is_some_and(|m| {
-            m.role == Role::Assistant
-                && m.tool_calls.is_empty()
-                && crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
-        });
-        let mut chunks: Vec<&str> = Vec::new();
-        let mut idx = msgs.len();
-        loop {
-            // Step over a trailing continuation reminder only. A Stop-hook
-            // re-prompt is `auto_initiated` too but is NOT a continuation: it
-            // starts a new answer segment, so the scan must stop there rather
-            // than reach back into the previous segment's discarded chunks.
-            if idx > 0 && msgs[idx - 1].role == Role::User && msgs[idx - 1].continuation {
-                idx -= 1;
-            }
-            if idx > 0
-                && msgs[idx - 1].role == Role::Assistant
-                && msgs[idx - 1].tool_calls.is_empty()
-                && crate::llm::stop_reason_is_length(msgs[idx - 1].stop_reason.as_deref())
-            {
-                chunks.push(&msgs[idx - 1].content);
-                idx -= 1;
-            } else {
-                break;
+    /// Forward-replay the in-flight output-limit continuation state for a turn
+    /// being recovered after a crash, converging on the same `(answer, count)`
+    /// the live loop held when it was interrupted (issue #114).
+    ///
+    /// Starts from `snapshot` — the answer text + continuation count persisted
+    /// into a mid-turn compaction's `Replace` record, or empty when no
+    /// compaction intervened — and walks `tail`, the turn's messages logged
+    /// *after* that snapshot, in forward order:
+    ///
+    /// - a *continuation reminder* (`continuation`) counts one scheduled
+    ///   continuation: the budget tracks scheduled reminders, matching the live
+    ///   loop (which increments the count *before* pushing the reminder), not
+    ///   truncated replies — the two diverge when the crash lands after a
+    ///   truncated chunk but before its reminder is logged;
+    /// - any *other* user message (a steer, a Stop-hook re-prompt, the restated
+    ///   pending input) begins a new answer segment, so the accumulated prefix
+    ///   resets;
+    /// - a length-truncated plain assistant chunk extends the answer;
+    /// - any other assistant message (a tool call, or a clean reply) and any
+    ///   tool result begins a new segment, so the prefix resets (its tool-call
+    ///   markup must never leak into the text answer).
+    ///
+    /// The count is turn-wide — a tool run clears the answer accumulator but
+    /// still spends the budget — so it is only ever incremented, never reset;
+    /// only the answer text resets at a segment boundary.
+    fn replay_continuation(snapshot: Option<(String, usize)>, tail: &[Message]) -> (String, usize) {
+        let (mut answer, mut count) = snapshot.unwrap_or_default();
+        for msg in tail {
+            match msg.role {
+                Role::User if msg.continuation => count += 1,
+                Role::User => answer.clear(),
+                Role::Assistant
+                    if msg.tool_calls.is_empty() && crate::llm::stop_reason_is_length(msg.stop_reason.as_deref()) =>
+                {
+                    answer.push_str(&msg.content);
+                }
+                Role::Assistant | Role::Tool => answer.clear(),
+                Role::System => {}
             }
         }
-        chunks.reverse();
-        (chunks.concat(), chunks.len(), ends_on_truncated)
+        (answer, count)
     }
 
     /// Mirror the live output-limit continuation state into the pending input,
@@ -2255,14 +2265,20 @@ impl Agent {
         self.apply_mode_to_system_prompt();
     }
 
-    /// Add queued steering messages to the conversation.
-    fn absorb_steers(&mut self) -> Result<()> {
+    /// Pull any queued steer messages into the conversation. Returns whether at
+    /// least one steer was absorbed, so the caller can reset the output-limit
+    /// continuation accumulator: an absorbed steer begins a new answer segment,
+    /// and the discarded cut-off prefix must not be carried into the revised
+    /// answer (issue #114).
+    fn absorb_steers(&mut self) -> Result<bool> {
+        let mut absorbed = false;
         for steer in self.control.take_pending() {
             self.push(Message::user(&steer.text))?;
             self.emit(AgentEvent::UserMessage { text: &steer.text });
             self.control.inner.absorbed.lock().unwrap().push(steer);
+            absorbed = true;
         }
-        Ok(())
+        Ok(absorbed)
     }
 
     pub fn set_streaming(&mut self, streaming: bool) {
@@ -2721,7 +2737,9 @@ impl Agent {
         // (any non-compaction replacement) clears it too.
         self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
         self.pending_input = match (self.pending_input.take(), pending_position) {
-            (Some(pending), Some(position)) => Some(PendingInput { position, ..pending }),
+            (Some(pending), Some(position)) => {
+                Some(PendingInput { position, continuation_base: Some(self.conversation.len()), ..pending })
+            }
             _ => None,
         };
         self.calibration = None;
@@ -3031,6 +3049,12 @@ impl Agent {
         // truncated chunks into the summary, so this — not the conversation
         // tail — is where a post-compaction crash recovers them (issue #114).
         let persisted_continuation = resuming.as_ref().and_then(|pending| pending.continuation.clone());
+        // The compaction boundary persisted with the pending input: the index
+        // past the folded, summarized messages, so recovery replays only the
+        // chunks logged *after* it over `persisted_continuation` (issue #114).
+        // `None` when no compaction intervened — recovery then replays from the
+        // input position with an empty snapshot.
+        let resume_continuation_base = resuming.as_ref().and_then(|pending| pending.continuation_base);
         // Set to the conversation length just before a resume `SessionStart`
         // hook's context message is appended, so the continuation scan reads
         // the persisted turn tail rather than that freshly added context.
@@ -3086,10 +3110,15 @@ impl Agent {
                     // crash can land after the clean continuation that follows
                     // one or more length-truncated chunks, and replaying only
                     // `last.content` would permanently record the tail and drop
-                    // the earlier prefix (issue #114). The contiguous answer is
-                    // the trailing run of truncated chunks plus this final one.
-                    let tail = &self.conversation[pending.position..];
-                    let (prefix, _, _) = Self::truncated_prefix(&tail[..tail.len() - 1]);
+                    // the earlier prefix (issue #114). Replay the continuation
+                    // chunks logged before this final chunk over any persisted
+                    // snapshot — starting at the compaction boundary when a
+                    // mid-turn compaction folded earlier chunks into the
+                    // summary — then append the final clean chunk.
+                    let end = self.conversation.len() - 1;
+                    let boundary = pending.continuation_base.unwrap_or(pending.position).min(end);
+                    let (prefix, _) =
+                        Self::replay_continuation(pending.continuation.clone(), &self.conversation[boundary..end]);
                     let response = format!("{prefix}{}", last.content);
                     let outcome = Outcome::reported_in(&self.conversation[pending.position..]);
                     return self.finish_turn(input_id, response, outcome, StopReason::EndTurn).map(end_turn);
@@ -3120,6 +3149,7 @@ impl Agent {
                             text: user_input.to_string(),
                             position: self.conversation.len(),
                             continuation: None,
+                            continuation_base: None,
                         });
                         if let Some(log) = &mut self.session {
                             log.append(&Record::Input {
@@ -3145,6 +3175,7 @@ impl Agent {
                     text: user_input.to_string(),
                     position: self.conversation.len(),
                     continuation: None,
+                    continuation_base: None,
                 });
                 if let Some(log) = &mut self.session {
                     log.append(&Record::Input {
@@ -3205,44 +3236,35 @@ impl Agent {
         // continuation reminder was logged — re-push that reminder so the model
         // actually continues.
         if let Some(start) = resume_position.filter(|&s| s <= self.conversation.len()) {
-            // Prefer the continuation state persisted with the pending input
-            // (captured into the `Replace` record at compaction time): a
-            // mid-turn compaction folds the truncated chunks into the summary,
-            // so the conversation tail no longer holds them and a scan would
-            // lose the answer prefix and reset the count (issue #114). Fall
-            // back to scanning the message tail only when no state was
-            // persisted (a crash with no intervening compaction).
-            let persisted = persisted_continuation;
             // Read the persisted turn tail, stopping before any resume
             // `SessionStart` hook context appended above: that fresh message is
             // not part of the interrupted turn, and scanning into it would stop
             // the reconstruction at the hook boundary (issue #114).
             let scan_end = hook_context_start.unwrap_or(self.conversation.len()).max(start);
-            let msgs = &self.conversation[start..scan_end];
-            let (scanned_prefix, _trailing_chunks, last_is_truncated_assistant) = Self::truncated_prefix(msgs);
-            match persisted {
-                Some((text, count)) => {
-                    continued_answer = text;
-                    truncated_continuations = count;
-                }
-                None => {
-                    if !scanned_prefix.is_empty() {
-                        continued_answer = scanned_prefix;
-                    }
-                    // The continuation budget is turn-wide, not just the trailing
-                    // run: a tool run clears the answer accumulator but a
-                    // continuation still spends the budget, so count *every*
-                    // length-truncated chunk logged for this turn (issue #114).
-                    truncated_continuations = msgs
-                        .iter()
-                        .filter(|m| {
-                            m.role == Role::Assistant
-                                && m.tool_calls.is_empty()
-                                && crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
-                        })
-                        .count();
-                }
-            }
+            // Replay from the compaction boundary over the persisted snapshot
+            // when a mid-turn compaction folded the earlier chunks into the
+            // summary; otherwise from the input position over an empty snapshot
+            // (a crash with no intervening compaction). A single forward replay
+            // reconstructs both the answer prefix and the turn-wide count, and —
+            // crucially — also walks the messages logged *after* the compaction
+            // (additional chunks, a segment reset), which the snapshot alone
+            // does not capture (issue #114).
+            let boundary = resume_continuation_base.unwrap_or(start).clamp(start, scan_end);
+            let (answer, count) =
+                Self::replay_continuation(persisted_continuation, &self.conversation[boundary..scan_end]);
+            continued_answer = answer;
+            truncated_continuations = count;
+            // Whether the turn's last logged message is a length-truncated
+            // chunk whose continuation reminder was never logged (the crash
+            // landed before it). A property of the real conversation tail,
+            // independent of the compaction boundary: the budget-spending chunk
+            // may itself sit inside the folded, pre-boundary region (issue
+            // #114).
+            let last_is_truncated_assistant = self.conversation[start..scan_end].last().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && m.tool_calls.is_empty()
+                    && crate::llm::stop_reason_is_length(m.stop_reason.as_deref())
+            });
             // Re-push the continuation reminder only when the interrupt cut the
             // turn off before logging it AND the budget still has room: a crash
             // after the budget-spending chunk must not send one more request
@@ -3321,7 +3343,16 @@ impl Agent {
                 cancelled = true;
                 break;
             }
-            self.absorb_steers()?;
+            if self.absorb_steers()? {
+                // A steer absorbed here begins a new answer segment, like a
+                // tool run or a Stop-hook re-prompt: drop any accumulated
+                // output-limit continuation prefix so the revised answer is not
+                // prefixed by the discarded cut-off chunk. The turn-wide
+                // continuation budget is retained — the steer does not refund a
+                // spent cut-off (issue #114).
+                continued_answer.clear();
+                self.sync_pending_continuation(&continued_answer, truncated_continuations);
+            }
             // A `/model <spec>` typed mid-turn applies here, so the request
             // built below goes to the new model. If the turn was cancelled
             // while the switch was building, stop before the threshold
@@ -3578,10 +3609,17 @@ impl Agent {
                             && !context::is_context_overflow(&message)
                         {
                             max_output_retried = true;
-                            let base = self.output_token_base_uncapped();
+                            // Derive the no-numeric-limit fallback from the
+                            // budget this request actually *sent*
+                            // (`request_max_tokens`, after the context-window
+                            // clamp), not the unclamped base: a context-clamped
+                            // request sends far less than the base, so halving
+                            // the base can land *above* what was sent, making
+                            // `learned < request_max_tokens` false and failing
+                            // the turn without ever retrying (issue #114).
                             let learned = context::output_cap_from_error(&message)
                                 .map(|c| c as i64)
-                                .unwrap_or((base / 2).max(1_024))
+                                .unwrap_or((request_max_tokens / 2).max(1_024))
                                 .max(256);
                             // Only act when this actually lowers the request.
                             // Compare against the budget this request *sent*
@@ -3727,6 +3765,10 @@ impl Agent {
                         continued_answer.push_str(&response.content);
                         self.sync_pending_continuation(&continued_answer, truncated_continuations);
                         last_content = response.content.clone();
+                        #[cfg(test)]
+                        if let Some(hook) = self.after_continuation_scheduled.take() {
+                            hook();
+                        }
                         continue;
                     }
                     // The continuation cap is spent, or the turn cannot continue
@@ -5890,12 +5932,160 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_replays_chunks_logged_after_the_summary() {
+        // A mid-turn compaction persisted the snapshot `("one ", 1)`, then the
+        // turn logged a *further* truncated chunk and its reminder before the
+        // crash. Recovery must replay those post-compaction records over the
+        // snapshot — not stop at the persisted state — so the later chunk and
+        // its spent continuation are not lost (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-extra").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // Logged *after* the compaction: a second truncated chunk and its
+        // reminder, then the crash.
+        log.append(&Record::Message(Box::new(truncated_assistant("two ")))).unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+        )))
+        .unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("three")], dir.path());
+        agent.load_session("compact-extra").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one two three", "the post-compaction chunk is folded into the whole answer");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once to finish the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run() {
+        // A post-compaction tool run begins a new answer segment, so the
+        // persisted continuation prefix must be dropped from the eventual text
+        // answer — its tool-call markup must not leak into it, even across the
+        // compaction boundary (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-tool").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // Logged after the compaction: a tool run that resets the answer
+        // segment, then the crash before the fresh answer.
+        log.append(&Record::Message(Box::new(Message::assistant_with_tools(
+            "",
+            vec![ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                arguments: json!({"text": "pong"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+        ))))
+        .unwrap();
+        log.append(&Record::Message(Box::new(Message::tool_result("c1", "echo", "pong")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("fresh")], dir.path());
+        agent.load_session("compact-tool").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "fresh", "the post-tool answer is not prefixed by the discarded continuation");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the model is called once after the tool run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_compaction_replays_a_logged_clean_final_answer() {
+        // A clean final answer logged *after* a mid-turn compaction, with the
+        // crash before `TurnEnd`. The replay shortcut (no model call) must fold
+        // the persisted snapshot prefix back in, not record only the final
+        // chunk — the shortcut must be checkpoint-aware too (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "compact-clean").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("run it")],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: Some(("one ".to_string(), 1)),
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        // The clean final chunk logged after the compaction; the crash landed
+        // before `TurnEnd`.
+        log.append(&Record::Message(Box::new(Message::assistant("done")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("compact-clean").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "one done", "the replay shortcut folds the persisted prefix into the answer");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_the_third_cutoff_still_issues_the_last_continuation() {
+        // No compaction: a crash after the third truncated chunk but before its
+        // continuation reminder was logged. Only *two* reminders were scheduled,
+        // so the live loop would have incremented to the third and requested a
+        // fourth chunk — recovery must match it and issue that request, not
+        // miscount the three truncated *replies* as three scheduled
+        // continuations and end `MaxTokens` a request early (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let reminder = || Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation();
+        crashed_session(
+            dir.path(),
+            "third-cutoff",
+            vec![
+                Record::Message(Box::new(Message::user("run it"))),
+                Record::Message(Box::new(truncated_assistant("a"))),
+                Record::Message(Box::new(reminder())),
+                Record::Message(Box::new(truncated_assistant("b"))),
+                Record::Message(Box::new(reminder())),
+                // The third truncated chunk, then the crash before its reminder.
+                Record::Message(Box::new(truncated_assistant("c"))),
+            ],
+        );
+        let (mut agent, seen) = agent(vec![text("d")], dir.path());
+        agent.load_session("third-cutoff").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn, "the budget still had room for the fourth request");
+        assert_eq!(outcome.response, "abcd", "the final chunk is stitched onto the recovered prefix");
+        // The recovered turn re-pushed the missing reminder and issued the
+        // fourth continuation request that completed the answer.
+        assert_eq!(seen.lock().unwrap().len(), 1, "one continuation request finishes the turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resume_with_a_spent_budget_before_turn_end_ends_max_tokens() {
-        // No compaction: a crash after the budget-spending (3rd) truncated chunk
-        // but before `TurnEnd`. The scan restores a count of 3 (the cap), so the
-        // recovered turn must end `MaxTokens` without another model call — a
-        // clean reply would otherwise be recorded `EndTurn`, hiding the cut-off
-        // (issue #114).
+        // No compaction: a crash after the fourth (budget-spending) truncated
+        // chunk but before `TurnEnd`. Three reminders were scheduled (the cap),
+        // so the recovered turn must end `MaxTokens` without another model call
+        // — a clean reply would otherwise be recorded `EndTurn`, hiding the
+        // cut-off (issue #114).
         let dir = tempfile::tempdir().unwrap();
         let reminder = || Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation();
         crashed_session(
@@ -5907,15 +6097,18 @@ mod tests {
                 Record::Message(Box::new(reminder())),
                 Record::Message(Box::new(truncated_assistant("b"))),
                 Record::Message(Box::new(reminder())),
-                // The third truncated chunk, then the crash before its reminder.
                 Record::Message(Box::new(truncated_assistant("c"))),
+                Record::Message(Box::new(reminder())),
+                // The fourth truncated chunk spends the budget; the crash lands
+                // before its reminder (which the cap would never schedule).
+                Record::Message(Box::new(truncated_assistant("d"))),
             ],
         );
         let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
         agent.load_session("spent").unwrap();
         let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::MaxTokens, "the spent budget ends the recovered turn");
-        assert_eq!(outcome.response, "abc", "the accumulated chunks are preserved");
+        assert_eq!(outcome.response, "abcd", "the accumulated chunks are preserved");
         assert!(seen.lock().unwrap().is_empty(), "an exhausted recovered turn makes no model call");
     }
 
@@ -6968,6 +7161,77 @@ mod tests {
         // skip the retry, dropping history).
         assert_eq!(sent[1], 6_144, "the retry halved the sent budget: {sent:?}");
         assert!(sent[1] <= 7_000, "the retried summary fits the cap: {sent:?}");
+    }
+
+    /// A client that rejects its FIRST chat request with an output-cap error
+    /// carrying no parseable numeric limit (so the halving fallback runs), then
+    /// succeeds. Records every request's `max_tokens`.
+    struct ChatCapFallbackClient {
+        seen_max_tokens: Arc<Mutex<Vec<i64>>>,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for ChatCapFallbackClient {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.seen_max_tokens.lock().unwrap().push(request.max_tokens.unwrap_or(0));
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                // No number for `output_cap_from_error` to parse: the fallback
+                // must derive the cap from the sent budget, not the chat base.
+                anyhow::bail!("max_tokens is too large for this model");
+            }
+            Ok(text("recovered"))
+        }
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+        fn kind(&self) -> Option<providers::ProviderKind> {
+            Some(providers::ProviderKind::Openai)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_output_cap_fallback_halves_the_sent_budget() {
+        // A chat turn whose request is context-clamped below the 32,768 base is
+        // rejected with an output-cap error carrying no numeric limit. The
+        // fallback must halve the budget the request actually *sent*
+        // (`request_max_tokens`), not the unclamped base: halving the base
+        // lands *above* the clamped request, so `learned < request` is false,
+        // the retry is skipped, and the turn fails instead of recovering (issue
+        // #114).
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = ChatCapFallbackClient { seen_max_tokens: seen.clone(), calls: Arc::new(Mutex::new(0)) };
+        let config = Config {
+            session_dir: Some(dir.path().to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            // A large base with a small total window clamps the request well
+            // below the base, so halving the base cannot lower it.
+            max_tokens: 32_768,
+            context_window: Some(16_000),
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.new_session().unwrap();
+        let response = agent.send_message("ping").await.unwrap();
+        assert_eq!(response, "recovered", "the context-clamped retry recovered the turn");
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "an over-cap request, then the halved retry: {sent:?}");
+        assert!(sent[0] < 32_768, "the request was context-clamped below the base: {sent:?}");
+        // The crux: the clamped request sits at or below the base's half, so a
+        // base-derived fallback (16,384) would not lower it and the retry would
+        // be skipped — only halving the *sent* budget recovers the turn.
+        assert!(sent[0] <= 16_384, "the base's half would not lower the clamped request: {sent:?}");
+        assert_eq!(sent[1], sent[0] / 2, "the retry halves the sent budget, not the base: {sent:?}");
     }
 
     /// A client that rejects the FIRST summary request with a numeric
@@ -10434,6 +10698,31 @@ mod tests {
         let n = conversation.len();
         assert_eq!(conversation[n - 3].content, "first draft");
         assert_eq!(conversation[n - 2].content, "make it shorter");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_steer_between_continuations_drops_the_cut_off_prefix() {
+        // A length-truncated chunk schedules its continuation, then a steer
+        // lands *between* that scheduling and the next iteration's absorb —
+        // after the post-response steer check already evaluated no steer. The
+        // absorbed steer begins a new answer segment, so the revised answer
+        // must NOT be prefixed by the discarded cut-off chunk (issue #114).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, seen) = agent(vec![cut_text("cut ", 50), text("revised")], dir.path());
+        let control = agent.control();
+        // Fires right after the cut-off chunk schedules its reminder, mimicking
+        // a steer that arrives in the window the post-response check just
+        // missed.
+        agent.after_continuation_scheduled = Some(Box::new(move || control.steer("change course", None)));
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "write").await.unwrap();
+        assert_eq!(outcome.response, "revised", "the steered answer is not prefixed by the discarded cut-off chunk");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the cut-off chunk, then the steered continuation");
+        let conversation = agent.conversation();
+        assert!(
+            conversation.iter().any(|m| m.role == Role::User && m.content == "change course"),
+            "the steer was absorbed into the turn: {conversation:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

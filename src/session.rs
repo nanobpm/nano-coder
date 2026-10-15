@@ -130,6 +130,15 @@ pub struct PendingInput {
     /// instead of losing both with the folded messages (issue #114). `None`
     /// when no continuation is in flight.
     pub continuation: Option<(String, usize)>,
+    /// The conversation length at the mid-turn compaction that produced this
+    /// pending input's `Replace` record — i.e. the index past the folded,
+    /// summarized messages. A post-compaction crash recovery replays only the
+    /// messages logged *after* this boundary over the persisted `continuation`
+    /// snapshot, so chunks already folded into the summary are not double
+    /// counted and chunks logged *after* the compaction are not lost (issue
+    /// #114). `None` when no compaction intervened, in which case recovery
+    /// replays from the input `position` with an empty snapshot.
+    pub continuation_base: Option<usize>,
 }
 
 /// State rebuilt from a session log.
@@ -441,8 +450,13 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
             }
             _ if index == 0 => bail!("session log does not start with a session header"),
             Record::Input { id, text, .. } => {
-                restored.pending_input =
-                    Some(PendingInput { id, text, position: restored.conversation.len(), continuation: None });
+                restored.pending_input = Some(PendingInput {
+                    id,
+                    text,
+                    position: restored.conversation.len(),
+                    continuation: None,
+                    continuation_base: None,
+                });
             }
             Record::Message(mut message) => {
                 // A direct record's ID is its physical line (`history_read`
@@ -484,7 +498,15 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                     // Restore the persisted continuation state too: the chunks it
                     // was built from may have been folded into the summary, so
                     // the conversation alone no longer holds them (issue #114).
-                    (Some(pending), Some(position)) => Some(PendingInput { position, continuation, ..pending }),
+                    // The boundary is the restored (compacted) conversation
+                    // length, so recovery replays only post-compaction messages
+                    // over the snapshot.
+                    (Some(pending), Some(position)) => Some(PendingInput {
+                        position,
+                        continuation,
+                        continuation_base: Some(restored.conversation.len()),
+                        ..pending
+                    }),
                     _ => None,
                 };
                 // A smart compaction offers the history tools; restore that
@@ -656,7 +678,13 @@ mod tests {
         assert_eq!(restored.completed.get("in-1").map(String::as_str), Some("hello"));
         assert_eq!(
             restored.pending_input,
-            Some(PendingInput { id: "in-2".into(), text: "hi".into(), position: 3, continuation: None })
+            Some(PendingInput {
+                id: "in-2".into(),
+                text: "hi".into(),
+                position: 3,
+                continuation: None,
+                continuation_base: None
+            })
         );
         assert!(SessionLog::create(dir.path(), "s1").is_err(), "create must not clobber");
     }
@@ -740,7 +768,13 @@ mod tests {
         assert_eq!(restored.conversation, expected);
         assert_eq!(
             restored.pending_input,
-            Some(PendingInput { id: "in-1".into(), text: "go".into(), position: 2, continuation: None })
+            Some(PendingInput {
+                id: "in-1".into(),
+                text: "go".into(),
+                position: 2,
+                continuation: None,
+                continuation_base: Some(3)
+            })
         );
     }
 
