@@ -859,6 +859,26 @@ fn context_limit(row: &Value) -> Option<usize> {
     positive(row, &["context_limit", "contextLimit", "context_window", "contextWindow", "max_context_window_tokens"])
 }
 
+/// A row's published output-token cap, if any: Muse's `output_limit` /
+/// `max_output_tokens` (snake or camel) or the OpenAI-compatible spellings.
+/// Read best-effort so an unset `max_tokens` defaults to the model's real
+/// limit instead of an arbitrary fallback (issue #114); kept separate from
+/// [`context_limit`] so the configured-window probe path, which skips the
+/// window, can still surface this limit.
+fn output_limit(row: &Value) -> Option<usize> {
+    positive(
+        row,
+        &[
+            "output_limit",
+            "outputLimit",
+            "max_output_tokens",
+            "maxOutputTokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+        ],
+    )
+}
+
 /// A row's reasoning-effort tiers: Muse's `reasoning_effort_variants` (`[{tier}]`,
 /// `[{effort}]`, or `["low", …]`), else a flat `reasoning_effort` list. Muse's
 /// object shape carries the level under `effort` (e.g. `{ "effort": "high" }`).
@@ -952,11 +972,13 @@ impl LLMClient for MuseClient {
     async fn detect_context_window(&self) -> Option<DetectedWindow> {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            let max_output_tokens = output_limit(&entry);
             context_limit(&entry).map(|tokens| DetectedWindow {
                 tokens,
                 source: "Muse /muse-code/models context_limit".to_string(),
                 cap: ContextCap::Total,
                 total_tokens: None,
+                max_output_tokens,
             })
         })
         .await
@@ -988,20 +1010,24 @@ impl LLMClient for MuseClient {
         .flatten()
     }
 
-    async fn detect_capabilities(&self) -> (Option<DetectedWindow>, Option<Reported>, Option<crate::vision::Vision>) {
+    async fn detect_capabilities(
+        &self,
+    ) -> (Option<DetectedWindow>, Option<Reported>, Option<crate::vision::Vision>, Option<usize>) {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let entry = self.model_entry(PROBE_TIMEOUT).await?;
+            let max_output = output_limit(&entry);
             let window = context_limit(&entry).map(|tokens| DetectedWindow {
                 tokens,
                 source: "Muse /muse-code/models context_limit".to_string(),
                 cap: ContextCap::Total,
                 total_tokens: None,
+                max_output_tokens: max_output,
             });
             let thinking = Reported::from_model_entry(&entry).or_else(|| {
                 effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
             });
             let vision = muse_vision(&entry);
-            Some((window, thinking, vision))
+            Some((window, thinking, vision, max_output))
         })
         .await
         .ok()
@@ -1009,14 +1035,15 @@ impl LLMClient for MuseClient {
         .unwrap_or_default()
     }
 
-    async fn detect_thinking_and_vision(&self) -> (Option<Reported>, Option<crate::vision::Vision>) {
+    async fn detect_thinking_and_vision(&self) -> (Option<Reported>, Option<crate::vision::Vision>, Option<usize>) {
         tokio::time::timeout(PROBE_TIMEOUT, async {
             let entry = self.model_entry(PROBE_TIMEOUT).await?;
             let thinking = Reported::from_model_entry(&entry).or_else(|| {
                 effort_levels(&entry).map(|levels| Reported { levels, adaptive: false, format: Format::Effort })
             });
             let vision = muse_vision(&entry);
-            Some((thinking, vision))
+            let max_output = output_limit(&entry);
+            Some((thinking, vision, max_output))
         })
         .await
         .ok()
