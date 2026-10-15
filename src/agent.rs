@@ -1521,10 +1521,15 @@ impl Agent {
             return;
         }
         let probe = self.client.detect_capabilities();
-        let (window, thinking, vision) = tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
+        let (window, thinking, vision, max_output) =
+            tokio::time::timeout(DETECT_TIMEOUT, probe).await.ok().unwrap_or_default();
         // Capture the published output limit separately so it survives even
-        // when a later configured window clears the detected window (issue #114).
-        *self.reported_max_output.lock().unwrap() = window.as_ref().and_then(|w| w.max_output_tokens);
+        // when the detected window is `None` (an entry can publish an output
+        // cap with no recognized window field) or when a later configured
+        // window clears the detected window (issue #114). Fall back to the
+        // window's own cap when the probe returns none independently.
+        *self.reported_max_output.lock().unwrap() =
+            max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
         *self.detected_window.lock().unwrap() = window;
         *self.reported_thinking.lock().unwrap() = thinking;
         // Vision is derived from the same probe responses `detect_capabilities`
@@ -1745,10 +1750,13 @@ impl Agent {
                         .unwrap_or_default();
                 (None, thinking, vision, max_output)
             } else {
-                let (window, thinking, vision) =
+                let (window, thinking, vision, probed_max_output) =
                     tokio::time::timeout(DETECT_TIMEOUT, probe.detect_capabilities()).await.ok().unwrap_or_default();
-                // Carry the window's published output limit forward separately.
-                let max_output = window.as_ref().and_then(|w| w.max_output_tokens);
+                // Carry the published output limit forward separately: it
+                // survives even when the detected window is `None` (an entry
+                // can publish an output cap with no window field), falling back
+                // to the window's own cap when the probe returns none (issue #114).
+                let max_output = probed_max_output.or_else(|| window.as_ref().and_then(|w| w.max_output_tokens));
                 (window, thinking, vision, max_output)
             };
             Self::finish_detect(
@@ -1940,10 +1948,14 @@ impl Agent {
     /// copy, so a configured context window never suppresses the discovered
     /// output limit (issue #114).
     fn detected_max_output(&self) -> Option<usize> {
-        self.reported_max_output
-            .lock()
-            .unwrap()
-            .or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
+        // Copy the reported value out so its guard is released *before* locking
+        // `detected_window`. `finish_detect` takes these locks in the opposite
+        // order — window first, then `max_output` — so holding the report guard
+        // across the window lock here inverts that order and can deadlock a
+        // background model-switch probe when the report is still `None`
+        // (issue #114).
+        let reported = *self.reported_max_output.lock().unwrap();
+        reported.or_else(|| self.detected_window.lock().unwrap().as_ref().and_then(|d| d.max_output_tokens))
     }
 
     /// The effective `max_tokens` the next request would send before the
@@ -3428,7 +3440,7 @@ impl Agent {
                     && !self.control.is_cancelled()
                     && let Some(reason) = self.run_claude_stop_hooks()
                 {
-                    self.push(Message::user(&reminders::wrap(&reason)))?;
+                    self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
                     // The Stop-hook reply is a fresh answer, not a continuation.
                     continued_answer.clear();
                     last_content = response.content.clone();
@@ -3449,7 +3461,9 @@ impl Agent {
                     {
                         truncated_continuations += 1;
                         let tokens = response.usage.as_ref().map_or(0, |u| u.completion_tokens);
-                        self.push(Message::user(&reminders::wrap(&truncated_continuation_note(tokens))))?;
+                        self.push(
+                            Message::user(&reminders::wrap(&truncated_continuation_note(tokens))).auto_initiated(),
+                        )?;
                         // Keep this cut-off chunk so the finished answer is the
                         // whole reply, not just the final continuation's tail.
                         continued_answer.push_str(&response.content);
@@ -3846,7 +3860,7 @@ impl Agent {
                     && !self.control.is_cancelled()
                     && let Some(reason) = self.run_claude_stop_hooks()
                 {
-                    self.push(Message::user(&reminders::wrap(&reason)))?;
+                    self.push(Message::user(&reminders::wrap(&reason)).auto_initiated())?;
                     last_content = reported.take().map(|outcome| outcome.response()).unwrap_or_default();
                     continue;
                 }
@@ -6924,7 +6938,7 @@ mod tests {
         agent.config_mut().max_tokens = 0;
         agent.config_mut().model = "some-unlisted-model".into();
         assert_eq!(agent.effective_max_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
-        assert!(DEFAULT_MAX_OUTPUT_TOKENS > 4096);
+        const { assert!(DEFAULT_MAX_OUTPUT_TOKENS > 4096) };
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7643,10 +7657,10 @@ mod tests {
             }
             async fn detect_capabilities(
                 &self,
-            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>)
+            ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>)
             {
                 self.calls.lock().unwrap().push("capabilities");
-                (Some(DetectedWindow::total(65_536, "test")), None, None)
+                (Some(DetectedWindow::total(65_536, "test")), None, None, None)
             }
             async fn detect_thinking_levels(&self) -> Option<crate::thinking::Reported> {
                 self.calls.lock().unwrap().push("thinking");

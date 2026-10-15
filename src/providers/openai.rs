@@ -360,7 +360,17 @@ impl StreamAccumulator {
             })
             .collect();
         LLMResponse {
-            content: self.content.trim_start().to_string(),
+            // Only strip leading whitespace that is cleanup after a thinking
+            // block; with no thinking, the content's leading whitespace is
+            // real (a streamed continuation resuming mid-word/line, e.g. a
+            // cut-off `Hello` followed by ` world`) and must be preserved
+            // (issue #114). `emit_piece` applies the same condition so the
+            // streamed pieces and this returned content agree.
+            content: if self.thinking.is_empty() {
+                std::mem::take(&mut self.content)
+            } else {
+                self.content.trim_start().to_string()
+            },
             tool_calls,
             usage: self.usage,
             stop_reason: self.finish_reason,
@@ -375,8 +385,12 @@ fn emit_piece(content: &mut String, thinking: &mut String, sink: StreamSink<'_>,
         thinking.push_str(piece);
         sink(StreamEvent::Thinking(piece));
     } else {
-        // Drop the blank lines that usually follow `</think>`.
-        let piece = if content.is_empty() { piece.trim_start() } else { piece };
+        // Drop the blank lines that usually follow `</think>` — but only when a
+        // thinking block actually preceded this content. With no thinking, the
+        // first piece's leading whitespace is real (a streamed continuation
+        // resuming mid-line) and trimming it would corrupt the answer
+        // (issue #114).
+        let piece = if content.is_empty() && !thinking.is_empty() { piece.trim_start() } else { piece };
         if !piece.is_empty() {
             content.push_str(piece);
             sink(StreamEvent::Text(piece));
@@ -476,7 +490,7 @@ impl LLMClient for OpenAiClient {
 
     async fn detect_capabilities(
         &self,
-    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
         detect_capabilities(&self.transport).await
     }
 
@@ -632,13 +646,19 @@ pub(crate) async fn detect_window(transport: &HttpTransport) -> Option<DetectedW
 /// serially at startup or on a model switch.
 pub(crate) async fn detect_capabilities(
     transport: &HttpTransport,
-) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
     let provider = transport.provider();
     let base = provider.base_url.as_str();
     let root = base.strip_suffix("/v1").unwrap_or(base);
     let model = provider.model.as_str();
     let models = probe(transport, reqwest::Method::GET, &format!("{base}/models"), None).await;
     let entry = models.as_ref().and_then(|m| model_entry(m, model));
+    // The model's published output cap lives on the `/models` entry and is a
+    // separate budget from the context window: an entry can carry it with no
+    // recognized window field, or its window can come from a server-specific
+    // follow-up below. Read it here, independent of the window, so it survives
+    // even when the window half is `None` (issue #114).
+    let max_output = entry.and_then(output_limit_in_entry);
     let server = identify(&provider.name, root, entry);
     match server {
         Server::LlamaCpp => {
@@ -654,7 +674,7 @@ pub(crate) async fn detect_capabilities(
             let thinking = props.as_ref().and_then(crate::thinking::Reported::from_llamacpp_props);
             // Vision comes from the same `/props` response — no second probe.
             let vision = props.as_ref().and_then(crate::vision::Vision::from_llamacpp_props);
-            (window, thinking, vision)
+            (window, thinking, vision, max_output)
         }
         Server::Ollama => {
             let (window, show) = match entry.and_then(window_in_entry) {
@@ -669,7 +689,7 @@ pub(crate) async fn detect_capabilities(
             let thinking = show.as_ref().and_then(crate::thinking::Reported::from_ollama_show);
             // Vision comes from the same `/api/show` response — no second probe.
             let vision = show.as_ref().and_then(crate::vision::Vision::from_ollama_show);
-            (window, thinking, vision)
+            (window, thinking, vision, max_output)
         }
         Server::LmStudio => {
             let window = match entry.and_then(window_in_entry) {
@@ -682,9 +702,9 @@ pub(crate) async fn detect_capabilities(
                     .and_then(as_tokens)
                     .map(|tokens| DetectedWindow::total(tokens, "LM Studio loaded_context_length")),
             };
-            (window, None, None)
+            (window, None, None, max_output)
         }
-        Server::Other => (entry.and_then(window_in_entry), None, None),
+        Server::Other => (entry.and_then(window_in_entry), None, None, max_output),
     }
 }
 
@@ -1556,6 +1576,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_leading_whitespace_is_preserved_without_thinking() {
+        // A streamed continuation can resume mid-line (the model's first piece
+        // begins with a space/newline). With no preceding thinking block there
+        // is nothing to clean up, so that leading whitespace is real content and
+        // must survive both the streamed pieces and the final response (issue #114).
+        let events = [
+            json!({"choices":[{"delta":{"role":"assistant","content":" world"}}]}),
+            json!({"choices":[{"delta":{"content":" again"}}]}),
+            json!({"choices":[],"finish_reason":"stop"}),
+        ];
+        let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        body.push_str("data: [DONE]\n\n");
+        let (url, _) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", body)]).await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hello")];
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event: StreamEvent<'_>| {
+            if let StreamEvent::Text(t) = event {
+                seen.lock().unwrap().push(t.to_string());
+            }
+        };
+        let response = client
+            .chat_stream(
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, " world again", "leading whitespace preserved with no thinking");
+        assert_eq!(*seen.lock().unwrap(), vec![" world", " again"], "first streamed piece keeps its leading space");
+    }
+
+    #[tokio::test]
+    async fn streamed_leading_whitespace_after_thinking_is_trimmed() {
+        // The blank line that follows `</think>` is cleanup and must still be
+        // dropped once a thinking block has been seen (both native reasoning and
+        // inline `<think>`), so the trim stays conditioned on thinking presence.
+        let events = [
+            json!({"choices":[{"delta":{"role":"assistant","reasoning_content":"ponder"}}]}),
+            json!({"choices":[{"delta":{"content":"\n\nanswer"}}]}),
+            json!({"choices":[],"finish_reason":"stop"}),
+        ];
+        let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        body.push_str("data: [DONE]\n\n");
+        let (url, _) = test_server::serve(vec![(200, "content-type: text/event-stream\r\n", body)]).await;
+        let client = OpenAiClient::new(provider(&url, "")).unwrap();
+        let messages = [Message::user("hello")];
+        let response = client
+            .chat_stream(
+                &ChatRequest {
+                    messages: &messages,
+                    tools: &[],
+                    temperature: None,
+                    max_tokens: None,
+                    thinking: None,
+                    vision: None,
+                    attachments_dir: None,
+                },
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.content, "answer", "post-think blank line is trimmed");
+        assert_eq!(response.thinking, "ponder");
+    }
+
+    #[tokio::test]
     async fn replays_reasoning_content_when_enabled() {
         let events = [
             json!({"choices":[{"delta":{"role":"assistant","reasoning_content":"Need ls."}}]}),
@@ -1793,9 +1888,31 @@ mod tests {
             },
         )]);
         let resolved = resolve(&format!("{provider_name}/qwen3:8b"), &user, "mock").unwrap();
-        let (window, thinking, _vision) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
+        let (window, thinking, _vision, _max_output) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
         let paths = captured.lock().unwrap().iter().map(|c| c.path.clone()).collect();
         (window, thinking, paths)
+    }
+
+    #[tokio::test]
+    async fn output_cap_survives_absent_window_on_generic_server() {
+        // A `/models` entry can publish the output cap with no recognized
+        // context-window field. The window is then `None`, but the cap is a
+        // separate budget and must survive so `max_tokens` can default to it
+        // (issue #114).
+        let models = json!({"data": [{"id": "qwen3:8b", "max_completion_tokens": 8000}]});
+        let (url, _) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let user = HashMap::from([(
+            "hosted".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("{url}/v1")),
+                ..Default::default()
+            },
+        )]);
+        let resolved = resolve("hosted/qwen3:8b", &user, "mock").unwrap();
+        let (window, _thinking, _vision, max_output) = OpenAiClient::new(resolved).unwrap().detect_capabilities().await;
+        assert!(window.is_none(), "no window field means no detected window");
+        assert_eq!(max_output, Some(8000), "the published output cap survives the absent window");
     }
 
     #[tokio::test]

@@ -79,6 +79,14 @@ pub struct Message {
     /// For tool results: the tool failed (or never finished).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// A harness-injected automatic follow-up (a truncated-output continuation
+    /// or a Claude Stop-hook re-prompt), not a turn the user initiated. Carried
+    /// so a provider that bills per user-initiated request (Copilot) can send
+    /// `X-Initiator: agent` for it even though the reminder keeps `Role::User`
+    /// on the wire, instead of being charged a premium request mid-turn
+    /// (issue #114). Not sent to providers as content; log only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_initiated: bool,
     /// Provider-specific reasoning blocks that must be replayed with this
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -132,6 +140,7 @@ impl Message {
             attachments: vec![],
             tool_calls: vec![],
             is_error: false,
+            auto_initiated: false,
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
@@ -177,6 +186,14 @@ impl Message {
     /// Attach `attachments` to this (tool-result) message.
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Mark this (user-role) reminder as a harness-injected automatic follow-up
+    /// rather than a user-initiated turn, so Copilot bills it as agent-initiated
+    /// (issue #114).
+    pub fn auto_initiated(mut self) -> Self {
+        self.auto_initiated = true;
         self
     }
 }
@@ -611,8 +628,15 @@ pub trait LLMClient: Send + Sync {
     ) -> (Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
         (self.detect_thinking_levels().await, self.detect_vision().await, None)
     }
-    /// The window, thinking levels and vision capability the endpoint reports,
-    /// probed together.
+    /// The window, thinking levels, vision capability **and** published
+    /// output-token limit the endpoint reports, probed together.
+    ///
+    /// The output limit is returned *independently* of the window: an endpoint
+    /// can publish an output cap on a `/models` entry that carries no
+    /// recognized context-window field (or whose window is found by a
+    /// server-specific follow-up), and that cap must survive even when the
+    /// window is `None`, exactly as the configured-window path
+    /// (`detect_thinking_and_vision`) already keeps it (issue #114).
     ///
     /// The default probes each on its own; a provider whose detections would
     /// fetch the same endpoint response (OpenAI-compatible servers probe
@@ -621,8 +645,13 @@ pub trait LLMClient: Send + Sync {
     /// not probed two or three times serially.
     async fn detect_capabilities(
         &self,
-    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
-        (self.detect_context_window().await, self.detect_thinking_levels().await, self.detect_vision().await)
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
+        let window = self.detect_context_window().await;
+        // Keep any output cap the window carried, independent of the window
+        // itself, so the agent consumer can store it even when the window half
+        // is absent.
+        let max_output = window.as_ref().and_then(|w| w.max_output_tokens);
+        (window, self.detect_thinking_levels().await, self.detect_vision().await, max_output)
     }
     /// A boxed clone, for work that outlives the caller's borrow — e.g. the
     /// agent probing the context window in a background task after a mid-turn

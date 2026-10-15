@@ -509,10 +509,13 @@ impl LLMClient for GithubCopilotClient {
             // vision path (only when one is actually sent).
             (body, plan.carries_image())
         };
-        // Copilot bills a premium request per user-initiated turn; tool
-        // follow-ups are marked agent-initiated, as VS Code does.
-        let initiator = match request.messages.last().map(|m| &m.role) {
-            Some(Role::User) => "user",
+        // Copilot bills a premium request per user-initiated turn. A turn ends
+        // with a `Role::User` message, but a harness-injected automatic
+        // follow-up (truncated-output continuation, Claude Stop-hook re-prompt)
+        // keeps that role on the wire while being agent-initiated, so it must
+        // not be billed as a fresh user turn (issue #114).
+        let initiator = match request.messages.last() {
+            Some(m) if m.role == Role::User && !m.auto_initiated => "user",
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
@@ -573,8 +576,13 @@ impl LLMClient for GithubCopilotClient {
             };
             (body, plan.carries_image())
         };
-        let initiator = match request.messages.last().map(|m| &m.role) {
-            Some(Role::User) => "user",
+        // Copilot bills a premium request per user-initiated turn. A turn ends
+        // with a `Role::User` message, but a harness-injected automatic
+        // follow-up (truncated-output continuation, Claude Stop-hook re-prompt)
+        // keeps that role on the wire while being agent-initiated, so it must
+        // not be billed as a fresh user turn (issue #114).
+        let initiator = match request.messages.last() {
+            Some(m) if m.role == Role::User && !m.auto_initiated => "user",
             _ => "agent",
         };
         let overrides = self.transport.provider().headers.clone();
@@ -678,7 +686,7 @@ impl LLMClient for GithubCopilotClient {
     /// keeps a slow or unavailable endpoint from being probed repeatedly.
     async fn detect_capabilities(
         &self,
-    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>) {
+    ) -> (Option<DetectedWindow>, Option<crate::thinking::Reported>, Option<crate::vision::Vision>, Option<usize>) {
         // Bound the whole probe: `models_json` first does a token exchange whose
         // request carries the transport's normal (long) timeout, so a stalled
         // exchange could otherwise blow past the probe budget even though the
@@ -718,7 +726,10 @@ impl LLMClient for GithubCopilotClient {
             let thinking = crate::thinking::Reported::from_model_entry(&entry);
             // Vision comes from the same cached `/models` entry — no second probe.
             let vision = crate::vision::Vision::from_model_entry(&entry);
-            Some((window, thinking, vision))
+            // Surface the output cap independently: an entry can publish it with
+            // neither prompt nor context-window limit, leaving `window` `None`,
+            // and the cap must still survive (issue #114).
+            Some((window, thinking, vision, max_output))
         })
         .await
         .ok()
@@ -1230,6 +1241,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_initiated_trailing_user_message_is_billed_as_agent() {
+        // An automatic harness follow-up (truncated-output continuation, Claude
+        // Stop-hook re-prompt) is a `Role::User` message so the model treats it
+        // as the turn's last word, but it is agent-initiated and must not be
+        // billed as a premium user request (issue #114).
+        let (api, api_log) = test_server::serve(vec![(200, "", CHAT_OK.into())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+
+        let messages =
+            vec![Message::user("hello"), Message::assistant("partial"), Message::user("continue").auto_initiated()];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: &[],
+            temperature: None,
+            max_tokens: None,
+            thinking: None,
+            vision: None,
+            attachments_dir: None,
+        };
+        client.chat(&request).await.unwrap();
+
+        let api_log = api_log.lock().unwrap();
+        assert!(
+            api_log[0].headers.to_lowercase().contains("x-initiator: agent"),
+            "auto-initiated trailing user message is agent-initiated, not a billed user turn"
+        );
+    }
+
+    #[tokio::test]
     async fn reexchanges_once_on_unauthorized() {
         let (api, api_log) = test_server::serve(vec![
             (401, "", r#"{"error":{"message":"token expired"}}"#.into()),
@@ -1305,7 +1346,7 @@ mod tests {
         let (api, api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (window, thinking, vision) = client.detect_capabilities().await;
+        let (window, thinking, vision, _max_output) = client.detect_capabilities().await;
         assert_eq!(window.unwrap().tokens, 111);
         assert_eq!(thinking.unwrap().levels, ["off", "low", "high"]);
         assert!(vision.is_some(), "vision derived from the same shared /models entry");
@@ -1322,8 +1363,24 @@ mod tests {
         let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (window, _thinking, _vision) = client.detect_capabilities().await;
+        let (window, _thinking, _vision, max_output) = client.detect_capabilities().await;
         assert_eq!(window.unwrap().max_output_tokens, Some(16_000));
+        assert_eq!(max_output, Some(16_000), "output limit also surfaced independently of the window");
+    }
+
+    #[tokio::test]
+    async fn detect_capabilities_keeps_output_limit_when_window_is_absent() {
+        // The output cap is a separate budget: an entry can publish it with no
+        // prompt/context-window limit, leaving the window `None`, and the cap
+        // must still survive so `max_tokens` can default to it (issue #114).
+        let models = json!({ "data": [{ "id": "gpt-5-mini", "capabilities": {
+            "limits": { "max_output_tokens": 16_000 } } }] });
+        let (api, _api_log) = test_server::serve(vec![(200, "", models.to_string())]).await;
+        let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
+        let client = client(&auth);
+        let (window, _thinking, _vision, max_output) = client.detect_capabilities().await;
+        assert!(window.is_none(), "no prompt or context-window limit means no detected window");
+        assert_eq!(max_output, Some(16_000), "the output cap survives the absent window");
     }
 
     #[tokio::test]
@@ -1334,7 +1391,7 @@ mod tests {
         let (api, api_log) = test_server::serve(vec![(500, "", r#"{"error":"boom"}"#.into())]).await;
         let (auth, _auth_log) = test_server::serve(vec![(200, "", token_body(&api, "sess-1"))]).await;
         let client = client(&auth);
-        let (window, thinking, _vision) = client.detect_capabilities().await;
+        let (window, thinking, _vision, _max_output) = client.detect_capabilities().await;
         assert_eq!((window, thinking), (None, None));
         assert_eq!(api_log.lock().unwrap().len(), 1, "the failed fetch is not retried for the second probe");
     }
