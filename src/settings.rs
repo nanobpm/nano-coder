@@ -86,10 +86,9 @@ fn key_status_in(provider: &ProviderConfig, data_dir: Option<&Path>) -> String {
 /// credential is recognised regardless of the env-var setting.
 fn stored_login_status(provider: &ProviderConfig, env_var: Option<&String>, data_dir: Option<&Path>) -> String {
     let (stored, login): (bool, Option<&str>) = match provider.kind {
-        Some(ProviderKind::GithubCopilot) => (
-            providers::github_copilot::load_credentials_in_dir(data_dir).is_some(),
-            Some("--login github-copilot"),
-        ),
+        Some(ProviderKind::GithubCopilot) => {
+            (providers::github_copilot::load_credentials_in_dir(data_dir).is_some(), Some("--login github-copilot"))
+        }
         Some(ProviderKind::Muse) => {
             (providers::muse::load_credentials_in_dir(data_dir).is_some(), Some("--login muse"))
         }
@@ -119,7 +118,10 @@ pub fn derived_endpoint_source(provider: &ProviderConfig) -> String {
         Some(ProviderKind::Muse) => {
             let direct_key = provider.api_key.is_some()
                 || provider.api_key_command.is_some()
-                || provider.api_key_env.as_ref().is_some_and(|v| !v.is_empty() && env::var(v).is_ok_and(|k| !k.is_empty()));
+                || provider
+                    .api_key_env
+                    .as_ref()
+                    .is_some_and(|v| !v.is_empty() && env::var(v).is_ok_and(|k| !k.is_empty()));
             if direct_key { "(from API key)".to_string() } else { "(from minted key)".to_string() }
         }
         _ => "-".to_string(),
@@ -1726,7 +1728,8 @@ mod tests {
         // An explicitly empty `api_key_env` is treated as absent: the stored
         // login is still recognised.
         let dir = muse_login_dir();
-        let muse = ProviderConfig { kind: Some(ProviderKind::Muse), api_key_env: Some(String::new()), ..Default::default() };
+        let muse =
+            ProviderConfig { kind: Some(ProviderKind::Muse), api_key_env: Some(String::new()), ..Default::default() };
         assert_eq!(key_status_in(&muse, Some(dir.path())), "logged in (unofficial)");
     }
 

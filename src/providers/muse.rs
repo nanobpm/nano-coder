@@ -464,11 +464,7 @@ async fn refresh_grant(http: &reqwest::Client, endpoints: &Endpoints, grant: &Oa
     let response = with_client_headers(http.post(&endpoints.token), &Default::default())
         .header("Accept", "application/json")
         .header("x-api-version", MUSE_API_VERSION)
-        .form(&[
-            ("client_id", client_id().as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-        ])
+        .form(&[("client_id", client_id().as_str()), ("grant_type", "refresh_token"), ("refresh_token", refresh_token)])
         .send()
         .await
         .ok()?;
@@ -873,9 +869,7 @@ fn effort_levels(row: &Value) -> Option<Vec<String>> {
     let levels: Vec<String> = raw
         .iter()
         .filter_map(|v| {
-            v.as_str().or_else(|| {
-                ["tier", "effort"].iter().find_map(|k| v.get(*k).and_then(Value::as_str))
-            })
+            v.as_str().or_else(|| ["tier", "effort"].iter().find_map(|k| v.get(*k).and_then(Value::as_str)))
         })
         .map(|level| match level.trim().to_ascii_lowercase().as_str() {
             "none" => "off".to_string(),
@@ -918,7 +912,7 @@ impl LLMClient for MuseClient {
                 .await;
             match result {
                 Ok(value) => {
-                    return openai_responses::parse_response(&value, self.transport.provider().replay_reasoning)
+                    return openai_responses::parse_response(&value, self.transport.provider().replay_reasoning);
                 }
                 // The key was revoked or expired early: mint once more, then fail.
                 Err(e) if !force_refresh && is_unauthorized(&e) => force_refresh = true,
@@ -1120,7 +1114,11 @@ mod tests {
     /// A non-expiring OAuth grant for tests: no refresh token, no expiry, so
     /// `session_key` mints with it directly and never attempts a refresh.
     fn grant(token: &str) -> Arc<tokio::sync::Mutex<OauthGrant>> {
-        Arc::new(tokio::sync::Mutex::new(OauthGrant { access_token: token.to_string(), refresh_token: None, expires_at: None }))
+        Arc::new(tokio::sync::Mutex::new(OauthGrant {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: None,
+        }))
     }
 
     fn mint_body(base: &str) -> String {
@@ -1346,7 +1344,8 @@ mod tests {
         let rotated = json!({ "access_token": "fresh-tok", "expires_in": 3600 });
         let (auth_srv, _auth_log) = test_server::serve(vec![(200, "", rotated.to_string())]).await;
         let (mint_srv, mint_log) =
-            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))]).await;
+            test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
+                .await;
         let endpoints = |token: &str| Endpoints {
             token: format!("{token}/oidc/device/token/"),
             ..Endpoints::for_bases(token, &mint_srv)
@@ -1385,7 +1384,11 @@ mod tests {
         // Client 2 adopted the renewed grant: its mint carried the fresh access
         // token, and it never needed the (failing) refresh endpoint.
         let mint_log = mint_log.lock().unwrap();
-        assert!(mint_log[1].headers.to_lowercase().contains("authorization: bearer fresh-tok"), "{}", mint_log[1].headers);
+        assert!(
+            mint_log[1].headers.to_lowercase().contains("authorization: bearer fresh-tok"),
+            "{}",
+            mint_log[1].headers
+        );
         assert!(dead_log.lock().unwrap().is_empty(), "client 2 must not refresh with the invalidated token");
     }
 
@@ -1483,7 +1486,8 @@ mod tests {
 
     #[tokio::test]
     async fn remints_once_after_a_401() {
-        let ok = r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"status":"completed"}"#;
+        let ok =
+            r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"status":"completed"}"#;
         let (mint_srv, mint_log) =
             test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
                 .await;
@@ -1523,8 +1527,7 @@ mod tests {
         // default API base rather than failing the login.
         let endpoints = Endpoints::for_bases("http://unused", "http://unused");
         let http = reqwest::Client::new();
-        let (mint_srv, _) =
-            test_server::serve(vec![(200, "", json!({ "api_key": "minted-key" }).to_string())]).await;
+        let (mint_srv, _) = test_server::serve(vec![(200, "", json!({ "api_key": "minted-key" }).to_string())]).await;
         let endpoints = Endpoints { mint: format!("{mint_srv}/muse-code/key"), ..endpoints };
         let minted = mint(&http, &endpoints, "oauth-tok", false).await.unwrap();
         assert_eq!(minted.api_key, "minted-key");
@@ -1606,14 +1609,9 @@ mod tests {
         // environment so the catalog request authenticates via the injected
         // OAuth grant (minting a key) rather than a direct key.
         provider.api_key = None;
-        let client = MuseClient::with_endpoints(
-            provider,
-            Some(grant("oauth-tok")),
-            endpoints(&mint_srv, &catalog),
-            None,
-            false,
-        )
-        .unwrap();
+        let client =
+            MuseClient::with_endpoints(provider, Some(grant("oauth-tok")), endpoints(&mint_srv, &catalog), None, false)
+                .unwrap();
         client.list_models().await.unwrap();
         let sent = catalog_log.lock().unwrap()[0].headers.to_lowercase();
         assert!(sent.contains("user-agent: custom-agent/9"), "{sent}");
@@ -1638,11 +1636,8 @@ mod tests {
         // ApiError(401) so the one-time remint runs, not swallowed as a parse
         // error that aborts --list-models.
         let body = json!({ "data": [{ "model_id": "muse-spark-1.3" }] }).to_string();
-        let (catalog, catalog_log) = test_server::serve(vec![
-            (401, "", "Unauthorized".to_string()),
-            (200, "", body),
-        ])
-        .await;
+        let (catalog, catalog_log) =
+            test_server::serve(vec![(401, "", "Unauthorized".to_string()), (200, "", body)]).await;
         let (mint_srv, mint_log) =
             test_server::serve(vec![(200, "", mint_body("http://unused")), (200, "", mint_body("http://unused"))])
                 .await;
@@ -1729,7 +1724,8 @@ mod tests {
         let http = reqwest::Client::new();
         for (onboard, want) in [(true, "true"), (false, "false")] {
             let (mint_srv, log) =
-                test_server::serve(vec![(200, "", json!({ "api_key": "k", "base_url": "http://x" }).to_string())]).await;
+                test_server::serve(vec![(200, "", json!({ "api_key": "k", "base_url": "http://x" }).to_string())])
+                    .await;
             let endpoints = Endpoints {
                 mint: format!("{mint_srv}/muse-code/key"),
                 ..Endpoints::for_bases("http://unused", "http://unused")
@@ -1778,7 +1774,10 @@ mod tests {
         assert!(muse_vision(&json!({ "model_id": "muse-spark-1.3" })).is_some());
         assert!(muse_vision(&json!({ "model_id": "muse-image-1.0", "supports_image_generation": true })).is_none());
         assert!(muse_vision(&json!({ "model_id": "muse-internal-x", "visibility": "hidden" })).is_none());
-        assert!(muse_vision(&json!({ "model_id": "muse-internal-y", "metadata": { "muse-code": { "is_hidden": true } } })).is_none());
+        assert!(
+            muse_vision(&json!({ "model_id": "muse-internal-y", "metadata": { "muse-code": { "is_hidden": true } } }))
+                .is_none()
+        );
     }
 
     /// A stale grant with a refresh token: expired `expires_at`, so `session_key`
@@ -1798,12 +1797,17 @@ mod tests {
         let refreshed = json!({ "access_token": "fresh-tok", "refresh_token": "refresh-tok-2", "expires_in": 3600 });
         let (auth_srv, auth_log) = test_server::serve(vec![(200, "", refreshed.to_string())]).await;
         let (mint_srv, mint_log) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
-        let endpoints = Endpoints {
-            token: format!("{auth_srv}/oidc/device/token/"),
-            ..Endpoints::for_bases(&auth_srv, &mint_srv)
-        };
+        let endpoints =
+            Endpoints { token: format!("{auth_srv}/oidc/device/token/"), ..Endpoints::for_bases(&auth_srv, &mint_srv) };
         let provider = client_model("http://unused", "muse-spark-1.3");
-        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(stale_grant()), endpoints, None, false).unwrap();
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some(stale_grant()),
+            endpoints,
+            None,
+            false,
+        )
+        .unwrap();
         let session = client.session_key(false).await.unwrap();
         assert_eq!(session.api_key, "minted-key");
         // The refresh hit the token endpoint (the captured `body` is not parsed
@@ -1812,7 +1816,11 @@ mod tests {
         assert_eq!(auth_log[0].path, "/oidc/device/token/");
         // ...and the mint used the refreshed access token.
         let mint_log = mint_log.lock().unwrap();
-        assert!(mint_log[0].headers.to_lowercase().contains("authorization: bearer fresh-tok"), "{}", mint_log[0].headers);
+        assert!(
+            mint_log[0].headers.to_lowercase().contains("authorization: bearer fresh-tok"),
+            "{}",
+            mint_log[0].headers
+        );
     }
 
     #[tokio::test]
@@ -1825,15 +1833,18 @@ mod tests {
         let refreshed = json!({ "access_token": "fresh-tok", "refresh_token": "refresh-tok-2", "expires_in": 3600 });
         let (auth_srv, _) = test_server::serve(vec![(200, "", refreshed.to_string())]).await;
         let (mint_srv, _) = test_server::serve(vec![(200, "", mint_body("http://unused"))]).await;
-        let endpoints = Endpoints {
-            token: format!("{auth_srv}/oidc/device/token/"),
-            ..Endpoints::for_bases(&auth_srv, &mint_srv)
-        };
+        let endpoints =
+            Endpoints { token: format!("{auth_srv}/oidc/device/token/"), ..Endpoints::for_bases(&auth_srv, &mint_srv) };
         let provider = client_model("http://unused", "muse-spark-1.3");
         let grant = stale_grant();
-        let client =
-            MuseClient::with_endpoints(provider.transport.provider().clone(), Some(grant.clone()), endpoints, None, false)
-                .unwrap();
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some(grant.clone()),
+            endpoints,
+            None,
+            false,
+        )
+        .unwrap();
         client.session_key(false).await.unwrap();
         // The refresh happened in memory...
         assert_eq!(grant.lock().await.access_token, "fresh-tok");
@@ -1853,7 +1864,14 @@ mod tests {
             ..Endpoints::for_bases("http://127.0.0.1:1", &mint_srv)
         };
         let provider = client_model("http://unused", "muse-spark-1.3");
-        let client = MuseClient::with_endpoints(provider.transport.provider().clone(), Some(grant("oauth-tok")), endpoints, None, false).unwrap();
+        let client = MuseClient::with_endpoints(
+            provider.transport.provider().clone(),
+            Some(grant("oauth-tok")),
+            endpoints,
+            None,
+            false,
+        )
+        .unwrap();
         let session = client.session_key(false).await.unwrap();
         assert_eq!(session.api_key, "minted-key");
         assert!(mint_log.lock().unwrap()[0].headers.to_lowercase().contains("authorization: bearer oauth-tok"));
