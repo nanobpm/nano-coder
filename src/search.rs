@@ -22,7 +22,7 @@
 //!   capped, with an explicit truncation note rather than silent loss.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -502,7 +502,24 @@ fn load_gitignore(dir: &Path, rel_dir: &Path, cwd: &Path, policy: &Policy) -> Ve
     if policy.read_denied(&path, cwd) {
         return Vec::new();
     }
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    // Bound the read so a pathological `.gitignore` cannot exhaust memory
+    // before any result limit applies. grep's 16 MiB per-file guard covers
+    // searched content, not this traversal step, so a large regular or sparse
+    // ignore file would otherwise be slurped whole even for `glob` with
+    // `limit: 1`. Skip files the stat already reports as oversized, and cap the
+    // actual read too so growth between the stat and the open cannot bypass the
+    // check.
+    if meta.len() > MAX_FILE_BYTES {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(&path) else { return Vec::new() };
+    let mut text = String::new();
+    if file.take(MAX_FILE_BYTES + 1).read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Vec::new();
+    }
     text.lines().filter_map(|line| parse_ignore_line(line, rel_dir)).collect()
 }
 
@@ -796,6 +813,22 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(grep_out, "src/src/inner.rs", "grep include filter over-matched: {grep_out}");
+    }
+
+    #[test]
+    fn oversized_gitignore_is_skipped() {
+        // A pathological `.gitignore` (larger than the per-file byte cap) must
+        // not be slurped into memory; it is skipped entirely, so its rules do
+        // not apply and matching files stay visible.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut rules = String::from("*.rs\n");
+        rules.push_str(&"#".repeat((MAX_FILE_BYTES as usize) + 1024));
+        std::fs::write(root.join(".gitignore"), rules).unwrap();
+        std::fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let out =
+            text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
+        assert_eq!(out, "a.rs", "oversized .gitignore was honoured: {out}");
     }
 
     #[cfg(unix)]

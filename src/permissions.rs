@@ -292,10 +292,18 @@ impl Policy {
     }
 
     fn read_deny_rule(&self, path: &Path, cwd: &Path) -> Option<&Rule> {
+        // Both search tools call this for *every* discovered entry, so skip the
+        // filesystem work when nothing can match: with no applicable Read-deny
+        // rule there is nothing to check, yet `resolve_symlinks` below would
+        // still canonicalize each path against the filesystem (the default
+        // policy has an empty deny list). Bail out before joining, normalizing
+        // or resolving when no Read-deny path rule exists.
+        let read_rules = || self.deny.iter().filter(|rule| rule.subject == Subject::Path && rule.applies_to("read_file"));
+        read_rules().next()?;
         let joined = cwd.join(path);
         let absolute = normalize(&joined);
         let resolved = resolve_symlinks(&joined);
-        self.deny.iter().filter(|rule| rule.subject == Subject::Path && rule.applies_to("read_file")).find(|rule| {
+        read_rules().find(|rule| {
             absolute.ancestors().any(|candidate| path_rule_matches(rule, candidate, cwd))
                 || resolved.ancestors().any(|candidate| path_rule_matches(rule, candidate, cwd))
         })
@@ -2804,6 +2812,18 @@ mod tests {
         let p = policy(&[], &["Grep"]);
         assert!(p.check_in("grep", &json!({"pattern": "x"}), cwd).is_err());
         assert!(p.check_in("glob", &json!({"pattern": "*"}), cwd).is_ok());
+    }
+
+    #[test]
+    fn read_denied_is_false_without_read_deny_rules() {
+        // With no Read-deny path rule, every discovered entry short-circuits to
+        // `false` without touching the filesystem (the hot path for the default
+        // policy that both search tools run per entry). A non-Read path rule
+        // must not pull the check back onto the filesystem-resolving path.
+        let cwd = Path::new("/work/project");
+        assert!(!Policy::default().read_denied(Path::new("secrets/api.key"), cwd));
+        let p = policy(&[], &["Write(**/secrets)"]);
+        assert!(!p.read_denied(Path::new("secrets/api.key"), cwd));
     }
 
     #[test]
