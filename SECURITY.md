@@ -21,10 +21,21 @@ maintenance cost, and the encodings that dodge the parser are exactly the
 effects the OS sandbox exists to contain. We therefore treat this layer as a
 **best-effort, high-signal advisory** and do **not** try to make it complete.
 
-The guard does fail **closed** on the one bounded case it can recognise as
+The guard does fail **closed** on bounded cases it can recognise as
 uninspectable: a command whose body is computed at run time and cannot be parsed
 at all (e.g. `bash -c "$CMD"`). That is a genuine "cannot inspect" signal, not a
 gap in an option grammar.
+
+Shell loops are classified by **effect** rather than rejected merely because a
+loop variable's values are unknown. A `for`/`select`/`while`/`until` loop may
+run when every condition and body command is a known read-only utility or
+builtin, the program is not computed at run time or supplied to an interpreter
+or shell, and the loop has no file-writing redirection (fd duplication and safe
+sinks such as `/dev/null` aside). A destructive, dynamic, interpreter-running,
+or otherwise unclassified loop body still fails closed, with the error naming
+the offending command. This widens the accepted syntax only for provably
+read-only bodies; it does not weaken the destructive-command rules or make the
+static guard a containment boundary.
 
 #### Known, accepted static-bypass classes
 

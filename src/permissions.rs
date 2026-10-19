@@ -636,9 +636,7 @@ fn contains_git_dir(root: &Path) -> bool {
 
 fn expand_all(parsed: &[Simple]) -> Result<Vec<Simple>, String> {
     let mut out = Vec::new();
-    for simple in parsed {
-        expand(simple, 0, &mut out)?;
-    }
+    expand_sequence(parsed, 0, &mut out)?;
     Ok(out)
 }
 
@@ -646,10 +644,8 @@ fn parse_inner(script: &str, depth: usize, out: &mut Vec<Simple>) -> Result<(), 
     if depth >= MAX_EXPAND_DEPTH {
         return Err("commands nest too deeply".into());
     }
-    for simple in shell::parse_nested(script, depth)? {
-        expand(&simple, depth + 1, out)?;
-    }
-    Ok(())
+    let parsed = shell::parse_nested(script, depth)?;
+    expand_sequence(&parsed, depth + 1, out)
 }
 
 /// Text of a script argument (`bash -c SCRIPT`, `eval ...`), or an error when
@@ -662,6 +658,330 @@ fn script_text(words: &[Word]) -> Result<String, String> {
         return Err(format!("the script `{text}` is computed at run time"));
     }
     Ok(text)
+}
+
+struct LoopFrame {
+    kind: String,
+    in_body: bool,
+}
+
+/// Expand a parsed command sequence, classifying shell loops by effect.
+///
+/// The shell parser represents a loop as independent simple commands: the
+/// header/condition, each body command, and `done` are separate `Simple`s.
+/// Outside a loop this sequence expands exactly as before. Once a
+/// `for`/`select`/`while`/`until` opens, every condition and body command
+/// until the matching `done` must be provably read-only. The loop variable's
+/// values are deliberately not modeled; instead the commands it can flow to
+/// are restricted so no binding can turn a recognized destructive operation
+/// into an invisible one.
+fn expand_sequence(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
+    let mut loops: Vec<LoopFrame> = Vec::new();
+    for simple in parsed {
+        let offset = loop_command_offset(&simple.words);
+        let head = simple.words.get(offset).filter(|word| is_loop_keyword(word)).map(|word| word.text.as_str());
+        let starts_loop = matches!(head, Some("for" | "select" | "while" | "until"));
+        let closes_loop = head == Some("done") && !loops.is_empty();
+        if loops.is_empty() && !starts_loop {
+            expand(simple, depth, out)?;
+            continue;
+        }
+
+        let saw_do = simple.words[..offset].iter().any(|word| word.text == "do");
+        if saw_do && let Some(frame) = loops.last_mut() {
+            frame.in_body = true;
+        }
+
+        if starts_loop {
+            let kind = head.unwrap_or_default().to_string();
+            let phase = if matches!(kind.as_str(), "while" | "until") { "condition" } else { "header" };
+            check_loop_side_effects(simple, &kind, phase)?;
+            if matches!(kind.as_str(), "for" | "select") {
+                validate_loop_header(simple, offset, &kind)?;
+            }
+            loops.push(LoopFrame { kind: kind.clone(), in_body: false });
+            if matches!(kind.as_str(), "while" | "until") && offset + 1 < simple.words.len() {
+                let condition = Simple { words: simple.words[offset + 1..].to_vec(), ..simple.clone() };
+                check_readonly_loop_command(&condition, &kind, "condition")?;
+                expand(&condition, depth, out)?;
+            }
+            continue;
+        }
+
+        let Some(frame) = loops.last() else {
+            expand(simple, depth, out)?;
+            continue;
+        };
+        let kind = frame.kind.clone();
+        if closes_loop {
+            check_loop_side_effects(simple, &kind, "closing")?;
+            if offset + 1 < simple.words.len() {
+                return Err(format!(
+                    "cannot inspect words after `done` in `{}`; rewrite the loop as explicit commands",
+                    command_text(simple)
+                ));
+            }
+            loops.pop();
+            continue;
+        }
+
+        let phase = if frame.in_body { "body" } else { "condition" };
+        let effective = Simple { words: simple.words[offset..].to_vec(), ..simple.clone() };
+        check_readonly_loop_command(&effective, &kind, phase)?;
+        expand(&effective, depth, out)?;
+    }
+    if let Some(frame) = loops.last() {
+        return Err(format!(
+            "unterminated `{}` loop cannot be inspected; rewrite the loop as explicit commands",
+            frame.kind
+        ));
+    }
+    Ok(())
+}
+
+/// Offset of the first word that is not a leading control-flow keyword. A
+/// body fragment reaches expansion as `do CMD`, `then CMD`, `if CMD`, and so
+/// on; the reserved word is syntax, not the command whose effect matters.
+fn loop_command_offset(words: &[Word]) -> usize {
+    let mut offset = 0;
+    while let Some(word) = words.get(offset) {
+        if !is_loop_keyword(word)
+            || !matches!(word.text.as_str(), "!" | "if" | "then" | "else" | "elif" | "do" | "{" | "}" | "fi" | "esac")
+        {
+            break;
+        }
+        offset += 1;
+    }
+    offset
+}
+
+fn is_loop_keyword(word: &Word) -> bool {
+    !word.dynamic && !word.quoted
+}
+
+fn validate_loop_header(simple: &Simple, offset: usize, kind: &str) -> Result<(), String> {
+    let Some(variable) = simple.words.get(offset + 1) else {
+        return Err(format!(
+            "cannot inspect `{kind}` loop header `{}`; only `for NAME [in WORDS]` loops are supported \
+             (arithmetic `for ((...))` loops are not)",
+            command_text(simple)
+        ));
+    };
+    if variable.dynamic || variable.quoted || !is_shell_identifier(&variable.text) {
+        return Err(format!(
+            "cannot inspect `{kind}` loop header `{}`; only `for NAME [in WORDS]` loops are supported \
+             (arithmetic `for ((...))` loops are not)",
+            command_text(simple)
+        ));
+    }
+    Ok(())
+}
+
+fn is_shell_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn check_loop_side_effects(cmd: &Simple, kind: &str, phase: &str) -> Result<(), String> {
+    let rendered = command_text(cmd);
+    for redirect in &cmd.redirects {
+        if is_write_redirect(&redirect.op) && !is_safe_loop_redirect(redirect) {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` writes via redirection \
+                 `{} {}`; keep the loop free of file-writing redirections or rewrite it as explicit commands",
+                redirect.op, redirect.target.text
+            ));
+        }
+    }
+    for heredoc in &cmd.heredocs {
+        if heredoc.expand && (heredoc.body.contains("$(") || heredoc.body.contains('`')) {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a command substitution \
+                 in an expanding here-document; move that work out of the loop or rewrite it as explicit commands"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_loop_redirect(redirect: &crate::shell::Redirect) -> bool {
+    if redirect.target.dynamic {
+        return false;
+    }
+    let target = redirect.target.text.as_str();
+    SAFE_DEVICES.contains(&target)
+        || (redirect.op == ">&"
+            && (target == "-" || (!target.is_empty() && target.chars().all(|c| c.is_ascii_digit()))))
+}
+
+/// Commands whose ordinary option surface produces output only on stdout /
+/// stderr and does not create, modify, delete, or execute files. This is a
+/// deliberately small first set: an unrecognized command stays fail-closed
+/// inside a loop even though the ordinary catastrophic-damage guard would
+/// have allowed it as an explicit command.
+const READONLY_LOOP_COMMANDS: &[&str] = &[
+    "echo", "printf", "grep", "egrep", "fgrep", "wc", "cat", "head", "tail", "ls", "stat", "file", "basename",
+    "dirname", "read", "test", "[", "[[", "true", "false", ":", "pwd", "break", "continue", "sort",
+];
+
+/// Assignments that can alter program lookup or inject code into one of the
+/// otherwise read-only utilities above.
+const DANGEROUS_LOOP_ASSIGNMENTS: &[&str] = &[
+    "PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "GREP_OPTIONS",
+];
+
+const LOOP_EXEC_COMMANDS: &[&str] =
+    &["bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "eval", "exec", "source", ".", "ssh", "xargs"];
+
+fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<(), String> {
+    check_loop_side_effects(cmd, kind, phase)?;
+    let rendered = command_text(cmd);
+    let mut i = 0;
+    while let Some(word) = cmd.words.get(i) {
+        if !ASSIGNMENT.is_match(&word.text) {
+            break;
+        }
+        let name = word.text.split('=').next().unwrap_or_default().trim_end_matches('+');
+        let name = name.split('[').next().unwrap_or(name);
+        if DANGEROUS_LOOP_ASSIGNMENTS.contains(&name) {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns `{name}`, which can \
+                 change what the loop's commands run; rewrite it as explicit commands"
+            ));
+        }
+        i += 1;
+    }
+    let Some(first) = cmd.words.get(i) else { return Ok(()) };
+    let mut program_index = i;
+    match first.text.as_str() {
+        "builtin" => program_index = i + 1,
+        "command" => {
+            let mut j = i + 1;
+            while cmd.words.get(j).is_some_and(|word| word.text == "-p") {
+                j += 1;
+            }
+            if cmd.words.get(j).is_some_and(|word| matches!(word.text.as_str(), "-v" | "-V")) {
+                return Ok(());
+            }
+            if cmd.words.get(j).is_some_and(|word| word.text == "--") {
+                j += 1;
+            } else if cmd.words.get(j).is_some_and(|word| word.text.starts_with('-') && word.text.len() > 1) {
+                return Err(format!(
+                    "cannot allow `{kind}` loop: {phase} command `{rendered}` uses unsupported \
+                     `command` options; rewrite it as explicit commands"
+                ));
+            }
+            program_index = j;
+        }
+        _ => {}
+    }
+    let Some(program_word) = cmd.words.get(program_index) else {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` does not name a command to inspect"
+        ));
+    };
+    if program_word.dynamic {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` runs a command computed at run time; \
+             rewrite it as explicit commands"
+        ));
+    }
+    let program_text = program_word.text.as_str();
+    let program = basename(program_text);
+    if program_text.contains('/') {
+        let parent = program_text.rsplit_once('/').map(|(parent, _)| parent).unwrap_or_default();
+        if !matches!(parent, "/bin" | "/usr/bin") {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` runs path-qualified program \
+                 `{program_text}`, which cannot be verified as a read-only utility"
+            ));
+        }
+    }
+    if LOOP_EXEC_COMMANDS.contains(&program) || INTERPRETERS.iter().any(|prefix| program.starts_with(prefix)) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` runs an interpreter, shell, \
+             or other dynamic command; rewrite it as explicit commands"
+        ));
+    }
+    if !READONLY_LOOP_COMMANDS.contains(&program) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` is not a known read-only command; \
+             keep the loop body to read-only commands like `echo`, `grep`, `cat` and `wc`, or rewrite it \
+             as explicit commands"
+        ));
+    }
+    let args = &cmd.words[program_index + 1..];
+    match program {
+        // A computed word can arrive in option position. `sort` and `file`
+        // have options that write a file or run a helper program, so a
+        // dynamic operand is acceptable only after `--`.
+        "sort" => {
+            check_loop_dynamic_option_position(args, cmd, kind, phase, program)?;
+            if has_short_option(args, 'o')
+                || has_long_option(args, "--output")
+                || has_long_option(args, "--compress-program")
+            {
+                return Err(format!(
+                    "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `sort` option \
+                     that writes a file or runs another program"
+                ));
+            }
+        }
+        "file" => {
+            check_loop_dynamic_option_position(args, cmd, kind, phase, program)?;
+            if has_short_option(args, 'C') || has_long_option(args, "--compile") {
+                return Err(format!(
+                    "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `file` option \
+                     that writes a compiled magic file"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_loop_dynamic_option_position(
+    args: &[Word],
+    cmd: &Simple,
+    kind: &str,
+    phase: &str,
+    program: &str,
+) -> Result<(), String> {
+    for arg in args {
+        if arg.text == "--" {
+            break;
+        }
+        if arg.dynamic {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{}` passes a computed argument to \
+                 `{program}` where it could be read as an option; put `--` before it or rewrite the loop \
+                 as explicit commands",
+                command_text(cmd)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn has_short_option(args: &[Word], letter: char) -> bool {
+    args.iter().take_while(|arg| arg.text != "--").any(|arg| {
+        arg.text.starts_with('-') && !arg.text.starts_with("--") && arg.text.len() > 1 && arg.text[1..].contains(letter)
+    })
+}
+
+fn has_long_option(args: &[Word], name: &str) -> bool {
+    args.iter()
+        .take_while(|arg| arg.text != "--")
+        .any(|arg| arg.text == name || arg.text.starts_with(&format!("{name}=")))
 }
 
 /// The inline script an interpreter runs via `-c`/`-e`/`--eval` (attached or
@@ -900,11 +1220,11 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
         match basename(text) {
             "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "fi" | "done" | "esac"
             | "[[" | "coproc" | "nohup" | "builtin" | "unbuffer" | "busybox" => i += 1,
-            // A `for`/`select` loop binds a variable to values we cannot resolve
-            // statically. Its body is parsed as independent simple commands, so
-            // `for x in /; do rm -rf "$x"; done` would inspect `rm -rf "$x"` with
-            // `$x` unset — treated as empty and silently allowed. Fail closed:
-            // refuse to model the loop rather than under-approximate its variable.
+            // Ordinary loop sequences are classified by `expand_sequence`
+            // before this function sees them. A `for`/`select` reaching this
+            // single-command fallback has no surrounding body available to
+            // classify, so still fail closed rather than inspect later body
+            // commands with its variable under-approximated.
             "for" | "select" => {
                 return Err(format!(
                     "cannot analyze `{text}` loop variables safely; rewrite the loop as explicit commands"
@@ -2097,6 +2417,46 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_bodies_are_allowed_by_effect() {
+        // Regression from #119: counting tests per file is a read-only
+        // inspection even though the value bound to `f` is not tracked.
+        allowed(
+            "for f in src/*.rs src/providers/*.rs; do echo \"$(grep -c '#\\[test\\]' $f) $f\"; done | sort -rn | head -20",
+        );
+        allowed("while IFS= read -r line; do printf '%s\\n' \"$line\"; done < input.txt");
+        allowed("until grep -q ready status.txt; do cat status.txt; done");
+        allowed("for f in src/*.rs; do if grep -q TODO \"$f\"; then echo \"$f\"; fi; done");
+        allowed("for f in src/*.rs; do for word in one two; do echo \"$word $f\"; done; done");
+        allowed("for f in src/*.rs; do n=$(grep -c TODO \"$f\"); echo \"$n $f\"; done");
+        allowed("for f in src/*.rs; do grep -n TODO \"$f\" 2>/dev/null; done");
+        allowed("for f in *.txt; do sort -- \"$f\"; done");
+        allowed("bash -c 'for f in *.txt; do cat \"$f\"; done'");
+
+        // A destructive, executable, or merely unclassified body remains
+        // fail-closed, and the error identifies the command responsible.
+        let err = blocked("for f in *; do rm -rf \"$f\"; done");
+        assert!(err.contains("body command `rm -rf $f`"), "{err}");
+        let err = blocked("for f in *.sh; do bash \"$f\"; done");
+        assert!(err.contains("body command `bash $f`") && err.contains("interpreter"), "{err}");
+        assert!(blocked("for f in *.py; do python3 \"$f\"; done").contains("interpreter"));
+        assert!(blocked("for f in *.sh; do source \"$f\"; done").contains("interpreter"));
+        let err = blocked("for f in *; do echo x > \"$f\"; done");
+        assert!(err.contains("body command `echo x`") && err.contains("`> $f`"), "{err}");
+        let err = blocked("while read l; do eval \"$l\"; done < f");
+        assert!(err.contains("body command `eval $l`") && err.contains("dynamic command"), "{err}");
+        let err = blocked("for c in id whoami; do $c; done");
+        assert!(err.contains("body command `$c`") && err.contains("computed at run time"), "{err}");
+        let err = blocked("for f in *; do echo \"$f\"; done > out.txt");
+        assert!(err.contains("closing command `done`") && err.contains("`> out.txt`"), "{err}");
+        assert!(blocked("for f in *; do touch \"$f\"; done").contains("not a known read-only command"));
+        assert!(blocked("for f in *; do frobnicate \"$f\"; done").contains("not a known read-only command"));
+        assert!(blocked("for f in *.txt; do sort \"$f\"; done").contains("put `--` before it"));
+        assert!(blocked("for f in *.txt; do sort -o out.txt input.txt; done").contains("writes a file"));
+        assert!(blocked("for f in *; do file -C; done").contains("compiled magic file"));
+        assert!(blocked("for f in *; do PATH=/tmp/evil grep x \"$f\"; done").contains("assigns `PATH`"));
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",
@@ -2587,9 +2947,9 @@ mod tests {
 
     #[test]
     fn round12_guard_hardening() {
-        // #2 `for`/`select` loops bind a variable we cannot resolve statically, so
-        // the guard fails closed instead of inspecting the body with it unset
-        // (which would treat `$x` as empty and let `rm -rf "$x"` through).
+        // #2 Loops may now run when their bodies are provably read-only, but a
+        // destructive body must still fail closed: inspecting `rm -rf "$x"`
+        // with `$x` under-approximated would silently let it through.
         assert!(blocked("for x in /; do rm -rf \"$x\"; done").contains("loop"));
         assert!(blocked("select x in a b; do rm -rf \"$x\"; done").contains("loop"));
 
