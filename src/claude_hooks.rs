@@ -1375,6 +1375,25 @@ mod tests {
     }
 
     #[test]
+    fn grep_and_glob_hooks_match_claude_names() {
+        // A PreToolUse hook keyed on Claude's `Grep` name must see (and can
+        // block) nano's `grep` tool, and must not fire for other tools.
+        let dir = tempfile::tempdir().unwrap();
+        let mut hook = command_hook(Event::PreToolUse, "exit 2");
+        hook.matcher = Some("Grep".to_string());
+        let manager = manager_with(vec![hook], dir.path());
+
+        let blocked = manager.run_pre_tool_use("grep", &json!({"pattern": "needle"}), "t1");
+        assert!(blocked.denies(), "Grep-matcher hook blocks grep");
+
+        let untouched = manager.run_pre_tool_use("read_file", &json!({"path": "a.txt"}), "t2");
+        assert!(!untouched.denies(), "Grep-matcher hook ignores read_file");
+
+        assert_eq!(claude_tool_name("grep"), "Grep");
+        assert_eq!(claude_tool_name("glob"), "Glob");
+    }
+
+    #[test]
     fn reads_tool_input_command_like_a_claude_script() {
         // A real Claude-style hook: jq reads .tool_input.command, exits 2 to block.
         let dir = tempfile::tempdir().unwrap();

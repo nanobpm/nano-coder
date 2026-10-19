@@ -78,7 +78,14 @@ impl Rule {
         }
         let (tools, subject) = match name.to_ascii_lowercase().as_str() {
             "bash" | "shell" => (vec!["bash".to_string()], Subject::Command),
-            "read" | "read_file" => (vec!["read_file".to_string()], Subject::Path),
+            "read" | "read_file" => {
+                // `Read(...)` governs every tool that reveals file contents or
+                // names from disk, so a rule like `Read(**/.env)` keeps those
+                // files out of grep/glob results as well as `read_file`.
+                (vec!["read_file".to_string(), "grep".to_string(), "glob".to_string()], Subject::Path)
+            }
+            "grep" => (vec!["grep".to_string()], Subject::Arguments),
+            "glob" => (vec!["glob".to_string()], Subject::Arguments),
             "edit" | "write" | "edit_file" | "write_file" => {
                 (vec!["write_file".to_string(), "edit_file".to_string()], Subject::Path)
             }
@@ -245,6 +252,26 @@ impl Policy {
                 }
                 Ok(())
             }
+            "grep" | "glob" => {
+                // `Read(...)` deny rules keyed on the search root block the
+                // call outright; rules covering individual files *inside* the
+                // root are enforced per discovered file by the search tools
+                // (see `read_denied`), so a project-wide grep still works
+                // with its `.env` filtered out.
+                let root = args.get("path").and_then(Value::as_str).unwrap_or(".");
+                if let Some(rule) = self.read_deny_rule(&expand_tilde(root), cwd) {
+                    return Err(format!("rule `{}` denies {tool} on {root}", rule.source));
+                }
+                let text = args.to_string();
+                match self
+                    .deny
+                    .iter()
+                    .find(|r| r.subject == Subject::Arguments && r.applies_to(tool) && r.matches(&text))
+                {
+                    Some(rule) => Err(format!("rule `{}` denies {tool}", rule.source)),
+                    None => Ok(()),
+                }
+            }
             _ => {
                 let text = args.to_string();
                 match self.deny.iter().find(|r| r.applies_to(tool) && r.matches(&text)) {
@@ -253,6 +280,25 @@ impl Policy {
                 }
             }
         }
+    }
+
+    /// Whether a `Read(...)` deny rule covers `path` — the path itself or
+    /// any ancestor directory, so `Read(secrets)` also withholds the files
+    /// inside `secrets/`. The search tools call this for every discovered
+    /// file, keeping denied contents and names out of their output even
+    /// when the search root itself is allowed.
+    pub(crate) fn read_denied(&self, path: &Path, cwd: &Path) -> bool {
+        self.read_deny_rule(path, cwd).is_some()
+    }
+
+    fn read_deny_rule(&self, path: &Path, cwd: &Path) -> Option<&Rule> {
+        let joined = cwd.join(path);
+        let absolute = normalize(&joined);
+        let resolved = resolve_symlinks(&joined);
+        self.deny.iter().filter(|rule| rule.subject == Subject::Path && rule.applies_to("read_file")).find(|rule| {
+            absolute.ancestors().any(|candidate| path_rule_matches(rule, candidate, cwd))
+                || resolved.ancestors().any(|candidate| path_rule_matches(rule, candidate, cwd))
+        })
     }
 
     fn check_command(&self, command: &str, cwd: &Path) -> Result<(), String> {
@@ -338,7 +384,12 @@ pub fn rule_matches(rule_src: &str, tool: &str, args: &Value) -> bool {
             }
         }
         Subject::Path => {
-            let Some(path) = args.get("path").and_then(Value::as_str) else { return false };
+            // The search tools default their root to the working directory.
+            let path = match args.get("path").and_then(Value::as_str) {
+                Some(path) => path,
+                None if matches!(tool, "grep" | "glob") => ".",
+                None => return false,
+            };
             let joined = cwd.join(expand_tilde(path));
             let absolute = normalize(&joined);
             let resolved = resolve_symlinks(&joined);
@@ -2730,6 +2781,29 @@ mod tests {
             &SandboxConfig::default(),
         );
         assert_eq!(bad.errors.len(), 1);
+    }
+
+    #[test]
+    fn read_rules_cover_grep_and_glob() {
+        let cwd = Path::new("/work/project");
+        let p = policy(&[], &["Read(**/.env)", "Read(~/.ssh/**)"]);
+        // A denied search root blocks the call outright…
+        assert!(p.check_in("grep", &json!({"pattern": "x", "path": ".env"}), cwd).is_err());
+        assert!(p.check_in("glob", &json!({"pattern": "*", "path": "~/.ssh/id_ed25519"}), cwd).is_err());
+        // …but searching a tree that merely *contains* denied files is
+        // allowed: the tools filter those files out per discovery.
+        assert!(p.check_in("grep", &json!({"pattern": "x"}), cwd).is_ok());
+        assert!(p.check_in("glob", &json!({"pattern": "*.rs", "path": "src"}), cwd).is_ok());
+        assert!(p.read_denied(Path::new("config/.env"), cwd), "discovered .env is filtered");
+        assert!(!p.read_denied(Path::new("src/main.rs"), cwd));
+        // A rule naming a directory withholds everything beneath it.
+        let p = policy(&[], &["Read(**/secrets)"]);
+        assert!(p.read_denied(Path::new("secrets/api.key"), cwd));
+        assert!(p.check_in("grep", &json!({"pattern": "x", "path": "secrets/api.key"}), cwd).is_err());
+        // Bare tool-name rules deny the whole tool, Claude-style casing included.
+        let p = policy(&[], &["Grep"]);
+        assert!(p.check_in("grep", &json!({"pattern": "x"}), cwd).is_err());
+        assert!(p.check_in("glob", &json!({"pattern": "*"}), cwd).is_ok());
     }
 
     #[test]

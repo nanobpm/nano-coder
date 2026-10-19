@@ -126,6 +126,7 @@ fn tool_kind(name: &str) -> &'static str {
     match name {
         "bash" => "execute",
         "read_file" => "read",
+        "grep" | "glob" => "search",
         "write_file" | "edit_file" => "edit",
         name if crate::plan::is_plan_tool(name) || name == crate::goal::TOOL_NAME => "think",
         _ => "other",

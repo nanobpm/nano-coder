@@ -251,7 +251,6 @@ phases). Disable them with `--no-hooks`, or granularly via the
 ## Built-in Tools
 
 - `get_time` - Get current date and time
-- `echo` - Echo back input text
 - `bash` - Run `bash -c <command>` (stdin closed, own process group). Arguments:
   `command`, optional `timeout_seconds` (default `bash_timeout_secs`, 600) and
   `max_output_length` (default 40,000, max 1,000,000 characters each for stdout and stderr).
@@ -264,6 +263,19 @@ phases). Disable them with `--no-hooks`, or granularly via the
   an unbounded post-exit reread of a multi-gigabyte capture.
 - `read_file` - Numbered lines of a text file; `path`, optional `offset` (1-based) and `limit`
   (default 2000 lines). Refuses binary files.
+- `grep` - Search file contents for a regular expression (`pattern`, optional `path` — a file
+  or directory, default the working directory —, optional `glob` include filter such as `*.rs`
+  or `src/**/*.rs`, optional `output_mode` `content` (default; `path:line:text`), `files` or
+  `count`, optional `limit`, default 250). Read-only and allowed in plan mode.
+- `glob` - List files matching a glob `pattern` (optional `path`, `limit`). A pattern without
+  `/` matches file names at any depth; with `/` it matches paths relative to the search root,
+  `*` within one directory and `**` across directories. Read-only and allowed in plan mode.
+- `grep` and `glob` respect `.gitignore` (a subset: comments, `!` negation, directory
+  patterns, anchored patterns, `*`/`?`/`**`), skip `.git`, symlinks, binary files and files
+  over 16 MiB, return results sorted by path, and say when the `limit` cut results short.
+  Files covered by a `Read(...)` deny rule never appear in their output — neither contents
+  nor names — and `Grep`/`Glob` rules can deny the tools outright (see
+  [Permissions and Sandbox](#permissions-and-sandbox)).
 - `write_file` - Create or overwrite a file (`path`, `content`), creating parent directories.
 - `edit_file` - Replace text (`path`, `old_string`, `new_string`, optional `replace_all`).
   Fails unless `old_string` matches exactly once (or `replace_all` is set). With no exact match,
@@ -309,7 +321,7 @@ wins. An allow rule approves a shell command only when *every* command in it mat
 |---|---|
 | `Bash(rm -rf *)` | a shell command; `*` matches anything, including spaces and `/` |
 | `Bash(git push:*)` | `git push` alone or with any arguments |
-| `Read(~/.ssh/**)` | `read_file` paths; `**` crosses directories, `*` does not |
+| `Read(~/.ssh/**)` | `read_file` paths and files `grep`/`glob` may reveal; `**` crosses directories, `*` does not |
 | `Edit(**/.env)` / `Write(...)` | `write_file` and `edit_file` paths (relative to the working directory, or absolute) |
 | `write_file`, `bash`, any tool name | every call to that tool |
 

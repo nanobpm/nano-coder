@@ -38,6 +38,7 @@ mod recents;
 mod reminders;
 mod resume;
 mod sandbox;
+mod search;
 mod session;
 mod session_index;
 mod settings;
@@ -63,27 +64,13 @@ fn register_builtin_tools(agent: &mut Agent) {
         ToolDefinition::new("get_time", "Get the current date and time", json!({ "type": "object", "properties": {} }));
     agent.tools().register(time_def, Box::new(|_| Ok(json!({ "time": Local::now().to_string() }))));
 
-    // echo tool
-    let echo_def = ToolDefinition::new(
-        "echo",
-        "Echo back the input text",
-        json!({
-            "type": "object",
-            "properties": {
-                "text": { "type": "string" }
-            },
-            "required": ["text"]
-        }),
-    );
-    agent.tools().register(
-        echo_def,
-        Box::new(|args| {
-            let text = args["text"].as_str().unwrap_or("");
-            Ok(json!({ "echo": text }))
-        }),
-    );
-
     files::register(agent.tools());
+
+    // Read-only workspace search. The tools filter every file they discover
+    // through the same `Read(...)` deny rules the agent's policy enforces
+    // per call, so a search never reveals a denied file's contents or name.
+    let search_policy = permissions::Policy::new(&agent.config().permissions, &agent.config().sandbox);
+    search::register(agent.tools(), search_policy);
 
     // bash tool
     let bash_config = bash::BashConfig {
@@ -2729,6 +2716,17 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn builtin_tools_include_search_and_no_echo() {
+        let mut agent =
+            Agent::new(Box::new(providers::mock::MockLLMClient::new("mock", "mock")), crate::config::Config::default());
+        register_builtin_tools(&mut agent);
+        let names = agent.tools().list_tools();
+        assert!(names.iter().any(|n| n == "grep"), "{names:?}");
+        assert!(names.iter().any(|n| n == "glob"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "echo"), "vestigial echo tool is gone: {names:?}");
+    }
 
     #[test]
     fn double_escape_needs_two_presses_within_the_window() {

@@ -10975,14 +10975,28 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn plan_mode_keeps_read_only_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut agent, _) = agent(vec![tool_call("e1"), text("done")], dir.path());
+        let call = LLMResponse {
+            tool_calls: vec![ToolCall {
+                id: "g1".into(),
+                name: "grep".into(),
+                arguments: json!({"pattern": "pong"}),
+                item_id: None,
+                malformed_arguments: None,
+            }],
+            ..Default::default()
+        };
+        let (mut agent, _) = agent(vec![call, text("done")], dir.path());
+        agent.tools().register(
+            ToolDefinition::new("grep", "search", json!({"type": "object"})),
+            Box::new(|_| Ok(json!("a.txt:1:pong"))),
+        );
         agent.new_session().unwrap();
         agent.set_mode(crate::mode::AgentMode::Plan);
-        let outcome = agent.run_turn(None, "echo something").await.unwrap();
+        let outcome = agent.run_turn(None, "search for pong").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         let conversation = agent.conversation();
-        let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("echo ran");
-        assert!(!tool_result.is_error, "echo is read-only and allowed in plan mode");
+        let tool_result = conversation.iter().find(|m| m.role == Role::Tool).expect("grep ran");
+        assert!(!tool_result.is_error, "grep is read-only and allowed in plan mode");
     }
 
     #[tokio::test(flavor = "multi_thread")]

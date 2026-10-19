@@ -72,8 +72,9 @@ impl std::str::FromStr for AgentMode {
 /// other mutating tool — is gated.
 const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "read_file",
+    "grep",
+    "glob",
     "get_time",
-    "echo",
     "plan_add",
     "plan_update",
     "plan_show",
@@ -108,6 +109,16 @@ mod tests {
         assert_eq!(AgentMode::Normal.next(), AgentMode::Plan);
         assert_eq!(AgentMode::Plan.next(), AgentMode::Auto);
         assert_eq!(AgentMode::Auto.next(), AgentMode::Normal);
+    }
+
+    #[test]
+    fn plan_allows_read_only_search_but_not_writes() {
+        assert!(plan_allows("grep"));
+        assert!(plan_allows("glob"));
+        assert!(plan_allows("read_file"));
+        assert!(!plan_allows("bash"));
+        assert!(!plan_allows("write_file"));
+        assert!(!plan_allows("edit_file"));
     }
 
     #[test]
