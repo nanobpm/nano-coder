@@ -298,7 +298,8 @@ impl Policy {
         // still canonicalize each path against the filesystem (the default
         // policy has an empty deny list). Bail out before joining, normalizing
         // or resolving when no Read-deny path rule exists.
-        let read_rules = || self.deny.iter().filter(|rule| rule.subject == Subject::Path && rule.applies_to("read_file"));
+        let read_rules =
+            || self.deny.iter().filter(|rule| rule.subject == Subject::Path && rule.applies_to("read_file"));
         read_rules().next()?;
         let joined = cwd.join(path);
         let absolute = normalize(&joined);

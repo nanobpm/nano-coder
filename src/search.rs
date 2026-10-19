@@ -393,12 +393,7 @@ fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFil
             return Ok(Vec::new());
         }
         let rel = root_path.file_name().map(PathBuf::from).unwrap_or_else(|| root_path.to_path_buf());
-        return Ok(vec![FoundFile {
-            fs_path: fs_root,
-            display: root.to_string(),
-            rel,
-            explicit_file: true,
-        }]);
+        return Ok(vec![FoundFile { fs_path: fs_root, display: root.to_string(), rel, explicit_file: true }]);
     }
     if !metadata.is_dir() {
         bail!("search path {root} is neither a file nor a directory");
@@ -542,10 +537,7 @@ fn load_gitignore(dir: &Path, rel_dir: &Path, cwd: &Path, policy: &Policy) -> Ve
     // rules stop applying (fail-open toward visibility, like an unreadable or
     // oversized ignore file) rather than compiling unbounded regexes before
     // any result limit applies.
-    text.lines()
-        .filter_map(|line| parse_ignore_line(line, rel_dir))
-        .take(MAX_IGNORE_RULES)
-        .collect()
+    text.lines().filter_map(|line| parse_ignore_line(line, rel_dir)).take(MAX_IGNORE_RULES).collect()
 }
 
 fn parse_ignore_line(line: &str, base: &Path) -> Option<IgnoreRule> {
@@ -830,12 +822,17 @@ mod tests {
         std::fs::create_dir_all(root.join("src/src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "x\n").unwrap();
         std::fs::write(root.join("src/src/inner.rs"), "x\n").unwrap();
-        let out = text_out(glob_in(&json!({"pattern": "src/**/*.rs", "path": "src"}), &Policy::default(), root).unwrap());
+        let out =
+            text_out(glob_in(&json!({"pattern": "src/**/*.rs", "path": "src"}), &Policy::default(), root).unwrap());
         assert_eq!(out, "src/src/inner.rs", "display-path fallback over-matched: {out}");
         // grep's include filter shares the same rule.
         let grep_out = text_out(
-            grep_in(&json!({"pattern": "x", "glob": "src/**/*.rs", "path": "src", "output_mode": "files"}), &Policy::default(), root)
-                .unwrap(),
+            grep_in(
+                &json!({"pattern": "x", "glob": "src/**/*.rs", "path": "src", "output_mode": "files"}),
+                &Policy::default(),
+                root,
+            )
+            .unwrap(),
         );
         assert_eq!(grep_out, "src/src/inner.rs", "grep include filter over-matched: {grep_out}");
     }
@@ -991,9 +988,7 @@ mod tests {
         let count =
             text_out(grep_in(&json!({"pattern": "needle", "output_mode": "count"}), &Policy::default(), root).unwrap());
         assert_eq!(count, "big.txt:2");
-        let content = text_out(
-            grep_in(&json!({"pattern": "needle", "limit": 1}), &Policy::default(), root).unwrap(),
-        );
+        let content = text_out(grep_in(&json!({"pattern": "needle", "limit": 1}), &Policy::default(), root).unwrap());
         assert!(content.starts_with("big.txt:1:needle"), "content mode wrong: {content}");
     }
 }
