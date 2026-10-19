@@ -46,6 +46,20 @@ pub struct Simple {
     pub words: Vec<Word>,
     pub redirects: Vec<Redirect>,
     pub heredocs: Vec<Heredoc>,
+    /// Set when this command was lifted out of a loop header or loop
+    /// condition's command substitution (`for f in "$(cmd)"`,
+    /// `while cmd "$(sub)"; do ...`). The parser flattens substitutions ahead
+    /// of their containing command, so such a command reaches the effect
+    /// classifier before any loop frame exists; this flag lets the classifier
+    /// still apply the loop's read-only rules to it.
+    pub loop_header_sub: bool,
+}
+
+/// `for`/`select`/`while`/`until` begin a loop whose header or condition runs
+/// on the parent shell. A command substitution in that position is subject to
+/// the loop's read-only rules even though the parser emits it first.
+fn is_loop_head_keyword(word: &Word) -> bool {
+    !word.quoted && matches!(word.text.as_str(), "for" | "select" | "while" | "until")
 }
 
 const MAX_DEPTH: usize = 16;
@@ -271,7 +285,11 @@ impl Parser {
                     if self.peek_at(1) == Some('(') {
                         // Process substitution <(...) / >(...).
                         self.pos += 2;
+                        let out_start = self.out.len();
                         self.substitution()?;
+                        if current.words.first().is_some_and(is_loop_head_keyword) {
+                            self.mark_loop_header_subs(out_start);
+                        }
                         current.words.push(Word { text: "/dev/fd/63".into(), dynamic: true, ..Default::default() });
                     } else {
                         self.redirect(&mut current, &mut pending)?;
@@ -285,7 +303,12 @@ impl Parser {
                         self.redirect(&mut current, &mut pending)?;
                         continue;
                     }
+                    let in_loop_head = current.words.first().is_some_and(is_loop_head_keyword);
+                    let out_start = self.out.len();
                     let word = self.word()?;
+                    if in_loop_head {
+                        self.mark_loop_header_subs(out_start);
+                    }
                     if current.words.is_empty() && !word.quoted {
                         match word.text.as_str() {
                             "case" => self.case_depth += 1,
@@ -329,6 +352,18 @@ impl Parser {
                 Some('\\') if self.peek_at(1) == Some('\n') => self.pos += 2,
                 _ => return,
             }
+        }
+    }
+
+    /// Flag every command emitted since `out_start` as a loop header/condition
+    /// substitution. The parser appends a substitution's inner commands to
+    /// `out` before flushing their containing command, so these are the
+    /// commands lifted out of the loop header or condition currently being
+    /// parsed; the effect classifier must hold them to the loop's read-only
+    /// rules even though no loop frame exists when it reaches them.
+    fn mark_loop_header_subs(&mut self, out_start: usize) {
+        for simple in self.out[out_start..].iter_mut() {
+            simple.loop_header_sub = true;
         }
     }
 

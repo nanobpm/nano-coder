@@ -10,7 +10,7 @@
 //! script and run it. The OS sandbox (`sandbox.rs`) and scoped credentials
 //! are the security boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -339,6 +339,7 @@ impl Policy {
                 home: dirs::home_dir(),
                 protected: &self.protected_branches,
                 assigned: assignments(&commands_with_assignments(command)),
+                loop_bound: loop_bound_vars(&commands_with_assignments(command)),
                 depth: std::cell::Cell::new(0),
             }
         });
@@ -678,6 +679,16 @@ struct LoopFrame {
 fn expand_sequence(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
     let mut loops: Vec<LoopFrame> = Vec::new();
     for simple in parsed {
+        // A command substitution lifted out of a loop header or condition
+        // (`for f in "$(printf x > out)"`, `while echo "$(touch out)"; do ...`)
+        // is emitted by the parser before its loop, so no frame exists here yet.
+        // Hold it to the loop's read-only rules regardless, then expand it so
+        // its contents still face the ordinary guard.
+        if simple.loop_header_sub {
+            check_readonly_loop_command(simple, "loop", "header or condition substitution")?;
+            expand(simple, depth, out)?;
+            continue;
+        }
         let offset = loop_command_offset(&simple.words);
         let head = simple.words.get(offset).filter(|word| is_loop_keyword(word)).map(|word| word.text.as_str());
         let starts_loop = matches!(head, Some("for" | "select" | "while" | "until"));
@@ -772,6 +783,17 @@ fn validate_loop_header(simple: &Simple, offset: usize, kind: &str) -> Result<()
             "cannot inspect `{kind}` loop header `{}`; only `for NAME [in WORDS]` loops are supported \
              (arithmetic `for ((...))` loops are not)",
             command_text(simple)
+        ));
+    }
+    // The loop variable is itself an assignment: `for PATH in /tmp/evil; do ls; done`
+    // would rebind command lookup, so reject the same names forbidden in ordinary
+    // assignment words.
+    if DANGEROUS_LOOP_ASSIGNMENTS.contains(&variable.text.as_str()) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: header `{}` binds `{}`, which can change what the loop's \
+             commands run; rewrite it as explicit commands",
+            command_text(simple),
+            variable.text
         ));
     }
     Ok(())
@@ -944,7 +966,150 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
                 ));
             }
         }
+        // `read` and `printf -v` assign shell variables without a `NAME=value`
+        // word, so the leading-assignment scan above never sees them. A loop
+        // body that rebinds `PATH` (`printf -v PATH /tmp/evil`, `read -r PATH`)
+        // can redirect later command lookup, so validate their destinations.
+        "read" => check_loop_read_destinations(args, kind, phase, &rendered)?,
+        "printf" => check_loop_printf_destination(args, kind, phase, &rendered)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// Reject a loop binding whose name can redirect command lookup or inject code,
+/// or that is computed at run time (so its true name is unknown).
+fn reject_dangerous_loop_destination(
+    name: &Word,
+    kind: &str,
+    phase: &str,
+    rendered: &str,
+    builtin: &str,
+) -> Result<(), String> {
+    if name.dynamic || name.quoted {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` writes a shell variable with \
+             `{builtin}` whose name is computed at run time; rewrite it as explicit commands"
+        ));
+    }
+    let base = name.text.split('[').next().unwrap_or(&name.text);
+    if DANGEROUS_LOOP_ASSIGNMENTS.contains(&base) {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` writes `{base}` with `{builtin}`, \
+             which can change what the loop's commands run; rewrite it as explicit commands"
+        ));
+    }
+    Ok(())
+}
+
+/// Options to `read` that consume the following word as a value. `-a NAME`
+/// also names a destination array, handled separately.
+fn read_option_takes_value(letter: char) -> bool {
+    matches!(letter, 'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u')
+}
+
+fn check_loop_read_destinations(
+    args: &[Word],
+    kind: &str,
+    phase: &str,
+    rendered: &str,
+) -> Result<(), String> {
+    let uninspectable = || {
+        format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `read` option that cannot \
+             be inspected; rewrite it as explicit commands"
+        )
+    };
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            i += 1;
+            break;
+        }
+        if !(text.starts_with('-') && text.len() > 1) {
+            break;
+        }
+        // A computed option word hides whether it writes a variable or carries one.
+        if arg.dynamic {
+            return Err(uninspectable());
+        }
+        let letters: Vec<char> = text[1..].chars().collect();
+        let mut k = 0;
+        while k < letters.len() {
+            let letter = letters[k];
+            if letter == 'a' {
+                // `-a NAME` (or clustered `-aNAME`) names a destination array.
+                if k + 1 < letters.len() {
+                    let name = Word { text: letters[k + 1..].iter().collect(), ..Word::default() };
+                    reject_dangerous_loop_destination(&name, kind, phase, rendered, "read")?;
+                } else {
+                    i += 1;
+                    match args.get(i) {
+                        Some(name) => reject_dangerous_loop_destination(name, kind, phase, rendered, "read")?,
+                        None => return Err(uninspectable()),
+                    }
+                }
+                k = letters.len();
+            } else if read_option_takes_value(letter) {
+                if k + 1 >= letters.len() {
+                    // The value is the next word; skip it.
+                    i += 1;
+                    if args.get(i).is_none() {
+                        return Err(uninspectable());
+                    }
+                }
+                k = letters.len();
+            } else if matches!(letter, 'r' | 's' | 'e') {
+                k += 1;
+            } else {
+                // An option we do not model could write a variable; fail closed.
+                return Err(uninspectable());
+            }
+        }
+        i += 1;
+    }
+    for name in &args[i.min(args.len())..] {
+        reject_dangerous_loop_destination(name, kind, phase, rendered, "read")?;
+    }
+    Ok(())
+}
+
+fn check_loop_printf_destination(
+    args: &[Word],
+    kind: &str,
+    phase: &str,
+    rendered: &str,
+) -> Result<(), String> {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            break;
+        }
+        if text == "-v" {
+            match args.get(i + 1) {
+                Some(name) => reject_dangerous_loop_destination(name, kind, phase, rendered, "printf")?,
+                None => {
+                    return Err(format!(
+                        "cannot allow `{kind}` loop: {phase} command `{rendered}` uses `printf -v` \
+                         without a destination; rewrite it as explicit commands"
+                    ));
+                }
+            }
+            break;
+        }
+        if let Some(rest) = text.strip_prefix("-v") {
+            let name = Word { text: rest.to_string(), dynamic: arg.dynamic, ..Word::default() };
+            reject_dangerous_loop_destination(&name, kind, phase, rendered, "printf")?;
+            break;
+        }
+        if text.starts_with('-') && text.len() > 1 {
+            i += 1;
+            continue;
+        }
+        // The first non-option word is the format string (inert data); stop.
+        break;
     }
     Ok(())
 }
@@ -960,9 +1125,12 @@ fn check_loop_dynamic_option_position(
         if arg.text == "--" {
             break;
         }
-        if arg.dynamic {
+        // Unquoted globs expand to filenames that can begin with `-` (a file
+        // named `-oresult` turns `sort *` into `sort -oresult ...`), so they are
+        // as unsafe as a computed word in option position unless `--` precedes them.
+        if arg.dynamic || arg.glob {
             return Err(format!(
-                "cannot allow `{kind}` loop: {phase} command `{}` passes a computed argument to \
+                "cannot allow `{kind}` loop: {phase} command `{}` passes a computed or glob argument to \
                  `{program}` where it could be read as an option; put `--` before it or rewrite the loop \
                  as explicit commands",
                 command_text(cmd)
@@ -1219,7 +1387,16 @@ fn expand(simple: &Simple, depth: usize, out: &mut Vec<Simple>) -> Result<(), St
         }
         match basename(text) {
             "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "fi" | "done" | "esac"
-            | "[[" | "coproc" | "nohup" | "builtin" | "unbuffer" | "busybox" => i += 1,
+            | "coproc" | "nohup" | "builtin" | "unbuffer" | "busybox" => i += 1,
+            // `[[ ... ]]` is a conditional expression, not a command runner: its
+            // operands are test data, never executed. Stripping it as a wrapper
+            // would expose the first operand as the command and reject a read-only
+            // test like `[[ "$f" == a ]]` (whose `$f` looks computed). Keep `[[`
+            // as the command so it is treated as the read-only builtin it is.
+            "[[" => {
+                push(out, i);
+                return Ok(());
+            }
             // Ordinary loop sequences are classified by `expand_sequence`
             // before this function sees them. A `for`/`select` reaching this
             // single-command fallback has no surrounding body available to
@@ -1448,6 +1625,11 @@ struct Guard<'a> {
     /// Variables assigned in the command line itself: `Some(value)` when
     /// assigned once to a literal, `None` when the value is not known.
     assigned: HashMap<String, Option<String>>,
+    /// Variables bound by a `for`/`select` loop header. The shell leaves such a
+    /// variable holding its last loop value after `done`, which the static
+    /// analysis cannot know, so any destructive operand that depends on one must
+    /// fail closed rather than resolve against a stale pre-loop assignment.
+    loop_bound: HashSet<String>,
     /// Directory relative paths resolve against, following `cd`/`pushd`
     /// earlier in the command; `None` once it can't be determined.
     base: std::cell::RefCell<Option<PathBuf>>,
@@ -1562,6 +1744,41 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
         }
     }
     out
+}
+
+/// Names bound by a `for`/`select` loop header anywhere in the command. The
+/// shell leaves the variable holding its last (statically unknown) loop value
+/// after `done`, so later destructive operands that depend on it must fail
+/// closed instead of resolving against any pre-loop literal.
+fn loop_bound_vars(commands: &[Simple]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for cmd in commands {
+        let offset = loop_command_offset(&cmd.words);
+        let is_for = cmd
+            .words
+            .get(offset)
+            .filter(|word| is_loop_keyword(word))
+            .is_some_and(|word| matches!(word.text.as_str(), "for" | "select"));
+        if is_for
+            && let Some(variable) = cmd.words.get(offset + 1)
+            && !variable.dynamic
+            && !variable.quoted
+            && is_shell_identifier(&variable.text)
+        {
+            out.insert(variable.text.clone());
+        }
+    }
+    out
+}
+
+/// Whether `text` expands any variable a loop bound (`$d`, `${d}`, `${d:-x}`).
+fn references_vars(text: &str, names: &HashSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    static VAR_REF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    VAR_REF.captures_iter(text).any(|caps| names.contains(&caps[1]))
 }
 
 const SAFE_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"];
@@ -2016,6 +2233,14 @@ impl Guard<'_> {
             Ok(Some(resolved)) => resolved,
             Ok(None) => return Ok(()),
             Err(()) => {
+                if word.dynamic && references_vars(&word.text, &self.loop_bound) {
+                    return Err(format!(
+                        "`{action} {}` depends on a loop variable whose value nano-coder cannot determine \
+                         after the loop (the shell leaves it holding the last iterated value); \
+                         rewrite it as explicit commands",
+                        word.text
+                    ));
+                }
                 return Err(format!(
                     "`{action} {}` runs after a `cd` to a directory nano-coder can't determine; use an absolute path",
                     word.text
@@ -2143,6 +2368,13 @@ impl Guard<'_> {
     /// all-wildcard component (`*`, `.*`) is reported as a glob over its parent.
     /// `Err` when the path is relative to a directory that can't be determined.
     fn resolve(&self, word: &Word) -> Result<Option<(PathBuf, bool)>, ()> {
+        // A word that expands a loop-bound variable resolves to the loop's last
+        // (unknown) value at run time. Substituting the stale pre-loop literal or
+        // an empty placeholder would check the wrong path, so fail closed and let
+        // the destructive-path guard reject it.
+        if word.dynamic && references_vars(&word.text, &self.loop_bound) {
+            return Err(());
+        }
         let text = if word.dynamic { self.substitute(&word.text).0 } else { word.text.clone() };
         let Some(text) = self.expand_home(text) else { return Ok(None) };
         if text.is_empty() {
@@ -2454,6 +2686,70 @@ mod tests {
         assert!(blocked("for f in *.txt; do sort -o out.txt input.txt; done").contains("writes a file"));
         assert!(blocked("for f in *; do file -C; done").contains("compiled magic file"));
         assert!(blocked("for f in *; do PATH=/tmp/evil grep x \"$f\"; done").contains("assigns `PATH`"));
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round2_safety_gaps() {
+        // #1 A command substitution in a loop header or condition runs on the
+        // parent shell. The parser emits it before the loop, so it must still be
+        // held to the loop's read-only rules rather than slip through as an
+        // ordinary command — for both `for` headers and `while` conditions.
+        assert!(
+            blocked("for f in \"$(printf x > out)\"; do :; done").contains("writes via redirection"),
+            "{}",
+            blocked("for f in \"$(printf x > out)\"; do :; done")
+        );
+        assert!(blocked("while echo \"$(touch out)\"; do break; done").contains("not a known read-only command"));
+        assert!(blocked("for f in \"$(rm -rf junk)\"; do :; done").contains("not a known read-only command"));
+        assert!(blocked("until test -f \"$(curl -o x http://h)\"; do cat x; done").contains("read-only"));
+        // A read-only header/condition substitution is still allowed.
+        allowed("for f in \"$(grep -l TODO README.md)\"; do echo \"$f\"; done");
+        allowed("while test -n \"$(cat marker)\"; do break; done");
+
+        // #2 A loop leaves its variable holding the last iterated value, which the
+        // guard cannot know. A destructive operand that depends on it must fail
+        // closed instead of resolving against a stale pre-loop literal.
+        assert!(
+            blocked("d=./scratch; for d in /etc; do :; done; rm -rf \"$d\"").contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for d in /etc; do :; done; rm -rf \"$d\"")
+        );
+        assert!(blocked("for d in /etc; do :; done; rm -rf \"$d\"").contains("loop variable"));
+        assert!(blocked("for d in /etc; do :; done; chmod -R 777 \"$d\"").contains("loop variable"));
+        assert!(blocked("select d in a b; do :; done; rm -rf \"${d}\"").contains("loop variable"));
+
+        // #3 `[[ ... ]]` is a conditional, not a command runner: its operands are
+        // data, so a read-only test is allowed in both body and condition.
+        allowed("for f in a b; do [[ \"$f\" == a ]] && echo \"$f\"; done");
+        allowed("for f in a b; do if [[ \"$f\" == a ]]; then echo \"$f\"; fi; done");
+        allowed("while [[ -f marker ]]; do cat marker; break; done");
+        allowed("[[ -f foo ]] && cat foo");
+
+        // #4 The loop variable is itself an assignment; a dangerous name rebinds
+        // command lookup, so reject it in `for`/`select` headers.
+        assert!(blocked("for PATH in /tmp/evil; do ls; done").contains("binds `PATH`"));
+        assert!(blocked("select PATH in a b; do ls; done").contains("binds `PATH`"));
+        assert!(blocked("for LD_PRELOAD in /tmp/x; do ls; done").contains("binds `LD_PRELOAD`"));
+
+        // #5 `read` and `printf -v` assign variables without a `NAME=value` word.
+        // Reject dangerous or computed destinations and uninspectable options.
+        assert!(
+            blocked("for f in x; do printf -v PATH '%s' /tmp/evil; cat input; done").contains("writes `PATH`"),
+            "{}",
+            blocked("for f in x; do printf -v PATH '%s' /tmp/evil; cat input; done")
+        );
+        assert!(blocked("while read -r PATH; do cat x; done < input").contains("writes `PATH`"));
+        assert!(blocked("for f in x; do read -a PATH; cat input; done").contains("writes `PATH`"));
+        assert!(blocked("for f in x; do read -r \"$dest\"; cat input; done").contains("computed at run time"));
+        // Benign variable writes stay allowed.
+        allowed("for f in x; do read -r name; echo \"$name\"; done");
+        allowed("for f in x; do printf -v count '%d' 5; echo \"$count\"; done");
+
+        // #6 An unquoted glob can expand to a filename beginning with `-`, so it
+        // is as unsafe as a computed word in option position: require `--`.
+        assert!(blocked("for f in input; do sort *; done").contains("put `--`"));
+        assert!(blocked("for f in input; do file *; done").contains("put `--`"));
+        allowed("for f in input; do sort -- *; done");
     }
 
     #[test]
