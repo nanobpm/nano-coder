@@ -333,13 +333,25 @@ impl Policy {
         // is caught here too.
         let guard = self.builtin.then(|| {
             let cwd = resolve_symlinks(cwd);
+            let with_assignments = commands_with_assignments(command);
+            let loop_bound = loop_bound_vars(&with_assignments);
+            let mut assigned = assignments(&with_assignments);
+            // A loop-bound name (a `for`/`select` header variable, or one a loop
+            // body rebinds) holds a statically unknown value by the time later
+            // commands run. `substitute()` reads `assigned` directly for command
+            // lookup, redirect sinks and `cd`, so leaving a stale pre-loop literal
+            // there (`c=echo; for c in rm; do :; done; "$c" -rf /etc`) would inspect
+            // the wrong program. Mark every loop-bound name unknown so it fails closed.
+            for name in &loop_bound {
+                assigned.insert(name.clone(), None);
+            }
             Guard {
                 base: std::cell::RefCell::new(Some(cwd.clone())),
                 cwd,
                 home: dirs::home_dir(),
                 protected: &self.protected_branches,
-                assigned: assignments(&commands_with_assignments(command)),
-                loop_bound: loop_bound_vars(&commands_with_assignments(command)),
+                assigned,
+                loop_bound,
                 depth: std::cell::Cell::new(0),
             }
         });
@@ -712,7 +724,12 @@ fn expand_sequence(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>) -> Re
             }
             loops.push(LoopFrame { kind: kind.clone(), in_body: false });
             if matches!(kind.as_str(), "while" | "until") && offset + 1 < simple.words.len() {
-                let condition = Simple { words: simple.words[offset + 1..].to_vec(), ..simple.clone() };
+                // The condition can carry its own leading control keyword
+                // (`while ! grep -q ready status.txt`): strip it so the negated
+                // command is inspected, not the `!`, which is not a program.
+                let cond_words = &simple.words[offset + 1..];
+                let cond_offset = loop_command_offset(cond_words);
+                let condition = Simple { words: cond_words[cond_offset..].to_vec(), ..simple.clone() };
                 check_readonly_loop_command(&condition, &kind, "condition")?;
                 expand(&condition, depth, out)?;
             }
@@ -950,6 +967,7 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
             if has_short_option(args, 'o')
                 || has_long_option(args, "--output")
                 || has_long_option(args, "--compress-program")
+                || has_abbreviated_long_option(args, &["output", "compress-program"])
             {
                 return Err(format!(
                     "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `sort` option \
@@ -959,7 +977,10 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         }
         "file" => {
             check_loop_dynamic_option_position(args, cmd, kind, phase, program)?;
-            if has_short_option(args, 'C') || has_long_option(args, "--compile") {
+            if has_short_option(args, 'C')
+                || has_long_option(args, "--compile")
+                || has_abbreviated_long_option(args, &["compile"])
+            {
                 return Err(format!(
                     "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `file` option \
                      that writes a compiled magic file"
@@ -986,10 +1007,11 @@ fn reject_dangerous_loop_destination(
     rendered: &str,
     builtin: &str,
 ) -> Result<(), String> {
-    if name.dynamic || name.quoted {
+    if name.dynamic || name.quoted || name.glob {
         return Err(format!(
             "cannot allow `{kind}` loop: {phase} command `{rendered}` writes a shell variable with \
-             `{builtin}` whose name is computed at run time; rewrite it as explicit commands"
+             `{builtin}` whose name is computed at run time or produced by filename expansion; \
+             rewrite it as explicit commands"
         ));
     }
     let base = name.text.split('[').next().unwrap_or(&name.text);
@@ -1030,8 +1052,8 @@ fn check_loop_read_destinations(
         if !(text.starts_with('-') && text.len() > 1) {
             break;
         }
-        // A computed option word hides whether it writes a variable or carries one.
-        if arg.dynamic {
+        // A computed or glob option word hides whether it writes a variable or carries one.
+        if arg.dynamic || arg.glob {
             return Err(uninspectable());
         }
         let letters: Vec<char> = text[1..].chars().collect();
@@ -1085,6 +1107,7 @@ fn check_loop_printf_destination(
     while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
         if text == "--" {
+            i += 1;
             break;
         }
         if text == "-v" {
@@ -1097,21 +1120,73 @@ fn check_loop_printf_destination(
                     ));
                 }
             }
-            break;
+            i += 2;
+            continue;
         }
         if let Some(rest) = text.strip_prefix("-v") {
-            let name = Word { text: rest.to_string(), dynamic: arg.dynamic, ..Word::default() };
+            let name = Word { text: rest.to_string(), dynamic: arg.dynamic, glob: arg.glob, ..Word::default() };
             reject_dangerous_loop_destination(&name, kind, phase, rendered, "printf")?;
-            break;
+            i += 1;
+            continue;
         }
         if text.starts_with('-') && text.len() > 1 {
             i += 1;
             continue;
         }
-        // The first non-option word is the format string (inert data); stop.
+        // The first non-option word is the format string; stop option scanning.
         break;
     }
+    // The format string is not inert: a `%n` conversion writes the running
+    // output length into the variable named by the matching operand, bypassing
+    // the `-v` check above, and a computed format could hide a `%n` from view.
+    // Fail closed on both so a loop body cannot rebind a name through `printf`.
+    if let Some(fmt) = args.get(i) {
+        if fmt.dynamic {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` runs `printf` with a format \
+                 computed at run time, which could write shell variables; rewrite it as explicit commands"
+            ));
+        }
+        if printf_format_writes(&fmt.text) {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `printf` `%n` conversion \
+                 that writes a shell variable; rewrite it as explicit commands"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether a `printf` format string contains a `%n` conversion, which writes
+/// the number of characters output so far into the variable named by the
+/// matching operand. `%%` is a literal percent, not a conversion.
+fn printf_format_writes(fmt: &str) -> bool {
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        // Skip flags, field width and precision (including `*`) before the conversion.
+        while i < bytes.len()
+            && (matches!(bytes[i], b'-' | b'+' | b' ' | b'#' | b'\'' | b'.' | b'*') || bytes[i].is_ascii_digit())
+        {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'n' {
+            return true;
+        }
+    }
+    false
 }
 
 fn check_loop_dynamic_option_position(
@@ -1150,6 +1225,20 @@ fn has_long_option(args: &[Word], name: &str) -> bool {
     args.iter()
         .take_while(|arg| arg.text != "--")
         .any(|arg| arg.text == name || arg.text.starts_with(&format!("{name}=")))
+}
+
+/// Whether any argument is a prefix abbreviation of one of the given long option
+/// names (without the leading `--`). GNU utilities accept any unambiguous prefix
+/// of a long option (`sort --out=x` runs `--output`), and an *ambiguous* prefix
+/// that could still resolve to a dangerous option is unsafe too, so a non-empty
+/// prefix of a dangerous name is rejected rather than inspected character by
+/// character — fail closed on the whole class of abbreviations.
+fn has_abbreviated_long_option(args: &[Word], dangerous: &[&str]) -> bool {
+    args.iter().take_while(|arg| arg.text != "--").any(|arg| {
+        let Some(body) = arg.text.strip_prefix("--") else { return false };
+        let name = body.split('=').next().unwrap_or(body);
+        !name.is_empty() && dangerous.iter().any(|full| full.starts_with(name))
+    })
 }
 
 /// The inline script an interpreter runs via `-c`/`-e`/`--eval` (attached or
@@ -1717,7 +1806,12 @@ fn nested_scripts(simple: &Simple) -> Vec<String> {
 fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
     let mut out: HashMap<String, Option<String>> = HashMap::new();
     for cmd in commands {
-        let mut words = cmd.words.iter().peekable();
+        // A loop/conditional body command reaches here as `do NAME=value`,
+        // `then NAME=value`, and so on; the reserved word is syntax, so skip it
+        // or the assignment scan breaks on `do` and never records the binding,
+        // leaving a later `$NAME` resolving against a stale pre-loop literal.
+        let offset = loop_command_offset(&cmd.words);
+        let mut words = cmd.words[offset..].iter().peekable();
         if words
             .peek()
             .is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
@@ -1746,29 +1840,161 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
     out
 }
 
-/// Names bound by a `for`/`select` loop header anywhere in the command. The
-/// shell leaves the variable holding its last (statically unknown) loop value
-/// after `done`, so later destructive operands that depend on it must fail
-/// closed instead of resolving against any pre-loop literal.
+/// Names whose value cannot be trusted to a pre-loop literal. A `for`/`select`
+/// header binds its variable to each (statically unknown) word; a loop body can
+/// also rebind any name — through a `NAME=value` assignment or a `read` /
+/// `printf -v` builtin that writes without such a word. The shell leaves all of
+/// these holding an unknown value once the loop runs, so later destructive
+/// operands that depend on them must fail closed instead of resolving against a
+/// pre-loop literal.
 fn loop_bound_vars(commands: &[Simple]) -> HashSet<String> {
     let mut out = HashSet::new();
+    // Nesting depth of open loops, so a write is attributed to a loop only when
+    // it sits between a loop's start and its matching `done`.
+    let mut depth: usize = 0;
     for cmd in commands {
         let offset = loop_command_offset(&cmd.words);
-        let is_for = cmd
-            .words
-            .get(offset)
-            .filter(|word| is_loop_keyword(word))
-            .is_some_and(|word| matches!(word.text.as_str(), "for" | "select"));
-        if is_for
-            && let Some(variable) = cmd.words.get(offset + 1)
-            && !variable.dynamic
-            && !variable.quoted
-            && is_shell_identifier(&variable.text)
-        {
-            out.insert(variable.text.clone());
+        let head = cmd.words.get(offset).filter(|word| is_loop_keyword(word)).map(|word| word.text.as_str());
+        let starts_loop = matches!(head, Some("for" | "select" | "while" | "until"));
+        let closes_loop = head == Some("done") && depth > 0;
+        if starts_loop {
+            if matches!(head, Some("for" | "select"))
+                && let Some(variable) = cmd.words.get(offset + 1)
+                && !variable.dynamic
+                && !variable.quoted
+                && is_shell_identifier(&variable.text)
+            {
+                out.insert(variable.text.clone());
+            }
+            // A `while`/`until` condition on the same command can rebind a name
+            // too (`while read d; do :; done`); collect its writes before the
+            // body opens so a later `$d` cannot resolve to a pre-loop literal.
+            if matches!(head, Some("while" | "until")) {
+                let cond = &cmd.words[offset + 1..];
+                let cond_offset = loop_command_offset(cond);
+                collect_loop_body_writes(&cond[cond_offset.min(cond.len())..], &mut out);
+            }
+            depth += 1;
+            continue;
+        }
+        if closes_loop {
+            depth -= 1;
+            continue;
+        }
+        // A command between a loop's start and its `done` — whether a further
+        // condition command or a body command — can rebind a name to a run-time
+        // value, so collect its writes regardless of the condition/body phase.
+        if depth > 0 {
+            collect_loop_body_writes(&cmd.words[offset..], &mut out);
         }
     }
     out
+}
+
+/// Record every variable a loop-body command writes: leading `NAME=value`
+/// assignments and the destinations of `read` / `printf -v`. These rebind names
+/// to run-time-unknown values, so they must be treated as loop-bound.
+fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
+    let mut i = 0;
+    if words.get(i).is_some_and(|w| matches!(w.text.as_str(), "export" | "local" | "declare" | "typeset" | "readonly"))
+    {
+        i += 1;
+    }
+    while let Some(word) = words.get(i) {
+        if !ASSIGNMENT.is_match(&word.text) {
+            break;
+        }
+        let name = word.text.split('=').next().unwrap_or_default().trim_end_matches('+');
+        let name = name.split('[').next().unwrap_or(name);
+        if !name.is_empty() {
+            out.insert(name.to_string());
+        }
+        i += 1;
+    }
+    let Some(program) = words.get(i) else { return };
+    let args = &words[i + 1..];
+    match basename(&program.text) {
+        "read" => collect_read_destinations(args, out),
+        "printf" => collect_printf_destination(args, out),
+        _ => {}
+    }
+}
+
+/// Destination names written by `read` (`read NAME`, `read -a NAME`, clustered
+/// `-aNAME`), skipping value-taking options. Names computed at run time cannot
+/// be recorded, but `check_loop_read_destinations` already rejects those.
+fn collect_read_destinations(args: &[Word], out: &mut HashSet<String>) {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            i += 1;
+            break;
+        }
+        if !(text.starts_with('-') && text.len() > 1) {
+            break;
+        }
+        let letters: Vec<char> = text[1..].chars().collect();
+        let mut k = 0;
+        while k < letters.len() {
+            let letter = letters[k];
+            if letter == 'a' {
+                if k + 1 < letters.len() {
+                    insert_var_name(&letters[k + 1..].iter().collect::<String>(), out);
+                } else {
+                    i += 1;
+                    if let Some(name) = args.get(i) {
+                        insert_var_name(&name.text, out);
+                    }
+                }
+                k = letters.len();
+            } else if read_option_takes_value(letter) {
+                if k + 1 >= letters.len() {
+                    i += 1;
+                }
+                k = letters.len();
+            } else {
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    for name in &args[i.min(args.len())..] {
+        insert_var_name(&name.text, out);
+    }
+}
+
+/// Destination name written by `printf -v NAME` (space-separated or attached).
+fn collect_printf_destination(args: &[Word], out: &mut HashSet<String>) {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            break;
+        }
+        if text == "-v" {
+            if let Some(name) = args.get(i + 1) {
+                insert_var_name(&name.text, out);
+            }
+            break;
+        }
+        if let Some(rest) = text.strip_prefix("-v") {
+            insert_var_name(rest, out);
+            break;
+        }
+        if text.starts_with('-') && text.len() > 1 {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+}
+
+fn insert_var_name(text: &str, out: &mut HashSet<String>) {
+    let base = text.split('[').next().unwrap_or(text);
+    if is_shell_identifier(base) {
+        out.insert(base.to_string());
+    }
 }
 
 /// Whether `text` expands any variable a loop bound (`$d`, `${d}`, `${d:-x}`).
@@ -2750,6 +2976,93 @@ mod tests {
         assert!(blocked("for f in input; do sort *; done").contains("put `--`"));
         assert!(blocked("for f in input; do file *; done").contains("put `--`"));
         allowed("for f in input; do sort -- *; done");
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round3_safety_gaps() {
+        // #1 A `for`/`select` header rebinds its variable, and a loop body can
+        // rebind any name. Command lookup, redirect sinks and `cd` read the
+        // assignment map directly, so a stale pre-loop literal there would inspect
+        // the wrong program/path. Every loop-bound name must fail closed.
+        assert!(
+            blocked("c=echo; for c in rm; do :; done; \"$c\" -rf /etc").contains("computed at run time"),
+            "{}",
+            blocked("c=echo; for c in rm; do :; done; \"$c\" -rf /etc")
+        );
+        assert!(
+            blocked("D=/dev/null; for D in /dev/sda; do :; done; echo x > \"$D\"").contains("computed at run time"),
+            "{}",
+            blocked("D=/dev/null; for D in /dev/sda; do :; done; echo x > \"$D\"")
+        );
+
+        // #2 A negated `while`/`until` condition (`while ! grep ...`) must inspect
+        // the command after the control keyword, not reject the loop outright.
+        allowed("while ! grep -q ready status.txt; do cat status.txt; done");
+        allowed("until ! test -f lock; do cat lock; done");
+        assert!(
+            blocked("while ! touch out; do :; done").contains("not a known read-only command"),
+            "{}",
+            blocked("while ! touch out; do :; done")
+        );
+
+        // #3 A `read` destination that is a glob (or array `-a *`) expands to a
+        // filename at run time, so its real name — possibly `PATH` — is unknown.
+        assert!(blocked("for f in x; do read *; cat input; done").contains("filename expansion"));
+        assert!(blocked("for f in x; do read -a *; cat input; done").contains("filename expansion"));
+
+        // #4 A `printf` `%n` conversion writes a shell variable through an operand,
+        // bypassing the `-v` check; a computed format could hide one. Fail closed.
+        assert!(blocked("for f in x; do printf -- '%n' PATH; cat input; done").contains("%n"));
+        assert!(
+            blocked("for f in x; do printf \"$fmt\" PATH; cat input; done").contains("computed at run time"),
+            "{}",
+            blocked("for f in x; do printf \"$fmt\" PATH; cat input; done")
+        );
+        // A literal percent (`%%n`) is not a conversion, and ordinary formats stay allowed.
+        allowed("for f in x; do printf '%%n\\n'; echo done; done");
+        allowed("for f in x; do printf '%s\\n' \"$f\"; done");
+
+        // #5 GNU `sort`/`file` accept unambiguous long-option abbreviations, so a
+        // prefix of a file-writing option (`--out=`, `--com...`) must be rejected too.
+        assert!(blocked("for f in input; do sort --out=result input; done").contains("writes a file"));
+        assert!(blocked("for f in input; do sort --o result input; done").contains("writes a file"));
+        assert!(blocked("for f in input; do sort --compress=gzip input; done").contains("writes a file"));
+        assert!(blocked("for f in input; do file --comp magic; done").contains("compiled magic file"));
+        // An unrelated long option that is not a prefix of a dangerous one is allowed.
+        allowed("for f in input; do sort --check input; done");
+
+        // #6 A loop body that rebinds a name through assignment or `read`/`printf -v`
+        // leaves it holding an unknown value, so a later destructive operand on it
+        // must fail closed rather than resolve against a pre-loop literal.
+        assert!(
+            blocked("d=./scratch; for f in x; do d=/etc; done; rm -rf \"$d\"").contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for f in x; do d=/etc; done; rm -rf \"$d\"")
+        );
+        assert!(blocked("d=./scratch; for f in x; do read d; done; rm -rf \"$d\"").contains("loop variable"));
+        assert!(blocked("d=./scratch; while read d; do :; done < input; rm -rf \"$d\"").contains("loop variable"));
+        assert!(
+            blocked("d=./scratch; for f in x; do printf -v d '%s' /etc; done; rm -rf \"$d\"").contains("loop variable")
+        );
+
+        // #7 A loop header behind a leading control keyword (`then`, `!`) still runs
+        // its header substitution on the parent shell; it must be flagged.
+        assert!(
+            blocked("if true; then for f in \"$(touch out)\"; do :; done; fi").contains("not a known read-only command"),
+            "{}",
+            blocked("if true; then for f in \"$(touch out)\"; do :; done; fi")
+        );
+
+        // #8 A command substitution in a loop condition's redirect target also runs
+        // on the parent shell; parsing it via the redirect path must still mark it.
+        assert!(
+            blocked("while read line < \"$(touch out; echo /dev/null)\"; do :; done")
+                .contains("not a known read-only command"),
+            "{}",
+            blocked("while read line < \"$(touch out; echo /dev/null)\"; do :; done")
+        );
+        // A read-only redirect-target substitution in a loop condition stays allowed.
+        allowed("while read line < \"$(echo input)\"; do cat input; break; done");
     }
 
     #[test]

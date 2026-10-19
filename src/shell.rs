@@ -55,11 +55,27 @@ pub struct Simple {
     pub loop_header_sub: bool,
 }
 
-/// `for`/`select`/`while`/`until` begin a loop whose header or condition runs
-/// on the parent shell. A command substitution in that position is subject to
-/// the loop's read-only rules even though the parser emits it first.
-fn is_loop_head_keyword(word: &Word) -> bool {
-    !word.quoted && matches!(word.text.as_str(), "for" | "select" | "while" | "until")
+/// Whether the words parsed so far open a loop whose header or condition runs
+/// on the parent shell. `for`/`select`/`while`/`until` begin such a loop, and a
+/// command substitution in that header/condition is subject to the loop's
+/// read-only rules even though the parser emits it first. The loop keyword can
+/// sit behind leading control-flow keywords (`if true; then for f in "$(cmd)"`,
+/// `! while ...`), so skip those first — mirroring
+/// `permissions::loop_command_offset` — rather than only inspecting the first
+/// word, or a header substitution after a control prefix slips through
+/// unflagged before the loop frame exists.
+fn opens_loop_header(words: &[Word]) -> bool {
+    for word in words {
+        if word.quoted {
+            return false;
+        }
+        match word.text.as_str() {
+            "for" | "select" | "while" | "until" => return true,
+            "!" | "if" | "then" | "else" | "elif" | "do" | "{" | "}" | "fi" | "esac" => continue,
+            _ => return false,
+        }
+    }
+    false
 }
 
 const MAX_DEPTH: usize = 16;
@@ -287,7 +303,7 @@ impl Parser {
                         self.pos += 2;
                         let out_start = self.out.len();
                         self.substitution()?;
-                        if current.words.first().is_some_and(is_loop_head_keyword) {
+                        if opens_loop_header(&current.words) {
                             self.mark_loop_header_subs(out_start);
                         }
                         current.words.push(Word { text: "/dev/fd/63".into(), dynamic: true, ..Default::default() });
@@ -303,7 +319,7 @@ impl Parser {
                         self.redirect(&mut current, &mut pending)?;
                         continue;
                     }
-                    let in_loop_head = current.words.first().is_some_and(is_loop_head_keyword);
+                    let in_loop_head = opens_loop_header(&current.words);
                     let out_start = self.out.len();
                     let word = self.word()?;
                     if in_loop_head {
@@ -390,7 +406,15 @@ impl Parser {
         if self.peek().is_none_or(|c| is_operator(c) && c != '<' && c != '>') {
             return Err(format!("redirection {op} has no target"));
         }
+        // A command substitution in a redirect target of a loop header or
+        // condition (`while read x < "$(touch out)"; do ...`) runs on the parent
+        // shell, but the target is parsed here via `word()` rather than the main
+        // loop, so mark its substitutions as header substitutions too.
+        let out_start = self.out.len();
         let target = self.word()?;
+        if opens_loop_header(&current.words) {
+            self.mark_loop_header_subs(out_start);
+        }
         if op == "<<" || op == "<<-" {
             // The body belongs to the current command, which gets its index when flushed.
             // A quoted delimiter (`<<'EOF'`) disables expansion of the body.
