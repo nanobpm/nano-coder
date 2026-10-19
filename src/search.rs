@@ -249,18 +249,21 @@ fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: boo
             if found.lines.len() < collect_up_to {
                 found.lines.push((line_no, clip_line(line)));
             }
-            // Only take a match-driven early return once the binary-sniff
-            // window is fully read (or EOF). Otherwise a NUL later in the
-            // window would be missed, so binary exclusion would depend on
-            // the mode and limit rather than on the file's contents.
-            if sniffed >= BINARY_SNIFF_BYTES {
-                if first_only {
-                    return found;
-                }
-                if collect_up_to > 0 && found.lines.len() >= collect_up_to {
-                    // Past what the caller can use; `count` already proves it.
-                    return found;
-                }
+        }
+        // Test for an early return after *every* line, not only matching ones.
+        // Otherwise a file whose last useful match lands before the early-exit
+        // condition is met would keep scanning its non-matching tail (up to
+        // 16 MiB) for nothing. Gate on a completed binary-sniff window (at EOF
+        // the loop ends anyway) so a NUL later in the window is never missed —
+        // binary exclusion must depend on the file's contents, not on the mode
+        // or limit.
+        if sniffed >= BINARY_SNIFF_BYTES {
+            if first_only && found.count > 0 {
+                return found;
+            }
+            if collect_up_to > 0 && found.lines.len() >= collect_up_to {
+                // Past what the caller can use; `count` already proves it.
+                return found;
             }
         }
     }
@@ -316,12 +319,17 @@ struct GlobFilter {
 
 impl GlobFilter {
     fn compile(pattern: &str) -> Result<Self> {
-        let cleaned = pattern.trim().strip_prefix("./").unwrap_or(pattern.trim()).trim_start_matches('/');
+        let trimmed = pattern.trim();
+        let cleaned = trimmed.strip_prefix("./").unwrap_or(trimmed).trim_start_matches('/');
         if cleaned.is_empty() {
             bail!("glob pattern must not be empty");
         }
         let regex = permissions::path_glob(cleaned).map_err(anyhow::Error::msg)?;
-        Ok(Self { regex, by_name: !cleaned.contains('/') })
+        // Decide name-vs-root-relative from the *original* pattern, before the
+        // leading `./` or `/` is stripped. Those prefixes mark a root-relative
+        // pattern (`./*.rs`, `/main.rs`); keying `by_name` off the stripped
+        // form would drop that and wrongly match the name at any depth.
+        Ok(Self { regex, by_name: !trimmed.contains('/') })
     }
 
     fn matches(&self, file: &FoundFile) -> bool {
@@ -371,7 +379,7 @@ fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFil
         let rel = root_path.file_name().map(PathBuf::from).unwrap_or_else(|| root_path.to_path_buf());
         return Ok(vec![FoundFile {
             fs_path: fs_root,
-            display: root.trim_start_matches("./").to_string(),
+            display: root.to_string(),
             rel,
             explicit_file: true,
         }]);
@@ -448,7 +456,10 @@ fn display_path(root: &str, rel: &Path) -> String {
         // returned path stays absolute and usable with `read_file`.
         return if root.is_empty() { rel } else { format!("/{rel}") };
     }
-    format!("{}/{rel}", trimmed.trim_start_matches("./"))
+    // Keep `trimmed` exactly as given; do not strip a leading `./`. Trimming
+    // can turn a relative root like `.//src` into the absolute `/src`, so the
+    // reported path would open a different file (or fail) under `read_file`.
+    format!("{trimmed}/{rel}")
 }
 
 fn slash(path: &Path) -> String {
@@ -818,5 +829,72 @@ mod tests {
         // A backslash is a valid filename character on Unix, not a separator.
         assert_eq!(slash(Path::new("a\\b.rs")), "a\\b.rs");
         assert_eq!(display_path("src", Path::new("a\\b.rs")), "src/a\\b.rs");
+    }
+
+    #[test]
+    fn root_relative_pattern_is_not_name_matched() {
+        // A leading `./` or `/` marks a root-relative pattern: `./*.rs` and
+        // `/main.rs` must match only at the root, not the bare name at any
+        // depth. `by_name` is decided from the original pattern, so stripping
+        // the prefix must not collapse them into name matches.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("main.rs"), "x\n").unwrap();
+        std::fs::write(root.join("sub/main.rs"), "x\n").unwrap();
+        for pattern in ["./*.rs", "/main.rs"] {
+            let out = text_out(glob_in(&json!({"pattern": pattern}), &Policy::default(), root).unwrap());
+            assert_eq!(out, "main.rs", "root-relative pattern {pattern} leaked a nested file: {out}");
+        }
+        // A bare name pattern still matches at any depth.
+        let out = text_out(glob_in(&json!({"pattern": "main.rs"}), &Policy::default(), root).unwrap());
+        assert_eq!(out, "main.rs\nsub/main.rs", "bare-name pattern should match at any depth: {out}");
+    }
+
+    #[test]
+    fn display_path_preserves_relative_root() {
+        // Trimming a leading `./` can turn a relative root into an absolute
+        // path (`.//src` -> `/src`), which would open a different file.
+        assert_eq!(display_path("./src", Path::new("a.rs")), "./src/a.rs");
+        assert_eq!(display_path(".//src", Path::new("a.rs")), ".//src/a.rs");
+    }
+
+    #[test]
+    fn explicit_file_root_preserves_relative_prefix() {
+        // An explicitly named file root is reported verbatim; a leading `./`
+        // (or `.//`) must survive so the path stays relative and usable with
+        // `read_file`, never collapsing to an absolute `/a.rs`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": ".//a.rs", "output_mode": "files"}), &Policy::default(), root)
+                .unwrap(),
+        );
+        assert_eq!(out, ".//a.rs", "explicit-file display dropped its relative prefix: {out}");
+    }
+
+    #[test]
+    fn early_return_is_correct_with_long_nonmatching_tail() {
+        // A single early match followed by a long non-matching tail: the
+        // per-line early return must still report the file in every mode and
+        // count accurately, without over-scanning or under-counting.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut body = String::from("needle\nneedle\n");
+        for _ in 0..5000 {
+            body.push_str("filler\n");
+        }
+        std::fs::write(root.join("big.txt"), &body).unwrap();
+        let files =
+            text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
+        assert_eq!(files, "big.txt");
+        let count =
+            text_out(grep_in(&json!({"pattern": "needle", "output_mode": "count"}), &Policy::default(), root).unwrap());
+        assert_eq!(count, "big.txt:2");
+        let content = text_out(
+            grep_in(&json!({"pattern": "needle", "limit": 1}), &Policy::default(), root).unwrap(),
+        );
+        assert!(content.starts_with("big.txt:1:needle"), "content mode wrong: {content}");
     }
 }
