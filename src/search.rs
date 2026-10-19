@@ -37,6 +37,11 @@ const MAX_LIMIT: usize = 5_000;
 const MAX_LINE_CHARS: usize = 2_000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8_192;
+/// Cap on compiled `.gitignore` rules per directory: each rule is a compiled
+/// regex, so an adversarial ignore file (e.g. 1 MiB of `x\n` lines) would
+/// otherwise compile and retain hundreds of thousands of regexes before any
+/// result limit applies.
+const MAX_IGNORE_RULES: usize = 1_024;
 const NO_MATCHES: &str = "(no matches)";
 
 pub fn register(tools: &ToolRegistry, policy: Policy) {
@@ -227,11 +232,22 @@ fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: boo
     let mut raw: Vec<u8> = Vec::new();
     let mut sniffed = 0usize;
     let mut line_no = 0usize;
+    // Total bytes consumed from the file. The stat check above only covers the
+    // size at open time: a file that keeps growing (an appended log) or one
+    // long unterminated line would otherwise let `read_until` allocate and
+    // scan past the cap regardless of `limit`, so enforce it while reading.
+    let mut consumed = 0u64;
     loop {
         raw.clear();
         match reader.read_until(b'\n', &mut raw) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
+        }
+        consumed += raw.len() as u64;
+        if consumed > MAX_FILE_BYTES {
+            // Past the per-file budget: discard any matches gathered so far,
+            // exactly as if the stat had already reported the file oversized.
+            return FileMatches::default();
         }
         line_no += 1;
         if sniffed < BINARY_SNIFF_BYTES {
@@ -520,7 +536,16 @@ fn load_gitignore(dir: &Path, rel_dir: &Path, cwd: &Path, policy: &Policy) -> Ve
     if text.len() as u64 > MAX_FILE_BYTES {
         return Vec::new();
     }
-    text.lines().filter_map(|line| parse_ignore_line(line, rel_dir)).collect()
+    // The byte cap alone does not bound compiled state: a small file of
+    // repeated short lines still compiles one regex per rule, all retained
+    // for the traversal. Cap the rule count too; past the budget the file's
+    // rules stop applying (fail-open toward visibility, like an unreadable or
+    // oversized ignore file) rather than compiling unbounded regexes before
+    // any result limit applies.
+    text.lines()
+        .filter_map(|line| parse_ignore_line(line, rel_dir))
+        .take(MAX_IGNORE_RULES)
+        .collect()
 }
 
 fn parse_ignore_line(line: &str, base: &Path) -> Option<IgnoreRule> {
@@ -829,6 +854,47 @@ mod tests {
         let out =
             text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
         assert_eq!(out, "a.rs", "oversized .gitignore was honoured: {out}");
+    }
+
+    #[test]
+    fn gitignore_rule_budget_stops_compilation() {
+        // A `.gitignore` under the byte cap can still hold an unbounded number
+        // of rules (one compiled regex each). Past MAX_IGNORE_RULES the file's
+        // rules must stop applying, so a rule flood cannot compile and retain
+        // hundreds of thousands of regexes before any result limit applies.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut rules = String::new();
+        for i in 0..(MAX_IGNORE_RULES + 1) {
+            rules.push_str(&format!("f{i}\n"));
+        }
+        std::fs::write(root.join(".gitignore"), rules).unwrap();
+        // The rule that lands past the budget must not take effect.
+        std::fs::write(root.join(format!("f{MAX_IGNORE_RULES}")), "needle\n").unwrap();
+        let out =
+            text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
+        assert_eq!(out, format!("f{MAX_IGNORE_RULES}"), "rule past the budget was honoured: {out}");
+    }
+
+    #[test]
+    fn search_file_discards_matches_past_byte_cap() {
+        // The stat check only covers the size at open time. A file whose
+        // content crosses the cap while being read (one long unterminated
+        // line, or an appended log) must be treated as oversized: matches
+        // gathered before the crossing are discarded, not returned.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut content = String::from("needle\n");
+        content.push_str(&"x".repeat((MAX_FILE_BYTES as usize) + 1024));
+        std::fs::write(root.join("growing.log"), content).unwrap();
+        for args in [
+            json!({"pattern": "needle"}),
+            json!({"pattern": "needle", "output_mode": "files"}),
+            json!({"pattern": "needle", "output_mode": "count"}),
+        ] {
+            let out = text_out(grep_in(&args, &Policy::default(), root).unwrap());
+            assert_eq!(out, NO_MATCHES, "match past the byte cap leaked for {args}");
+        }
     }
 
     #[cfg(unix)]
