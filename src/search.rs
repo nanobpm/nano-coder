@@ -246,14 +246,21 @@ fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: boo
         let line = line.strip_suffix('\r').unwrap_or(line);
         if regex.is_match(line) {
             found.count += 1;
-            if first_only {
-                return found;
-            }
             if found.lines.len() < collect_up_to {
                 found.lines.push((line_no, clip_line(line)));
-            } else if collect_up_to > 0 {
-                // Past what the caller can use; `count` already proves it.
-                return found;
+            }
+            // Only take a match-driven early return once the binary-sniff
+            // window is fully read (or EOF). Otherwise a NUL later in the
+            // window would be missed, so binary exclusion would depend on
+            // the mode and limit rather than on the file's contents.
+            if sniffed >= BINARY_SNIFF_BYTES {
+                if first_only {
+                    return found;
+                }
+                if collect_up_to > 0 && found.lines.len() >= collect_up_to {
+                    // Past what the caller can use; `count` already proves it.
+                    return found;
+                }
             }
         }
     }
@@ -322,7 +329,15 @@ impl GlobFilter {
             let name = file.rel.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
             return self.regex.is_match(&name);
         }
-        self.regex.is_match(&slash(&file.rel)) || self.regex.is_match(file.display.trim_start_matches("./"))
+        if self.regex.is_match(&slash(&file.rel)) {
+            return true;
+        }
+        // The display path is only a valid match target for an explicitly
+        // named file root. For a directory search a file's display path
+        // includes the search root, so matching it would wrongly let a
+        // root-qualified pattern (e.g. `src/**/*.rs` under `path: "src"`)
+        // match files that are not actually under that sub-path.
+        file.explicit_file && self.regex.is_match(file.display.trim_start_matches("./"))
     }
 }
 
@@ -337,6 +352,8 @@ struct FoundFile {
     display: String,
     /// Path relative to the search root (the file name for a file root).
     rel: PathBuf,
+    /// True only for an explicitly named file root (`path` was a file).
+    explicit_file: bool,
 }
 
 fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFile>> {
@@ -352,7 +369,12 @@ fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFil
             return Ok(Vec::new());
         }
         let rel = root_path.file_name().map(PathBuf::from).unwrap_or_else(|| root_path.to_path_buf());
-        return Ok(vec![FoundFile { fs_path: fs_root, display: root.trim_start_matches("./").to_string(), rel }]);
+        return Ok(vec![FoundFile {
+            fs_path: fs_root,
+            display: root.trim_start_matches("./").to_string(),
+            rel,
+            explicit_file: true,
+        }]);
     }
     if !metadata.is_dir() {
         bail!("search path {root} is neither a file nor a directory");
@@ -376,7 +398,7 @@ fn walk_dir(
     is_root: bool,
 ) -> Result<()> {
     let mut rules: Vec<IgnoreRule> = inherited.to_vec();
-    rules.extend(load_gitignore(dir, rel_dir));
+    rules.extend(load_gitignore(dir, rel_dir, cwd, policy));
 
     let read_dir = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -408,7 +430,7 @@ fn walk_dir(
         if file_type.is_dir() {
             walk_dir(&fs_path, &rel, root, cwd, policy, &rules, out, false)?;
         } else if file_type.is_file() {
-            out.push(FoundFile { display: display_path(root, &rel), fs_path, rel });
+            out.push(FoundFile { display: display_path(root, &rel), fs_path, rel, explicit_file: false });
         }
     }
     Ok(())
@@ -416,12 +438,30 @@ fn walk_dir(
 
 fn display_path(root: &str, rel: &Path) -> String {
     let rel = slash(rel);
-    let root = root.trim_end_matches('/');
-    if root.is_empty() || root == "." { rel } else { format!("{}/{rel}", root.trim_start_matches("./")) }
+    let trimmed = root.trim_end_matches('/');
+    if trimmed == "." {
+        return rel;
+    }
+    if trimmed.is_empty() {
+        // `root` is empty (cwd) or consists only of slashes (a filesystem
+        // root like `/`). Keep the leading slash for the latter so the
+        // returned path stays absolute and usable with `read_file`.
+        return if root.is_empty() { rel } else { format!("/{rel}") };
+    }
+    format!("{}/{rel}", trimmed.trim_start_matches("./"))
 }
 
 fn slash(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    // A backslash is a path separator only on Windows; on Unix it is a valid
+    // filename character, so rewriting it would corrupt real paths.
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,8 +478,20 @@ struct IgnoreRule {
     anchored: bool,
 }
 
-fn load_gitignore(dir: &Path, rel_dir: &Path) -> Vec<IgnoreRule> {
-    let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) else { return Vec::new() };
+fn load_gitignore(dir: &Path, rel_dir: &Path, cwd: &Path, policy: &Policy) -> Vec<IgnoreRule> {
+    let path = dir.join(".gitignore");
+    // Apply the same safety checks the walker uses for discovered entries
+    // *before* reading: never follow a symlink out of the tree, never open a
+    // non-regular file (a FIFO would block, a device like `/dev/zero` would
+    // allocate without bound), and honour Read-deny rules.
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Vec::new() };
+    if !meta.file_type().is_file() {
+        return Vec::new();
+    }
+    if policy.read_denied(&path, cwd) {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
     text.lines().filter_map(|line| parse_ignore_line(line, rel_dir)).collect()
 }
 
@@ -694,5 +746,77 @@ mod tests {
         let out =
             text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
         assert_eq!(out, "important.log\nsub/open.txt", "{out}");
+    }
+
+    #[test]
+    fn binary_exclusion_is_independent_of_mode_and_limit() {
+        // Four matching lines then a NUL inside the sniff window. Binary
+        // exclusion must not depend on the mode or on how early a match-driven
+        // return fires, so every mode (and a limit of 1) must skip this file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trap.txt"), b"needle\nneedle\nneedle\nneedle\n\x00rest").unwrap();
+        for args in [
+            json!({"pattern": "needle"}),
+            json!({"pattern": "needle", "limit": 1}),
+            json!({"pattern": "needle", "output_mode": "files"}),
+            json!({"pattern": "needle", "output_mode": "files", "limit": 1}),
+            json!({"pattern": "needle", "output_mode": "count"}),
+        ] {
+            let out = text_out(grep_in(&args, &Policy::default(), dir.path()).unwrap());
+            assert_eq!(out, NO_MATCHES, "binary file leaked for {args}");
+        }
+    }
+
+    #[test]
+    fn root_qualified_glob_does_not_match_via_display_path() {
+        // Under `path: "src"`, a pattern that names the root again must only
+        // match files genuinely under that sub-path, not every file whose
+        // display path happens to start with the root.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "x\n").unwrap();
+        std::fs::write(root.join("src/src/inner.rs"), "x\n").unwrap();
+        let out = text_out(glob_in(&json!({"pattern": "src/**/*.rs", "path": "src"}), &Policy::default(), root).unwrap());
+        assert_eq!(out, "src/src/inner.rs", "display-path fallback over-matched: {out}");
+        // grep's include filter shares the same rule.
+        let grep_out = text_out(
+            grep_in(&json!({"pattern": "x", "glob": "src/**/*.rs", "path": "src", "output_mode": "files"}), &Policy::default(), root)
+                .unwrap(),
+        );
+        assert_eq!(grep_out, "src/src/inner.rs", "grep include filter over-matched: {grep_out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_gitignore_is_not_followed() {
+        // A `.gitignore` that is a symlink (which could point outside the tree
+        // at a device or FIFO) must not be read; its rules must not apply.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("rules.txt"), "*.rs\n").unwrap();
+        std::os::unix::fs::symlink(root.join("rules.txt"), root.join(".gitignore")).unwrap();
+        std::fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let out =
+            text_out(grep_in(&json!({"pattern": "needle", "output_mode": "files"}), &Policy::default(), root).unwrap());
+        assert_eq!(out, "a.rs", "symlinked .gitignore was honoured: {out}");
+    }
+
+    #[test]
+    fn display_path_preserves_filesystem_root() {
+        assert_eq!(display_path("/", Path::new("etc/hosts")), "/etc/hosts");
+        assert_eq!(display_path("//", Path::new("etc/hosts")), "/etc/hosts");
+        assert_eq!(display_path(".", Path::new("a.rs")), "a.rs");
+        assert_eq!(display_path("", Path::new("a.rs")), "a.rs");
+        assert_eq!(display_path("src", Path::new("a.rs")), "src/a.rs");
+        assert_eq!(display_path("src/", Path::new("a.rs")), "src/a.rs");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn slash_keeps_literal_backslashes_on_unix() {
+        // A backslash is a valid filename character on Unix, not a separator.
+        assert_eq!(slash(Path::new("a\\b.rs")), "a\\b.rs");
+        assert_eq!(display_path("src", Path::new("a\\b.rs")), "src/a\\b.rs");
     }
 }
