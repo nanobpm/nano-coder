@@ -21,6 +21,13 @@ pub struct Word {
     pub glob: bool,
     /// Some part of the word was quoted or escaped.
     pub quoted: bool,
+    /// The word may expand to other than exactly one argument: it contains an
+    /// unquoted expansion or glob (word-splitting / pathname expansion), or a
+    /// `$@` / `${arr[@]}` expansion that yields multiple arguments even when
+    /// quoted. `quoted` alone does not prove single-argument — `""$x` is quoted
+    /// yet `$x` still splits — so callers that need a provably single argument
+    /// (e.g. an option value that must not smuggle extra options) check this.
+    pub splits: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +85,27 @@ fn opens_loop_header(words: &[Word]) -> bool {
     false
 }
 
-const MAX_DEPTH: usize = 16;
+/// Whether the words parsed so far are inside an open `[[ ... ]]` conditional,
+/// where `<` and `>` are string-comparison operators rather than redirections.
+/// `[[` need not be the first word — it can follow control keywords such as
+/// `do`/`then` in the same simple command (`do [[ $a > $b ]]`) — so scan for an
+/// opened-but-not-yet-closed `[[`.
+fn in_conditional(words: &[Word]) -> bool {
+    let mut open = false;
+    for w in words {
+        if w.quoted {
+            continue;
+        }
+        match w.text.as_str() {
+            "[[" => open = true,
+            "]]" => open = false,
+            _ => {}
+        }
+    }
+    open
+}
 
+const MAX_DEPTH: usize = 16;
 /// Parse a command line into its simple commands, including those inside
 /// command substitutions.
 pub fn parse(source: &str) -> Result<Vec<Simple>, String> {
@@ -307,6 +333,14 @@ impl Parser {
                             self.mark_loop_header_subs(out_start);
                         }
                         current.words.push(Word { text: "/dev/fd/63".into(), dynamic: true, ..Default::default() });
+                    } else if in_conditional(&current.words) {
+                        // Inside `[[ ... ]]`, `<` and `>` are string-comparison
+                        // operators, not redirections (`[[ $a > $b ]]` compares,
+                        // it does not write a file named `$b`). Record the
+                        // operator as a plain word; a real redirect after `]]`
+                        // still parses normally because `]]` ends the conditional.
+                        current.words.push(Word { text: c.to_string(), ..Default::default() });
+                        self.pos += 1;
                     } else {
                         self.redirect(&mut current, &mut pending)?;
                     }
@@ -539,8 +573,11 @@ impl Parser {
         Err(format!("unterminated {open}"))
     }
 
-    /// `$...` at the current position (the `$` not yet consumed).
-    fn dollar(&mut self, word: &mut Word) -> Result<(), String> {
+    /// `$...` at the current position (the `$` not yet consumed). `quoted` is
+    /// true when the expansion sits inside double quotes, where most expansions
+    /// stay a single argument; an unquoted expansion (and a quoted `$@` /
+    /// `${arr[@]}`) can produce multiple arguments, which sets `word.splits`.
+    fn dollar(&mut self, word: &mut Word, quoted: bool) -> Result<(), String> {
         self.pos += 1;
         match self.peek() {
             Some('(') if self.peek_at(1) == Some('(') => {
@@ -549,18 +586,29 @@ impl Parser {
                 self.eat(')');
                 word.text.push_str(&format!("$(({body}))"));
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
             }
             Some('(') => {
                 self.pos += 1;
                 self.substitution()?;
                 word.text.push_str("$(...)");
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
             }
             Some('{') => {
                 self.pos += 1;
                 let body = self.balanced('{', '}')?;
                 word.text.push_str(&format!("${{{body}}}"));
                 word.dynamic = true;
+                // `${arr[@]}` yields one argument per element even when quoted;
+                // any unquoted expansion word-splits.
+                if !quoted || body.contains("[@]") {
+                    word.splits = true;
+                }
             }
             Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
                 word.text.push('$');
@@ -569,12 +617,21 @@ impl Parser {
                     self.pos += 1;
                 }
                 word.dynamic = true;
+                if !quoted {
+                    word.splits = true;
+                }
             }
             Some(c) if "@*#?$!-".contains(c) => {
                 word.text.push('$');
                 word.text.push(c);
                 self.pos += 1;
                 word.dynamic = true;
+                // `$@` expands to multiple arguments even inside quotes; the
+                // other special parameters are single, but any unquoted
+                // expansion still word-splits.
+                if !quoted || c == '@' {
+                    word.splits = true;
+                }
             }
             _ => word.text.push('$'),
         }
@@ -633,7 +690,7 @@ impl Parser {
                                 }
                                 self.pos += 2;
                             }
-                            Some('$') => self.dollar(&mut word)?,
+                            Some('$') => self.dollar(&mut word, true)?,
                             Some('`') => {
                                 self.pos += 1;
                                 self.backtick()?;
@@ -668,15 +725,17 @@ impl Parser {
                         }
                     }
                 }
-                '$' => self.dollar(&mut word)?,
+                '$' => self.dollar(&mut word, false)?,
                 '`' => {
                     self.pos += 1;
                     self.backtick()?;
                     word.text.push_str("$(...)");
                     word.dynamic = true;
+                    word.splits = true;
                 }
                 '*' | '?' | '[' => {
                     word.glob = true;
+                    word.splits = true;
                     word.text.push(c);
                     self.pos += 1;
                 }

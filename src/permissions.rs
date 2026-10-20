@@ -1147,11 +1147,14 @@ fn check_loop_read_destinations(
                     // The value is the next word.
                     i += 1;
                     match args.get(i) {
-                        // An unquoted computed value or a glob word-splits, and
-                        // the extra words become read destinations (`read -p $p`
-                        // with $p='prompt PATH' reads into PATH). A quoted
-                        // expansion stays one argument and is safe.
-                        Some(value) if value.glob || (value.dynamic && !value.quoted) => {
+                        // An unquoted computed value, a glob, or a
+                        // multi-argument expansion (`$@`, `${arr[@]}`)
+                        // word-splits, and the extra words become read
+                        // destinations (`read -p $p` with $p='prompt PATH' reads
+                        // into PATH; `read -p ""$p` splits despite partial
+                        // quoting). A provably single-argument value (a quoted
+                        // scalar) stays one argument and is safe.
+                        Some(value) if value.splits => {
                             return Err(uninspectable());
                         }
                         Some(_) => {}
@@ -1280,6 +1283,12 @@ fn printf_format_writes(fmt: &str) -> bool {
         while i < bytes.len()
             && (matches!(bytes[i], b'-' | b'+' | b' ' | b'#' | b'\'' | b'.' | b'*') || bytes[i].is_ascii_digit())
         {
+            i += 1;
+        }
+        // Skip length modifiers (`l`, `h`, `L`, `j`, `z`, `t`, `q`); bash's
+        // `printf` accepts and ignores them, so `%ln` still writes via the
+        // trailing `n` conversion.
+        while i < bytes.len() && matches!(bytes[i], b'l' | b'h' | b'L' | b'j' | b'z' | b't' | b'q') {
             i += 1;
         }
         if i < bytes.len() && bytes[i] == b'n' {
@@ -1413,13 +1422,15 @@ fn check_loop_dynamic_option_position(
             opts.chars().position(|c| short.contains(c)).is_some_and(|pos| pos + 1 == opts.chars().count())
         };
         if consume_next {
-            // The consumed value word is itself unsafe when it can word-split
-            // into multiple arguments: an unquoted expansion or a glob supplies
-            // extra options/operands (`sort -T $opts input` with
-            // $opts='tmp -o result' runs `-T tmp -o result input`). A quoted
-            // expansion stays a single argument and is safe.
+            // The consumed value word is unsafe unless it is provably a single
+            // argument: an unquoted expansion, a glob, or a multi-argument
+            // expansion (`$@`, `${arr[@]}`) supplies extra options/operands
+            // (`sort -T $opts input` with $opts='tmp -o result' runs
+            // `-T tmp -o result input`; `sort -T ""$opts input` word-splits even
+            // though part of the word is quoted). A quoted scalar expansion
+            // (`sort -T "$dir"`) stays one argument and is safe.
             if let Some(value) = args.get(i + 1)
-                && (value.glob || (value.dynamic && !value.quoted))
+                && value.splits
             {
                 return Err(dynamic_err());
             }
@@ -3548,6 +3559,60 @@ mod tests {
             "{}",
             blocked("d=./scratch; for f in x; do printf -vignored -vd '%s' /etc; done; rm -rf \"$d\"")
         );
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round6_safety_gaps() {
+        // #1 Inside `[[ ... ]]`, `>` and `<` are string-comparison operators, not
+        // redirections, so a read-only comparison loop is allowed; a genuine
+        // write redirection after `]]` is still blocked.
+        allowed("for f in a z; do [[ \"$f\" > m ]] && echo \"$f\"; done");
+        allowed("for f in a z; do [[ \"$f\" < m ]] && echo \"$f\"; done");
+        assert!(
+            blocked("for f in a z; do [[ \"$f\" = m ]] > out; done").contains("redirection"),
+            "{}",
+            blocked("for f in a z; do [[ \"$f\" = m ]] > out; done")
+        );
+
+        // #2 Bash's `printf` accepts and ignores length modifiers, so `%ln`
+        // still writes via the trailing `n` conversion; the scanner skips the
+        // modifier before checking for `n`.
+        assert!(
+            blocked("for f in x; do printf -- '%ln' PATH; cat input; done").contains("%n"),
+            "{}",
+            blocked("for f in x; do printf -- '%ln' PATH; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do printf -- '%lln' PATH; cat input; done").contains("%n"),
+            "{}",
+            blocked("for f in x; do printf -- '%lln' PATH; cat input; done")
+        );
+        // A length-modified non-`n` conversion is still a read-only format.
+        allowed("for f in x; do printf -- '%ld' 1; cat input; done");
+
+        // #3 `quoted` means only that *some* part of a word was quoted, not that
+        // it is a single argument: `""$opts` and `"$@"` still produce multiple
+        // arguments, so a consumed option value that is not provably
+        // single-argument is rejected in both the `sort`/`file` and `read`
+        // validators; a quoted scalar stays one argument and is allowed.
+        assert!(
+            blocked("for opts in 'tmp -o result'; do sort -T \"\"$opts input; done").contains("computed or glob"),
+            "{}",
+            blocked("for opts in 'tmp -o result'; do sort -T \"\"$opts input; done")
+        );
+        assert!(
+            blocked("for p in 'prompt PATH'; do read -p \"\"$p; cat input; done").contains("cannot be inspected"),
+            "{}",
+            blocked("for p in 'prompt PATH'; do read -p \"\"$p; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T \"$@\" input; done").contains("computed or glob"),
+            "{}",
+            blocked("for f in x; do sort -T \"$@\" input; done")
+        );
+        // A provably single-argument quoted scalar value stays allowed.
+        allowed("for d in /tmp; do sort -T \"$d\" input; done");
+        allowed("for p in x; do read -p \"$p\"; cat input; done");
     }
 
     #[test]
