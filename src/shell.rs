@@ -28,6 +28,13 @@ pub struct Word {
     /// yet `$x` still splits — so callers that need a provably single argument
     /// (e.g. an option value that must not smuggle extra options) check this.
     pub splits: bool,
+    /// The word contains an expansion that can assign a shell variable when the
+    /// shell evaluates it: arithmetic `$((x = ...))` (assignment operators are
+    /// full arithmetic inside `$(( ))`) or a parameter expansion with an
+    /// assignment-capable operator (`${x:=y}`, `${x+=y}`, `${x::=y}`). Such an
+    /// expansion runs before the command it sits in, so a guard that inspects
+    /// the command's own words never sees the write.
+    pub assigns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,21 +92,107 @@ fn opens_loop_header(words: &[Word]) -> bool {
     false
 }
 
+/// Whether an arithmetic `$(( ... ))` body contains an assignment operator,
+/// which writes a shell variable when the expansion runs. Inside arithmetic,
+/// `=` and the compound forms (`+=`, `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`,
+/// `&=`, `|=`, `^=`) assign; a bare `=` is not a comparison operator there
+/// (equality is `==`), so any `=` that is not part of `==`, `<=`, `>=`, `!=`
+/// assigns. A `<<=` / `>>=` is an assignment, not the comparison `<=` / `>=`
+/// it ends with, so a `=` preceded by `<` / `>` only escapes classification as
+/// an assignment when that predecessor is not itself a shift. Nested
+/// `$( ( ... ) )` bodies arrive with their inner parens intact, so a nested
+/// assignment (`$(( (x = 1) + 2 ))`) is still seen.
+fn arithmetic_assigns(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '=' {
+            continue;
+        }
+        let prev = i.checked_sub(1).and_then(|p| chars.get(p)).copied();
+        let next = chars.get(i + 1).copied();
+        if next == Some('=') {
+            continue; // `==` (and the `=` of `<=`/`>=`/`!=` handled below)
+        }
+        match prev {
+            Some('=') | Some('!') => continue,
+            // `<=` / `>=` compare, but `<<=` / `>>=` assign.
+            Some('<') | Some('>') => {
+                let before = i.checked_sub(2).and_then(|p| chars.get(p)).copied();
+                if before == prev {
+                    return true; // `<<=` / `>>=`
+                }
+                continue;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Whether a `${ ... }` parameter-expansion body assigns its variable when the
+/// expansion runs: the assignment-capable operators `:=`, `::=`, `+=` (and
+/// `=`, which assigns only when the variable is unset — still a write) after a
+/// plain variable name or positional parameter. Test operators (`:-`, `:?`,
+/// `:+`, `-`, `?`, `+`), substring/length forms and pattern edits never
+/// assign, and neither do subscripted arrays (`${a[0]:=x}` assigns an element,
+/// not the variable the guard tracks, and the subscript itself is arithmetic —
+/// fail closed there is left to the dynamic-word rules).
+fn param_expansion_assigns(body: &str) -> bool {
+    let mut chars = body.chars().peekable();
+    // `$#` is a length prefix, not the parameter name.
+    if chars.peek() == Some(&'#') && body.len() > 1 {
+        chars.next();
+    }
+    // The parameter name: a plain identifier, a positional digit, or a special
+    // parameter. Anything else (subscript, indirection) is not a simple
+    // variable assignment this check needs to model.
+    match chars.peek().copied() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                chars.next();
+            }
+        }
+        Some(c) if c.is_ascii_digit() => {
+            while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+        Some(c) if "@*#?$!-".contains(c) => {
+            chars.next();
+        }
+        _ => return false,
+    }
+    let rest: String = chars.collect();
+    rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=")
+}
+
 /// Whether the words parsed so far are inside an open `[[ ... ]]` conditional,
 /// where `<` and `>` are string-comparison operators rather than redirections.
-/// `[[` need not be the first word — it can follow control keywords such as
-/// `do`/`then` in the same simple command (`do [[ $a > $b ]]`) — so scan for an
-/// opened-but-not-yet-closed `[[`.
+/// `[[` only has that meaning in command position — possibly behind leading
+/// control-flow keywords (`do [[ $a > $b ]]`, `! [[ ... ]]`, `if [[ ... ]]`,
+/// mirroring `permissions::loop_command_offset`). An `[[` that is an *operand*
+/// (`echo [[ > out`) is ordinary text, so its `>` is a real redirection and
+/// must not be treated as a comparison.
 fn in_conditional(words: &[Word]) -> bool {
     let mut open = false;
+    let mut seen_command = false;
     for w in words {
-        if w.quoted {
+        if w.quoted || w.dynamic {
+            // A quoted or computed word is never conditional syntax, and it
+            // occupies command position if none was taken yet.
+            if !seen_command {
+                seen_command = true;
+            }
             continue;
         }
         match w.text.as_str() {
-            "[[" => open = true,
-            "]]" => open = false,
-            _ => {}
+            "[[" if !seen_command => {
+                open = true;
+                seen_command = true;
+            }
+            "]]" if open => open = false,
+            "!" | "if" | "then" | "else" | "elif" | "do" | "{" | "}" | "fi" | "esac" if !seen_command => {}
+            _ => seen_command = true,
         }
     }
     open
@@ -589,6 +682,11 @@ impl Parser {
                 if !quoted {
                     word.splits = true;
                 }
+                // Arithmetic assignment operators (`$((x = 1))`, `$((x += 1))`)
+                // write a shell variable when the expansion runs.
+                if arithmetic_assigns(&body) {
+                    word.assigns = true;
+                }
             }
             Some('(') => {
                 self.pos += 1;
@@ -604,10 +702,16 @@ impl Parser {
                 let body = self.balanced('{', '}')?;
                 word.text.push_str(&format!("${{{body}}}"));
                 word.dynamic = true;
-                // `${arr[@]}` yields one argument per element even when quoted;
+                // `${arr[@]}` and the positional list `${@}` (plain or sliced,
+                // `${@:1}`) yield one argument per element even when quoted;
                 // any unquoted expansion word-splits.
-                if !quoted || body.contains("[@]") {
+                if !quoted || body.contains("[@]") || body.starts_with('@') {
                     word.splits = true;
+                }
+                // `${x:=y}`, `${x+=y}` and friends assign the variable when the
+                // expansion runs.
+                if param_expansion_assigns(&body) {
+                    word.assigns = true;
                 }
             }
             Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
