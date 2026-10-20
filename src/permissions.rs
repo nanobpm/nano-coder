@@ -4160,6 +4160,46 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_closes_review_round12_safety_gaps() {
+        // #1 (previously missed) An indirect parameter expansion `${!ref:=/etc}`
+        // assigns the variable `ref` points to, but the parser consumed `!` as
+        // the whole parameter and never saw the `:=`. The assignment operator
+        // after the indirect name must still flag the write — both in a command
+        // word and in an expanding heredoc body (which shares the helper).
+        assert!(
+            blocked("for f in x; do echo \"${!ref:=/etc}\"; cat input; done").contains("loop"),
+            "{}",
+            blocked("for f in x; do echo \"${!ref:=/etc}\"; cat input; done")
+        );
+        assert!(
+            blocked("for n in x; do : <<EOF\n${!ref:=/etc}\nEOF\ncat input; done").contains("here-document"),
+            "{}",
+            blocked("for n in x; do : <<EOF\n${!ref:=/etc}\nEOF\ncat input; done")
+        );
+        // A plain indirect read, and the name-enumeration form, stay allowed.
+        allowed("for f in x; do echo \"${!ref}\"; cat input; done");
+        allowed("for f in x; do echo \"${!prefix@}\"; cat input; done");
+
+        // #2 (previously missed) A comma or range nested inside another brace
+        // still expands the word to one argument per alternative, but the
+        // scanner only recognised separators at depth 1, so `-o{{a,b}}` slipped
+        // a file-writing option value past inspection. Nested expansion
+        // metadata must propagate.
+        assert!(
+            blocked("for f in x; do sort -T -o{{a,b}} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T -o{{a,b}} input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T {{1..3}} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T {{1..3}} input; done")
+        );
+        // A nested brace with no comma/range at any depth stays literal.
+        allowed("for f in x; do echo {{a}}; cat input; done");
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",

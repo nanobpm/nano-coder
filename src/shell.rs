@@ -173,7 +173,34 @@ fn param_expansion_assigns(body: &str) -> bool {
                 chars.next();
             }
         }
-        Some(c) if "@*#?$!-".contains(c) => {
+        // Indirection `${!name}` reads the variable named by `name`, but an
+        // assignment operator after the name still assigns through it:
+        // `${!ref:=/etc}` sets the variable `ref` points to. Consume the real
+        // name and fall through so the operator check below still runs —
+        // rejecting the assigning expansion does not require resolving `ref`.
+        Some('!') => {
+            chars.next();
+            match chars.peek().copied() {
+                Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+                    while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                        chars.next();
+                    }
+                }
+                Some(c) if c.is_ascii_digit() => {
+                    while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+                // `${!prefix@}` / `${!prefix*}` enumerate names (read-only);
+                // anything else is not a simple assignment target.
+                Some(c) if "@*".contains(c) => {
+                    chars.next();
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        Some(c) if "@*#?$-".contains(c) => {
             chars.next();
         }
         _ => return false,
@@ -1090,16 +1117,25 @@ impl Parser {
                                     break;
                                 }
                             }
-                            ',' if depth == 1 => {
+                            ',' => {
+                                // A comma at *any* brace depth is an
+                                // alternative separator for some enclosing
+                                // brace: `{{a,b},c}` and `-o{{a,b}}` both
+                                // expand to one argument per inner
+                                // alternative. Recognising only depth 1 left
+                                // nested lists (`-o{{a,b}}` → `-o{a}` /
+                                // `-o{b}`) unmarked, so propagate the split
+                                // from nested braces too.
                                 has_comma = true;
                                 word.text.push(c);
                                 self.pos += 1;
                             }
-                            '.' if depth == 1 && self.peek_at(1) == Some('.') => {
+                            '.' if self.peek_at(1) == Some('.') => {
                                 // A sequence range `{a..z}` / `{1..9}` /
-                                // `{1..9..2}` expands to one argument per step,
-                                // exactly like a comma list, so treat the `..`
-                                // marker the same way.
+                                // `{1..9..2}` expands to one argument per
+                                // step, exactly like a comma list — including
+                                // when nested inside another brace. Treat the
+                                // `..` marker the same way at any depth.
                                 has_range = true;
                                 word.text.push_str("..");
                                 self.pos += 2;
@@ -1381,5 +1417,45 @@ mod tests {
         assert!(!heredoc_body_assigns("no expansions here\n"), "literal body");
         // An escaped expansion is literal, so it does not assign.
         assert!(!heredoc_body_assigns("\\${d:=/etc}\n"), "escaped expansion is literal");
+    }
+
+    /// Round-12 advisory: an indirect parameter expansion `${!ref:=value}`
+    /// assigns the variable `ref` points to, so the assignment operator after
+    /// the indirect name must be detected — the parser must not stop at the
+    /// `!` and treat the rest as a plain read.
+    #[test]
+    fn indirect_expansion_assigns() {
+        let assign = parse("echo \"${!ref:=/etc}\"").unwrap().remove(0).words.remove(1);
+        assert!(assign.assigns, "${{!ref:=/etc}} assigns through the indirect name");
+        let plus = parse("echo \"${!ref+=/etc}\"").unwrap().remove(0).words.remove(1);
+        assert!(plus.assigns, "${{!ref+=/etc}} appends through the indirect name");
+        // A plain indirect read does not assign.
+        let read = parse("echo \"${!ref}\"").unwrap().remove(0).words.remove(1);
+        assert!(!read.assigns, "${{!ref}} only reads");
+        // Name-enumeration forms are read-only.
+        let names = parse("echo \"${!prefix@}\"").unwrap().remove(0).words.remove(1);
+        assert!(!names.assigns, "${{!prefix@}} enumerates names, no assignment");
+        // The same detection drives the expanding-heredoc scan, which shares
+        // this helper.
+        assert!(heredoc_body_assigns("${!ref:=/etc}\n"), "indirect assignment in a heredoc body");
+        assert!(!heredoc_body_assigns("${!ref}\n"), "indirect read in a heredoc body");
+    }
+
+    /// Round-12 advisory: a comma or range *nested* inside another brace still
+    /// expands the word to one argument per alternative/step, so it must mark
+    /// the word computed and splitting even though the separator is not at
+    /// depth 1 (`-o{{a,b}}` → `-o{a}` / `-o{b}`).
+    #[test]
+    fn nested_brace_expansion_marks_dynamic() {
+        let nested_comma = parse("sort -T -o{{a,b}} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(nested_comma.text, "-o{{a,b}}");
+        assert!(nested_comma.splits, "nested comma brace splits");
+        assert!(nested_comma.dynamic, "nested comma brace is a computed word");
+        let nested_range = parse("sort -T {{1..3}} input").unwrap().remove(0).words.remove(2);
+        assert!(nested_range.splits, "nested range brace splits");
+        assert!(nested_range.dynamic, "nested range brace is a computed word");
+        // A brace with no comma or range at any depth stays literal.
+        let plain = parse("sort {{a}} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "single nested brace word is not computed");
     }
 }
