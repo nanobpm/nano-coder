@@ -101,8 +101,17 @@ fn opens_loop_header(words: &[Word]) -> bool {
 /// it ends with, so a `=` preceded by `<` / `>` only escapes classification as
 /// an assignment when that predecessor is not itself a shift. Nested
 /// `$( ( ... ) )` bodies arrive with their inner parens intact, so a nested
-/// assignment (`$(( (x = 1) + 2 ))`) is still seen.
-fn arithmetic_assigns(body: &str) -> bool {
+/// assignment (`$(( (x = 1) + 2 ))`) is still seen. The prefix/postfix
+/// increment and decrement operators (`x++`, `--x`) also write their operand,
+/// so any `++` / `--` counts as an assignment too.
+pub(crate) fn arithmetic_assigns(body: &str) -> bool {
+    // `++` / `--` increment or decrement (and thus write) their operand.
+    // Arithmetic never needs two adjacent `+`/`-` for anything else (a double
+    // negation is written `- -x` with a space), so treating the bare digraph
+    // as an assignment is both correct and fail-closed.
+    if body.contains("++") || body.contains("--") {
+        return true;
+    }
     let chars: Vec<char> = body.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         if c != '=' {
@@ -134,9 +143,9 @@ fn arithmetic_assigns(body: &str) -> bool {
 /// `=`, which assigns only when the variable is unset — still a write) after a
 /// plain variable name or positional parameter. Test operators (`:-`, `:?`,
 /// `:+`, `-`, `?`, `+`), substring/length forms and pattern edits never
-/// assign, and neither do subscripted arrays (`${a[0]:=x}` assigns an element,
-/// not the variable the guard tracks, and the subscript itself is arithmetic —
-/// fail closed there is left to the dynamic-word rules).
+/// assign. An array subscript (`${a[i=1]}`, `${a[0]:=x}`) is itself an
+/// arithmetic context, so a subscript that assigns — or any element
+/// assignment — writes a variable and must be flagged too.
 fn param_expansion_assigns(body: &str) -> bool {
     let mut chars = body.chars().peekable();
     // `$#` is a length prefix, not the parameter name.
@@ -162,6 +171,21 @@ fn param_expansion_assigns(body: &str) -> bool {
         }
         _ => return false,
     }
+    // A subscript is an arithmetic context: `${a[i=1]}` sets `i` even when the
+    // outer expansion only reads it. Fail closed on any assigning subscript.
+    if chars.peek() == Some(&'[') {
+        chars.next();
+        let mut subscript = String::new();
+        for c in chars.by_ref() {
+            if c == ']' {
+                break;
+            }
+            subscript.push(c);
+        }
+        if arithmetic_assigns(&subscript) {
+            return true;
+        }
+    }
     let rest: String = chars.collect();
     rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=")
 }
@@ -170,7 +194,8 @@ fn param_expansion_assigns(body: &str) -> bool {
 /// where `<` and `>` are string-comparison operators rather than redirections.
 /// `[[` only has that meaning in command position — possibly behind leading
 /// control-flow keywords (`do [[ $a > $b ]]`, `! [[ ... ]]`, `if [[ ... ]]`,
-/// mirroring `permissions::loop_command_offset`). An `[[` that is an *operand*
+/// `while [[ ... ]]`, `until [[ ... ]]`, mirroring
+/// `permissions::loop_command_offset`). An `[[` that is an *operand*
 /// (`echo [[ > out`) is ordinary text, so its `>` is a real redirection and
 /// must not be treated as a comparison.
 fn in_conditional(words: &[Word]) -> bool {
@@ -191,7 +216,8 @@ fn in_conditional(words: &[Word]) -> bool {
                 seen_command = true;
             }
             "]]" if open => open = false,
-            "!" | "if" | "then" | "else" | "elif" | "do" | "{" | "}" | "fi" | "esac" if !seen_command => {}
+            "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "}" | "fi" | "esac"
+                if !seen_command => {}
             _ => seen_command = true,
         }
     }

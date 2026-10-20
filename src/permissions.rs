@@ -961,6 +961,10 @@ const DANGEROUS_LOOP_ASSIGNMENTS: &[&str] = &[
 const LOOP_EXEC_COMMANDS: &[&str] =
     &["bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "eval", "exec", "source", ".", "ssh", "xargs"];
 
+/// Numeric comparison operators inside `[[`/`[`/`test`. Bash evaluates the
+/// operands flanking these as arithmetic, so an operand may assign a variable.
+const ARITH_TEST_OPS: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+
 fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<(), String> {
     check_loop_side_effects(cmd, kind, phase)?;
     let rendered = command_text(cmd);
@@ -971,6 +975,23 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         }
         let name = word.text.split('=').next().unwrap_or_default().trim_end_matches('+');
         let name = name.split('[').next().unwrap_or(name);
+        // The *left-hand-side* subscript of an assignment (`a[PATH=0]=x`) is an
+        // arithmetic context, so it writes `PATH` even though the base name
+        // (`a`) looks inert. Only a `[` that directly follows the leading
+        // variable name is that subscript — brackets in the value
+        // (`foo=a[x=1]`) are literal/glob text, not arithmetic — so locate it
+        // past the identifier and reject any assigning subscript.
+        let id_len = word.text.find(|c: char| !(c == '_' || c.is_ascii_alphanumeric())).unwrap_or(word.text.len());
+        if word.text[id_len..].starts_with('[')
+            && let Some(close_rel) = word.text[id_len + 1..].find(']')
+            && crate::shell::arithmetic_assigns(&word.text[id_len + 1..id_len + 1 + close_rel])
+        {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns a shell variable \
+                 through the arithmetic array subscript of `{}`; rewrite it as explicit commands",
+                word.text
+            ));
+        }
         if DANGEROUS_LOOP_ASSIGNMENTS.contains(&name) {
             return Err(format!(
                 "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns `{name}`, which can \
@@ -1039,6 +1060,22 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         ));
     }
     let args = &cmd.words[program_index + 1..];
+    // `[[`/`[`/`test` numeric comparisons (`-eq`, `-ne`, `-lt`, `-le`, `-gt`,
+    // `-ge`) evaluate their operands as arithmetic, so an operand like `d=1`
+    // assigns a shell variable that no expansion flag or write collector sees.
+    // Reject such a test; string comparisons (`[[ $a == $b ]]`, `[ "$x" = "$y" ]`)
+    // and pure numeric ones (`[[ 1 -eq 2 ]]`) carry no assignment and stay
+    // allowed.
+    if matches!(program, "[[" | "[" | "test")
+        && args.iter().any(|w| ARITH_TEST_OPS.contains(&w.text.as_str()))
+        && let Some(operand) = args.iter().find(|w| crate::shell::arithmetic_assigns(&w.text))
+    {
+        return Err(format!(
+            "cannot allow `{kind}` loop: {phase} command `{rendered}` runs an arithmetic test whose \
+             operand `{}` assigns a shell variable; rewrite it as explicit commands",
+            operand.text
+        ));
+    }
     match program {
         // A computed word can arrive in option position. `sort` and `file`
         // have options that write a file or run a helper program, so a
@@ -2397,7 +2434,9 @@ fn insert_var_name(text: &str, out: &mut HashSet<String>) {
 /// loop outright whenever such a word sits in it).
 fn expansion_assigned_name(text: &str) -> Option<&str> {
     if let Some(start) = text.find("$((") {
-        let body = &text[start + 2..];
+        // Skip the full three-byte `$((` prefix; skipping two leaves a leading
+        // `(` so the identifier scan below would read an empty name.
+        let body = &text[start + 3..];
         let body = body.trim_start();
         let name_len = body
             .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
@@ -2714,6 +2753,21 @@ impl Guard<'_> {
                     starts.push(implicit.clone());
                 }
                 if narrowed {
+                    // A start path that expands a loop-bound variable resolves
+                    // to an unknown run-time value (`for d in /etc; do :; done;
+                    // find "$d" -name passwd -delete`). `resolve` reports that
+                    // as `Err`, which the `Ok(Some(..))` checks below silently
+                    // skip — so fail closed here rather than inspect a stale or
+                    // absent path.
+                    for start in &starts {
+                        if self.resolve(start).is_err() {
+                            return Err(format!(
+                                "`find -delete` start path `{}` expands a loop variable whose value \
+                                 cannot be determined; rewrite it as explicit commands",
+                                start.text
+                            ));
+                        }
+                    }
                     // A narrowed `-delete` still recurses from its start paths, so a
                     // catastrophic root (`find / -name passwd -delete`, `find ~ ...`,
                     // `find ~/Documents ...`, `find .git ...`) can wipe protected files.
@@ -3855,6 +3909,89 @@ mod tests {
             "{}",
             blocked("for f in x; do read -p \"${@}\"; cat input; done")
         );
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round8_safety_gaps() {
+        // #1 `[[` numeric comparisons (`-eq`, `-lt`, …) evaluate their operands
+        // as arithmetic, so an operand can assign a shell variable the guard
+        // never inspects. Reject the arithmetic test; keep string comparisons
+        // and pure numeric tests read-only.
+        assert!(
+            blocked("d=; for f in x; do [[ 1 -eq d=1 ]]; done; rm -rf \"${d:+/etc}\"")
+                .contains("arithmetic test"),
+            "{}",
+            blocked("d=; for f in x; do [[ 1 -eq d=1 ]]; done; rm -rf \"${d:+/etc}\"")
+        );
+        assert!(
+            blocked("for f in x; do [ 1 -eq d=1 ]; done").contains("arithmetic test"),
+            "{}",
+            blocked("for f in x; do [ 1 -eq d=1 ]; done")
+        );
+        allowed("for f in x; do [[ 1 -eq 2 ]] && echo hi; done");
+        allowed("for f in a z; do [[ \"$f\" == z ]] && echo \"$f\"; done");
+
+        // #2 An array-subscript assignment evaluates its subscript as
+        // arithmetic, so `a[PATH=0]=x` writes `PATH` though its base name looks
+        // inert. Reject any assigning subscript.
+        assert!(
+            blocked("for f in x; do a[PATH=0]=x; cat input; done")
+                .contains("arithmetic array subscript"),
+            "{}",
+            blocked("for f in x; do a[PATH=0]=x; cat input; done")
+        );
+        allowed("for f in x; do a[0]=x; echo done; done");
+        // A value containing brackets (`foo=a[x=1]`) is literal/glob text, not
+        // an arithmetic subscript, so it must stay allowed.
+        allowed("for f in x; do foo=a[x=1]; echo hi; done");
+
+        // #3 Arithmetic prefix/postfix `++`/`--` write their operand, so
+        // `$((d++))` must flag the word as assigning and loop-bind `d`.
+        assert!(
+            blocked("d=; for f in x; do echo \"$((d++))\"; done; rm -rf \"${d:+/etc}\"")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("d=; for f in x; do echo \"$((d++))\"; done; rm -rf \"${d:+/etc}\"")
+        );
+        assert!(
+            blocked("d=; for f in x; do echo \"$((--d))\"; done; rm -rf \"${d:+/etc}\"")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("d=; for f in x; do echo \"$((--d))\"; done; rm -rf \"${d:+/etc}\"")
+        );
+
+        // #4 A subscripted parameter expansion evaluates its arithmetic
+        // subscript, so `${a[PATH=0]:=x}` writes `PATH`. Flag the word as
+        // assigning so the loop guard rejects it.
+        assert!(
+            blocked("for f in x; do echo \"${a[PATH=0]:=x}\"; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("for f in x; do echo \"${a[PATH=0]:=x}\"; cat input; done")
+        );
+        allowed("for f in x; do echo \"${a[0]}\"; done");
+
+        // #5 An arithmetic assignment outside a loop must mark its destination
+        // unknown: the `$((` prefix is three bytes, so the name scan must skip
+        // all three or it reads an empty name and leaves `d` resolving to its
+        // stale pre-assignment value.
+        let e = check(&Policy::default(), "d=; echo \"$((d=1))\"; rm -rf \"${d:+/etc}\"");
+        assert!(e.is_err(), "RESULT: {e:?}");
+
+        // #6 A narrowed `find -delete` whose start path expands a loop-bound
+        // variable resolves to an unknown run-time value; fail closed instead
+        // of inspecting a stale/absent path.
+        assert!(
+            blocked("for d in /etc; do :; done; find \"$d\" -name passwd -delete")
+                .contains("cannot be determined"),
+            "{}",
+            blocked("for d in /etc; do :; done; find \"$d\" -name passwd -delete")
+        );
+
+        // #7 `while`/`until` are command-position keywords, so a following
+        // `[[ ... ]]` is a read-only condition, not a redirect.
+        allowed("while [[ z > m ]]; do echo z; break; done");
+        allowed("until [[ z > m ]]; do echo z; break; done");
     }
 
     #[test]
