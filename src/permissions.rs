@@ -689,23 +689,62 @@ struct LoopFrame {
 /// are restricted so no binding can turn a recognized destructive operation
 /// into an invisible one.
 fn expand_sequence(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>) -> Result<(), String> {
+    expand_sequence_with(parsed, depth, out, false)
+}
+
+/// `readonly` is set when the sequence is itself a loop header/condition
+/// substitution (`$(...)` lifted out of a `for`/`while` header): every command
+/// in it — including those inside a conditional branch or nested loop — must be
+/// provably read-only, since it runs on the parent shell each iteration.
+fn expand_sequence_with(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>, readonly: bool) -> Result<(), String> {
     let mut loops: Vec<LoopFrame> = Vec::new();
-    for simple in parsed {
+    let mut index = 0;
+    while let Some(simple) = parsed.get(index) {
         // A command substitution lifted out of a loop header or condition
         // (`for f in "$(printf x > out)"`, `while echo "$(touch out)"; do ...`)
         // is emitted by the parser before its loop, so no frame exists here yet.
         // Hold it to the loop's read-only rules regardless, then expand it so
         // its contents still face the ordinary guard.
         if simple.loop_header_sub {
-            check_readonly_loop_command(simple, "loop", "header or condition substitution")?;
-            expand(simple, depth, out)?;
+            // A header substitution is itself a command *sequence*
+            // (`$(if true; then echo input; fi)`, `$(for g in y; do cat "$g"; done)`),
+            // so classifying the raw first word would reject a read-only `if` or
+            // nested `for` outright. Reclassify the whole contiguous run of flagged
+            // commands as one sequence (recursing into conditional branches and
+            // nested loops) so a multi-command substitution keeps its body and
+            // closing keyword together; the read-only rules apply to each command.
+            let start = index;
+            while parsed.get(index).is_some_and(|s| s.loop_header_sub) {
+                index += 1;
+            }
+            let run = &parsed[start..index];
+            if run.iter().any(starts_readonly_loop_keyword) {
+                let text = run.iter().map(command_text).collect::<Vec<_>>().join("; ");
+                let reparsed = shell::parse_nested(&text, depth)?;
+                expand_sequence_with(&reparsed, depth + 1, out, true)?;
+            } else {
+                for cmd in run {
+                    check_readonly_loop_command(cmd, "loop", "header or condition substitution")?;
+                    expand(cmd, depth, out)?;
+                }
+            }
             continue;
         }
+        index += 1;
         let offset = loop_command_offset(&simple.words);
         let head = simple.words.get(offset).filter(|word| is_loop_keyword(word)).map(|word| word.text.as_str());
         let starts_loop = matches!(head, Some("for" | "select" | "while" | "until"));
         let closes_loop = head == Some("done") && !loops.is_empty();
         if loops.is_empty() && !starts_loop {
+            // Inside a read-only header substitution an ordinary command (a
+            // conditional branch, or a loop's condition/body) must still be
+            // read-only; outside one it faces the ordinary guard. Strip leading
+            // control keywords (`if`, `then`, `do`, ...) so the branch's actual
+            // command is classified, not the keyword.
+            if readonly {
+                let effective = Simple { words: simple.words[offset..].to_vec(), ..simple.clone() };
+                check_readonly_loop_command(&effective, "loop", "header or condition substitution")?;
+            }
             expand(simple, depth, out)?;
             continue;
         }
@@ -785,6 +824,23 @@ fn loop_command_offset(words: &[Word]) -> usize {
 
 fn is_loop_keyword(word: &Word) -> bool {
     !word.dynamic && !word.quoted
+}
+
+/// Whether a command lifted out of a loop header/condition substitution opens
+/// with a control or loop keyword (`if`, `for`, `while`, ...). Such a
+/// substitution is a command *sequence*, not a single read-only command, so it
+/// is classified by recursing into ordinary sequence classification rather than
+/// by checking its first word against the read-only command list (which would
+/// reject a read-only `if`/`for` outright). This inspects the *first* word:
+/// `loop_command_offset` skips `if`/`then`/`do`, so it cannot be reused here.
+fn starts_readonly_loop_keyword(simple: &Simple) -> bool {
+    simple.words.first().is_some_and(|word| {
+        is_loop_keyword(word)
+            && matches!(
+                word.text.as_str(),
+                "if" | "for" | "select" | "while" | "until" | "case" | "!" | "{" | "do" | "then" | "else" | "elif" | "fi" | "done" | "esac" | "}"
+            )
+    })
 }
 
 fn validate_loop_header(simple: &Simple, offset: usize, kind: &str) -> Result<(), String> {
@@ -964,10 +1020,15 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         // dynamic operand is acceptable only after `--`.
         "sort" => {
             check_loop_dynamic_option_position(args, cmd, kind, phase, program)?;
-            if has_short_option(args, 'o')
-                || has_long_option(args, "--output")
-                || has_long_option(args, "--compress-program")
-                || has_abbreviated_long_option(args, &["output", "compress-program"])
+            if has_short_option(args, 'o', SORT_SHORT_WITH_VALUE, SORT_LONG_WITH_VALUE)
+                || has_long_option(args, "--output", SORT_SHORT_WITH_VALUE, SORT_LONG_WITH_VALUE)
+                || has_long_option(args, "--compress-program", SORT_SHORT_WITH_VALUE, SORT_LONG_WITH_VALUE)
+                || has_abbreviated_long_option(
+                    args,
+                    &["output", "compress-program"],
+                    SORT_SHORT_WITH_VALUE,
+                    SORT_LONG_WITH_VALUE,
+                )
             {
                 return Err(format!(
                     "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `sort` option \
@@ -977,9 +1038,9 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         }
         "file" => {
             check_loop_dynamic_option_position(args, cmd, kind, phase, program)?;
-            if has_short_option(args, 'C')
-                || has_long_option(args, "--compile")
-                || has_abbreviated_long_option(args, &["compile"])
+            if has_short_option(args, 'C', FILE_SHORT_WITH_VALUE, FILE_LONG_WITH_VALUE)
+                || has_long_option(args, "--compile", FILE_SHORT_WITH_VALUE, FILE_LONG_WITH_VALUE)
+                || has_abbreviated_long_option(args, &["compile"], FILE_SHORT_WITH_VALUE, FILE_LONG_WITH_VALUE)
             {
                 return Err(format!(
                     "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `file` option \
@@ -1110,6 +1171,20 @@ fn check_loop_printf_destination(
             i += 1;
             break;
         }
+        // A word that cannot be an option (`$fmt`, `%s`, `PATH`) is the format
+        // string; stop scanning options and leave it to the format check below.
+        if !text.starts_with('-') {
+            break;
+        }
+        // A computed or glob option word hides whether it carries `-v` (a file
+        // named `-vPATH` turns `printf * ...` into `printf -vPATH ...`), so it
+        // must be rejected rather than skipped.
+        if arg.dynamic || arg.glob {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` passes a computed or glob \
+                 argument to `printf` where it could be read as an option; rewrite it as explicit commands"
+            ));
+        }
         if text == "-v" {
             match args.get(i + 1) {
                 Some(name) => reject_dangerous_loop_destination(name, kind, phase, rendered, "printf")?,
@@ -1141,6 +1216,15 @@ fn check_loop_printf_destination(
     // the `-v` check above, and a computed format could hide a `%n` from view.
     // Fail closed on both so a loop body cannot rebind a name through `printf`.
     if let Some(fmt) = args.get(i) {
+        // A glob format expands to a filename at run time, and a file named
+        // `%n` would turn the format into a variable write.
+        if fmt.glob {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` runs `printf` with a format \
+                 produced by filename expansion, which could write shell variables; rewrite it as \
+                 explicit commands"
+            ));
+        }
         if fmt.dynamic {
             return Err(format!(
                 "cannot allow `{kind}` loop: {phase} command `{rendered}` runs `printf` with a format \
@@ -1189,6 +1273,82 @@ fn printf_format_writes(fmt: &str) -> bool {
     false
 }
 
+/// Short options (letters) that consume the following word as their value for
+/// `sort`. A standalone `--` can be such a value (`sort -T -- -o result` runs
+/// `-T --`), so it is not always the option terminator.
+const SORT_SHORT_WITH_VALUE: &str = "knmotT";
+/// Long options (in `--opt value` form) that consume the following word for
+/// `sort`.
+const SORT_LONG_WITH_VALUE: &[&str] = &[
+    "--batch-size",
+    "--buffer-size",
+    "--compress-program",
+    "--debug",
+    "--files0-from",
+    "--key",
+    "--merge",
+    "--output",
+    "--random-source",
+    "--separator",
+    "--temporary-directory",
+];
+
+/// Short options that consume the following word for `file`.
+const FILE_SHORT_WITH_VALUE: &str = "mMdf";
+/// Long options (in `--opt value` form) that consume the following word for
+/// `file`.
+const FILE_LONG_WITH_VALUE: &[&str] = &["--magic-file", "--exclude", "--exclude-quiet"];
+
+/// The option-position words of a `sort`/`file` invocation: every word before a
+/// *real* `--` terminator, with value-taking options consuming their value word
+/// so a standalone `--` used as a value (`sort -T --`) is not mistaken for the
+/// terminator. Computed/glob words are included (they occupy option position);
+/// words at and after a real terminator are operands and excluded.
+fn option_position_words<'a>(args: &'a [Word], short_with_value: &str, long_with_value: &[&str]) -> Vec<&'a Word> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            break;
+        }
+        // A computed or glob word occupies option position (a file named
+        // `-oresult` turns `sort *` into `sort -oresult`), so yield it — but it
+        // is not a *known* option, so it consumes no value word.
+        if arg.dynamic || arg.glob {
+            out.push(arg);
+            i += 1;
+            continue;
+        }
+        if !text.starts_with('-') || text == "-" {
+            i += 1;
+            continue;
+        }
+        out.push(arg);
+        let consume_next = if let Some(body) = text.strip_prefix("--") {
+            // `--opt=value` carries its value in the same word; only the
+            // space-separated `--opt value` form consumes the next word.
+            !body.contains('=') && long_with_value.contains(&text)
+        } else {
+            // A value-taking short option consumes the next word only when it is
+            // the last letter of its bundle; otherwise the rest of the same word
+            // is its value.
+            let opts = &text[1..];
+            opts.chars().position(|c| short_with_value.contains(c)).is_some_and(|pos| pos + 1 == opts.chars().count())
+        };
+        i += if consume_next { 2 } else { 1 };
+    }
+    out
+}
+
+/// The *static* (known) option words, for the dangerous-option scans.
+fn option_words<'a>(args: &'a [Word], short_with_value: &str, long_with_value: &[&str]) -> Vec<&'a Word> {
+    option_position_words(args, short_with_value, long_with_value)
+        .into_iter()
+        .filter(|arg| !arg.dynamic && !arg.glob)
+        .collect()
+}
+
 fn check_loop_dynamic_option_position(
     args: &[Word],
     cmd: &Simple,
@@ -1196,10 +1356,12 @@ fn check_loop_dynamic_option_position(
     phase: &str,
     program: &str,
 ) -> Result<(), String> {
-    for arg in args {
-        if arg.text == "--" {
-            break;
-        }
+    let (short, long) = match program {
+        "sort" => (SORT_SHORT_WITH_VALUE, SORT_LONG_WITH_VALUE),
+        "file" => (FILE_SHORT_WITH_VALUE, FILE_LONG_WITH_VALUE),
+        _ => ("", &[][..]),
+    };
+    for arg in option_position_words(args, short, long) {
         // Unquoted globs expand to filenames that can begin with `-` (a file
         // named `-oresult` turns `sort *` into `sort -oresult ...`), so they are
         // as unsafe as a computed word in option position unless `--` precedes them.
@@ -1215,15 +1377,15 @@ fn check_loop_dynamic_option_position(
     Ok(())
 }
 
-fn has_short_option(args: &[Word], letter: char) -> bool {
-    args.iter().take_while(|arg| arg.text != "--").any(|arg| {
+fn has_short_option(args: &[Word], letter: char, short_with_value: &str, long_with_value: &[&str]) -> bool {
+    option_words(args, short_with_value, long_with_value).iter().any(|arg| {
         arg.text.starts_with('-') && !arg.text.starts_with("--") && arg.text.len() > 1 && arg.text[1..].contains(letter)
     })
 }
 
-fn has_long_option(args: &[Word], name: &str) -> bool {
-    args.iter()
-        .take_while(|arg| arg.text != "--")
+fn has_long_option(args: &[Word], name: &str, short_with_value: &str, long_with_value: &[&str]) -> bool {
+    option_words(args, short_with_value, long_with_value)
+        .iter()
         .any(|arg| arg.text == name || arg.text.starts_with(&format!("{name}=")))
 }
 
@@ -1233,8 +1395,13 @@ fn has_long_option(args: &[Word], name: &str) -> bool {
 /// that could still resolve to a dangerous option is unsafe too, so a non-empty
 /// prefix of a dangerous name is rejected rather than inspected character by
 /// character — fail closed on the whole class of abbreviations.
-fn has_abbreviated_long_option(args: &[Word], dangerous: &[&str]) -> bool {
-    args.iter().take_while(|arg| arg.text != "--").any(|arg| {
+fn has_abbreviated_long_option(
+    args: &[Word],
+    dangerous: &[&str],
+    short_with_value: &str,
+    long_with_value: &[&str],
+) -> bool {
+    option_words(args, short_with_value, long_with_value).iter().any(|arg| {
         let Some(body) = arg.text.strip_prefix("--") else { return false };
         let name = body.split('=').next().unwrap_or(body);
         !name.is_empty() && dangerous.iter().any(|full| full.starts_with(name))
@@ -1866,6 +2033,12 @@ fn loop_bound_vars(commands: &[Simple]) -> HashSet<String> {
             {
                 out.insert(variable.text.clone());
             }
+            // `select` also writes the raw input line to `REPLY` on every
+            // iteration — even for an invalid selection — so `REPLY` is
+            // loop-bound whether or not the pick names a variable.
+            if head == Some("select") {
+                out.insert("REPLY".to_string());
+            }
             // A `while`/`until` condition on the same command can rebind a name
             // too (`while read d; do :; done`); collect its writes before the
             // body opens so a later `$d` cannot resolve to a pre-loop literal.
@@ -1912,7 +2085,30 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
         i += 1;
     }
     let Some(program) = words.get(i) else { return };
-    let args = &words[i + 1..];
+    // Unwrap the `builtin`/`command` wrappers the read-only classifier also
+    // unwraps, so a wrapped `read`/`printf -v` still records its destination
+    // (`builtin printf -v d '%s' /etc` rebinds `d`). Lookup-only `command -v/-V`
+    // writes nothing, so it is left alone.
+    let mut program_index = i;
+    match program.text.as_str() {
+        "builtin" => program_index = i + 1,
+        "command" => {
+            let mut j = i + 1;
+            while words.get(j).is_some_and(|w| w.text == "-p") {
+                j += 1;
+            }
+            if words.get(j).is_some_and(|w| matches!(w.text.as_str(), "-v" | "-V")) {
+                return;
+            }
+            if words.get(j).is_some_and(|w| w.text == "--") {
+                j += 1;
+            }
+            program_index = j;
+        }
+        _ => {}
+    }
+    let Some(program) = words.get(program_index) else { return };
+    let args = &words[program_index + 1..];
     match basename(&program.text) {
         "read" => collect_read_destinations(args, out),
         "printf" => collect_printf_destination(args, out),
@@ -1921,10 +2117,12 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
 }
 
 /// Destination names written by `read` (`read NAME`, `read -a NAME`, clustered
-/// `-aNAME`), skipping value-taking options. Names computed at run time cannot
-/// be recorded, but `check_loop_read_destinations` already rejects those.
+/// `-aNAME`), skipping value-taking options. A `read` with no destination word
+/// (and no `-a ARRAY`) writes the implicit `REPLY`. Names computed at run time
+/// cannot be recorded, but `check_loop_read_destinations` already rejects those.
 fn collect_read_destinations(args: &[Word], out: &mut HashSet<String>) {
     let mut i = 0;
+    let mut saw_array = false;
     while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
         if text == "--" {
@@ -1939,6 +2137,7 @@ fn collect_read_destinations(args: &[Word], out: &mut HashSet<String>) {
         while k < letters.len() {
             let letter = letters[k];
             if letter == 'a' {
+                saw_array = true;
                 if k + 1 < letters.len() {
                     insert_var_name(&letters[k + 1..].iter().collect::<String>(), out);
                 } else {
@@ -1959,8 +2158,14 @@ fn collect_read_destinations(args: &[Word], out: &mut HashSet<String>) {
         }
         i += 1;
     }
-    for name in &args[i.min(args.len())..] {
+    let destinations = &args[i.min(args.len())..];
+    for name in destinations {
         insert_var_name(&name.text, out);
+    }
+    // `read` with no destination (and no `-a ARRAY`) writes the implicit
+    // `REPLY`, so it rebinds `REPLY` even though no word names it.
+    if destinations.is_empty() && !saw_array {
+        out.insert("REPLY".to_string());
     }
 }
 
@@ -3063,6 +3268,113 @@ mod tests {
         );
         // A read-only redirect-target substitution in a loop condition stays allowed.
         allowed("while read line < \"$(echo input)\"; do cat input; break; done");
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round4_safety_gaps() {
+        // #1 A header substitution is itself a command sequence, so a read-only
+        // `if` or nested `for` inside it must be classified command-by-command,
+        // not rejected on its first keyword.
+        allowed("for f in \"$(if true; then echo input; fi)\"; do cat \"$f\"; done");
+        allowed("for f in \"$(for g in y; do echo \"$g\"; done)\"; do cat \"$f\"; done");
+        // ...but a writing command anywhere inside the sequence is still rejected.
+        assert!(
+            blocked("for f in \"$(if true; then touch out; fi)\"; do :; done")
+                .contains("not a known read-only command"),
+            "{}",
+            blocked("for f in \"$(if true; then touch out; fi)\"; do :; done")
+        );
+        assert!(
+            blocked("for f in \"$(for g in y; do touch \"$g\"; done)\"; do :; done")
+                .contains("not a known read-only command"),
+            "{}",
+            blocked("for f in \"$(for g in y; do touch \"$g\"; done)\"; do :; done")
+        );
+
+        // #2 A computed or glob `printf` option word can carry `-v` (a file named
+        // `-vPATH` turns `printf * ...` into `printf -vPATH ...`), and a glob
+        // format can expand to a `%n` filename. Reject both; operands after a
+        // literal format stay dynamic-tolerant.
+        assert!(
+            blocked("for opt in v; do printf -$opt PATH '%s' /tmp/evil; cat input; done")
+                .contains("computed or glob"),
+            "{}",
+            blocked("for opt in v; do printf -$opt PATH '%s' /tmp/evil; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do printf %* PATH; cat input; done").contains("filename expansion"),
+            "{}",
+            blocked("for f in x; do printf %* PATH; cat input; done")
+        );
+        allowed("for f in x; do printf '%s\\n' \"$f\"; done");
+
+        // #3 A standalone `--` can be an option *value* rather than the option
+        // terminator: `sort -T -- -o result` runs `-T --`, leaving `-o result`
+        // to overwrite `result`. Value-aware parsing must keep scanning past it.
+        assert!(
+            blocked("for f in input; do sort -T -- -o result input; done").contains("writes a file"),
+            "{}",
+            blocked("for f in input; do sort -T -- -o result input; done")
+        );
+        // A real `--` terminator still ends the option scan.
+        allowed("for f in input; do sort -- -o input; done");
+
+        // #4 The write collector must unwrap `builtin`/`command` the way the
+        // read-only classifier does, so a wrapped `printf -v`/`read` rebind is
+        // not checked against a stale pre-loop literal.
+        assert!(
+            blocked("d=./scratch; for f in x; do builtin printf -v d '%s' /etc; done; rm -rf \"$d\"")
+                .contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for f in x; do builtin printf -v d '%s' /etc; done; rm -rf \"$d\"")
+        );
+        assert!(
+            blocked("d=./scratch; for f in x; do command read d; done; rm -rf \"$d\"").contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for f in x; do command read d; done; rm -rf \"$d\"")
+        );
+
+        // #5 `read` with no destination writes the implicit `REPLY`, and `select`
+        // writes the raw input line to `REPLY` even for an invalid pick, so both
+        // leave `REPLY` holding a run-time value.
+        assert!(
+            blocked("REPLY=./scratch; while read -r; do break; done; rm -rf \"$REPLY\"")
+                .contains("loop variable"),
+            "{}",
+            blocked("REPLY=./scratch; while read -r; do break; done; rm -rf \"$REPLY\"")
+        );
+        assert!(
+            blocked("REPLY=./scratch; select f in x; do break; done; rm -rf \"$REPLY\"")
+                .contains("loop variable"),
+            "{}",
+            blocked("REPLY=./scratch; select f in x; do break; done; rm -rf \"$REPLY\"")
+        );
+
+        // Edge cases for the header-substitution sequence classification (#1):
+        // two substitutions in one header form two separate runs, and a writing
+        // command in the second is still caught.
+        allowed("for f in \"$(echo a)\" \"$(echo b)\"; do cat \"$f\"; done");
+        assert!(
+            blocked("for f in \"$(echo a)\" \"$(touch out)\"; do :; done").contains("not a known read-only command"),
+            "{}",
+            blocked("for f in \"$(echo a)\" \"$(touch out)\"; do :; done")
+        );
+        // A `select` header with a substitution routes through classification too.
+        assert!(
+            blocked("select f in \"$(touch out)\"; do :; done").contains("not a known read-only command"),
+            "{}",
+            blocked("select f in \"$(touch out)\"; do :; done")
+        );
+
+        // Edge cases for value-aware option parsing (#3): a value-taking option
+        // consumes its value word, so a dangerous option after it is still seen.
+        assert!(
+            blocked("for f in input; do sort -T -- --output=result input; done").contains("writes a file"),
+            "{}",
+            blocked("for f in input; do sort -T -- --output=result input; done")
+        );
+        // A benign value-taking option with a real terminator stays allowed.
+        allowed("for f in input; do sort -t : -- input; done");
     }
 
     #[test]
