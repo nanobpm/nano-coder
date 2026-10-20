@@ -4242,6 +4242,28 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_closes_review_round14_safety_gaps() {
+        // (previously missed) A positional/array list can hide behind *several*
+        // levels of nested scalar defaults. Skipping to the closing brace of an
+        // outer `${...}` missed it, leaving the quoted word a single argument so
+        // a file-writing option value slipped through
+        // (`sort -T "${outer:-${inner:-"$@"}}"` → `-T /tmp -oresult`). Scanning
+        // now recurses into each nested default.
+        for cmd in [
+            "for f in x; do sort -T \"${outer:-${inner:-\"$@\"}}\" input; done",
+            "for f in x; do sort -T \"${a:-${b:-${c:-\"$@\"}}}\" input; done",
+            "for f in x; do sort -T \"${outer:-${inner:-\"${arr[@]}\"}}\" input; done",
+        ] {
+            assert!(blocked(cmd).contains("sort"), "{}", blocked(cmd));
+        }
+        // A nested scalar default, however deep, stays a single argument.
+        allowed("for f in x; do sort -T \"${outer:-${inner:-\"$dir\"}}\" input; done");
+        // A nested length count stays a scalar (no false positive from the old
+        // `contains(\"[@]\")` substring test).
+        allowed("for f in x; do sort -T \"${outer:-${#arr[@]}}\" input; done");
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",

@@ -278,19 +278,22 @@ fn nested_list_expansion(body: &str) -> bool {
                         j += 1;
                     }
                     let inner: String = chars[i + 2..j].iter().collect();
-                    // A leading `#` is the length prefix (`${#arr[@]}` is the
-                    // element *count*, a scalar), not a list — skip it.
-                    if inner.starts_with('#') {
-                        i = j + 1;
-                        continue;
+                    // This `${...}` is itself a whole-list expansion — `${@}` /
+                    // `${*:1}` (positional) or `${arr[@]}` / `${arr[*]}` (array),
+                    // each yielding one argument per element. `top_level_list`
+                    // already excludes the `${#...}` length form (a scalar
+                    // count) and only honours the outer expansion's own
+                    // subscript, so a `[@]` buried in a nested default does not
+                    // misfire here.
+                    if top_level_list(&inner) {
+                        return true;
                     }
-                    // `${@}` / `${*:1}` (positional) and `${arr[@]}` /
-                    // `${arr[*]}` (array) each yield one argument per element.
-                    if inner.starts_with('@')
-                        || inner.starts_with('*')
-                        || inner.contains("[@]")
-                        || inner.contains("[*]")
-                    {
+                    // Otherwise keep scanning *inside* it: a positional/array
+                    // list can hide in a nested default
+                    // (`${outer:-${inner:-"$@"}}`), so skipping straight to the
+                    // closing brace would miss it. A leading `#` is the length
+                    // prefix, whose body is a scalar count — never a list.
+                    if !inner.starts_with('#') && nested_list_expansion(&inner) {
                         return true;
                     }
                     i = j + 1;
@@ -1606,6 +1609,22 @@ mod tests {
         assert!(top_at.splits, "${{@}} is a positional list");
         let top_arr = parse("sort -T \"${arr[@]}\" input").unwrap().remove(0).words.remove(2);
         assert!(top_arr.splits, "${{arr[@]}} is an array list");
+        // Round-14 advisory: a positional/array list can hide behind *several*
+        // levels of nested defaults — scanning must recurse into each nested
+        // `${...}` rather than skipping to its closing brace.
+        let deep_at = parse("sort -T \"${outer:-${inner:-\"$@\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deep_at.splits, "${{outer:-${{inner:-\"$@\"}}}} reaches the positional list");
+        let deeper = parse("sort -T \"${a:-${b:-${c:-\"$@\"}}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deeper.splits, "three levels of defaults still reach the positional list");
+        let deep_arr = parse("sort -T \"${outer:-${inner:-\"${arr[@]}\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(deep_arr.splits, "a nested array list splits through nested defaults");
+        // A nested *scalar* default, however deep, must not split.
+        let deep_scalar = parse("sort -T \"${outer:-${inner:-\"$dir\"}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!deep_scalar.splits, "a nested scalar default stays a single argument");
+        // A nested *length* count, however deep, stays a scalar (no false
+        // positive from the old `contains(\"[@]\")` substring test).
+        let deep_count = parse("sort -T \"${outer:-${#arr[@]}}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!deep_count.splits, "a nested ${{#arr[@]}} count is a scalar, not a list");
     }
 
     /// Round-13 advisory: unquoted wildcards inside a brace expansion keep
