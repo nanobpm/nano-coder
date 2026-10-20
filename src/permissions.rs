@@ -727,8 +727,7 @@ fn expand_sequence_with(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>, 
                 // already form a command sequence, so clearing the flag and
                 // recursing keeps loop frames intact and applies the read-only
                 // rules to each command — redirects and all.
-                let cleared: Vec<Simple> =
-                    run.iter().map(|s| Simple { loop_header_sub: false, ..s.clone() }).collect();
+                let cleared: Vec<Simple> = run.iter().map(|s| Simple { loop_header_sub: false, ..s.clone() }).collect();
                 expand_sequence_with(&cleared, depth, out, true)?;
             } else {
                 for cmd in run {
@@ -846,7 +845,21 @@ fn starts_readonly_loop_keyword(simple: &Simple) -> bool {
         is_loop_keyword(word)
             && matches!(
                 word.text.as_str(),
-                "if" | "for" | "select" | "while" | "until" | "case" | "!" | "{" | "do" | "then" | "else" | "elif" | "fi" | "done" | "esac" | "}"
+                "if" | "for"
+                    | "select"
+                    | "while"
+                    | "until"
+                    | "case"
+                    | "!"
+                    | "{"
+                    | "do"
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "fi"
+                    | "done"
+                    | "esac"
+                    | "}"
             )
     })
 }
@@ -1188,12 +1201,7 @@ fn read_option_takes_value(letter: char) -> bool {
     matches!(letter, 'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u')
 }
 
-fn check_loop_read_destinations(
-    args: &[Word],
-    kind: &str,
-    phase: &str,
-    rendered: &str,
-) -> Result<(), String> {
+fn check_loop_read_destinations(args: &[Word], kind: &str, phase: &str, rendered: &str) -> Result<(), String> {
     let uninspectable = || {
         format!(
             "cannot allow `{kind}` loop: {phase} command `{rendered}` uses a `read` option that cannot \
@@ -1266,12 +1274,7 @@ fn check_loop_read_destinations(
     Ok(())
 }
 
-fn check_loop_printf_destination(
-    args: &[Word],
-    kind: &str,
-    phase: &str,
-    rendered: &str,
-) -> Result<(), String> {
+fn check_loop_printf_destination(args: &[Word], kind: &str, phase: &str, rendered: &str) -> Result<(), String> {
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
@@ -2191,7 +2194,9 @@ fn assignments(commands: &[Simple]) -> HashMap<String, Option<String>> {
         // This scan is separate from the assignment-word loop below, which
         // stops at the first non-assignment word (the program).
         for word in &cmd.words {
-            if word.assigns && let Some(name) = expansion_assigned_name(&word.text) {
+            if word.assigns
+                && let Some(name) = expansion_assigned_name(&word.text)
+            {
                 out.insert(name.to_string(), None);
             }
         }
@@ -2295,7 +2300,9 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
     // the assigned value after the loop. Record those names too, or a later
     // destructive operand resolves against a stale pre-loop literal.
     for word in words {
-        if word.assigns && let Some(name) = expansion_assigned_name(&word.text) {
+        if word.assigns
+            && let Some(name) = expansion_assigned_name(&word.text)
+        {
             insert_var_name(name, out);
         }
     }
@@ -2451,17 +2458,13 @@ fn expansion_assigned_name(text: &str) -> Option<&str> {
         // `(` so the identifier scan below would read an empty name.
         let body = &text[start + 3..];
         let body = body.trim_start();
-        let name_len = body
-            .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
-            .unwrap_or(body.len());
+        let name_len = body.find(|c: char| !(c == '_' || c.is_ascii_alphanumeric())).unwrap_or(body.len());
         let name = &body[..name_len];
         return if is_shell_identifier(name) { Some(name) } else { None };
     }
     if let Some(start) = text.find("${") {
         let body = &text[start + 2..];
-        let name_len = body
-            .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
-            .unwrap_or(body.len());
+        let name_len = body.find(|c: char| !(c == '_' || c.is_ascii_alphanumeric())).unwrap_or(body.len());
         let name = &body[..name_len];
         return if is_shell_identifier(name) { Some(name) } else { None };
     }
@@ -2473,8 +2476,7 @@ fn references_vars(text: &str, names: &HashSet<String>) -> bool {
     if names.is_empty() {
         return false;
     }
-    static VAR_REF: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    static VAR_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").unwrap());
     VAR_REF.captures_iter(text).any(|caps| names.contains(&caps[1]))
 }
 
@@ -3534,7 +3536,8 @@ mod tests {
         // #7 A loop header behind a leading control keyword (`then`, `!`) still runs
         // its header substitution on the parent shell; it must be flagged.
         assert!(
-            blocked("if true; then for f in \"$(touch out)\"; do :; done; fi").contains("not a known read-only command"),
+            blocked("if true; then for f in \"$(touch out)\"; do :; done; fi")
+                .contains("not a known read-only command"),
             "{}",
             blocked("if true; then for f in \"$(touch out)\"; do :; done; fi")
         );
@@ -3577,8 +3580,7 @@ mod tests {
         // format can expand to a `%n` filename. Reject both; operands after a
         // literal format stay dynamic-tolerant.
         assert!(
-            blocked("for opt in v; do printf -$opt PATH '%s' /tmp/evil; cat input; done")
-                .contains("computed or glob"),
+            blocked("for opt in v; do printf -$opt PATH '%s' /tmp/evil; cat input; done").contains("computed or glob"),
             "{}",
             blocked("for opt in v; do printf -$opt PATH '%s' /tmp/evil; cat input; done")
         );
@@ -3619,14 +3621,12 @@ mod tests {
         // writes the raw input line to `REPLY` even for an invalid pick, so both
         // leave `REPLY` holding a run-time value.
         assert!(
-            blocked("REPLY=./scratch; while read -r; do break; done; rm -rf \"$REPLY\"")
-                .contains("loop variable"),
+            blocked("REPLY=./scratch; while read -r; do break; done; rm -rf \"$REPLY\"").contains("loop variable"),
             "{}",
             blocked("REPLY=./scratch; while read -r; do break; done; rm -rf \"$REPLY\"")
         );
         assert!(
-            blocked("REPLY=./scratch; select f in x; do break; done; rm -rf \"$REPLY\"")
-                .contains("loop variable"),
+            blocked("REPLY=./scratch; select f in x; do break; done; rm -rf \"$REPLY\"").contains("loop variable"),
             "{}",
             blocked("REPLY=./scratch; select f in x; do break; done; rm -rf \"$REPLY\"")
         );
@@ -3857,7 +3857,8 @@ mod tests {
             blocked("for f in x; do echo \"$((n <<= 1))\"; cat input; done")
         );
         assert!(
-            blocked("d=; for f in \"$((n=1))\"; do echo \"$f\"; done; rm -rf \"$d\"").contains("assigns a shell variable"),
+            blocked("d=; for f in \"$((n=1))\"; do echo \"$f\"; done; rm -rf \"$d\"")
+                .contains("assigns a shell variable"),
             "{}",
             blocked("d=; for f in \"$((n=1))\"; do echo \"$f\"; done; rm -rf \"$d\"")
         );
@@ -3931,8 +3932,7 @@ mod tests {
         // never inspects. Reject the arithmetic test; keep string comparisons
         // and pure numeric tests read-only.
         assert!(
-            blocked("d=; for f in x; do [[ 1 -eq d=1 ]]; done; rm -rf \"${d:+/etc}\"")
-                .contains("arithmetic test"),
+            blocked("d=; for f in x; do [[ 1 -eq d=1 ]]; done; rm -rf \"${d:+/etc}\"").contains("arithmetic test"),
             "{}",
             blocked("d=; for f in x; do [[ 1 -eq d=1 ]]; done; rm -rf \"${d:+/etc}\"")
         );
@@ -3948,8 +3948,7 @@ mod tests {
         // arithmetic, so `a[PATH=0]=x` writes `PATH` though its base name looks
         // inert. Reject any assigning subscript.
         assert!(
-            blocked("for f in x; do a[PATH=0]=x; cat input; done")
-                .contains("arithmetic array subscript"),
+            blocked("for f in x; do a[PATH=0]=x; cat input; done").contains("arithmetic array subscript"),
             "{}",
             blocked("for f in x; do a[PATH=0]=x; cat input; done")
         );
@@ -3977,8 +3976,7 @@ mod tests {
         // subscript, so `${a[PATH=0]:=x}` writes `PATH`. Flag the word as
         // assigning so the loop guard rejects it.
         assert!(
-            blocked("for f in x; do echo \"${a[PATH=0]:=x}\"; cat input; done")
-                .contains("assigns a shell variable"),
+            blocked("for f in x; do echo \"${a[PATH=0]:=x}\"; cat input; done").contains("assigns a shell variable"),
             "{}",
             blocked("for f in x; do echo \"${a[PATH=0]:=x}\"; cat input; done")
         );
@@ -3995,8 +3993,7 @@ mod tests {
         // variable resolves to an unknown run-time value; fail closed instead
         // of inspecting a stale/absent path.
         assert!(
-            blocked("for d in /etc; do :; done; find \"$d\" -name passwd -delete")
-                .contains("cannot be determined"),
+            blocked("for d in /etc; do :; done; find \"$d\" -name passwd -delete").contains("cannot be determined"),
             "{}",
             blocked("for d in /etc; do :; done; find \"$d\" -name passwd -delete")
         );
@@ -4041,8 +4038,7 @@ mod tests {
             blocked("for f in x; do echo \"${missing:-${d:=/etc}}\"; cat input; done")
         );
         assert!(
-            blocked("for f in x; do echo \"${text:PATH=0:1}\"; cat input; done")
-                .contains("assigns a shell variable"),
+            blocked("for f in x; do echo \"${text:PATH=0:1}\"; cat input; done").contains("assigns a shell variable"),
             "{}",
             blocked("for f in x; do echo \"${text:PATH=0:1}\"; cat input; done")
         );
@@ -4072,8 +4068,7 @@ mod tests {
         // A parameter assignment inside a brace alternative keeps its assign
         // metadata, so a later destructive command sees the real write.
         assert!(
-            blocked("for f in x; do echo {x,${d:=/etc}}; cat input; done")
-                .contains("assigns a shell variable"),
+            blocked("for f in x; do echo {x,${d:=/etc}}; cat input; done").contains("assigns a shell variable"),
             "{}",
             blocked("for f in x; do echo {x,${d:=/etc}}; cat input; done")
         );
@@ -4100,8 +4095,7 @@ mod tests {
         // #3 (advisory) The substring *length* field is arithmetic too, so an
         // assignment there changes command lookup for the following command.
         assert!(
-            blocked("for f in x; do echo \"${text:0:PATH=0}\"; cat input; done")
-                .contains("assigns a shell variable"),
+            blocked("for f in x; do echo \"${text:0:PATH=0}\"; cat input; done").contains("assigns a shell variable"),
             "{}",
             blocked("for f in x; do echo \"${text:0:PATH=0}\"; cat input; done")
         );
@@ -4116,14 +4110,12 @@ mod tests {
         // so a `${text:PATH=0:1}` in the body rebinds command lookup even
         // though the command's own words look inert.
         assert!(
-            blocked("for n in x; do : <<EOF\n${text:PATH=0:1}\nEOF\ncat input; done")
-                .contains("here-document"),
+            blocked("for n in x; do : <<EOF\n${text:PATH=0:1}\nEOF\ncat input; done").contains("here-document"),
             "{}",
             blocked("for n in x; do : <<EOF\n${text:PATH=0:1}\nEOF\ncat input; done")
         );
         assert!(
-            blocked("for n in x; do : <<EOF\n${d:=/etc}\nEOF\ncat input; done")
-                .contains("here-document"),
+            blocked("for n in x; do : <<EOF\n${d:=/etc}\nEOF\ncat input; done").contains("here-document"),
             "{}",
             blocked("for n in x; do : <<EOF\n${d:=/etc}\nEOF\ncat input; done")
         );

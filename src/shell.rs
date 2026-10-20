@@ -337,9 +337,7 @@ fn top_level_list(body: &str) -> bool {
         }
         _ => return false,
     }
-    matches!(chars.next(), Some('['))
-        && matches!(chars.next(), Some('@') | Some('*'))
-        && chars.next() == Some(']')
+    matches!(chars.next(), Some('[')) && matches!(chars.next(), Some('@') | Some('*')) && chars.next() == Some(']')
 }
 
 /// Whether any `$(( ... ))` or `${ ... }` nested in `body` assigns a shell
@@ -453,8 +451,7 @@ const MAX_DEPTH: usize = 16;
 /// quoted-delimiter heredoc (`<<'EOF'`) does not expand and must not be passed
 /// here. Fails closed: a malformed/unterminated expansion returns `true`.
 pub fn heredoc_body_assigns(body: &str) -> bool {
-    let mut parser =
-        Parser { chars: body.chars().collect(), pos: 0, depth: 0, out: Vec::new(), case_depth: 0 };
+    let mut parser = Parser { chars: body.chars().collect(), pos: 0, depth: 0, out: Vec::new(), case_depth: 0 };
     let mut word = Word::default();
     while let Some(c) = parser.peek() {
         match c {
