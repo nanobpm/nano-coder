@@ -4045,6 +4045,58 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_closes_review_round10_safety_gaps() {
+        // #1 (new thread) The brace scanner must parse quotes, command
+        // substitutions and parameter expansions inside `{...}` normally, not
+        // swallow them as literal text. A command substitution inside a brace
+        // alternative runs (and here creates a file), so it must be inspected
+        // and rejected rather than hidden.
+        assert!(
+            blocked("for f in x; do echo {a,`mktemp`}; done").contains("cannot allow"),
+            "{}",
+            blocked("for f in x; do echo {a,`mktemp`}; done")
+        );
+        // A parameter assignment inside a brace alternative keeps its assign
+        // metadata, so a later destructive command sees the real write.
+        assert!(
+            blocked("for f in x; do echo {x,${d:=/etc}}; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("for f in x; do echo {x,${d:=/etc}}; cat input; done")
+        );
+        // A quoted alternative stays literal (its comma is not a separator) and
+        // read-only brace words stay allowed.
+        allowed("for f in x; do echo {a,b}; cat input; done");
+        allowed("for f in x; do echo \"{a,b}\"; cat input; done");
+
+        // #2 (advisory) A brace-expanded word is a computed value, so the
+        // option and destination checks keyed on `dynamic` reject a smuggled
+        // file-writing option or destination argument — not only the
+        // option-value consumers keyed on `splits`.
+        assert!(
+            blocked("for f in input; do sort {input,-oresult} input; done").contains("sort"),
+            "{}",
+            blocked("for f in input; do sort {input,-oresult} input; done")
+        );
+        assert!(
+            blocked("for f in x; do read {name,PATH}; done").contains("read"),
+            "{}",
+            blocked("for f in x; do read {name,PATH}; done")
+        );
+
+        // #3 (advisory) The substring *length* field is arithmetic too, so an
+        // assignment there changes command lookup for the following command.
+        assert!(
+            blocked("for f in x; do echo \"${text:0:PATH=0}\"; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("for f in x; do echo \"${text:0:PATH=0}\"; cat input; done")
+        );
+        // A constant offset and length stays allowed.
+        allowed("for f in x; do echo \"${text:0:3}\"; cat input; done");
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",

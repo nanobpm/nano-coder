@@ -197,16 +197,19 @@ fn param_expansion_assigns(body: &str) -> bool {
     if rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=") {
         return true;
     }
-    // A substring expansion `${name:offset[:length]}` evaluates offset and
-    // length as arithmetic; either can assign (`${text:PATH=0:1}`). The first
-    // `:` after the name opens the offset (but `:-`, `:=`, `:+`, `:?`, `::=`
-    // are operators, not substrings). Fail closed on an assigning offset.
-    if let Some(offset) = rest.strip_prefix(':')
-        && !offset.starts_with(['-', '=', '+', '?'])
+    // A substring expansion `${name:offset[:length]}` evaluates *both* the
+    // offset and the length as arithmetic; either can assign (`${text:PATH=0:1}`
+    // through the offset, `${text:0:PATH=0}` through the length). The first `:`
+    // after the name opens the offset (but `:-`, `:=`, `:+`, `:?`, `::=` are
+    // operators, not substrings). Fail closed if any field assigns — not just
+    // the offset.
+    if let Some(sub) = rest.strip_prefix(':')
+        && !sub.starts_with(['-', '=', '+', '?'])
     {
-        // The offset runs to the next top-level `:` (the length) or the end.
-        let offset = offset.split(':').next().unwrap_or("");
-        if arithmetic_assigns(offset) {
+        // `offset` runs to the next top-level `:`; `length` is the remainder.
+        // Scan every colon-separated field, so a length assignment is caught
+        // as well as an offset one.
+        if sub.split(':').any(arithmetic_assigns) {
             return true;
         }
     }
@@ -872,6 +875,85 @@ impl Parser {
         Ok(())
     }
 
+    /// A single-quoted `'...'` segment (pos at the opening `'`). Everything
+    /// inside is literal, so it only marks the word quoted.
+    fn single_quote(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 1;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated single quote".into()),
+                Some('\'') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// A double-quoted `"..."` segment (pos at the opening `"`). Expansions and
+    /// command substitutions inside are still parsed by their normal handlers,
+    /// so their metadata (dynamic / assigns) is preserved.
+    fn double_quote(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 1;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated double quote".into()),
+                Some('"') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') if matches!(self.peek_at(1), Some('"' | '\\' | '$' | '`' | '\n')) => {
+                    let next = self.chars[self.pos + 1];
+                    if next != '\n' {
+                        word.text.push(next);
+                    }
+                    self.pos += 2;
+                }
+                Some('$') => self.dollar(word, true)?,
+                Some('`') => {
+                    self.pos += 1;
+                    self.backtick()?;
+                    word.text.push_str("$(...)");
+                    word.dynamic = true;
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// An ANSI-C `$'...'` string (pos at the `$`, next char `'`). Its escapes
+    /// are decoded but it is otherwise literal, so it only marks the word quoted.
+    fn ansi_c_string(&mut self, word: &mut Word) -> Result<(), String> {
+        self.pos += 2;
+        word.quoted = true;
+        loop {
+            match self.peek() {
+                None => return Err("unterminated $'...' string".into()),
+                Some('\'') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.ansi_c_escape(word)?;
+                }
+                Some(c) => {
+                    word.text.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
     fn word(&mut self) -> Result<Word, String> {
         let mut word = Word::default();
         while let Some(c) = self.peek() {
@@ -890,75 +972,9 @@ impl Parser {
                         None => word.text.push('\\'),
                     }
                 }
-                '\'' => {
-                    self.pos += 1;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated single quote".into()),
-                            Some('\'') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
-                '"' => {
-                    self.pos += 1;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated double quote".into()),
-                            Some('"') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some('\\') if matches!(self.peek_at(1), Some('"' | '\\' | '$' | '`' | '\n')) => {
-                                let next = self.chars[self.pos + 1];
-                                if next != '\n' {
-                                    word.text.push(next);
-                                }
-                                self.pos += 2;
-                            }
-                            Some('$') => self.dollar(&mut word, true)?,
-                            Some('`') => {
-                                self.pos += 1;
-                                self.backtick()?;
-                                word.text.push_str("$(...)");
-                                word.dynamic = true;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
-                '$' if self.peek_at(1) == Some('\'') => {
-                    self.pos += 2;
-                    word.quoted = true;
-                    loop {
-                        match self.peek() {
-                            None => return Err("unterminated $'...' string".into()),
-                            Some('\'') => {
-                                self.pos += 1;
-                                break;
-                            }
-                            Some('\\') => {
-                                self.pos += 1;
-                                self.ansi_c_escape(&mut word)?;
-                            }
-                            Some(c) => {
-                                word.text.push(c);
-                                self.pos += 1;
-                            }
-                        }
-                    }
-                }
+                '\'' => self.single_quote(&mut word)?,
+                '"' => self.double_quote(&mut word)?,
+                '$' if self.peek_at(1) == Some('\'') => self.ansi_c_string(&mut word)?,
                 '$' => self.dollar(&mut word, false)?,
                 '`' => {
                     self.pos += 1;
@@ -977,7 +993,13 @@ impl Parser {
                     // Unquoted brace expansion (`{a,b}`) yields one argument
                     // per alternative, so the word can split into several
                     // (e.g. `sort -T {/tmp,-oout}` supplies `-T /tmp -oout`).
-                    // Quoted/escaped braces are literal and handled above.
+                    // Parse the alternatives with the *normal* lexer handlers
+                    // so quotes, command substitutions and parameter
+                    // expansions inside braces keep their metadata — a nested
+                    // `{a,`mktemp`}` is still inspected, a `{x,${d:=/etc}}`
+                    // still marks the word assigning — instead of being
+                    // swallowed as literal characters. Quoted/escaped braces
+                    // are literal (handled above).
                     word.text.push(c);
                     self.pos += 1;
                     let mut depth = 1usize;
@@ -987,23 +1009,60 @@ impl Parser {
                             break;
                         }
                         match c {
-                            '{' => depth += 1,
+                            '\\' => {
+                                self.pos += 1;
+                                match self.peek() {
+                                    Some('\n') => self.pos += 1,
+                                    Some(next) => {
+                                        word.text.push(next);
+                                        word.quoted = true;
+                                        self.pos += 1;
+                                    }
+                                    None => word.text.push('\\'),
+                                }
+                            }
+                            '\'' => self.single_quote(&mut word)?,
+                            '"' => self.double_quote(&mut word)?,
+                            '$' if self.peek_at(1) == Some('\'') => self.ansi_c_string(&mut word)?,
+                            '$' => self.dollar(&mut word, false)?,
+                            '`' => {
+                                self.pos += 1;
+                                self.backtick()?;
+                                word.text.push_str("$(...)");
+                                word.dynamic = true;
+                            }
+                            '{' => {
+                                depth += 1;
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
                             '}' => {
                                 depth = depth.saturating_sub(1);
+                                word.text.push(c);
+                                self.pos += 1;
                                 if depth == 0 {
-                                    word.text.push(c);
-                                    self.pos += 1;
                                     break;
                                 }
                             }
-                            ',' if depth == 1 => has_comma = true,
-                            _ => {}
+                            ',' if depth == 1 => {
+                                has_comma = true;
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
+                            _ => {
+                                word.text.push(c);
+                                self.pos += 1;
+                            }
                         }
-                        word.text.push(c);
-                        self.pos += 1;
                     }
                     if has_comma {
+                        // One argument per alternative: the word both splits
+                        // and is a computed value, so the option, destination
+                        // and format checks that key on `dynamic` reject it
+                        // (`sort {input,-oresult}`, `read {name,PATH}`) — not
+                        // only the option-value consumers that key on `splits`.
                         word.splits = true;
+                        word.dynamic = true;
                     }
                 }
                 _ => {
@@ -1168,5 +1227,57 @@ mod tests {
             cmds.iter().any(|s| s.words.iter().any(|w| w.text == "||")),
             "the || should be a word inside the conditional, got {cmds:?}"
         );
+    }
+
+    /// Round-10 thread: the brace scanner must parse quotes, command
+    /// substitutions and parameter expansions inside `{...}` with the normal
+    /// lexer handlers, not swallow them as literal characters.
+    #[test]
+    fn brace_expansion_preserves_inner_parsing() {
+        // A command substitution inside a brace alternative is still inspected
+        // (it appears as a nested simple command in the parse), not hidden.
+        let cmds = parse("echo {a,`mktemp`}").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.first().is_some_and(|w| w.text == "mktemp")),
+            "mktemp inside the brace must be parsed as a command, got {cmds:?}"
+        );
+        // A parameter assignment inside a brace alternative keeps its assign
+        // metadata instead of being lost as text.
+        let assign = parse("echo {x,${d:=/etc}}").unwrap().remove(0).words.remove(1);
+        assert!(assign.assigns, "{{x,${{d:=/etc}}}} assigns d");
+        // A dollar-arithmetic assignment inside a brace alternative too.
+        let arith = parse("echo {x,$((PATH=0))}").unwrap().remove(0).words.remove(1);
+        assert!(arith.assigns, "{{x,$((PATH=0))}} assigns PATH");
+        // A quoted comma is literal, not an alternative separator, but the word
+        // still parses without swallowing the quote.
+        let quoted = parse("echo {a,\"b,c\"}").unwrap().remove(0).words.remove(1);
+        assert!(quoted.splits, "the unquoted comma still makes the brace split");
+    }
+
+    /// Round-10 advisory: a brace-expanded word is a computed value, so the
+    /// effect-sensitive checks keyed on `dynamic` must see it as such — not
+    /// only the option-value checks keyed on `splits`.
+    #[test]
+    fn brace_expansion_marks_dynamic() {
+        let brace = parse("sort {input,-oresult} input").unwrap().remove(0).words.remove(1);
+        assert_eq!(brace.text, "{input,-oresult}");
+        assert!(brace.splits, "brace expansion splits");
+        assert!(brace.dynamic, "brace expansion is a computed word");
+        // A single-alternative brace is literal: neither splitting nor computed.
+        let plain = parse("sort {input} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "single brace word is not computed");
+    }
+
+    /// Round-10 advisory: the substring *length* field is arithmetic too, so an
+    /// assignment there (`${text:0:PATH=0}`) must flag `assigns`, not only the
+    /// offset.
+    #[test]
+    fn substring_length_arithmetic_assigns() {
+        let length = parse("echo \"${text:0:PATH=0}\"").unwrap().remove(0).words.remove(1);
+        assert!(length.assigns, "${{text:0:PATH=0}} assigns PATH via length");
+        let offset = parse("echo \"${text:PATH=0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(offset.assigns, "${{text:PATH=0:1}} assigns PATH via offset");
+        let clean = parse("echo \"${text:0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(!clean.assigns, "${{text:0:1}} has constant offset and length");
     }
 }
