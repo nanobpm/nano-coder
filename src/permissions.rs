@@ -4200,6 +4200,48 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_closes_review_round13_safety_gaps() {
+        // #1 (previously missed) A positional/array-list expansion nested in a
+        // quoted default still expands to one argument per element, so the
+        // outer quoted word splits and a file-writing option value built from
+        // it must be rejected (`sort -T "${missing:-"$@"}"` → `-T /tmp
+        // -oresult`).
+        assert!(
+            blocked("for f in x; do sort -T \"${missing:-\"$@\"}\" input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T \"${missing:-\"$@\"}\" input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T \"${missing:-\"${arr[@]}\"}\" input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T \"${missing:-\"${arr[@]}\"}\" input; done")
+        );
+        // A quoted scalar default stays a single argument and is allowed.
+        allowed("for f in x; do sort -T \"${missing:-/tmp}\" input; done");
+        allowed("for f in x; do sort -T \"${missing:-\"$dir\"}\" input; done");
+        // A nested length (`${#arr[@]}` is the element count, a scalar) is not a
+        // list, so it stays a single argument and is allowed.
+        allowed("for f in x; do sort -T \"${missing:-\"${#arr[@]}\"}\" input; done");
+
+        // #2 (previously missed) An unquoted wildcard inside a brace expansion
+        // keeps its pathname-expansion metadata, so a consumed option value
+        // built from one is not a single argument (`sort -T -o{*} input` →
+        // `-o{a}` + `-o{b}` when those files exist).
+        assert!(
+            blocked("for f in x; do sort -T -o{*} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T -o{*} input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T -o{a?b} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T -o{a?b} input; done")
+        );
+        // A brace with no wildcard, comma or range stays literal and allowed.
+        allowed("for f in x; do echo -o{ab}; cat input; done");
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",

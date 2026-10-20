@@ -246,6 +246,99 @@ fn param_expansion_assigns(body: &str) -> bool {
     nested_expansion_assigns(body)
 }
 
+/// Whether any expansion nested in `body` yields one argument per element even
+/// under the outer expansion's quotes — a positional list `$@` / `$*` /
+/// `${@}` / `${*:...}` or an array list `${arr[@]}` / `${arr[*]}`. A quoted
+/// `"${x:-"$@"}"` still expands to the whole positional list, so the outer word
+/// word-splits despite being quoted. Only a *nested* form is reported: a
+/// top-level `${@}` / `${arr[@]}` body is already handled by the caller's own
+/// `[@]` / `@` check.
+fn nested_list_expansion(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                // A bare positional list `$@` / `$*`.
+                '@' | '*' => return true,
+                '{' => {
+                    let mut depth = 0usize;
+                    let mut j = i + 1;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    let inner: String = chars[i + 2..j].iter().collect();
+                    // A leading `#` is the length prefix (`${#arr[@]}` is the
+                    // element *count*, a scalar), not a list — skip it.
+                    if inner.starts_with('#') {
+                        i = j + 1;
+                        continue;
+                    }
+                    // `${@}` / `${*:1}` (positional) and `${arr[@]}` /
+                    // `${arr[*]}` (array) each yield one argument per element.
+                    if inner.starts_with('@')
+                        || inner.starts_with('*')
+                        || inner.contains("[@]")
+                        || inner.contains("[*]")
+                    {
+                        return true;
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a `${...}` body is itself a positional/array list expansion —
+/// `${@}`, `${*}` (plain or sliced) or `${arr[@]}` / `${arr[*]}` — yielding one
+/// argument per element even when quoted. Only the *outer* expansion's own
+/// subscript counts: a `[@]` belonging to a nested expansion (`${x:-"${y[@]}"}`)
+/// is handled by the caller's `nested_list_expansion`, and a leading `#` is the
+/// length prefix (`${#arr[@]}` is the element *count*, a scalar), not a list.
+fn top_level_list(body: &str) -> bool {
+    if body.starts_with('#') {
+        return false;
+    }
+    // `${@...}` / `${*...}` (a positional list, plain or sliced).
+    if body.starts_with('@') || body.starts_with('*') {
+        return true;
+    }
+    // `${name[@]}` / `${name[*]}`: an identifier or positional digit followed
+    // directly by the whole-list subscript.
+    let mut chars = body.chars().peekable();
+    match chars.peek().copied() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+            while chars.peek().is_some_and(|&c| c == '_' || c.is_ascii_alphanumeric()) {
+                chars.next();
+            }
+        }
+        Some(c) if c.is_ascii_digit() => {
+            while chars.peek().is_some_and(|&c| c.is_ascii_digit()) {
+                chars.next();
+            }
+        }
+        _ => return false,
+    }
+    matches!(chars.next(), Some('['))
+        && matches!(chars.next(), Some('@') | Some('*'))
+        && chars.next() == Some(']')
+}
+
 /// Whether any `$(( ... ))` or `${ ... }` nested in `body` assigns a shell
 /// variable. Only the innermost expansions matter — an outer arithmetic body is
 /// already scanned by `arithmetic_assigns` — so this walks the text, and on
@@ -902,8 +995,21 @@ impl Parser {
                 word.dynamic = true;
                 // `${arr[@]}` and the positional list `${@}` (plain or sliced,
                 // `${@:1}`) yield one argument per element even when quoted;
-                // any unquoted expansion word-splits.
-                if !quoted || body.contains("[@]") || body.starts_with('@') {
+                // any unquoted expansion word-splits. Only the *outer*
+                // expansion's own subscript counts — a `[@]`/`[*]` on a nested
+                // expansion (`${x:-"${y[@]}"}`) or a `${#...}` length prefix
+                // (`${#arr[@]}` is the count, a scalar) is not a list.
+                if !quoted || top_level_list(&body) {
+                    word.splits = true;
+                }
+                // A *nested* positional/array-list expansion inside a quoted
+                // default or alternate still expands to one argument per
+                // element: `"${missing:-"$@"}"` supplies the whole positional
+                // list (`sort -T "${missing:-"$@"}"` → `-T /tmp -oresult`),
+                // and `"${x:-"${arr[@]}"}"` likewise. The outer quotes do not
+                // collapse that list to a single argument, so mark the word
+                // splitting even when the outer expansion is quoted.
+                if quoted && nested_list_expansion(&body) {
                     word.splits = true;
                 }
                 // `${x:=y}`, `${x+=y}` and friends assign the variable when the
@@ -1139,6 +1245,18 @@ impl Parser {
                                 has_range = true;
                                 word.text.push_str("..");
                                 self.pos += 2;
+                            }
+                            // Unquoted wildcards keep their pathname-expansion
+                            // metadata inside braces too: `-o{*}` expands to
+                            // one argument per matching file (files `-o{a}` and
+                            // `-o{b}` → `-o{a}` + `-o{b}`), so the consumed
+                            // option value is not a single argument. Mirror the
+                            // top-level `*`/`?`/`[` handler.
+                            '*' | '?' | '[' => {
+                                word.glob = true;
+                                word.splits = true;
+                                word.text.push(c);
+                                self.pos += 1;
                             }
                             _ => {
                                 word.text.push(c);
@@ -1457,5 +1575,55 @@ mod tests {
         // A brace with no comma or range at any depth stays literal.
         let plain = parse("sort {{a}} input").unwrap().remove(0).words.remove(1);
         assert!(!plain.dynamic, "single nested brace word is not computed");
+    }
+
+    /// Round-13 advisory: a positional/array-list expansion nested in a quoted
+    /// default still expands to one argument per element, so the outer quoted
+    /// word splits (`sort -T "${missing:-"$@"}"` → `-T /tmp -oresult`).
+    #[test]
+    fn quoted_default_nested_list_splits() {
+        let at = parse("sort -T \"${missing:-\"$@\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(at.splits, "${{missing:-\"$@\"}} expands to the positional list");
+        let arr = parse("sort -T \"${missing:-\"${arr[@]}\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(arr.splits, "${{missing:-\"${{arr[@]}}\"}} expands to the array elements");
+        let star = parse("sort -T \"${missing:-\"$*\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(star.splits, "${{missing:-\"$*\"}} expands to the positional list");
+        // A quoted default with no nested list stays a single argument.
+        let plain = parse("sort -T \"${missing:-/tmp}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!plain.splits, "${{missing:-/tmp}} is a single literal default");
+        // A nested scalar read does not split.
+        let scalar = parse("sort -T \"${missing:-\"$dir\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!scalar.splits, "${{missing:-\"$dir\"}} is a single scalar default");
+        // A nested *length* (`${#arr[@]}` is the element count, a scalar) is not
+        // a list — the `[@]` belongs to the nested expansion, not the outer one.
+        let count = parse("sort -T \"${missing:-\"${#arr[@]}\"}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!count.splits, "${{missing:-\"${{#arr[@]}}\"}} is a scalar count, not a list");
+        // A top-level `${#arr[@]}` count is a scalar too.
+        let top_count = parse("sort -T \"${#arr[@]}\" input").unwrap().remove(0).words.remove(2);
+        assert!(!top_count.splits, "${{#arr[@]}} is a scalar count");
+        // A top-level positional/array list still splits even when quoted.
+        let top_at = parse("sort -T \"${@}\" input").unwrap().remove(0).words.remove(2);
+        assert!(top_at.splits, "${{@}} is a positional list");
+        let top_arr = parse("sort -T \"${arr[@]}\" input").unwrap().remove(0).words.remove(2);
+        assert!(top_arr.splits, "${{arr[@]}} is an array list");
+    }
+
+    /// Round-13 advisory: unquoted wildcards inside a brace expansion keep
+    /// their pathname-expansion metadata, so a consumed option value built from
+    /// one is not treated as a single argument (`sort -T -o{*} input` →
+    /// `-o{a}` + `-o{b}` when those files exist).
+    #[test]
+    fn brace_wildcard_keeps_glob_metadata() {
+        let star = parse("sort -T -o{*} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(star.text, "-o{*}");
+        assert!(star.glob, "wildcard inside braces is a glob");
+        assert!(star.splits, "wildcard inside braces word-splits");
+        let q = parse("sort -T -o{a?b} input").unwrap().remove(0).words.remove(2);
+        assert!(q.glob && q.splits, "`?` inside braces globs and splits");
+        let class = parse("sort -T -o{a[bc]} input").unwrap().remove(0).words.remove(2);
+        assert!(class.glob && class.splits, "`[...]` inside braces globs and splits");
+        // A brace with no wildcard, comma or range stays literal.
+        let plain = parse("sort -T -o{ab} input").unwrap().remove(0).words.remove(2);
+        assert!(!plain.glob && !plain.splits, "literal brace word is not a glob");
     }
 }
