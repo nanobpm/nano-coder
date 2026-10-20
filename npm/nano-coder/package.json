@@ -7,8 +7,7 @@
   "homepage": "https://github.com/nanobpm/nano-coder",
   "keywords": ["ai", "agent", "coding-agent", "acp", "cli"],
   "bin": { "nano-coder": "bin/nano-coder" },
-  "files": ["bin/", "lib/", "install.js", "README.md"],
-  "scripts": { "postinstall": "node install.js" },
+  "files": ["bin/", "lib/", "README.md"],
   "engines": { "node": ">=18" },
   "optionalDependencies": {}
 }
