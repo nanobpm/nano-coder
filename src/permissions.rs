@@ -904,6 +904,19 @@ fn check_loop_side_effects(cmd: &Simple, kind: &str, phase: &str) -> Result<(), 
                  in an expanding here-document; move that work out of the loop or rewrite it as explicit commands"
             ));
         }
+        // An expanding here-document is itself an assignment surface: its body
+        // is expanded like double-quoted text, so `${text:PATH=0:1}` or
+        // `${d:=/etc}` in the body writes a shell variable before the command
+        // runs, yet the `assigns` scan below only inspects the command's own
+        // words. A quoted-delimiter heredoc (`<<'EOF'`, `expand == false`) is
+        // inert and stays allowed.
+        if heredoc.expand && crate::shell::heredoc_body_assigns(&heredoc.body) {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` assigns a shell variable \
+                 via an expansion in an expanding here-document; move that assignment out of the loop \
+                 or rewrite it as explicit commands"
+            ));
+        }
     }
     // An expansion can assign a shell variable before the command runs, and the
     // guard — which inspects only the command's own words — never sees that
@@ -4094,6 +4107,56 @@ mod tests {
         );
         // A constant offset and length stays allowed.
         allowed("for f in x; do echo \"${text:0:3}\"; cat input; done");
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round11_safety_gaps() {
+        // #1 (new thread) An expanding here-document body is an assignment
+        // surface: its parameter expansions run when the heredoc is delivered,
+        // so a `${text:PATH=0:1}` in the body rebinds command lookup even
+        // though the command's own words look inert.
+        assert!(
+            blocked("for n in x; do : <<EOF\n${text:PATH=0:1}\nEOF\ncat input; done")
+                .contains("here-document"),
+            "{}",
+            blocked("for n in x; do : <<EOF\n${text:PATH=0:1}\nEOF\ncat input; done")
+        );
+        assert!(
+            blocked("for n in x; do : <<EOF\n${d:=/etc}\nEOF\ncat input; done")
+                .contains("here-document"),
+            "{}",
+            blocked("for n in x; do : <<EOF\n${d:=/etc}\nEOF\ncat input; done")
+        );
+        // A quoted-delimiter heredoc does not expand, so it stays inert and
+        // allowed; a plain reading heredoc is fine too.
+        allowed("for n in x; do cat <<'EOF'\n${text:PATH=0:1}\nEOF\n done");
+        allowed("for n in x; do cat <<EOF\nhello ${name}\nEOF\n done");
+
+        // #2 (advisory) A backtick command substitution inside a brace
+        // alternative word-splits like the top-level handler, so a consumed
+        // option value that splits into a file-writing option is rejected.
+        assert!(
+            blocked("for f in x; do sort -T {`printf '/tmp -oresult'`} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T {`printf '/tmp -oresult'`} input; done")
+        );
+
+        // #3 (advisory) A brace *range* expands to one argument per step just
+        // like a comma list, so a `printf -v{c..d}` destination (which writes a
+        // variable) is rejected instead of being read as a literal.
+        assert!(
+            blocked("for f in x; do printf -v{c..d} '%s' /etc; cat input; done").contains("printf"),
+            "{}",
+            blocked("for f in x; do printf -v{c..d} '%s' /etc; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T {1..9} input; done").contains("sort"),
+            "{}",
+            blocked("for f in x; do sort -T {1..9} input; done")
+        );
+        // A plain numeric range argument to a command that tolerates dynamic
+        // arguments (echo) stays allowed.
+        allowed("for f in x; do echo {1..9}; cat input; done");
     }
 
     #[test]

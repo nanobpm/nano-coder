@@ -321,6 +321,44 @@ fn in_conditional(words: &[Word]) -> bool {
 }
 
 const MAX_DEPTH: usize = 16;
+
+/// Whether an **expanding** here-document body (`<<EOF`, unquoted delimiter)
+/// contains an expansion that assigns a shell variable when the heredoc is
+/// delivered. The body is expanded like double-quoted text — `${x:=1}`,
+/// `$((x=1))`, `${text:PATH=0:1}` all write a variable — but it never passes
+/// through `word()`, so the ordinary `assigns` scan never sees it. A
+/// quoted-delimiter heredoc (`<<'EOF'`) does not expand and must not be passed
+/// here. Fails closed: a malformed/unterminated expansion returns `true`.
+pub fn heredoc_body_assigns(body: &str) -> bool {
+    let mut parser =
+        Parser { chars: body.chars().collect(), pos: 0, depth: 0, out: Vec::new(), case_depth: 0 };
+    let mut word = Word::default();
+    while let Some(c) = parser.peek() {
+        match c {
+            // In an expanding heredoc only `$`, backtick and `\` are special;
+            // a backslash escapes the following `$`/backtick/`\`, making it
+            // literal rather than an expansion.
+            '\\' if matches!(parser.peek_at(1), Some('$' | '`' | '\\')) => parser.pos += 2,
+            '$' => {
+                if parser.dollar(&mut word, true).is_err() {
+                    return true;
+                }
+            }
+            '`' => {
+                parser.pos += 1;
+                if parser.backtick().is_err() {
+                    return true;
+                }
+            }
+            _ => parser.pos += 1,
+        }
+        if word.assigns {
+            return true;
+        }
+    }
+    word.assigns
+}
+
 /// Parse a command line into its simple commands, including those inside
 /// command substitutions.
 pub fn parse(source: &str) -> Result<Vec<Simple>, String> {
@@ -1004,6 +1042,7 @@ impl Parser {
                     self.pos += 1;
                     let mut depth = 1usize;
                     let mut has_comma = false;
+                    let mut has_range = false;
                     while let Some(c) = self.peek() {
                         if is_operator(c) || matches!(c, ' ' | '\t' | '\r') {
                             break;
@@ -1030,6 +1069,13 @@ impl Parser {
                                 self.backtick()?;
                                 word.text.push_str("$(...)");
                                 word.dynamic = true;
+                                // Like the top-level backtick handler, an
+                                // unquoted command substitution inside braces
+                                // word-splits: `{`printf '/tmp -oresult'`}`
+                                // expands to `{/tmp` and `-oresult}`, so the
+                                // option-value consumers that key on `splits`
+                                // must reject it.
+                                word.splits = true;
                             }
                             '{' => {
                                 depth += 1;
@@ -1049,18 +1095,29 @@ impl Parser {
                                 word.text.push(c);
                                 self.pos += 1;
                             }
+                            '.' if depth == 1 && self.peek_at(1) == Some('.') => {
+                                // A sequence range `{a..z}` / `{1..9}` /
+                                // `{1..9..2}` expands to one argument per step,
+                                // exactly like a comma list, so treat the `..`
+                                // marker the same way.
+                                has_range = true;
+                                word.text.push_str("..");
+                                self.pos += 2;
+                            }
                             _ => {
                                 word.text.push(c);
                                 self.pos += 1;
                             }
                         }
                     }
-                    if has_comma {
-                        // One argument per alternative: the word both splits
-                        // and is a computed value, so the option, destination
-                        // and format checks that key on `dynamic` reject it
-                        // (`sort {input,-oresult}`, `read {name,PATH}`) — not
-                        // only the option-value consumers that key on `splits`.
+                    if has_comma || has_range {
+                        // One argument per alternative (comma list) or per step
+                        // (sequence range): the word both splits and is a
+                        // computed value, so the option, destination and format
+                        // checks that key on `dynamic` reject it (`sort
+                        // {input,-oresult}`, `read {name,PATH}`, `printf
+                        // -v{c..d}`) — not only the option-value consumers that
+                        // key on `splits`.
                         word.splits = true;
                         word.dynamic = true;
                     }
@@ -1279,5 +1336,50 @@ mod tests {
         assert!(offset.assigns, "${{text:PATH=0:1}} assigns PATH via offset");
         let clean = parse("echo \"${text:0:1}\"").unwrap().remove(0).words.remove(1);
         assert!(!clean.assigns, "${{text:0:1}} has constant offset and length");
+    }
+
+    /// Round-11 advisory: a backtick command substitution inside a brace
+    /// alternative word-splits exactly like the top-level handler, so it must
+    /// set `splits` (`{`printf '/tmp -oresult'`}` becomes `{/tmp` + `-oresult}`).
+    #[test]
+    fn backtick_inside_brace_splits() {
+        let cmds = parse("sort -T {`printf '/tmp -oresult'`} input").unwrap();
+        let outer = cmds.iter().find(|s| s.words.first().is_some_and(|w| w.text == "sort")).unwrap();
+        let word = &outer.words[2];
+        assert!(word.splits, "backtick inside braces word-splits");
+        assert!(word.dynamic, "backtick inside braces is a computed word");
+    }
+
+    /// Round-11 advisory: a brace *range* (`{c..d}`, `{1..9}`) expands to one
+    /// argument per step just like a comma list, so it must be marked computed
+    /// and splitting — not treated as a literal destination.
+    #[test]
+    fn brace_range_marks_dynamic() {
+        let alpha = parse("printf -v{c..d} '%s' /etc").unwrap().remove(0).words.remove(1);
+        assert_eq!(alpha.text, "-v{c..d}");
+        assert!(alpha.splits, "alphabetic brace range splits");
+        assert!(alpha.dynamic, "alphabetic brace range is a computed word");
+        let numeric = parse("sort -T {1..9} input").unwrap().remove(0).words.remove(2);
+        assert!(numeric.splits, "numeric brace range splits");
+        assert!(numeric.dynamic, "numeric brace range is a computed word");
+        // A single dot is not a range marker, so a lone brace stays literal.
+        let plain = parse("sort {input} input").unwrap().remove(0).words.remove(1);
+        assert!(!plain.dynamic, "non-range single brace word is not computed");
+    }
+
+    /// Round-11 advisory: an expanding here-document body is an assignment
+    /// surface — its expansions run when the heredoc is delivered — so a
+    /// parameter/arithmetic assignment in the body must be detected. A
+    /// quoted-delimiter (non-expanding) heredoc is inert.
+    #[test]
+    fn heredoc_body_assigns_detects_expansions() {
+        assert!(heredoc_body_assigns("${text:PATH=0:1}\n"), "offset-field assignment");
+        assert!(heredoc_body_assigns("${text:0:PATH=0}\n"), "length-field assignment");
+        assert!(heredoc_body_assigns("${d:=/etc}\n"), ":= default assignment");
+        assert!(heredoc_body_assigns("$((PATH=0))\n"), "arithmetic assignment");
+        assert!(!heredoc_body_assigns("plain ${text} and ${d:-x}\n"), "reads do not assign");
+        assert!(!heredoc_body_assigns("no expansions here\n"), "literal body");
+        // An escaped expansion is literal, so it does not assign.
+        assert!(!heredoc_body_assigns("\\${d:=/etc}\n"), "escaped expansion is literal");
     }
 }
