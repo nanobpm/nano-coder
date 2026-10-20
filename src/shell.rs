@@ -146,6 +146,13 @@ pub(crate) fn arithmetic_assigns(body: &str) -> bool {
 /// assign. An array subscript (`${a[i=1]}`, `${a[0]:=x}`) is itself an
 /// arithmetic context, so a subscript that assigns — or any element
 /// assignment — writes a variable and must be flagged too.
+///
+/// The *value* of any operator and the offset/length of a substring expansion
+/// are evaluated too, so a nested expansion there runs its own writes:
+/// `${x:-$((PATH=0))}` and `${missing:-${d:=/etc}}` assign through the default,
+/// and `${text:PATH=0:1}` assigns through its arithmetic offset. Scan the whole
+/// body for a nested `$(( ... ))` / `${ ... }` that assigns, and for a
+/// substring offset/length that is an arithmetic assignment.
 fn param_expansion_assigns(body: &str) -> bool {
     let mut chars = body.chars().peekable();
     // `$#` is a length prefix, not the parameter name.
@@ -187,7 +194,93 @@ fn param_expansion_assigns(body: &str) -> bool {
         }
     }
     let rest: String = chars.collect();
-    rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=")
+    if rest.starts_with("+=") || rest.starts_with('=') || rest.starts_with(":=") || rest.starts_with("::=") {
+        return true;
+    }
+    // A substring expansion `${name:offset[:length]}` evaluates offset and
+    // length as arithmetic; either can assign (`${text:PATH=0:1}`). The first
+    // `:` after the name opens the offset (but `:-`, `:=`, `:+`, `:?`, `::=`
+    // are operators, not substrings). Fail closed on an assigning offset.
+    if let Some(offset) = rest.strip_prefix(':')
+        && !offset.starts_with(['-', '=', '+', '?'])
+    {
+        // The offset runs to the next top-level `:` (the length) or the end.
+        let offset = offset.split(':').next().unwrap_or("");
+        if arithmetic_assigns(offset) {
+            return true;
+        }
+    }
+    // A nested expansion anywhere in the body runs when the outer one does, so
+    // propagate its writes: `$(( ... ))` arithmetic and `${ ... }` parameter
+    // expansions can both assign even when the outer operator only reads.
+    nested_expansion_assigns(body)
+}
+
+/// Whether any `$(( ... ))` or `${ ... }` nested in `body` assigns a shell
+/// variable. Only the innermost expansions matter — an outer arithmetic body is
+/// already scanned by `arithmetic_assigns` — so this walks the text, and on
+/// each nested expansion checks the assignment class for that form.
+fn nested_expansion_assigns(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1] == '(' {
+                // `$((` arithmetic, or `$(` command substitution (whose inner
+                // commands the parser already models separately). Only the
+                // arithmetic form is an assignment context here.
+                let arith = i + 2 < chars.len() && chars[i + 2] == '(';
+                let open = i + 1;
+                let mut depth = 0usize;
+                let mut j = open;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if arith {
+                    let inner: String = chars[open + 2..j].iter().collect();
+                    if arithmetic_assigns(&inner) {
+                        return true;
+                    }
+                }
+                i = j + 1;
+                continue;
+            } else if chars[i + 1] == '{' {
+                let mut depth = 0usize;
+                let mut j = i + 1;
+                while j < chars.len() {
+                    match chars[j] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let inner: String = chars[i + 2..j].iter().collect();
+                if param_expansion_assigns(&inner) {
+                    return true;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether the words parsed so far are inside an open `[[ ... ]]` conditional,
@@ -410,6 +503,17 @@ impl Parser {
                 ';' | '&' | '|' => {
                     if c == '&' && self.peek_at(1) == Some('>') {
                         self.redirect(&mut current, &mut pending)?;
+                        continue;
+                    }
+                    // Inside `[[ ... ]]`, `&&` and `||` are conditional
+                    // conjunctions/disjunctions, not command separators
+                    // (`[[ -f m && -r m ]]` is one test). Keep them as plain
+                    // words so the conditional stays a single command until
+                    // `]]`; a single `&`/`|`/`;` still separates commands.
+                    let doubled = self.peek_at(1) == Some(c);
+                    if doubled && c != ';' && in_conditional(&current.words) {
+                        current.words.push(Word { text: format!("{c}{c}"), ..Default::default() });
+                        self.pos += 2;
                         continue;
                     }
                     self.pos += 1;
@@ -869,6 +973,39 @@ impl Parser {
                     word.text.push(c);
                     self.pos += 1;
                 }
+                '{' => {
+                    // Unquoted brace expansion (`{a,b}`) yields one argument
+                    // per alternative, so the word can split into several
+                    // (e.g. `sort -T {/tmp,-oout}` supplies `-T /tmp -oout`).
+                    // Quoted/escaped braces are literal and handled above.
+                    word.text.push(c);
+                    self.pos += 1;
+                    let mut depth = 1usize;
+                    let mut has_comma = false;
+                    while let Some(c) = self.peek() {
+                        if is_operator(c) || matches!(c, ' ' | '\t' | '\r') {
+                            break;
+                        }
+                        match c {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    word.text.push(c);
+                                    self.pos += 1;
+                                    break;
+                                }
+                            }
+                            ',' if depth == 1 => has_comma = true,
+                            _ => {}
+                        }
+                        word.text.push(c);
+                        self.pos += 1;
+                    }
+                    if has_comma {
+                        word.splits = true;
+                    }
+                }
                 _ => {
                     word.text.push(c);
                     self.pos += 1;
@@ -976,5 +1113,60 @@ mod tests {
         }
         let deep = "$(".repeat(40) + &")".repeat(40);
         assert!(parse(&format!("echo {deep}")).is_err());
+    }
+
+    /// Round-9 advisory: unquoted `{a,b}` expands to one argument per
+    /// alternative, so it must set `splits` (the option-value consumers rely on
+    /// it to reject smuggled extra options).
+    #[test]
+    fn unquoted_brace_expansion_splits() {
+        let brace = parse("sort -T {/tmp,-oout} input").unwrap().remove(0).words.remove(2);
+        assert_eq!(brace.text, "{/tmp,-oout}");
+        assert!(brace.splits, "brace expansion must split");
+        // A brace without a comma (`{a}`, a `{ ...; }` group word) does not
+        // expand to multiple arguments.
+        let plain = parse("echo {a}").unwrap().remove(0).words.remove(1);
+        assert!(!plain.splits, "single brace word stays one argument");
+        // Quoted braces are literal, not expansion.
+        let quoted = parse("echo '{a,b}'").unwrap().remove(0).words.remove(1);
+        assert!(!quoted.splits, "quoted braces are literal");
+    }
+
+    /// Round-9 advisory: nested expansions and substring offsets are evaluated
+    /// when the outer expansion runs, so their writes must flag `assigns`.
+    #[test]
+    fn nested_and_substring_expansions_assign() {
+        let nested_arith = parse("echo \"${x:-$((PATH=0))}\"").unwrap().remove(0).words.remove(1);
+        assert!(nested_arith.assigns, "${{x:-$((PATH=0))}} assigns PATH");
+        let nested_param = parse("echo \"${missing:-${d:=/etc}}\"").unwrap().remove(0).words.remove(1);
+        assert!(nested_param.assigns, "${{missing:-${{d:=/etc}}}} assigns d");
+        let substring = parse("echo \"${text:PATH=0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(substring.assigns, "${{text:PATH=0:1}} assigns PATH via offset");
+        // Read-only forms stay clean.
+        let read = parse("echo \"${x:-default}\"").unwrap().remove(0).words.remove(1);
+        assert!(!read.assigns, "${{x:-default}} only reads");
+        let sub = parse("echo \"${text:0:1}\"").unwrap().remove(0).words.remove(1);
+        assert!(!sub.assigns, "${{text:0:1}} has a constant offset");
+    }
+
+    /// Round-9 advisory: `&&` / `||` inside `[[ ... ]]` are conditional
+    /// logic, not command separators, so the conditional stays one command.
+    #[test]
+    fn logical_operators_stay_inside_conditional() {
+        // The whole `[[ ... && ... ]]` is a single command; nothing splits off.
+        let cmds = parse("while [[ -f marker && -r marker ]]; do cat marker; break; done").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.iter().any(|w| w.text == "&&")),
+            "the && should be a word inside the conditional, got {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|s| s.words.first().is_some_and(|w| w.text == "-r")),
+            "no command should start at -r, got {cmds:?}"
+        );
+        let cmds = parse("for f in a z; do [[ \"$f\" == a || \"$f\" == z ]]; done").unwrap();
+        assert!(
+            cmds.iter().any(|s| s.words.iter().any(|w| w.text == "||")),
+            "the || should be a word inside the conditional, got {cmds:?}"
+        );
     }
 }

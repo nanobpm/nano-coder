@@ -3995,6 +3995,56 @@ mod tests {
     }
 
     #[test]
+    fn readonly_loop_closes_review_round9_safety_gaps() {
+        // #1 An unquoted brace expansion yields one argument per alternative,
+        // so a `{...,...}` option value smuggles extra options past the
+        // single-argument check unless it sets `splits`.
+        assert!(
+            blocked("for f in input; do sort -T {/tmp,-oresult} input; done").contains("sort"),
+            "{}",
+            blocked("for f in input; do sort -T {/tmp,-oresult} input; done")
+        );
+        assert!(
+            blocked("for f in x; do read -p {prompt,PATH}; done").contains("read"),
+            "{}",
+            blocked("for f in x; do read -p {prompt,PATH}; done")
+        );
+        // A provably single argument stays allowed.
+        allowed("for f in input; do sort -T /tmp input; done");
+        allowed("for f in input; do sort -T \"$tmpdir\" input 2>/dev/null; done");
+
+        // #2 A nested expansion or a substring offset is evaluated when the
+        // outer expansion runs, so its write must flag the word as assigning.
+        assert!(
+            blocked("x=; for f in x; do echo \"${x:-$((PATH=0))}\"; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("x=; for f in x; do echo \"${x:-$((PATH=0))}\"; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do echo \"${missing:-${d:=/etc}}\"; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("for f in x; do echo \"${missing:-${d:=/etc}}\"; cat input; done")
+        );
+        assert!(
+            blocked("for f in x; do echo \"${text:PATH=0:1}\"; cat input; done")
+                .contains("assigns a shell variable"),
+            "{}",
+            blocked("for f in x; do echo \"${text:PATH=0:1}\"; cat input; done")
+        );
+        // Read-only expansions stay allowed.
+        allowed("for f in x; do echo \"${x:-default}\"; cat input; done");
+        allowed("for f in x; do echo \"${text:0:1}\"; cat input; done");
+
+        // #3 `&&` / `||` inside `[[ ... ]]` are conditional logic, not command
+        // separators, so a compound condition stays one read-only command.
+        allowed("while [[ -f marker && -r marker ]]; do cat marker; break; done");
+        allowed("for f in a z; do [[ \"$f\" == a || \"$f\" == z ]]; echo \"$f\"; done");
+        allowed("until [[ -f a || -f b ]]; do cat a; break; done");
+    }
+
+    #[test]
     fn blocks_catastrophic_deletes() {
         for command in [
             "rm -rf /",
