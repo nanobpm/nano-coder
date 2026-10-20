@@ -719,9 +719,17 @@ fn expand_sequence_with(parsed: &[Simple], depth: usize, out: &mut Vec<Simple>, 
             }
             let run = &parsed[start..index];
             if run.iter().any(starts_readonly_loop_keyword) {
-                let text = run.iter().map(command_text).collect::<Vec<_>>().join("; ");
-                let reparsed = shell::parse_nested(&text, depth)?;
-                expand_sequence_with(&reparsed, depth + 1, out, true)?;
+                // Reclassify the cloned records with their header flag cleared
+                // rather than re-parsing `command_text`: the display text discards
+                // redirections, here-documents and quoting, so a redirecting
+                // command inside the substitution (`$(if true; then printf x > out; fi)`)
+                // would lose its `> out` and be wrongly accepted. The records
+                // already form a command sequence, so clearing the flag and
+                // recursing keeps loop frames intact and applies the read-only
+                // rules to each command — redirects and all.
+                let cleared: Vec<Simple> =
+                    run.iter().map(|s| Simple { loop_header_sub: false, ..s.clone() }).collect();
+                expand_sequence_with(&cleared, depth, out, true)?;
             } else {
                 for cmd in run {
                     check_readonly_loop_command(cmd, "loop", "header or condition substitution")?;
@@ -1136,10 +1144,18 @@ fn check_loop_read_destinations(
                 k = letters.len();
             } else if read_option_takes_value(letter) {
                 if k + 1 >= letters.len() {
-                    // The value is the next word; skip it.
+                    // The value is the next word.
                     i += 1;
-                    if args.get(i).is_none() {
-                        return Err(uninspectable());
+                    match args.get(i) {
+                        // An unquoted computed value or a glob word-splits, and
+                        // the extra words become read destinations (`read -p $p`
+                        // with $p='prompt PATH' reads into PATH). A quoted
+                        // expansion stays one argument and is safe.
+                        Some(value) if value.glob || (value.dynamic && !value.quoted) => {
+                            return Err(uninspectable());
+                        }
+                        Some(_) => {}
+                        None => return Err(uninspectable()),
                     }
                 }
                 k = letters.len();
@@ -1275,29 +1291,32 @@ fn printf_format_writes(fmt: &str) -> bool {
 
 /// Short options (letters) that consume the following word as their value for
 /// `sort`. A standalone `--` can be such a value (`sort -T -- -o result` runs
-/// `-T --`), so it is not always the option terminator.
-const SORT_SHORT_WITH_VALUE: &str = "knmotT";
+/// `-T --`), so it is not always the option terminator. Valueless flags such as
+/// `-n` (numeric) and `-m` (merge) are deliberately excluded: treating them as
+/// value-taking would hide a following file-writing `-o`.
+const SORT_SHORT_WITH_VALUE: &str = "kotTS";
 /// Long options (in `--opt value` form) that consume the following word for
-/// `sort`.
+/// `sort`. `--debug` and `--merge` take no value and are excluded for the same
+/// reason as their short forms.
 const SORT_LONG_WITH_VALUE: &[&str] = &[
     "--batch-size",
     "--buffer-size",
     "--compress-program",
-    "--debug",
     "--files0-from",
     "--key",
-    "--merge",
     "--output",
     "--random-source",
     "--separator",
     "--temporary-directory",
 ];
 
-/// Short options that consume the following word for `file`.
-const FILE_SHORT_WITH_VALUE: &str = "mMdf";
+/// Short options that consume the following word for `file`. `-d` is a valueless
+/// debug flag (excluded so it cannot hide a following `-C`); `-F`/`-e` take a
+/// value and are included so their value is not mistaken for another option.
+const FILE_SHORT_WITH_VALUE: &str = "mMfFe";
 /// Long options (in `--opt value` form) that consume the following word for
 /// `file`.
-const FILE_LONG_WITH_VALUE: &[&str] = &["--magic-file", "--exclude", "--exclude-quiet"];
+const FILE_LONG_WITH_VALUE: &[&str] = &["--magic-file", "--exclude", "--exclude-quiet", "--separator"];
 
 /// The option-position words of a `sort`/`file` invocation: every word before a
 /// *real* `--` terminator, with value-taking options consuming their value word
@@ -1361,17 +1380,52 @@ fn check_loop_dynamic_option_position(
         "file" => (FILE_SHORT_WITH_VALUE, FILE_LONG_WITH_VALUE),
         _ => ("", &[][..]),
     };
-    for arg in option_position_words(args, short, long) {
-        // Unquoted globs expand to filenames that can begin with `-` (a file
-        // named `-oresult` turns `sort *` into `sort -oresult ...`), so they are
-        // as unsafe as a computed word in option position unless `--` precedes them.
+    let dynamic_err = || {
+        format!(
+            "cannot allow `{kind}` loop: {phase} command `{}` passes a computed or glob argument to \
+             `{program}` where it could be read as an option; put `--` before it or rewrite the loop \
+             as explicit commands",
+            command_text(cmd)
+        )
+    };
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        let text = arg.text.as_str();
+        if text == "--" {
+            // A real terminator ends option position; the operands after it are
+            // safe to be computed/globbed.
+            break;
+        }
+        // Any computed or glob word in option position can expand to begin with
+        // `-` (a file named `-oresult` turns `sort *` into `sort -oresult`) or to
+        // a real option, so reject it regardless of quoting unless `--` precedes it.
         if arg.dynamic || arg.glob {
-            return Err(format!(
-                "cannot allow `{kind}` loop: {phase} command `{}` passes a computed or glob argument to \
-                 `{program}` where it could be read as an option; put `--` before it or rewrite the loop \
-                 as explicit commands",
-                command_text(cmd)
-            ));
+            return Err(dynamic_err());
+        }
+        if !text.starts_with('-') || text == "-" {
+            i += 1;
+            continue;
+        }
+        let consume_next = if let Some(body) = text.strip_prefix("--") {
+            !body.contains('=') && long.contains(&text)
+        } else {
+            let opts = &text[1..];
+            opts.chars().position(|c| short.contains(c)).is_some_and(|pos| pos + 1 == opts.chars().count())
+        };
+        if consume_next {
+            // The consumed value word is itself unsafe when it can word-split
+            // into multiple arguments: an unquoted expansion or a glob supplies
+            // extra options/operands (`sort -T $opts input` with
+            // $opts='tmp -o result' runs `-T tmp -o result input`). A quoted
+            // expansion stays a single argument and is safe.
+            if let Some(value) = args.get(i + 1)
+                && (value.glob || (value.dynamic && !value.quoted))
+            {
+                return Err(dynamic_err());
+            }
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     Ok(())
@@ -1379,7 +1433,24 @@ fn check_loop_dynamic_option_position(
 
 fn has_short_option(args: &[Word], letter: char, short_with_value: &str, long_with_value: &[&str]) -> bool {
     option_words(args, short_with_value, long_with_value).iter().any(|arg| {
-        arg.text.starts_with('-') && !arg.text.starts_with("--") && arg.text.len() > 1 && arg.text[1..].contains(letter)
+        let Some(letters) = arg.text.strip_prefix('-').filter(|rest| !rest.starts_with('-') && !rest.is_empty()) else {
+            return false;
+        };
+        // A short-option bundle ends at the first value-taking letter: the rest
+        // of the word is that option's attached value, not more option letters.
+        // Scanning the whole word would mistake a value's characters for options
+        // (`sort -T/tmp/sort` is `-T` + value, not a `-o`; `file -mCustom.magic`
+        // is `-m` + value, not a `-C`), so stop at that boundary while still
+        // detecting a dangerous option letter that precedes it.
+        for c in letters.chars() {
+            if c == letter {
+                return true;
+            }
+            if short_with_value.contains(c) {
+                break;
+            }
+        }
+        false
     })
 }
 
@@ -2169,7 +2240,9 @@ fn collect_read_destinations(args: &[Word], out: &mut HashSet<String>) {
     }
 }
 
-/// Destination name written by `printf -v NAME` (space-separated or attached).
+/// Destination names written by `printf -v NAME` (space-separated or attached).
+/// Bash honours the *last* `-v` of repeated options, so every `-v` destination
+/// is recorded — the guard invalidates any loop variable one of them names.
 fn collect_printf_destination(args: &[Word], out: &mut HashSet<String>) {
     let mut i = 0;
     while let Some(arg) = args.get(i) {
@@ -2181,11 +2254,13 @@ fn collect_printf_destination(args: &[Word], out: &mut HashSet<String>) {
             if let Some(name) = args.get(i + 1) {
                 insert_var_name(&name.text, out);
             }
-            break;
+            i += 2;
+            continue;
         }
         if let Some(rest) = text.strip_prefix("-v") {
             insert_var_name(rest, out);
-            break;
+            i += 1;
+            continue;
         }
         if text.starts_with('-') && text.len() > 1 {
             i += 1;
@@ -3375,6 +3450,104 @@ mod tests {
         );
         // A benign value-taking option with a real terminator stays allowed.
         allowed("for f in input; do sort -t : -- input; done");
+    }
+
+    #[test]
+    fn readonly_loop_closes_review_round5_safety_gaps() {
+        // #1 A header substitution is reclassified from its cloned records (flags
+        // cleared), not its display text, so a write *redirection* inside a
+        // conditional header substitution is no longer discarded and accepted.
+        assert!(
+            blocked("for f in \"$(if true; then printf x > out; fi)\"; do :; done").contains("redirection"),
+            "{}",
+            blocked("for f in \"$(if true; then printf x > out; fi)\"; do :; done")
+        );
+        // A safe-device redirect inside the same substitution stays allowed.
+        allowed("for f in \"$(if true; then echo x > /dev/null; fi)\"; do cat \"$f\"; done");
+
+        // #2 A value-taking `read` option whose value word is an unquoted
+        // expansion or glob can word-split into extra destinations (`read -p $p`
+        // with $p='prompt PATH' reads into PATH), so reject it; a quoted value
+        // stays one argument and is allowed.
+        assert!(
+            blocked("for p in 'prompt PATH'; do read -p $p; cat input; done").contains("cannot be inspected"),
+            "{}",
+            blocked("for p in 'prompt PATH'; do read -p $p; cat input; done")
+        );
+        allowed("for p in x; do read -p \"$p\"; cat input; done");
+
+        // #3 `sort`'s valueless flags (`-n`, `--merge`) must not consume the next
+        // word, or they would hide a following file-writing option.
+        assert!(
+            blocked("for f in input; do sort -n -o result input; done").contains("writes a file"),
+            "{}",
+            blocked("for f in input; do sort -n -o result input; done")
+        );
+        assert!(
+            blocked("for f in input; do sort --merge --output=result input; done").contains("writes a file"),
+            "{}",
+            blocked("for f in input; do sort --merge --output=result input; done")
+        );
+        allowed("for f in input; do sort -n -r input; done");
+
+        // #4 `file -d` is a valueless debug flag (so it cannot hide `-C`), while
+        // `-F`/`--separator` take a value (so a consumed `--` is not the
+        // terminator).
+        assert!(
+            blocked("for f in x; do file -d -C -m magic input; done").contains("compiled magic"),
+            "{}",
+            blocked("for f in x; do file -d -C -m magic input; done")
+        );
+        assert!(
+            blocked("for f in x; do file -F -- -C -m magic input; done").contains("compiled magic"),
+            "{}",
+            blocked("for f in x; do file -F -- -C -m magic input; done")
+        );
+        allowed("for f in x; do file -d input; done");
+
+        // #5 A consumed option *value* that can word-split is as unsafe as a
+        // computed option word (`sort -T $opts input` with $opts='tmp -o result'
+        // runs `-T tmp -o result input`), so include it in the safety scan; a
+        // quoted value stays one argument and is allowed.
+        assert!(
+            blocked("for opts in 'tmp -o result'; do sort -T $opts input; done").contains("computed or glob"),
+            "{}",
+            blocked("for opts in 'tmp -o result'; do sort -T $opts input; done")
+        );
+        assert!(
+            blocked("for f in x; do sort -T * input; done").contains("computed or glob"),
+            "{}",
+            blocked("for f in x; do sort -T * input; done")
+        );
+        allowed("for d in /tmp; do sort -T \"$d\" input; done");
+
+        // #6 Scanning a short-option bundle stops at the first value-taking
+        // letter, so an attached value containing `o`/`C` is not mistaken for a
+        // dangerous option — while a dangerous option before the boundary is
+        // still detected.
+        allowed("for f in input; do sort -T/tmp/sort -- input; done");
+        allowed("for f in x; do file -mCustom.magic input; done");
+        assert!(
+            blocked("for f in input; do sort -o/tmp/x input; done").contains("writes a file"),
+            "{}",
+            blocked("for f in input; do sort -o/tmp/x input; done")
+        );
+
+        // #7 Bash honours the *last* of repeated `printf -v` destinations, so the
+        // collector records every destination (separate and attached), and a
+        // later destructive use of the final one is blocked.
+        assert!(
+            blocked("d=./scratch; for f in x; do printf -v ignored -v d '%s' /etc; done; rm -rf \"$d\"")
+                .contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for f in x; do printf -v ignored -v d '%s' /etc; done; rm -rf \"$d\"")
+        );
+        assert!(
+            blocked("d=./scratch; for f in x; do printf -vignored -vd '%s' /etc; done; rm -rf \"$d\"")
+                .contains("loop variable"),
+            "{}",
+            blocked("d=./scratch; for f in x; do printf -vignored -vd '%s' /etc; done; rm -rf \"$d\"")
+        );
     }
 
     #[test]
