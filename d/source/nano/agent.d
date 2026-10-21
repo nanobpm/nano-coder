@@ -352,6 +352,8 @@ class Agent
                 compact(rep, CompactTrigger.threshold);
                 if (control.isCancelled) return cancelled(ev);
             }
+            if (auto spec = control.takeModelRequest())
+                if (onModelRequest !is null) onModelRequest(spec);
             LLMResponse r;
             import std.datetime.stopwatch : StopWatch, AutoStart;
             auto sw = StopWatch(AutoStart.yes);
@@ -1019,6 +1021,8 @@ class Agent
     bool planTools = true;
     /// Called after the plan changes (the UI shows the checklist).
     void delegate() onPlanChanged;
+    /// A `/model SPEC` queued mid-turn, applied (on the agent thread) before the next model call.
+    void delegate(string) onModelRequest;
 
     private string runPlanTool(string name, JSONValue args)
     {

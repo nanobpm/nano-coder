@@ -64,6 +64,26 @@ final class TurnControl
         atomicStore(mode_, cast(int) m);
     }
 
+    private string modelRequest;
+
+    /// `/model SPEC` typed mid-turn: switch before the next model call.
+    void requestModel(string spec) @trusted
+    {
+        lock.lock();
+        scope (exit) lock.unlock();
+        modelRequest = spec;
+    }
+
+    /// The pending model switch, cleared (null when there is none).
+    string takeModelRequest() @trusted
+    {
+        lock.lock();
+        scope (exit) lock.unlock();
+        auto s = modelRequest;
+        modelRequest = null;
+        return s;
+    }
+
     /// Queue a message for the running turn. It is added before the next model call.
     void steer(string text) @trusted { steer(Steer(text)); }
 

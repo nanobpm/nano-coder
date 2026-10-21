@@ -6,6 +6,8 @@ import std.stdio;
 import std.json;
 import std.format : format;
 import std.string : strip, stripRight, startsWith, indexOf;
+import nano.turn_commands : LiveView, splitCmd, timing, Timing;
+import std.array : join;
 static import std.string;
 import std.file : getcwd, exists, readText;
 import std.process : environment;
@@ -289,7 +291,7 @@ string runQueueCommand(MessageQueue queue, string args)
 }
 
 void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions,
-    MessageQueue queue)
+    MessageQueue queue, string delegate(string) midTurn = null)
 {
     while (!atomicLoad(*done))
     {
@@ -326,6 +328,13 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 }
                 if (text.startsWith("/") && unescapePrompt(text) is null)
                 {
+                    // Read-only commands and settings run now (turn_commands.rs).
+                    if (midTurn !is null)
+                        if (auto shown = midTurn(text))
+                        {
+                            console.note(shown);
+                            break;
+                        }
                     held ~= text;
                     stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
                 }
@@ -563,8 +572,12 @@ class Console : AgentEvents
         stdout.flush();
     }
 
+    /// Runs on the agent's thread after each model call and tool (refreshes the live view).
+    void delegate() afterStep;
+
     void toolEnd(const ref ToolCall call, string result, bool isError)
     {
+        scope (exit) if (afterStep !is null) afterStep();
         if (quiet(call) && !isError) return;
         auto lines = result.lineCount;
         if (isError) writeln("  ", red("✗ " ~ result.firstLine));
@@ -573,7 +586,10 @@ class Console : AgentEvents
         stdout.flush();
     }
 
-    void usage(TokenUsage u) {}
+    void usage(TokenUsage u)
+    {
+        if (afterStep !is null) afterStep();
+    }
     void userMessage(string text) { endLine(); writeln(dim("↪ " ~ text)); }
     void assistantMessage(string text, string reasoning)
     {
@@ -675,6 +691,39 @@ ProjectInstructions discoverInstructions(const ref Config c, string dir)
 }
 
 /// `/context`: window use, token totals, compaction settings.
+string toolsListing(Agent agent)
+{
+    string[] out_;
+    foreach (d; agent.tools.definitions) out_ ~= format("  %-14s %s", d.name, firstLine(d.description));
+    return out_.join("\n");
+}
+
+string skillsListing(const Skills skills)
+{
+    if (skills is null || skills.empty) return "No skills found.";
+    string[] out_;
+    foreach (sk; skills.skills) out_ ~= format("  %-20s %s", sk.name, firstLine(sk.description));
+    return out_.join("\n");
+}
+
+string sessionText(Agent agent)
+{
+    return agent.log is null ? "not recording (--no-session)" : format("session %s\nlog: %s", agent.log.id, agent.log.path);
+}
+
+string planText(Agent agent)
+{
+    return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
+        : agent.plan.render(true, size_t.max).stripRight;
+}
+
+string modeListing(AgentMode current)
+{
+    string[] out_ = [format("Mode: %s (%s)", current.name, current.describe)];
+    foreach (m; allModes) out_ ~= format("  %-8s %s", m.name, m.describe);
+    return (out_ ~ "(Shift+Tab cycles; /mode NAME sets it directly)").join("\n");
+}
+
 string contextReport(Agent agent)
 {
     import nano.context : formatTokens, modeName;
@@ -1001,6 +1050,87 @@ int runMain(string[] args)
     string[] held; // lines to run before reading the prompt again
     auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
 
+    /// Switch the model (history carries over); the "Model set to" text.
+    string switchModel(string spec)
+    {
+        auto rp = resolve(cfg, spec);
+        client = makeClient(rp);
+        agent.client = client;
+        agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
+        agent.learnedWindow = 0;
+        agent.learnedMaxOutput = 0;
+        agent.refreshCapabilities();
+        auto text = format("Model set to %s (provider %s)", client.modelName, client.providerName);
+        foreach (w; settingWarnings(agent)) text ~= "\nWarning: " ~ w;
+        return text;
+    }
+    agent.onModelRequest = (string spec) {
+        try console.note(switchModel(spec));
+        catch (Exception e) console.note(console.red(format("[/model %s: %s]", spec, e.msg)));
+    };
+
+    // Read-only commands typed mid-turn show this, rendered on the agent thread.
+    auto view = new LiveView;
+    void refreshView()
+    {
+        view.set("/tools", toolsListing(agent));
+        view.set("/skills", skillsListing(skills));
+        view.set("/session", sessionText(agent));
+        view.set("/plan", planText(agent));
+        view.set("/context", contextReport(agent));
+        view.set("log", agent.log is null ? null : agent.log.path);
+    }
+    console.afterStep = &refreshView;
+
+    /// A `/command` typed during a turn: its output if it runs now, else null (held).
+    string midTurn(string text)
+    {
+        static import nano.trajectory;
+        auto p = splitCmd(text);
+        auto name = p[0], arg = p[1];
+        final switch (timing(text))
+        {
+            case Timing.afterTurn:
+                return null;
+            case Timing.immediate:
+                switch (name)
+                {
+                    case "/help": return helpText().stripRight;
+                    case "/mode": return modeListing(agent.control.mode);
+                    case "/trajectory":
+                        auto path = view.get("log");
+                        if (path is null) return "Session persistence is disabled: no trajectory to show";
+                        try
+                        {
+                            auto t = nano.trajectory.load(path);
+                            return arg == "--json" ? t.toJson : arg.length ? t.toMarkdown : t.toPlain;
+                        }
+                        catch (Exception e) return "Could not read the session log: " ~ e.msg;
+                    default: return view.get(name);
+                }
+            case Timing.nextStep:
+                if (name == "/mode")
+                {
+                    try
+                    {
+                        auto m = parseMode(arg);
+                        agent.control.mode = m;
+                        return format("Mode set to %s (%s); applies from the agent's next step", m.name, m.describe);
+                    }
+                    catch (Exception e) return e.msg;
+                }
+                if (name == "/model")
+                {
+                    // Validate now so a bad spec is reported at once and never queued.
+                    try resolve(cfg, arg);
+                    catch (Exception e) return format("[%s: %s]", text, e.msg);
+                    agent.control.requestModel(arg);
+                    return format("Model switch to %s queued; applies at the next model call (the history carries over)", arg);
+                }
+                return null;
+        }
+    }
+
     // The system prompt's plan section follows the mode; Shift-Tab mid-turn
     // only switches the live mode, so the prompt catches up at the next turn.
     bool sysPlan = o.plan;
@@ -1027,7 +1157,8 @@ int runMain(string[] args)
             if (o.verbose)
                 stderr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
-            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions, queue));
+            refreshView();
+            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions, queue, &midTurn));
             keys.start();
         }
         scope (exit)
@@ -1184,16 +1315,12 @@ int runMain(string[] args)
                     writeln(runQueueCommand(queue, arg));
                     continue;
                 case "/plan":
-                    if (agent.plan.empty) writeln("No plan yet. The agent makes one with the plan_add tool.");
-                    else writeln(agent.plan.render(true, size_t.max).stripRight);
+                    writeln(planText(agent));
                     continue;
                 case "/mode":
                     if (!arg.length)
                     {
-                        auto current = agent.control.mode;
-                        writefln("Mode: %s (%s)", current.name, current.describe);
-                        foreach (m; allModes) writefln("  %-8s %s", m.name, m.describe);
-                        writeln("(/mode NAME sets it)");
+                        writeln(modeListing(agent.control.mode));
                         continue;
                     }
                     try
@@ -1206,12 +1333,10 @@ int runMain(string[] args)
                     catch (Exception e) writeln(e.msg);
                     continue;
                 case "/tools":
-                    foreach (d; agent.tools.definitions)
-                        writefln("  %-14s %s", d.name, firstLine(d.description));
+                    writeln(toolsListing(agent));
                     continue;
                 case "/skills":
-                    if (skills is null || skills.empty) { writeln("No skills found."); continue; }
-                    foreach (sk; skills.skills) writefln("  %-20s %s", sk.name, firstLine(sk.description));
+                    writeln(skillsListing(skills));
                     continue;
                 case "/resume":
                 {
@@ -1272,8 +1397,7 @@ int runMain(string[] args)
                     continue;
                 }
                 case "/session":
-                    if (agent.log is null) writeln("not recording (--no-session)");
-                    else writefln("session %s\nlog: %s", agent.log.id, agent.log.path);
+                    writeln(sessionText(agent));
                     continue;
                 case "/hooks":
                     write(agent.hooks !is null ? agent.hooks.listing : "No hooks loaded.\n");
@@ -1301,18 +1425,7 @@ int runMain(string[] args)
                     continue;
                 case "/model":
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }
-                    try
-                    {
-                        auto rp = resolve(cfg, arg);
-                        client = makeClient(rp);
-                        agent.client = client;
-                        agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
-                        agent.learnedWindow = 0;
-                        agent.learnedMaxOutput = 0;
-                        agent.refreshCapabilities();
-                        writefln("Model set to %s (provider %s)", client.modelName, client.providerName);
-                        foreach (w; settingWarnings(agent)) writeln("Warning: ", w);
-                    }
+                    try writeln(switchModel(arg));
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 default:
