@@ -1,0 +1,11 @@
+{
+  "name": "nano-coder-d",
+  "description": "nano-coder, reimplemented in D (port in progress; see PORTING.md)",
+  "license": "Apache-2.0",
+  "targetName": "nano-coder-d",
+  "targetType": "executable",
+  "libs": ["curl"],
+  "buildTypes": {
+    "release": { "buildOptions": ["releaseMode", "optimize", "inline"] }
+  }
+}
