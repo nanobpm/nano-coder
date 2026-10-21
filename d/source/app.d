@@ -220,8 +220,12 @@ int main(string[] args)
     Policy policy;
     try policy = Policy.fromConfig("permissions" in rawConfig ? rawConfig["permissions"] : JSONValue(null));
     catch (Exception e) die("[permissions]: " ~ e.msg);
-    foreach (r; o.allow) policy.allow ~= parseRule(r);
-    foreach (r; o.deny) policy.deny ~= parseRule(r);
+    try
+    {
+        foreach (r; o.allow) policy.allow ~= parseRule(r);
+        foreach (r; o.deny) policy.deny ~= parseRule(r);
+    }
+    catch (Exception e) die(e.msg);
     if (o.plan) policy.mode = Mode.plan;
 
     auto tools = new ToolRegistry;

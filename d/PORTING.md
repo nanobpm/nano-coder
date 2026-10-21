@@ -29,7 +29,12 @@ which macOS and most Linux distributions already have.
 | `nano/tools/bash.d` | `bash.rs` | `bash -c` runs in its own session. The timeout kills the whole process group, and stdout and stderr are captured to files. |
 | `nano/tools/files.d` | `files.rs` | `read_file`, `write_file` and `edit_file` with the same schemas. Writes and edits are refused if the file wasn't read first or has changed since. Fuzzy matching ignores trailing whitespace, then indentation. Images are reported as unsupported. |
 | `nano/tools/search.d` | `search.rs` | `grep` and `glob` with the same schemas. They honour nested .gitignore files and skip `.git`, symlinks and binary files. Results are sorted and capped. |
-| `nano/permissions.d` | `permissions.rs`, `shell.rs` (partly) | Order is deny, then allow, then built-in guards, and an allow must cover every command in the line. Rules look like `Bash(...)`, `Edit(...)` or `Read(...)`, plus `protected_branches`. Plan mode blocks tools that change things. |
+| `nano/shell.d` | `shell.rs` | The shell word/redirect/heredoc parser the guards inspect. |
+| `nano/paths.d` | `std::path` usage in `permissions.rs` | Lexical path semantics (components, normalize, parent, starts_with) plus symlink resolution. |
+| `nano/cmdexpand.d` | `permissions.rs` 548–2549 | Expands commands for inspection: wrappers, nested `bash -c`, loops, option scans, containers, heredocs, assignments and loop-bound variables. `Blocked` is Rust's `Err(String)`. |
+| `nano/guard.d` | `permissions.rs` 2549–3320 | The built-in guards: root/home/workspace deletes, devices, protected branches, databases, `cd` tracking. |
+| `nano/permissions.d` | `permissions.rs` 1–547 | Rules (`Bash`/`Read`/`Edit`/tool names, `:*` prefixes, `**` paths), deny, then allow, then guards, `readDenied`, `ruleMatches`, `validateRule`. Also plan mode, which Rust handles in the agent. Bad rules are rejected at startup. |
+| `nano/permissions_test.d` | `permissions.rs` tests | 46 of the 47 Rust tests, translated one to one. `sandbox_confines_file_tools` is left out (no sandbox). |
 | `nano/session.d` | `session.rs`, `resume.rs` (partly), `instructions.rs` (partly) | JSONL logs, `--resume [id\|last]`, and AGENTS.md/CLAUDE.md from the git root down to the cwd, plus `~/.config/nano-coder/AGENTS.md`. |
 | `nano/agent.d` | `agent.rs` (core loop only) | Runs model call → tools → results until done or `max_iterations`. It gives specific advice for invalid arguments, unknown tools and blocked calls. |
 | `app.d` | `main.rs`, `ui.rs` (minimal) | Flags: `--model`, `--config`, `-p`, `--resume`, `--plan`, `--allow`, `--deny`, `--list-models`, `--no-session`, `--verbose`, `--version`. A plain readln REPL with `/model`, `/plan`, `/normal`, `/clear`, `/usage` and `/quit`. Piped stdin runs one prompt per line. |
@@ -61,7 +66,7 @@ Roughly in dependency order. Sizes are Rust lines.
    history tools), system reminders (`reminders.rs` 1.8k), turn caps and
    modes (`mode.rs`), cancel/steer (`queue.rs` 0.3k), and `report_outcome`
    (`goal.rs`).
-2. **Shell parser and full permissions** (`shell.rs` 0.7k, `permissions.rs` 2.9k).
+2. **Permissions vs. sandbox.** The parser and guards are fully ported, but file-tool writes are not held to sandbox roots, and the search tools don't call `readDenied` for each file yet.
 3. **Sandbox** (`sandbox.rs` 0.8k): Seatbelt on macOS, Landlock on Linux.
 4. **Providers.** OpenAI Responses (`openai_responses.rs` 1.0k), Copilot model routing
    and login (`--login`, device flow), Muse (`muse.rs` 1.9k), Qwen

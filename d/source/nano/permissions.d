@@ -1,61 +1,224 @@
 /// Permission checks run before every tool call (config `[permissions]`).
+/// Port of src/permissions.rs.
 ///
-/// Order: user `deny` rules, then user `allow` rules, then built-in guards
-/// against destructive commands. Deny always wins; an allow rule approves a
-/// shell command only when every command in it matches an allow rule. Plan
-/// mode blocks every mutating tool.
+/// Order: user `deny` rules, then user `allow` rules, then the built-in
+/// guards against destructive commands. Deny always wins; an allow rule
+/// approves a shell command only when every command in it matches an allow
+/// rule. Plan mode (an agent-level gate) blocks every mutating tool.
 ///
-/// Port status: the Rust version parses shell with a full word/expansion
-/// parser (shell.rs) and reasons about loops, redirects and sandbox roots.
-/// This port splits on shell operators outside quotes and matches the
-/// destructive guards with patterns; see PORTING.md.
+/// These checks catch mistakes, not adversaries: a model can still write a
+/// script and run it. The Rust build also holds file writes to the OS
+/// sandbox's writable roots; the D port has no sandbox yet (PORTING.md).
+///
+/// Shell commands are parsed by nano.shell, normalized by nano.cmdexpand
+/// (wrappers stripped, nested scripts and loops inspected) and judged by
+/// nano.guard. Errors keep the Rust wording.
 module nano.permissions;
+
+@safe:
 
 import std.json;
 import std.format : format;
-import std.regex;
-import std.string : strip, indexOf, startsWith, endsWith, toLower;
-import std.algorithm : canFind, any, all;
-import std.path : globMatch, absolutePath, buildNormalizedPath, expandTilde;
-import nano.tools.search : globToRegex;
+import std.regex : regex, matchFirst, Regex;
+import std.string : strip, indexOf, toLower;
+import std.algorithm : canFind, any, all, startsWith, endsWith, filter;
+import std.array : array;
+import nano.shell : parse, Simple;
+import nano.cmdexpand;
+import nano.guard;
+import nano.paths;
 
 enum string blockAdvice = "Do not try to get around this with a different command or a script. "
-    ~ "If the action is really needed, stop and tell the user what you want to run and why, so they can run it themselves or add an allow rule.";
+    ~ "If the action is really needed, stop and tell the user what you want to run and why, so they can run it "
+    ~ "themselves or add an allow rule.";
 
 enum Mode { normal, plan, auto_ }
 
-struct Rule
+/// A malformed permission rule.
+class RuleError : Exception
 {
-    string src;
-    string tool;    // "bash", "edit", "read", or a tool name
-    string pattern; // empty: every call to the tool
+    this(string msg) pure nothrow { super(msg); }
 }
 
+enum Subject
+{
+    /// `Bash(...)`: matched against each command and the whole command line.
+    command,
+    /// `Read(...)` / `Edit(...)`: matched against the path argument.
+    path,
+    /// Any other tool name: matched against its JSON arguments.
+    arguments,
+}
+
+struct Rule
+{
+    string source;
+    string[] tools;
+    Subject subject;
+    /// null: every call to the tool.
+    string patternSource;
+    Regex!char pattern;
+
+    bool appliesTo(string tool) const { return tools.canFind(tool); }
+
+    bool matches(string text) const @trusted
+    {
+        return patternSource is null || !matchFirst(text, cast() pattern).empty;
+    }
+}
+
+private string quoted(string s) { return JSONValue(s).toString; }
+
+/// Parse a rule like `Bash(git push *)`, `Read(**/.env)` or `write_file`.
 Rule parseRule(string src)
 {
-    auto s = src.strip;
-    Rule r = Rule(src);
-    auto open = s.indexOf('(');
-    if (open > 0 && s.endsWith(")"))
+    auto source = src.strip;
+    string name, pattern;
+    bool hasPattern = false;
+    auto open = source.indexOf('(');
+    if (open >= 0)
     {
-        r.tool = s[0 .. open].toLower;
-        r.pattern = s[open + 1 .. $ - 1];
+        if (!source.endsWith(")"))
+            throw new RuleError(format("permission rule %s is missing its closing )", quoted(source)));
+        name = source[0 .. open];
+        pattern = source[open + 1 .. $ - 1];
+        hasPattern = true;
     }
-    else r.tool = s.toLower;
-    if (r.tool == "bash" && r.pattern.endsWith(":*")) r.pattern = r.pattern[0 .. $ - 2] ~ "*";
+    else name = source;
+    name = name.strip;
+    if (!name.length) throw new RuleError(format("permission rule %s has no tool name", quoted(source)));
+    Rule r;
+    r.source = source;
+    switch (name.toLower)
+    {
+    case "bash", "shell": r.tools = ["bash"]; r.subject = Subject.command; break;
+    case "read", "read_file": r.tools = ["read_file", "grep", "glob"]; r.subject = Subject.path; break;
+    case "grep": r.tools = ["grep"]; r.subject = Subject.arguments; break;
+    case "glob": r.tools = ["glob"]; r.subject = Subject.arguments; break;
+    case "edit", "write", "edit_file", "write_file": r.tools = ["write_file", "edit_file"]; r.subject = Subject.path; break;
+    default: r.tools = [name]; r.subject = Subject.arguments;
+    }
+    auto p = pattern.strip;
+    if (hasPattern && p.length && p != "*" && p != "**")
+    {
+        r.patternSource = r.subject == Subject.path ? pathGlob(p) : commandGlob(p);
+        try r.pattern = regex(r.patternSource, "s");
+        catch (Exception e) throw new RuleError(format("bad pattern %s: %s", quoted(p), e.msg));
+    }
     return r;
 }
 
-/// The rule family a tool belongs to.
-string family(string tool)
+private string escapeChar(dchar c)
 {
-    switch (tool)
+    import std.conv : to;
+    if (`\.+*?()|[]{}^$`.canFind(c)) return "\\" ~ c.to!string;
+    return c.to!string;
+}
+
+/// `*` matches anything (including spaces and `/`); a trailing `:*` matches
+/// the prefix alone or followed by arguments (`npm run test:*`).
+string commandGlob(string pattern)
+{
+    bool prefix = pattern.endsWith(":*");
+    auto body = prefix ? pattern[0 .. $ - 2] : pattern;
+    string re = "^";
+    foreach (dchar c; body)
+        re ~= c == '*' ? ".*" : c == '?' ? "." : escapeChar(c);
+    if (prefix) re ~= "(?: .*)?";
+    return re ~ "$";
+}
+
+/// `**` crosses directories, `*` and `?` do not. `~/` is the home directory.
+string pathGlob(string pattern)
+{
+    import std.conv : to;
+    auto home = homeDir();
+    if (pattern.startsWith("~/") && home !is null) pattern = home ~ "/" ~ pattern[2 .. $];
+    auto chars = pattern.to!(dchar[]);
+    string re = "^";
+    size_t i = 0;
+    while (i < chars.length)
     {
-        case "bash": return "bash";
-        case "write_file", "edit_file": return "edit";
-        case "read_file", "grep", "glob": return "read";
-        default: return tool;
+        if (chars[i] == '*' && i + 1 < chars.length && chars[i + 1] == '*')
+        {
+            if (i + 2 < chars.length && chars[i + 2] == '/') { re ~= "(?:.*/)?"; i += 3; }
+            else { re ~= ".*"; i += 2; }
+            continue;
+        }
+        re ~= chars[i] == '*' ? "[^/]*" : chars[i] == '?' ? "[^/]" : escapeChar(chars[i]);
+        ++i;
     }
+    return re ~ "$";
+}
+
+private bool pathRuleMatches(const Rule rule, string absolute, string cwd)
+{
+    if (rule.patternSource is null) return true;
+    if (rule.matches(absolute)) return true;
+    if (startsWithPath(absolute, cwd))
+    {
+        auto rel = fromComponents(components(absolute)[components(cwd).length .. $]);
+        return rule.matches(rel);
+    }
+    return false;
+}
+
+/// Whether a permission-style rule string matches a tool call (hook `if`
+/// filters). False when the rule fails to parse or does not apply.
+bool ruleMatches(string ruleSrc, string tool, JSONValue args)
+{
+    Rule rule;
+    try rule = parseRule(ruleSrc);
+    catch (RuleError) return false;
+    if (!rule.appliesTo(tool)) return false;
+    auto cwd = currentDir();
+    final switch (rule.subject)
+    {
+    case Subject.command:
+        auto c = stringArg(args, "command");
+        if (c is null) return false;
+        if (rule.matches(c.strip)) return true;
+        try
+        {
+            foreach (cmd; expandAll(parse(c)))
+                if (rule.matches(commandText(cmd))) return true;
+        }
+        catch (Exception) {}
+        return false;
+    case Subject.path:
+        auto path = stringArg(args, "path");
+        if (path is null)
+        {
+            if (tool == "grep" || tool == "glob") path = ".";
+            else return false;
+        }
+        auto joined = joinPath(cwd, expandTilde(path));
+        return pathRuleMatches(rule, normalize(joined), cwd) || pathRuleMatches(rule, resolveSymlinks(joined), cwd);
+    case Subject.arguments:
+        return rule.matches(args.toString);
+    }
+}
+
+/// The parse error of a malformed rule, or null.
+string validateRule(string ruleSrc)
+{
+    try parseRule(ruleSrc);
+    catch (RuleError e) return e.msg;
+    return null;
+}
+
+private string stringArg(JSONValue args, string key) @trusted
+{
+    if (args.type != JSONType.object) return null;
+    auto v = key in args;
+    return v !is null && v.type == JSONType.string ? v.str : null;
+}
+
+private string currentDir() @trusted
+{
+    import std.file : getcwd;
+    try return getcwd();
+    catch (Exception) return "/";
 }
 
 bool isMutating(string tool)
@@ -63,78 +226,7 @@ bool isMutating(string tool)
     return tool == "bash" || tool == "write_file" || tool == "edit_file";
 }
 
-/// Split a shell script into simple commands at `;`, `&&`, `||`, `|`, `&`,
-/// newlines and `$(`/backticks, outside single/double quotes.
-string[] splitCommands(string script)
-{
-    string[] out_;
-    string cur;
-    char quote = 0;
-    void flush()
-    {
-        auto t = cur.strip;
-        if (t.length) out_ ~= t;
-        cur = null;
-    }
-    for (size_t i = 0; i < script.length; i++)
-    {
-        char c = script[i];
-        if (quote)
-        {
-            if (c == '\\' && quote == '"' && i + 1 < script.length) { cur ~= c; cur ~= script[++i]; continue; }
-            if (c == quote) quote = 0;
-            if (quote == '"' && c == '$' && i + 1 < script.length && script[i + 1] == '(') { flush(); i++; continue; }
-            cur ~= c;
-            continue;
-        }
-        if (c == '\\' && i + 1 < script.length) { cur ~= c; cur ~= script[++i]; continue; }
-        if (c == '\'' || c == '"') { quote = c; cur ~= c; continue; }
-        if (c == '$' && i + 1 < script.length && script[i + 1] == '(') { flush(); i++; continue; }
-        if (";|&\n`()".canFind(c)) { flush(); continue; }
-        cur ~= c;
-    }
-    flush();
-    return out_;
-}
-
-private bool commandMatches(string pattern, string command)
-{
-    return !matchFirst(command, regex("^" ~ globToRegex(pattern)[1 .. $ - 1] ~ "$", "s")).empty
-        || command == pattern;
-}
-
-/// Built-in guards: return a reason when `command` looks destructive.
-string destructive(string command, const string[] protectedBranches)
-{
-    auto c = command.strip;
-    static struct G { string re; string why; }
-    static immutable G[] guards = [
-        G(`^(sudo|doas)\b`, "runs with elevated privileges"),
-        G(`^rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\s+.*(\s|^)(/|~|\$HOME|\*|\.|\.\.)/?(\s|$)`, "recursively deletes a root, home or whole working directory"),
-        G(`^rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\s+(/|~|\$HOME|\*|\.|\.\.)/?(\s|$)`, "recursively deletes a root, home or whole working directory"),
-        G(`^git\s+reset\s+.*--hard`, "discards uncommitted work (git reset --hard)"),
-        G(`^git\s+clean\s+.*-[a-zA-Z]*f`, "deletes untracked files (git clean -f)"),
-        G(`^git\s+push\s+.*(--force\b|-f\b|--force-with-lease|\+)`, "force-pushes"),
-        G(`^git\s+(checkout|restore)\s+(--\s+)?\.(\s|$)`, "discards all working-tree changes"),
-        G(`^git\s+branch\s+.*-D\b`, "force-deletes a branch"),
-        G(`^git\s+stash\s+(drop|clear)\b`, "drops stashed work"),
-        G(`^(mkfs|fdisk|diskutil\s+erase|shutdown|reboot|halt)\b`, "is a system-level destructive command"),
-        G(`^dd\s+.*of=/dev/`, "writes to a device"),
-        G(`>\s*/dev/(sd|disk|nvme)`, "writes to a device"),
-        G(`^chmod\s+(-R\s+)?0?777\s+/`, "opens permissions on a system path"),
-    ];
-    foreach (g; guards)
-        if (!matchFirst(c, regex(g.re)).empty) return g.why;
-    auto push = matchFirst(c, regex(`^git\s+push\s+\S+\s+(\S+:)?(\S+)`));
-    if (!push.empty)
-    {
-        auto target = push[2];
-        if (protectedBranches.canFind(target) || protectedBranches.canFind(target.startsWith("refs/heads/") ? target[11 .. $] : ""))
-            return format("pushes directly to protected branch %s", target);
-    }
-    return null;
-}
-
+/// Checks tool calls against rules and the built-in guards.
 struct Policy
 {
     Rule[] allow;
@@ -143,7 +235,8 @@ struct Policy
     string[] protectedBranches = ["main", "master", "trunk", "develop"];
     Mode mode = Mode.normal;
 
-    static Policy fromConfig(JSONValue section)
+    /// Build from the `[permissions]` table; throws RuleError on a bad rule.
+    static Policy fromConfig(JSONValue section) @trusted
     {
         Policy p;
         if (section.type != JSONType.object) return p;
@@ -158,56 +251,120 @@ struct Policy
         return p;
     }
 
-    private bool ruleMatches(const Rule r, string tool, string subject)
-    {
-        if (r.tool != family(tool) && r.tool != tool) return false;
-        if (!r.pattern.length) return true;
-        if (family(tool) == "bash") return commandMatches(r.pattern, subject);
-        // path rules: match the absolute path or the path as given
-        auto abs = buildNormalizedPath(absolutePath(expandTilde(subject)));
-        auto pat = r.pattern.startsWith("~") ? expandTilde(r.pattern) : r.pattern;
-        auto re = regex(globToRegex(pat.startsWith("/") ? pat : "**/" ~ pat));
-        return !matchFirst(abs, re).empty || !matchFirst(subject, regex(globToRegex(pat))).empty;
-    }
-
     /// null when the call may run, else the reason it is blocked.
     string check(string tool, JSONValue args)
     {
         if (mode == Mode.plan && isMutating(tool))
             return format("%s is not available in plan mode (read-only). Present the plan instead.", tool);
-        string[] subjects;
-        if (tool == "bash")
+        auto reason = checkIn(tool, args, currentDir());
+        if (reason is null) return null;
+        return format("Blocked by nano-coder permissions: %s. %s", reason, blockAdvice);
+    }
+
+    /// The bare reason a call is blocked (no advice), or null.
+    string checkIn(string tool, JSONValue args, string cwd)
+    {
+        try
         {
-            auto cmd = "command" in args;
-            if (cmd is null || cmd.type != JSONType.string) return null; // the tool reports the bad argument
-            subjects = splitCommands(cmd.str);
+            switch (tool)
+            {
+            case "bash":
+                auto c = stringArg(args, "command");
+                if (c !is null) checkCommand(c, cwd);
+                return null;
+            case "read_file", "write_file", "edit_file":
+                auto path = stringArg(args, "path");
+                if (path is null) return null;
+                auto joined = joinPath(cwd, expandTilde(path));
+                auto absolute = normalize(joined);
+                auto resolved = resolveSymlinks(joined);
+                foreach (rule; deny)
+                    if (rule.appliesTo(tool)
+                        && (pathRuleMatches(rule, absolute, cwd) || pathRuleMatches(rule, resolved, cwd)))
+                        return format("rule `%s` denies %s on %s", rule.source, tool, absolute);
+                return null;
+            case "grep", "glob":
+                auto root = stringArg(args, "path");
+                if (root is null) root = ".";
+                if (auto rule = readDenyRule(expandTilde(root), cwd))
+                    return format("rule `%s` denies %s on %s", rule, tool, root);
+                auto text = args.toString;
+                foreach (rule; deny)
+                    if (rule.subject == Subject.arguments && rule.appliesTo(tool) && rule.matches(text))
+                        return format("rule `%s` denies %s", rule.source, tool);
+                return null;
+            default:
+                auto text = args.toString;
+                foreach (rule; deny)
+                    if (rule.appliesTo(tool) && rule.matches(text))
+                        return format("rule `%s` denies %s", rule.source, tool);
+                return null;
+            }
         }
-        else if (auto path = "path" in args)
+        catch (Blocked b) return b.msg;
+    }
+
+    /// Whether a `Read(...)` deny rule covers `path` or any ancestor of it.
+    /// The search tools call this for every discovered file.
+    bool readDenied(string path, string cwd) { return readDenyRule(path, cwd) !is null; }
+
+    /// The source of the `Read(...)` deny rule covering `path`, or null.
+    private string readDenyRule(string path, string cwd)
+    {
+        bool any_ = false;
+        foreach (ref r; deny)
+            if (r.subject == Subject.path && r.appliesTo("read_file")) { any_ = true; break; }
+        if (!any_) return null;
+        auto joined = joinPath(cwd, path);
+        auto absolute = normalize(joined);
+        auto resolved = resolveSymlinks(joined);
+        foreach (ref r; deny)
         {
-            if (path.type == JSONType.string) subjects = [path.str];
-        }
-        if (!subjects.length) subjects = [""];
-        foreach (s; subjects)
-            foreach (r; deny)
-                if (ruleMatches(r, tool, s))
-                    return format("Blocked by deny rule %s. %s", r.src, blockAdvice);
-        if (subjects.all!(s => allow.any!(r => ruleMatches(r, tool, s)))) return null;
-        if (builtinRules && tool == "bash")
-        {
-            // Pipelines are split apart above, so check this one on the whole script.
-            if (!matchFirst(args["command"].str, regex(`(curl|wget)\b[^;&|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b`)).empty)
-                return format("Blocked by nano-coder permissions: piping a download into a shell. %s", blockAdvice);
-            foreach (s; subjects)
-                if (auto why = destructive(s, protectedBranches))
-                    return format("Blocked by nano-coder permissions: `%s` %s. %s", s, why, blockAdvice);
+            if (!(r.subject == Subject.path && r.appliesTo("read_file"))) continue;
+            for (string c = absolute; c !is null; c = parent(c))
+                if (pathRuleMatches(r, c, cwd)) return r.source;
+            for (string c = resolved; c !is null; c = parent(c))
+                if (pathRuleMatches(r, c, cwd)) return r.source;
         }
         return null;
     }
-}
 
-unittest
-{
-    assert(splitCommands(`git status && echo "a;b" | wc -l; x=$(rm -rf /)`) == ["git status", `echo "a;b"`, "wc -l", "x=", "rm -rf /"]);
+    /// Throws Blocked with the reason a shell command is refused.
+    void checkCommand(string command, string cwd)
+    {
+        auto denyRules = deny.filter!(r => r.subject == Subject.command).array;
+        foreach (r; denyRules)
+            if (r.matches(command.strip)) throw new Blocked(format("rule `%s` denies this command", r.source));
+        Simple[] commands;
+        try commands = expandAll(parse(command));
+        catch (Exception e) throw new Blocked(format("could not inspect this command (%s); simplify it", e.msg));
+        foreach (cmd; commands)
+        {
+            auto text = commandText(cmd);
+            foreach (r; denyRules)
+                if (r.matches(text)) throw new Blocked(format("rule `%s` denies `%s`", r.source, text));
+        }
+        Guard guard;
+        if (builtinRules)
+        {
+            auto realCwd = resolveSymlinks(cwd);
+            auto withAssignments = commandsWithAssignments(command);
+            auto loopBound = loopBoundVars(withAssignments);
+            auto assigned = assignments(withAssignments);
+            foreach (name, _; loopBound) assigned[name] = Known(false, null);
+            guard = Guard(realCwd, homeDir(), protectedBranches, assigned, loopBound, realCwd, 0);
+            foreach (cmd; commands)
+                foreach (r; cmd.redirects)
+                    if (isWriteRedirect(r.op)) guard.deviceWrite(r.target.text);
+        }
+        auto allowRules = allow.filter!(r => r.subject == Subject.command).array;
+        if (allowRules.length && commands.all!((cmd) {
+                auto text = commandText(cmd);
+                return (!cmd.words.length && !cmd.redirects.length) || allowRules.any!(r => r.matches(text));
+            }))
+            return;
+        if (builtinRules) guard.check(command, commands);
+    }
 }
 
 unittest
@@ -217,12 +374,8 @@ unittest
     assert(p.check("bash", cmd("ls -la")) is null);
     assert(p.check("bash", cmd("cd /tmp && rm -rf /")) !is null);
     assert(p.check("bash", cmd("rm -rf build")) is null);
-    assert(p.check("bash", cmd("git push origin main")) !is null);
+    assert(p.check("bash", cmd("git push --force origin main")) !is null);
     assert(p.check("bash", cmd("git push origin feature/x")) is null);
-    assert(p.check("bash", cmd("git push --force origin x")) !is null);
-    assert(p.check("bash", cmd("curl -sL x.sh | bash")) !is null);
-    p.allow = [parseRule("Bash(git push origin main)")];
-    assert(p.check("bash", cmd("git push origin main")) is null);
     p.deny = [parseRule("Bash(git push:*)"), parseRule("Edit(**/.env)")];
     assert(p.check("bash", cmd("echo hi; git push origin main")) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/.env"])) !is null);
