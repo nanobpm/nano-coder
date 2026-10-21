@@ -46,7 +46,13 @@ class AnthropicClient : LLMClient
                     push(msgs, "user", textBlock(m.content));
                     break;
                 case Role.assistant:
+                    // Signed reasoning precedes the text and tool use it led to;
+                    // other providers' reasoning items aren't replayable here.
                     JSONValue[] blocks;
+                    foreach (ref tb; m.thinkingBlocks)
+                        if (tb.type == JSONType.object && "type" in tb && tb["type"].type == JSONType.string
+                                && (tb["type"].str == "thinking" || tb["type"].str == "redacted_thinking"))
+                            blocks ~= parseJSON(tb.toString);
                     if (m.content.length) blocks ~= textBlock(m.content);
                     foreach (c; m.toolCalls)
                     {
@@ -159,7 +165,12 @@ class AnthropicClient : LLMClient
         {
             auto t = block["type"].str;
             if (t == "text") r.content ~= block["text"].str;
-            else if (t == "thinking") r.reasoning ~= block["thinking"].str;
+            else if (t == "thinking")
+            {
+                r.reasoning ~= block["thinking"].str;
+                r.thinkingBlocks ~= block;
+            }
+            else if (t == "redacted_thinking") r.thinkingBlocks ~= block;
             else if (t == "tool_use")
             {
                 ToolCall c = ToolCall(block["id"].str, block["name"].str);
@@ -201,8 +212,9 @@ struct AnthropicStream
 {
     StreamSink sink;
     LLMResponse r;
-    private string[size_t] kinds, ids, names, inputs;
-    private size_t[] order;
+    private string[size_t] kinds, ids, names, inputs, thoughts, signatures;
+    private JSONValue[size_t] redacted;
+    private size_t[] order, reasoningOrder;
 
     void event(string data)
     {
@@ -217,6 +229,18 @@ struct AnthropicStream
                 auto idx = cast(size_t) j["index"].integer;
                 auto b = j["content_block"];
                 kinds[idx] = b["type"].str;
+                // Signed thinking and redacted blocks are kept verbatim for replay.
+                if (kinds[idx] == "thinking")
+                {
+                    reasoningOrder ~= idx;
+                    thoughts[idx] = "thinking" in b && b["thinking"].type == JSONType.string ? b["thinking"].str : "";
+                    signatures[idx] = "signature" in b && b["signature"].type == JSONType.string ? b["signature"].str : "";
+                }
+                else if (kinds[idx] == "redacted_thinking")
+                {
+                    reasoningOrder ~= idx;
+                    redacted[idx] = b;
+                }
                 if (kinds[idx] == "tool_use")
                 {
                     order ~= idx;
@@ -236,7 +260,11 @@ struct AnthropicStream
                         break;
                     case "thinking_delta":
                         r.reasoning ~= d["thinking"].str;
+                        if (auto t = idx in thoughts) *t ~= d["thinking"].str;
                         sink(true, d["thinking"].str);
+                        break;
+                    case "signature_delta":
+                        if (auto s = idx in signatures) *s ~= d["signature"].str;
                         break;
                     case "input_json_delta":
                         inputs[idx] ~= d["partial_json"].str;
@@ -260,6 +288,12 @@ struct AnthropicStream
     LLMResponse finish()
     {
         foreach (idx; order) r.toolCalls ~= ToolCall.fromRaw(ids[idx], names[idx], inputs[idx]);
+        foreach (idx; reasoningOrder)
+        {
+            if (auto b = idx in redacted) { r.thinkingBlocks ~= *b; continue; }
+            JSONValue t = ["type": "thinking", "thinking": thoughts[idx], "signature": signatures[idx]];
+            r.thinkingBlocks ~= t;
+        }
         return r;
     }
 }
@@ -300,4 +334,36 @@ unittest
     auto r = st.finish();
     assert(shown == "Hi" && r.toolCalls[0].arguments["pattern"].str == "*.d");
     assert(r.usage.inputTokens == 105 && r.usage.outputTokens == 7 && r.stopReason == "tool_use");
+}
+
+unittest
+{
+    // Streamed thinking keeps its signature; redacted blocks are kept whole;
+    // both replay before the text and tool use, in order.
+    AnthropicStream st;
+    st.sink = (bool reasoning, string text) {};
+    foreach (e; [
+        `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Plan."}}`,
+        `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}`,
+        `{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"xyz"}}`,
+        `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"glob","input":{}}}`,
+        `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+    ])
+        st.event(e);
+    auto r = st.finish();
+    assert(r.thinkingBlocks.length == 2 && r.reasoning == "Plan.");
+    assert(r.thinkingBlocks[0] == parseJSON(`{"type":"thinking","thinking":"Plan.","signature":"sig"}`));
+    assert(r.thinkingBlocks[1]["data"].str == "xyz");
+
+    auto reply = Message.assistant("", r.toolCalls);
+    reply.thinkingBlocks = r.thinkingBlocks ~ parseJSON(`{"type":"reasoning_content","text":"from kimi"}`);
+    ResolvedProvider p;
+    p.model = "claude";
+    ChatRequest req;
+    req.messages = [Message.user("q"), reply, Message.toolResult("t1", "glob", "none")];
+    auto body_ = new AnthropicClient(p).requestBody(req, false);
+    auto content = body_["messages"][1]["content"].array;
+    assert(content.length == 3 && content[0]["type"].str == "thinking" && content[0]["signature"].str == "sig");
+    assert(content[1]["type"].str == "redacted_thinking" && content[2]["type"].str == "tool_use");
 }

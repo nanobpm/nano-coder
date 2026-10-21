@@ -91,6 +91,12 @@ JSONValue messageRecord(const ref Message m)
     if (m.isError) j["is_error"] = true;
     if (m.timestamp.length) j["timestamp"] = m.timestamp;
     if (m.thinking.length) j["thinking"] = m.thinking;
+    if (m.thinkingBlocks.length)
+    {
+        JSONValue[] blocks;
+        foreach (ref b; m.thinkingBlocks) blocks ~= parseJSON(b.toString);
+        j["thinking_blocks"] = blocks;
+    }
     if (m.hasUsage)
         j["usage"] = JSONValue(["prompt_tokens": m.usage.inputTokens, "completion_tokens": m.usage.outputTokens,
             "total_tokens": m.usage.inputTokens + m.usage.outputTokens]);
@@ -134,6 +140,9 @@ Message messageFromRecord(JSONValue j)
         case "is_error": m.isError = v.type == JSONType.true_; break;
         case "timestamp": m.timestamp = v.str; break;
         case "thinking": m.thinking = v.str; break;
+        case "thinking_blocks":
+            if (v.type == JSONType.array) m.thinkingBlocks = v.array.dup;
+            break;
         case "usage":
             m.hasUsage = true;
             if (auto p = "prompt_tokens" in v) m.usage.inputTokens = p.integer;

@@ -84,6 +84,8 @@ struct Message
     /// The message's physical line in the session log (0: not logged), its
     /// `#N` ID for smart compaction and the history tools.
     ulong logLine;
+    /// Assistant: provider reasoning items replayed on later requests.
+    JSONValue[] thinkingBlocks;
     /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),
     /// kept so a resumed Rust log round-trips them.
     JSONValue extra;
@@ -158,6 +160,10 @@ struct LLMResponse
     ToolCall[] toolCalls;
     TokenUsage usage;
     string stopReason;
+    /// Provider reasoning items to replay with this reply (Anthropic signed
+    /// `thinking`/`redacted_thinking` blocks, OpenAI `reasoning_content`,
+    /// Responses `reasoning` items).
+    JSONValue[] thinkingBlocks;
 }
 
 struct ToolDefinition

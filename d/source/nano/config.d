@@ -87,6 +87,9 @@ struct ProviderConfig
     ModelSettings[string] models;
     long timeoutSecs = 600;
     long maxRetries = 3;
+    /// Send the model's reasoning back on later turns (null: on for models
+    /// that reason over the Responses API).
+    Nullable!bool replayReasoning;
 
     /// Merge `extra_body` into a built request body (nested objects field by
     /// field, so an unrelated option doesn't clobber a generated sibling), then
@@ -136,6 +139,7 @@ struct ProviderConfig
             foreach (name, m; v.object) models[name] = ModelSettings.fromJSON(m);
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
+        if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
     }
 }
 
@@ -295,6 +299,16 @@ struct ResolvedProvider
     string model;
     ProviderConfig config;
     string apiKey;
+    /// Whether reasoning items are replayed (see `ProviderConfig.replayReasoning`).
+    bool replayReasoning;
+}
+
+/// Whether this provider and model reason over the Responses API: they
+/// need reasoning replayed and reject a non-default temperature.
+bool reasonsOverResponses(ProviderKind kind, string model)
+{
+    import nano.copilot : isReasoningModel;
+    return kind == ProviderKind.githubCopilot && isReasoningModel(model);
 }
 
 /// Split `provider/model` (or a bare provider, or a bare model).
@@ -332,6 +346,7 @@ ResolvedProvider resolve(const ref Config c, string spec)
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
     if (r.config.baseUrl.indexOf('?') >= 0 || r.config.baseUrl.indexOf('#') >= 0)
         throw new Exception(format("provider %s: base_url must not contain a query or fragment", name));
+    r.replayReasoning = pc.replayReasoning.isNull ? reasonsOverResponses(r.config.kind, r.model) : pc.replayReasoning.get;
     r.apiKey = pc.apiKey;
     if (!r.apiKey.length && pc.apiKeyEnv.length) r.apiKey = environment.get(pc.apiKeyEnv, "");
     if (!r.apiKey.length && pc.apiKeyCommand.length)
@@ -367,4 +382,20 @@ unittest
     assert(isNaN(c.temperature));
     auto a = resolve(c, "anthropic");
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
+}
+
+@trusted unittest
+{
+    import nano.toml : parseToml;
+    // replay_reasoning defaults on only for Copilot reasoning models.
+    Config c;
+    c.providers = presets();
+    c.providers["github-copilot"].apiKey = "x";
+    assert(resolve(c, "github-copilot/gpt-6-astra").replayReasoning);
+    assert(!resolve(c, "github-copilot/gpt-4.1").replayReasoning);
+    assert(!resolve(c, "github-copilot/o4-mini").replayReasoning);
+    c.providers["github-copilot"].merge(parseToml("replay_reasoning = false"));
+    assert(!resolve(c, "github-copilot/gpt-5").replayReasoning);
+    c.providers["deepseek"].merge(parseToml("replay_reasoning = true"));
+    assert(resolve(c, "deepseek/deepseek-reasoner").replayReasoning);
 }

@@ -62,7 +62,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
         return b;
     }
 
-    static JSONValue encode(const ref Message m)
+    static JSONValue encode(const ref Message m, bool replayReasoning = false)
     {
         JSONValue j = ["role": roleName(m.role)];
         final switch (m.role)
@@ -91,7 +91,22 @@ class OpenAIClient : LLMClient, CapabilityProbe
                 j["content"] = m.content;
                 break;
         }
+        if (replayReasoning && m.role == Role.assistant)
+        {
+            string reasoning;
+            foreach (ref b; m.thinkingBlocks)
+                if (b.type == JSONType.object && "type" in b && b["type"].type == JSONType.string
+                        && b["type"].str == "reasoning_content" && "text" in b && b["text"].type == JSONType.string)
+                    reasoning ~= b["text"].str;
+            if (reasoning.length) j["reasoning_content"] = reasoning;
+        }
         return j;
+    }
+
+    /// A `thinking_blocks` entry holding `reasoning_content` for replay.
+    static JSONValue reasoningBlock(string text)
+    {
+        return JSONValue(["type": "reasoning_content", "text": text]);
     }
 
     /// Chat Completions messages. `tool` messages carry only text, so a tool
@@ -113,7 +128,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
         foreach (i, m; req.messages)
         {
             if (m.role != Role.tool) flush();
-            auto j = encode(m);
+            auto j = encode(m, p.replayReasoning);
             if (m.role == Role.tool && m.attachments.length)
             {
                 string content = m.content;
@@ -145,7 +160,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
         if (!p.config.stream || sink is null)
         {
             auto text = postJson(url, headers(req), requestBody(req, false), what, p.config.maxRetries, p.config.timeoutSecs);
-            auto r = parseWhole(parseJSON(text));
+            auto r = parseWhole(parseJSON(text), p.replayReasoning);
             if (sink !is null)
             {
                 if (r.reasoning.length) sink(true, r.reasoning);
@@ -155,20 +170,27 @@ class OpenAIClient : LLMClient, CapabilityProbe
         }
         StreamState st;
         st.sink = sink;
+        st.replay = p.replayReasoning;
         postJson(url, headers(req), requestBody(req, true), what, p.config.maxRetries, p.config.timeoutSecs,
                 (string data) { st.event(data); });
         return st.finish();
     }
 
-    static LLMResponse parseWhole(JSONValue j)
+    static LLMResponse parseWhole(JSONValue j, bool replay = false)
     {
         LLMResponse r;
         if (auto e = "error" in j) throw new Exception("provider error: " ~ e.toString);
         auto choice = j["choices"][0];
         auto msg = choice["message"];
         if (auto c = "content" in msg) if (c.type == JSONType.string) r.content = c.str;
+        // `reasoning_content` (DeepSeek, llama.cpp, vLLM), else `reasoning`.
         foreach (key; ["reasoning_content", "reasoning"])
-            if (auto c = key in msg) if (c.type == JSONType.string) r.reasoning ~= c.str;
+            if (auto c = key in msg)
+                if (c.type == JSONType.string && c.str.length) { r.reasoning ~= c.str; break; }
+        // Replay echoes only the provider's actual `reasoning_content`.
+        if (replay)
+            if (auto c = "reasoning_content" in msg)
+                if (c.type == JSONType.string && c.str.length) r.thinkingBlocks ~= reasoningBlock(c.str);
         if (auto calls = "tool_calls" in msg)
             if (calls.type == JSONType.array)
                 foreach (c; calls.array)
@@ -302,6 +324,9 @@ struct StreamState
     ThinkSplitter think;
     string[size_t] ids, names, args;
     size_t[] order;
+    /// Keep `reasoning_content` for replay.
+    bool replay;
+    string replayText;
 
     void event(string data)
     {
@@ -320,7 +345,9 @@ struct StreamState
                 if (v.type == JSONType.string && v.str.length)
                 {
                     r.reasoning ~= v.str;
+                    if (key == "reasoning_content") replayText ~= v.str;
                     sink(true, v.str);
+                    break;
                 }
         if (auto v = "content" in *delta)
             if (v.type == JSONType.string && v.str.length)
@@ -354,6 +381,7 @@ struct StreamState
             auto id = ids[idx].length ? ids[idx] : format("call_%s", n);
             r.toolCalls ~= ToolCall.fromRaw(id, names[idx], args[idx]);
         }
+        if (replay && replayText.length) r.thinkingBlocks ~= OpenAIClient.reasoningBlock(replayText);
         return r;
     }
 }
@@ -480,4 +508,29 @@ unittest
     assert(b["think"].boolean == false && "temperature" !in b);
     assert(b["messages"][1]["tool_calls"][0]["function"]["arguments"].str == `{"command":"ls"}`);
     assert(b["messages"][2]["tool_call_id"].str == "c1");
+}
+
+unittest
+{
+    // With replay on, streamed `reasoning_content` is kept and sent back on
+    // the assistant message; the generic `reasoning` field never is.
+    StreamState st;
+    st.sink = (bool t, string x) {};
+    st.replay = true;
+    st.event(`{"choices":[{"delta":{"role":"assistant","reasoning_content":"Need ls."}}]}`);
+    st.event(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{}"}}]}}]}`);
+    auto r = st.finish();
+    assert(r.thinkingBlocks == [parseJSON(`{"type":"reasoning_content","text":"Need ls."}`)]);
+    auto m = Message.assistant("", r.toolCalls);
+    m.thinkingBlocks = r.thinkingBlocks;
+    assert(OpenAIClient.encode(m, true)["reasoning_content"].str == "Need ls.");
+    assert("reasoning_content" !in OpenAIClient.encode(m, false));
+
+    StreamState off;
+    off.sink = (bool t, string x) {};
+    off.event(`{"choices":[{"delta":{"reasoning":"hm"}}]}`);
+    auto r2 = off.finish();
+    assert(r2.reasoning == "hm" && r2.thinkingBlocks.length == 0);
+    auto w = OpenAIClient.parseWhole(parseJSON(`{"choices":[{"message":{"content":"x","reasoning_content":"a","reasoning":"b"}}]}`), true);
+    assert(w.reasoning == "a" && w.thinkingBlocks.length == 1);
 }

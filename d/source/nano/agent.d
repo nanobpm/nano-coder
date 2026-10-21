@@ -324,6 +324,7 @@ class Agent
             ev.usage(r.usage);
             auto reply = Message.assistant(r.content, r.toolCalls);
             reply.thinking = r.reasoning;
+            reply.thinkingBlocks = r.thinkingBlocks;
             reply.usage = r.usage;
             reply.hasUsage = r.usage != TokenUsage.init;
             reply.durationMs = sw.peek.total!"msecs";
