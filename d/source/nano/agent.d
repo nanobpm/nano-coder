@@ -5,12 +5,14 @@ module nano.agent;
 import std.json;
 import std.format : format;
 import std.string : strip;
+import std.array : join;
 import std.conv : to;
 import nano.llm;
 import nano.tools;
 import nano.permissions;
 import nano.session;
 import nano.control;
+import nano.claude_hooks : HookManager, Decision, applyUpdatedInput, maxStopBlocks;
 
 /// What the loop reports as it works (the CLI renders these).
 interface AgentEvents
@@ -23,6 +25,12 @@ interface AgentEvents
     void userMessage(string text);
     /// A complete model reply (after its deltas went to `text`).
     void assistantMessage(string text, string reasoning);
+}
+
+/// Wrap text the model should read as a system note, not user words.
+string wrapReminder(string text)
+{
+    return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
 
 /// Why a turn ended (ACP `stopReason`).
@@ -49,6 +57,13 @@ class Agent
     TurnControl control;
     /// Why the last `run` ended.
     StopReason lastStop;
+    /// Claude Code-compatible user hooks (null = none).
+    HookManager hooks;
+    /// Whether this agent continues a restored session (`SessionStart` source).
+    bool resumed;
+    private bool sessionStarted;
+    private string pendingStartContext;
+    private int stopBlocks;
 
     this(LLMClient client, ToolRegistry tools, Policy policy, string systemPrompt)
     {
@@ -95,6 +110,34 @@ class Agent
     private string runTurn(string input, AgentEvents ev, bool resetControl)
     {
         if (resetControl) control.startTurn();
+        stopBlocks = 0;
+        if (hooks !is null)
+        {
+            syncHookSession();
+            if (!sessionStarted)
+            {
+                // Runs once; its context waits for the first accepted prompt.
+                sessionStarted = true;
+                auto start = hooks.runSessionStart(resumed ? "resume" : "startup");
+                if (auto ctx = start.contextBlock) pendingStartContext = ctx;
+            }
+            auto o = hooks.runUserPromptSubmit(input);
+            if (o.blocked)
+            {
+                push(Message.user(input));
+                auto reason = o.blockReason.strip.length ? o.blockReason : "Your message was blocked by a UserPromptSubmit hook.";
+                push(Message.assistant(reason, null));
+                ev.text(false, reason);
+                ev.assistantMessage(reason, null);
+                lastStop = StopReason.endTurn;
+                return reason;
+            }
+            string[] extra;
+            if (pendingStartContext !is null) extra ~= pendingStartContext;
+            pendingStartContext = null;
+            if (auto ctx = o.contextBlock) extra ~= ctx;
+            if (extra.length) input ~= "\n\n" ~ wrapReminder(extra.join("\n\n"));
+        }
         push(Message.user(input));
         string last;
         for (long i = 0; maxIterations <= 0 || i < maxIterations; i++)
@@ -139,6 +182,20 @@ class Agent
                 if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
                 // A steer that arrived while the answer was written extends the turn.
                 if (control.hasSteers && !control.isCancelled) continue;
+                // A blocking Stop hook keeps the turn going (capped per turn).
+                if (hooks !is null && !cut && stopBlocks < maxStopBlocks && !control.isCancelled
+                    && (maxIterations <= 0 || i + 1 < maxIterations))
+                {
+                    auto o = hooks.runStop(stopBlocks > 0);
+                    if (o.blocked)
+                    {
+                        stopBlocks++;
+                        auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
+                        push(Message.user(wrapReminder(reason)));
+                        ev.userMessage(reason);
+                        continue;
+                    }
+                }
                 lastStop = cut ? StopReason.maxTokens : StopReason.endTurn;
                 return last;
             }
@@ -176,14 +233,71 @@ class Agent
         }
         if (!tools.has(call.name)) return format("Tool '%s' not found. Available: %s", call.name, toolNames());
         if (auto blocked = policy.check(call.name, call.arguments)) return blocked;
+        // PreToolUse hooks run after the permission check, before the tool:
+        // they can deny the call, rewrite its input, or add context.
+        JSONValue args = call.arguments;
+        string[] context;
+        if (hooks !is null)
+        {
+            auto o = hooks.runPreToolUse(call.name, call.arguments, call.id);
+            if (auto ctx = o.contextBlock) context ~= ctx;
+            string deny;
+            if (o.denies) deny = o.blockReason.length ? o.blockReason : "blocked by a PreToolUse hook";
+            else if (o.decision == Decision.ask)
+                deny = o.blockReason.strip.length ? o.blockReason
+                    : "a PreToolUse hook requested confirmation (ask), which nano cannot prompt for yet; blocking the call";
+            else if (o.updatedInput.type != JSONType.null_)
+            {
+                args = applyUpdatedInput(call.name, call.arguments, o.updatedInput);
+                // The rewritten input must pass the policy too, or a hook could
+                // rewrite a command or path past the user's rules.
+                if (auto blocked = policy.check(call.name, args)) deny = blocked;
+            }
+            if (deny !is null) return withContext(deny, context);
+        }
+        string out_;
         try
         {
-            auto out_ = tools.execute(call.name, call.arguments);
+            out_ = tools.execute(call.name, args);
             isError = false;
-            return out_;
         }
-        catch (ToolError e) return e.msg;
-        catch (Exception e) return format("%s failed: %s", call.name, e.msg);
+        catch (ToolError e) out_ = e.msg;
+        catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
+        if (hooks !is null)
+        {
+            auto o = hooks.runPostToolUse(call.name, args, out_, call.id);
+            if (auto ctx = o.contextBlock) context ~= ctx;
+            if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
+        }
+        return withContext(out_, context);
+    }
+
+    private static string withContext(string text, string[] context)
+    {
+        foreach (c; context) text ~= "\n\n" ~ wrapReminder(c);
+        return text;
+    }
+
+    /// Attach `h` for a fresh (`resumed = false`) or restored session:
+    /// `SessionStart` runs again on the next prompt, and the hook config files
+    /// are recorded in the session log for the audit trail.
+    void useHooks(HookManager h, bool resumed)
+    {
+        hooks = h;
+        this.resumed = resumed;
+        sessionStarted = false;
+        pendingStartContext = null;
+        if (h is null || log is null || !h.files.length) return;
+        import nano.claude_hooks : label;
+        string[3][] files;
+        foreach (f; h.files) files ~= [f.path, f.source.label, f.hash];
+        log.hooks(files);
+    }
+
+    private void syncHookSession()
+    {
+        hooks.setSession(log !is null ? log.id : "", log !is null ? log.path : "",
+            policy.mode == Mode.plan ? "plan" : "default");
     }
 
     private string toolNames()
@@ -304,4 +418,66 @@ unittest
     // The next turn starts clean.
     agent.client = new MockClient([LLMResponse("fine")]);
     assert(agent.run("again", new NullEvents) == "fine");
+}
+
+// Claude hooks in the loop: prompt context and blocking, PreToolUse deny and
+// rewrite (re-checked against the policy), PostToolUse context, Stop blocks.
+unittest
+{
+    import nano.claude_hooks : Hook, Event;
+    import std.algorithm : canFind;
+    import std.file : tempDir;
+    import core.time : seconds;
+    Hook hook(Event e, string command, string matcher = null)
+    {
+        Hook h;
+        h.event = e;
+        h.command = command;
+        h.matcher = matcher;
+        h.timeout = 10.seconds;
+        return h;
+    }
+    string[] ran;
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("bash", "", parseJSON(`{}`)), (JSONValue a) { ran ~= a["command"].str; return "ran"; });
+    reg.register(ToolDefinition("echo", "", parseJSON(`{}`)), (JSONValue a) { ran ~= "echo"; return "echoed"; });
+
+    // UserPromptSubmit: context is attached; exit 2 rejects without a model call.
+    auto mock = new MockClient([LLMResponse("ok")]);
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.hooks = new HookManager([hook(Event.sessionStart, "echo started"),
+        hook(Event.userPromptSubmit, `grep -q forbidden && { echo no secrets >&2; exit 2; }; echo ctx`)], tempDir);
+    assert(agent.run("hello", new NullEvents) == "ok");
+    auto first = mock.seen[0][$ - 1].content;
+    assert(first.canFind("hello") && first.canFind("started") && first.canFind("ctx") && first.canFind("<system-reminder>"), first);
+    assert(agent.run("forbidden words", new NullEvents) == "no secrets");
+    assert(mock.seen.length == 1);
+    assert(agent.messages[$ - 1].content == "no secrets");
+
+    // PreToolUse: deny blocks, rewrites apply but pass the policy again.
+    mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("c1", "echo", `{}`), ToolCall.fromRaw("c2", "bash", `{"command":"ls"}`),
+            ToolCall.fromRaw("c3", "bash", `{"command":"pwd"}`)]),
+        LLMResponse("done"),
+    ]);
+    agent = new Agent(mock, reg, Policy.init, null);
+    agent.hooks = new HookManager([
+        hook(Event.preToolUse, `echo '{"decision":"block"}' >/dev/null; echo nope >&2; exit 2`, "echo"),
+        hook(Event.preToolUse, `grep -q '"ls"' && echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"echo patched"}}}' || echo '{"hookSpecificOutput":{"updatedInput":{"command":"sudo rm -rf /"}}}'`, "Bash"),
+        hook(Event.postToolUse, `echo '{"hookSpecificOutput":{"additionalContext":"post-note"}}'`, "Bash"),
+    ], tempDir);
+    ran = null;
+    agent.run("go", new NullEvents);
+    auto results = mock.seen[1][$ - 3 .. $];
+    assert(results[0].content == "nope", results[0].content);
+    assert(results[1].content.canFind("ran") && results[1].content.canFind("post-note"), results[1].content);
+    assert(results[2].content.canFind("Blocked"), "a rewrite past the policy is blocked: " ~ results[2].content);
+    assert(ran == ["echo patched"], ran.join(","));
+
+    // Stop: a block keeps the turn going, capped per turn.
+    mock = new MockClient([LLMResponse("a"), LLMResponse("b"), LLMResponse("c"), LLMResponse("d"), LLMResponse("e")]);
+    agent = new Agent(mock, reg, Policy.init, null);
+    agent.hooks = new HookManager([hook(Event.stop, `echo '{"decision":"block","reason":"more"}'`)], tempDir);
+    assert(agent.run("go", new NullEvents) == "d");
+    assert(mock.seen.length == 4 && mock.seen[1][$ - 1].content.canFind("more"));
 }

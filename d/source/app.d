@@ -20,6 +20,7 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
+import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
@@ -31,7 +32,7 @@ enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTI
 
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--verbose] [--acp]
+                    [--no-session] [--no-hooks] [--verbose] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --list-models PROVIDER[/model]
        nano-coder-d --version
@@ -39,13 +40,13 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /quit
+REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /hooks /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels;
-    bool plan, noSession, verbose, hasResume, acp, listSessions, all, json;
+    bool plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
 
@@ -77,6 +78,7 @@ Options parseArgs(string[] args)
             case "--all": o.all = true; break;
             case "--json": o.json = true; break;
             case "--no-session": o.noSession = true; break;
+            case "--no-hooks": o.noHooks = true; break;
             case "--verbose", "-v": o.verbose = true; break;
             case "--resume":
                 o.hasResume = true;
@@ -407,6 +409,21 @@ int main(string[] args)
         return buildSystemPrompt(cfg, dir, plan, skills, index);
     }
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    HookManager loadHooks(string dir)
+    {
+        import nano.claude_hooks : LoadOptions;
+        LoadOptions lo;
+        lo.disableHooks = cfg.disableHooks || o.noHooks;
+        lo.disableProjectHooks = cfg.disableProjectHooks;
+        lo.claudeUserHooks = cfg.claudeUserHooks;
+        lo.nanoHooks = cfg.hooks;
+        auto m = HookManager.load(lo, dir);
+        if (auto notice = m.startupNotice) stderr.writeln(notice);
+        foreach (sk; m.skipped)
+            if (!sk.source.isProject)
+                stderr.writefln("hooks: skipped %s (%s): %s", listingField(sk.eventName), sk.source.label, listingField(sk.reason));
+        return m;
+    }
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
     agent.temperature = cfg.temperature;
@@ -423,6 +440,7 @@ int main(string[] args)
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
+        host.loadHooks = &loadHooks;
         auto server = new AcpServer(agent, host);
         if (!server.serveStdio())
         {
@@ -453,6 +471,7 @@ int main(string[] args)
         }
     }
     catch (Exception e) die(e.msg);
+    agent.useHooks(loadHooks(cwd), o.hasResume);
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose);
 
@@ -530,6 +549,9 @@ int main(string[] args)
                     agent.policy.mode = plan ? Mode.plan : Mode.normal;
                     agent.messages[0].content = systemFor(cwd, plan);
                     writeln(plan ? "plan mode: read-only" : "normal mode");
+                    continue;
+                case "/hooks":
+                    write(agent.hooks !is null ? agent.hooks.listing : "No hooks loaded.\n");
                     continue;
                 case "/memory":
                     if (memory is null) { writeln("memory is off"); continue; }

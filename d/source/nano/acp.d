@@ -22,6 +22,7 @@ import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
 import core.sync.condition : Condition;
 import nano.agent;
+import nano.claude_hooks : HookManager;
 import nano.control;
 import nano.llm;
 import nano.session;
@@ -154,6 +155,8 @@ struct Host
     /// Session logs live here; null disables session/load and logging.
     string sessionDir;
     string version_;
+    /// Load the user hooks for a session in `cwd` (null = no hooks).
+    HookManager delegate(string cwd) loadHooks;
 }
 
 /// FIFO of parsed messages shared by the reader thread and the turn loop.
@@ -474,6 +477,7 @@ final class AcpServer : AgentEvents
             import std.datetime.systime : Clock;
             sessionId = format("session-%x", Clock.currStdTime);
         }
+        if (host.loadHooks !is null) agent.useHooks(host.loadHooks(cwd), false);
     }
 
     private void loadSession_(string want)
@@ -487,6 +491,7 @@ final class AcpServer : AgentEvents
             if (m.role != Role.system) agent.messages ~= m;
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
+        if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
     }
 

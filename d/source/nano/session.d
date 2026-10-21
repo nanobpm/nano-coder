@@ -200,6 +200,15 @@ class SessionLog
         write_(record("input", JSONValue(["id": inputId, "text": text, "recorded_at": nowStamp()])));
     }
 
+    /// The hook configuration files that apply to this session (audit trail):
+    /// each `[path, source label, content hash]`.
+    void hooks(const string[3][] files)
+    {
+        JSONValue[] list;
+        foreach (f; files) list ~= JSONValue(["path": f[0], "source": f[1], "hash": f[2]]);
+        write_(record("hooks", JSONValue(["files": JSONValue(list), "recorded_at": JSONValue(nowStamp())])));
+    }
+
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
     void turnEnd(string inputId, string response, string stopReason)
     {

@@ -123,6 +123,12 @@ struct Config
     ProviderConfig[string] providers;
     SkillsConfig skills;
     MemoryMode memory = MemoryMode.on;
+    /// Hooks: `disable_hooks` (or `--no-hooks`), `disable_project_hooks`,
+    /// `claude_user_hooks`, and nano's own `[hooks]` table (Claude's shape).
+    bool disableHooks;
+    bool disableProjectHooks;
+    bool claudeUserHooks = true;
+    JSONValue hooks;
     string memoryDir;
     long memoryExpiryDays = defaultExpiryDays;
     string path;
@@ -148,6 +154,10 @@ struct Config
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
+        if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
+        if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
+        if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;
+        if (auto v = "hooks" in doc) c.hooks = *v;
         if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
