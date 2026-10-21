@@ -1,0 +1,13 @@
+{
+  "name": "@nanobpm/nano-coder-d",
+  "version": "0.0.0",
+  "description": "nano-coder, reimplemented in D. A small coding agent; run a fleet on your laptop.",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/nanobpm/nano-coder.git", "directory": "d" },
+  "homepage": "https://github.com/nanobpm/nano-coder/tree/main/d",
+  "keywords": ["ai", "agent", "coding-agent", "acp", "cli", "dlang"],
+  "bin": { "nano-coder-d": "bin/nano-coder-d" },
+  "files": ["bin/", "lib/", "README.md"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {}
+}

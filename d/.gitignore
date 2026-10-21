@@ -1,4 +1,4 @@
 .dub/
-nano-coder-d
-nano-coder-d-test-*
+/nano-coder-d
+/nano-coder-d-test-*
 *.o

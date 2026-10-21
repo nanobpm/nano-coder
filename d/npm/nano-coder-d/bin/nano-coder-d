@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+// JS launcher for nano-coder-d (the D port). On its first run it best-effort replaces itself
+// with the native binary (so later invocations run without a Node process in
+// front), then runs the binary for the current invocation. If the swap fails
+// (e.g. a read-only global prefix) the launcher stays and keeps working — every
+// run just pays the small Node startup cost.
+'use strict';
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const { binaryPath, launcher } = require('../lib/platform.js');
+
+let bin;
+try {
+  bin = binaryPath();
+} catch (err) {
+  console.error(`nano-coder-d: ${err.message}`);
+  process.exit(1);
+}
+
+// Best-effort self-replacement with the native binary. Errors (unwritable
+// install dir, antivirus lock, ...) are swallowed: the current invocation below
+// still runs the binary through this launcher, and the swap is retried on the
+// next run.
+try {
+  const tmp = `${launcher}.tmp-${process.pid}`;
+  fs.copyFileSync(bin, tmp);
+  fs.chmodSync(tmp, 0o755);
+  fs.renameSync(tmp, launcher);
+} catch {
+  // keep the launcher
+}
+
+const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
+if (r.error) {
+  console.error(`nano-coder-d: failed to run ${bin}: ${r.error.message}`);
+  process.exit(1);
+}
+if (r.signal) process.kill(process.pid, r.signal);
+process.exit(r.status ?? 1);

@@ -1,0 +1,135 @@
+name: Release (D port)
+
+# Builds the D port (d/) for each platform and publishes it to npm as
+# `@nanobpm/nano-coder-d` plus one `@nanobpm/nano-coder-d-<os>-<cpu>` package per
+# platform. It is separate from release.yml (the Rust release) and only runs on
+# demand. Its version is `packageVersion` in d/source/app.d (set here from the
+# `version` input) and is independent of the Rust version. A real run also tags
+# `d-vX.Y.Z` and creates a GitHub release with the tarballs. See d/RELEASING.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (X.Y.Z)
+        required: true
+        type: string
+      dry_run:
+        description: Build and pack; publish, tag and release nothing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-d
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.npm }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, npm: darwin-arm64, triple: aarch64-apple-darwin }
+          - { os: macos-15-intel, npm: darwin-x64, triple: x86_64-apple-darwin }
+          # Ubuntu 22.04 runners link against glibc 2.35 for broad compatibility.
+          - { os: ubuntu-22.04, npm: linux-x64, triple: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, npm: linux-arm64, triple: aarch64-unknown-linux-gnu }
+    defaults:
+      run:
+        working-directory: d
+    steps:
+      - uses: actions/checkout@v5
+      - run: node scripts/set-version.mjs ${{ inputs.version }}
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.43.0
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev zlib1g-dev
+      - run: dub test
+      - run: dub build -b release
+      - name: Smoke test
+        run: ./nano-coder-d --version | grep -F "nano-coder-d ${{ inputs.version }} "
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          cp nano-coder-d ../dist/nano-coder-d-${{ matrix.npm }}
+          tar -czf ../dist/nano-coder-d-${{ inputs.version }}-${{ matrix.triple }}.tar.gz nano-coder-d
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d-bin-${{ matrix.npm }}
+          path: dist/*
+
+  npm:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      # Trusted publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@11.5.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: d-bin-*
+          merge-multiple: true
+          path: bins
+      - run: node d/scripts/set-version.mjs ${{ inputs.version }}
+      - run: node d/scripts/npm-packages.mjs --version ${{ inputs.version }} --binaries bins --out npm-dist
+      - name: Publish (platform packages first, then the main package)
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          flags=(--access public --provenance)
+          [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
+          publish() {
+            local id
+            id=$(node -p "const p=require('./$1/package.json'); p.name+'@'+p.version")
+            if npm view "$id" version >/dev/null 2>&1; then
+              echo "$id already published; skipping"
+            else
+              (cd "$1" && npm publish "${flags[@]}")
+            fi
+          }
+          for d in npm-dist/*/; do
+            d=${d%/}
+            [ "$d" = "npm-dist/nano-coder-d" ] && continue
+            publish "$d"
+          done
+          publish npm-dist/nano-coder-d
+
+  github-release:
+    needs: [build, npm]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: d-bin-*
+          merge-multiple: true
+          path: dist
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: d-v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+          gh release create "$TAG" --repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}" \
+            --title "nano-coder-d ${{ inputs.version }}" --notes "D port of nano-coder; see d/PORTING.md." \
+            *.tar.gz SHA256SUMS

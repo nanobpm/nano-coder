@@ -182,7 +182,7 @@ int printTrajectory(string id, bool json, bool markdown)
 
 /// Print the plain ledger, or page it when both ends are a terminal and it
 /// doesn't fit on one screen.
-void showTrajectory(const ref nano.trajectory.Trajectory t)
+void showTrajectory(const ref imported!"nano.trajectory".Trajectory t)
 {
     static import nano.trajectory;
     auto text = t.toPlain;

@@ -7,6 +7,9 @@
   "libs": [
     "curl"
   ],
+  "libs-linux": [
+    "z"
+  ],
   "buildTypes": {
     "release": {
       "buildOptions": [
@@ -15,7 +18,8 @@
         "inline"
       ],
       "dflags-ldc": [
-        "-boundscheck=on"
+        "-boundscheck=on",
+        "-link-defaultlib-shared=false"
       ]
     }
   },
