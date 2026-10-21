@@ -26,7 +26,7 @@ immutable Command[] commands = [
     Command("/help", "", "Show this help"),
     Command("/compact", "[--smart|--standard] [focus]", "Summarize older messages to free context (optional mode and focus)"),
     Command("/context", "", "Show context-window use and token totals"),
-    Command("/usage", "", "Show token totals for this session"),
+    Command("/verbosity", "[quiet|normal|verbose|debug]", "Show or set output detail"),
     Command("/plan", "", "Show the agent's task plan with notes"),
     Command("/memory", "[forget ID]", "List cross-session memories (or forget one by id)"),
     Command("/hooks", "", "List loaded user hooks (.claude/settings.json and friends)"),
@@ -34,12 +34,13 @@ immutable Command[] commands = [
     Command("/tools", "", "List available tools"),
     Command("/skills", "", "List skills the agent can load"),
     Command("/model", "[provider/model]", "Show the model or switch to another"),
+    Command("/mode", "[normal|plan|auto]", "Show or set the agent mode (Shift+Tab cycles)"),
+    Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),
+    Command("/providers", "", "List configured providers"),
     Command("/session", "", "Show the session ID and log path"),
     Command("/trajectory", "[--json|--markdown]", "Show this session's turn-by-turn trajectory in your pager (or export it)"),
     Command("/resume", "[ID|last]", "Switch to a saved session: pick one, or give its ID"),
-    Command("/mode", "[normal|plan|auto]", "Show or set the agent mode"),
-    Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),
-    Command("/clear", "", "Start a fresh conversation (clean context) without exiting"),
+    Command("/restart", "", "Start a fresh session (clean context) without exiting"),
     Command("/exit", "", "Exit the agent"),
     Command("/quit", "", "Exit the agent (alias for /exit)"),
 ];
@@ -168,6 +169,12 @@ Suggestion[] suggestions(string line)
         case "/mode":
             foreach (m; allModes) all ~= Suggestion(m.name, m.describe);
             break;
+        case "/verbosity":
+            {
+                import nano.ui : allVerbosities, vname = name, vdescribe = describe;
+                foreach (v; allVerbosities) all ~= Suggestion(v.vname, v.vdescribe);
+                break;
+            }
         case "/thinking":
             all = [Suggestion("default", "send no level; the model decides"),
                 Suggestion("off", "turn thinking off, where the model allows it"),
@@ -185,7 +192,7 @@ bool hasArgumentMenu(string line)
 {
     bool ok;
     auto parts = splitCommand(line, ok);
-    return ok && ["/model", "/mode", "/thinking"].canFind(parts[0]);
+    return ok && ["/model", "/mode", "/verbosity", "/thinking"].canFind(parts[0]);
 }
 
 /// What Tab turns the line into: a `/command` completes like `complete`; its

@@ -44,7 +44,7 @@ enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTI
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--no-hooks] [--verbose] [--acp]
+                    [--no-session] [--no-hooks] [--verbosity quiet|normal|verbose|debug] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --trajectory SESSION_ID [--json|--markdown]
        nano-coder-d --list-models PROVIDER[/model]
@@ -54,12 +54,12 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /mode [normal|plan] /clear /usage /memory [forget ID] /hooks /tools /skills /session /resume /trajectory /quit
+REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
-    string model, configPath, prompt, resume, listModels, sandbox, login, trajectory;
+    string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
     bool markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
@@ -97,7 +97,8 @@ Options parseArgs(string[] args)
             case "--trajectory": o.trajectory = value(); break;
             case "--no-session": o.noSession = true; break;
             case "--no-hooks": o.noHooks = true; break;
-            case "--verbose", "-v": o.verbose = true; break;
+            case "--verbose", "-v": o.verbosity = "verbose"; break;
+            case "--verbosity": o.verbosity = value(); break;
             case "--resume":
                 o.hasResume = true;
                 if (eq > 0) o.resume = value();
@@ -386,6 +387,13 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
 /// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).
 shared bool gThinkingExpanded;
 
+// The output detail level (ui.rs's global verbosity), read live by Console.
+import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
+static import nano.ui;
+shared Verbosity gVerbosity = Verbosity.normal;
+Verbosity verbosity() @trusted { return atomicLoad(gVerbosity); }
+void setVerbosity(Verbosity v) @trusted { atomicStore(gVerbosity, v); }
+
 // The pinned status line (status.rs), when installed, and what it shows.
 import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
 __gshared StatusLine gStatus;
@@ -434,8 +442,16 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown) @trusted
 
 class Console : AgentEvents
 {
-    bool color, verbose, tty;
+    bool color, tty;
     private bool inReasoning, midLine;
+    /// Tool output previews and expanded thinking (verbosity verbose or debug).
+    bool verbose() const { return verbosity >= Verbosity.verbose; }
+    /// Quiet shows only final answers: the last assistant text of the turn
+    /// is kept for the end, as are whether answer deltas were dropped (a turn
+    /// that turns louder mid-answer reprints the whole answer).
+    bool quiet() const { return verbosity == Verbosity.quiet; }
+    string finalAnswer;
+    bool droppedAnswer;
     // The reasoning block being shown (as in Rust's legacy renderer): a live
     // one-line view redrawn in place, then "∴ Thought for Ns · N chars", or
     // the full text when expanded (Ctrl-O or --verbose).
@@ -443,10 +459,9 @@ class Console : AgentEvents
     private string thinkText, lastThinking;
     private long thinkStart, lastDraw;
 
-    this(bool color, bool verbose, bool tty = false)
+    this(bool color, bool tty = false)
     {
         this.color = color;
-        this.verbose = verbose;
         this.tty = tty;
     }
 
@@ -575,6 +590,11 @@ class Console : AgentEvents
             auto rate = meter.record(chunk.length, nowMs);
             if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
         }
+        if (quiet)
+        {
+            if (!reasoning && chunk.length) droppedAnswer = true;
+            return;
+        }
         synchronized (this)
         {
             if (reasoning)
@@ -615,7 +635,7 @@ class Console : AgentEvents
     }
 
     /// plan_add/plan_update show as the checklist, not as calls.
-    private bool quiet(const ref ToolCall call) { return !verbose && (call.name == "plan_add" || call.name == "plan_update"); }
+    private bool quietTool(const ref ToolCall call) { return !verbose && (call.name == "plan_add" || call.name == "plan_update"); }
 
     void toolStart(const ref ToolCall call)
     {
@@ -628,7 +648,7 @@ class Console : AgentEvents
             if (name == "history_read") s.historyReads++;
         });
         meter.reset();
-        if (quiet(call)) return;
+        if (quiet || quietTool(call)) return;
         endLine();
         writeln(bold("● " ~ call.name), " ", dim(summary(call)));
         stdout.flush();
@@ -641,7 +661,7 @@ class Console : AgentEvents
     {
         scope (exit) if (afterStep !is null) afterStep();
         updateStatus((ref Stats s) { s.activity = Activity.thinking; });
-        if (quiet(call) && !isError) return;
+        if (quiet || (quietTool(call) && !isError)) return;
         auto lines = result.lineCount;
         if (isError) writeln("  ", red("✗ " ~ result.firstLine));
         else if (verbose) writeln(dim(indent(result)));
@@ -653,9 +673,16 @@ class Console : AgentEvents
     {
         if (afterStep !is null) afterStep();
     }
-    void userMessage(string text) { endLine(); writeln(dim("↪ " ~ text)); }
+    void userMessage(string text)
+    {
+        if (quiet) return;
+        endLine();
+        writeln(dim("↪ " ~ text));
+    }
     void assistantMessage(string text, string reasoning)
     {
+        finalAnswer = text;
+        if (quiet) return;
         synchronized (this)
         {
             // Reasoning that didn't stream shows now, like a block that just ended.
@@ -1117,8 +1144,15 @@ int runMain(string[] args)
     catch (Exception e) die(e.msg);
     agent.useHooks(loadHooks(cwd), o.hasResume);
 
-    auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose, isTerminal(1));
+    auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, isTerminal(1));
+    setVerbosity(cfg.verbosity);
+    if (o.verbosity.length)
+    {
+        try setVerbosity(parseVerbosity(o.verbosity));
+        catch (Exception e) die(e.msg);
+    }
     agent.onPlanChanged = () {
+        if (console.quiet) return;
         console.endLine();
         write(checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4, console.color));
         stdout.flush();
@@ -1243,6 +1277,8 @@ int runMain(string[] args)
                 {
                     case "/help": return helpText().stripRight;
                     case "/mode": return modeListing(agent.control.mode);
+                    case "/verbosity": return verbosityListing(verbosity);
+                    case "/providers": return providersListing(cfg.providers, cfg.defaultProvider);
                     case "/trajectory":
                         auto path = view.get("log");
                         if (path is null) return "Session persistence is disabled: no trajectory to show";
@@ -1262,6 +1298,16 @@ int runMain(string[] args)
                         auto m = parseMode(arg);
                         agent.control.mode = m;
                         return format("Mode set to %s (%s); applies from the agent's next step", m.name, m.describe);
+                    }
+                    catch (Exception e) return e.msg;
+                }
+                if (name == "/verbosity")
+                {
+                    try
+                    {
+                        auto v = parseVerbosity(arg);
+                        setVerbosity(v);
+                        return format("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
                     }
                     catch (Exception e) return e.msg;
                 }
@@ -1306,7 +1352,7 @@ int runMain(string[] args)
         Thread keys;
         if (editor !is null)
         {
-            if (o.verbose)
+            if (verbosity >= Verbosity.verbose)
                 stderr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
@@ -1319,6 +1365,8 @@ int runMain(string[] args)
                 atomicStore(turnDone, true);
                 keys.join();
             }
+        console.finalAnswer = null;
+        console.droppedAnswer = false;
         try agent.run(input, console);
         catch (Exception e)
         {
@@ -1327,6 +1375,13 @@ int runMain(string[] args)
             ok = false;
         }
         console.endLine();
+        // Quiet shows only the final answer; a turn that got louder after
+        // answer deltas were dropped reprints the whole answer (ui.rs).
+        if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
+        {
+            writeln(console.finalAnswer);
+            stdout.flush();
+        }
         // Steers that arrived after the agent's last step run as the next prompts.
         auto late = agent.control.takePending;
         if (inbox !is null)
@@ -1431,14 +1486,44 @@ int runMain(string[] args)
             {
                 case "/quit", "/exit": return 0;
                 case "/help": writeln(editor !is null ? helpText() : usage); continue;
-                case "/clear":
-                    agent.messages = agent.messages[0 .. 1];
-                    if (agent.log !is null) agent.log.replace(agent.messages);
-                    if (!agent.plan.empty) agent.setPlan(Plan.init, false);
-                    agent.historyAvailable = agent.historyHintPending = false;
+                case "/restart":
+                {
+                    // A brand-new session in place: new ID, just the system
+                    // prompt, default mode, empty plan, counters zeroed. The
+                    // previous log stays on disk and is still resumable.
+                    import nano.session : newSessionId;
+                    SessionLog log;
+                    try
+                    {
+                        if (!o.noSession)
+                            log = new SessionLog(sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
+                    }
+                    catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
+                    agent.restart(systemFor(cwd, false), log);
+                    sysPlan = false;
+                    agent.useHooks(loadHooks(cwd), false);
                     if (gStatus !is null) gStatus.clear();
+                    else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdout.flush(); }
                     refreshStatus();
-                    writeln("conversation cleared");
+                    if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
+                    else writefln("Session: %s", newSessionId());
+                    continue;
+                }
+                case "/providers":
+                    writeln(providersListing(cfg.providers, cfg.defaultProvider));
+                    continue;
+                case "/verbosity":
+                    if (!arg.length) writeln(verbosityListing(verbosity));
+                    else
+                    {
+                        try
+                        {
+                            auto v = parseVerbosity(arg);
+                            setVerbosity(v);
+                            writefln("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
+                        }
+                        catch (Exception e) writeln(e.msg);
+                    }
                     continue;
                 case "/compact":
                 {
@@ -1476,10 +1561,6 @@ int runMain(string[] args)
                     continue;
                 case "/context":
                     writeln(contextReport(agent));
-                    continue;
-                case "/usage":
-                    writefln("last request: %s input (%s cached), %s output tokens", agent.lastUsage.inputTokens,
-                            agent.lastUsage.cachedInputTokens, agent.lastUsage.outputTokens);
                     continue;
                 case "/queue":
                     writeln(runQueueCommand(queue, arg));

@@ -33,16 +33,15 @@ enum Timing
     afterTurn,
 }
 
-/// When `cmd` (a trimmed `/…` line) can run during a turn. Rust's table,
-/// minus `/providers` and `/verbosity`, which the D port does not have.
+/// When `cmd` (a trimmed `/…` line) can run during a turn (Rust's table).
 Timing timing(string cmd)
 {
     auto p = splitCmd(cmd);
     auto name = p[0], arg = p[1];
-    if (["/help", "/tools", "/skills", "/session", "/plan", "/context"].canFind(name) && !arg.length)
+    if (["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context"].canFind(name) && !arg.length)
         return Timing.immediate;
     if (name == "/trajectory" && ["", "--json", "--markdown", "--md"].canFind(arg)) return Timing.immediate;
-    if (name == "/mode") return arg.length ? Timing.nextStep : Timing.immediate;
+    if (name == "/mode" || name == "/verbosity") return arg.length ? Timing.nextStep : Timing.immediate;
     if (name == "/model") return arg.length ? Timing.nextStep : Timing.afterTurn;
     return Timing.afterTurn;
 }
@@ -82,7 +81,7 @@ unittest
         assert(timing("/trajectory --bogus") == afterTurn);
         assert(timing("/mode") == immediate && timing("/mode plan") == nextStep);
         assert(timing("/model") == afterTurn && timing("/model mock/x") == nextStep);
-        assert(timing("/compact") == afterTurn && timing("/clear") == afterTurn && timing("/resume") == afterTurn);
+        assert(timing("/compact") == afterTurn && timing("/restart") == afterTurn && timing("/resume") == afterTurn);
     }
     auto v = new LiveView;
     assert(v.get("/plan") is null);

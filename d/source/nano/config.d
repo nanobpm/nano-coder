@@ -236,6 +236,8 @@ struct Config
     string model = "gpt-4o-mini";
     string defaultProvider = "mock";
     double temperature = 0.7;
+    /// Output detail (`verbosity`): quiet, normal, verbose or debug.
+    imported!"nano.ui".Verbosity verbosity = imported!"nano.ui".Verbosity.normal;
     /// Global thinking level and vision override.
     Thinking thinking;
     Nullable!bool vision;
@@ -302,6 +304,7 @@ struct Config
         if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str);
         if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
+        if (auto v = "verbosity" in doc) c.verbosity = imported!"nano.ui".parseVerbosity(v.str);
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "session_titles" in doc) c.sessionTitles = v.boolean;
         if (auto v = "title_model" in doc) c.titleModel = v.str;

@@ -978,6 +978,33 @@ class Agent
     bool historyHintPending;
     bool historyEnabled() const { return log !is null && historyAvailable; }
 
+    /// Start a fresh session in place (Rust `new_session`, for `/restart`):
+    /// the conversation is just `system`, logged to `newLog` (null: not
+    /// persisted); mode, session thinking, plan, reminders, hook session,
+    /// calibration, history tools and counters are reset. The old log stays.
+    void restart(string system, SessionLog newLog)
+    {
+        import nano.mode : AgentMode;
+        messages = [Message.system(system)];
+        log = newLog;
+        if (log !is null) log.append(messages[0]);
+        control.mode = AgentMode.normal;
+        sessionThinking.nullify();
+        plan = Plan.init;
+        reminders = Reminders.init;
+        sessionStarted = false;
+        pendingStartContext = null;
+        resumed = false;
+        stopBlocks = 0;
+        calibLen = calibTokens = 0;
+        compactFloor = 0;
+        historyAvailable = historyHintPending = false;
+        sessionInputTokens = sessionOutputTokens = 0;
+        compactions = 0;
+        lastUsage = TokenUsage.init;
+        hasOutcome = hasReported = false;
+    }
+
     /// Offer `report_outcome` (config `outcome_tool`).
     bool outcomeTool = true;
     /// System reminders and the loop detector (config `reminders`).
