@@ -20,6 +20,7 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
+import nano.skills : Skills, skillsDefinition = definition;
 import nano.control : TurnControl, FdLineReader;
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
@@ -300,7 +301,7 @@ string indent(string s)
 enum string planNote = "\n\nYou are in PLAN MODE: read-only. Do not create, modify or delete files or run commands with side effects; "
     ~ "investigate with the read-only tools and present a plan.";
 
-string buildSystemPrompt(const ref Config c, string cwd, bool plan)
+string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null)
 {
     import std.datetime.systime : Clock;
     auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
@@ -310,6 +311,7 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan)
     auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
             Clock.currTime.toISOExtString[0 .. 10]);
     s ~= projectInstructions(cwd);
+    if (skills !is null) s ~= skills.renderIndex;
     if (plan) s ~= planNote;
     return s;
 }
@@ -364,7 +366,19 @@ int main(string[] args)
     registerSearch(tools, (string path) => agent.policy.readDenied(path, getcwd()));
 
     auto cwd = getcwd();
-    agent = new Agent(client, tools, policy, buildSystemPrompt(cfg, cwd, o.plan));
+    // Skills: the index goes into the system prompt; `load_skill` reads one.
+    Skills skills;
+    Skills discoverSkills(string dir)
+    {
+        if (!cfg.skills.enabled) return null;
+        auto s = Skills.discover(dir, cfg.skills);
+        foreach (w; s.warnings) stderr.writeln("nano-coder-d: skills: ", w);
+        return s;
+    }
+    skills = discoverSkills(cwd);
+    if (cfg.skills.enabled && (o.acp || !skills.empty))
+        tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
+    agent = new Agent(client, tools, policy, buildSystemPrompt(cfg, cwd, o.plan, skills));
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
     agent.temperature = cfg.temperature;
@@ -374,7 +388,10 @@ int main(string[] args)
         import nano.acp : AcpServer, Host;
         Host host;
         bool plan = o.plan;
-        host.systemPrompt = (string dir) => buildSystemPrompt(cfg, dir, plan);
+        host.systemPrompt = (string dir) {
+            if (dir != cwd) skills = discoverSkills(dir);
+            return buildSystemPrompt(cfg, dir, plan, skills);
+        };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;

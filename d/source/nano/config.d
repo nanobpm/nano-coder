@@ -3,6 +3,8 @@
 /// built-in provider presets.
 module nano.config;
 
+import nano.skills : SkillsConfig;
+
 import std.json;
 import std.file : exists, readText;
 import std.path : buildPath, expandTilde;
@@ -118,6 +120,7 @@ struct Config
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
     ProviderConfig[string] providers;
+    SkillsConfig skills;
     string path;
 
     static string defaultPath()
@@ -141,6 +144,7 @@ struct Config
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
+        if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
             foreach (name, table; ps.object)
             {
