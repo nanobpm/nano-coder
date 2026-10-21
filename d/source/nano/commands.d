@@ -3,6 +3,8 @@
 /// rejection of unknown commands (port of `commands.rs`, D's command set).
 module nano.commands;
 
+import nano.context : CompactionMode;
+
 import std.algorithm : filter, map, maxElement, min, startsWith, canFind, any;
 import std.array : array;
 import std.format : format;
@@ -22,6 +24,8 @@ struct Command
 
 immutable Command[] commands = [
     Command("/help", "", "Show this help"),
+    Command("/compact", "[--smart|--standard] [focus]", "Summarize older messages to free context (optional mode and focus)"),
+    Command("/context", "", "Show context-window use and token totals"),
     Command("/usage", "", "Show token totals for this session"),
     Command("/plan", "", "Show the agent's task plan with notes"),
     Command("/memory", "[forget ID]", "List cross-session memories (or forget one by id)"),
@@ -36,6 +40,31 @@ immutable Command[] commands = [
     Command("/exit", "", "Exit the agent"),
     Command("/quit", "", "Exit the agent (alias for /exit)"),
 ];
+
+/// `/compact` arguments: an optional `--smart`/`--standard`, then a focus.
+/// Returns whether a mode was given.
+bool parseCompactArgs(string args, out CompactionMode mode, out string focus)
+{
+    import std.string : strip, indexOf;
+    args = args.strip;
+    auto sp = args.indexOf(' ');
+    auto first = sp < 0 ? args : args[0 .. sp];
+    bool has = true;
+    if (first == "--smart") mode = CompactionMode.smart;
+    else if (first == "--standard") mode = CompactionMode.standard;
+    else has = false;
+    focus = has ? (sp < 0 ? "" : args[sp + 1 .. $].strip) : args;
+    return has;
+}
+
+unittest
+{
+    CompactionMode m;
+    string f;
+    assert(parseCompactArgs("--smart  the bug", m, f) && m == CompactionMode.smart && f == "the bug");
+    assert(!parseCompactArgs("focus here", m, f) && f == "focus here");
+    assert(parseCompactArgs("--standard", m, f) && m == CompactionMode.standard && f == "");
+}
 
 /// Why a submitted `/…` line can't be sent: its first word isn't a command.
 /// null for anything else (not a `/` line, a known command, or a `//` escape).

@@ -436,6 +436,30 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
     return s;
 }
 
+/// `/context`: window use, token totals, compaction settings.
+string contextReport(Agent agent)
+{
+    import nano.context : formatTokens, modeName;
+    import std.array : join;
+    bool calibrated;
+    auto tokens = agent.estimateContextTokens(calibrated);
+    string source;
+    auto window = agent.contextWindow(source);
+    string[] out_;
+    out_ ~= format("Model:        %s/%s", agent.client.providerName, agent.client.modelName);
+    out_ ~= format("Context:      %s%s of %s tokens (%.1f%%)%s", calibrated ? "" : "~", tokens, window,
+        window ? tokens * 100.0 / window : 0.0, calibrated ? ", anchored to reported usage" : ", estimated");
+    out_ ~= format("Window:       %s (%s)", formatTokens(window), source);
+    out_ ~= format("Messages:     %s", agent.messages.length);
+    out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
+    out_ ~= agent.autoCompact
+        ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
+            cast(size_t)(window * agent.autoCompactThreshold), agent.compactions)
+        : "Auto-compact: off";
+    out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
+    return out_.join("\n");
+}
+
 int main(string[] args)
 {
     auto o = parseArgs(args);
@@ -462,7 +486,13 @@ int main(string[] args)
 
     auto spec = o.model.length ? o.model : cfg.model;
     LLMClient client;
-    try client = makeClient(resolve(cfg, spec));
+    size_t configuredWindow;
+    try
+    {
+        auto rp = resolve(cfg, spec);
+        configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
+        client = makeClient(rp);
+    }
     catch (Exception e) die(e.msg);
 
     Policy policy;
@@ -564,6 +594,19 @@ int main(string[] args)
     }
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
+    agent.configuredWindow = configuredWindow;
+    agent.autoCompact = cfg.autoCompact;
+    agent.autoCompactThreshold = cfg.autoCompactThreshold;
+    {
+        import nano.context : parseCompactionMode;
+        if (!parseCompactionMode(cfg.compactionMode, agent.compactionMode))
+            die(`compaction_mode must be "standard" or "smart", got "` ~ cfg.compactionMode ~ `"`);
+    }
+    bool compactingByHand;
+    agent.onCompacted = (ref const CompactReport r) {
+        // Manual compactions are reported by /compact itself.
+        if (!compactingByHand) stderr.writeln("[agent] auto-", r.toString);
+    };
     agent.temperature = cfg.temperature;
 
     if (o.acp)
@@ -597,6 +640,8 @@ int main(string[] args)
             foreach (m; restored.conversation)
                 if (m.role != Role.system) agent.messages ~= m;
             if (!o.noSession) agent.log = new SessionLog(path);
+            agent.historyAvailable = restored.historyAvailable;
+            agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
             if (restored.plan.type == JSONType.object)
             {
                 try agent.plan = Plan.fromJSON(restored.plan);
@@ -743,7 +788,29 @@ int main(string[] args)
                     agent.messages = agent.messages[0 .. 1];
                     if (agent.log !is null) agent.log.replace(agent.messages);
                     if (!agent.plan.empty) agent.setPlan(Plan.init, false);
+                    agent.historyAvailable = agent.historyHintPending = false;
                     writeln("conversation cleared");
+                    continue;
+                case "/compact":
+                {
+                    import nano.commands : parseCompactArgs;
+                    import nano.context : CompactionMode;
+                    CompactionMode mode;
+                    string focus;
+                    bool hasMode = parseCompactArgs(arg, mode, focus);
+                    writeln("Compacting...");
+                    CompactReport rep;
+                    compactingByHand = true;
+                    scope (exit) compactingByHand = false;
+                    agent.control.startTurn();
+                    bool done;
+                    try done = agent.compact(rep, CompactTrigger.manual, hasMode ? &mode : null, focus);
+                    catch (Exception e) { stderr.writeln(console.red("error: " ~ e.msg)); continue; }
+                    writeln(done ? "Conversation " ~ rep.toString : "Nothing to compact");
+                    continue;
+                }
+                case "/context":
+                    writeln(contextReport(agent));
                     continue;
                 case "/usage":
                     writefln("last request: %s input (%s cached), %s output tokens", agent.lastUsage.inputTokens,
@@ -814,8 +881,11 @@ int main(string[] args)
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }
                     try
                     {
-                        client = makeClient(resolve(cfg, arg));
+                        auto rp = resolve(cfg, arg);
+                        client = makeClient(rp);
                         agent.client = client;
+                        agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
+                        agent.learnedWindow = 0;
                         writeln("model: ", client.providerName, "/", client.modelName);
                     }
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));

@@ -24,6 +24,8 @@ class MockClient : LLMClient
         if (script.length == 0) return LLMResponse("(mock: script exhausted)");
         auto r = script[0];
         script = script[1 .. $];
+        // A scripted provider error.
+        if (r.content.length > 7 && r.content[0 .. 7] == "!error:") throw new Exception(r.content[7 .. $]);
         if (sink !is null && r.content.length) sink(false, r.content);
         return r;
     }

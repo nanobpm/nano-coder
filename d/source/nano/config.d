@@ -132,6 +132,11 @@ struct Config
     bool outcomeTool = true;
     /// System reminders and the repeated-call loop detector.
     bool reminders = true;
+    /// Compact automatically at `autoCompactThreshold` of the context window.
+    bool autoCompact = true;
+    double autoCompactThreshold = 0.8;
+    /// `standard` or `smart` (summary cites the session log; history tools).
+    string compactionMode = "standard";
     bool disableHooks;
     bool disableProjectHooks;
     bool claudeUserHooks = true;
@@ -166,6 +171,10 @@ struct Config
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
         if (auto v = "outcome_tool" in doc) c.outcomeTool = v.boolean;
         if (auto v = "reminders" in doc) c.reminders = v.boolean;
+        if (auto v = "auto_compact" in doc) c.autoCompact = v.boolean;
+        if (auto v = "auto_compact_threshold" in doc)
+            c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
+        if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;

@@ -494,8 +494,11 @@ final class AcpServer : AgentEvents
         auto path = findSession(host.sessionDir, want);
         auto sys = host.systemPrompt !is null ? host.systemPrompt(getcwd()) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
-        foreach (m; restore(path).conversation)
+        auto restored = restore(path);
+        foreach (m; restored.conversation)
             if (m.role != Role.system) agent.messages ~= m;
+        agent.historyAvailable = restored.historyAvailable;
+        agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);

@@ -90,6 +90,7 @@ JSONValue messageRecord(const ref Message m)
             "total_tokens": m.usage.inputTokens + m.usage.outputTokens]);
     if (m.durationMs >= 0) j["duration_ms"] = m.durationMs;
     if (m.stopReason.length) j["stop_reason"] = m.stopReason;
+    if (m.logLine) j["log_line"] = m.logLine;
     return j;
 }
 
@@ -129,7 +130,7 @@ Message messageFromRecord(JSONValue j)
             break;
         case "duration_ms": m.durationMs = v.integer; break;
         case "stop_reason": m.stopReason = v.str; break;
-        case "log_line": break; // re-derived from the line number
+        case "log_line": if (v.type == JSONType.integer) m.logLine = v.integer; break; // direct records: the physical line wins
         default: extra[k] = v;
         }
     }
@@ -153,6 +154,8 @@ class SessionLog
     string id;
     string path;
     private File f;
+    /// Lines written so far: the next record's physical line is `lines + 1`.
+    private ulong lines;
 
     /// Create a new log in `dir`.
     this(string dir, string model, string cwd, string id = null)
@@ -183,6 +186,7 @@ class SessionLog
             import std.file : write_file = write;
             write_file(path, bytes[0 .. committed]);
         }
+        foreach (b; bytes[0 .. committed]) if (b == '\n') ++lines;
         f = File(path, "a");
     }
 
@@ -190,9 +194,17 @@ class SessionLog
     {
         f.write(line);
         f.flush();
+        ++lines;
     }
 
-    void append(const ref Message m) { write_(record("message", messageRecord(m))); }
+    /// Log a message; returns its physical line (its `#N` ID).
+    ulong append(const ref Message m)
+    {
+        auto j = messageRecord(m);
+        if ("log_line" in j) () @trusted { j.object.remove("log_line"); }(); // a direct record's ID is its line
+        write_(record("message", j));
+        return lines;
+    }
 
     /// A prompt starts a turn.
     void input(string inputId, string text)
@@ -230,12 +242,16 @@ class SessionLog
     }
 
     /// The conversation was replaced wholesale (e.g. `/clear` keeps only the system prompt).
-    void replace(const Message[] messages)
+    /// Compaction also records the folded log-line range, its mode and model.
+    void replace(const Message[] messages, ulong first = 0, ulong last = 0, string mode = null, string model = null)
     {
         JSONValue[] ms;
         foreach (ref m; messages) ms ~= messageRecord(m);
         JSONValue d = ["recorded_at": nowStamp()];
         d["messages"] = ms;
+        if (first) d["summarized"] = JSONValue([JSONValue(first), JSONValue(last)]);
+        if (mode !is null) d["mode"] = mode;
+        if (model !is null) d["model"] = model;
         write_(record("replace", d));
     }
 }
@@ -249,6 +265,10 @@ struct Restored
     string pendingInput;
     /// The latest plan record (`{goal, items}`), or null.
     JSONValue plan;
+    /// The latest compaction was smart: the history tools are offered.
+    bool historyAvailable;
+    /// The one-time history hint was already shown after that compaction.
+    bool historyHintConsumed;
 }
 
 /// Read a session log (Rust format), dropping a torn last line.
@@ -262,8 +282,10 @@ Restored restore(string path)
     if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
     string pendingId;
     size_t index;
+    ulong lineNo;
     foreach (line; text[0 .. committed].lineSplitter)
     {
+        ++lineNo;
         if (!line.length) continue;
         JSONValue rec;
         try rec = parseJSON(line);
@@ -293,6 +315,11 @@ Restored restore(string path)
             break;
         case "message":
             r.conversation ~= messageFromRecord(data);
+            r.conversation[$ - 1].logLine = lineNo;
+            {
+                import nano.session_history : consumesHint;
+                if (r.historyAvailable && consumesHint(r.conversation[$ - 1])) r.historyHintConsumed = true;
+            }
             break;
         case "turn_end":
             if (data["input_id"].str == pendingId) { pendingId = null; r.pendingInput = null; }
@@ -300,6 +327,11 @@ Restored restore(string path)
         case "replace":
             r.conversation = null;
             foreach (m; data["messages"].array) r.conversation ~= messageFromRecord(m);
+            {
+                auto mode = "mode" in data;
+                r.historyAvailable = mode !is null && mode.type == JSONType.string && mode.str == "smart";
+                r.historyHintConsumed = false;
+            }
             if ("pending_position" !in data || data["pending_position"].type == JSONType.null_)
             {
                 pendingId = null;

@@ -78,6 +78,9 @@ struct Message
     long durationMs = -1;
     /// Assistant: the provider's stop reason, normalised (`end_turn`, `tool_use`, `max_tokens`).
     string stopReason;
+    /// The message's physical line in the session log (0: not logged), its
+    /// `#N` ID for smart compaction and the history tools.
+    ulong logLine;
     /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),
     /// kept so a resumed Rust log round-trips them.
     JSONValue extra;

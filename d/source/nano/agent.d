@@ -13,6 +13,8 @@ import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, 
 import nano.mode : AgentMode, planAllows;
 import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
+import ctx = nano.context;
+import hist = nano.session_history;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
@@ -36,6 +38,29 @@ interface AgentEvents
 string wrapReminder(string text)
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
+}
+
+/// Why compaction was requested.
+enum CompactTrigger { manual, threshold, overflow }
+
+/// What a compaction did.
+struct CompactReport
+{
+    size_t messagesBefore, messagesAfter, tokensBefore, tokensAfter, summarized;
+    /// Why the summary failed (older messages were dropped instead), or null.
+    string fallback;
+    bool truncated;
+    ctx.CompactionMode mode;
+
+    string toString() const
+    {
+        auto s = format("%scompacted %s messages: ~%s -> ~%s tokens (%s -> %s messages)",
+            mode == ctx.CompactionMode.smart ? "smart-" : "", summarized, ctx.formatTokens(tokensBefore),
+            ctx.formatTokens(tokensAfter), messagesBefore, messagesAfter);
+        if (fallback !is null) s ~= format("; summary failed (%s), older messages were dropped", fallback);
+        else if (truncated) s ~= "; the summary hit the output limit and is incomplete";
+        return s;
+    }
 }
 
 /// The result for calls skipped after the loop detector's hard stop.
@@ -77,6 +102,27 @@ class Agent
     private string pendingStartContext;
     private int stopBlocks;
 
+    // ---- context accounting and compaction (context.rs, agent.rs) ----
+    /// Compact automatically past `autoCompactThreshold` of the window.
+    bool autoCompact = true;
+    double autoCompactThreshold = 0.8;
+    ctx.CompactionMode compactionMode = ctx.CompactionMode.standard;
+    /// The provider config's `context_window` (0: none).
+    size_t configuredWindow;
+    /// Learned from a context-overflow error (0: none).
+    size_t learnedWindow;
+    /// Compactions this session.
+    uint compactions;
+    /// Session token totals.
+    ulong sessionInputTokens, sessionOutputTokens;
+    /// Called after every compaction with its report (the UI prints it).
+    void delegate(const ref CompactReport) onCompacted;
+    /// Usage-anchored estimate: messages[0 .. calibLen] cost `calibTokens`.
+    private size_t calibLen, calibTokens;
+    /// Tokens right after the last compaction: no auto-compaction until the
+    /// context has grown a tenth of the window past it (no compaction loops).
+    private size_t compactFloor;
+
     this(LLMClient client, ToolRegistry tools, Policy policy, string systemPrompt)
     {
         this.client = client;
@@ -90,8 +136,8 @@ class Agent
     {
         import nano.session : nowStamp;
         if (!m.timestamp.length) m.timestamp = nowStamp();
+        if (log !is null) m.logLine = log.append(m);
         messages ~= m;
-        if (log !is null) log.append(m);
     }
 
     /// Run one user input to completion. Returns the final assistant text,
@@ -185,22 +231,55 @@ class Agent
                 ev.userMessage(s.text);
                 control.absorbed(s);
             }
-            ChatRequest req;
-            req.messages = messages;
-            req.tools = offeredTools();
-            req.maxTokens = maxTokens;
-            req.temperature = temperature;
+            if (overThreshold())
+            {
+                CompactReport rep;
+                compact(rep, CompactTrigger.threshold);
+                if (control.isCancelled) return cancelled(ev);
+            }
             LLMResponse r;
             import std.datetime.stopwatch : StopWatch, AutoStart;
             auto sw = StopWatch(AutoStart.yes);
-            try r = client.chat(req, (bool t, string s) { ev.text(t, s); });
-            catch (Cancelled) return cancelled(ev);
-            catch (Exception e)
+            bool overflowRetried;
+            for (;;)
             {
-                if (control.isCancelled) return cancelled(ev);
-                throw e;
+                ChatRequest req;
+                req.messages = messages;
+                req.tools = offeredTools();
+                req.maxTokens = requestMaxTokens();
+                req.temperature = temperature;
+                try
+                {
+                    r = client.chat(req, (bool t, string s) { ev.text(t, s); });
+                    break;
+                }
+                catch (Cancelled) return cancelled(ev);
+                catch (Exception e)
+                {
+                    if (control.isCancelled) return cancelled(ev);
+                    if (overflowRetried || !ctx.isContextOverflow(e.msg)) throw e;
+                    // The request did not fit: learn the window, compact, retry once.
+                    overflowRetried = true;
+                    auto learned = ctx.limitFromError(e.msg);
+                    if (!learned) learned = estimateContextTokens() * 9 / 10;
+                    learnedWindow = learned > 1_000 ? learned : 1_000;
+                    CompactReport rep;
+                    if (!compact(rep, CompactTrigger.overflow))
+                    {
+                        if (control.isCancelled) return cancelled(ev);
+                        throw e;
+                    }
+                    if (control.isCancelled) return cancelled(ev);
+                }
             }
             lastUsage = r.usage;
+            recordUsage(r.usage);
+            if (r.usage.inputTokens > 0)
+            {
+                // Anchored at the assistant message about to be pushed.
+                calibLen = messages.length + 1;
+                calibTokens = cast(size_t)(r.usage.inputTokens + (r.usage.outputTokens > 0 ? r.usage.outputTokens : 0));
+            }
             ev.usage(r.usage);
             auto reply = Message.assistant(r.content, r.toolCalls);
             reply.thinking = r.reasoning;
@@ -246,6 +325,12 @@ class Agent
                 else
                 {
                     result = runTool(call, r.stopReason, isError);
+                    if (hist.isHistoryTool(call.name)) historyHintPending = false;
+                    else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
+                    {
+                        historyHintPending = false;
+                        result ~= "\n\n" ~ hist.failedToolHint;
+                    }
                     if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
                 }
                 ev.toolEnd(call, result, isError);
@@ -327,6 +412,190 @@ class Agent
         return extra;
     }
 
+    /// The context window and where it came from.
+    size_t contextWindow() const { string _; return contextWindow(_); }
+
+    size_t contextWindow(out string source) const
+    {
+        size_t w;
+        if (configuredWindow) { w = configuredWindow; source = "configured"; }
+        else if ((w = ctx.windowForModel(client.modelName)) != 0) source = "known for the model name";
+        else { w = ctx.defaultContextWindow; source = "default"; }
+        if (learnedWindow && learnedWindow < w)
+        {
+            w = learnedWindow;
+            source = "learned from a context-overflow error";
+        }
+        return w;
+    }
+
+    /// Estimated tokens the next request sends, and whether it is anchored
+    /// to provider-reported usage.
+    size_t estimateContextTokens(out bool calibrated)
+    {
+        calibrated = calibLen && calibLen <= messages.length;
+        if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $]);
+        size_t tools_;
+        foreach (d; offeredTools())
+            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() @trusted { return d.parameters.toString; }());
+        return ctx.messagesTokens(messages) + tools_;
+    }
+
+    size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
+
+    private size_t outputBase() const { return maxTokens > 0 ? cast(size_t) maxTokens : ctx.minOutputReserve; }
+
+    /// Past the auto-compaction threshold (or too close to the window for the
+    /// output reservation)?
+    bool overThreshold()
+    {
+        if (!autoCompact) return false;
+        auto threshold = autoCompactThreshold < 0.1 ? 0.1 : autoCompactThreshold > 0.99 ? 0.99 : autoCompactThreshold;
+        auto tokens = estimateContextTokens();
+        auto window = contextWindow();
+        auto reserved = (outputBase < ctx.minOutputReserve ? outputBase : ctx.minOutputReserve) + ctx.outputMargin(window);
+        double limit = window * threshold;
+        if (window > reserved && window - reserved < limit) limit = window - reserved;
+        return tokens > limit && tokens > compactFloor + window / 10;
+    }
+
+    /// `max_tokens` for the next request: the configured value lowered so the
+    /// prompt plus output fits the window. 0 (unset) stays unset.
+    private long requestMaxTokens()
+    {
+        if (maxTokens <= 0) return maxTokens;
+        auto window = contextWindow();
+        auto used = estimateContextTokens() + ctx.outputMargin(window);
+        long room = window > used ? cast(long)(window - used) : 0;
+        auto n = maxTokens < room ? maxTokens : room;
+        return n < 1 ? 1 : n;
+    }
+
+    /// Summarize older messages into one, keeping recent messages verbatim.
+    /// `mode` overrides `compactionMode` (null: the configured one); `focus`
+    /// steers the summary. Returns false when there is nothing to compact.
+    bool compact(out CompactReport report, CompactTrigger trigger = CompactTrigger.manual,
+            const(ctx.CompactionMode)* mode = null, string focus = null)
+    {
+        ctx.CompactionMode m = mode is null ? compactionMode : *mode;
+        // Smart compaction points into the session log; without one it is standard.
+        if (log is null) m = ctx.CompactionMode.standard;
+        bool smart = m == ctx.CompactionMode.smart;
+        auto window = contextWindow();
+        size_t bodyStart = messages.length && messages[0].role == Role.system ? 1 : 0;
+        auto len = messages.length;
+        size_t keepBudget = trigger == CompactTrigger.manual ? 0
+            : (ctx.keepRecentTokens < window / 4 ? ctx.keepRecentTokens : window / 4);
+        // Split where no tool result is separated from its call.
+        size_t[] boundaries;
+        foreach (i; bodyStart + 1 .. len)
+            if (messages[i].role == Role.user || messages[i].role == Role.assistant) boundaries ~= i;
+        if (!boundaries.length) return false;
+        auto split = boundaries[$ - 1];
+        foreach_reverse (b; boundaries)
+        {
+            if (ctx.messagesTokens(messages[b .. $]) > keepBudget) break;
+            split = b;
+        }
+        if (split == boundaries[0]) split = boundaries[$ - 1];
+        auto summarized = messages[bodyStart .. split].dup;
+        if (!summarized.length) return false;
+        auto tokensBefore = estimateContextTokens();
+        ulong first, last;
+        foreach (ref x; summarized)
+            if (x.logLine)
+            {
+                if (!first || x.logLine < first) first = x.logLine;
+                if (x.logLine > last) last = x.logLine;
+            }
+
+        auto budget = ctx.summaryOutputBudget(window, cast(long) outputBase);
+        string summary, fallback;
+        bool truncated, retried;
+        for (;;)
+        {
+            auto inputWindow = window > cast(size_t) budget ? window - cast(size_t) budget : 0;
+            auto chars = (inputWindow > 4_000 ? inputWindow - 2_000 : 2_000) * 3;
+            auto request = "Conversation to summarize:\n\n" ~ ctx.renderTranscript(summarized, chars, smart);
+            if (focus.strip.length) request ~= "\n\nWhen summarizing, focus on: " ~ focus.strip;
+            ChatRequest req;
+            req.messages = [Message.system(ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "")),
+                Message.user(request)];
+            req.maxTokens = budget;
+            req.temperature = temperature;
+            try
+            {
+                auto r = client.chat(req, (bool, string) {});
+                recordUsage(r.usage);
+                truncated = r.stopReason == "length" || r.stopReason == "max_tokens";
+                auto body_ = r.content.strip;
+                if (body_.length)
+                {
+                    if (truncated) body_ ~= ctx.summaryTruncatedNote;
+                    summary = smart ? ctx.smartSummaryPrefix ~ "\n" ~ body_ ~ "\n\n" ~ ctx.smartSummaryNote(first, last)
+                        : ctx.summaryPrefix ~ "\n" ~ body_;
+                }
+                else
+                {
+                    fallback = truncated ? "empty summary: the output limit was reached before any summary text" : "empty summary";
+                    truncated = false;
+                }
+                break;
+            }
+            catch (Cancelled) return false;
+            catch (Exception e)
+            {
+                if (control.isCancelled) return false;
+                // Learn a smaller output cap and retry once.
+                if (!retried && ctx.isOutputCapError(e.msg) && !ctx.isContextOverflow(e.msg))
+                {
+                    retried = true;
+                    long learned = ctx.outputCapFromError(e.msg);
+                    if (!learned) learned = budget / 2 > 1_024 ? budget / 2 : 1_024;
+                    if (learned < 256) learned = 256;
+                    if (learned < budget) { budget = learned; continue; }
+                }
+                fallback = e.msg;
+                break;
+            }
+        }
+        if (fallback !is null)
+        {
+            auto note = format("[%s earlier messages were removed to fit the context window; no summary is available]",
+                summarized.length);
+            summary = smart && first ? ctx.smartSummaryPrefix ~ "\n" ~ note ~ "\n\n" ~ ctx.smartSummaryNote(first, last) : note;
+        }
+        if (planTools && !plan.empty) summary ~= "\n\n" ~ plan.contextNote();
+
+        Message[] next = messages[0 .. bodyStart].dup;
+        next ~= Message.user(summary);
+        next[$ - 1].timestamp = nowStamp();
+        next ~= messages[split .. $];
+        if (trigger != CompactTrigger.manual)
+        {
+            auto clipTo = window / 8 > 1_000 ? window / 8 : 1_000;
+            foreach (ref x; next[bodyStart + 1 .. $])
+                if (x.role == Role.tool && ctx.clipMessage(x, clipTo) && smart && x.logLine)
+                    x.content ~= format("\n[clipped at compaction; history_read #%s has it whole]", x.logLine);
+        }
+        messages = next;
+        calibLen = 0;
+        if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName);
+        report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), split - bodyStart,
+            fallback, truncated, m);
+        compactFloor = report.tokensAfter;
+        compactions++;
+        historyAvailable = historyHintPending = m == ctx.CompactionMode.smart;
+        if (onCompacted !is null) onCompacted(report);
+        return true;
+    }
+
+    private void recordUsage(TokenUsage u)
+    {
+        sessionInputTokens += u.inputTokens;
+        sessionOutputTokens += u.outputTokens;
+    }
+
     private string cancelled(AgentEvents ev)
     {
         ev.text(false, "\n" ~ cancelledResponse);
@@ -347,7 +616,8 @@ class Agent
         }
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
-        if (!isPlan && !isOutcome && !tools.has(call.name))
+        bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
+        if (!isPlan && !isOutcome && !isHistory && !tools.has(call.name))
             return format("Tool '%s' not found. Available: %s", call.name, toolNames());
         // Backstop for a call already in flight when plan mode was switched on.
         if (control.mode == AgentMode.plan && !planAllows(call.name))
@@ -385,11 +655,14 @@ class Agent
                 reported = o;
                 hasReported = true;
             }
+            else if (isHistory)
+                out_ = call.name == hist.searchTool ? hist.search(log.path, args) : hist.read(log.path, args);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
         catch (PlanError e) out_ = e.msg;
+        catch (hist.HistoryError e) out_ = e.msg;
         catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
@@ -401,6 +674,12 @@ class Agent
         }
         return withContext(out_, context);
     }
+
+    /// A smart summary is in context: offer history_search/history_read.
+    bool historyAvailable;
+    /// Append the "look in history" hint to the next failed tool result.
+    bool historyHintPending;
+    bool historyEnabled() const { return log !is null && historyAvailable; }
 
     /// Offer `report_outcome` (config `outcome_tool`).
     bool outcomeTool = true;
@@ -420,7 +699,7 @@ class Agent
     ToolDefinition[] offeredTools()
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
-            ~ (outcomeTool ? [outcomeDefinition()] : null);
+            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;
@@ -755,4 +1034,62 @@ unittest
     mock.script = [same("d1"), same("d2"), same("d3"), same("d4"), same("d5"), same("d6"), LLMResponse("done")];
     agent.remindersEnabled = false;
     assert(agent.run("again", new NullEvents) == "done");
+}
+
+// Compaction: manual, past the threshold, and after a context overflow.
+unittest
+{
+    import std.algorithm : startsWith, canFind;
+    import nano.providers.mock;
+    auto mock = new MockClient([LLMResponse("SUM")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    agent.messages ~= [Message.user("u1"), Message.assistant("a1"), Message.user("u2"), Message.assistant("a2")];
+    CompactReport rep;
+    assert(agent.compact(rep));
+    assert(agent.messages.length == 3 && agent.messages[1].content == ctx.summaryPrefix ~ "\nSUM");
+    assert(agent.messages[2].content == "a2" && rep.summarized == 3 && agent.compactions == 1);
+    assert(rep.toString.startsWith("compacted 3 messages: ~"), rep.toString);
+    // The summarizer saw the folded messages, not the kept one.
+    auto req = mock.seen[0][1].content;
+    assert(req.canFind("USER:\nu1") && req.canFind("ASSISTANT:\na1") && !req.canFind("a2"));
+    assert(mock.seen[0][0].content == ctx.summarySystemPrompt);
+    // Nothing left to fold.
+    agent.messages = agent.messages[0 .. 1] ~ Message.user("only");
+    assert(!agent.compact(rep));
+
+    // A failed summary drops the older messages with a note.
+    mock.script = [LLMResponse("!error:boom")];
+    agent.messages ~= [Message.assistant("a"), Message.user("b")];
+    assert(agent.compact(rep) && rep.fallback == "boom");
+    assert(agent.messages[1].content.startsWith("[2 earlier messages were removed"));
+
+    // Past the threshold, the turn compacts before the request and goes on.
+    string big;
+    foreach (_; 0 .. 1_000) big ~= "0123456789";
+    auto auto_ = new MockClient([LLMResponse("SUM2"), LLMResponse("done")]);
+    auto b = new Agent(auto_, new ToolRegistry, Policy.init, "sys");
+    b.configuredWindow = 4_000;
+    b.messages ~= [Message.user(big), Message.assistant(big), Message.user("q"), Message.assistant("a")];
+    string reported;
+    b.onCompacted = (ref const CompactReport r) { reported = r.toString; };
+    assert(b.overThreshold());
+    assert(b.run("go", new NullEvents) == "done");
+    assert(auto_.seen.length == 2 && auto_.seen[0][0].content == ctx.summarySystemPrompt, reported);
+    assert(auto_.seen[1][1].content == ctx.summaryPrefix ~ "\nSUM2" && reported.canFind("compacted"));
+    assert(!b.overThreshold(), "the floor stops a compaction loop");
+
+    // A context overflow learns the window, compacts and retries once.
+    auto over = new MockClient([LLMResponse("!error:This model's maximum context length is 9000 tokens"),
+        LLMResponse("SUM3"), LLMResponse("ok")]);
+    auto c = new Agent(over, new ToolRegistry, Policy.init, "sys");
+    c.messages ~= [Message.user("x"), Message.assistant("y")];
+    assert(c.run("go", new NullEvents) == "ok");
+    assert(c.learnedWindow == 9_000 && c.contextWindow == 9_000 && over.seen.length == 3);
+    // A second overflow in the same request is an error.
+    over.script = [LLMResponse("!error:context length exceeded"), LLMResponse("SUM4"),
+        LLMResponse("!error:context length exceeded")];
+    bool threw;
+    try c.run("again", new NullEvents);
+    catch (Exception e) threw = true;
+    assert(threw);
 }
