@@ -12,6 +12,32 @@ class ToolError : Exception
     this(string msg) { super(msg); }
 }
 
+/// Decodes bytes as UTF-8, replacing each invalid sequence with U+FFFD
+/// (like Rust's `String::from_utf8_lossy`), so tool output is never lost
+/// to an encoding error.
+string lossyUtf8(const(ubyte)[] data) @safe pure
+{
+    import std.utf : decode, UTFException;
+    import std.array : appender;
+    auto s = cast(const(char)[]) data;
+    auto o = appender!string;
+    size_t i = 0;
+    while (i < s.length)
+    {
+        if (s[i] < 0x80) { o.put(s[i]); ++i; continue; }
+        size_t j = i;
+        try { decode(s, j); o.put(s[i .. j]); i = j; }
+        catch (UTFException) { o.put("\uFFFD"); ++i; }
+    }
+    return o[];
+}
+
+unittest
+{
+    ubyte[] bad = [0x61, 0xff, 0x62, 0xe2, 0x82, 0xac];
+    assert(lossyUtf8(bad) == "a\uFFFDb€");
+}
+
 alias ToolHandler = string delegate(JSONValue args);
 
 class ToolRegistry

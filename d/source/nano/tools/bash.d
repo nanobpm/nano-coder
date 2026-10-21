@@ -84,8 +84,9 @@ BashResult run(string command, Duration timeout, string cwd = null)
         }
         Thread.sleep(20.msecs);
     }
-    r.stdout_ = readText(outPath);
-    r.stderr_ = readText(errPath);
+    import std.file : read;
+    r.stdout_ = lossyUtf8(cast(const(ubyte)[]) read(outPath));
+    r.stderr_ = lossyUtf8(cast(const(ubyte)[]) read(errPath));
     return r;
 }
 

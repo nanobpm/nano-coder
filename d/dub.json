@@ -4,8 +4,19 @@
   "license": "Apache-2.0",
   "targetName": "nano-coder-d",
   "targetType": "executable",
-  "libs": ["curl"],
+  "libs": [
+    "curl"
+  ],
   "buildTypes": {
-    "release": { "buildOptions": ["releaseMode", "optimize", "inline"] }
+    "release": {
+      "buildOptions": [
+        "releaseMode",
+        "optimize",
+        "inline"
+      ],
+      "dflags-ldc": [
+        "-boundscheck=on"
+      ]
+    }
   }
 }
