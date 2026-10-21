@@ -527,7 +527,26 @@ string contextReport(Agent agent)
     return out_.join("\n");
 }
 
+/// The agent, for `main`'s exit (title requests may still be in flight).
+__gshared Agent mainAgent;
+
 int main(string[] args)
+{
+    auto rc = runMain(args);
+    import core.time : dur;
+    if (mainAgent !is null && !mainAgent.settleTitles(dur!"seconds"(3)))
+    {
+        // A title request is still running: druntime teardown would race the
+        // thread, so leave without it (Rust likewise drops pending tasks).
+        import core.sys.posix.unistd : _exit;
+        stdout.flush();
+        stderr.flush();
+        _exit(rc);
+    }
+    return rc;
+}
+
+int runMain(string[] args)
 {
     auto o = parseArgs(args);
     auto cfgPath = o.configPath.length ? o.configPath : Config.defaultPath;
@@ -648,7 +667,11 @@ int main(string[] args)
     auto questions = new QuestionBroker;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    mainAgent = agent;
     agent.instructions = instructions;
+    agent.sessionTitles = cfg.sessionTitles;
+    agent.titleModel = cfg.titleModel;
+    agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
     if (instructions !is null && !o.acp && !o.prompt.length)
     {
         foreach (f; instructions.loadedPaths) stderr.writeln("Instructions: ", f);

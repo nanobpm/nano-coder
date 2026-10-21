@@ -31,8 +31,13 @@ enum int formatVersion = 1;
 /// chrono writes it (`2026-10-21T11:24:12.855560+13:00`).
 string nowStamp()
 {
-    import core.time : Duration;
-    auto t = Clock.currTime;
+    return stamp(Clock.currTime);
+}
+
+/// `t` in local time as RFC 3339 with offset and microseconds (chrono's form).
+string stamp(SysTime when)
+{
+    auto t = when.toLocalTime;
     auto off = t.utcOffset;
     auto mins = off.total!"minutes";
     char sign = mins < 0 ? '-' : '+';
@@ -377,87 +382,16 @@ Restored restore(string path)
     return r;
 }
 
-/// One saved session, for `--list-sessions` and `--resume last`.
-struct Summary
-{
-    string id, path, cwd, model, createdAt;
-    SysTime lastUsed;
-    size_t prompts;
-    string firstPrompt, lastPrompt, contextPrompt;
-}
-
 import std.datetime.systime : SysTime;
-
-/// Whether a prompt says too little to identify a session by itself.
-bool isTerse(string text)
-{
-    import std.array : split;
-    import std.range : walkLength;
-    auto t = text.strip;
-    return t.startsWith("/") || (t.walkLength < 24 && t.split.length <= 4);
-}
-
 import std.string : startsWith;
-
-/// Summarize a log from its header and input records (other lines are skipped unparsed).
-Summary summarize(string path)
-{
-    Summary s;
-    s.path = path;
-    s.lastUsed = timeLastModified(path);
-    bool first = true;
-    auto text = readText(path);
-    foreach (line; text.lineSplitter)
-    {
-        if (first)
-        {
-            first = false;
-            auto h = parseJSON(line);
-            if (h["type"].str != "session") throw new Exception("no session header");
-            auto d = h["data"];
-            s.id = d["id"].str;
-            if (auto c = "cwd" in d) s.cwd = c.str;
-            if (auto m = "model" in d) s.model = m.str;
-            if (auto c = "created_at" in d) s.createdAt = c.str;
-            continue;
-        }
-        if (!line.startsWith(`{"type":"input"`)) continue;
-        JSONValue rec;
-        try rec = parseJSON(line);
-        catch (Exception) continue; // torn last line
-        if (rec["type"].str != "input") continue;
-        auto t = rec["data"]["text"].str;
-        s.prompts++;
-        if (!s.firstPrompt.length) s.firstPrompt = t;
-        if (s.lastPrompt.length && !isTerse(s.lastPrompt)) s.contextPrompt = s.lastPrompt;
-        s.lastPrompt = t;
-        if (!isTerse(t)) s.contextPrompt = null;
-    }
-    return s;
-}
-
 import std.algorithm : canFind;
+public import nano.session_index : Summary, isTerse;
 
-/// Every readable session in `dir`, newest first.
+/// Every resumable session in `dir`, newest first (via the summary index).
 Summary[] listSessions(string dir)
 {
-    Summary[] out_;
-    if (!dir.exists) return out_;
-    foreach (DirEntry e; dirEntries(dir, "*.jsonl", SpanMode.shallow, false))
-    {
-        auto stem = e.name.baseName.stripExtension;
-        try validateId(stem);
-        catch (Exception) continue;
-        if (!e.isFile) continue;
-        try
-        {
-            auto s = summarize(e.name);
-            if (s.id == stem) out_ ~= s;
-        }
-        catch (Exception) {}
-    }
-    out_.sort!((a, b) => a.lastUsed > b.lastUsed);
-    return out_;
+    import nano.session_index : list;
+    return list(dir);
 }
 
 /// Find a session log by id, or "last" for the newest one started in `cwd`.
@@ -506,7 +440,8 @@ string listRow(const ref Summary s, SysTime now)
     auto project = s.cwd.length ? oneLine(s.cwd.baseName) : "?";
     auto prompts = s.prompts == 1 ? "1 prompt" : format("%s prompts", s.prompts);
     auto topic = oneLine(s.lastPrompt);
-    if (s.contextPrompt.length) topic ~= "  ← " ~ oneLine(s.contextPrompt);
+    if (s.title !is null) topic = oneLine(s.title) ~ " · " ~ topic;
+    else if (s.contextPrompt.length) topic ~= "  ← " ~ oneLine(s.contextPrompt);
     auto line = format("%-10s  %s  %s  %s", ago(s.lastUsed, now), project, prompts, topic);
     if (line.walkLength > 100) line = line.take(99).to!string ~ "…";
     return oneLine(s.id) ~ "  " ~ line;

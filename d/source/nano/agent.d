@@ -8,6 +8,9 @@ import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
+import core.thread : Thread;
+import core.time : Duration;
+static import nano.session_index;
 import nano.tools;
 import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer;
 import nano.mode : AgentMode, planAllows;
@@ -177,20 +180,106 @@ class Agent
         // Every input carries an id; the log pairs it with a turn_end record,
         // so an input without one marks a turn a crash interrupted.
         auto inputId = format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
+        ulong from = log !is null ? logSize() : 0;
         if (log !is null) log.input(inputId, input);
         string response;
         try response = runTurn(input, ev, resetControl);
         catch (Exception e)
         {
-            if (log !is null) log.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
+            if (log !is null)
+            {
+                log.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
+                indexTurn(from);
+            }
             throw e;
         }
         if (log !is null)
+        {
             log.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
+            indexTurn(from);
+        }
         return response;
     }
 
+    /// Ask for session titles (`session_titles`): `titleClient` builds a client
+    /// for a `provider/model` spec; `titleModel` (null: the session's model).
+    bool sessionTitles;
+    string titleModel;
+    LLMClient delegate(string spec) titleClient;
+    private bool[string] titlesRequested;
+
+    private ulong logSize() @trusted
+    {
+        import std.file : getSize;
+        try return getSize(log.path);
+        catch (Exception) return 0;
+    }
+
+    /// Keep the `--resume` picker's summary current (only a cache: the picker
+    /// rebuilds a missing or stale summary), then maybe request a title.
+    private void indexTurn(ulong from) @trusted
+    {
+        import nano.session_index : update, Summary;
+        Summary s;
+        try s = update(log.path, from, client.providerName ~ "/" ~ client.modelName);
+        catch (Exception) return;
+        requestTitle(s);
+    }
+
+    /// With `session_titles` on, ask the model for a title in the background
+    /// once the session has a telling prompt and no title. Failures are silent:
+    /// a later run tries again.
+    private void requestTitle(const ref nano.session_index.Summary s) @trusted
+    {
+        import nano.session_index : titleSource, cleanTitle, setTitle;
+        import core.thread : Thread;
+        if (!sessionTitles || titleClient is null || s.title !is null || (s.id in titlesRequested)) return;
+        auto source = titleSource(s);
+        if (source is null) return;
+        titlesRequested[s.id] = true;
+        auto spec = titleModel !is null ? titleModel : client.providerName ~ "/" ~ client.modelName;
+        auto make = titleClient;
+        auto path = log.path;
+        auto t = new Thread({
+            try
+            {
+                auto c = make(spec);
+                ChatRequest req;
+                req.messages = [Message.system(titlePrompt), Message.user(source)];
+                req.maxTokens = 400; // room for reasoning models that think first
+                auto title = cleanTitle(c.chat(req, null).content);
+                if (title !is null) setTitle(path, title); // false: another process won
+            }
+            catch (Throwable) {}
+        });
+        t.isDaemon = true;
+        t.start();
+        titleThreads ~= t;
+    }
+
+    /// Title requests in flight (tests join them).
+    Thread[] titleThreads;
+
+    /// Wait up to `max` for title requests to finish; false if one still runs.
+    bool settleTitles(Duration max) @trusted
+    {
+        import core.time : MonoTime, msecs;
+        auto deadline = MonoTime.currTime + max;
+        foreach (t; titleThreads)
+            while (t.isRunning)
+            {
+                if (MonoTime.currTime >= deadline) return false;
+                Thread.sleep(20.msecs);
+            }
+        return true;
+    }
+
     private size_t inputCounter;
+
+    /// System prompt for session titles.
+    enum string titlePrompt = "You name coding-assistant sessions. Reply with a title of at most six words "
+        ~ "that says what the user is working on, from their requests below. Reply with the title only: no quotes, "
+        ~ "no trailing period.";
 
     private string runTurn(string input, AgentEvents ev, bool resetControl)
     {
@@ -1361,4 +1450,40 @@ unittest
     auto gone = req.attachmentPlan;
     assert(req.resolveAttachments(1, gone)[0].text.canFind("no longer available"));
     assert(toolResultDisplay("x", t.attachments) == "x\n[image: " ~ png ~ ", 20×10]");
+}
+
+// Each turn updates the session index; with session_titles on, a telling
+// prompt gets one background title request, stored cleaned in the index.
+@trusted unittest
+{
+    import std.file : tempDir, exists, rmdirRecurse;
+    import std.path : buildPath;
+    import nano.session : SessionLog;
+    import nano.session_index : list;
+    import nano.providers.mock : MockClient;
+    auto dir = buildPath(tempDir, "nano-d-agent-titles");
+    if (dir.exists) rmdirRecurse(dir);
+    auto agent = new Agent(new MockClient([LLMResponse("a"), LLMResponse("b"), LLMResponse("c")]), new ToolRegistry,
+        Policy.init, null);
+    agent.log = new SessionLog(dir, "mock/m", "/w");
+    MockClient titler;
+    string[] specs;
+    agent.sessionTitles = true;
+    agent.titleClient = (string spec) {
+        specs ~= spec;
+        titler = new MockClient([LLMResponse("Title: \"Fixing the deploy test.\"")]);
+        return cast(LLMClient) titler;
+    };
+    auto ev = new NullEvents;
+    agent.run("hi", ev); // terse: no title yet
+    assert(agent.titleThreads.length == 0 && list(dir)[0].prompts == 1);
+    agent.run("Fix the flaky deploy test in CI", ev);
+    assert(agent.titleThreads.length == 1);
+    agent.titleThreads[0].join();
+    assert(specs == ["mock/mock"], specs[0]);
+    assert(titler.seen[0][0].content == Agent.titlePrompt && titler.seen[0][1].content == "Fix the flaky deploy test in CI");
+    agent.run("ok", ev); // titled already: no second request
+    assert(agent.titleThreads.length == 1);
+    auto s = list(dir)[0];
+    assert(s.title == "Fixing the deploy test" && s.prompts == 3 && s.model == "mock/mock");
 }

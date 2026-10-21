@@ -241,6 +241,10 @@ struct Config
     Nullable!bool vision;
     long maxTokens = 0;
     string systemPrompt;
+    /// Ask a model for a few-word title per session (`session_titles`).
+    bool sessionTitles;
+    /// The model titles come from (`title_model`); null uses the session's.
+    string titleModel;
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
     ProviderConfig[string] providers;
@@ -297,6 +301,8 @@ struct Config
         if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
+        if (auto v = "session_titles" in doc) c.sessionTitles = v.boolean;
+        if (auto v = "title_model" in doc) c.titleModel = v.str;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
         if (auto v = "outcome_tool" in doc) c.outcomeTool = v.boolean;
