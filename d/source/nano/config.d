@@ -12,6 +12,7 @@ import std.file : exists, readText;
 import std.path : buildPath, expandTilde;
 import std.process : environment, executeShell;
 import std.string : strip, indexOf, startsWith;
+import std.algorithm : stripRight;
 import std.format : format;
 import std.math : isNaN;
 import nano.toml;
@@ -50,16 +51,18 @@ string[] strings(JSONValue v)
     return o;
 }
 
-enum ProviderKind { openai, anthropic, githubCopilot }
+enum ProviderKind { openai, anthropic, githubCopilot, muse, mock }
 
 ProviderKind parseKind(string s)
 {
     switch (s)
     {
-        case "openai": return ProviderKind.openai;
+        case "openai", "openai-compatible", "openai-chat": return ProviderKind.openai;
         case "anthropic": return ProviderKind.anthropic;
-        case "github-copilot", "github_copilot": return ProviderKind.githubCopilot;
-        default: throw new Exception(format("provider kind %s is not supported by the D port yet (openai, anthropic, github-copilot)", s));
+        case "github-copilot", "github_copilot", "copilot": return ProviderKind.githubCopilot;
+        case "muse", "muse-code": return ProviderKind.muse;
+        case "mock": return ProviderKind.mock;
+        default: throw new Exception(format("unknown provider kind %s (openai, anthropic, github-copilot, muse, mock)", s));
     }
 }
 
@@ -198,28 +201,41 @@ ProviderConfig[string] presets()
 {
     alias O = ProviderKind.openai;
     ProviderConfig[string] m;
-    m["openai"] = preset(O, "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5");
+    m["openai"] = preset(O, "https://api.openai.com/v1", "OPENAI_API_KEY");
     m["openai"].maxTokensParam = "max_completion_tokens";
-    m["anthropic"] = preset(ProviderKind.anthropic, "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", "claude-sonnet-4-5");
+    m["anthropic"] = preset(ProviderKind.anthropic, "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY");
     m["openrouter"] = preset(O, "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY");
     m["fireworks"] = preset(O, "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY");
     m["groq"] = preset(O, "https://api.groq.com/openai/v1", "GROQ_API_KEY");
     m["together"] = preset(O, "https://api.together.xyz/v1", "TOGETHER_API_KEY");
     m["deepseek"] = preset(O, "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY");
-    m["moonshot"] = preset(O, "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY");
+    m["kimi"] = preset(O, "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY");
+    // K3 fixes temperature and rejects other values; it also needs its
+    // reasoning replayed with each assistant message.
+    m["kimi"].maxTokensParam = "max_completion_tokens";
+    m["kimi"].dropParams = ["temperature"];
+    m["kimi"].replayReasoning = true;
     m["mistral"] = preset(O, "https://api.mistral.ai/v1", "MISTRAL_API_KEY");
     m["gemini"] = preset(O, "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY");
-    m["ollama"] = preset(O, "http://localhost:11434/v1", null);
     // No base_url: the session token names the API endpoint.
     m["github-copilot"] = preset(ProviderKind.githubCopilot, null, "GITHUB_COPILOT_OAUTH_TOKEN", "gpt-4.1");
+    // The endpoint is minted alongside the API key on login.
+    m["muse"] = preset(ProviderKind.muse, null, "META_API_KEY", "muse-spark-1.3");
+    {
+        import nano.qwen : defaultEndpoint;
+        m["qwen"] = preset(O, defaultEndpoint.baseUrl, defaultEndpoint.apiKeyEnv);
+    }
+    m["ollama"] = preset(O, "http://localhost:11434/v1", null);
+    m["llamacpp"] = preset(O, "http://localhost:8080/v1", null);
+    m["mock"] = preset(ProviderKind.mock, null, null, "mock");
     return m;
 }
 
 struct Config
 {
-    string model = "openai/gpt-5";
-    string defaultProvider = "openai";
-    double temperature = double.nan;
+    string model = "gpt-4o-mini";
+    string defaultProvider = "mock";
+    double temperature = 0.7;
     /// Global thinking level and vision override.
     Thinking thinking;
     Nullable!bool vision;
@@ -315,9 +331,19 @@ struct Config
                 p.merge(table);
                 c.providers[name] = p;
             }
-        // Legacy top-level credentials apply to the default provider.
-        if (auto v = "api_key" in doc) c.providers[c.defaultProvider].apiKey = v.str;
-        if (auto v = "base_url" in doc) c.providers[c.defaultProvider].baseUrl = v.str;
+        // Legacy top-level credentials apply to the default provider (OpenAI
+        // when that is still the offline mock); explicit [providers.*] win.
+        auto apiKey = "api_key" in doc, baseUrl = "base_url" in doc;
+        if (apiKey !is null || baseUrl !is null)
+        {
+            if (c.defaultProvider == "mock") c.defaultProvider = "openai";
+            auto own = "providers" in doc;
+            auto table = own is null ? null : c.defaultProvider in own.object;
+            auto p = c.defaultProvider in c.providers ? c.providers[c.defaultProvider] : ProviderConfig.init;
+            if (apiKey !is null && (table is null || "api_key" !in table.object)) p.apiKey = apiKey.str;
+            if (baseUrl !is null && (table is null || "base_url" !in table.object)) p.baseUrl = baseUrl.str;
+            c.providers[c.defaultProvider] = p;
+        }
         return c;
     }
 }
@@ -338,7 +364,8 @@ struct ResolvedProvider
 bool reasonsOverResponses(ProviderKind kind, string model) @safe
 {
     import nano.copilot : isReasoningModel;
-    return kind == ProviderKind.githubCopilot && isReasoningModel(model);
+    // Muse always speaks Responses and always reasons.
+    return kind == ProviderKind.muse || (kind == ProviderKind.githubCopilot && isReasoningModel(model));
 }
 
 /// Split `provider/model` (or a bare provider, or a bare model).
@@ -362,20 +389,60 @@ void parseModelSpec(string spec, const ProviderConfig[string] providers, string 
     model = spec;
 }
 
+/// A base URL a request path can be appended to: http(s), no whitespace or
+/// control characters, no query or fragment.
+void validateHttpBaseUrl(string provider, string url)
+{
+    import std.uni : isWhite;
+    import std.ascii : isControl;
+    import std.string : toLower, startsWith;
+    if (url.strip.length == 0) throw new Exception(format("provider \"%s\" has an empty base_url", provider));
+    foreach (dchar ch; url)
+        if (isWhite(ch) || (ch < 0x80 && isControl(cast(char) ch)) || (ch >= 0x80 && ch < 0xa0))
+            throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain whitespace or control characters", provider, url));
+    auto colon = url.indexOf("://");
+    if (colon <= 0) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+    auto scheme = url[0 .. colon].toLower;
+    if (scheme != "http" && scheme != "https")
+        throw new Exception(format("provider \"%s\" base_url \"%s\" must be http(s), not \"%s\"", provider, url, scheme));
+    if (url.length == colon + 3) throw new Exception(format("provider \"%s\" has a malformed base_url \"%s\"", provider, url));
+    if (url.indexOf('?') >= 0 || url.indexOf('#') >= 0)
+        throw new Exception(format("provider \"%s\" base_url \"%s\" must not contain a query or fragment", provider, url));
+}
+
 ResolvedProvider resolve(const ref Config c, string spec)
 {
     string name, model;
     parseModelSpec(spec, c.providers, c.defaultProvider, name, model);
     auto pc = name in c.providers;
-    if (pc is null) throw new Exception("unknown provider " ~ name);
+    if (pc is null)
+    {
+        import std.algorithm : sort;
+        import std.array : join;
+        auto names = c.providers.keys.dup;
+        names.sort();
+        throw new Exception(format("unknown provider \"%s\" for model \"%s\"; known providers: %s", name, spec, names.join(", ")));
+    }
     ResolvedProvider r;
     r.name = name;
     r.config = cast(ProviderConfig) *pc;
     r.model = model.length ? model : pc.defaultModel;
-    if (!r.model.length) throw new Exception(format("no model given for provider %s; use --model %s/<model>", name, name));
+    if (!r.model.length)
+        throw new Exception(format("no model given for provider \"%s\" and it has no default_model", name));
     if (!r.config.hasKind) r.config.kind = ProviderKind.openai;
-    if (r.config.baseUrl.indexOf('?') >= 0 || r.config.baseUrl.indexOf('#') >= 0)
-        throw new Exception(format("provider %s: base_url must not contain a query or fragment", name));
+    final switch (r.config.kind)
+    {
+        // Mock needs no endpoint; Copilot and Muse derive theirs unless overridden.
+        case ProviderKind.mock: break;
+        case ProviderKind.githubCopilot, ProviderKind.muse:
+            if (r.config.baseUrl.length) validateHttpBaseUrl(name, r.config.baseUrl);
+            break;
+        case ProviderKind.openai, ProviderKind.anthropic:
+            if (r.config.baseUrl is null) throw new Exception(format("provider \"%s\" has no base_url", name));
+            validateHttpBaseUrl(name, r.config.baseUrl);
+            break;
+    }
+    r.config.baseUrl = r.config.baseUrl.stripRight('/');
     r.replayReasoning = pc.replayReasoning.isNull ? reasonsOverResponses(r.config.kind, r.model) : pc.replayReasoning.get;
     r.apiKey = pc.apiKey;
     if (!r.apiKey.length && pc.apiKeyEnv.length) r.apiKey = environment.get(pc.apiKeyEnv, "");
@@ -428,4 +495,64 @@ unittest
     assert(!resolve(c, "github-copilot/gpt-5").replayReasoning);
     c.providers["deepseek"].merge(parseToml("replay_reasoning = true"));
     assert(resolve(c, "deepseek/deepseek-reasoner").replayReasoning);
+}
+
+@trusted unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    Config c;
+    c.providers = presets();
+    // Rust's defaults: the offline mock, temperature 0.7.
+    assert(c.defaultProvider == "mock" && c.temperature == 0.7);
+    auto mock = resolve(c, c.model);
+    assert(mock.name == "mock" && mock.config.kind == ProviderKind.mock && mock.model == "gpt-4o-mini");
+    auto qwen = resolve(c, "qwen/qwen3.8-max");
+    assert(qwen.config.baseUrl == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1" && !qwen.replayReasoning);
+    assert(c.providers["qwen"].apiKeyEnv == "DASHSCOPE_API_KEY");
+    auto kimi = resolve(c, "kimi/kimi-k3");
+    assert(kimi.config.baseUrl == "https://api.moonshot.ai/v1" && kimi.replayReasoning);
+    assert(kimi.config.dropParams == ["temperature"] && kimi.config.maxTokensParam == "max_completion_tokens");
+    auto muse = resolve(c, "muse");
+    assert(muse.model == "muse-spark-1.3" && muse.replayReasoning && muse.config.baseUrl == "");
+    assert(collectExceptionMsg(resolve(c, "openai")).canFind("has no default_model"));
+    assert(collectExceptionMsg(resolve(c, "nope/x")) is null); // a bare model on the default provider
+    c.defaultProvider = "none";
+    assert(collectExceptionMsg(resolve(c, "x")).canFind("known providers: anthropic, deepseek"));
+    assert(parseKind("muse-code") == ProviderKind.muse && parseKind("openai-compatible") == ProviderKind.openai);
+}
+
+@trusted unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    string msg(string url)
+    {
+        return collectExceptionMsg(validateHttpBaseUrl("p", url));
+    }
+    assert(msg("https://host/v1") is null && msg("http://127.0.0.1:8080/v1") is null);
+    assert(msg(" https://host/v1").canFind("whitespace") && msg("https://host/v1\n").canFind("control"));
+    assert(msg("ftp://host").canFind("must be http(s)") && msg("host/v1").canFind("malformed"));
+    assert(msg("https://host/v1?k=1").canFind("query or fragment") && msg("").canFind("empty base_url"));
+    Config c;
+    c.providers = presets();
+    c.providers["local"] = ProviderConfig.init;
+    assert(collectExceptionMsg(resolve(c, "local/m")).canFind("has no base_url"));
+}
+
+@trusted unittest
+{
+    import std.file : tempDir, write, remove;
+    import std.path : buildPath;
+    auto path = buildPath(tempDir, "nano-d-legacy.toml");
+    scope (exit) remove(path);
+    // Legacy top-level credentials move the mock default to OpenAI.
+    write(path, "api_key = \"sk-legacy\"\nbase_url = \"http://legacy/v1\"\n");
+    auto c = Config.load(path);
+    assert(c.defaultProvider == "openai" && c.providers["openai"].apiKey == "sk-legacy");
+    assert(c.providers["openai"].baseUrl == "http://legacy/v1");
+    // Explicit [providers.*] settings win.
+    write(path, "default_provider = \"groq\"\napi_key = \"sk-legacy\"\n[providers.groq]\napi_key = \"sk-own\"\n");
+    c = Config.load(path);
+    assert(c.providers["groq"].apiKey == "sk-own" && c.providers["openai"].apiKey is null);
 }

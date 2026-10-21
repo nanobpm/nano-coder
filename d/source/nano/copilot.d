@@ -128,19 +128,59 @@ struct Endpoints
     }
 }
 
-/// `github-copilot.json` in the platform data dir, shared with the Rust build.
-string credentialsPath(string dataDir = null) @trusted
+/// The platform data dir (`~/Library/Application Support/nano-coder` or
+/// `$XDG_DATA_HOME/nano-coder`), shared with the Rust build; the legacy
+/// `agentic-harness` dir when only that exists.
+string appDataDir() @trusted
 {
     import std.path : buildPath, expandTilde;
     import std.file : exists;
-    if (!dataDir.length)
+    version (OSX) auto base = buildPath(expandTilde("~"), "Library", "Application Support");
+    else auto base = environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share"));
+    auto current = buildPath(base, "nano-coder"), legacy = buildPath(base, "agentic-harness");
+    return !current.exists && legacy.exists ? legacy : current;
+}
+
+/// `github-copilot.json` in the platform data dir, shared with the Rust build.
+string credentialsPath(string dataDir = null) @trusted
+{
+    import std.path : buildPath;
+    return buildPath(dataDir.length ? dataDir : appDataDir(), "github-copilot.json");
+}
+
+/// Replace `path` with `text` atomically, owner-only (0600): written to a
+/// unique, exclusively created temp file in the same dir, then renamed, so a
+/// failed write never leaves a torn or empty credentials file.
+void writePrivateAtomic(string path, string text) @trusted
+{
+    import std.file : mkdirRecurse, rename, remove, setAttributes, exists;
+    import std.path : dirName;
+    import std.random : uniform;
+    import std.process : thisProcessID;
+    import std.string : toStringz;
+    import core.sys.posix.fcntl : open, O_CREAT, O_EXCL, O_WRONLY;
+    import core.sys.posix.unistd : write, close, fsync;
+    mkdirRecurse(path.dirName);
+    auto tmp = format("%s.tmp.%s.%08x", path, thisProcessID, uniform!uint);
+    int fd = open(tmp.toStringz, O_CREAT | O_EXCL | O_WRONLY, octal!600);
+    if (fd < 0) throw new Exception("open " ~ tmp ~ " failed");
+    bool ok;
+    scope (exit) if (!ok && tmp.exists) remove(tmp);
     {
-        version (OSX) auto base = buildPath(expandTilde("~"), "Library", "Application Support");
-        else auto base = environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share"));
-        auto current = buildPath(base, "nano-coder"), legacy = buildPath(base, "agentic-harness");
-        dataDir = !current.exists && legacy.exists ? legacy : current;
+        scope (exit) close(fd);
+        size_t done;
+        while (done < text.length)
+        {
+            auto n = write(fd, text.ptr + done, text.length - done);
+            if (n <= 0) throw new Exception("write " ~ tmp ~ " failed");
+            done += n;
+        }
+        fsync(fd);
     }
-    return buildPath(dataDir, "github-copilot.json");
+    rename(tmp, path);
+    ok = true;
+    // A pre-existing file's looser mode doesn't survive the rename, but force it anyway.
+    setAttributes(path, octal!600);
 }
 
 struct StoredCredentials
@@ -168,19 +208,13 @@ bool loadCredentials(out StoredCredentials c, string dataDir = null) @trusted
 /// Write the login with owner-only permissions; returns the path.
 string saveCredentials(const StoredCredentials c, string dataDir = null) @trusted
 {
-    import std.file : mkdirRecurse, write, setAttributes;
-    import std.path : dirName;
     auto path = credentialsPath(dataDir);
-    mkdirRecurse(path.dirName);
     JSONValue j = ["oauth_token": c.oauthToken, "domain": c.domain, "created_at": c.createdAt];
-    // Create empty with 0600 before the token is written.
-    write(path, "");
-    setAttributes(path, octal!600);
-    write(path, j.toPrettyString);
+    writePrivateAtomic(path, j.toPrettyString);
     return path;
 }
 
-private template octal(int n) { enum octal = (n / 100) * 64 + ((n / 10) % 10) * 8 + n % 10; }
+package template octal(int n) { enum octal = (n / 100) * 64 + ((n / 10) % 10) * 8 + n % 10; }
 
 /// `proxy-ep=proxy.individual.githubcopilot.com` → `https://api.individual.githubcopilot.com`.
 string baseUrlFromToken(string token) pure

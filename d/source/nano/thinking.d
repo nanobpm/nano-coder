@@ -89,6 +89,7 @@ Wire wireFor(ProviderKind kind, string model)
             case CopilotApi.messages: return Wire.anthropicMessages;
         }
     }
+    if (kind == ProviderKind.muse) return Wire.responses;
     return kind == ProviderKind.anthropic ? Wire.anthropicMessages : Wire.chatCompletions;
 }
 

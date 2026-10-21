@@ -44,7 +44,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
                     [--no-session] [--no-hooks] [--verbose] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --list-models PROVIDER[/model]
-       nano-coder-d --login github-copilot
+       nano-coder-d --login github-copilot|muse
        nano-coder-d --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
@@ -113,16 +113,26 @@ Options parseArgs(string[] args)
 /// `--login PROVIDER`: interactive device-flow sign-in.
 int runLogin(string provider)
 {
-    if (provider != "github-copilot")
-        die(format("unknown provider %(%s%) for --login; supported: github-copilot (other providers use API keys)", [provider]));
+    import core.thread : Thread;
+    import core.time : seconds;
+    import std.functional : toDelegate;
+    void delegate(string) @safe note = toDelegate((string s) @trusted { stderr.writeln(s); });
+    void delegate(long) @safe sleep = toDelegate((long n) @trusted { Thread.sleep(n.seconds); });
     try
     {
-        import nano.copilot : login;
-        import core.thread : Thread;
-        import core.time : seconds;
-        auto path = login((string s) @trusted { stderr.writeln(s); }, (long n) @trusted { Thread.sleep(n.seconds); });
-        writeln("Saved GitHub Copilot credentials to ", path);
-        return 0;
+        switch (provider)
+        {
+            case "github-copilot":
+                import nano.copilot : copilotLogin = login;
+                writeln("Saved GitHub Copilot credentials to ", copilotLogin(note, sleep));
+                return 0;
+            case "muse":
+                import nano.muse : museLogin = login;
+                writeln("Saved Muse Code credentials to ", museLogin(note, sleep));
+                return 0;
+            default:
+                die(format("unknown provider %(%s%) for --login; supported: github-copilot, muse (other providers use API keys)", [provider]));
+        }
     }
     catch (Exception e) die(e.msg);
     assert(0);
