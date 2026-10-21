@@ -20,6 +20,9 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
+import nano.lineedit : LineEditor, Outcome, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
+import nano.commands : helpText, unescapePrompt;
+import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
@@ -41,7 +44,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /hooks /quit
+REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /hooks /tools /skills /session /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
@@ -217,6 +220,43 @@ final class Inbox
                     stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
                 put(text);
             }
+        }
+    }
+}
+
+/// Keys during a turn (runs on its own thread until `done`).
+void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held)
+{
+    while (!atomicLoad(*done))
+    {
+        auto r = editor.readLine("↪ ", console.dim("↪ "), true, () @trusted => atomicLoad(*done));
+        final switch (r.outcome)
+        {
+            case Outcome.stopped: return;
+            case Outcome.eof:
+                gControl.cancel();
+                return;
+            case Outcome.cancel, Outcome.interrupt:
+                if (!gControl.isCancelled)
+                {
+                    gControl.cancel();
+                    stderr.writeln(console.dim("[cancelling...]"));
+                }
+                break;
+            case Outcome.line:
+                auto text = r.text.strip;
+                if (!text.length) break;
+                if (text.startsWith("/"))
+                {
+                    held ~= text;
+                    stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+                }
+                else
+                {
+                    gControl.steer(text);
+                    stderr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+                }
+                break;
         }
     }
 }
@@ -502,12 +542,29 @@ int main(string[] args)
         sigaction(SIGINT, &sa, null);
     }
     Inbox inbox;
+    LineEditor editor;
+    string[] held; // lines to run before reading the prompt again
 
     bool turn(string input)
     {
         atomicStore(gTurnRunning, true);
         scope (exit) atomicStore(gTurnRunning, false);
         bool ok = true;
+        // With the line editor, keys typed during the turn steer it (a
+        // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
+        shared bool turnDone;
+        Thread keys;
+        if (editor !is null)
+        {
+            keys = new Thread(() => turnKeys(editor, console, &turnDone, held));
+            keys.start();
+        }
+        scope (exit)
+            if (keys !is null)
+            {
+                atomicStore(turnDone, true);
+                keys.join();
+            }
         try agent.run(input, console);
         catch (Exception e)
         {
@@ -520,13 +577,20 @@ int main(string[] args)
         auto late = agent.control.takePending;
         if (inbox !is null)
             foreach_reverse (t; late) inbox.put(t.text, true);
+        if (editor !is null) foreach_reverse (t; late) held = t.text ~ held;
         return ok;
     }
 
     if (o.prompt.length) return turn(o.prompt) ? 0 : 1;
 
     bool interactive = isTerminal(0);
-    if (interactive)
+    if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
+        && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
+    {
+        editor = new LineEditor(fdSource(0), (string s) => writeFd(1, s), () => terminalWidth());
+    }
+    scope (exit) leaveKeyMode();
+    if (interactive && editor is null)
     {
         import core.thread : Thread;
         inbox = new Inbox;
@@ -539,12 +603,33 @@ int main(string[] args)
                 client.modelName, cwd);
     for (;;)
     {
-        if (interactive) { write(console.bold("\n› ")); stdout.flush(); }
-        auto line = inbox !is null ? inbox.take() : readln();
+        string line;
+        if (held.length)
+        {
+            line = held[0];
+            held = held[1 .. $];
+        }
+        else if (editor !is null)
+        {
+            write("\n");
+            stdout.flush();
+            auto r = editor.readLine("› ", console.bold("› "));
+            if (r.outcome == Outcome.eof) break;
+            if (r.outcome != Outcome.line) continue;
+            line = r.text;
+            if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
+        }
+        else
+        {
+            if (interactive) { write(console.bold("\n› ")); stdout.flush(); }
+            line = inbox !is null ? inbox.take() : readln();
+        }
         if (line is null) break;
+        bool literal = line.startsWith("\x00");
+        if (literal) line = line[1 .. $];
         auto input = line.strip;
         if (!input.length) continue;
-        if (input.startsWith("/"))
+        if (!literal && input.startsWith("/"))
         {
             auto sp = input.indexOf(' ');
             auto cmd = sp > 0 ? input[0 .. sp] : input;
@@ -552,7 +637,7 @@ int main(string[] args)
             switch (cmd)
             {
                 case "/quit", "/exit": return 0;
-                case "/help": writeln(usage); continue;
+                case "/help": writeln(editor !is null ? helpText() : usage); continue;
                 case "/clear":
                     agent.messages = agent.messages[0 .. 1];
                     if (agent.log !is null) agent.log.replace(agent.messages);
@@ -567,6 +652,18 @@ int main(string[] args)
                     agent.policy.mode = plan ? Mode.plan : Mode.normal;
                     agent.messages[0].content = systemFor(cwd, plan);
                     writeln(plan ? "plan mode: read-only" : "normal mode");
+                    continue;
+                case "/tools":
+                    foreach (d; agent.tools.definitions)
+                        writefln("  %-14s %s", d.name, firstLine(d.description));
+                    continue;
+                case "/skills":
+                    if (skills is null || skills.empty) { writeln("No skills found."); continue; }
+                    foreach (sk; skills.skills) writefln("  %-20s %s", sk.name, firstLine(sk.description));
+                    continue;
+                case "/session":
+                    if (agent.log is null) writeln("not recording (--no-session)");
+                    else writefln("session %s\nlog: %s", agent.log.id, agent.log.path);
                     continue;
                 case "/hooks":
                     write(agent.hooks !is null ? agent.hooks.listing : "No hooks loaded.\n");
