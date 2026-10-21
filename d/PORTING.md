@@ -106,14 +106,15 @@ Roughly in dependency order. Sizes are Rust lines.
 9. ~~**Hooks**~~: done in `nano/claude_hooks.d` (project hooks run inside the sandbox).
 10. ~~**Sessions, rest**~~: done (`nano/session_index.d`, `nano/resume.d`, `nano/trajectory.d`).
 11. ~~**ACP server**~~ (`acp.rs` 0.9k): done in `nano/acp.d`. Resuming an interrupted input by ID is not ported.
-12. **Terminal UI, rest**: the line editor, input history and slash menu
-    are done (see the table above). Still to do: `frame.rs` (a frame that
-    keeps the input below streaming output), `status.rs` (status bar),
-    `ui.rs` markdown rendering, Shift-Tab mode cycling, `turn_commands.rs`,
-    `recents.rs`, `settings.rs` (`/settings`), and Ctrl-R search. Input typed
-    before the editor takes over the terminal at startup goes through the
-    kernel's line discipline, so an Enter there arrives as a newline.
-13. **Packaging**: npm platform packages and release workflow for the D binary.
+12. ~~**Terminal UI, rest**~~: done. That covers the frame renderer (the default, switchable live from
+    `/settings`), the status bar, Shift-Tab mode cycling, turn commands, recents, `/settings`, Ctrl-R search
+    and type-ahead. Rust has no markdown rendering, so there is nothing to port there. One difference
+    remains. Input typed before the editor takes over the terminal at startup goes through the kernel's
+    line discipline, so an Enter there arrives as a newline.
+13. ~~**Packaging**~~: done. It adds `@nanobpm/nano-coder-d` and its platform packages (`npm/`,
+    `scripts/npm-packages.mjs`) and two workflows: `release-d.yml` (dispatch only, dry run by default) and
+    `ci-d.yml`. See `RELEASING.md`. npm trusted publishing still has to be configured for the new package
+    names before the first real publish.
 
 Notes for porting:
 - Keep tool names, schemas and error wording identical to Rust. Models and
