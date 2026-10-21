@@ -200,8 +200,8 @@ void delegate(imported!"nano.ui".Verbosity) @safe onVerbosity;
 
 string rendererDescribe(string mode)
 {
-    return mode == "frame" ? "app-owned frame; nano-coder re-renders on a width change"
-        : "scroll region; the terminal owns scrollback and reflow";
+    return mode == "frame" ? "app re-renders the frame on a width change"
+        : "terminal owns scrollback and reflow (scroll region)";
 }
 
 private bool parseCount(string t, out long v)

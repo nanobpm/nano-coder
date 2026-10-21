@@ -545,13 +545,32 @@ final class LineEditor
 
     private bool plain, masked;
 
+    /// Frame mode (`nano.frame`): the editor doesn't draw. `frameDraw` gets
+    /// the editor rows (cursor marked) whenever they change, and
+    /// `frameCommit` the line a finished prompt or picker leaves behind.
+    void delegate(string[] rows) @safe frameDraw;
+    void delegate(string line) @safe frameCommit;
+
+    private void drawFrame(string[] menuRows)
+    {
+        import nano.frame : editorLines, fit;
+        import std.conv : to;
+        auto w = max(width(), 2);
+        auto text = masked ? replicateD('*', state.buf.length) : state.buf.idup;
+        auto rows = editorLines(styledPrompt, text, state.cursor, w);
+        foreach (r; menuRows) rows ~= fit(r, w);
+        frameDraw(rows);
+    }
+
+    private static dstring replicateD(dchar c, size_t n) pure { dstring r; foreach (_; 0 .. n) r ~= c; return r; }
+
     private Result read(string prompt, string styledPrompt, bool turn, bool delegate() @safe stop)
     {
         this.prompt = prompt;
         this.styledPrompt = styledPrompt;
         promptW = textWidth(prompt);
         notice = null;
-        if (!turn || state.buf.length) render();
+        if (!turn || state.buf.length || frameDraw !is null) render();
         for (;;)
         {
             auto key = decode(src, stop is null ? -1 : 100, utf8);
@@ -650,6 +669,23 @@ final class LineEditor
         }
         void draw(bool final_)
         {
+            if (frameDraw !is null)
+            {
+                auto fw = max(width(), 2);
+                if (final_)
+                {
+                    frameDraw(null);
+                    frameCommit("\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m");
+                    return;
+                }
+                if (at < top) top = at;
+                if (at >= top + visible) top = at + 1 - visible;
+                string[] rows = ["\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, fw - 3) ~ "\x1b[0m"];
+                foreach (k; top .. top + visible)
+                    rows ~= k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], fw - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], fw - 3);
+                frameDraw(rows);
+                return;
+            }
             string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
             s ~= "\r\x1b[J";
             auto w = max(width(), 2);
@@ -682,6 +718,7 @@ final class LineEditor
                     return at;
                 case K.escape, K.interrupt, K.eof, K.closed:
                     if (key.kind == K.escape && key.text.length) pushback = 0x1b;
+                    if (frameDraw !is null) { frameDraw(null); return -1; }
                     string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
                     out_(s ~ "\r\x1b[J");
                     return -1;
@@ -715,6 +752,7 @@ final class LineEditor
     void erase()
     {
         if (!drawn) return;
+        if (frameDraw !is null) { frameDraw(null); drawn = false; return; }
         out_((drawnRow ? format("\x1b[%sA", drawnRow) : "") ~ "\r\x1b[J");
         drawn = false;
         drawnRow = 0;
@@ -723,6 +761,14 @@ final class LineEditor
     private void finish()
     {
         if (restyle !is null) styledPrompt = restyle();
+        if (frameDraw !is null)
+        {
+            import std.conv : to;
+            auto text = masked ? replicateD('*', state.buf.length).to!string : state.text;
+            frameCommit(styledPrompt ~ text);
+            drawn = false;
+            return;
+        }
         state.cursor = state.buf.length;
         render(false);
         out_("\n");
@@ -732,6 +778,18 @@ final class LineEditor
 
     private void render(bool extras = true)
     {
+        if (frameDraw !is null)
+        {
+            string[] extra;
+            if (extras)
+            {
+                if (notice.length) extra = [notice];
+                else if (!plain) extra = state.menu(max(width(), 2), menuRows);
+            }
+            drawFrame(extra);
+            drawn = true;
+            return;
+        }
         auto w = max(width(), 2);
         Pos cur, end;
         layout(state.buf, promptW, w, state.cursor, cur, end);
@@ -818,9 +876,14 @@ version (Posix)
     /// Whether key mode is on (so a nested user can leave it as it was).
     bool inKeyMode() @trusted nothrow { return keyMode; }
 
+    /// The terminal's output fd: 1, or the saved one while the frame
+    /// renderer has fd 1 pointing at its pipe.
+    __gshared int ttyOut = 1;
+
     /// Terminal height of `fd` (24 when unknown).
     size_t terminalHeight(int fd = 1) @trusted
     {
+        if (fd == 1) fd = ttyOut;
         import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
         winsize ws;
         if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
@@ -830,6 +893,7 @@ version (Posix)
     /// Terminal width of `fd` (80 when unknown).
     size_t terminalWidth(int fd = 1) @trusted
     {
+        if (fd == 1) fd = ttyOut;
         import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
         winsize ws;
         if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;

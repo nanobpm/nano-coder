@@ -28,6 +28,7 @@ import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse,
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
+import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
 import nano.commands : helpText, unescapePrompt;
 import core.thread : Thread;
@@ -187,7 +188,13 @@ void showTrajectory(const ref nano.trajectory.Trajectory t)
     auto text = t.toPlain;
     auto size = nano.trajectory.terminalSize(1);
     bool pageable = isTerminal(0) && isTerminal(1) && size[0] && nano.trajectory.needsPager(text, size[0], size[1]);
-    if (!(pageable && nano.trajectory.page(text))) writeln(text);
+    if (pageable)
+    {
+        if (gFrame !is null) gFrame.suspend();
+        scope (exit) if (gFrame !is null) gFrame.resume();
+        if (nano.trajectory.page(text)) return;
+    }
+    writeln(text);
 }
 
 noreturn die(string msg)
@@ -199,6 +206,8 @@ noreturn die(string msg)
 bool isTerminal(int fd)
 {
     import core.sys.posix.unistd : isatty;
+    import nano.lineedit : ttyOut;
+    if (fd == 1 || fd == 2) if (gFrame !is null) fd = ttyOut;
     return isatty(fd) != 0;
 }
 
@@ -451,6 +460,16 @@ void setVerbosity(Verbosity v) @trusted { atomicStore(gVerbosity, v); }
 // The pinned status line (status.rs), when installed, and what it shows.
 import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
 __gshared StatusLine gStatus;
+/// The frame renderer, when `renderer = "frame"` drives the terminal.
+__gshared FrameUi gFrame;
+
+/// The status bar text for the frame's last line.
+string frameStatus(size_t width) @trusted
+{
+    import nano.status : renderStatus = render;
+    if (environment.get("AGENTIC_NO_STATUS") !is null) return "";
+    synchronized (gStatsLock) return renderStatus(gStats, width);
+}
 __gshared Stats gStats;
 __gshared Object gStatsLock;
 shared bool gResized;
@@ -459,9 +478,10 @@ shared static this() { gStatsLock = new Object; }
 /// Change the status line's stats and redraw it (no-op without one).
 void updateStatus(scope void delegate(ref Stats) @safe f) @trusted
 {
-    if (gStatus is null) return;
+    if (gStatus is null && gFrame is null) return;
     synchronized (gStatsLock) f(gStats);
-    gStatus.draw();
+    if (gStatus !is null) gStatus.draw();
+    if (gFrame !is null) gFrame.redraw();
 }
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
@@ -667,7 +687,7 @@ class Console : AgentEvents
 
     void text(bool reasoning, string chunk)
     {
-        if (gStatus !is null)
+        if (gStatus !is null || gFrame !is null)
         {
             auto rate = meter.record(chunk.length, nowMs);
             if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
@@ -996,6 +1016,9 @@ void watchResize() @trusted
     import core.thread : Thread;
     import core.time : msecs;
     extern (C) static void onWinch(int) nothrow @nogc { atomicStore(gResized, true); }
+    static bool watching;
+    if (watching) return;
+    watching = true;
     sigaction_t sa;
     sa.sa_handler = &onWinch;
     sigemptyset(&sa.sa_mask);
@@ -1583,16 +1606,42 @@ int runMain(string[] args)
         questions.interactive = true;
     }
     scope (exit) leaveKeyMode();
-    if (editor !is null)
+    // Legacy: a status line pinned under a scroll region. Frame: the app
+    // owns the screen and re-renders it (`renderer`).
+    void useRenderer(string mode)
     {
-        gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
-        if (gStatus !is null)
+        if (editor is null) return;
+        if (mode == "frame" && gFrame is null)
         {
+            if (gStatus !is null) { gStatus.teardown(); gStatus = null; }
+            gFrame = FrameUi.install((size_t w) @trusted => frameStatus(w));
+            if (gFrame is null) return;
+            editor.frameDraw = (string[] rows) @trusted { gFrame.draw(rows); };
+            editor.frameCommit = (string line) @trusted { gFrame.commit(line); };
             refreshStatus();
-            watchResize();
+        }
+        else if (mode == "legacy" && gFrame !is null)
+        {
+            auto lines = gFrame.uninstall();
+            gFrame = null;
+            editor.frameDraw = null;
+            editor.frameCommit = null;
+            // The frame's redraws cleared the scrollback: replay its transcript.
+            write("\x1b[H\x1b[2J\x1b[3J");
+            foreach (l; lines) writeln(l);
+            stdout.flush();
+            gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
+            if (gStatus !is null) { refreshStatus(); watchResize(); }
+        }
+        else if (mode == "legacy" && gStatus is null)
+        {
+            gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
+            if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
     }
+    useRenderer(cfg.renderer);
     scope (exit) if (gStatus !is null) gStatus.teardown();
+    scope (exit) if (gFrame !is null) { gFrame.uninstall(); gFrame = null; }
     if (interactive && editor is null)
     {
         import core.thread : Thread;
@@ -1684,7 +1733,8 @@ int runMain(string[] args)
                     agent.restart(systemFor(cwd, false), log);
                     sysPlan = false;
                     agent.useHooks(loadHooks(cwd), false);
-                    if (gStatus !is null) gStatus.clear();
+                    if (gFrame !is null) gFrame.clear();
+                    else if (gStatus !is null) gStatus.clear();
                     else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdout.flush(); }
                     refreshStatus();
                     if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
@@ -1861,6 +1911,7 @@ int runMain(string[] args)
                     {
                         auto h = settingsHost();
                         foreach (n; runSettings(new EditorUi(editor), h)) writeln(n);
+                        useRenderer(cfg.renderer);
                     }
                     refreshStatus();
                     continue;

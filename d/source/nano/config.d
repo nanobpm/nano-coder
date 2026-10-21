@@ -239,7 +239,7 @@ struct Config
     /// Top-level `context_window`: overrides every provider's.
     long contextWindow;
     /// The interactive renderer (`renderer`): `legacy` or `frame`.
-    string renderer = "legacy";
+    string renderer = "frame";
     /// Dim `HH:MM:SS` stamps on the prompt and transcript (`timestamps`).
     bool timestamps = true;
     /// Output detail (`verbosity`): quiet, normal, verbose or debug.
