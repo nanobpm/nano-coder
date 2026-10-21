@@ -878,7 +878,7 @@ unittest // history recall; Ctrl-D; Ctrl-C
 unittest // slash commands: Tab, menu, rejection, Esc
 {
     string screen;
-    auto e = editor("/mo\t gpt\r", screen);
+    auto e = editor("/mod\tl\t gpt\r", screen);
     assert(e.readLine("> ", "> ").text == "/model  gpt");
     screen = null;
     e = editor("/he", screen);

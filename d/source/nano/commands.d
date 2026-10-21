@@ -91,7 +91,7 @@ string helpText()
     auto out_ = "Commands:";
     foreach (c; commands) out_ ~= format("\n  %-*s  %s", width, synopsis(c), c.description);
     out_ ~= "\nType / to list commands as you type; Tab completes them; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.";
-    out_ ~= "\nKeys: Enter during a turn steers it; Ctrl-C or Esc Esc cancels the turn; Esc Esc also clears the input at the prompt; Ctrl-J, Alt-Enter or Ctrl-Enter inserts a newline; Up/Down recall earlier input.";
+    out_ ~= "\nKeys: Enter during a turn steers it and Ctrl-Enter queues it for a later turn (/queue edits the queue); Ctrl-C or Esc Esc cancels the turn; Esc Esc also clears the input at the prompt; at the prompt Ctrl-J, Alt-Enter or Ctrl-Enter inserts a newline; Up/Down recall earlier input.";
     return out_;
 }
 
@@ -133,11 +133,18 @@ string synopsis(const Command c)
     return c.args.length ? c.name ~ " " ~ c.args : c.name;
 }
 
+/// Synopses longer than this overflow the name column instead of widening it.
+enum nameColumn = 20;
+
 size_t columnWidth()
 {
     size_t w;
-    foreach (c; commands) w = w < synopsis(c).count ? synopsis(c).count : w;
-    return w;
+    foreach (c; commands)
+    {
+        auto n = synopsis(c).count;
+        if (n <= nameColumn && n > w) w = n;
+    }
+    return w ? w : nameColumn;
 }
 
 /// The command closest to a mistyped `word`: the only one it is a prefix of,
@@ -222,7 +229,8 @@ unittest // rejection with did-you-mean, path hint and // escape
 unittest // Tab completion
 {
     assert(complete("/he") == "/help");
-    assert(complete("/mo") == "/model ");
+    assert(complete("/mo") == "/mode"); // /mode and /model share it
+    assert(complete("/mode") is null && complete("/model") == "/model ");
     assert(complete("/e") == "/exit");
     assert(complete("/s") == null); // /session, /skills: no longer prefix
     assert(complete("/zz") is null);
@@ -232,7 +240,7 @@ unittest // Tab completion
 unittest // menu rows
 {
     auto rows = menu("/m", 80, 10);
-    assert(rows.length == 2 && rows[0].canFind("\x1b[1m/m\x1b[0;36memory"), rows[0]);
+    assert(rows.length == 3 && rows[0].canFind("\x1b[1m/m\x1b[0;36memory"), rows[0]);
     assert(menu("/model x", 80, 10) is null && menu("hi", 80, 10) is null && menu("/", 80, 0) is null);
     assert(menu("/zz", 80, 10)[0].canFind("no matching command"));
     auto few = menu("/", 80, 3);
