@@ -27,7 +27,8 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
-import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
+import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
+import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
 import nano.commands : helpText, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
@@ -390,6 +391,30 @@ shared bool gThinkingExpanded;
 
 // The output detail level (ui.rs's global verbosity), read live by Console.
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
+
+/// The `/settings` prompts on the line editor.
+final class EditorUi : SettingsUi
+{
+    private LineEditor e;
+    this(LineEditor e) { this.e = e; }
+
+    ptrdiff_t select(string prompt, const string[] labels, size_t initial)
+    {
+        return e.select(prompt, labels, initial);
+    }
+
+    string input(string prompt, string initial) { return value(prompt, initial, false); }
+    string secret(string prompt) { return value(prompt, "", true); }
+    void say(string line) @trusted { writeln(line); stdout.flush(); }
+
+    private string value(string prompt, string initial, bool masked) @trusted
+    {
+        auto p = prompt ~ ": ";
+        auto r = e.readValue(p, "\x1b[1m" ~ p ~ "\x1b[0m", initial, masked);
+        if (r.outcome != Outcome.line) return null;
+        return r.text;
+    }
+}
 static import nano.ui;
 shared Verbosity gVerbosity = Verbosity.normal;
 
@@ -816,6 +841,12 @@ unittest
     assert(toolResult(true, "x\ny", true, 80, false) == "  ⎿ x\n    y\n");
 }
 
+/// The configured context window: top-level `context_window`, else the provider's.
+size_t windowFor(const ref Config c, const ref ProviderConfig p)
+{
+    return c.contextWindow > 0 ? cast(size_t) c.contextWindow : p.contextWindow > 0 ? cast(size_t) p.contextWindow : 0;
+}
+
 /// Untrusted multi-line text for the terminal: lines kept, every other
 /// control character (so any escape sequence) dropped, tabs expanded.
 string sanitizeBlock(string s)
@@ -1053,7 +1084,7 @@ int runMain(string[] args)
     try
     {
         auto rp = resolve(cfg, spec);
-        configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
+        configuredWindow = windowFor(cfg, rp.config);
         client = makeClient(rp);
     }
     catch (Exception e) die(e.msg);
@@ -1330,7 +1361,7 @@ int runMain(string[] args)
         auto rp = resolve(cfg, spec);
         client = makeClient(rp);
         agent.client = client;
-        agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
+        agent.configuredWindow = windowFor(cfg, rp.config);
         agent.learnedWindow = 0;
         agent.learnedMaxOutput = 0;
         agent.refreshCapabilities();
@@ -1442,6 +1473,28 @@ int runMain(string[] args)
         sysPlan = plan;
     }
 
+    SettingsHost settingsHost()
+    {
+        SettingsHost h;
+        h.cfg = &cfg;
+        h.agent = agent;
+        h.configPath = cfgPath;
+        h.recents = () @trusted => recents.models;
+        h.switchModel = (string spec) @trusted {
+            try { switchModel(spec); return cast(string) null; }
+            catch (Exception e) return e.msg;
+        };
+        h.listModels = (string name) @trusted => makeClient(resolve(cfg, name)).listModels();
+        h.refreshSystem = () @trusted { agent.messages[0].content = systemFor(cwd, sysPlan); };
+        h.refreshClient = (string name) @trusted {
+            if (agent.client.providerName != name) return cast(string) null;
+            try { switchModel(name ~ "/" ~ agent.client.modelName); return cast(string) null; }
+            catch (Exception e) return e.msg;
+        };
+        onVerbosity = (Verbosity v) @trusted { setVerbosity(v); };
+        return h;
+    }
+
     bool turn(string input)
     {
         syncMode();
@@ -1509,6 +1562,7 @@ int runMain(string[] args)
             // The editor's erase-to-end-of-screen wipes the status row too.
             writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
         }, () => terminalWidth());
+        editor.rows = () => terminalHeight();
         editor.onAction = (K k) @trusted {
             bool inTurn = atomicLoad(gTurnRunning);
             if (k == K.toggleThinking)
@@ -1802,7 +1856,25 @@ int runMain(string[] args)
                     }
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
                     continue;
+                case "/settings":
+                    if (editor is null) { writeln("/settings needs an interactive terminal"); continue; }
+                    {
+                        auto h = settingsHost();
+                        foreach (n; runSettings(new EditorUi(editor), h)) writeln(n);
+                    }
+                    refreshStatus();
+                    continue;
                 case "/model":
+                    if (!arg.length && editor !is null)
+                    {
+                        auto h = settingsHost();
+                        if (auto picked = pickModel(new EditorUi(editor), h))
+                        {
+                            try writeln(switchModel(picked));
+                            catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
+                        }
+                        continue;
+                    }
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }
                     try writeln(switchModel(arg));
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));

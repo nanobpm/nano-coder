@@ -488,6 +488,9 @@ final class LineEditor
     private ByteSource src;
     private void delegate(string) @safe out_;
     private size_t delegate() @safe width;
+    /// Terminal rows (for `select`'s window); null means 24.
+    size_t delegate() @safe rows;
+    private size_t height() { return rows is null ? 24 : rows(); }
     private size_t drawnRow;
     private bool drawn;
     private string prompt, styledPrompt, notice;
@@ -522,6 +525,28 @@ final class LineEditor
     /// keeping the typed text for the next call.
     Result readLine(string prompt, string styledPrompt, bool turn = false, bool delegate() @safe stop = null)
     {
+        plain = masked = false;
+        return read(prompt, styledPrompt, turn, stop);
+    }
+
+    /// A value prompt (`/settings`): no slash menu or command checks, the
+    /// buffer starts as `initial`, and `masked` shows `*` for each character.
+    /// Esc (twice, or once on an empty line) and Ctrl-C cancel.
+    Result readValue(string prompt, string styledPrompt, string initial, bool masked = false)
+    {
+        import std.conv : to;
+        plain = true;
+        this.masked = masked;
+        state.buf = initial.to!(dchar[]);
+        state.cursor = state.buf.length;
+        scope (exit) plain = this.masked = false;
+        return read(prompt, styledPrompt, false, null);
+    }
+
+    private bool plain, masked;
+
+    private Result read(string prompt, string styledPrompt, bool turn, bool delegate() @safe stop)
+    {
         this.prompt = prompt;
         this.styledPrompt = styledPrompt;
         promptW = textWidth(prompt);
@@ -540,6 +565,7 @@ final class LineEditor
             {
                 case K.none, K.ignored: break;
                 case K.submit:
+                    if (plain) { auto t = state.text; finish(); state.clear(); return Result(Outcome.line, t); }
                     if (auto note = commands.rejection(state.text))
                     {
                         notice = "\x1b[2m" ~ note ~ "\x1b[0m";
@@ -594,6 +620,7 @@ final class LineEditor
                     return Result(Outcome.eof);
                 case K.escape:
                     if (key.text.length) pushback = 0x1b;
+                    if (plain) { state.clear(); erase(); return Result(Outcome.cancel); }
                     auto now = nowMs();
                     bool second = now - lastEscMs <= 500;
                     lastEscMs = second ? long.min / 2 : now;
@@ -609,10 +636,18 @@ final class LineEditor
 
     /// Pick one of `labels` with Up/Down (or its number) and Enter; Esc or
     /// Ctrl-C dismisses (-1). Leaves the prompt and the choice on screen.
-    ptrdiff_t select(string prompt, const string[] labels)
+    ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0)
     {
-        size_t at;
-        size_t drawnRows;
+        size_t at = initial < labels.length ? initial : 0;
+        size_t drawnRows, top;
+        // At most `visible` rows show; the window scrolls to keep `at` in it.
+        size_t visible = labels.length;
+        {
+            auto h = height();
+            auto cap = h > 4 ? h - 3 : 1;
+            if (cap > 15) cap = 15;
+            if (visible > cap) visible = cap;
+        }
         void draw(bool final_)
         {
             string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
@@ -626,11 +661,13 @@ final class LineEditor
                 return;
             }
             s ~= "\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, w - 3) ~ "\x1b[0m";
-            foreach (k, l; labels)
-                s ~= "\r\n" ~ (k == at ? "\x1b[36m❯ " ~ fitCols(l, w - 3) ~ "\x1b[0m" : "  " ~ fitCols(l, w - 3));
+            if (at < top) top = at;
+            if (at >= top + visible) top = at + 1 - visible;
+            foreach (k; top .. top + visible)
+                s ~= "\r\n" ~ (k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], w - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], w - 3));
             s ~= "\r";
             out_(s);
-            drawnRows = labels.length;
+            drawnRows = visible;
         }
         draw(false);
         for (;;)
@@ -704,7 +741,7 @@ final class LineEditor
         foreach (ch; state.buf)
         {
             if (ch == '\n') s ~= "\r\n" ~ spaces(indent);
-            else s ~= ch.to!string;
+            else s ~= masked ? "*" : ch.to!string;
         }
         // At exactly the right margin the terminal defers the wrap: force it.
         if (end.col == 0 && end.row > 0 && (state.buf.length ? state.buf[$ - 1] != '\n' : true)) s ~= " \r\x1b[K";
@@ -712,7 +749,7 @@ final class LineEditor
         if (extras)
         {
             if (notice.length) rows = [notice];
-            else rows = state.menu(w, menuRows);
+            else if (!plain) rows = state.menu(w, menuRows);
         }
         foreach (r; rows) s ~= "\r\n" ~ r;
         auto up = end.row + rows.length - cur.row;

@@ -236,6 +236,10 @@ struct Config
     string model = "gpt-4o-mini";
     string defaultProvider = "mock";
     double temperature = 0.7;
+    /// Top-level `context_window`: overrides every provider's.
+    long contextWindow;
+    /// The interactive renderer (`renderer`): `legacy` or `frame`.
+    string renderer = "legacy";
     /// Dim `HH:MM:SS` stamps on the prompt and transcript (`timestamps`).
     bool timestamps = true;
     /// Output detail (`verbosity`): quiet, normal, verbose or debug.
@@ -306,6 +310,13 @@ struct Config
         if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str);
         if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "timestamps" in doc) c.timestamps = v.boolean;
+        if (auto v = "context_window" in doc) c.contextWindow = v.integer;
+        if (auto v = "renderer" in doc)
+        {
+            if (v.str != "legacy" && v.str != "frame")
+                throw new Exception(format("unknown renderer %s (legacy, frame)", v.str));
+            c.renderer = v.str;
+        }
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "verbosity" in doc) c.verbosity = imported!"nano.ui".parseVerbosity(v.str);
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
