@@ -61,6 +61,8 @@ class Agent
 
     void push(Message m)
     {
+        import nano.session : nowStamp;
+        if (!m.timestamp.length) m.timestamp = nowStamp();
         messages ~= m;
         if (log !is null) log.append(m);
     }
@@ -71,6 +73,26 @@ class Agent
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
     string run(string input, AgentEvents ev, bool resetControl = true)
+    {
+        import std.datetime.systime : Clock;
+        // Every input carries an id; the log pairs it with a turn_end record,
+        // so an input without one marks a turn a crash interrupted.
+        auto inputId = format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
+        if (log !is null) log.input(inputId, input);
+        string response;
+        try response = runTurn(input, ev, resetControl);
+        catch (Exception e)
+        {
+            if (log !is null) log.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
+            throw e;
+        }
+        if (log !is null) log.turnEnd(inputId, response, cast(string) lastStop);
+        return response;
+    }
+
+    private size_t inputCounter;
+
+    private string runTurn(string input, AgentEvents ev, bool resetControl)
     {
         if (resetControl) control.startTurn();
         push(Message.user(input));
@@ -90,6 +112,8 @@ class Agent
             req.maxTokens = maxTokens;
             req.temperature = temperature;
             LLMResponse r;
+            import std.datetime.stopwatch : StopWatch, AutoStart;
+            auto sw = StopWatch(AutoStart.yes);
             try r = client.chat(req, (bool t, string s) { ev.text(t, s); });
             catch (Cancelled) return cancelled(ev);
             catch (Exception e)
@@ -99,7 +123,14 @@ class Agent
             }
             lastUsage = r.usage;
             ev.usage(r.usage);
-            push(Message.assistant(r.content, r.toolCalls));
+            auto reply = Message.assistant(r.content, r.toolCalls);
+            reply.thinking = r.reasoning;
+            reply.usage = r.usage;
+            reply.hasUsage = r.usage != TokenUsage.init;
+            reply.durationMs = sw.peek.total!"msecs";
+            reply.stopReason = r.toolCalls.length ? "tool_use"
+                : (r.stopReason == "length" || r.stopReason == "max_tokens") ? "max_tokens" : "end_turn";
+            push(reply);
             last = r.content;
             if (r.content.length || r.reasoning.length) ev.assistantMessage(r.content, r.reasoning);
             if (r.toolCalls.length == 0)

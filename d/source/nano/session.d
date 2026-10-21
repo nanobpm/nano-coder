@@ -8,6 +8,7 @@ import std.file;
 import std.path;
 import std.stdio : File;
 import std.string : strip, lineSplitter;
+import std.stdio : fileno;
 import std.datetime.systime : Clock;
 import std.process : environment;
 import std.algorithm : sort, filter, map;
@@ -23,66 +24,408 @@ string sessionDir()
         return buildPath(environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share")), "nano-coder-d", "sessions");
 }
 
+/// Session log format version (Rust `session::FORMAT_VERSION`).
+enum int formatVersion = 1;
+
+/// The current local time as RFC 3339 with offset and microseconds, as
+/// chrono writes it (`2026-10-21T11:24:12.855560+13:00`).
+string nowStamp()
+{
+    import core.time : Duration;
+    auto t = Clock.currTime;
+    auto off = t.utcOffset;
+    auto mins = off.total!"minutes";
+    char sign = mins < 0 ? '-' : '+';
+    if (mins < 0) mins = -mins;
+    return format("%04d-%02d-%02dT%02d:%02d:%02d.%06d%s%02d:%02d", t.year, cast(int) t.month, t.day, t.hour,
+        t.minute, t.second, t.fracSecs.total!"usecs", sign, mins / 60, mins % 60);
+}
+
+/// A new session id: `sess-YYYYmmddTHHMMSS-xxxxxxxx` (UTC).
+string newSessionId()
+{
+    import std.random : uniform;
+    import std.datetime.timezone : UTC;
+    auto t = Clock.currTime(UTC());
+    return format("sess-%04d%02d%02dT%02d%02d%02d-%08x", t.year, cast(int) t.month, t.day, t.hour, t.minute,
+        t.second, uniform!uint);
+}
+
+/// Session ids name files: 1-128 of [A-Za-z0-9._-], not starting with '.'.
+void validateId(string id)
+{
+    import std.algorithm : all;
+    import std.ascii : isAlphaNum;
+    bool ok = id.length && id.length <= 128 && id[0] != '.'
+        && id.all!(c => c.isAlphaNum || c == '-' || c == '_' || c == '.');
+    if (!ok)
+        throw new Exception(format("invalid session id %s: use 1-128 of [A-Za-z0-9._-], not starting with '.'",
+            JSONValue(id).toString));
+}
+
+/// A message as a session-log record body (Rust's serde form of `Message`).
+JSONValue messageRecord(const ref Message m)
+{
+    JSONValue j = ["role": roleName(m.role), "content": m.content];
+    if (m.extra.type == JSONType.object)
+        foreach (k, v; m.extra.object) j[k] = v;
+    if (m.toolCalls.length)
+    {
+        JSONValue[] calls;
+        foreach (c; m.toolCalls)
+        {
+            JSONValue cj = ["id": c.id, "name": c.name];
+            cj["arguments"] = c.invalidArguments.length ? JSONValue(c.invalidArguments) : parseJSON(c.arguments.toString);
+            calls ~= cj;
+        }
+        j["tool_calls"] = calls;
+    }
+    if (m.toolCallId.length) j["tool_call_id"] = m.toolCallId;
+    if (m.toolName.length) j["name"] = m.toolName;
+    if (m.isError) j["is_error"] = true;
+    if (m.timestamp.length) j["timestamp"] = m.timestamp;
+    if (m.thinking.length) j["thinking"] = m.thinking;
+    if (m.hasUsage)
+        j["usage"] = JSONValue(["prompt_tokens": m.usage.inputTokens, "completion_tokens": m.usage.outputTokens,
+            "total_tokens": m.usage.inputTokens + m.usage.outputTokens]);
+    if (m.durationMs >= 0) j["duration_ms"] = m.durationMs;
+    if (m.stopReason.length) j["stop_reason"] = m.stopReason;
+    return j;
+}
+
+/// Parse a message record body.
+Message messageFromRecord(JSONValue j)
+{
+    import std.algorithm : countUntil;
+    Message m;
+    auto names = ["system", "user", "assistant", "tool"];
+    auto r = names.countUntil(j["role"].str);
+    if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
+    m.role = cast(Role) r;
+    JSONValue extra = string[string].init;
+    foreach (k, v; j.object)
+    {
+        switch (k)
+        {
+        case "role": break;
+        case "content": m.content = v.type == JSONType.string ? v.str : ""; break;
+        case "tool_calls":
+            foreach (c; v.array)
+            {
+                auto args = c["arguments"];
+                m.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["name"].str,
+                    args.type == JSONType.string ? args.str : args.toString);
+            }
+            break;
+        case "tool_call_id": m.toolCallId = v.str; break;
+        case "name": m.toolName = v.str; break;
+        case "is_error": m.isError = v.type == JSONType.true_; break;
+        case "timestamp": m.timestamp = v.str; break;
+        case "thinking": m.thinking = v.str; break;
+        case "usage":
+            m.hasUsage = true;
+            if (auto p = "prompt_tokens" in v) m.usage.inputTokens = p.integer;
+            if (auto p = "completion_tokens" in v) m.usage.outputTokens = p.integer;
+            break;
+        case "duration_ms": m.durationMs = v.integer; break;
+        case "stop_reason": m.stopReason = v.str; break;
+        case "log_line": break; // re-derived from the line number
+        default: extra[k] = v;
+        }
+    }
+    if (extra.object.length) m.extra = extra;
+    return m;
+}
+
+/// One log line. `type` comes first and `/` is not escaped, byte-for-byte
+/// like serde: Rust's session index finds records by the `{"type":"input"` prefix.
+private string record(string type, JSONValue data)
+{
+    return `{"type":` ~ JSONValue(type).toString ~ `,"data":` ~ data.toString(JSONOptions.doNotEscapeSlashes) ~ "}\n";
+}
+
+/// An append-only session log in the Rust nano-coder's format (version 1):
+/// one `{"type":…,"data":…}` record per line, a `session` header first.
+/// Only newline-terminated lines are committed; a torn last line from a crash
+/// is dropped on resume and truncated away before the next append.
 class SessionLog
 {
     string id;
     string path;
     private File f;
 
-    this(string dir, string model, string cwd)
+    /// Create a new log in `dir`.
+    this(string dir, string model, string cwd, string id = null)
     {
+        this.id = id.length ? id : newSessionId();
+        validateId(this.id);
         mkdirRecurse(dir);
-        auto now = Clock.currTime;
-        id = format("%04d%02d%02d-%02d%02d%02d-%04x", now.year, cast(int) now.month, now.day, now.hour, now.minute,
-                now.second, (cast(uint) Clock.currStdTime) & 0xffff);
-        path = buildPath(dir, id ~ ".jsonl");
+        path = buildPath(dir, this.id ~ ".jsonl");
+        if (path.exists) throw new Exception("session log " ~ path ~ " already exists");
         f = File(path, "a");
-        JSONValue h = ["type": "session", "id": id, "model": model, "cwd": cwd, "started": now.toISOExtString];
-        f.writeln(h.toString);
-        f.flush();
+        JSONValue h = ["id": this.id, "created_at": nowStamp(), "cwd": cwd, "model": model];
+        h["version"] = formatVersion;
+        write_(record("session", h));
     }
 
-    /// Continue an existing log.
+    /// Continue an existing log (after `restore` read it).
     this(string existingPath)
     {
         path = existingPath;
         id = existingPath.baseName.stripExtension;
+        validateId(id);
+        auto bytes = cast(ubyte[]) read(path);
+        size_t committed = bytes.length;
+        while (committed && bytes[committed - 1] != '\n') committed--;
+        if (committed < bytes.length)
+        {
+            // Drop a torn trailing record so later appends stay line-aligned.
+            import std.file : write_file = write;
+            write_file(path, bytes[0 .. committed]);
+        }
         f = File(path, "a");
     }
 
-    void append(const ref Message m)
+    private void write_(string line)
     {
-        JSONValue line = ["type": "message"];
-        line["message"] = m.toJson;
-        f.writeln(line.toString);
+        f.write(line);
         f.flush();
+    }
+
+    void append(const ref Message m) { write_(record("message", messageRecord(m))); }
+
+    /// A prompt starts a turn.
+    void input(string inputId, string text)
+    {
+        write_(record("input", JSONValue(["id": inputId, "text": text, "recorded_at": nowStamp()])));
+    }
+
+    /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
+    void turnEnd(string inputId, string response, string stopReason)
+    {
+        JSONValue d = ["input_id": inputId, "response": response, "recorded_at": nowStamp()];
+        if (stopReason.length && stopReason != "end_turn") d["stop_reason"] = stopReason;
+        write_(record("turn_end", d));
+        import core.sys.posix.unistd : fsync;
+        fsync(fileno(f.getFP));
+    }
+
+    /// The conversation was replaced wholesale (e.g. `/clear` keeps only the system prompt).
+    void replace(const Message[] messages)
+    {
+        JSONValue[] ms;
+        foreach (ref m; messages) ms ~= messageRecord(m);
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["messages"] = ms;
+        write_(record("replace", d));
     }
 }
 
-/// Messages recorded in a session log.
-Message[] loadSession(string path)
+/// What a session log restores to.
+struct Restored
 {
-    Message[] out_;
-    foreach (line; readText(path).lineSplitter)
+    string id, cwd, model, createdAt;
+    Message[] conversation;
+    /// The text of an input whose turn never ended (a crash mid-turn).
+    string pendingInput;
+}
+
+/// Read a session log (Rust format), dropping a torn last line.
+Restored restore(string path)
+{
+    import std.algorithm : countUntil;
+    Restored r;
+    auto text = readText(path);
+    auto committed = text.length;
+    while (committed && text[committed - 1] != '\n') committed--;
+    if (!committed) throw new Exception("session log " ~ path ~ " has no committed records");
+    string pendingId;
+    size_t index;
+    foreach (line; text[0 .. committed].lineSplitter)
     {
-        if (!line.strip.length) continue;
-        auto j = parseJSON(line);
-        if (j["type"].str == "message") out_ ~= Message.fromJson(j["message"]);
+        if (!line.length) continue;
+        JSONValue rec;
+        try rec = parseJSON(line);
+        catch (Exception e) throw new Exception(format("decode record %s of %s: %s", index + 1, path, e.msg));
+        auto type = rec["type"].str;
+        auto data = "data" in rec ? rec["data"] : JSONValue(null);
+        if (type == "session")
+        {
+            if (index) throw new Exception(format("session record must be first (found at record %s)", index + 1));
+            auto v = data["version"].integer;
+            if (v != formatVersion)
+                throw new Exception(format("unsupported session format version %s (this build supports %s)", v, formatVersion));
+            r.id = data["id"].str;
+            if (r.id != path.baseName.stripExtension)
+                throw new Exception(format("session log header id %s does not match %s", JSONValue(r.id).toString,
+                    JSONValue(path.baseName.stripExtension).toString));
+            if (auto c = "cwd" in data) r.cwd = c.str;
+            if (auto m = "model" in data) r.model = m.str;
+            if (auto c = "created_at" in data) r.createdAt = c.str;
+        }
+        else if (!index) throw new Exception("session log " ~ path ~ " does not start with a session header");
+        else switch (type)
+        {
+        case "input":
+            pendingId = data["id"].str;
+            r.pendingInput = data["text"].str;
+            break;
+        case "message":
+            r.conversation ~= messageFromRecord(data);
+            break;
+        case "turn_end":
+            if (data["input_id"].str == pendingId) { pendingId = null; r.pendingInput = null; }
+            break;
+        case "replace":
+            r.conversation = null;
+            foreach (m; data["messages"].array) r.conversation ~= messageFromRecord(m);
+            if ("pending_position" !in data || data["pending_position"].type == JSONType.null_)
+            {
+                pendingId = null;
+                r.pendingInput = null;
+            }
+            break;
+        default: // plan, hooks: not conversation state
+            break;
+        }
+        index++;
     }
+    return r;
+}
+
+/// One saved session, for `--list-sessions` and `--resume last`.
+struct Summary
+{
+    string id, path, cwd, model, createdAt;
+    SysTime lastUsed;
+    size_t prompts;
+    string firstPrompt, lastPrompt, contextPrompt;
+}
+
+import std.datetime.systime : SysTime;
+
+/// Whether a prompt says too little to identify a session by itself.
+bool isTerse(string text)
+{
+    import std.array : split;
+    import std.range : walkLength;
+    auto t = text.strip;
+    return t.startsWith("/") || (t.walkLength < 24 && t.split.length <= 4);
+}
+
+import std.string : startsWith;
+
+/// Summarize a log from its header and input records (other lines are skipped unparsed).
+Summary summarize(string path)
+{
+    Summary s;
+    s.path = path;
+    s.lastUsed = timeLastModified(path);
+    bool first = true;
+    auto text = readText(path);
+    foreach (line; text.lineSplitter)
+    {
+        if (first)
+        {
+            first = false;
+            auto h = parseJSON(line);
+            if (h["type"].str != "session") throw new Exception("no session header");
+            auto d = h["data"];
+            s.id = d["id"].str;
+            if (auto c = "cwd" in d) s.cwd = c.str;
+            if (auto m = "model" in d) s.model = m.str;
+            if (auto c = "created_at" in d) s.createdAt = c.str;
+            continue;
+        }
+        if (!line.startsWith(`{"type":"input"`)) continue;
+        JSONValue rec;
+        try rec = parseJSON(line);
+        catch (Exception) continue; // torn last line
+        if (rec["type"].str != "input") continue;
+        auto t = rec["data"]["text"].str;
+        s.prompts++;
+        if (!s.firstPrompt.length) s.firstPrompt = t;
+        if (s.lastPrompt.length && !isTerse(s.lastPrompt)) s.contextPrompt = s.lastPrompt;
+        s.lastPrompt = t;
+        if (!isTerse(t)) s.contextPrompt = null;
+    }
+    return s;
+}
+
+import std.algorithm : canFind;
+
+/// Every readable session in `dir`, newest first.
+Summary[] listSessions(string dir)
+{
+    Summary[] out_;
+    if (!dir.exists) return out_;
+    foreach (DirEntry e; dirEntries(dir, "*.jsonl", SpanMode.shallow, false))
+    {
+        auto stem = e.name.baseName.stripExtension;
+        try validateId(stem);
+        catch (Exception) continue;
+        if (!e.isFile) continue;
+        try
+        {
+            auto s = summarize(e.name);
+            if (s.id == stem) out_ ~= s;
+        }
+        catch (Exception) {}
+    }
+    out_.sort!((a, b) => a.lastUsed > b.lastUsed);
     return out_;
 }
 
-/// Find a session by id, or "last" for the newest.
-string findSession(string dir, string which)
+/// Find a session log by id, or "last" for the newest one started in `cwd`.
+string findSession(string dir, string which, string cwd = null)
 {
-    if (!dir.exists) throw new Exception("no sessions yet in " ~ dir);
-    auto logs = dirEntries(dir, "*.jsonl", SpanMode.shallow).map!(e => e.name).array;
-    if (!logs.length) throw new Exception("no sessions yet in " ~ dir);
-    logs.sort!((a, b) => timeLastModified(a) < timeLastModified(b));
-    if (which == "last" || !which.length) return logs[$ - 1];
-    foreach (l; logs)
-        if (l.baseName.stripExtension == which) return l;
-    throw new Exception("no session " ~ which ~ " in " ~ dir);
+    if (which == "last" || !which.length)
+    {
+        foreach (s; listSessions(dir))
+            if (cwd is null || s.cwd == cwd) return s.path;
+        throw new Exception(format("no saved session for %s; run with --list-sessions to see them", cwd));
+    }
+    validateId(which);
+    auto p = buildPath(dir, which ~ ".jsonl");
+    if (!p.exists) throw new Exception("no session " ~ which ~ " in " ~ dir);
+    return p;
+}
+
+/// How long ago `then` was, briefly.
+string ago(SysTime then, SysTime now)
+{
+    auto minutes = (now - then).total!"minutes";
+    if (minutes < 1) return "just now";
+    if (minutes < 60) return format("%sm ago", minutes);
+    if (minutes < 1440) return format("%sh ago", minutes / 60);
+    if (minutes < 2880) return "yesterday";
+    if (minutes < 10080) return format("%sd ago", minutes / 1440);
+    static immutable months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return format("%s %s", months[then.month - 1], then.day);
+}
+
+/// One line of text: whitespace collapsed and control characters dropped.
+string oneLine(string text)
+{
+    import std.array : split, join;
+    import std.uni : isControl;
+    string o;
+    foreach (dchar c; text.split.join(" ")) if (!c.isControl) o ~= c;
+    return o;
+}
+
+/// A plain list row: `<id>  <ago>  <project>  N prompts  <topic>`, fitted to 100 columns after the id.
+string listRow(const ref Summary s, SysTime now)
+{
+    import std.range : walkLength, take;
+    import std.conv : to;
+    auto project = s.cwd.length ? oneLine(s.cwd.baseName) : "?";
+    auto prompts = s.prompts == 1 ? "1 prompt" : format("%s prompts", s.prompts);
+    auto topic = oneLine(s.lastPrompt);
+    if (s.contextPrompt.length) topic ~= "  ← " ~ oneLine(s.contextPrompt);
+    auto line = format("%-10s  %s  %s  %s", ago(s.lastUsed, now), project, prompts, topic);
+    if (line.walkLength > 100) line = line.take(99).to!string ~ "…";
+    return oneLine(s.id) ~ "  " ~ line;
 }
 
 /// Project instruction files from the git root down to `cwd` (first name
@@ -119,14 +462,56 @@ unittest
 {
     auto dir = buildPath(tempDir, "nano-coder-d-session-test");
     if (dir.exists) rmdirRecurse(dir);
-    auto log = new SessionLog(dir, "mock", "/x");
+    auto log = new SessionLog(dir, "mock/m", "/x");
+    assert(log.id.startsWith("sess-"));
     auto m1 = Message.user("hello");
     auto m2 = Message.assistant("", [ToolCall.fromRaw("c", "bash", `{"command":"ls"}`)]);
+    m2.hasUsage = true;
+    m2.usage.inputTokens = 5;
+    m2.stopReason = "tool_use";
+    log.input("in-1", "hello");
     log.append(m1);
     log.append(m2);
-    auto back = loadSession(findSession(dir, "last"));
-    assert(back.length == 2 && back[0].content == "hello" && back[1].toolCalls[0].name == "bash");
+    log.turnEnd("in-1", "", "end_turn");
+    log.input("in-2", "crash here");
+    // Arguments are stored as JSON values, records as {"type","data"}.
+    auto lines = readText(log.path).lineSplitter.array;
+    assert(lines[1].startsWith(`{"type":"input","data":{`) && !lines[0].canFind(`\/`), lines[0]);
+    auto rec = parseJSON(lines[3]);
+    assert(rec["type"].str == "message" && rec["data"]["tool_calls"][0]["arguments"]["command"].str == "ls");
+    assert(parseJSON(lines[0])["data"]["version"].integer == 1);
+    assert(!("stop_reason" in parseJSON(lines[4])["data"]));
+    // A torn last line is ignored, then truncated when the log is reopened.
+    std.file.append(log.path, `{"type":"message","data":{"ro`);
+    auto r = restore(findSession(dir, "last", "/x"));
+    assert(r.conversation.length == 2 && r.conversation[1].toolCalls[0].name == "bash");
+    assert(r.conversation[1].hasUsage && r.conversation[1].usage.inputTokens == 5);
+    assert(r.pendingInput == "crash here" && r.model == "mock/m" && r.cwd == "/x");
+    auto again = new SessionLog(log.path);
+    again.append(m1);
+    assert(restore(log.path).conversation.length == 3);
+    // replace wins over earlier messages; unknown fields round-trip.
+    auto m3 = messageFromRecord(parseJSON(`{"role":"assistant","content":"x","thinking_blocks":[{"t":1}]}`));
+    again.replace([m3]);
+    auto r2 = restore(log.path);
+    assert(r2.conversation.length == 1 && messageRecord(r2.conversation[0])["thinking_blocks"][0]["t"].integer == 1);
     assert(findSession(dir, log.id) == log.path);
+    auto list = listSessions(dir);
+    assert(list.length == 1 && list[0].prompts == 2 && list[0].lastPrompt == "crash here");
+    import std.exception : assertThrown;
+    assertThrown(findSession(dir, "../etc"));
+    assertThrown(findSession(dir, "last", "/elsewhere"));
+    // A header from another format version is refused.
+    std.file.write(buildPath(dir, "v9.jsonl"), `{"type":"session","data":{"version":9,"id":"v9","created_at":"x"}}` ~ "\n");
+    assertThrown(restore(buildPath(dir, "v9.jsonl")));
+}
+
+unittest
+{
+    assert(isTerse("do it") && isTerse("/model x") && !isTerse("Fix the flaky deploy test"));
+    auto now = Clock.currTime;
+    import core.time : minutes, hours;
+    assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
 }
 
 unittest

@@ -37,22 +37,19 @@ which macOS and most Linux distributions already have.
 | `nano/permissions_test.d` | `permissions.rs` tests | 46 of the 47 Rust tests, translated one to one. `sandbox_confines_file_tools` is left out (no sandbox). |
 | `nano/control.d` | `TurnControl` in `agent.rs` | Cancel and steer. Ctrl-C cancels a running turn: libcurl aborts through its progress callback, bash kills the process group, and remaining tool calls are recorded as cancelled. In a TTY, a line typed mid-turn becomes a steer that joins the next model call; if it arrives too late it runs as the next prompt. A `/command` waits for the turn to end. |
 | `nano/acp.d` | `acp.rs` | `--acp`: the Agent Client Protocol over stdio (`initialize`, `session/new`, `session/load` with history replay, `session/prompt`, `session/cancel`). A reader thread routes cancels and steers while a turn runs, defers everything else, and requeues late steers at the position they arrived. Prompts can run `/tools`, `/settings` and `/model`; other `/…` prompts are rejected and `//…` sends a literal slash. Not ported: `/compact`, `/plan`, `/providers` over ACP, `_meta.projectInstructions`, input IDs, hooks. |
-| `nano/session.d` | `session.rs`, `resume.rs` (partly), `instructions.rs` (partly) | JSONL logs, `--resume [id\|last]`, and AGENTS.md/CLAUDE.md from the git root down to the cwd, plus `~/.config/nano-coder/AGENTS.md`. |
+| `nano/session.d` | `session.rs`, `session_index.rs` and `resume.rs` (partly), `instructions.rs` (partly) | Rust's log format, version 1: `session`, `input`, `message` (with timestamp, usage, duration and stop reason), `turn_end` and `replace` records. A torn last line is dropped and truncated. Reading skips `plan`/`hooks` and keeps message fields D doesn't model. `--resume [id\|last]` (`last` = newest session in this cwd) and `--list-sessions [--all] [--json]`. Also AGENTS.md/CLAUDE.md from the git root down to the cwd, plus `~/.config/nano-coder/AGENTS.md`. Tested both ways: Rust lists and resumes D logs, and D resumes Rust logs. |
 | `nano/agent.d` | `agent.rs` (core loop only) | Runs model call → tools → results until done or `max_iterations`. It gives specific advice for invalid arguments, unknown tools and blocked calls. |
-| `app.d` | `main.rs`, `ui.rs` (minimal) | Flags: `--model`, `--config`, `-p`, `--resume`, `--plan`, `--allow`, `--deny`, `--list-models`, `--no-session`, `--verbose`, `--version`. A plain readln REPL with `/model`, `/plan`, `/normal`, `/clear`, `/usage` and `/quit`. Piped stdin runs one prompt per line. |
+| `app.d` | `main.rs`, `ui.rs` (minimal) | Flags: `--model`, `--config`, `-p`, `--resume`, `--plan`, `--allow`, `--deny`, `--list-models`, `--list-sessions`, `--acp`, `--no-session`, `--verbose`, `--version`. A plain readln REPL with `/model`, `/plan`, `/normal`, `/clear`, `/usage` and `/quit`. Piped stdin runs one prompt per line. |
 
 Sessions are written to `nano-coder-d/sessions` under the platform data
-directory, not the Rust directory, because the record format isn't compatible yet (see below).
+directory (override with `NANO_CODER_D_SESSIONS`). The format is the same as Rust's, so pointing this at the Rust
+directory works; it's kept separate by default so the port can't damage real sessions.
 
 ## Known differences from the Rust version
 
-- **Shell analysis.** Permission checks split commands on operators outside
-  quotes and match destructive patterns with regexes. The Rust version parses
-  the shell (`shell.rs`), works out loops, redirects, here-docs and dynamic
-  words, and fails closed when it can't parse a command.
-- **Session format.** Rust logs are versioned, recover from a torn last line
-  and include input IDs, `turn_end`, `replace` (compaction) and plan
-  records. The D log has only a header and messages.
+- **Sessions.** No index cache (`.index.jsonl`), titles, interactive picker,
+  `--trajectory`, spill files or attachments. A crashed turn is reported on
+  resume but not re-run.
 - **Interrupts.** Ctrl-C cancels a turn and typed lines steer it (`nano/control.d`),
   but there is no prompt queue UI.
 - **Copilot routing.** Every model goes through Chat Completions. Rust sends
@@ -84,9 +81,8 @@ Roughly in dependency order. Sizes are Rust lines.
    (`plan.rs` 0.6k) and the **question tool** (`question.rs` 0.4k).
 9. **Hooks**: Claude-compatible command hooks (`claude_hooks.rs` 2.0k) and the
    internal registry (`hooks.rs`).
-10. **Sessions, full version** (`session.rs` 1.0k, `session_index.rs` 1.1k,
-    `resume.rs` 0.7k, `trajectory.rs` 1.3k). This covers a format compatible with the Rust
-    logs, `--list-sessions`, the resume picker and `--trajectory`.
+10. **Sessions, rest** (`session_index.rs` cache and titles, `resume.rs` picker,
+    `trajectory.rs` 1.3k). The format and `--list-sessions` are done.
 11. ~~**ACP server**~~ (`acp.rs` 0.9k): done in `nano/acp.d`, except the commands listed above.
 12. **Terminal UI** (`lineedit.rs` 3.3k, `frame.rs` 1.4k, `status.rs` 1.1k,
     `ui.rs` 3.0k, `input_history.rs`, `commands.rs` 0.6k, `turn_commands.rs`

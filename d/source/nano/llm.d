@@ -66,6 +66,22 @@ struct Message
     string toolName;
     bool isError;
 
+    // Session-log metadata (not sent to providers), as in Rust's `Message`.
+    /// When the message joined the conversation (RFC 3339 with offset).
+    string timestamp;
+    /// Assistant: the reasoning text of the reply.
+    string thinking;
+    /// Assistant: provider-reported usage for the request (if `hasUsage`).
+    TokenUsage usage;
+    bool hasUsage;
+    /// Assistant: wall-clock duration of the request in ms (-1: unknown).
+    long durationMs = -1;
+    /// Assistant: the provider's stop reason, normalised (`end_turn`, `tool_use`, `max_tokens`).
+    string stopReason;
+    /// Fields the D port doesn't model (e.g. Anthropic `thinking_blocks`),
+    /// kept so a resumed Rust log round-trips them.
+    JSONValue extra;
+
     static Message system(string c) { return Message(Role.system, c); }
     static Message user(string c) { return Message(Role.user, c); }
     static Message assistant(string c, ToolCall[] calls = null)

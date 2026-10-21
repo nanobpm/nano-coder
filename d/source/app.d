@@ -30,6 +30,7 @@ enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTI
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--allow RULE]... [--deny RULE]...
                     [--no-session] [--verbose] [--acp]
+       nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --list-models PROVIDER[/model]
        nano-coder-d --version
 
@@ -42,7 +43,7 @@ Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 struct Options
 {
     string model, configPath, prompt, resume, listModels;
-    bool plan, noSession, verbose, hasResume, acp;
+    bool plan, noSession, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
 
@@ -70,6 +71,9 @@ Options parseArgs(string[] args)
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
             case "--acp": o.acp = true; break;
+            case "--list-sessions": o.listSessions = true; break;
+            case "--all": o.all = true; break;
+            case "--json": o.json = true; break;
             case "--no-session": o.noSession = true; break;
             case "--verbose", "-v": o.verbose = true; break;
             case "--resume":
@@ -83,7 +87,46 @@ Options parseArgs(string[] args)
             default: die("unknown argument " ~ a ~ "\n\n" ~ usage);
         }
     }
+    if ((o.all || o.json) && !o.listSessions) die("--all and --json require --list-sessions");
+    if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length))
+        die("--list-sessions can't be combined with --resume, --acp, --list-models or -p");
     return o;
+}
+
+/// `--list-sessions [--all] [--json]`: this directory's saved sessions, newest first.
+int printSessions(bool all, bool json)
+{
+    import std.algorithm : filter;
+    import std.array : array;
+    auto cwd = getcwd();
+    auto shown = listSessions(sessionDir).filter!(s => all || s.cwd == cwd).array;
+    if (json)
+    {
+        JSONValue[] items;
+        foreach (s; shown)
+        {
+            JSONValue j = ["id": s.id, "last_used": s.lastUsed.toISOExtString];
+            j["prompts"] = s.prompts;
+            if (s.cwd.length) j["cwd"] = s.cwd;
+            if (s.model.length) j["model"] = s.model;
+            if (s.createdAt.length) j["created_at"] = s.createdAt;
+            if (s.firstPrompt.length) j["first_prompt"] = s.firstPrompt;
+            if (s.lastPrompt.length) j["last_prompt"] = s.lastPrompt;
+            if (s.contextPrompt.length) j["context_prompt"] = s.contextPrompt;
+            items ~= j;
+        }
+        writeln(JSONValue(items).toPrettyString);
+        return 0;
+    }
+    if (!shown.length)
+    {
+        stderr.writefln("No saved sessions%s.", all ? "" : " for " ~ oneLine(cwd) ~ " (--all lists every directory)");
+        return 0;
+    }
+    import std.datetime.systime : Clock;
+    auto now = Clock.currTime;
+    foreach (s; shown) writeln(listRow(s, now));
+    return 0;
 }
 
 noreturn die(string msg)
@@ -284,6 +327,7 @@ int main(string[] args)
     }
     catch (Exception e) die(e.msg);
 
+    if (o.listSessions) return printSessions(o.all, o.json);
     if (o.listModels.length)
     {
         try
@@ -347,11 +391,15 @@ int main(string[] args)
     {
         if (o.hasResume)
         {
-            auto path = findSession(sessionDir, o.resume);
-            foreach (m; loadSession(path))
+            auto path = findSession(sessionDir, o.resume, cwd);
+            auto restored = restore(path);
+            foreach (m; restored.conversation)
                 if (m.role != Role.system) agent.messages ~= m;
             if (!o.noSession) agent.log = new SessionLog(path);
-            stderr.writefln("resumed %s (%s messages)", path, agent.messages.length - 1);
+            stderr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+            if (restored.pendingInput.length)
+                stderr.writefln("the last prompt never finished (the session was interrupted): %s",
+                    oneLine(restored.pendingInput));
         }
         else if (!o.noSession)
         {
@@ -425,6 +473,7 @@ int main(string[] args)
                 case "/help": writeln(usage); continue;
                 case "/clear":
                     agent.messages = agent.messages[0 .. 1];
+                    if (agent.log !is null) agent.log.replace(agent.messages);
                     writeln("conversation cleared");
                     continue;
                 case "/usage":

@@ -483,7 +483,7 @@ final class AcpServer : AgentEvents
         auto path = findSession(host.sessionDir, want);
         auto sys = host.systemPrompt !is null ? host.systemPrompt(getcwd()) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
-        foreach (m; loadSession(path))
+        foreach (m; restore(path).conversation)
             if (m.role != Role.system) agent.messages ~= m;
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
