@@ -4,12 +4,14 @@ module nano.agent;
 
 import std.json;
 import std.format : format;
-import std.string : strip;
+import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
 import nano.tools;
-import nano.question : QuestionError;
+import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer;
+import nano.mode : AgentMode, planAllows;
+import nano.goal : Outcome, OutcomeError, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
@@ -36,6 +38,9 @@ string wrapReminder(string text)
 }
 
 /// Why a turn ended (ACP `stopReason`).
+/// The turn cap for runs nobody can answer a "keep going?" prompt in.
+enum headlessSafetyCap = 300;
+
 enum StopReason : string
 {
     endTurn = "end_turn",
@@ -103,7 +108,8 @@ class Agent
             if (log !is null) log.turnEnd(inputId, "Error: " ~ e.msg, "end_turn");
             throw e;
         }
-        if (log !is null) log.turnEnd(inputId, response, cast(string) lastStop);
+        if (log !is null)
+            log.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
         return response;
     }
 
@@ -113,6 +119,7 @@ class Agent
     {
         if (resetControl) control.startTurn();
         stopBlocks = 0;
+        hasOutcome = hasReported = false;
         if (hooks !is null)
         {
             syncHookSession();
@@ -142,8 +149,28 @@ class Agent
         }
         push(Message.user(input));
         string last;
-        for (long i = 0; maxIterations <= 0 || i < maxIterations; i++)
+        // The turn cap: interactive normal mode asks to keep going; auto mode
+        // has none; headless runs (ACP, -p) stop at the cap, or at a safety
+        // cap when there is none. Re-read from the live mode each iteration.
+        long granted, iteration, budget;
+        for (;;)
         {
+            iteration++;
+            auto mode = control.mode;
+            bool headlessCap = headless && (maxIterations <= 0 || mode == AgentMode.auto_);
+            budget = headlessCap ? headlessSafetyCap + granted
+                : (mode == AgentMode.auto_ || maxIterations <= 0) ? long.max : maxIterations + granted;
+            if (iteration > budget)
+            {
+                if (mode == AgentMode.normal && !headless && askKeepGoing())
+                {
+                    ev.text(false, "\n[continuing past the turn cap]\n");
+                    granted += maxIterations;
+                    iteration--;
+                    continue;
+                }
+                break;
+            }
             if (control.isCancelled) return cancelled(ev);
             foreach (s; control.takePending)
             {
@@ -153,7 +180,7 @@ class Agent
             }
             ChatRequest req;
             req.messages = messages;
-            req.tools = tools.definitions ~ (planTools ? planDefinitions() : null);
+            req.tools = offeredTools();
             req.maxTokens = maxTokens;
             req.temperature = temperature;
             LLMResponse r;
@@ -186,7 +213,7 @@ class Agent
                 if (control.hasSteers && !control.isCancelled) continue;
                 // A blocking Stop hook keeps the turn going (capped per turn).
                 if (hooks !is null && !cut && stopBlocks < maxStopBlocks && !control.isCancelled
-                    && (maxIterations <= 0 || i + 1 < maxIterations))
+                    && iteration < budget)
                 {
                     auto o = hooks.runStop(stopBlocks > 0);
                     if (o.blocked)
@@ -209,10 +236,39 @@ class Agent
                 ev.toolEnd(call, result, isError);
                 push(Message.toolResult(call.id, call.name, result, isError));
             }
+            if (hasReported)
+            {
+                // A reported outcome ends the turn like a tool-free answer, so
+                // it passes the same Stop gate.
+                if (hooks !is null && stopBlocks < maxStopBlocks && !control.isCancelled && iteration < budget)
+                {
+                    auto o = hooks.runStop(stopBlocks > 0);
+                    if (o.blocked)
+                    {
+                        stopBlocks++;
+                        hasReported = false;
+                        auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
+                        push(Message.user(wrapReminder(reason)));
+                        ev.userMessage(reason);
+                        last = reported.response;
+                        continue;
+                    }
+                }
+                auto response = reported.response;
+                push(Message.assistant(response, null));
+                ev.text(false, response);
+                ev.assistantMessage(response, null);
+                lastOutcome = reported;
+                hasOutcome = true;
+                hasReported = false;
+                lastStop = StopReason.endTurn;
+                return response;
+            }
         }
-        ev.text(false, format("\n[stopped after %s model calls (max_iterations)]", maxIterations));
+        auto note = format("[stopped after %s LLM calls without a final answer]", iteration - 1);
+        ev.text(false, "\n" ~ note);
         lastStop = StopReason.maxTurnRequests;
-        return last;
+        return (last ~ "\n" ~ note).stripLeft;
     }
 
     private string cancelled(AgentEvents ev)
@@ -234,7 +290,12 @@ class Agent
             return format("Invalid arguments for %s (not a JSON object): %s\n%s", call.name, raw, advice);
         }
         bool isPlan = planTools && isPlanTool(call.name);
-        if (!isPlan && !tools.has(call.name)) return format("Tool '%s' not found. Available: %s", call.name, toolNames());
+        bool isOutcome = outcomeTool && call.name == outcomeToolName;
+        if (!isPlan && !isOutcome && !tools.has(call.name))
+            return format("Tool '%s' not found. Available: %s", call.name, toolNames());
+        // Backstop for a call already in flight when plan mode was switched on.
+        if (control.mode == AgentMode.plan && !planAllows(call.name))
+            return format("%s is disabled in plan mode (read-only)", call.name);
         if (auto blocked = policy.check(call.name, call.arguments)) return blocked;
         // PreToolUse hooks run after the permission check, before the tool:
         // they can deny the call, rewrite its input, or add context.
@@ -261,11 +322,19 @@ class Agent
         string out_;
         try
         {
-            out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
+            if (isOutcome)
+            {
+                auto o = Outcome.fromArgs(args);
+                out_ = format("Recorded outcome: %s. Your turn ends now.", o.toJSON["status"].str);
+                reported = o;
+                hasReported = true;
+            }
+            else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
         catch (PlanError e) out_ = e.msg;
+        catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
         if (hooks !is null)
@@ -275,6 +344,40 @@ class Agent
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
         return withContext(out_, context);
+    }
+
+    /// Offer `report_outcome` (config `outcome_tool`).
+    bool outcomeTool = true;
+    /// Asks the user (question tool, turn-cap prompt); null or not
+    /// interactive means headless: a hard cap and no prompts.
+    QuestionBroker questions;
+    /// The outcome the last turn reported, if any.
+    Outcome lastOutcome;
+    bool hasOutcome;
+    private Outcome reported;
+    private bool hasReported;
+
+    /// The tools offered to the model: plan mode keeps only the read-only ones.
+    ToolDefinition[] offeredTools()
+    {
+        auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
+            ~ (outcomeTool ? [outcomeDefinition()] : null);
+        if (control.mode != AgentMode.plan) return all;
+        ToolDefinition[] kept;
+        foreach (t; all) if (planAllows(t.name)) kept ~= t;
+        return kept;
+    }
+
+    private bool headless() { return questions is null || !questions.interactive; }
+
+    /// Interactive normal mode: ask whether to keep going past the cap.
+    private bool askKeepGoing()
+    {
+        auto q = Question("Reached the turn cap without a final answer. Keep going?", null,
+            [QuestionOption("No"), QuestionOption("Yes")]);
+        q.custom = false;
+        auto a = questions.ask([q]);
+        return a.kind == Answer.Kind.answers && a.answers.length && a.answers[0] == "Yes";
     }
 
     /// The task plan (`plan_*` tools), kept outside the conversation.
@@ -331,7 +434,7 @@ class Agent
     private void syncHookSession()
     {
         hooks.setSession(log !is null ? log.id : "", log !is null ? log.path : "",
-            policy.mode == Mode.plan ? "plan" : "default");
+            control.mode == AgentMode.plan ? "plan" : "default");
     }
 
     private string toolNames()
@@ -514,4 +617,54 @@ unittest
     agent.hooks = new HookManager([hook(Event.stop, `echo '{"decision":"block","reason":"more"}'`)], tempDir);
     assert(agent.run("go", new NullEvents) == "d");
     assert(mock.seen.length == 4 && mock.seen[1][$ - 1].content.canFind("more"));
+}
+
+// report_outcome ends the turn with its summary as the answer.
+unittest
+{
+    import nano.providers.mock;
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("c1", "report_outcome", `{"status":"blocked","summary":"no token"}`)]),
+        LLMResponse("never sent"),
+    ]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    auto ev = new NullEvents;
+    assert(agent.run("go", ev) == "Blocked: no token");
+    assert(agent.hasOutcome && agent.lastOutcome.summary == "no token");
+    assert(mock.seen.length == 1 && agent.lastStop == StopReason.endTurn);
+    assert(agent.messages[$ - 2].content == "Recorded outcome: blocked. Your turn ends now.");
+    assert(agent.messages[$ - 1].content == "Blocked: no token");
+    // A bad report is a tool error the model can fix; the turn goes on.
+    mock.script = [
+        LLMResponse("", "", [ToolCall.fromRaw("c2", "report_outcome", `{"status":"maybe","summary":"x"}`)]),
+        LLMResponse("fine"),
+    ];
+    assert(agent.run("again", ev) == "fine" && !agent.hasOutcome);
+}
+
+// A headless turn stops at the cap with Rust's note; plan mode hides mutating tools.
+unittest
+{
+    import nano.providers.mock;
+    import std.algorithm : canFind;
+    auto echo = LLMResponse("working", "", [ToolCall.fromRaw("c", "echo", `{}`)]);
+    auto mock = new MockClient([echo, echo, echo]);
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("echo", "", parseJSON(`{"type":"object"}`)), (JSONValue a) => "pong");
+    reg.register(ToolDefinition("read_file", "", parseJSON(`{"type":"object"}`)), (JSONValue a) => "text");
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.maxIterations = 2;
+    auto response = agent.run("go", new NullEvents);
+    assert(mock.seen.length == 2 && agent.lastStop == StopReason.maxTurnRequests);
+    assert(response == "working\n[stopped after 2 LLM calls without a final answer]", response);
+    assert(mock.toolsSeen[0].canFind("echo") && mock.toolsSeen[0].canFind("report_outcome"));
+
+    agent.control.mode = AgentMode.plan;
+    mock.script = [echo, LLMResponse("ok")];
+    agent.maxIterations = 0;
+    agent.run("plan it", new NullEvents);
+    assert(!mock.toolsSeen[$ - 1].canFind("echo") && mock.toolsSeen[$ - 1].canFind("read_file"));
+    assert(mock.toolsSeen[$ - 1].canFind("plan_add"));
+    // The in-flight backstop.
+    assert(agent.messages[$ - 2].content == "echo is disabled in plan mode (read-only)");
 }

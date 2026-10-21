@@ -38,6 +38,8 @@ struct Steer
     JSONValue tag;
 }
 
+import nano.mode : AgentMode;
+
 final class TurnControl
 {
     private Mutex lock;
@@ -45,6 +47,22 @@ final class TurnControl
     private Steer[] absorbed_;
 
     this() @trusted { lock = new Mutex; }
+
+    private shared int mode_;
+
+    /// The live agent mode; the running turn reads it at each iteration.
+    AgentMode mode() @trusted
+    {
+        import core.atomic : atomicLoad;
+        return cast(AgentMode) atomicLoad(mode_);
+    }
+
+    /// ditto
+    void mode(AgentMode m) @trusted
+    {
+        import core.atomic : atomicStore;
+        atomicStore(mode_, cast(int) m);
+    }
 
     /// Queue a message for the running turn. It is added before the next model call.
     void steer(string text) @trusted { steer(Steer(text)); }

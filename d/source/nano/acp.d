@@ -139,6 +139,7 @@ string toolKind(string name)
     case "read_file": return "read";
     case "grep", "glob": return "search";
     case "write_file", "edit_file": return "edit";
+    case "plan_add", "plan_update", "plan_show", "report_outcome": return "think";
     default: return "other";
     }
 }
@@ -223,6 +224,12 @@ final class AcpServer : AgentEvents
             import std.stdio : stdout;
             stdout.writeln(l);
             stdout.flush();
+        };
+        agent.onPlanChanged = () {
+            JSONValue u = ["sessionUpdate": "plan"];
+            u["entries"] = agent.plan.acpEntries;
+            u["_meta"] = JSONValue(["plan": agent.plan.toJSON]);
+            update(u);
         };
     }
 
@@ -535,7 +542,12 @@ final class AcpServer : AgentEvents
         atomicStore(turnActive, false);
         auto stop = cast(string) agent.lastStop;
         if (id.type != JSONType.null_)
-            send(rpcResult(id, JSONValue(["stopReason": stop, "response": response])));
+        {
+            auto reply = JSONValue(["stopReason": stop, "response": response]);
+            // Extension: the model's explicit completed/blocked report.
+            if (agent.hasOutcome && stop == "end_turn") reply["_meta"] = JSONValue(["outcome": agent.lastOutcome.toJSON]);
+            send(rpcResult(id, reply));
+        }
         // Steers folded into this turn are answered by it.
         foreach (s; agent.control.takeAbsorbed)
             if (s.tag.type != JSONType.null_)

@@ -33,7 +33,6 @@ enum string blockAdvice = "Do not try to get around this with a different comman
     ~ "If the action is really needed, stop and tell the user what you want to run and why, so they can run it "
     ~ "themselves or add an allow rule.";
 
-enum Mode { normal, plan, auto_ }
 
 /// A malformed permission rule.
 class RuleError : Exception
@@ -222,11 +221,6 @@ private string currentDir() @trusted
     catch (Exception) return "/";
 }
 
-bool isMutating(string tool)
-{
-    return tool == "bash" || tool == "write_file" || tool == "edit_file";
-}
-
 /// Checks tool calls against rules and the built-in guards.
 struct Policy
 {
@@ -234,7 +228,6 @@ struct Policy
     Rule[] deny;
     bool builtinRules = true;
     string[] protectedBranches = ["main", "master", "trunk", "develop"];
-    Mode mode = Mode.normal;
     /// File-tool writes stay inside the sandbox's writable roots.
     SandboxConfig sandbox;
 
@@ -257,8 +250,6 @@ struct Policy
     /// null when the call may run, else the reason it is blocked.
     string check(string tool, JSONValue args)
     {
-        if (mode == Mode.plan && isMutating(tool))
-            return format("%s is not available in plan mode (read-only). Present the plan instead.", tool);
         auto reason = checkIn(tool, args, currentDir());
         if (reason is null) return null;
         return format("Blocked by nano-coder permissions: %s. %s", reason, blockAdvice);
@@ -389,7 +380,4 @@ unittest
     assert(p.check("bash", cmd("echo hi; git push origin main")) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/.env"])) !is null);
     assert(p.check("edit_file", JSONValue(["path": "/x/y/env.d"])) is null);
-    p.mode = Mode.plan;
-    assert(p.check("write_file", JSONValue(["path": "a"])) !is null);
-    assert(p.check("read_file", JSONValue(["path": "a"])) is null);
 }

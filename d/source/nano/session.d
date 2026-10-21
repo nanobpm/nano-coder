@@ -218,9 +218,11 @@ class SessionLog
     }
 
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
-    void turnEnd(string inputId, string response, string stopReason)
+    void turnEnd(string inputId, string response, string stopReason, JSONValue outcome = JSONValue.init)
     {
-        JSONValue d = ["input_id": inputId, "response": response, "recorded_at": nowStamp()];
+        JSONValue d = ["input_id": inputId, "response": response];
+        if (outcome.type == JSONType.object) d["outcome"] = outcome;
+        d["recorded_at"] = nowStamp();
         if (stopReason.length && stopReason != "end_turn") d["stop_reason"] = stopReason;
         write_(record("turn_end", d));
         import core.sys.posix.unistd : fsync;

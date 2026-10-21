@@ -5,7 +5,7 @@ module app;
 import std.stdio;
 import std.json;
 import std.format : format;
-import std.string : strip, startsWith, indexOf;
+import std.string : strip, stripRight, startsWith, indexOf;
 import std.file : getcwd, exists, readText;
 import std.process : environment;
 import core.stdc.stdlib : exit;
@@ -21,6 +21,7 @@ import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
 import nano.plan : Plan, checklist;
+import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe;
 import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
 import nano.commands : helpText, unescapePrompt;
@@ -387,8 +388,7 @@ string indent(string s)
     return "    " ~ t.replace("\n", "\n    ");
 }
 
-enum string planNote = "\n\nYou are in PLAN MODE: read-only. Do not create, modify or delete files or run commands with side effects; "
-    ~ "investigate with the read-only tools and present a plan.";
+alias planNote = planPromptNote;
 
 string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null, string memoryIndex = null)
 {
@@ -444,7 +444,6 @@ int main(string[] args)
         foreach (r; o.deny) policy.deny ~= parseRule(r);
     }
     catch (Exception e) die(e.msg);
-    if (o.plan) policy.mode = Mode.plan;
     {
         import nano.sandbox : parseMode;
         auto env = environment.get("NANO_CODER_SANDBOX");
@@ -497,7 +496,7 @@ int main(string[] args)
         ToolHandler memoryHandler(string name)
         {
             return (JSONValue a) {
-                bool ro = !memoryWritable || agent.policy.mode == Mode.plan;
+                bool ro = !memoryWritable || agent.control.mode == AgentMode.plan;
                 try return runMemory(memory, name, a, agent.log !is null ? agent.log.id : null, ro);
                 catch (Exception e) throw new ToolError(e.msg);
             };
@@ -513,6 +512,9 @@ int main(string[] args)
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     agent.planTools = cfg.planTools;
+    agent.outcomeTool = cfg.outcomeTool;
+    agent.questions = questions;
+    if (o.plan) agent.control.mode = AgentMode.plan;
     HookManager loadHooks(string dir)
     {
         import nano.claude_hooks : LoadOptions;
@@ -707,24 +709,26 @@ int main(string[] args)
                             agent.lastUsage.cachedInputTokens, agent.lastUsage.outputTokens);
                     continue;
                 case "/plan":
-                    auto shown = agent.plan.render(true, size_t.max);
-                    write(shown, shown.length && shown[$ - 1] == '\n' ? "" : "\n");
+                    if (agent.plan.empty) writeln("No plan yet. The agent makes one with the plan_add tool.");
+                    else writeln(agent.plan.render(true, size_t.max).stripRight);
                     continue;
                 case "/mode":
                     if (!arg.length)
                     {
-                        writeln("mode: ", agent.policy.mode == Mode.plan ? "plan" : "normal");
+                        auto current = agent.control.mode;
+                        writefln("Mode: %s (%s)", current.name, current.describe);
+                        foreach (m; allModes) writefln("  %-8s %s", m.name, m.describe);
+                        writeln("(/mode NAME sets it)");
                         continue;
                     }
-                    if (arg != "plan" && arg != "normal")
+                    try
                     {
-                        writeln("unknown mode ", arg, " (normal or plan)");
-                        continue;
+                        auto m = parseMode(arg);
+                        agent.control.mode = m;
+                        agent.messages[0].content = systemFor(cwd, m == AgentMode.plan);
+                        writefln("Mode set to %s (%s)", m.name, m.describe);
                     }
-                    bool plan = arg == "plan";
-                    agent.policy.mode = plan ? Mode.plan : Mode.normal;
-                    agent.messages[0].content = systemFor(cwd, plan);
-                    writeln(plan ? "plan mode: read-only" : "normal mode");
+                    catch (Exception e) writeln(e.msg);
                     continue;
                 case "/tools":
                     foreach (d; agent.tools.definitions)

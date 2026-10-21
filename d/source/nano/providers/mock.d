@@ -8,6 +8,8 @@ class MockClient : LLMClient
 {
     LLMResponse[] script;
     Message[][] seen;
+    /// The tool names offered with each request.
+    string[][] toolsSeen;
 
     this(LLMResponse[] script) { this.script = script; }
 
@@ -16,6 +18,9 @@ class MockClient : LLMClient
         Message[] copy;
         foreach (m; req.messages) copy ~= cast(Message) m;
         seen ~= copy;
+        string[] names;
+        foreach (ref t; req.tools) names ~= t.name;
+        toolsSeen ~= names;
         if (script.length == 0) return LLMResponse("(mock: script exhausted)");
         auto r = script[0];
         script = script[1 .. $];
