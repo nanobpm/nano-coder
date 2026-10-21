@@ -31,7 +31,8 @@ import core.sync.condition : Condition;
 enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTING.md)";
 
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
-                    [--resume [SESSION_ID|last]] [--plan] [--allow RULE]... [--deny RULE]...
+                    [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
+                    [--allow RULE]... [--deny RULE]...
                     [--no-session] [--no-hooks] [--verbose] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --list-models PROVIDER[/model]
@@ -45,7 +46,7 @@ Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
-    string model, configPath, prompt, resume, listModels;
+    string model, configPath, prompt, resume, listModels, sandbox;
     bool plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
@@ -73,6 +74,7 @@ Options parseArgs(string[] args)
             case "--allow": o.allow ~= value(); break;
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
+            case "--sandbox": o.sandbox = value(); break;
             case "--acp": o.acp = true; break;
             case "--list-sessions": o.listSessions = true; break;
             case "--all": o.all = true; break;
@@ -359,11 +361,26 @@ int main(string[] args)
     }
     catch (Exception e) die(e.msg);
     if (o.plan) policy.mode = Mode.plan;
+    {
+        import nano.sandbox : parseMode;
+        auto env = environment.get("NANO_CODER_SANDBOX");
+        try
+        {
+            if (env.length) cfg.sandbox.mode = parseMode(env);
+        }
+        catch (Exception e) die("NANO_CODER_SANDBOX: " ~ e.msg);
+        try
+        {
+            if (o.sandbox.length) cfg.sandbox.mode = parseMode(o.sandbox);
+        }
+        catch (Exception e) die(e.msg);
+    }
+    policy.sandbox = cfg.sandbox;
 
     auto tools = new ToolRegistry;
     auto readState = new ReadState;
     auto bashTimeout = cfg.bashTimeoutSecs;
-    tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout));
+    tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout, cfg.sandbox));
     registerFiles(tools, readState);
     Agent agent;
     // Read-deny rules hide paths from search results (Policy.readDenied).
@@ -417,6 +434,7 @@ int main(string[] args)
         lo.disableProjectHooks = cfg.disableProjectHooks;
         lo.claudeUserHooks = cfg.claudeUserHooks;
         lo.nanoHooks = cfg.hooks;
+        lo.sandbox = cfg.sandbox;
         auto m = HookManager.load(lo, dir);
         if (auto notice = m.startupNotice) stderr.writeln(notice);
         foreach (sk; m.skipped)

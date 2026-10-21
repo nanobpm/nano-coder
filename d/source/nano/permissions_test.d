@@ -1357,3 +1357,29 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     p.builtinRules = false;
     assert(check(p, "rm -rf /").isOk);
 }
+
+@system unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexically-inside paths)
+{
+    import nano.sandbox : SandboxConfig, SandboxMode;
+    import nano.paths : canonicalize;
+    import std.file : getcwd;
+    import std.process : thisProcessID;
+    import std.format : format;
+    // Outside the temp directories, which the sandbox always allows.
+    auto cwd = canonicalize(getcwd) ~ format("/.dub/perm-sbx-%s", thisProcessID);
+    mkdirRecurse(cwd);
+    scope (exit) rmrf(cwd);
+    Policy p;
+    p.sandbox.mode = SandboxMode.workspace;
+    assert(p.checkIn("write_file", parseJSON(`{"path":"src/new.rs"}`), cwd).isOk);
+    auto probe = joinPath(homeDir(), ".nano-coder-sandbox-probe");
+    auto err = p.checkIn("write_file", JSONValue(["path": probe]), cwd);
+    assert(err.canFind("outside the workspace sandbox"), err);
+    assert(p.checkIn("read_file", JSONValue(["path": probe]), cwd).isOk);
+    symlink("/", joinPath(cwd, "root-link"));
+    err = p.checkIn("write_file", parseJSON(`{"path":"root-link/../etc/hosts"}`), cwd);
+    assert(err.canFind("outside the workspace sandbox"), err);
+    Policy ro;
+    ro.sandbox.mode = SandboxMode.readOnly;
+    assert(ro.checkIn("edit_file", parseJSON(`{"path":"src/new.rs"}`), cwd).isErr);
+}

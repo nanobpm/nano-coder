@@ -13,6 +13,7 @@ import core.thread : Thread;
 import nano.tools;
 import nano.control : cancelRequested;
 import nano.llm : ToolDefinition;
+import nano.sandbox : SandboxConfig, looksDenied;
 
 enum long defaultTimeoutSecs = 600;
 
@@ -48,7 +49,7 @@ struct BashResult
     bool cancelled;
 }
 
-BashResult run(string command, Duration timeout, string cwd = null)
+BashResult run(string command, Duration timeout, string cwd = null, const SandboxConfig sandbox = SandboxConfig.init)
 {
     import std.process : thisProcessID;
     import std.datetime.systime : Clock;
@@ -63,7 +64,15 @@ BashResult run(string command, Duration timeout, string cwd = null)
     auto outF = File(outPath, "w"), errF = File(errPath, "w"), inF = File("/dev/null", "r");
     Config cfg;
     cfg.preExecFunction = () @trusted nothrow @nogc { newSession(); return true; };
-    auto pid = spawnProcess(["bash", "-c", command], inF, outF, errF, null, cfg, cwd);
+    // The sandbox fails closed: ToolError when it can't be applied.
+    string[] argv = ["bash", "-c", command];
+    if (sandbox.active)
+    {
+        import std.file : getcwd;
+        try argv = sandbox.command("bash", command, cwd.length ? cwd : getcwd());
+        catch (Exception e) throw new ToolError(e.msg);
+    }
+    auto pid = spawnProcess(argv, inF, outF, errF, null, cfg, cwd);
     outF.close();
     errF.close();
     BashResult r;
@@ -94,7 +103,7 @@ BashResult run(string command, Duration timeout, string cwd = null)
     return r;
 }
 
-string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs)
+string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const SandboxConfig sandbox = SandboxConfig.init)
 {
     if (args.type != JSONType.object) throw new ToolError("bash arguments must be a JSON object");
     auto command = requireString(args, "command", "bash");
@@ -103,7 +112,7 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs)
     auto limit = optInt(args, "max_output_length", defaultMaxOutput);
     if (limit <= 0 || limit > maxOutputLimit)
         throw new ToolError(format(`bash argument "max_output_length" must be between 1 and %s`, maxOutputLimit));
-    auto r = run(command, secs.seconds);
+    auto r = run(command, secs.seconds, null, sandbox);
     string text;
     auto o = truncateOutput(r.stdout_, cast(size_t) limit, "bash-stdout");
     auto e = truncateOutput(r.stderr_, cast(size_t) limit, "bash-stderr");
@@ -111,7 +120,15 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs)
     if (e.length) text ~= (text.length && text[$ - 1] != '\n' ? "\n" : "") ~ "\nStderr:\n" ~ e;
     if (r.cancelled) text ~= "\n\nError: the turn was cancelled; the command was killed";
     else if (r.timedOut) text ~= format("\n\n[killed after %s seconds; raise timeout_seconds if it needs longer]", secs);
-    else if (r.exitCode != 0) text ~= format("\n\nExit code: %s", r.exitCode);
+    else if (r.exitCode != 0)
+    {
+        text ~= format("\n\nExit code: %s", r.exitCode);
+        if (sandbox.active && looksDenied(r.stdout_ ~ r.stderr_))
+        {
+            import std.file : getcwd;
+            text ~= format("\nNote: %s.", sandbox.describe(getcwd()));
+        }
+    }
     if (!text.length) text = "(no output)";
     return text;
 }

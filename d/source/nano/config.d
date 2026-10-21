@@ -7,6 +7,7 @@ import nano.skills : SkillsConfig;
 import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
 
 import std.json;
+import nano.sandbox : SandboxConfig;
 import std.file : exists, readText;
 import std.path : buildPath, expandTilde;
 import std.process : environment, executeShell;
@@ -129,6 +130,8 @@ struct Config
     bool disableProjectHooks;
     bool claudeUserHooks = true;
     JSONValue hooks;
+    /// `[sandbox]`: OS sandbox for shell commands and project hooks.
+    SandboxConfig sandbox;
     string memoryDir;
     long memoryExpiryDays = defaultExpiryDays;
     string path;
@@ -158,6 +161,11 @@ struct Config
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;
         if (auto v = "hooks" in doc) c.hooks = *v;
+        if (auto v = "sandbox" in doc)
+        {
+            try c.sandbox = SandboxConfig.fromJSON(*v);
+            catch (Exception e) throw new Exception("[sandbox]: " ~ e.msg);
+        }
         if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
         if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;

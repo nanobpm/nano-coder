@@ -18,6 +18,7 @@ import std.file : exists, readText, getcwd;
 import std.path : buildPath;
 import core.time : Duration, seconds, msecs, MonoTime;
 import nano.permissions : ruleMatches, validateRule;
+import nano.sandbox : SandboxConfig;
 
 /// Per-field cap on hook output, in characters (Claude Code's).
 enum fieldCap = 10_000;
@@ -125,6 +126,8 @@ struct LoadOptions
     JSONValue nanoHooks;
     /// Home directory for `~/.claude/settings.json` (tests override it).
     string home;
+    /// Project hooks run inside this sandbox when it is active.
+    SandboxConfig sandbox;
 }
 
 enum Decision
@@ -196,6 +199,7 @@ class HookManager
     string sessionId;
     string transcriptPath;
     string permissionMode = "default";
+    SandboxConfig sandbox;
 
     this(Hook[] hooks, string projectDir)
     {
@@ -211,6 +215,7 @@ class HookManager
         import nano.skills : gitRoot;
         auto root = gitRoot(cwd);
         auto m = new HookManager(null, root.length ? root : cwd);
+        m.sandbox = SandboxConfig(opts.sandbox.mode, opts.sandbox.writable.dup, opts.sandbox.network, opts.sandbox.toolCaches);
         if (opts.disableHooks) return m;
         if (opts.nanoHooks.type == JSONType.object) m.ingestGroups(opts.nanoHooks, Source.userNano);
         if (opts.claudeUserHooks)
@@ -485,7 +490,7 @@ class HookManager
     {
         Outcome o;
         auto json = input.toString;
-        foreach (ref h; selected) o.absorb(interpret(event, h, execute(h, json, projectDir)));
+        foreach (ref h; selected) o.absorb(interpret(event, h, execute(h, json, projectDir, h.source.isProject ? sandbox : SandboxConfig.init)));
         return o;
     }
 }
@@ -598,6 +603,11 @@ JSONValue applyUpdatedInput(string nanoTool, JSONValue original, JSONValue updat
 // Running one hook.
 // ---------------------------------------------------------------------------
 
+private string shellQuote(string text) pure
+{
+    return "'" ~ text.replace("'", `'\''`) ~ "'";
+}
+
 /// Raw result of running the hook process.
 struct ProcessRun
 {
@@ -620,7 +630,7 @@ enum graceTime = 2.seconds;
 /// terminal) and its own process group, bounded by its timeout. Output past
 /// `outputCap`, a descendant still holding a pipe past the deadline, or a read
 /// error each fail the run (closed) rather than parsing partial output.
-ProcessRun execute(const ref Hook hook, string input, string projectDir)
+ProcessRun execute(const ref Hook hook, string input, string projectDir, const SandboxConfig sandbox = SandboxConfig.init)
 {
     import std.process : spawnProcess, pipe, tryWait, wait, Config, Pid;
     import core.sys.posix.poll : pollfd, poll, POLLIN, POLLOUT, POLLHUP, POLLERR;
@@ -642,6 +652,19 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir)
         foreach (a; hook.args) argv ~= expandProjectDir(a, projectDir);
     }
     else argv = ["bash", "-c", hook.command];
+    if (sandbox.active)
+    {
+        // Fail closed: a hook that can't be sandboxed counts as failed (so a
+        // PreToolUse hook blocks the call).
+        string script = hook.command;
+        if (hook.hasArgs) script = argv.map!shellQuote.join(" ");
+        try argv = sandbox.command("bash", script, projectDir);
+        catch (Exception e)
+        {
+            r.launchError = "sandbox could not be applied: " ~ e.msg;
+            return r;
+        }
+    }
 
     // A hook that exits without reading stdin must not kill nano with SIGPIPE.
     signal(SIGPIPE, SIG_IGN);
@@ -1297,4 +1320,46 @@ unittest // read errors fail PreToolUse closed; content hash matches Rust's Defa
     assert(contentHash("") == "30406ea523c53def");
     assert(contentHash(`{"hooks":{}}`) == "6647320c7e280bfa");
     assert(contentHash("a fairly long settings text that spans more than eight bytes") == "1a7f6a17e1f1d383");
+}
+
+// Project hooks run inside an active sandbox (user hooks don't); a project
+// hook that can't be sandboxed fails closed.
+version (OSX) unittest
+{
+    import nano.sandbox : SandboxMode;
+    import nano.paths : canonicalize;
+    import std.file : mkdirRecurse, rmdirRecurse, exists, getcwd;
+    import std.process : thisProcessID;
+    auto base = getcwd ~ format("/.dub/hook-sbx-%s", thisProcessID);
+    auto ws = base ~ "/ws", outside = base ~ "/out";
+    mkdirRecurse(ws);
+    mkdirRecurse(outside);
+    scope (exit) rmdirRecurse(base);
+    Hook hook(Source src, string file)
+    {
+        Hook h;
+        h.event = Event.userPromptSubmit;
+        h.command = format("echo x > %s/%s; echo x > inside-%s; exit 0", outside, file, file);
+        h.timeout = 10.seconds;
+        h.source = src;
+        return h;
+    }
+    auto m = new HookManager([hook(Source.project, "project"), hook(Source.userClaude, "user")], ws);
+    m.sandbox.mode = SandboxMode.workspace;
+    m.sandbox.toolCaches = false;
+    m.runUserPromptSubmit("hi");
+    assert(exists(ws ~ "/inside-project") && exists(ws ~ "/inside-user"));
+    assert(!exists(outside ~ "/project"), "a sandboxed project hook wrote outside the workspace");
+    assert(exists(outside ~ "/user"), "user hooks run outside the sandbox");
+
+    // Exec form goes through the sandbox too, quoted.
+    Hook ex;
+    ex.event = Event.userPromptSubmit;
+    ex.command = "/bin/sh";
+    ex.args = ["-c", format("echo x > '%s/exec'; echo it's ok", outside)];
+    ex.hasArgs = true;
+    ex.timeout = 10.seconds;
+    ex.source = Source.project;
+    auto run = execute(ex, "{}", ws, m.sandbox);
+    assert(run.exited && !exists(outside ~ "/exec"), run.stdout_ ~ run.stderr_);
 }

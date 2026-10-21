@@ -27,6 +27,7 @@ import nano.shell : parse, Simple;
 import nano.cmdexpand;
 import nano.guard;
 import nano.paths;
+import nano.sandbox : SandboxConfig, modeName;
 
 enum string blockAdvice = "Do not try to get around this with a different command or a script. "
     ~ "If the action is really needed, stop and tell the user what you want to run and why, so they can run it "
@@ -234,6 +235,8 @@ struct Policy
     bool builtinRules = true;
     string[] protectedBranches = ["main", "master", "trunk", "develop"];
     Mode mode = Mode.normal;
+    /// File-tool writes stay inside the sandbox's writable roots.
+    SandboxConfig sandbox;
 
     /// Build from the `[permissions]` table; throws RuleError on a bad rule.
     static Policy fromConfig(JSONValue section) @trusted
@@ -282,6 +285,12 @@ struct Policy
                     if (rule.appliesTo(tool)
                         && (pathRuleMatches(rule, absolute, cwd) || pathRuleMatches(rule, resolved, cwd)))
                         return format("rule `%s` denies %s on %s", rule.source, tool, absolute);
+                // Check the symlink-resolved target too: `link/../etc/hosts`
+                // (link -> /) is lexically inside but writes /etc/hosts.
+                if (tool != "read_file" && sandbox.active)
+                    foreach (p; [absolute, resolved])
+                        if (!sandbox.allowsWrite(p, cwd))
+                            return format("%s is outside the %s sandbox's writable directories", p, sandbox.mode.modeName);
                 return null;
             case "grep", "glob":
                 auto root = stringArg(args, "path");
