@@ -543,6 +543,7 @@ int main(string[] args)
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     agent.planTools = cfg.planTools;
     agent.outcomeTool = cfg.outcomeTool;
+    agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;
     if (o.plan) agent.control.mode = AgentMode.plan;
     HookManager loadHooks(string dir)

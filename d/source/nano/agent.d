@@ -11,7 +11,8 @@ import nano.llm;
 import nano.tools;
 import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer;
 import nano.mode : AgentMode, planAllows;
-import nano.goal : Outcome, OutcomeError, outcomeToolName = toolName, outcomeDefinition = definition;
+import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolName, outcomeDefinition = definition;
+import nano.reminders : Reminders, wrap;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
@@ -36,6 +37,10 @@ string wrapReminder(string text)
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }
+
+/// The result for calls skipped after the loop detector's hard stop.
+enum string loopStoppedToolResult =
+    "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 
 /// Why a turn ended (ACP `stopReason`).
 /// The turn cap for runs nobody can answer a "keep going?" prompt in.
@@ -120,6 +125,8 @@ class Agent
         if (resetControl) control.startTurn();
         stopBlocks = 0;
         hasOutcome = hasReported = false;
+        reminders.outcomeTool = outcomeTool;
+        reminders.startTurn();
         if (hooks !is null)
         {
             syncHookSession();
@@ -228,13 +235,36 @@ class Agent
                 lastStop = cut ? StopReason.maxTokens : StopReason.endTurn;
                 return last;
             }
+            string loopStop;
             foreach (call; r.toolCalls)
             {
                 ev.toolStart(call);
                 bool isError = true;
-                auto result = control.isCancelled ? cancelledToolResult : runTool(call, r.stopReason, isError);
+                string result;
+                if (control.isCancelled) result = cancelledToolResult;
+                else if (loopStop !is null) result = loopStoppedToolResult;
+                else
+                {
+                    result = runTool(call, r.stopReason, isError);
+                    if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
+                }
                 ev.toolEnd(call, result, isError);
                 push(Message.toolResult(call.id, call.name, result, isError));
+            }
+            if (loopStop !is null)
+            {
+                // The loop detector's hard stop: end the turn as blocked rather
+                // than burning budget until the turn cap.
+                reported = Outcome(OutcomeStatus.blocked, loopStop);
+                auto response = reported.response;
+                push(Message.assistant(response, null));
+                ev.text(false, response);
+                ev.assistantMessage(response, null);
+                lastOutcome = reported;
+                hasOutcome = true;
+                hasReported = false;
+                lastStop = StopReason.endTurn;
+                return response;
             }
             if (hasReported)
             {
@@ -269,6 +299,32 @@ class Agent
         ev.text(false, "\n" ~ note);
         lastStop = StopReason.maxTurnRequests;
         return (last ~ "\n" ~ note).stripLeft;
+    }
+
+    /// System reminders for one finished call: plan/memory nudges and the
+    /// loop detector, whose hard stop sets `loopStop`. Returns text to append.
+    private string remind(const ref ToolCall call, bool ok, string result, ref string loopStop)
+    {
+        if ((planTools && isPlanTool(call.name)) || (outcomeTool && call.name == outcomeToolName))
+        {
+            // Never counted, but they break a repeat streak.
+            reminders.resetRepeat();
+            return null;
+        }
+        import nano.memory : saveTool;
+        if (ok && call.name == saveTool) reminders.memorySaved();
+        string extra;
+        foreach (note; reminders.afterToolCall(plan, tools.has(saveTool))) extra ~= "\n\n" ~ wrap(note);
+        auto v = reminders.afterRepeatCall(call.name, call.arguments,
+                call.invalidArguments.length ? call.invalidArguments : null, ok, result ~ extra);
+        if (v.warning) extra ~= "\n\n" ~ wrap(v.text);
+        else if (v.hardStop)
+        {
+            extra ~= "\n\n" ~ wrap("This call already ran, but it has repeated too many times: the turn is ending "
+                    ~ "as blocked and any further retries are being stopped. Do not retry it.");
+            loopStop = v.text;
+        }
+        return extra;
     }
 
     private string cancelled(AgentEvents ev)
@@ -348,6 +404,9 @@ class Agent
 
     /// Offer `report_outcome` (config `outcome_tool`).
     bool outcomeTool = true;
+    /// System reminders and the loop detector (config `reminders`).
+    bool remindersEnabled = true;
+    private Reminders reminders;
     /// Asks the user (question tool, turn-cap prompt); null or not
     /// interactive means headless: a hard cap and no prompts.
     QuestionBroker questions;
@@ -396,6 +455,7 @@ class Agent
 
     private void planChanged()
     {
+        reminders.planChanged();
         if (log !is null) log.plan(plan.toJSON);
         if (onPlanChanged !is null) onPlanChanged();
     }
@@ -667,4 +727,32 @@ unittest
     assert(mock.toolsSeen[$ - 1].canFind("plan_add"));
     // The in-flight backstop.
     assert(agent.messages[$ - 2].content == "echo is disabled in plan mode (read-only)");
+}
+
+// The loop detector warns on repeated identical calls, then ends the turn as
+// blocked and skips the rest of the batch.
+unittest
+{
+    import std.algorithm : startsWith, canFind;
+    import nano.providers.mock;
+    LLMResponse same(string id, size_t n = 1)
+    {
+        ToolCall[] calls;
+        foreach (i; 0 .. n) calls ~= ToolCall.fromRaw(format("%s-%s", id, i), "nope", `{"a":1}`);
+        return LLMResponse("", "", calls);
+    }
+    auto mock = new MockClient([same("c1"), same("c2"), same("c3"), same("c4"), same("c5", 2), LLMResponse("never")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    auto answer = agent.run("go", new NullEvents);
+    assert(answer.startsWith("Blocked: the model repeated the same `nope` call 5 times"), answer);
+    assert(agent.hasOutcome && mock.seen.length == 5);
+    assert(agent.messages[$ - 2].content == loopStoppedToolResult, agent.messages[$ - 2].content);
+    assert(agent.messages[$ - 3].content.canFind("Do not retry it."));
+    bool warned;
+    foreach (m; agent.messages) if (m.content.canFind("try something different, or call report_outcome")) warned = true;
+    assert(warned);
+    // Disabled, the loop runs into the turn cap instead.
+    mock.script = [same("d1"), same("d2"), same("d3"), same("d4"), same("d5"), same("d6"), LLMResponse("done")];
+    agent.remindersEnabled = false;
+    assert(agent.run("again", new NullEvents) == "done");
 }

@@ -130,6 +130,8 @@ struct Config
     bool planTools = true;
     /// Offer `report_outcome` (`outcome_tool`, default on).
     bool outcomeTool = true;
+    /// System reminders and the repeated-call loop detector.
+    bool reminders = true;
     bool disableHooks;
     bool disableProjectHooks;
     bool claudeUserHooks = true;
@@ -163,6 +165,7 @@ struct Config
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
         if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
         if (auto v = "outcome_tool" in doc) c.outcomeTool = v.boolean;
+        if (auto v = "reminders" in doc) c.reminders = v.boolean;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;
