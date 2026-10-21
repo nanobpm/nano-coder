@@ -11,6 +11,7 @@ import std.stdio : File;
 import core.time : seconds, msecs, Duration, MonoTime;
 import core.thread : Thread;
 import nano.tools;
+import nano.control : cancelRequested;
 import nano.llm : ToolDefinition;
 
 enum long defaultTimeoutSecs = 600;
@@ -44,6 +45,7 @@ struct BashResult
     string stderr_;
     int exitCode;
     bool timedOut;
+    bool cancelled;
 }
 
 BashResult run(string command, Duration timeout, string cwd = null)
@@ -74,12 +76,14 @@ BashResult run(string command, Duration timeout, string cwd = null)
             r.exitCode = st.status;
             break;
         }
-        if (MonoTime.currTime >= deadline)
+        bool cancelled = cancelRequested();
+        if (cancelled || MonoTime.currTime >= deadline)
         {
             import core.sys.posix.signal : kill, SIGKILL;
             kill(-pid.processID, SIGKILL);
             r.exitCode = wait(pid);
-            r.timedOut = true;
+            r.cancelled = cancelled;
+            r.timedOut = !cancelled;
             break;
         }
         Thread.sleep(20.msecs);
@@ -105,7 +109,8 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs)
     auto e = truncateOutput(r.stderr_, cast(size_t) limit, "bash-stderr");
     if (o.length) text ~= o;
     if (e.length) text ~= (text.length && text[$ - 1] != '\n' ? "\n" : "") ~ "\nStderr:\n" ~ e;
-    if (r.timedOut) text ~= format("\n\n[killed after %s seconds; raise timeout_seconds if it needs longer]", secs);
+    if (r.cancelled) text ~= "\n\nError: the turn was cancelled; the command was killed";
+    else if (r.timedOut) text ~= format("\n\n[killed after %s seconds; raise timeout_seconds if it needs longer]", secs);
     else if (r.exitCode != 0) text ~= format("\n\nExit code: %s", r.exitCode);
     if (!text.length) text = "(no output)";
     return text;

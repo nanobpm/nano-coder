@@ -3,6 +3,7 @@
 module nano.http;
 
 import std.net.curl : HTTP, CurlException;
+import nano.control : cancelRequested, Cancelled;
 import std.json;
 import std.format : format;
 import std.string : indexOf, strip, startsWith, toLower;
@@ -54,6 +55,9 @@ int perform(const ref Request req, out string body_, scope void delegate(const(c
         auto payload = cast(const(void)[]) req.body_;
         http.postData = payload;
     }
+    // A cancelled turn aborts the transfer (libcurl polls this about once a second
+    // and on every chunk).
+    http.onProgress = (size_t a, size_t b, size_t c, size_t d) => cancelRequested() ? 1 : 0;
     char[] buf;
     http.onReceive = (ubyte[] data) {
         buf ~= cast(char[]) data;
@@ -92,9 +96,10 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         }
         catch (CurlException e)
         {
+            if (cancelRequested()) throw new Cancelled;
             if (attempt < maxRetries && !received)
             {
-                Thread.sleep(backoff);
+                pause(backoff);
                 backoff = backoff * 2;
                 continue;
             }
@@ -107,11 +112,23 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         }
         if (attempt < maxRetries && retryable(status))
         {
-            Thread.sleep(backoff);
+            pause(backoff);
             backoff = backoff * 2;
             continue;
         }
         throw new ApiError(status, text, what);
+    }
+}
+
+/// Sleep for a retry backoff, cut short (with Cancelled) by a cancel.
+private void pause(Duration d)
+{
+    import core.time : MonoTime;
+    auto until = MonoTime.currTime + d;
+    while (MonoTime.currTime < until)
+    {
+        if (cancelRequested()) throw new Cancelled;
+        Thread.sleep(50.msecs);
     }
 }
 

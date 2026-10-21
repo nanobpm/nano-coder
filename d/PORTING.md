@@ -35,6 +35,7 @@ which macOS and most Linux distributions already have.
 | `nano/guard.d` | `permissions.rs` 2549–3320 | The built-in guards: root/home/workspace deletes, devices, protected branches, databases, `cd` tracking. |
 | `nano/permissions.d` | `permissions.rs` 1–547 | Rules (`Bash`/`Read`/`Edit`/tool names, `:*` prefixes, `**` paths), deny, then allow, then guards, `readDenied`, `ruleMatches`, `validateRule`. Also plan mode, which Rust handles in the agent. Bad rules are rejected at startup. |
 | `nano/permissions_test.d` | `permissions.rs` tests | 46 of the 47 Rust tests, translated one to one. `sandbox_confines_file_tools` is left out (no sandbox). |
+| `nano/control.d` | `TurnControl` in `agent.rs` | Cancel and steer. Ctrl-C cancels a running turn: libcurl aborts through its progress callback, bash kills the process group, and remaining tool calls are recorded as cancelled. In a TTY, a line typed mid-turn becomes a steer that joins the next model call; if it arrives too late it runs as the next prompt. A `/command` waits for the turn to end. |
 | `nano/session.d` | `session.rs`, `resume.rs` (partly), `instructions.rs` (partly) | JSONL logs, `--resume [id\|last]`, and AGENTS.md/CLAUDE.md from the git root down to the cwd, plus `~/.config/nano-coder/AGENTS.md`. |
 | `nano/agent.d` | `agent.rs` (core loop only) | Runs model call → tools → results until done or `max_iterations`. It gives specific advice for invalid arguments, unknown tools and blocked calls. |
 | `app.d` | `main.rs`, `ui.rs` (minimal) | Flags: `--model`, `--config`, `-p`, `--resume`, `--plan`, `--allow`, `--deny`, `--list-models`, `--no-session`, `--verbose`, `--version`. A plain readln REPL with `/model`, `/plan`, `/normal`, `/clear`, `/usage` and `/quit`. Piped stdin runs one prompt per line. |
@@ -64,7 +65,7 @@ Roughly in dependency order. Sizes are Rust lines.
 1. **Agent loop features** (`agent.rs`, 11.1k). Context accounting and
    auto-compaction (`context.rs` 0.7k, `history.rs` 0.6k for smart compaction's
    history tools), system reminders (`reminders.rs` 1.8k), turn caps and
-   modes (`mode.rs`), cancel/steer (`queue.rs` 0.3k), and `report_outcome`
+   modes (`mode.rs`), the editable `/queue` (`queue.rs` 0.3k), and `report_outcome`
    (`goal.rs`).
 2. **Permissions vs. sandbox.** The parser and guards are fully ported, but file-tool writes are not held to sandbox roots, and the search tools don't call `readDenied` for each file yet.
 3. **Sandbox** (`sandbox.rs` 0.8k): Seatbelt on macOS, Landlock on Linux.

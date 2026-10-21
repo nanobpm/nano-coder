@@ -20,6 +20,10 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
+import nano.control : TurnControl;
+import core.atomic : atomicLoad, atomicStore;
+import core.sync.mutex : Mutex;
+import core.sync.condition : Condition;
 
 enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTING.md)";
 
@@ -31,7 +35,8 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
-REPL commands: /help /model [spec] /plan /normal /clear /usage /quit`;
+REPL commands: /help /model [spec] /plan /normal /clear /usage /quit
+Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
@@ -92,6 +97,77 @@ bool isTerminal(int fd)
 }
 
 /// Renders agent events on the terminal.
+// Ctrl-C handling: cancel the running turn, or exit when idle.
+__gshared TurnControl gControl;
+shared bool gTurnRunning;
+
+extern (C) void onInterrupt(int) nothrow @nogc @system
+{
+    import core.sys.posix.unistd : write, _exit;
+    if (atomicLoad(gTurnRunning) && gControl !is null)
+    {
+        gControl.cancel();
+        enum msg = "\n[cancelling...]\n";
+        write(2, msg.ptr, msg.length);
+    }
+    else _exit(130);
+}
+
+/// Lines read from the terminal on a background thread, so the user can
+/// steer a running turn: a line typed mid-turn goes to the agent before its
+/// next step; a `/command` waits for the turn to finish.
+final class Inbox
+{
+    private Mutex lock;
+    private Condition ready;
+    private string[] lines;
+    private bool eof;
+
+    this() { lock = new Mutex; ready = new Condition(lock); }
+
+    void put(string line, bool front = false)
+    {
+        lock.lock();
+        scope (exit) lock.unlock();
+        if (line is null) eof = true;
+        else lines = front ? line ~ lines : lines ~ line;
+        ready.notify();
+    }
+
+    /// The next line, or null at end of input.
+    string take()
+    {
+        lock.lock();
+        scope (exit) lock.unlock();
+        while (!lines.length && !eof) ready.wait();
+        if (!lines.length) return null;
+        auto l = lines[0];
+        lines = lines[1 .. $];
+        return l;
+    }
+
+    void readLoop(Console console)
+    {
+        for (;;)
+        {
+            auto line = readln();
+            if (line is null) { put(null); return; }
+            auto text = line.strip;
+            if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
+            {
+                gControl.steer(text);
+                stderr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+            }
+            else
+            {
+                if (atomicLoad(gTurnRunning) && text.length)
+                    stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+                put(text);
+            }
+        }
+    }
+}
+
 class Console : AgentEvents
 {
     bool color, verbose;
@@ -137,6 +213,7 @@ class Console : AgentEvents
     }
 
     void usage(TokenUsage u) {}
+    void userMessage(string text) { endLine(); writeln(dim("↪ " ~ text)); }
 
     static string summary(const ref ToolCall c)
     {
@@ -261,32 +338,54 @@ int main(string[] args)
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose);
 
+    gControl = agent.control;
+    {
+        import core.sys.posix.signal : sigaction, sigaction_t, SIGINT, sigemptyset;
+        sigaction_t sa;
+        sa.sa_handler = &onInterrupt;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, null);
+    }
+    Inbox inbox;
+
     bool turn(string input)
     {
-        try
-        {
-            agent.run(input, console);
-            console.endLine();
-            return true;
-        }
+        atomicStore(gTurnRunning, true);
+        scope (exit) atomicStore(gTurnRunning, false);
+        bool ok = true;
+        try agent.run(input, console);
         catch (Exception e)
         {
             console.endLine();
             stderr.writeln(console.red("error: " ~ e.msg));
-            return false;
+            ok = false;
         }
+        console.endLine();
+        // Steers that arrived after the agent's last step run as the next prompts.
+        auto late = agent.control.takePending;
+        if (inbox !is null)
+            foreach_reverse (t; late) inbox.put(t, true);
+        return ok;
     }
 
     if (o.prompt.length) return turn(o.prompt) ? 0 : 1;
 
     bool interactive = isTerminal(0);
     if (interactive)
+    {
+        import core.thread : Thread;
+        inbox = new Inbox;
+        auto reader = new Thread(() => inbox.readLoop(console));
+        reader.isDaemon = true;
+        reader.start();
+    }
+    if (interactive)
         writefln("%s\n%s/%s · %s · /help for commands", console.bold("nano-coder-d"), client.providerName,
                 client.modelName, cwd);
     for (;;)
     {
         if (interactive) { write(console.bold("\n› ")); stdout.flush(); }
-        auto line = readln();
+        auto line = inbox !is null ? inbox.take() : readln();
         if (line is null) break;
         auto input = line.strip;
         if (!input.length) continue;
