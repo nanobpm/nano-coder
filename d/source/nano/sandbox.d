@@ -1,5 +1,5 @@
-/// OS sandbox for shell commands: Seatbelt (`sandbox-exec`) on macOS
-/// (port of `sandbox.rs`).
+/// OS sandbox for shell commands: Seatbelt (`sandbox-exec`) on macOS and
+/// Landlock (`nano/landlock.d`) on Linux (port of `sandbox.rs`).
 ///
 /// Commands can read everywhere but write only to the working directory (in
 /// `workspace` mode), its git directories, temp directories, package-manager
@@ -8,8 +8,8 @@
 /// localhost.
 ///
 /// The sandbox fails closed: when it is enabled but can't be applied (no
-/// `sandbox-exec`, or Linux, whose Landlock backend isn't ported), the command
-/// does not run.
+/// `sandbox-exec`, or a kernel without Landlock ABI 3, or ABI 4 when the
+/// network is blocked), the command does not run.
 module nano.sandbox;
 
 import std.algorithm : canFind, any, filter, count;
@@ -19,6 +19,9 @@ import std.json;
 import std.string : startsWith, endsWith, replace, strip, splitLines;
 
 import nano.paths : canonicalize, homeDir, isDir, joinPath, normalize;
+
+version (OSX) version = HasOsSandbox;
+version (linux) version = HasOsSandbox;
 
 @safe:
 
@@ -218,8 +221,14 @@ struct SandboxConfig
             if (!exists(sandboxExec)) throw new Exception("sandbox unavailable: " ~ sandboxExec ~ " not found");
             return [sandboxExec, "-p", profile(writableRoots(cwd)), shell, "-c", script];
         }
+        else version (linux)
+        {
+            import nano.landlock : check, argv;
+            if (auto e = check(network)) throw new Exception(e);
+            return argv(network, writableRoots(cwd), shell, script);
+        }
         else
-            throw new Exception("sandbox unavailable: the D build only supports the macOS sandbox (Landlock isn't ported)");
+            throw new Exception("sandbox unavailable on this platform");
     }
 
     /// The Seatbelt profile for `roots`.
@@ -374,7 +383,7 @@ version (unittest)
     assert(c.mode == SandboxMode.readOnly && !c.network && c.toolCaches);
 }
 
-version (OSX) @trusted unittest // workspace mode confines writes
+version (HasOsSandbox) @trusted unittest // workspace mode confines writes
 {
     import std.file : write, exists;
     auto ws = outsideDir(), other = outsideDir();
@@ -397,7 +406,7 @@ version (OSX) @trusted unittest // workspace mode confines writes
     assert(!c.allowsWrite("../x", ws));
 }
 
-version (OSX) @trusted unittest // read-only mode blocks workspace writes
+version (HasOsSandbox) @trusted unittest // read-only mode blocks workspace writes
 {
     import std.file : exists;
     auto ws = outsideDir();
@@ -412,7 +421,7 @@ version (OSX) @trusted unittest // read-only mode blocks workspace writes
     assert(!c.allowsWrite("inside.txt", ws));
 }
 
-version (OSX) @trusted unittest // extra writable paths
+version (HasOsSandbox) @trusted unittest // extra writable paths
 {
     import std.file : exists;
     auto ws = outsideDir(), extra = outsideDir();
@@ -479,7 +488,7 @@ version (OSX) @trusted unittest // extra writable paths
     assert(c.writableRoots(wt).any!(r => within(r, common)), c.writableRoots(wt).join(" "));
 }
 
-version (OSX) @trusted unittest // the OS sandbox contains what the static guard can't see
+version (HasOsSandbox) @trusted unittest // the OS sandbox contains what the static guard can't see
 {
     import std.file : exists;
     auto ws = outsideDir(), other = outsideDir();

@@ -1187,6 +1187,8 @@ unittest // nano [hooks] and ~/.claude/settings.json load alongside the project;
 
 unittest // unreadable_settings_file_is_reported_not_silently_skipped
 {
+    import core.sys.posix.unistd : geteuid;
+    if (geteuid() == 0) return; // root reads mode-0 files
     auto dir = tdir("unreadable");
     auto m0 = loadProject(dir, `{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}`);
     auto settings = buildPath(dir, ".claude", "settings.json");
