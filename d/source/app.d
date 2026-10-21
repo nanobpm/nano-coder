@@ -43,6 +43,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
                     [--allow RULE]... [--deny RULE]...
                     [--no-session] [--no-hooks] [--verbose] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
+       nano-coder-d --trajectory SESSION_ID [--json|--markdown]
        nano-coder-d --list-models PROVIDER[/model]
        nano-coder-d --login github-copilot|muse
        nano-coder-d --version
@@ -50,13 +51,13 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /mode [normal|plan] /clear /usage /memory [forget ID] /hooks /tools /skills /session /quit
+REPL commands: /help /model [spec] /plan /mode [normal|plan] /clear /usage /memory [forget ID] /hooks /tools /skills /session /resume /trajectory /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
-    string model, configPath, prompt, resume, listModels, sandbox, login;
-    bool plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    string model, configPath, prompt, resume, listModels, sandbox, login, trajectory;
+    bool markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
 
@@ -89,6 +90,8 @@ Options parseArgs(string[] args)
             case "--list-sessions": o.listSessions = true; break;
             case "--all": o.all = true; break;
             case "--json": o.json = true; break;
+            case "--markdown": o.markdown = true; break;
+            case "--trajectory": o.trajectory = value(); break;
             case "--no-session": o.noSession = true; break;
             case "--no-hooks": o.noHooks = true; break;
             case "--verbose", "-v": o.verbose = true; break;
@@ -103,7 +106,12 @@ Options parseArgs(string[] args)
             default: die("unknown argument " ~ a ~ "\n\n" ~ usage);
         }
     }
-    if ((o.all || o.json) && !o.listSessions) die("--all and --json require --list-sessions");
+    if (o.json && o.markdown) die("--json and --markdown are mutually exclusive");
+    if (o.markdown && o.trajectory is null) die("--markdown requires --trajectory <id>");
+    if (o.json && o.trajectory is null && !o.listSessions) die("--json requires --trajectory <id> or --list-sessions");
+    if (o.all && !o.listSessions) die("--all requires --list-sessions");
+    if (o.listSessions && o.trajectory !is null) die("--list-sessions and --trajectory are mutually exclusive");
+    if (o.hasResume && o.trajectory !is null) die("--resume and --trajectory are mutually exclusive");
     if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length))
         die("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
     if (o.hasResume && o.login.length) die("--resume and --login are mutually exclusive");
@@ -145,6 +153,35 @@ int printSessions(bool all, bool json)
     try printList(sessionDir, getcwd(), all, json);
     catch (Exception e) die(e.msg);
     return 0;
+}
+
+/// `--trajectory ID [--json|--markdown]`: a saved session's turn-by-turn ledger.
+int printTrajectory(string id, bool json, bool markdown)
+{
+    import nano.session : validateId;
+    import std.path : buildPath;
+    static import nano.trajectory;
+    try
+    {
+        validateId(id);
+        auto t = nano.trajectory.load(buildPath(sessionDir, id ~ ".jsonl"), id);
+        if (json) writeln(t.toJson);
+        else if (markdown) writeln(t.toMarkdown);
+        else showTrajectory(t);
+    }
+    catch (Exception e) die(e.msg);
+    return 0;
+}
+
+/// Print the plain ledger, or page it when both ends are a terminal and it
+/// doesn't fit on one screen.
+void showTrajectory(const ref nano.trajectory.Trajectory t)
+{
+    static import nano.trajectory;
+    auto text = t.toPlain;
+    auto size = nano.trajectory.terminalSize(1);
+    bool pageable = isTerminal(0) && isTerminal(1) && size[0] && nano.trajectory.needsPager(text, size[0], size[1]);
+    if (!(pageable && nano.trajectory.page(text))) writeln(text);
 }
 
 noreturn die(string msg)
@@ -533,6 +570,7 @@ int runMain(string[] args)
     }
     catch (Exception e) die(e.msg);
 
+    if (o.trajectory !is null) return printTrajectory(o.trajectory, o.json, o.markdown);
     if (o.listSessions) return printSessions(o.all, o.json);
     if (o.hasResume && (o.resume == "" || o.resume == "last"))
     {
@@ -1016,6 +1054,23 @@ int runMain(string[] args)
                     try loadSession(path);
                     catch (Exception e) { writeln(e.msg); continue; }
                     writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    continue;
+                }
+                case "/trajectory":
+                {
+                    static import nano.trajectory;
+                    if (agent.log is null) { writeln("Session persistence is disabled: no trajectory to show"); continue; }
+                    if (arg.length && arg != "--json" && arg != "--markdown" && arg != "--md")
+                    {
+                        writefln("Unknown option %s; use /trajectory [--json|--markdown]", JSONValue(arg).toString);
+                        continue;
+                    }
+                    nano.trajectory.Trajectory t;
+                    try t = nano.trajectory.load(agent.log.path);
+                    catch (Exception e) { writeln("Could not read the session log: ", e.msg); continue; }
+                    if (arg == "--json") writeln(t.toJson);
+                    else if (arg.length) writeln(t.toMarkdown);
+                    else showTrajectory(t);
                     continue;
                 }
                 case "/session":

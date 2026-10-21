@@ -56,7 +56,7 @@ struct Summary
     /// Fields in serde order as (key, JSON value); unset optional fields are omitted.
     string[2][] fields() const
     {
-        static string q(string s) { return JSONValue(s).toString(JSONOptions.doNotEscapeSlashes); }
+        static string q(string s) { import nano.trajectory : serdeString; return serdeString(s); }
         string[2][] f = [["id", q(id)]];
         void opt(string key, string v)
         {

@@ -65,7 +65,7 @@ void validateId(string id)
         && id.all!(c => c.isAlphaNum || c == '-' || c == '_' || c == '.');
     if (!ok)
         throw new Exception(format("invalid session id %s: use 1-128 of [A-Za-z0-9._-], not starting with '.'",
-            JSONValue(id).toString));
+            JSONValue(id).toString(JSONOptions.doNotEscapeSlashes)));
 }
 
 /// A message as a session-log record body (Rust's serde form of `Message`).
