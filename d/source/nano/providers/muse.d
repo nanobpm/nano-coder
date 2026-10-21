@@ -192,6 +192,15 @@ class MuseClient : LLMClient, CapabilityProbe
             if (levels.length) c.thinking = Reported(levels, false, Format.effort);
         }
         if (museVision(row)) c.vision = Vision.capable();
+        {
+            import nano.muse : contextLimit, outputLimit;
+            c.maxOutput = cast(size_t) outputLimit(row);
+            if (auto w = contextLimit(row))
+            {
+                c.window = cast(size_t) w;
+                c.windowSource = "Muse /muse-code/models context_limit";
+            }
+        }
         return c;
     }
 }

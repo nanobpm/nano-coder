@@ -538,7 +538,7 @@ final class AcpServer : AgentEvents
             auto th = agent.thinking();
             s["thinking"] = wireValue(th);
             s["thinking_source"] = label(th.source);
-            s["max_tokens"] = agent.maxTokens;
+            s["max_tokens"] = agent.effectiveMaxTokens;
             s["system_prompt"] = host.configSystemPrompt is null ? JSONValue(null) : JSONValue(host.configSystemPrompt);
             s["session_id"] = sessionId is null ? JSONValue(null) : JSONValue(sessionId);
             return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "settings": s]));

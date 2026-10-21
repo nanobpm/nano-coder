@@ -8,6 +8,7 @@ import std.format : format;
 import std.string : stripRight, strip, startsWith, endsWith;
 import std.math : isNaN;
 import std.algorithm : canFind, sort;
+import std.array : join;
 import nano.llm;
 import nano.http;
 import nano.config;
@@ -248,6 +249,9 @@ class OpenAIClient : LLMClient, CapabilityProbe
             || host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
     }
 
+    /// Copilot reads its window from `capabilities.limits` instead.
+    protected bool copilotLimits() { return false; }
+
     /// Thinking levels and vision from `/models`, then (by server) llama.cpp
     /// `/props` or Ollama `/api/show` (port of `detect_capabilities`).
     Capabilities probeCapabilities() @trusted
@@ -259,33 +263,49 @@ class OpenAIClient : LLMClient, CapabilityProbe
         if (!shouldProbe()) return c;
         auto base = baseUrl;
         auto root = base.length > 3 && base[$ - 3 .. $] == "/v1" ? base[0 .. $ - 3] : base;
-        auto models = probe(base ~ "/models");
-        JSONValue entry;
-        if (models.type == JSONType.object)
-            if (auto d = "data" in models)
-                if (d.type == JSONType.array)
-                    foreach (m; d.array)
-                        if (m.type == JSONType.object)
-                            if (auto id = "id" in m) if (id.type == JSONType.string && id.str == p.model) { entry = m; break; }
+        auto entry = modelEntry(probe(base ~ "/models"), p.model);
         if (entry.type == JSONType.object)
         {
             c.thinking = Reported.fromModelEntry(entry);
             c.vision = Vision.fromModelEntry(entry);
+            if (copilotLimits) copilotWindow(entry, c);
+            else
+            {
+                c.maxOutput = outputLimitInEntry(entry);
+                windowInEntry(entry, c);
+            }
         }
         string owner;
         if (entry.type == JSONType.object)
             if (auto o = "owned_by" in entry) if (o.type == JSONType.string) owner = o.str;
+        if (copilotLimits) return c;
         if (owner == "llamacpp" || p.name == "llamacpp")
         {
             auto props = probe(root ~ "/props?model=" ~ encodeComponent(p.model));
             if (c.thinking.isNull) c.thinking = Reported.fromLlamacppProps(props);
             if (c.vision.isNull) c.vision = Vision.fromLlamacppProps(props);
+            if (!c.window)
+            {
+                auto n = tokensAt(props, ["default_generation_settings", "n_ctx"]);
+                if (!n) n = tokensAt(props, ["n_ctx"]);
+                if (n) { c.window = n; c.windowSource = "llama.cpp /props n_ctx"; }
+            }
         }
         else if (p.name == "ollama" || root.endsWith(":11434") || owner == "library" || owner == "ollama")
         {
             auto show = probe(root ~ "/api/show", JSONValue(["model": p.model]).toString);
             if (c.thinking.isNull) c.thinking = Reported.fromOllamaShow(show);
             if (c.vision.isNull) c.vision = Vision.fromOllamaShow(show);
+            if (!c.window) ollamaWindow(probe(root ~ "/api/ps"), show, p.model, c);
+        }
+        else if (!c.window && (p.name == "lmstudio" || root.endsWith(":1234")))
+        {
+            auto listed = modelEntry(probe(root ~ "/api/v0/models"), p.model);
+            if (auto n = tokensAt(listed, ["loaded_context_length"]))
+            {
+                c.window = n;
+                c.windowSource = "LM Studio loaded_context_length";
+            }
         }
         return c;
     }
@@ -432,6 +452,8 @@ class CopilotClient : OpenAIClient
 
     override protected bool shouldProbe() { return true; }
 
+    override protected bool copilotLimits() { return true; }
+
     override protected string baseUrl()
     {
         ensureToken();
@@ -566,4 +588,146 @@ unittest
     assert(r2.reasoning == "hm" && r2.thinkingBlocks.length == 0);
     auto w = OpenAIClient.parseWhole(parseJSON(`{"choices":[{"message":{"content":"x","reasoning_content":"a","reasoning":"b"}}]}`), true);
     assert(w.reasoning == "a" && w.thinkingBlocks.length == 1);
+}
+
+/// The `/models` entry for `model`; a server listing a single model (such
+/// as ds4, which accepts aliases) is taken to be serving it.
+JSONValue modelEntry(JSONValue models, string model) @trusted
+{
+    JSONValue items = models;
+    if (models.type == JSONType.object)
+    {
+        auto d = "data" in models.object;
+        if (d is null) return JSONValue.init;
+        items = *d;
+    }
+    if (items.type != JSONType.array) return JSONValue.init;
+    foreach (m; items.array)
+        if (m.type == JSONType.object)
+            if (auto id = "id" in m.object)
+                if (id.type == JSONType.string && id.str == model) return m;
+    return items.array.length == 1 ? items.array[0] : JSONValue.init;
+}
+
+/// A positive integer at `path`, else 0.
+size_t tokensAt(JSONValue v, string[] path) @trusted
+{
+    foreach (k; path)
+    {
+        if (v.type != JSONType.object) return 0;
+        auto n = k in v.object;
+        if (n is null) return 0;
+        v = *n;
+    }
+    if (v.type == JSONType.integer && v.integer > 0) return cast(size_t) v.integer;
+    if (v.type == JSONType.uinteger && v.uinteger > 0) return cast(size_t) v.uinteger;
+    return 0;
+}
+
+/// The window listed on a `/models` entry (vLLM, OpenRouter, Groq, Mistral, ...).
+void windowInEntry(JSONValue entry, ref Capabilities c)
+{
+    static immutable string[][] paths = [["max_model_len"], ["loaded_context_length"], ["context_length"],
+        ["top_provider", "context_length"], ["context_window"], ["max_context_length"]];
+    foreach (path; paths)
+        if (auto n = tokensAt(entry, path.dup))
+        {
+            c.window = n;
+            c.windowSource = "/models " ~ path.join(".");
+            return;
+        }
+}
+
+/// The model's published output cap on its `/models` entry (0 = none).
+size_t outputLimitInEntry(JSONValue entry)
+{
+    static immutable string[][] paths = [["max_output_tokens"], ["max_completion_tokens"],
+        ["top_provider", "max_completion_tokens"], ["top_provider", "max_output_tokens"]];
+    foreach (path; paths)
+        if (auto n = tokensAt(entry, path.dup)) return n;
+    return 0;
+}
+
+/// Copilot: `max_prompt_tokens` caps the prompt alone (with the larger
+/// `max_context_window_tokens` as a second, combined limit).
+void copilotWindow(JSONValue entry, ref Capabilities c)
+{
+    auto limit = (string f) => tokensAt(entry, ["capabilities", "limits", f]);
+    auto prompt = limit("max_prompt_tokens"), combined = limit("max_context_window_tokens");
+    c.maxOutput = limit("max_output_tokens");
+    if (prompt)
+    {
+        c.window = prompt;
+        c.windowSource = "Copilot /models max_prompt_tokens";
+        c.promptCap = true;
+        c.totalWindow = combined;
+    }
+    else if (combined)
+    {
+        c.window = combined;
+        c.windowSource = "Copilot /models max_context_window_tokens";
+    }
+}
+
+/// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from
+/// the model's parameters (the model's maximum is not what Ollama runs with).
+void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c) @trusted
+{
+    import std.string : lineSplitter, strip;
+    import std.algorithm : startsWith;
+    import std.conv : to;
+    bool same(string n) { return n == model || n == model ~ ":latest"; }
+    if (ps.type == JSONType.object)
+        if (auto ms = "models" in ps.object)
+            if (ms.type == JSONType.array)
+                foreach (m; ms.array)
+                {
+                    bool hit;
+                    foreach (k; ["name", "model"])
+                        if (m.type == JSONType.object)
+                            if (auto v = k in m.object) if (v.type == JSONType.string && same(v.str)) hit = true;
+                    if (!hit) continue;
+                    if (auto n = tokensAt(m, ["context_length"]))
+                    {
+                        c.window = n;
+                        c.windowSource = "Ollama /api/ps context_length";
+                        return;
+                    }
+                    break;
+                }
+    if (show.type != JSONType.object) return;
+    auto params = "parameters" in show.object;
+    if (params is null || params.type != JSONType.string) return;
+    foreach (line; params.str.lineSplitter)
+    {
+        auto l = line.strip;
+        if (!l.startsWith("num_ctx")) continue;
+        try
+        {
+            auto n = l["num_ctx".length .. $].strip.to!size_t;
+            if (n > 0) { c.window = n; c.windowSource = "Ollama num_ctx"; return; }
+        }
+        catch (Exception) {}
+    }
+}
+
+unittest
+{
+    Capabilities c;
+    auto e = modelEntry(parseJSON(`{"data":[{"id":"other","max_model_len":1},{"id":"q","owned_by":"vllm","max_model_len":32768}]}`), "q");
+    windowInEntry(e, c);
+    assert(c.window == 32768 && c.windowSource == "/models max_model_len");
+    c = Capabilities.init;
+    windowInEntry(modelEntry(parseJSON(`{"data":[{"id":"x","top_provider":{"context_length":8192,"max_completion_tokens":4000}}]}`), "y"), c);
+    assert(c.window == 8192 && c.windowSource == "/models top_provider.context_length");
+    assert(outputLimitInEntry(parseJSON(`{"top_provider":{"max_completion_tokens":4000}}`)) == 4000);
+    c = Capabilities.init;
+    copilotWindow(parseJSON(`{"capabilities":{"limits":{"max_prompt_tokens":111,"max_context_window_tokens":200,"max_output_tokens":16000}}}`), c);
+    assert(c.window == 111 && c.promptCap && c.totalWindow == 200 && c.maxOutput == 16000);
+    c = Capabilities.init;
+    ollamaWindow(parseJSON(`{"models":[{"name":"qwen3:8b","context_length":8192}]}`), JSONValue.init, "qwen3:8b", c);
+    assert(c.window == 8192 && c.windowSource == "Ollama /api/ps context_length");
+    c = Capabilities.init;
+    ollamaWindow(JSONValue.init, parseJSON(`{"parameters":"temperature 0.6\nnum_ctx                        16384"}`), "qwen3:8b", c);
+    assert(c.window == 16384 && c.windowSource == "Ollama num_ctx");
 }

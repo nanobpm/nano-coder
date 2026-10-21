@@ -85,15 +85,21 @@ directory works; it's kept separate by default so the port can't damage real ses
 
 Roughly in dependency order. Sizes are Rust lines.
 
-1. ~~**Agent loop features**~~: modes and turn caps, `report_outcome`, `/queue`, reminders, context accounting with auto/smart compaction and the history tools are all ported. An output cap learned from a provider error (`max_tokens: N > M`) lowers later requests' `max_tokens` until `/model` switches. Rust also persists it per model; D does not yet (item 25).
+1. ~~**Agent loop features**~~: modes and turn caps, `report_outcome`, `/queue`, reminders, context accounting with auto/smart compaction and the history tools are all ported. An output cap learned from a provider error (`max_tokens: N > M`) lowers later requests' `max_tokens` until `/model` switches, as in Rust. Rust keeps it in memory only, like D. An error without a number halves the budget actually sent, with a floor of 1024.
 2. ~~**Permissions vs. sandbox**~~: file-tool writes are held to the sandbox's writable roots (lexical and symlink-resolved path), as in Rust.
 3. ~~**Sandbox**~~: Seatbelt done in `nano/sandbox.d`. Still to do: the Linux Landlock backend (until then the D build fails closed on Linux when a sandbox is configured).
 4. ~~**Providers**~~: OpenAI Responses, Copilot routing and login, Muse, Qwen, the
-   mock kind, retry classification and Rust's presets are done. Still to do: context-window
-   and output-cap detection from `/models` and the Muse catalog.
+   mock kind, retry classification and Rust's presets are done. Context-window and output-cap
+   detection are done too. Sources: `/models` (`max_model_len`, `context_length`, `top_provider.*`,
+   `context_window`, `max_context_length`, `max_output_tokens`/`max_completion_tokens`), Copilot
+   `capabilities.limits` (a prompt-only cap plus the combined window), llama.cpp `/props n_ctx`,
+   Ollama `/api/ps` / `num_ctx`, LM Studio `/api/v0/models` and the Muse catalog. D probes
+   synchronously at startup and after `/model`, and only Copilot, Muse and local endpoints;
+   Rust probes every provider in the background.
 5. ~~**Thinking, temperature and vision settings**~~: done (`nano/thinking.d`, `nano/temperature.d`, `nano/vision.d`).
-   Still differs: with no `max_tokens` configured, D sends none, while Rust sends the model's
-   published output cap or a large default (issue #114). D doesn't read the `/models` output cap.
+   With no `max_tokens` configured, D sends what Rust does (issue #114): the model's published
+   output cap, else a known cap for the model name (gpt-4o 16k, ...), else 32768. A learned cap
+   still clamps that, and the context window clamps it as well. `/settings` shows `auto (N)`.
 6. ~~**Image attachments**~~: done (`nano/attachment.d`; see the module table for the differences).
 7. ~~**Instructions, full version**~~: done (`nano/instructions.d`).
 8. ~~**Skills**~~, ~~**Memory**~~, ~~**plan tools**~~ and the ~~**question tool**~~: done (`nano/skills.d`, `nano/memory.d`, `nano/plan.d`, `nano/question.d`).

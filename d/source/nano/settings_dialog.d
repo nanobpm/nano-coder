@@ -116,7 +116,7 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h) @trusted
             "Add or edit a provider",
             format("Temperature      %s", a.temperatureNow.describe),
             format("Thinking         %s", a.thinking.describe),
-            format("Max tokens       %s", maxTokensLabel(cfg.maxTokens, a.maxTokens > 0 ? format("%s", a.maxTokens) : "model default")),
+            format("Max tokens       %s", maxTokensLabel(cfg.maxTokens, format("%s", a.effectiveMaxTokens))),
             format("Turn cap         %s", turnCapLabel(cfg.maxIterations)),
             "System prompt",
             format("Context          %s window, auto-compact %s, %s compaction", formatTokens(a.contextWindow),

@@ -164,6 +164,29 @@ unittest
 }
 
 /// Context window by model family, for models whose provider config has none.
+/// `max_tokens` when none is configured and the endpoint published no cap
+/// (issue #114): large enough for whole-file writes, still explicit.
+enum long defaultMaxOutputTokens = 32_768;
+
+/// A known output cap for a model whose `/models` doesn't publish one
+/// (most specific needle first).
+size_t outputLimitForModel(string model)
+{
+    import std.uni : toLower;
+    import std.algorithm : canFind;
+    auto m = model.toLower;
+    static immutable needles = ["gpt-4o", "gpt-4-turbo", "gpt-3.5"];
+    static immutable size_t[] limits = [16_384, 4_096, 4_096];
+    foreach (i, n; needles) if (m.canFind(n)) return limits[i];
+    return 0;
+}
+
+unittest
+{
+    assert(outputLimitForModel("GPT-4o-mini") == 16_384 && outputLimitForModel("gpt-4-turbo") == 4_096);
+    assert(outputLimitForModel("claude") == 0);
+}
+
 size_t windowForModel(string model)
 {
     static immutable string[] needles = ["claude", "gpt-4.1", "gpt-5", "gpt-4o", "o4-mini", "o3", "o1", "gemini",

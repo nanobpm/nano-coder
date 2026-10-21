@@ -272,6 +272,15 @@ struct Capabilities
     import nano.vision : Vision;
     Nullable!Reported thinking;
     Nullable!Vision vision;
+    /// The context window the endpoint reports (0 = none), and where from.
+    size_t window;
+    string windowSource;
+    /// `window` caps the prompt alone (Copilot `max_prompt_tokens`); output
+    /// tokens don't consume it. `totalWindow` is then the combined window, if known.
+    bool promptCap;
+    size_t totalWindow;
+    /// The model's published output-token cap (0 = none).
+    size_t maxOutput;
 }
 
 /// A client that can ask its endpoint what the model supports.

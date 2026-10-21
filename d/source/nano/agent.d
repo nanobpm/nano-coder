@@ -402,14 +402,20 @@ class Agent
                 catch (Exception e)
                 {
                     if (control.isCancelled) return cancelled(ev);
-                    if (!capRetried && maxTokens > 0 && ctx.isOutputCapError(e.msg) && !ctx.isContextOverflow(e.msg))
+                    if (!capRetried && ctx.isOutputCapError(e.msg) && !ctx.isContextOverflow(e.msg))
                     {
-                        // The provider caps output below max_tokens: learn it and retry.
-                        auto cap = ctx.outputCapFromError(e.msg);
-                        if (cap > 0 && (learnedMaxOutput == 0 || cap < learnedMaxOutput))
+                        // The provider caps output below the max_tokens this request
+                        // sent: learn the cap (else halve what was sent) and retry once.
+                        capRetried = true;
+                        long sent = req.maxTokens;
+                        long cap = ctx.outputCapFromError(e.msg);
+                        if (cap <= 0) cap = sent / 2 > 1_024 ? sent / 2 : 1_024;
+                        if (cap < 256) cap = 256;
+                        if (cap < sent)
                         {
-                            capRetried = true;
                             learnedMaxOutput = cap;
+                            import std.stdio : stderr;
+                            stderr.writefln("[agent] output-limit rejection (%s); retrying with max_tokens=%s", e.msg, cap);
                             continue;
                         }
                     }
@@ -590,6 +596,7 @@ class Agent
     {
         size_t w;
         if (configuredWindow) { w = configuredWindow; source = "configured"; }
+        else if (capabilities.window) { w = capabilities.window; source = "reported by the endpoint (" ~ capabilities.windowSource ~ ")"; }
         else if ((w = ctx.windowForModel(client.modelName)) != 0) source = "known for the model name";
         else { w = ctx.defaultContextWindow; source = "default"; }
         if (learnedWindow && learnedWindow < w)
@@ -614,7 +621,34 @@ class Agent
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
 
-    private size_t outputBase() const { return maxTokens > 0 ? cast(size_t) maxTokens : ctx.minOutputReserve; }
+    private size_t outputBase() const { return cast(size_t) effectiveMaxTokens(); }
+
+    /// The output budget before the context-window clamp: `max_tokens` when
+    /// configured, else the model's published cap, a known cap for the model
+    /// name, or the large default; never above a cap learned from an error.
+    long effectiveMaxTokens() const
+    {
+        long base = maxTokens > 0 ? maxTokens
+            : capabilities.maxOutput ? cast(long) capabilities.maxOutput
+            : ctx.outputLimitForModel(client.modelName) ? cast(long) ctx.outputLimitForModel(client.modelName)
+            : ctx.defaultMaxOutputTokens;
+        return learnedMaxOutput > 0 && learnedMaxOutput < base ? learnedMaxOutput : base;
+    }
+
+    /// The endpoint's prompt-only cap is in force (Copilot `max_prompt_tokens`).
+    private bool promptCapped() const
+    {
+        return !configuredWindow && capabilities.promptCap && capabilities.window
+            && (!learnedWindow || learnedWindow >= capabilities.window);
+    }
+
+    /// The combined prompt + output window to enforce alongside a prompt cap (0 = none).
+    private size_t combinedWindow() const
+    {
+        auto a = capabilities.totalWindow;
+        if (a && learnedWindow) return a < learnedWindow ? a : learnedWindow;
+        return a ? a : learnedWindow;
+    }
 
     /// Past the auto-compaction threshold (or too close to the window for the
     /// output reservation)?
@@ -778,8 +812,17 @@ class Agent
 
     private long requestMaxTokens()
     {
-        if (maxTokens <= 0) return maxTokens;
-        auto maxTokens = learnedMaxOutput > 0 && learnedMaxOutput < this.maxTokens ? learnedMaxOutput : this.maxTokens;
+        auto maxTokens = effectiveMaxTokens();
+        if (maxTokens < 1) maxTokens = 1;
+        if (promptCapped)
+        {
+            auto combined = combinedWindow();
+            if (!combined) return maxTokens;
+            auto usedC = estimateContextTokens() + ctx.outputMargin(combined);
+            long roomC = combined > usedC ? cast(long)(combined - usedC) : 0;
+            auto c = maxTokens < roomC ? maxTokens : roomC;
+            return c < 1 ? 1 : c;
+        }
         auto window = contextWindow();
         auto used = estimateContextTokens() + ctx.outputMargin(window);
         long room = window > used ? cast(long)(window - used) : 0;
@@ -1450,6 +1493,24 @@ unittest
     d.maxTokens = 64_000;
     d.configuredWindow = 1_000_000;
     assert(d.run("go", new NullEvents) == "fine" && d.learnedMaxOutput == 32_000);
+
+    // Unset max_tokens: the published cap, else a known cap, else the large
+    // default; a learned cap still clamps it (issue #114).
+    auto e = new Agent(new MockClient([LLMResponse("x")]), new ToolRegistry, Policy.init, "sys");
+    assert(e.effectiveMaxTokens == ctx.defaultMaxOutputTokens);
+    e.capabilities.maxOutput = 7_000;
+    assert(e.effectiveMaxTokens == 7_000);
+    e.learnedMaxOutput = 5_000;
+    assert(e.effectiveMaxTokens == 5_000);
+    e.maxTokens = 3_000;
+    assert(e.effectiveMaxTokens == 3_000);
+    // A prompt-only cap leaves max_tokens alone unless the combined window binds.
+    auto f = new Agent(new MockClient([LLMResponse("x")]), new ToolRegistry, Policy.init, "sys");
+    f.capabilities.window = 100;
+    f.capabilities.promptCap = true;
+    assert(f.requestMaxTokens == ctx.defaultMaxOutputTokens);
+    f.capabilities.totalWindow = 2_000;
+    assert(f.requestMaxTokens < 2_000);
 }
 
 @trusted unittest
