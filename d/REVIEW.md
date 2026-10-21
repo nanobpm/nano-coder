@@ -43,9 +43,24 @@ shared between tasks to be `Send`/`Sync`, so data races don't compile.
 D has the tools for this: `shared`, which bans unsynchronised access;
 `immutable`, which is thread-safe; and `std.concurrency` message passing.
 `@safe` code can't touch `__gshared`. These are opt-in, though, and they're
-weaker than Rust's checks because `shared` is easy to cast away. **R**, but
-it hasn't been tested yet. Porting cancel/steer and ACP (PORTING.md item 1
-and item 11) is what will show this in practice.
+weaker than Rust's checks because `shared` is easy to cast away. **R**.
+
+**After porting cancel/steer and ACP.** The D port now uses threads: a
+`TurnControl` behind a mutex, a process-wide atomic cancel flag that the
+libcurl progress callback and the bash wait loop poll, and a stdin reader
+thread that routes ACP messages while the turn runs on the main thread. No
+data race turned up. The one real bug was a **deadlock**: a reader thread
+blocked in `readln` holds stdin's `FILE` lock, and `std.process.spawnProcess`
+flushes (and so locks) every stdio stream before forking. The first bash call
+in a turn hung forever. Rust's `Send`/`Sync` wouldn't have caught this either,
+since it's lock ordering rather than a race. It is a D-specific hazard, though,
+because Phobos's stdio hides a global lock. Fix: `FdLineReader` reads fd 0
+with raw `read(2)`. Rule: threads that block on input must not use `std.stdio`.
+
+Toolchain note: LDC 1.43 failed to link once `acp.d` was added (an undefined
+`core.internal.switch_.__switch_error` instance, because LDC dropped a
+template instance that other modules relied on). `dub.json` builds with
+`-allinst` to work around it.
 
 ## 4. Architecture
 
@@ -70,5 +85,7 @@ and item 11) is what will show this in practice.
   this size. The D core is 3.6k lines including tests. The matching Rust
   modules are 9.7k lines without tests, but they also do more (Copilot routing,
   capability probes, shell parsing), so this isn't a like-for-like ratio.
-- **Still open:** how D holds up under concurrency (cancel, steer, ACP). This is
-  the deciding test, and it's the next port.
+- **Concurrency (cancel, steer, ACP):** ported and tested live. No data
+  races were found. One stdio-lock deadlock was found and fixed (section 3). D's
+  thread safety depends on discipline (`shared` and mutexes are opt-in), but at
+  this size that was manageable.

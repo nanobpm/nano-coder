@@ -21,6 +21,17 @@ interface AgentEvents
     void usage(TokenUsage u);
     /// A steering message joined the conversation mid-turn.
     void userMessage(string text);
+    /// A complete model reply (after its deltas went to `text`).
+    void assistantMessage(string text, string reasoning);
+}
+
+/// Why a turn ended (ACP `stopReason`).
+enum StopReason : string
+{
+    endTurn = "end_turn",
+    cancelled = "cancelled",
+    maxTurnRequests = "max_turn_requests",
+    maxTokens = "max_tokens",
 }
 
 class Agent
@@ -36,6 +47,8 @@ class Agent
     TokenUsage lastUsage;
     /// Steer or cancel the running turn from another thread.
     TurnControl control;
+    /// Why the last `run` ended.
+    StopReason lastStop;
 
     this(LLMClient client, ToolRegistry tools, Policy policy, string systemPrompt)
     {
@@ -55,18 +68,21 @@ class Agent
     /// Run one user input to completion. Returns the final assistant text,
     /// or `cancelledResponse` when the turn was cancelled. Steers that arrive
     /// too late for this turn stay in `control` for the caller to queue.
-    string run(string input, AgentEvents ev)
+    /// Pass `resetControl = false` when the caller already called
+    /// `control.startTurn()`, so a cancel routed before `run` began is kept.
+    string run(string input, AgentEvents ev, bool resetControl = true)
     {
-        control.startTurn();
+        if (resetControl) control.startTurn();
         push(Message.user(input));
         string last;
         for (long i = 0; maxIterations <= 0 || i < maxIterations; i++)
         {
             if (control.isCancelled) return cancelled(ev);
-            foreach (text; control.takePending)
+            foreach (s; control.takePending)
             {
-                push(Message.user(text));
-                ev.userMessage(text);
+                push(Message.user(s.text));
+                ev.userMessage(s.text);
+                control.absorbed(s);
             }
             ChatRequest req;
             req.messages = messages;
@@ -85,12 +101,14 @@ class Agent
             ev.usage(r.usage);
             push(Message.assistant(r.content, r.toolCalls));
             last = r.content;
+            if (r.content.length || r.reasoning.length) ev.assistantMessage(r.content, r.reasoning);
             if (r.toolCalls.length == 0)
             {
-                if (r.stopReason == "length" || r.stopReason == "max_tokens")
-                    ev.text(false, "\n[the reply hit the output-token limit]");
+                bool cut = r.stopReason == "length" || r.stopReason == "max_tokens";
+                if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
                 // A steer that arrived while the answer was written extends the turn.
                 if (control.hasSteers && !control.isCancelled) continue;
+                lastStop = cut ? StopReason.maxTokens : StopReason.endTurn;
                 return last;
             }
             foreach (call; r.toolCalls)
@@ -103,12 +121,14 @@ class Agent
             }
         }
         ev.text(false, format("\n[stopped after %s model calls (max_iterations)]", maxIterations));
+        lastStop = StopReason.maxTurnRequests;
         return last;
     }
 
     private string cancelled(AgentEvents ev)
     {
         ev.text(false, "\n" ~ cancelledResponse);
+        lastStop = StopReason.cancelled;
         return cancelledResponse;
     }
 
@@ -157,6 +177,7 @@ version (unittest)
         void usage(TokenUsage u) {}
         string[] steered;
         void userMessage(string t) { steered ~= t; }
+        void assistantMessage(string t, string r) {}
     }
 }
 

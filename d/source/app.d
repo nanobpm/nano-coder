@@ -20,7 +20,7 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
-import nano.control : TurnControl;
+import nano.control : TurnControl, FdLineReader;
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
 import core.sync.condition : Condition;
@@ -29,19 +29,20 @@ enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTI
 
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--verbose]
+                    [--no-session] [--verbose] [--acp]
        nano-coder-d --list-models PROVIDER[/model]
        nano-coder-d --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
+--acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
 REPL commands: /help /model [spec] /plan /normal /clear /usage /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels;
-    bool plan, noSession, verbose, hasResume;
+    bool plan, noSession, verbose, hasResume, acp;
     string[] allow, deny;
 }
 
@@ -68,6 +69,7 @@ Options parseArgs(string[] args)
             case "--allow": o.allow ~= value(); break;
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
+            case "--acp": o.acp = true; break;
             case "--no-session": o.noSession = true; break;
             case "--verbose", "-v": o.verbose = true; break;
             case "--resume":
@@ -148,9 +150,11 @@ final class Inbox
 
     void readLoop(Console console)
     {
+        // Not readln: see FdLineReader (a blocked readln deadlocks spawnProcess).
+        auto input = FdLineReader(0);
         for (;;)
         {
-            auto line = readln();
+            auto line = input.next();
             if (line is null) { put(null); return; }
             auto text = line.strip;
             if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
@@ -214,6 +218,7 @@ class Console : AgentEvents
 
     void usage(TokenUsage u) {}
     void userMessage(string text) { endLine(); writeln(dim("↪ " ~ text)); }
+    void assistantMessage(string text, string reasoning) {}
 
     static string summary(const ref ToolCall c)
     {
@@ -318,6 +323,24 @@ int main(string[] args)
     agent.maxTokens = cfg.maxTokens;
     agent.temperature = cfg.temperature;
 
+    if (o.acp)
+    {
+        import nano.acp : AcpServer, Host;
+        Host host;
+        bool plan = o.plan;
+        host.systemPrompt = (string dir) => buildSystemPrompt(cfg, dir, plan);
+        host.makeClient = (string s) => makeClient(resolve(cfg, s));
+        host.sessionDir = o.noSession ? null : sessionDir;
+        host.version_ = versionString;
+        auto server = new AcpServer(agent, host);
+        if (!server.serveStdio())
+        {
+            stderr.writeln("nano-coder-d: no ACP JSON-RPC request received on stdin");
+            return 1;
+        }
+        return 0;
+    }
+
     try
     {
         if (o.hasResume)
@@ -364,7 +387,7 @@ int main(string[] args)
         // Steers that arrived after the agent's last step run as the next prompts.
         auto late = agent.control.takePending;
         if (inbox !is null)
-            foreach_reverse (t; late) inbox.put(t, true);
+            foreach_reverse (t; late) inbox.put(t.text, true);
         return ok;
     }
 

@@ -67,7 +67,7 @@ struct Rule
     }
 }
 
-private string quoted(string s) { return JSONValue(s).toString; }
+private string quoted(string s) { return debugQuote(s); }
 
 /// Parse a rule like `Bash(git push *)`, `Read(**/.env)` or `write_file`.
 Rule parseRule(string src)

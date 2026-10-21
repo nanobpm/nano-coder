@@ -213,3 +213,30 @@ unittest
     assert(joinPath("/w", "x/") == "/w/x/");
     assert(joinPath("/w", "/abs") == "/abs");
 }
+
+/// A string quoted like Rust's `{:?}`: only `"`, `\\` and control characters are escaped.
+string debugQuote(string s) pure @safe
+{
+    import std.format : format;
+    string out_ = "\"";
+    foreach (dchar c; s)
+    {
+        switch (c)
+        {
+        case '"': out_ ~= `\"`; break;
+        case '\\': out_ ~= `\\`; break;
+        case '\n': out_ ~= `\n`; break;
+        case '\t': out_ ~= `\t`; break;
+        case '\r': out_ ~= `\r`; break;
+        default:
+            if (c < 0x20) out_ ~= format(`\u{%x}`, cast(uint) c);
+            else out_ ~= c;
+        }
+    }
+    return out_ ~ "\"";
+}
+
+unittest
+{
+    assert(debugQuote(`a/"b"`) == `"a/\"b\""`);
+}

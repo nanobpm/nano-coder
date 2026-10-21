@@ -18,5 +18,8 @@
         "-boundscheck=on"
       ]
     }
-  }
+  },
+  "dflags-ldc": [
+    "-allinst"
+  ]
 }
