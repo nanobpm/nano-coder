@@ -248,6 +248,8 @@ struct Config
     long maxIterations = 0;
     long bashTimeoutSecs = 600;
     ProviderConfig[string] providers;
+    /// Providers with a `[providers.*]` table in the config file (presets the user touched, or their own).
+    string[] userProviders;
     SkillsConfig skills;
     MemoryMode memory = MemoryMode.on;
     /// Hooks: `disable_hooks` (or `--no-hooks`), `disable_project_hooks`,
@@ -336,6 +338,7 @@ struct Config
                 auto p = name in c.providers ? c.providers[name] : ProviderConfig.init;
                 p.merge(table);
                 c.providers[name] = p;
+                c.userProviders ~= name;
             }
         // Legacy top-level credentials apply to the default provider (OpenAI
         // when that is still the offline mock); explicit [providers.*] win.

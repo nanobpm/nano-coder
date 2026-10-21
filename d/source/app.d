@@ -1050,9 +1050,54 @@ int runMain(string[] args)
     string[] held; // lines to run before reading the prompt again
     auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
 
+    // Recently used models lead the `/model` type-ahead (recents.rs).
+    static import nano.recents;
+    import nano.commands : Suggestion, modelSuggestionSource;
+    auto recentsPath = nano.recents.defaultPath();
+    auto recents = nano.recents.load(recentsPath);
+    if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
+    string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
+    modelSuggestionSource = () @trusted {
+        import std.algorithm : canFind, sort;
+        Suggestion[] out_;
+        void push(string value, string note)
+        {
+            if (value.length && !out_.canFind!(x => x.value == value)) out_ ~= Suggestion(value, note);
+        }
+        push(currentSpec(), "current");
+        synchronized foreach (r; recents.models) push(r, "recent");
+        bool configured(string n) { return cfg.userProviders.canFind(n) || n == cfg.defaultProvider; }
+        auto names = cfg.providers.keys.dup;
+        names.sort!((a, b) => configured(a) != configured(b) ? configured(a) : a < b);
+        string kindOf(string n)
+        {
+            auto p = cfg.providers[n];
+            if (!p.hasKind) return "provider";
+            final switch (p.kind)
+            {
+                case ProviderKind.openai: return "openai";
+                case ProviderKind.anthropic: return "anthropic";
+                case ProviderKind.githubCopilot: return "githubcopilot";
+                case ProviderKind.muse: return "muse";
+                case ProviderKind.mock: return "mock";
+            }
+        }
+        string providerNote(string n)
+        {
+            auto m = cfg.providers[n].defaultModel;
+            return kindOf(n) ~ (m.length ? " -> " ~ m : "") ~ (n == cfg.defaultProvider ? ", default provider" : "");
+        }
+        foreach (n; names)
+            if (auto m = cfg.providers[n].defaultModel)
+                push(n ~ "/" ~ m, n == cfg.defaultProvider ? "default provider" : providerNote(n));
+        foreach (n; names) push(n, providerNote(n));
+        return out_;
+    };
+
     /// Switch the model (history carries over); the "Model set to" text.
     string switchModel(string spec)
     {
+        auto previous = currentSpec();
         auto rp = resolve(cfg, spec);
         client = makeClient(rp);
         agent.client = client;
@@ -1060,6 +1105,12 @@ int runMain(string[] args)
         agent.learnedWindow = 0;
         agent.learnedMaxOutput = 0;
         agent.refreshCapabilities();
+        synchronized
+        {
+            recents.record(previous);
+            recents.record(nano.recents.canonical(spec, cfg.providers, cfg.defaultProvider));
+            nano.recents.save(recentsPath, recents);
+        }
         auto text = format("Model set to %s (provider %s)", client.modelName, client.providerName);
         foreach (w; settingWarnings(agent)) text ~= "\nWarning: " ~ w;
         return text;

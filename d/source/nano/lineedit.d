@@ -450,12 +450,12 @@ struct EditState
         return true;
     }
 
-    /// Tab: complete a `/command` typed so far (the whole line, no spaces yet).
+    /// Tab: complete a `/command` typed so far, or its first argument.
     void tab()
     {
         auto t = text;
-        if (cursor != buf.length || !t.startsWith("/") || t.canFind(' ')) return;
-        if (auto c = commands.complete(t)) set(c);
+        if (cursor != buf.length || !t.startsWith("/")) return;
+        if (auto c = commands.completeLine(t)) set(c);
         changed();
     }
 

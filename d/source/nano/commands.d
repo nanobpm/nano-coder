@@ -122,15 +122,132 @@ string helpText()
     auto width = columnWidth();
     auto out_ = "Commands:";
     foreach (c; commands) out_ ~= format("\n  %-*s  %s", width, synopsis(c), c.description);
-    out_ ~= "\nType / to list commands as you type; Tab completes them; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.";
-    out_ ~= "\nKeys: Enter during a turn steers it and Ctrl-Enter queues it for a later turn (/queue edits the queue); Ctrl-C or Esc Esc cancels the turn; Esc Esc also clears the input at the prompt; at the prompt Ctrl-J, Alt-Enter or Ctrl-Enter inserts a newline; Up/Down recall earlier input.";
+    out_ ~= "\nType / to list commands as you type; Tab completes commands and /model, /mode, /thinking arguments; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.";
+    out_ ~= "\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Esc Esc also clears the input at the prompt, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)";
     return out_;
 }
 
-/// Menu rows for the line being typed: empty unless it is a `/command`
-/// without arguments yet. Each row fits in `cols` columns; at most `maxRows`.
+/// One row of the argument type-ahead: the value Tab completes to and a note.
+struct Suggestion
+{
+    string value, note;
+}
+
+/// The `/model` candidates (current, recents, provider defaults, providers);
+/// set by the app, which has the config and the recents.
+Suggestion[] delegate() @safe modelSuggestionSource;
+
+/// The line as `command` + the start of its first argument; null past it.
+string[2] splitCommand(string line, out bool ok)
+{
+    ok = false;
+    size_t i;
+    while (i < line.length && !isWhite(line[i])) i++;
+    if (i == line.length) return typeof(return).init;
+    auto rest = line[i + 1 .. $];
+    while (rest.length && isWhite(rest[0])) rest = rest[1 .. $];
+    if (rest.any!isWhite) return typeof(return).init;
+    ok = true;
+    return [line[0 .. i], rest];
+}
+
+/// Argument candidates for the line being typed, filtered by the typed prefix.
+Suggestion[] suggestions(string line)
+{
+    import nano.mode : allModes, name, describe;
+    import nano.thinking : ORDER;
+    bool ok;
+    auto parts = splitCommand(line, ok);
+    if (!ok) return null;
+    Suggestion[] all;
+    switch (parts[0])
+    {
+        case "/model":
+            if (modelSuggestionSource !is null) all = modelSuggestionSource();
+            break;
+        case "/mode":
+            foreach (m; allModes) all ~= Suggestion(m.name, m.describe);
+            break;
+        case "/thinking":
+            all = [Suggestion("default", "send no level; the model decides"),
+                Suggestion("off", "turn thinking off, where the model allows it"),
+                Suggestion("reset", "drop the session level; use the configured one")];
+            foreach (l; ORDER) all ~= Suggestion(l, "");
+            break;
+        default: break;
+    }
+    return all.filter!(x => x.value.startsWith(parts[1])).array;
+}
+
+/// True past the name of a command with a known argument set (its type-ahead
+/// is drawn even when nothing matches, to say so).
+bool hasArgumentMenu(string line)
+{
+    bool ok;
+    auto parts = splitCommand(line, ok);
+    return ok && ["/model", "/mode", "/thinking"].canFind(parts[0]);
+}
+
+/// What Tab turns the line into: a `/command` completes like `complete`; its
+/// first argument completes against the suggestions (a unique match in full,
+/// the common prefix, or a provider name to its top-ranked model).
+string completeLine(string line)
+{
+    bool ok;
+    auto parts = splitCommand(line, ok);
+    if (!ok) return line.any!isWhite ? null : complete(line);
+    auto found = suggestions(line);
+    if (!found.length) return null;
+    string done;
+    if (found.length == 1) done = found[0].value;
+    else
+    {
+        string common = found[0].value;
+        foreach (x; found[1 .. $])
+        {
+            size_t n;
+            while (n < common.length && n < x.value.length && common[n] == x.value[n]) ++n;
+            common = common[0 .. n];
+        }
+        // Cut back to a whole character (Rust compares chars).
+        while (common.length && (common[$ - 1] & 0xC0) == 0x80) common = common[0 .. $ - 1];
+        if (common.length && (common[$ - 1] & 0x80)) common = common[0 .. $ - 1];
+        if (common.length > parts[1].length) done = common;
+        else
+            foreach (x; found)
+                if (x.value.startsWith(parts[1] ~ "/")) { done = x.value; break; }
+    }
+    return done.length ? parts[0] ~ " " ~ done : null;
+}
+
+/// Menu rows for an argument type-ahead: typed part bold, the rest of the value cyan, the note dim.
+string[] suggestionMenu(const Suggestion[] found, string line, size_t cols, size_t maxRows)
+{
+    if (maxRows == 0) return null;
+    bool ok;
+    auto parts = splitCommand(line, ok);
+    auto typed = ok ? parts[1].count : 0;
+    if (!found.length) return [fit("  no match (any provider/model ID works)", cols, [Style(0, "\x1b[2m")])];
+    size_t width;
+    foreach (x; found) width = width < x.value.count ? x.value.count : width;
+    auto shown = found.length > maxRows ? maxRows - 1 : found.length;
+    string[] rows;
+    foreach (x; found[0 .. shown])
+    {
+        auto plain = "  " ~ x.value ~ replicateStr(" ", width - x.value.count) ~ "  " ~ x.note;
+        auto valueEnd = 2 + x.value.count;
+        rows ~= fit(plain, cols, [Style(0, ""), Style(2, "\x1b[1m"), Style(2 + typed, "\x1b[0;36m"), Style(valueEnd, "\x1b[0;2m")]);
+    }
+    if (shown < found.length) rows ~= fit(format("  ... %s more", found.length - shown), cols, [Style(0, "\x1b[2m")]);
+    return rows;
+}
+
+/// Menu rows for the line being typed: the command list while a `/command`
+/// is typed, then its argument type-ahead. Each row fits in `cols` columns;
+/// at most `maxRows`.
 string[] menu(string line, size_t cols, size_t maxRows)
 {
+    if (hasArgumentMenu(line)) return suggestionMenu(suggestions(line), line, cols, maxRows);
     if (!line.startsWith("/") || line.any!isWhite || maxRows == 0) return null;
     auto found = matching(line);
     if (!found.length) return [fit("  no matching command (/help lists them)", cols, [Style(0, "\x1b[2m")])];
@@ -273,7 +390,7 @@ unittest // menu rows
 {
     auto rows = menu("/m", 80, 10);
     assert(rows.length == 3 && rows[0].canFind("\x1b[1m/m\x1b[0;36memory"), rows[0]);
-    assert(menu("/model x", 80, 10) is null && menu("hi", 80, 10) is null && menu("/", 80, 0) is null);
+    assert(menu("/help x", 80, 10) is null && menu("hi", 80, 10) is null && menu("/", 80, 0) is null);
     assert(menu("/zz", 80, 10)[0].canFind("no matching command"));
     auto few = menu("/", 80, 3);
     assert(few.length == 3 && few[2].canFind("more"));
@@ -282,3 +399,28 @@ unittest // menu rows
 }
 
 string replicateStr(string s, size_t n) pure { string r; foreach (_; 0 .. n) r ~= s; return r; }
+
+unittest // argument type-ahead (Rust suggestions / complete_line / suggestion_menu)
+{
+    import std.algorithm : map, equal;
+    auto saved = modelSuggestionSource;
+    scope (exit) modelSuggestionSource = saved;
+    modelSuggestionSource = () => [Suggestion("openai/gpt-4o", "current"), Suggestion("ollama/llama3", "recent"),
+        Suggestion("ollama/qwen", "openai -> qwen"), Suggestion("ollama", "openai -> qwen")];
+    assert(suggestions("/model oll").map!(x => x.value).equal(["ollama/llama3", "ollama/qwen", "ollama"]));
+    assert(suggestions("/model") is null && suggestions("/model a b") is null && suggestions("/help x") is null);
+    assert(hasArgumentMenu("/model ") && hasArgumentMenu("/mode x") && !hasArgumentMenu("/help ") && !hasArgumentMenu("/model"));
+    // Unique match in full; common prefix; an exact provider descends to its top spec.
+    assert(completeLine("/model op") == "/model openai/gpt-4o");
+    assert(completeLine("/model o") is null || completeLine("/model o") == "/model o");
+    assert(completeLine("/model oll") == "/model ollama");
+    assert(completeLine("/model ollama") == "/model ollama/llama3");
+    assert(completeLine("/model zz") is null);
+    assert(completeLine("/mode p") == "/mode plan");
+    assert(completeLine("/thinking xh") == "/thinking xhigh");
+    assert(completeLine("/mo") == "/mode" && completeLine("/model a b") is null);
+    auto rows = menu("/model zz", 80, 8);
+    assert(rows.length == 1 && rows[0].canFind("no match (any provider/model ID works)"));
+    rows = menu("/model oll", 80, 2);
+    assert(rows.length == 2 && rows[1].canFind("... 2 more") && rows[0].canFind("llama3"));
+}
