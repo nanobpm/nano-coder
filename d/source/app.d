@@ -96,7 +96,7 @@ Options parseArgs(string[] args)
                 o.hasResume = true;
                 if (eq > 0) o.resume = value();
                 else if (i + 1 < args.length && !args[i + 1].startsWith("-")) o.resume = args[++i];
-                else o.resume = "last";
+                else o.resume = "";
                 break;
             case "--version", "-V": writeln(versionString); exit(0);
             case "--help", "-h": writeln(usage); exit(0);
@@ -141,36 +141,9 @@ int runLogin(string provider)
 /// `--list-sessions [--all] [--json]`: this directory's saved sessions, newest first.
 int printSessions(bool all, bool json)
 {
-    import std.algorithm : filter;
-    import std.array : array;
-    auto cwd = getcwd();
-    auto shown = listSessions(sessionDir).filter!(s => all || s.cwd == cwd).array;
-    if (json)
-    {
-        JSONValue[] items;
-        foreach (s; shown)
-        {
-            JSONValue j = ["id": s.id, "last_used": s.lastUsed.toISOExtString];
-            j["prompts"] = s.prompts;
-            if (s.cwd.length) j["cwd"] = s.cwd;
-            if (s.model.length) j["model"] = s.model;
-            if (s.createdAt.length) j["created_at"] = s.createdAt;
-            if (s.firstPrompt.length) j["first_prompt"] = s.firstPrompt;
-            if (s.lastPrompt.length) j["last_prompt"] = s.lastPrompt;
-            if (s.contextPrompt.length) j["context_prompt"] = s.contextPrompt;
-            items ~= j;
-        }
-        writeln(JSONValue(items).toPrettyString);
-        return 0;
-    }
-    if (!shown.length)
-    {
-        stderr.writefln("No saved sessions%s.", all ? "" : " for " ~ oneLine(cwd) ~ " (--all lists every directory)");
-        return 0;
-    }
-    import std.datetime.systime : Clock;
-    auto now = Clock.currTime;
-    foreach (s; shown) writeln(listRow(s, now));
+    import nano.resume : printList;
+    try printList(sessionDir, getcwd(), all, json);
+    catch (Exception e) die(e.msg);
     return 0;
 }
 
@@ -561,6 +534,28 @@ int runMain(string[] args)
     catch (Exception e) die(e.msg);
 
     if (o.listSessions) return printSessions(o.all, o.json);
+    if (o.hasResume && (o.resume == "" || o.resume == "last"))
+    {
+        import nano.resume : pickOutcome, Pick, printList, resumeLast = last;
+        try
+        {
+            if (o.resume == "last") o.resume = resumeLast(sessionDir, getcwd());
+            else if (o.acp) die("--resume needs a session ID with --acp");
+            else if (isTerminal(0) && isTerminal(2))
+            {
+                string id;
+                if (pickOutcome(sessionDir, getcwd(), null, id) != Pick.selected) return 0;
+                o.resume = id;
+            }
+            else
+            {
+                // No terminal to pick in: list what could be resumed.
+                printList(sessionDir, getcwd(), false, false);
+                return 0;
+            }
+        }
+        catch (Exception e) die(e.msg);
+    }
     if (o.listModels.length)
     {
         try
@@ -744,27 +739,31 @@ int runMain(string[] args)
         return 0;
     }
 
+    /// Load a saved session into the agent: its conversation, plan and log.
+    void loadSession(string path)
+    {
+        auto restored = restore(path);
+        agent.messages = agent.messages[0 .. 1];
+        foreach (m; restored.conversation)
+            if (m.role != Role.system) agent.messages ~= m;
+        agent.log = o.noSession ? null : new SessionLog(path);
+        agent.historyAvailable = restored.historyAvailable;
+        agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
+        agent.plan = Plan.init;
+        if (restored.plan.type == JSONType.object)
+        {
+            try agent.plan = Plan.fromJSON(restored.plan);
+            catch (Exception e) stderr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
+        }
+        stderr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        if (restored.pendingInput.length)
+            stderr.writefln("the last prompt never finished (the session was interrupted): %s",
+                oneLine(restored.pendingInput));
+    }
+
     try
     {
-        if (o.hasResume)
-        {
-            auto path = findSession(sessionDir, o.resume, cwd);
-            auto restored = restore(path);
-            foreach (m; restored.conversation)
-                if (m.role != Role.system) agent.messages ~= m;
-            if (!o.noSession) agent.log = new SessionLog(path);
-            agent.historyAvailable = restored.historyAvailable;
-            agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
-            if (restored.plan.type == JSONType.object)
-            {
-                try agent.plan = Plan.fromJSON(restored.plan);
-                catch (Exception e) stderr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
-            }
-            stderr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
-            if (restored.pendingInput.length)
-                stderr.writefln("the last prompt never finished (the session was interrupted): %s",
-                    oneLine(restored.pendingInput));
-        }
+        if (o.hasResume) loadSession(findSession(sessionDir, o.resume, cwd));
         else if (!o.noSession)
         {
             agent.log = new SessionLog(sessionDir, spec, cwd);
@@ -978,6 +977,47 @@ int runMain(string[] args)
                     if (skills is null || skills.empty) { writeln("No skills found."); continue; }
                     foreach (sk; skills.skills) writefln("  %-20s %s", sk.name, firstLine(sk.description));
                     continue;
+                case "/resume":
+                {
+                    import nano.resume : pickOutcome, Pick, listRows, resumeLast = last;
+                    import std.array : join;
+                    if (o.noSession) { writeln("Sessions aren't saved (--no-session), so there is nothing to resume"); continue; }
+                    auto current = agent.log !is null ? agent.log.id : null;
+                    string id = arg;
+                    try
+                    {
+                        if (!arg.length && !(isTerminal(0) && isTerminal(2)))
+                        {
+                            auto rows = listRows(sessionDir, cwd, current);
+                            writeln(rows.length ? "Saved sessions (switch with /resume ID):\n" ~ rows.join("\n")
+                                : "No saved sessions for this directory");
+                            continue;
+                        }
+                        if (!arg.length)
+                        {
+                            final switch (pickOutcome(sessionDir, cwd, current, id))
+                            {
+                                case Pick.selected: break;
+                                case Pick.empty: continue;
+                                case Pick.cancelled: writeln("Session unchanged"); continue;
+                            }
+                        }
+                        else if (arg == "last") id = resumeLast(sessionDir, cwd, current);
+                    }
+                    catch (Exception e) { writeln(e.msg); continue; }
+                    if (id == current) { writefln("Already in session %s", id); continue; }
+                    import std.path : buildPath;
+                    import std.file : isFile;
+                    auto path = buildPath(sessionDir, id ~ ".jsonl");
+                    bool ok;
+                    try { validateId(id); ok = path.exists && path.isFile; }
+                    catch (Exception) {}
+                    if (!ok) { writefln("No saved session %s: /resume without an ID lists them", JSONValue(id).toString); continue; }
+                    try loadSession(path);
+                    catch (Exception e) { writeln(e.msg); continue; }
+                    writefln("Resumed session %s (resume later with --resume %s)", id, id);
+                    continue;
+                }
                 case "/session":
                     if (agent.log is null) writeln("not recording (--no-session)");
                     else writefln("session %s\nlog: %s", agent.log.id, agent.log.path);

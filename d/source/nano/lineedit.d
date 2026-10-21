@@ -759,6 +759,18 @@ version (Posix)
         }
     }
 
+    /// Whether key mode is on (so a nested user can leave it as it was).
+    bool inKeyMode() @trusted nothrow { return keyMode; }
+
+    /// Terminal height of `fd` (24 when unknown).
+    size_t terminalHeight(int fd = 1) @trusted
+    {
+        import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
+        winsize ws;
+        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
+        return 24;
+    }
+
     /// Terminal width of `fd` (80 when unknown).
     size_t terminalWidth(int fd = 1) @trusted
     {

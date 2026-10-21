@@ -35,6 +35,7 @@ immutable Command[] commands = [
     Command("/skills", "", "List skills the agent can load"),
     Command("/model", "[provider/model]", "Show the model or switch to another"),
     Command("/session", "", "Show the session ID and log path"),
+    Command("/resume", "[ID|last]", "Switch to a saved session: pick one, or give its ID"),
     Command("/mode", "[normal|plan|auto]", "Show or set the agent mode"),
     Command("/thinking", "[level|default|off|reset]", "Show or set the thinking level for this session"),
     Command("/clear", "", "Start a fresh conversation (clean context) without exiting"),

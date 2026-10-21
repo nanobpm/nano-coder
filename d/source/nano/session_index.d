@@ -53,25 +53,46 @@ struct Summary
     /// The log file (not serialized).
     string path;
 
-    /// Rust's serde form: optional fields are omitted when unset, `/` is not escaped.
-    string toJson() const
+    /// Fields in serde order as (key, JSON value); unset optional fields are omitted.
+    string[2][] fields() const
     {
         static string q(string s) { return JSONValue(s).toString(JSONOptions.doNotEscapeSlashes); }
-        string o = `{"id":` ~ q(id);
+        string[2][] f = [["id", q(id)]];
         void opt(string key, string v)
         {
-            if (v !is null) o ~= `,"` ~ key ~ `":` ~ q(v);
+            if (v !is null) f ~= [key, q(v)];
         }
         opt("cwd", cwd);
         opt("model", model);
         opt("created_at", createdAt);
-        o ~= `,"last_used":` ~ q(stamp(lastUsed)) ~ format(`,"prompts":%s`, prompts);
+        f ~= ["last_used", q(stamp(lastUsed))];
+        f ~= ["prompts", prompts.to!string];
         opt("first_prompt", firstPrompt);
         opt("first_telling_prompt", firstTellingPrompt);
         opt("last_prompt", lastPrompt);
         opt("context_prompt", contextPrompt);
         opt("title", title);
-        return o ~ format(`,"log_bytes":%s}`, logBytes);
+        f ~= ["log_bytes", logBytes.to!string];
+        return f;
+    }
+
+    /// Rust's compact serde form (`/` is not escaped).
+    string toJson() const
+    {
+        string o = "{";
+        foreach (i, kv; fields) o ~= (i ? "," : "") ~ `"` ~ kv[0] ~ `":` ~ kv[1];
+        return o ~ "}";
+    }
+
+    /// `serde_json::to_string_pretty` form, indented by `indent` spaces.
+    string toPrettyJson(size_t indent = 0) const
+    {
+        import std.array : replicate;
+        auto pad = " ".replicate(indent);
+        string o = "{\n";
+        auto f = fields;
+        foreach (i, kv; f) o ~= pad ~ `  "` ~ kv[0] ~ `": ` ~ kv[1] ~ (i + 1 < f.length ? ",\n" : "\n");
+        return o ~ pad ~ "}";
     }
 
     /// Parse one index line; throws on anything malformed.
