@@ -39,7 +39,8 @@ import core.atomic : atomicLoad, atomicStore, cas;
 import core.sync.mutex : Mutex;
 import core.sync.condition : Condition;
 
-enum string versionString = "nano-coder-d 0.1.0 (D port of nano-coder; see PORTING.md)";
+enum string packageVersion = "0.1.0";
+enum string versionString = "nano-coder-d " ~ packageVersion ~ " (D port of nano-coder; see PORTING.md)";
 
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
@@ -391,6 +392,34 @@ shared bool gThinkingExpanded;
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
 static import nano.ui;
 shared Verbosity gVerbosity = Verbosity.normal;
+
+// Rust's `timestamps` (on by default): a dim "HH:MM:SS " before the prompt and
+// each transcript block; continuation lines are padded to align under it.
+shared bool gTimestamps = true;
+
+/// The visible width of a non-empty stamp ("HH:MM:SS ").
+enum size_t stampWidth = 9;
+
+string stamp(bool color) @trusted
+{
+    import std.datetime.systime : Clock;
+    if (!atomicLoad(gTimestamps)) return "";
+    auto t = Clock.currTime;
+    auto s = format("%02d:%02d:%02d", t.hour, t.minute, t.second);
+    return color ? "\x1b[2m" ~ s ~ "\x1b[0m " : s ~ " ";
+}
+
+/// `text` with `stamp` before the first line and its width in spaces before the rest.
+string stampBlock(string stamp, string text)
+{
+    import std.array : replace;
+    if (!stamp.length) return text;
+    auto pad = spaces(stampWidth);
+    auto body = text.length && text[$ - 1] == '\n' ? text[0 .. $ - 1] : text;
+    return stamp ~ body.replace("\n", "\n" ~ pad) ~ (body.length < text.length ? "\n" : "");
+}
+
+private string spaces(size_t n) { import std.array : replicate; return " ".replicate(n); }
 Verbosity verbosity() @trusted { return atomicLoad(gVerbosity); }
 void setVerbosity(Verbosity v) @trusted { atomicStore(gVerbosity, v); }
 
@@ -458,6 +487,30 @@ class Console : AgentEvents
     private bool thinking, blockExpanded, streamedThinking;
     private string thinkText, lastThinking;
     private long thinkStart, lastDraw;
+    // The thinking block's stamp, and whether an answer segment is streaming
+    // (its first line got a stamp, so later lines are padded under it).
+    private string blockStamp;
+    private bool answering;
+
+    string stamp() { return .stamp(color); }
+
+    /// Writes `t` with every line that starts here indented by `pad`.
+    private void writeAligned(string t, size_t pad)
+    {
+        import std.algorithm : splitter;
+        import std.array : replicate;
+        if (!pad) { write(t); if (t.length) midLine = t[$ - 1] != '\n'; return; }
+        size_t i;
+        while (i < t.length)
+        {
+            auto nl = t[i .. $].indexOf('\n');
+            auto seg = nl >= 0 ? t[i .. i + nl + 1] : t[i .. $];
+            if (!midLine) write(" ".replicate(pad));
+            write(seg);
+            midLine = seg[$ - 1] != '\n';
+            i += seg.length;
+        }
+    }
 
     this(bool color, bool tty = false)
     {
@@ -481,13 +534,13 @@ class Console : AgentEvents
         import std.conv : to;
         enum prefix = "∴ Thinking: ", suffix = "  (ctrl+o to expand)";
         auto w = isTerminal(1) ? terminalWidth() : 80;
-        auto fixed = prefix.walkLength + suffix.length + 1;
+        auto fixed = prefix.walkLength + suffix.length + 1 + (blockStamp.length ? stampWidth : 0);
         auto room = w > fixed ? w - fixed : 0;
         auto flat = sanitizeLine(thinkText.split.join(" "));
         auto count = flat.walkLength;
         auto tail = count > room ? "…" ~ flat.drop(count - room + 1).to!string : flat;
-        return color ? "\r\x1b[2K\x1b[38;5;245m" ~ prefix ~ "\x1b[2m" ~ tail ~ suffix ~ "\x1b[0m"
-            : "\r\x1b[2K" ~ prefix ~ tail ~ suffix;
+        return color ? "\r\x1b[2K" ~ blockStamp ~ "\x1b[38;5;245m" ~ prefix ~ "\x1b[2m" ~ tail ~ suffix ~ "\x1b[0m"
+            : "\r\x1b[2K" ~ blockStamp ~ prefix ~ tail ~ suffix;
     }
 
     private void thinkingDelta(string chunk)
@@ -497,19 +550,20 @@ class Console : AgentEvents
         {
             if (midLine) { write("\n"); midLine = false; }
             thinking = true;
+            answering = false;
+            blockStamp = stamp();
             thinkText = null;
             thinkStart = nowMs();
             lastDraw = long.min / 2;
             blockExpanded = verbose || atomicLoad(gThinkingExpanded);
-            if (blockExpanded) write(thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
+            if (blockExpanded) write(blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
         }
         bool first = !thinkText.length;
         thinkText ~= chunk;
         if (blockExpanded)
         {
             auto t = first ? chunk.stripLeft : chunk;
-            write(thinkStyle(t));
-            if (t.length) midLine = t[$ - 1] != '\n';
+            if (t.length) writeAligned(thinkStyle(t), blockStamp.length ? stampWidth : 0);
         }
         else if (tty && nowMs() - lastDraw >= 50)
         {
@@ -535,7 +589,7 @@ class Console : AgentEvents
             auto secs = (nowMs() - thinkStart) / 1000.0;
             auto chars = thinkText.strip.walkLength;
             auto clear = tty ? "\r\x1b[2K" : "";
-            write(clear ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars (ctrl+o to expand)", chars))
+            write(clear ~ blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars (ctrl+o to expand)", chars))
                 ~ "\n");
         }
         midLine = false;
@@ -556,8 +610,11 @@ class Console : AgentEvents
             {
                 blockExpanded = expanded;
                 if (expanded)
-                    write((tty ? "\r\x1b[2K" : "\n") ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n"
-                        ~ thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))));
+                {
+                    write((tty ? "\r\x1b[2K" : "\n") ~ blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
+                    midLine = false;
+                    writeAligned(thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))), blockStamp.length ? stampWidth : 0);
+                }
                 else
                 {
                     write("\n" ~ collapsedLine());
@@ -605,8 +662,16 @@ class Console : AgentEvents
             }
             if (!chunk.length) return;
             finishThinking();
-            write(chunk);
-            midLine = chunk[$ - 1] != '\n';
+            if (!answering)
+            {
+                if (midLine) write("\n");
+                midLine = false;
+                auto st = stamp();
+                write(st);
+                midLine = st.length > 0;
+                answering = true;
+            }
+            writeAligned(chunk, atomicLoad(gTimestamps) ? stampWidth : 0);
             stdout.flush();
         }
     }
@@ -618,7 +683,8 @@ class Console : AgentEvents
         {
             if (midLine) write("\n");
             midLine = false;
-            writeln(text);
+            answering = false;
+            writeln(stampBlock(stamp(), text));
             stdout.flush();
         }
     }
@@ -630,6 +696,7 @@ class Console : AgentEvents
             finishThinking();
             if (midLine) writeln();
             midLine = false;
+            answering = false;
             inReasoning = false;
         }
     }
@@ -650,7 +717,7 @@ class Console : AgentEvents
         meter.reset();
         if (quiet || quietTool(call)) return;
         endLine();
-        writeln(bold("● " ~ call.name), " ", dim(summary(call)));
+        writeln(stamp(), color ? "\x1b[38;5;114m●\x1b[0m " : "● ", bold(call.name), " ", dim(summary(call)));
         stdout.flush();
     }
 
@@ -662,10 +729,9 @@ class Console : AgentEvents
         scope (exit) if (afterStep !is null) afterStep();
         updateStatus((ref Stats s) { s.activity = Activity.thinking; });
         if (quiet || (quietTool(call) && !isError)) return;
-        auto lines = result.lineCount;
-        if (isError) writeln("  ", red("✗ " ~ result.firstLine));
-        else if (verbose) writeln(dim(indent(result)));
-        else writeln(dim(format("  ⎿ %s", lines > 1 ? format("%s lines", lines) : result.firstLine)));
+        auto st = stamp();
+        auto w = (isTerminal(1) ? terminalWidth() : 80);
+        write(stampBlock(st, toolResult(!isError, sanitizeBlock(result), verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1)));
         stdout.flush();
     }
 
@@ -677,7 +743,7 @@ class Console : AgentEvents
     {
         if (quiet) return;
         endLine();
-        writeln(dim("↪ " ~ text));
+        writeln(stampBlock(stamp(), dim("↪ " ~ text)));
     }
     void assistantMessage(string text, string reasoning)
     {
@@ -704,6 +770,50 @@ class Console : AgentEvents
                 }
         return c.encodedArguments;
     }
+}
+
+/// A tool result as Rust's `tool_result`: `⎿ first line (+N lines)` (red
+/// `⎿ error:` for failures); verbose shows up to ten lines.
+string toolResult(bool ok, string output, bool verbose, size_t width, bool color = true)
+{
+    import std.algorithm : min;
+    import std.array : split;
+    import std.string : stripRight;
+    enum previewLines = 10;
+    auto lines = output.stripRight.split('\n');
+    if (output.stripRight.length == 0) lines = null;
+    string mark = ok ? "⎿" : "⎿ error:";
+    string on = !color ? "" : ok ? "\x1b[2m" : "\x1b[38;5;203m", off = color ? "\x1b[0m" : "";
+    if (!lines.length) return format("  %s%s (no output)%s\n", on, mark, off);
+    if (verbose)
+    {
+        string text;
+        foreach (i, l; lines[0 .. min($, previewLines)])
+            text ~= format("  %s%s %s%s\n", on, i == 0 ? mark : " ", fitText(l.stripRight("\r"), width), off);
+        if (lines.length > previewLines)
+            text ~= format("  %s  … +%s lines%s\n", color ? "\x1b[2m" : "", lines.length - previewLines, off);
+        return text;
+    }
+    auto more = lines.length > 1 ? format(" (+%s lines)", lines.length - 1) : "";
+    return format("  %s%s %s%s%s\n", on, mark, fitText(lines[0].stripRight("\r"), width > more.length ? width - more.length : 0), more, off);
+}
+
+/// `text` cut to `width` characters, ending in `…` when cut.
+string fitText(string text, size_t width)
+{
+    import std.range : walkLength, take;
+    import std.conv : to;
+    if (text.walkLength <= width) return text;
+    return (width ? text.take(width - 1).to!string : "") ~ "…";
+}
+
+unittest
+{
+    assert(toolResult(true, "a\nb\nc\n", false, 80, false) == "  ⎿ a (+2 lines)\n");
+    assert(toolResult(false, "boom", false, 80, false) == "  ⎿ error: boom\n");
+    assert(toolResult(true, "", false, 80, false) == "  ⎿ (no output)\n");
+    assert(toolResult(true, "abcdef", false, 4, false) == "  ⎿ abc…\n");
+    assert(toolResult(true, "x\ny", true, 80, false) == "  ⎿ x\n    y\n");
 }
 
 /// Untrusted multi-line text for the terminal: lines kept, every other
@@ -1038,11 +1148,6 @@ int runMain(string[] args)
     agent.sessionTitles = cfg.sessionTitles;
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
-    if (instructions !is null && !o.acp && !o.prompt.length)
-    {
-        foreach (f; instructions.loadedPaths) stderr.writeln("Instructions: ", f);
-        foreach (w; instructions.warnings) stderr.writeln("Instructions warning: ", w);
-    }
     agent.planTools = cfg.planTools;
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
@@ -1146,6 +1251,7 @@ int runMain(string[] args)
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, isTerminal(1));
     setVerbosity(cfg.verbosity);
+    atomicStore(gTimestamps, cfg.timestamps);
     if (o.verbosity.length)
     {
         try setVerbosity(parseVerbosity(o.verbosity));
@@ -1154,7 +1260,9 @@ int runMain(string[] args)
     agent.onPlanChanged = () {
         if (console.quiet) return;
         console.endLine();
-        write(checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4, console.color));
+        auto st = console.stamp();
+        write(stampBlock(st, checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4 - (st.length ? stampWidth : 0),
+            console.color)));
         stdout.flush();
     };
 
@@ -1440,8 +1548,25 @@ int runMain(string[] args)
         reader.start();
     }
     if (interactive)
-        writefln("%s\n%s/%s · %s · /help for commands", console.bold("nano-coder-d"), client.providerName,
-                client.modelName, cwd);
+    {
+        // The startup banner, as Rust's (one stamped block).
+        import std.algorithm : map;
+        import std.array : join;
+        string[] banner = [
+            "nano-coder-d v" ~ packageVersion,
+            format("Model: %s (provider: %s)", client.modelName, client.providerName),
+        ];
+        if (agent.log !is null) banner ~= format("Session: %s (resume with --resume %s)", agent.log.id, agent.log.id);
+        if (instructions !is null)
+        {
+            foreach (f; instructions.loadedPaths) banner ~= "Instructions: " ~ f;
+            foreach (w; instructions.warnings) banner ~= "Instructions warning: " ~ w;
+        }
+        if (skills !is null && skills.names.length) banner ~= "Skills: " ~ skills.names.join(", ");
+        if (skills !is null) foreach (w; skills.warnings) banner ~= "Skills warning: " ~ w;
+        banner ~= "Type /help for commands";
+        writeln(stampBlock(console.stamp(), banner.join("\n")));
+    }
     for (;;)
     {
         string line;
@@ -1461,7 +1586,10 @@ int runMain(string[] args)
             refreshStatus();
             write("\n");
             stdout.flush();
-            auto r = editor.readLine("› ", console.bold("› "));
+            // The prompt's stamp is redrawn with the submission time (Rust's restamp).
+            editor.restyle = () @trusted => console.stamp() ~ console.bold("› ");
+            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ console.bold("› "));
+            editor.restyle = null;
             if (r.outcome == Outcome.eof) break;
             if (r.outcome != Outcome.line) continue;
             line = r.text;
@@ -1469,7 +1597,7 @@ int runMain(string[] args)
         }
         else
         {
-            if (interactive) { write(console.bold("\n› ")); stdout.flush(); }
+            if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdout.flush(); }
             line = inbox !is null ? inbox.take() : readln();
         }
         if (line is null) break;

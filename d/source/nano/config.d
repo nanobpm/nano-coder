@@ -236,6 +236,8 @@ struct Config
     string model = "gpt-4o-mini";
     string defaultProvider = "mock";
     double temperature = 0.7;
+    /// Dim `HH:MM:SS` stamps on the prompt and transcript (`timestamps`).
+    bool timestamps = true;
     /// Output detail (`verbosity`): quiet, normal, verbose or debug.
     imported!"nano.ui".Verbosity verbosity = imported!"nano.ui".Verbosity.normal;
     /// Global thinking level and vision override.
@@ -303,6 +305,7 @@ struct Config
         if (auto v = "max_tokens" in doc) c.maxTokens = v.integer;
         if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str);
         if (auto v = "vision" in doc) c.vision = v.boolean;
+        if (auto v = "timestamps" in doc) c.timestamps = v.boolean;
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "verbosity" in doc) c.verbosity = imported!"nano.ui".parseVerbosity(v.str);
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;

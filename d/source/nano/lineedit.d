@@ -498,6 +498,10 @@ final class LineEditor
     long delegate() @safe nowMs;
     /// Shift-Tab / Ctrl-O: run with the input erased, then the input is redrawn.
     void delegate(K) @safe onAction;
+    /// On submit, the styled prompt to redraw the line with (Rust's
+    /// `restamp_prompt`: the timestamp becomes the submission time). It must
+    /// keep the prompt's visible width.
+    string delegate() @safe restyle;
 
     this(ByteSource src, void delegate(string) @safe out_, size_t delegate() @safe width)
     {
@@ -681,6 +685,7 @@ final class LineEditor
 
     private void finish()
     {
+        if (restyle !is null) styledPrompt = restyle();
         state.cursor = state.buf.length;
         render(false);
         out_("\n");
