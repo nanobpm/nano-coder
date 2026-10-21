@@ -576,6 +576,73 @@ final class LineEditor
         }
     }
 
+    /// Pick one of `labels` with Up/Down (or its number) and Enter; Esc or
+    /// Ctrl-C dismisses (-1). Leaves the prompt and the choice on screen.
+    ptrdiff_t select(string prompt, const string[] labels)
+    {
+        size_t at;
+        size_t drawnRows;
+        void draw(bool final_)
+        {
+            string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
+            s ~= "\r\x1b[J";
+            auto w = max(width(), 2);
+            if (final_)
+            {
+                s ~= "\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], w / 2) ~ "\x1b[0m\n";
+                out_(s);
+                drawnRows = 0;
+                return;
+            }
+            s ~= "\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, w - 3) ~ "\x1b[0m";
+            foreach (k, l; labels)
+                s ~= "\r\n" ~ (k == at ? "\x1b[36m❯ " ~ fitCols(l, w - 3) ~ "\x1b[0m" : "  " ~ fitCols(l, w - 3));
+            s ~= "\r";
+            out_(s);
+            drawnRows = labels.length;
+        }
+        draw(false);
+        for (;;)
+        {
+            auto key = decode(src, -1, utf8);
+            switch (key.kind)
+            {
+                case K.up: at = at ? at - 1 : labels.length - 1; break;
+                case K.down, K.tab: at = (at + 1) % labels.length; break;
+                case K.submit:
+                    draw(true);
+                    return at;
+                case K.escape, K.interrupt, K.eof, K.closed:
+                    if (key.kind == K.escape && key.text.length) pushback = 0x1b;
+                    string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
+                    out_(s ~ "\r\x1b[J");
+                    return -1;
+                case K.insert:
+                    import std.ascii : isDigit;
+                    if (key.text.length == 1 && key.text[0].isDigit && key.text[0] != '0'
+                            && key.text[0] - '1' < labels.length) at = key.text[0] - '1';
+                    break;
+                default: break;
+            }
+            draw(false);
+        }
+    }
+
+    private static string fitCols(string s, size_t w)
+    {
+        if (textWidth(s) <= w) return s;
+        string r;
+        size_t used;
+        foreach (dchar c; s)
+        {
+            auto cw = charWidth(c);
+            if (used + cw + 1 > w) break;
+            r ~= c.to!string;
+            used += cw;
+        }
+        return r ~ "…";
+    }
+
     /// Remove what the editor drew (the cursor ends at its first row).
     void erase()
     {
@@ -816,6 +883,17 @@ unittest // slash commands: Tab, menu, rejection, Esc
     e = editor("abc\x1b\x1b", screen);
     e.nowMs = () => t += 100;
     assert(e.readLine("", "", true).outcome == Outcome.cancel);
+}
+
+unittest // select
+{
+    string screen;
+    auto e = editor("\x1b[B\x1b[B\x1b[A\r", screen);
+    assert(e.select("Pick", ["a", "b", "c"]) == 1);
+    e = editor("3\r", screen);
+    assert(e.select("Pick", ["a", "b", "c"]) == 2);
+    e = editor("\x1b\xff", screen);
+    assert(e.select("Pick", ["a"]) == -1);
 }
 
 unittest // stop keeps the typed text

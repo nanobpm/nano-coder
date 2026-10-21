@@ -20,6 +20,8 @@ import nano.tools.search : registerSearch = register;
 import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
+import nano.plan : Plan, checklist;
+import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
 import nano.commands : helpText, unescapePrompt;
 import core.thread : Thread;
@@ -44,7 +46,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /hooks /tools /skills /session /quit
+REPL commands: /help /model [spec] /plan /mode [normal|plan] /clear /usage /memory [forget ID] /hooks /tools /skills /session /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
@@ -225,14 +227,22 @@ final class Inbox
 }
 
 /// Keys during a turn (runs on its own thread until `done`).
-void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held)
+void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions)
 {
     while (!atomicLoad(*done))
     {
-        auto r = editor.readLine("↪ ", console.dim("↪ "), true, () @trusted => atomicLoad(*done));
+        auto r = editor.readLine("↪ ", console.dim("↪ "), true,
+            () @trusted => atomicLoad(*done) || questions.pending !is null);
         final switch (r.outcome)
         {
-            case Outcome.stopped: return;
+            case Outcome.stopped:
+                if (auto qs = questions.pending)
+                {
+                    console.endLine();
+                    questions.resolve(askQuestions(editor, qs));
+                    break;
+                }
+                return;
             case Outcome.eof:
                 gControl.cancel();
                 return;
@@ -259,6 +269,35 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 break;
         }
     }
+}
+
+/// Ask each question with a picker; dismissing any one dismisses them all.
+Answer askQuestions(LineEditor editor, const Question[] qs)
+{
+    string[] answers;
+    foreach (ref q; qs)
+    {
+        string[] labels;
+        foreach (ref opt; q.options)
+            labels ~= opt.description.length ? sanitizeLine(opt.label) ~ " — " ~ sanitizeLine(opt.description)
+                : sanitizeLine(opt.label);
+        ptrdiff_t custom = -1;
+        if (q.custom)
+        {
+            custom = labels.length;
+            labels ~= "Type your own answer";
+        }
+        auto at = editor.select(sanitizeLine(q.question), labels);
+        if (at < 0) return Answer(Answer.Kind.dismissed);
+        if (at == custom)
+        {
+            auto r = editor.readLine("Answer: ", "\x1b[1mAnswer:\x1b[0m ");
+            if (r.outcome != Outcome.line) return Answer(Answer.Kind.dismissed);
+            answers ~= r.text;
+        }
+        else answers ~= q.options[at].label;
+    }
+    return Answer(Answer.Kind.answers, answers);
 }
 
 class Console : AgentEvents
@@ -289,8 +328,12 @@ class Console : AgentEvents
         inReasoning = false;
     }
 
+    /// plan_add/plan_update show as the checklist, not as calls.
+    private bool quiet(const ref ToolCall call) { return !verbose && (call.name == "plan_add" || call.name == "plan_update"); }
+
     void toolStart(const ref ToolCall call)
     {
+        if (quiet(call)) return;
         endLine();
         writeln(bold("● " ~ call.name), " ", dim(summary(call)));
         stdout.flush();
@@ -298,6 +341,7 @@ class Console : AgentEvents
 
     void toolEnd(const ref ToolCall call, string result, bool isError)
     {
+        if (quiet(call) && !isError) return;
         auto lines = result.lineCount;
         if (isError) writeln("  ", red("✗ " ~ result.firstLine));
         else if (verbose) writeln(dim(indent(result)));
@@ -465,7 +509,10 @@ int main(string[] args)
         auto index = memory !is null ? memory.index(memoryWritable && !plan) : null;
         return buildSystemPrompt(cfg, dir, plan, skills, index);
     }
+    auto questions = new QuestionBroker;
+    tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    agent.planTools = cfg.planTools;
     HookManager loadHooks(string dir)
     {
         import nano.claude_hooks : LoadOptions;
@@ -517,6 +564,11 @@ int main(string[] args)
             foreach (m; restored.conversation)
                 if (m.role != Role.system) agent.messages ~= m;
             if (!o.noSession) agent.log = new SessionLog(path);
+            if (restored.plan.type == JSONType.object)
+            {
+                try agent.plan = Plan.fromJSON(restored.plan);
+                catch (Exception e) stderr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
+            }
             stderr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
             if (restored.pendingInput.length)
                 stderr.writefln("the last prompt never finished (the session was interrupted): %s",
@@ -532,6 +584,11 @@ int main(string[] args)
     agent.useHooks(loadHooks(cwd), o.hasResume);
 
     auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose);
+    agent.onPlanChanged = () {
+        console.endLine();
+        write(checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4, console.color));
+        stdout.flush();
+    };
 
     gControl = agent.control;
     {
@@ -556,7 +613,7 @@ int main(string[] args)
         Thread keys;
         if (editor !is null)
         {
-            keys = new Thread(() => turnKeys(editor, console, &turnDone, held));
+            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions));
             keys.start();
         }
         scope (exit)
@@ -588,6 +645,7 @@ int main(string[] args)
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
         editor = new LineEditor(fdSource(0), (string s) => writeFd(1, s), () => terminalWidth());
+        questions.interactive = true;
     }
     scope (exit) leaveKeyMode();
     if (interactive && editor is null)
@@ -641,14 +699,29 @@ int main(string[] args)
                 case "/clear":
                     agent.messages = agent.messages[0 .. 1];
                     if (agent.log !is null) agent.log.replace(agent.messages);
+                    if (!agent.plan.empty) agent.setPlan(Plan.init, false);
                     writeln("conversation cleared");
                     continue;
                 case "/usage":
                     writefln("last request: %s input (%s cached), %s output tokens", agent.lastUsage.inputTokens,
                             agent.lastUsage.cachedInputTokens, agent.lastUsage.outputTokens);
                     continue;
-                case "/plan", "/normal":
-                    bool plan = cmd == "/plan";
+                case "/plan":
+                    auto shown = agent.plan.render(true, size_t.max);
+                    write(shown, shown.length && shown[$ - 1] == '\n' ? "" : "\n");
+                    continue;
+                case "/mode":
+                    if (!arg.length)
+                    {
+                        writeln("mode: ", agent.policy.mode == Mode.plan ? "plan" : "normal");
+                        continue;
+                    }
+                    if (arg != "plan" && arg != "normal")
+                    {
+                        writeln("unknown mode ", arg, " (normal or plan)");
+                        continue;
+                    }
+                    bool plan = arg == "plan";
                     agent.policy.mode = plan ? Mode.plan : Mode.normal;
                     agent.messages[0].content = systemFor(cwd, plan);
                     writeln(plan ? "plan mode: read-only" : "normal mode");

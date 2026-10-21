@@ -126,6 +126,8 @@ struct Config
     MemoryMode memory = MemoryMode.on;
     /// Hooks: `disable_hooks` (or `--no-hooks`), `disable_project_hooks`,
     /// `claude_user_hooks`, and nano's own `[hooks]` table (Claude's shape).
+    /// Offer the `plan_*` tools (`plan_tools`, default on).
+    bool planTools = true;
     bool disableHooks;
     bool disableProjectHooks;
     bool claudeUserHooks = true;
@@ -157,6 +159,7 @@ struct Config
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
+        if (auto v = "plan_tools" in doc) c.planTools = v.boolean;
         if (auto v = "disable_hooks" in doc) c.disableHooks = v.boolean;
         if (auto v = "disable_project_hooks" in doc) c.disableProjectHooks = v.boolean;
         if (auto v = "claude_user_hooks" in doc) c.claudeUserHooks = v.boolean;

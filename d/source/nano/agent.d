@@ -9,6 +9,8 @@ import std.array : join;
 import std.conv : to;
 import nano.llm;
 import nano.tools;
+import nano.question : QuestionError;
+import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
 import nano.control;
@@ -151,7 +153,7 @@ class Agent
             }
             ChatRequest req;
             req.messages = messages;
-            req.tools = tools.definitions;
+            req.tools = tools.definitions ~ (planTools ? planDefinitions() : null);
             req.maxTokens = maxTokens;
             req.temperature = temperature;
             LLMResponse r;
@@ -231,7 +233,8 @@ class Agent
                 : "Send the arguments as a single JSON object.";
             return format("Invalid arguments for %s (not a JSON object): %s\n%s", call.name, raw, advice);
         }
-        if (!tools.has(call.name)) return format("Tool '%s' not found. Available: %s", call.name, toolNames());
+        bool isPlan = planTools && isPlanTool(call.name);
+        if (!isPlan && !tools.has(call.name)) return format("Tool '%s' not found. Available: %s", call.name, toolNames());
         if (auto blocked = policy.check(call.name, call.arguments)) return blocked;
         // PreToolUse hooks run after the permission check, before the tool:
         // they can deny the call, rewrite its input, or add context.
@@ -258,10 +261,12 @@ class Agent
         string out_;
         try
         {
-            out_ = tools.execute(call.name, args);
+            out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
+        catch (PlanError e) out_ = e.msg;
+        catch (QuestionError e) out_ = e.msg;
         catch (Exception e) out_ = format("%s failed: %s", call.name, e.msg);
         if (hooks !is null)
         {
@@ -270,6 +275,35 @@ class Agent
             if (o.blocked && o.blockReason.strip.length) context ~= o.blockReason;
         }
         return withContext(out_, context);
+    }
+
+    /// The task plan (`plan_*` tools), kept outside the conversation.
+    Plan plan;
+    /// Offer the plan tools (config `plan_tools`).
+    bool planTools = true;
+    /// Called after the plan changes (the UI shows the checklist).
+    void delegate() onPlanChanged;
+
+    private string runPlanTool(string name, JSONValue args)
+    {
+        auto o = plan.apply(name, args);
+        if (o.changed) planChanged();
+        return o.text;
+    }
+
+    private void planChanged()
+    {
+        if (log !is null) log.plan(plan.toJSON);
+        if (onPlanChanged !is null) onPlanChanged();
+    }
+
+    /// Replace the plan with one carried over from an earlier run, telling
+    /// the model about it unless `announce` is false.
+    void setPlan(Plan p, bool announce)
+    {
+        plan = p;
+        if (announce && planTools && !plan.empty) push(Message.user(plan.carriedOverNote));
+        if (log !is null) log.plan(plan.toJSON);
     }
 
     private static string withContext(string text, string[] context)

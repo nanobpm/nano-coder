@@ -209,6 +209,14 @@ class SessionLog
         write_(record("hooks", JSONValue(["files": JSONValue(list), "recorded_at": JSONValue(nowStamp())])));
     }
 
+    /// The task plan after a change; the latest one wins.
+    void plan(JSONValue plan)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["plan"] = plan;
+        write_(record("plan", d));
+    }
+
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
     void turnEnd(string inputId, string response, string stopReason)
     {
@@ -237,6 +245,8 @@ struct Restored
     Message[] conversation;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
+    /// The latest plan record (`{goal, items}`), or null.
+    JSONValue plan;
 }
 
 /// Read a session log (Rust format), dropping a torn last line.
@@ -294,7 +304,10 @@ Restored restore(string path)
                 r.pendingInput = null;
             }
             break;
-        default: // plan, hooks: not conversation state
+        case "plan":
+            r.plan = data["plan"];
+            break;
+        default: // hooks: audit only
             break;
         }
         index++;
