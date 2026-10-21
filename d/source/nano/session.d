@@ -484,36 +484,6 @@ string listRow(const ref Summary s, SysTime now)
     return oneLine(s.id) ~ "  " ~ line;
 }
 
-/// Project instruction files from the git root down to `cwd` (first name
-/// found per directory), plus the user's own `~/.config/nano-coder/AGENTS.md`.
-string projectInstructions(string cwd, const string[] names = ["AGENTS.md", "CLAUDE.md"])
-{
-    string[] dirs;
-    auto d = cwd;
-    for (;;)
-    {
-        dirs = d ~ dirs;
-        if (buildPath(d, ".git").exists) break;
-        auto up = d.dirName;
-        if (up == d) { dirs = [cwd]; break; } // not a repo: only cwd
-        d = up;
-    }
-    string out_;
-    auto user = buildPath(expandTilde("~"), ".config", "nano-coder", "AGENTS.md");
-    if (user.exists) out_ ~= format("\n\n# User instructions (%s)\n\n%s", user, readText(user).strip);
-    foreach (dir; dirs)
-        foreach (n; names)
-        {
-            auto p = buildPath(dir, n);
-            if (p.exists && p.isFile)
-            {
-                out_ ~= format("\n\n# Project instructions (%s)\n\n%s", p, readText(p).strip);
-                break;
-            }
-        }
-    return out_;
-}
-
 unittest
 {
     auto dir = buildPath(tempDir, "nano-coder-d-session-test");
@@ -568,17 +538,4 @@ unittest
     auto now = Clock.currTime;
     import core.time : minutes, hours;
     assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
-}
-
-unittest
-{
-    auto root = buildPath(tempDir, "nano-coder-d-instr-test");
-    if (root.exists) rmdirRecurse(root);
-    mkdirRecurse(buildPath(root, ".git"));
-    mkdirRecurse(buildPath(root, "sub"));
-    write(buildPath(root, "AGENTS.md"), "root rules");
-    write(buildPath(root, "sub", "CLAUDE.md"), "sub rules");
-    import std.string : indexOf;
-    auto s = projectInstructions(buildPath(root, "sub"));
-    assert(s.indexOf("root rules") >= 0 && s.indexOf("sub rules") > s.indexOf("root rules"));
 }

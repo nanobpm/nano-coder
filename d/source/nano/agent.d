@@ -15,6 +15,7 @@ import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolN
 import nano.reminders : Reminders, wrap;
 import ctx = nano.context;
 import hist = nano.session_history;
+import nano.instructions : ProjectInstructions;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
@@ -336,6 +337,16 @@ class Agent
                 else
                 {
                     result = runTool(call, r.stopReason, isError);
+                    // Deeper instruction files and scoped rules attach to the first
+                    // file-tool result that touches a matching path.
+                    if (!isError && instructions !is null
+                        && (call.name == "read_file" || call.name == "write_file" || call.name == "edit_file"))
+                        if (auto p = "path" in call.arguments)
+                            if (p.type == JSONType.string)
+                            {
+                                import std.file : getcwd;
+                                if (auto nested = instructions.nestedFor(p.str, getcwd())) result ~= nested;
+                            }
                     if (hist.isHistoryTool(call.name)) historyHintPending = false;
                     else if (historyHintPending && historyEnabled && hist.looksFailed(call.name, !isError, result))
                     {
@@ -598,6 +609,8 @@ class Agent
         if (log !is null) log.replace(messages, first, last, ctx.modeName(m), client.providerName ~ "/" ~ client.modelName);
         report = CompactReport(len, messages.length, tokensBefore, estimateContextTokens(), split - bodyStart,
             fallback, truncated, m);
+        // Nested instructions attached to folded tool results may be gone.
+        if (instructions !is null) instructions.forgetNested();
         compactFloor = report.tokensAfter;
         compactions++;
         historyAvailable = historyHintPending = m == ctx.CompactionMode.smart;
@@ -690,6 +703,8 @@ class Agent
         return withContext(out_, context);
     }
 
+    /// Instruction files: nested ones attach to file-tool results.
+    ProjectInstructions instructions;
     /// A smart summary is in context: offer history_search/history_read.
     bool historyAvailable;
     /// Append the "look in history" hint to the next failed tool result.

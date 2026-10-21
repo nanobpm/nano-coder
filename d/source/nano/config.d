@@ -134,6 +134,12 @@ struct Config
     bool reminders = true;
     /// Compact automatically at `autoCompactThreshold` of the context window.
     bool autoCompact = true;
+    /// Instruction files (AGENTS.md and friends, the user's own, rules).
+    bool projectInstructions = true;
+    string[] projectInstructionFiles = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"];
+    string[] userInstructionFiles = ["~/.claude/CLAUDE.md", "~/.agents/AGENTS.md"];
+    string[] userRulesDirs = ["~/.claude/rules"];
+    bool instructionImportsOutsideProject;
     double autoCompactThreshold = 0.8;
     /// `standard` or `smart` (summary cites the session log; history tools).
     string compactionMode = "standard";
@@ -172,6 +178,12 @@ struct Config
         if (auto v = "outcome_tool" in doc) c.outcomeTool = v.boolean;
         if (auto v = "reminders" in doc) c.reminders = v.boolean;
         if (auto v = "auto_compact" in doc) c.autoCompact = v.boolean;
+        if (auto v = "project_instructions" in doc) c.projectInstructions = v.boolean;
+        static string[] strs(JSONValue v) { string[] o; foreach (x; v.array) o ~= x.str; return o; }
+        if (auto v = "project_instruction_files" in doc) c.projectInstructionFiles = strs(*v);
+        if (auto v = "user_instruction_files" in doc) c.userInstructionFiles = strs(*v);
+        if (auto v = "user_rules_dirs" in doc) c.userRulesDirs = strs(*v);
+        if (auto v = "instruction_imports_outside_project" in doc) c.instructionImportsOutsideProject = v.boolean;
         if (auto v = "auto_compact_threshold" in doc)
             c.autoCompactThreshold = v.type == JSONType.integer ? v.integer : v.floating;
         if (auto v = "compaction_mode" in doc) c.compactionMode = v.str;

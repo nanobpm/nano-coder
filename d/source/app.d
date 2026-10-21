@@ -31,6 +31,7 @@ import nano.claude_hooks : HookManager, listingField, label, isProject;
 import nano.skills : Skills, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
+import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
 import core.sync.condition : Condition;
@@ -420,7 +421,8 @@ string indent(string s)
 
 alias planNote = planPromptNote;
 
-string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null, string memoryIndex = null)
+string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null, string memoryIndex = null,
+    string instructions = null)
 {
     import std.datetime.systime : Clock;
     auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
@@ -429,11 +431,25 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
     else enum os = "unknown";
     auto s = format("%s\n\nWorking directory: %s\nPlatform: %s\nToday's date: %s", base, cwd, os,
             Clock.currTime.toISOExtString[0 .. 10]);
-    s ~= projectInstructions(cwd);
+    s ~= instructions;
     if (skills !is null) s ~= skills.renderIndex;
     s ~= memoryIndex;
     if (plan) s ~= planNote;
     return s;
+}
+
+/// The instruction files for `dir`, or null when disabled (config
+/// `project_instructions`, env `AGENTIC_NO_PROJECT_INSTRUCTIONS`).
+ProjectInstructions discoverInstructions(const ref Config c, string dir)
+{
+    import std.process : environment;
+    if (!c.projectInstructions || environment.get("AGENTIC_NO_PROJECT_INSTRUCTIONS") !is null) return null;
+    InstructionOptions o;
+    o.names = c.projectInstructionFiles.dup;
+    foreach (f; c.userInstructionFiles) o.userFiles ~= expandHome(f);
+    foreach (d; c.userRulesDirs) o.userRulesDirs ~= expandHome(d);
+    o.importsOutsideProject = c.instructionImportsOutsideProject;
+    return ProjectInstructions.discover(dir, o);
 }
 
 /// `/context`: window use, token totals, compaction settings.
@@ -451,6 +467,11 @@ string contextReport(Agent agent)
         window ? tokens * 100.0 / window : 0.0, calibrated ? ", anchored to reported usage" : ", estimated");
     out_ ~= format("Window:       %s (%s)", formatTokens(window), source);
     out_ ~= format("Messages:     %s", agent.messages.length);
+    if (agent.instructions is null || !agent.instructions.loadedPaths.length)
+        out_ ~= "Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)";
+    else out_ ~= "Instructions: " ~ agent.instructions.loadedPaths.join(", ");
+    if (agent.instructions !is null && agent.instructions.onDemandPaths.length)
+        out_ ~= "On-demand rules: " ~ agent.instructions.onDemandPaths.join(", ");
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
     out_ ~= agent.autoCompact
         ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
@@ -563,14 +584,29 @@ int main(string[] args)
         }
         foreach (d; memoryDefinitions(memoryWritable)) tools.register(d, memoryHandler(d.name));
     }
+    // Instruction files, discovered once per working directory.
+    ProjectInstructions instructions;
+    string instructionsDir;
     string systemFor(string dir, bool plan)
     {
         auto index = memory !is null ? memory.index(memoryWritable && !plan) : null;
-        return buildSystemPrompt(cfg, dir, plan, skills, index);
+        if (instructionsDir is null || instructionsDir != dir)
+        {
+            instructionsDir = dir;
+            instructions = discoverInstructions(cfg, dir);
+            if (agent !is null) agent.instructions = instructions;
+        }
+        return buildSystemPrompt(cfg, dir, plan, skills, index, instructions !is null ? instructions.render : null);
     }
     auto questions = new QuestionBroker;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
+    agent.instructions = instructions;
+    if (instructions !is null && !o.acp && !o.prompt.length)
+    {
+        foreach (f; instructions.loadedPaths) stderr.writeln("Instructions: ", f);
+        foreach (w; instructions.warnings) stderr.writeln("Instructions warning: ", w);
+    }
     agent.planTools = cfg.planTools;
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
