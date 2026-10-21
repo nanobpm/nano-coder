@@ -1260,6 +1260,20 @@ int runMain(string[] args)
         host.sessionDir = o.noSession ? null : sessionDir;
         host.version_ = versionString;
         host.loadHooks = &loadHooks;
+        host.providerNames = () => cfg.providers.keys;
+        host.configModel = cfg.model;
+        host.configSystemPrompt = cfg.systemPrompt;
+        host.sessionMeta = () @trusted {
+            JSONValue meta = ["projectInstructions": JSONValue(instructions !is null ? instructions.loadedPaths : null),
+                "skills": JSONValue(skills !is null ? skills.names : null)];
+            if (instructions !is null)
+            {
+                if (auto od = instructions.onDemandPaths) meta["projectInstructionsOnDemand"] = od;
+                if (instructions.warnings.length) meta["instructionWarnings"] = instructions.warnings;
+            }
+            if (skills !is null && skills.warnings.length) meta["skillWarnings"] = skills.warnings;
+            return meta;
+        };
         auto server = new AcpServer(agent, host);
         if (!server.serveStdio())
         {

@@ -296,6 +296,11 @@ struct Restored
     Message[] conversation;
     /// The text of an input whose turn never ended (a crash mid-turn).
     string pendingInput;
+    /// Finished turns by input id: response, stop reason and any outcome
+    /// (redelivering one of these ids replays the recorded answer).
+    string[string] completed;
+    string[string] completedStops;
+    JSONValue[string] completedOutcomes;
     /// The latest plan record (`{goal, items}`), or null.
     JSONValue plan;
     /// The latest compaction was smart: the history tools are offered.
@@ -356,6 +361,17 @@ Restored restore(string path)
             break;
         case "turn_end":
             if (data["input_id"].str == pendingId) { pendingId = null; r.pendingInput = null; }
+            {
+                auto iid = data["input_id"].str;
+                auto resp = "response" in data;
+                r.completed[iid] = resp !is null && resp.type == JSONType.string ? resp.str : "";
+                auto st = "stop_reason" in data;
+                if (st !is null && st.type == JSONType.string && st.str != "end_turn") r.completedStops[iid] = st.str;
+                else r.completedStops.remove(iid);
+                auto oc = "outcome" in data;
+                if (oc !is null && oc.type == JSONType.object) r.completedOutcomes[iid] = *oc;
+                else r.completedOutcomes.remove(iid);
+            }
             break;
         case "replace":
             r.conversation = null;

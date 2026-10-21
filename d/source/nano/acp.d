@@ -26,6 +26,7 @@ import nano.claude_hooks : HookManager;
 import nano.control;
 import nano.llm;
 import nano.session;
+import nano.plan : Plan;
 
 enum int protocolVersion = 1;
 
@@ -36,7 +37,7 @@ import std.array : join;
 
 /// Commands `handle` services over ACP. Reaching the slash fallback with one
 /// of these means only its arguments were not accepted.
-immutable string[] acpCommandRoots = ["/tools", "/settings", "/model"];
+immutable string[] acpCommandRoots = ["/compact", "/settings", "/tools", "/plan", "/providers", "/model"];
 
 JSONValue rpcResult(JSONValue id, JSONValue result)
 {
@@ -161,6 +162,32 @@ struct Host
     string version_;
     /// Load the user hooks for a session in `cwd` (null = no hooks).
     HookManager delegate(string cwd) loadHooks;
+    /// `_meta` for session/new and session/load: loaded instruction files,
+    /// on-demand rules, skills and warnings (called after `systemPrompt`).
+    JSONValue delegate() sessionMeta;
+    /// Configured and preset provider names, for `/providers`.
+    string[] delegate() providerNames;
+    /// The configured `model` and `system_prompt`, for `/settings`.
+    string configModel, configSystemPrompt;
+}
+
+/// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
+string inputId(JSONValue params) @trusted
+{
+    if (params.type != JSONType.object) return null;
+    auto v = "messageId" in params.object;
+    if (v is null)
+        if (auto m = "_meta" in params.object)
+            if (m.type == JSONType.object) v = "inputId" in m.object;
+    return v !is null && v.type == JSONType.string && v.str.length ? v.str : null;
+}
+
+unittest
+{
+    assert(inputId(parseJSON(`{"messageId": "m1", "_meta": {"inputId": "i"}}`)) == "m1");
+    assert(inputId(parseJSON(`{"_meta": {"inputId": "i"}}`)) == "i");
+    assert(inputId(parseJSON(`{"messageId": ""}`)) is null);
+    assert(inputId(parseJSON(`{}`)) is null);
 }
 
 /// FIFO of parsed messages shared by the reader thread and the turn loop.
@@ -379,15 +406,31 @@ final class AcpServer : AgentEvents
                 "protocolVersion": JSONValue(protocolVersion),
                 "agentInfo": JSONValue(["name": "nano-coder-d", "version": host.version_]),
                 "agentCapabilities": JSONValue(["loadSession": JSONValue(host.sessionDir !is null),
-                    "tools": JSONValue(true), "hooks": JSONValue(false), "compact": JSONValue(false)]),
+                    "tools": JSONValue(true), "hooks": JSONValue(false), "compact": JSONValue(true),
+                    "_meta": JSONValue(["planSeed": JSONValue(agent.planTools)])]),
             ])));
             return;
         case "session/new":
             if (auto e = applyCwd(params)) { reply(rpcError(id, -32602, e)); return; }
             try
             {
+                Plan seed;
+                bool seeded;
+                if (params.type == JSONType.object)
+                    if (auto m = "_meta" in params.object)
+                        if (m.type == JSONType.object)
+                            if (auto p = "plan" in m.object)
+                                if (p.type != JSONType.null_) { seed = Plan.fromJSON(*p); seeded = true; }
                 newSession();
-                reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": JSONValue(string[string].init)])));
+                if (seeded)
+                {
+                    // The client already showed the model the plan (e.g. in a resume prompt).
+                    auto inPrompt = "planInPrompt" in params["_meta"].object;
+                    agent.setPlan(seed, !(inPrompt !is null && inPrompt.type == JSONType.true_));
+                }
+                auto meta = sessionMeta();
+                if (!agent.plan.empty) meta["plan"] = agent.plan.toJSON;
+                reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": meta])));
             }
             catch (Exception e) reply(rpcError(id, -32603, e.msg));
             return;
@@ -398,7 +441,7 @@ final class AcpServer : AgentEvents
             try
             {
                 loadSession_(want);
-                reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": JSONValue(string[string].init)])));
+                reply(rpcResult(id, JSONValue(["sessionId": JSONValue(sessionId), "_meta": sessionMeta()])));
             }
             catch (Exception e) reply(rpcError(id, -32603, e.msg));
             return;
@@ -423,16 +466,61 @@ final class AcpServer : AgentEvents
                 reply(rpcResult(id, JSONValue(["stopReason": "end_turn", "response": note])));
                 return;
             }
-            runTurn(id, text);
+            runTurn(id, text, inputId(params));
             return;
         default:
             if (hasId && method !is null) reply(rpcError(id, -32601, "method not found: " ~ method));
         }
     }
 
+    private JSONValue sessionMeta()
+    {
+        return host.sessionMeta !is null ? host.sessionMeta() : JSONValue(string[string].init);
+    }
+
     /// Slash commands available over ACP; JSONValue.init when `text` isn't one.
     private JSONValue command(string text, JSONValue id)
     {
+        if (text == "/compact" || text.startsWith("/compact "))
+        {
+            import nano.commands : parseCompactArgs;
+            import nano.context : CompactionMode;
+            CompactionMode mode;
+            string focus;
+            bool hasMode = parseCompactArgs(text["/compact".length .. $], mode, focus);
+            CompactReport rep;
+            bool done;
+            // Manual: the reply reports it, so skip the auto-compaction notice.
+            auto notice = agent.onCompacted;
+            agent.onCompacted = null;
+            scope (exit) agent.onCompacted = notice;
+            try done = agent.compact(rep, CompactTrigger.manual, hasMode ? &mode : null, focus.length ? focus : null);
+            catch (Exception e) return rpcError(id, -32603, e.msg);
+            if (!done) return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "compacted": JSONValue(false)]));
+            JSONValue b = ["stopReason": JSONValue("end_turn"), "compacted": JSONValue(true)];
+            b["before"] = rep.messagesBefore;
+            b["after"] = rep.messagesAfter;
+            b["tokensBefore"] = rep.tokensBefore;
+            b["tokensAfter"] = rep.tokensAfter;
+            b["summarized"] = rep.summarized;
+            b["mode"] = rep.mode == CompactionMode.smart ? "smart" : "standard";
+            b["fallback"] = rep.fallback is null ? JSONValue(null) : JSONValue(rep.fallback);
+            b["truncated"] = rep.truncated;
+            return rpcResult(id, b);
+        }
+        if (text == "/plan")
+        {
+            JSONValue b = ["stopReason": JSONValue("end_turn"), "plan": agent.plan.toJSON];
+            b["text"] = agent.plan.render(true, size_t.max);
+            return rpcResult(id, b);
+        }
+        if (text == "/providers")
+        {
+            import std.algorithm : sort;
+            string[] names = host.providerNames !is null ? host.providerNames() : null;
+            names.sort();
+            return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "providers": JSONValue(names)]));
+        }
         if (text == "/tools")
         {
             JSONValue[] names;
@@ -441,8 +529,17 @@ final class AcpServer : AgentEvents
         }
         if (text == "/settings")
         {
+            import std.math : isNaN;
             JSONValue s = ["provider": agent.client.providerName, "provider_model": agent.client.modelName];
+            s["model"] = host.configModel;
+            auto temp = agent.temperatureNow;
+            s["temperature"] = isNaN(temp.effective) ? JSONValue(null) : JSONValue(temp.effective);
+            s["temperature_source"] = label(temp.source);
+            auto th = agent.thinking();
+            s["thinking"] = wireValue(th);
+            s["thinking_source"] = label(th.source);
             s["max_tokens"] = agent.maxTokens;
+            s["system_prompt"] = host.configSystemPrompt is null ? JSONValue(null) : JSONValue(host.configSystemPrompt);
             s["session_id"] = sessionId is null ? JSONValue(null) : JSONValue(sessionId);
             return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "settings": s]));
         }
@@ -505,6 +602,10 @@ final class AcpServer : AgentEvents
         auto sys = host.systemPrompt !is null ? host.systemPrompt(cwd) : null;
         agent.messages = sys.length ? [Message.system(sys)] : null;
         agent.log = null;
+        agent.completedInputs = null;
+        agent.completedStops = null;
+        agent.completedOutcomes = null;
+        agent.plan = Plan.init;
         if (host.sessionDir !is null)
         {
             agent.log = new SessionLog(host.sessionDir, agent.client.providerName ~ "/" ~ agent.client.modelName, cwd);
@@ -533,6 +634,15 @@ final class AcpServer : AgentEvents
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.log = new SessionLog(path);
         sessionId = agent.log.id;
+        agent.completedInputs = restored.completed;
+        agent.completedStops = restored.completedStops;
+        agent.completedOutcomes = restored.completedOutcomes;
+        agent.plan = Plan.init;
+        if (restored.plan.type == JSONType.object)
+        {
+            try agent.plan = Plan.fromJSON(restored.plan);
+            catch (Exception) {}
+        }
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
     }
@@ -556,7 +666,7 @@ final class AcpServer : AgentEvents
     }
 
     /// Run one prompt turn; the reader thread routes cancels and steers meanwhile.
-    private void runTurn(JSONValue id, string text)
+    private void runTurn(JSONValue id, string text, string givenId = null)
     {
         {
             inbox.lock.lock();
@@ -566,7 +676,7 @@ final class AcpServer : AgentEvents
             atomicStore(turnActive, true);
         }
         string response;
-        try response = agent.run(text, this, false);
+        try response = agent.run(text, this, false, givenId);
         catch (Exception e)
         {
             response = "Error: " ~ e.msg;

@@ -123,6 +123,11 @@ class Agent
     TurnControl control;
     /// Why the last `run` ended.
     StopReason lastStop;
+    /// Finished turns by input id (see `Restored.completed`): redelivering
+    /// one returns the recorded response without re-running the turn.
+    string[string] completedInputs;
+    string[string] completedStops;
+    JSONValue[string] completedOutcomes;
     /// Claude Code-compatible user hooks (null = none).
     HookManager hooks;
     /// Whether this agent continues a restored session (`SessionStart` source).
@@ -174,12 +179,26 @@ class Agent
     /// too late for this turn stay in `control` for the caller to queue.
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
-    string run(string input, AgentEvents ev, bool resetControl = true)
+    string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null) @trusted
     {
         import std.datetime.systime : Clock;
+        import std.conv : to;
+        if (givenId.length)
+            if (auto done = givenId in completedInputs)
+            {
+                import std.stdio : stderr;
+                stderr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
+                auto st = givenId in completedStops;
+                lastStop = st is null ? StopReason.endTurn : (*st).to!StopReason;
+                auto oc = givenId in completedOutcomes;
+                hasOutcome = oc !is null;
+                if (hasOutcome) lastOutcome = Outcome.fromArgs(*oc);
+                return *done;
+            }
         // Every input carries an id; the log pairs it with a turn_end record,
         // so an input without one marks a turn a crash interrupted.
-        auto inputId = format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
+        auto inputId = givenId.length ? givenId
+            : format("in-%s-%s", (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000, ++inputCounter);
         ulong from = log !is null ? logSize() : 0;
         if (log !is null) log.input(inputId, input);
         string response;
@@ -198,6 +217,11 @@ class Agent
             log.turnEnd(inputId, response, cast(string) lastStop, hasOutcome ? lastOutcome.toJSON : JSONValue.init);
             indexTurn(from);
         }
+        completedInputs[inputId] = response;
+        if (lastStop != StopReason.endTurn) completedStops[inputId] = cast(string) lastStop;
+        else completedStops.remove(inputId);
+        if (hasOutcome) completedOutcomes[inputId] = lastOutcome.toJSON;
+        else completedOutcomes.remove(inputId);
         return response;
     }
 
