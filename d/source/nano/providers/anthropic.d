@@ -142,7 +142,7 @@ class AnthropicClient : LLMClient
         auto what = format("%s chat request", p.name);
         if (!p.config.stream || sink is null)
         {
-            auto text = postJson(url, headers(), requestBody(req, false), what, p.config.maxRetries, p.config.timeoutSecs);
+            auto text = postProvider(url, headers(), requestBody(req, false), what, p.config);
             auto r = parseWhole(parseJSON(text));
             if (sink !is null)
             {
@@ -153,8 +153,9 @@ class AnthropicClient : LLMClient
         }
         AnthropicStream st;
         st.sink = sink;
-        postJson(url, headers(), requestBody(req, true), what, p.config.maxRetries, p.config.timeoutSecs,
+        auto whole = postProvider(url, headers(), requestBody(req, true), what, p.config,
                 (string data) { st.event(data); });
+        if (whole !is null) return reportWhole(parseWhole(parseJSON(whole)), sink);
         return st.finish();
     }
 

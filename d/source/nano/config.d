@@ -86,7 +86,28 @@ struct ProviderConfig
     bool hasThinkingLevels;
     ModelSettings[string] models;
     long timeoutSecs = 600;
-    long maxRetries = 3;
+    long maxRetries = 5;
+    long retryInitialBackoffMs = -1, retryMaxBackoffMs = -1;
+    ushort[] retryableStatuses;
+    bool hasRetryableStatuses;
+
+    /// The retry policy these settings describe.
+    imported!"nano.retry".RetryPolicy retryPolicy() const
+    {
+        import core.time : msecs;
+        imported!"nano.retry".RetryPolicy r;
+        r.maxRetries = maxRetries;
+        if (retryInitialBackoffMs >= 0) r.initialBackoff = retryInitialBackoffMs.msecs;
+        if (retryMaxBackoffMs >= 0) r.maxBackoff = retryMaxBackoffMs.msecs;
+        return r;
+    }
+
+    /// HTTP statuses worth retrying.
+    const(ushort)[] statuses() const
+    {
+        import nano.retry : defaultRetryableStatuses;
+        return hasRetryableStatuses ? retryableStatuses : defaultRetryableStatuses;
+    }
     /// Send the model's reasoning back on later turns (null: on for models
     /// that reason over the Responses API).
     Nullable!bool replayReasoning;
@@ -139,6 +160,14 @@ struct ProviderConfig
             foreach (name, m; v.object) models[name] = ModelSettings.fromJSON(m);
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
+        if (auto v = "retry_initial_backoff_ms" in o) retryInitialBackoffMs = v.integer;
+        if (auto v = "retry_max_backoff_ms" in o) retryMaxBackoffMs = v.integer;
+        if (auto v = "retryable_statuses" in o)
+        {
+            hasRetryableStatuses = true;
+            retryableStatuses = null;
+            foreach (st; v.array) retryableStatuses ~= cast(ushort) st.integer;
+        }
         if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
     }
 }
@@ -181,7 +210,8 @@ ProviderConfig[string] presets()
     m["mistral"] = preset(O, "https://api.mistral.ai/v1", "MISTRAL_API_KEY");
     m["gemini"] = preset(O, "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY");
     m["ollama"] = preset(O, "http://localhost:11434/v1", null);
-    m["github-copilot"] = preset(ProviderKind.githubCopilot, "https://api.githubcopilot.com", null, "gpt-4.1");
+    // No base_url: the session token names the API endpoint.
+    m["github-copilot"] = preset(ProviderKind.githubCopilot, null, "GITHUB_COPILOT_OAUTH_TOKEN", "gpt-4.1");
     return m;
 }
 
@@ -305,7 +335,7 @@ struct ResolvedProvider
 
 /// Whether this provider and model reason over the Responses API: they
 /// need reasoning replayed and reject a non-default temperature.
-bool reasonsOverResponses(ProviderKind kind, string model)
+bool reasonsOverResponses(ProviderKind kind, string model) @safe
 {
     import nano.copilot : isReasoningModel;
     return kind == ProviderKind.githubCopilot && isReasoningModel(model);

@@ -75,7 +75,10 @@ JSONValue messageRecord(const ref Message m)
         foreach (c; m.toolCalls)
         {
             JSONValue cj = ["id": c.id, "name": c.name];
-            cj["arguments"] = c.invalidArguments.length ? JSONValue(c.invalidArguments) : parseJSON(c.arguments.toString);
+            // Rust's shape: malformed text is kept beside an empty object.
+            cj["arguments"] = c.invalidArguments.length ? parseJSON("{}") : parseJSON(c.arguments.toString);
+            if (c.invalidArguments.length) cj["malformed_arguments"] = c.invalidArguments;
+            if (c.itemId.length) cj["item_id"] = c.itemId;
             calls ~= cj;
         }
         j["tool_calls"] = calls;
@@ -126,8 +129,13 @@ Message messageFromRecord(JSONValue j)
             foreach (c; v.array)
             {
                 auto args = c["arguments"];
-                m.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["name"].str,
-                    args.type == JSONType.string ? args.str : args.toString);
+                auto mal = "malformed_arguments" in c;
+                // Legacy logs held malformed text as a string `arguments`.
+                auto raw = mal && mal.type == JSONType.string ? mal.str
+                    : args.type == JSONType.string ? args.str : args.toString;
+                auto call = ToolCall.fromRaw(c["id"].str, c["name"].str, raw);
+                if (auto iid = "item_id" in c) if (iid.type == JSONType.string) call.itemId = iid.str;
+                m.toolCalls ~= call;
             }
             break;
         case "attachments":
@@ -558,4 +566,18 @@ unittest
     auto now = Clock.currTime;
     import core.time : minutes, hours;
     assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
+}
+
+@trusted unittest
+{
+    // Malformed arguments and Responses item ids round-trip in Rust's shape.
+    auto m = Message.assistant("", [ToolCall.fromRaw("c1", "bash", "{oops")]);
+    m.toolCalls[0].itemId = "fc_1";
+    auto rec = messageRecord(m);
+    auto call = rec["tool_calls"][0];
+    assert(call["arguments"].object.length == 0 && call["malformed_arguments"].str == "{oops" && call["item_id"].str == "fc_1");
+    auto back = messageFromRecord(rec);
+    assert(back.toolCalls[0].invalidArguments == "{oops" && back.toolCalls[0].itemId == "fc_1");
+    auto legacy = messageFromRecord(parseJSON(`{"role":"assistant","content":"","tool_calls":[{"id":"c","name":"bash","arguments":"{bad"}]}`));
+    assert(legacy.toolCalls[0].invalidArguments == "{bad");
 }

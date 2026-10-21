@@ -24,6 +24,9 @@ struct ToolCall
     JSONValue arguments;
     /// The raw text when the model's arguments were not a JSON object.
     string invalidArguments;
+    /// Responses API output-item id (`fc_*`), replayed so reasoning models
+    /// can pair a preserved reasoning item with its call.
+    string itemId;
 
     static ToolCall fromRaw(string id, string name, string raw)
     {
@@ -347,4 +350,15 @@ unittest
     auto m = Message.assistant("x", [ToolCall.fromRaw("c1", "read_file", `{"path":"a"}`)]);
     auto back = Message.fromJson(parseJSON(m.toJson.toString));
     assert(back.toolCalls[0].arguments["path"].str == "a");
+}
+
+/// Show a whole (non-streamed) response through `sink`.
+LLMResponse reportWhole(LLMResponse r, StreamSink sink)
+{
+    if (sink !is null)
+    {
+        if (r.reasoning.length) sink(true, r.reasoning);
+        if (r.content.length) sink(false, r.content);
+    }
+    return r;
 }

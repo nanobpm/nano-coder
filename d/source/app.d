@@ -44,6 +44,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
                     [--no-session] [--no-hooks] [--verbose] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --list-models PROVIDER[/model]
+       nano-coder-d --login github-copilot
        nano-coder-d --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
@@ -54,7 +55,7 @@ Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
 {
-    string model, configPath, prompt, resume, listModels, sandbox;
+    string model, configPath, prompt, resume, listModels, sandbox, login;
     bool plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
@@ -79,6 +80,7 @@ Options parseArgs(string[] args)
             case "--config": o.configPath = value(); break;
             case "-p", "--prompt": o.prompt = value(); break;
             case "--list-models": o.listModels = value(); break;
+            case "--login": o.login = value(); break;
             case "--allow": o.allow ~= value(); break;
             case "--deny": o.deny ~= value(); break;
             case "--plan": o.plan = true; break;
@@ -102,9 +104,28 @@ Options parseArgs(string[] args)
         }
     }
     if ((o.all || o.json) && !o.listSessions) die("--all and --json require --list-sessions");
-    if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length))
-        die("--list-sessions can't be combined with --resume, --acp, --list-models or -p");
+    if (o.listSessions && (o.hasResume || o.acp || o.listModels.length || o.prompt.length || o.login.length))
+        die("--list-sessions can't be combined with --resume, --acp, --list-models, --login or -p");
+    if (o.hasResume && o.login.length) die("--resume and --login are mutually exclusive");
     return o;
+}
+
+/// `--login PROVIDER`: interactive device-flow sign-in.
+int runLogin(string provider)
+{
+    if (provider != "github-copilot")
+        die(format("unknown provider %(%s%) for --login; supported: github-copilot (other providers use API keys)", [provider]));
+    try
+    {
+        import nano.copilot : login;
+        import core.thread : Thread;
+        import core.time : seconds;
+        auto path = login((string s) @trusted { stderr.writeln(s); }, (long n) @trusted { Thread.sleep(n.seconds); });
+        writeln("Saved GitHub Copilot credentials to ", path);
+        return 0;
+    }
+    catch (Exception e) die(e.msg);
+    assert(0);
 }
 
 /// `--list-sessions [--all] [--json]`: this directory's saved sessions, newest first.
@@ -502,6 +523,7 @@ int main(string[] args)
     auto cfgPath = o.configPath.length ? o.configPath : Config.defaultPath;
     Config cfg;
     JSONValue rawConfig = JSONValue(string[string].init);
+    if (o.login.length) return runLogin(o.login);
     try
     {
         cfg = Config.load(cfgPath);

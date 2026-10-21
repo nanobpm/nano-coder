@@ -69,7 +69,9 @@ struct Resolved
 /// Why `model` accepts no temperature, if it doesn't.
 string fixedReason(ProviderKind kind, const ref ProviderConfig provider, string model)
 {
+    import nano.config : reasonsOverResponses;
     if (provider.dropParams.canFind("temperature")) return "the provider drops temperature (drop_params)";
+    if (reasonsOverResponses(kind, model)) return model ~ " is a reasoning model and rejects a custom temperature";
     return null;
 }
 
@@ -113,7 +115,11 @@ Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig prov
     }
     r.extraBodyWarning = ebWarning;
     r.warning = ebWarning;
-    if (kind == ProviderKind.anthropic && !isNaN(effective))
+    // Anthropic Messages (also Copilot's Claude 4/5 route) takes 0..1.
+    import nano.copilot : usesAnthropicMessages;
+    auto anthropicMessages = kind == ProviderKind.anthropic
+        || (kind == ProviderKind.githubCopilot && usesAnthropicMessages(model));
+    if (anthropicMessages && !isNaN(effective))
     {
         string w;
         if (effective > 1) { w = format("temperature %s is above Anthropic's maximum of 1; sending 1", show(effective)); effective = 1; }
@@ -155,4 +161,15 @@ Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig prov
     assert(r.effective == 0.7 && r.source == Source.extraBody);
     r = r.fixedBy("thinking is on");
     assert(isNaN(r.effective) && r.warning.canFind("from the provider's extra_body"));
+}
+
+@trusted unittest
+{
+    ProviderConfig none;
+    // Copilot reasoning models take no temperature; Copilot Claude is clamped.
+    auto r = resolve(0.5, ProviderKind.githubCopilot, none, "gpt-5");
+    assert(isNaN(r.effective) && r.fixed.length);
+    auto c = resolve(1.5, ProviderKind.githubCopilot, none, "claude-sonnet-4.5");
+    assert(c.effective == 1 && c.warning.length);
+    assert(resolve(1.5, ProviderKind.githubCopilot, none, "gpt-4.1").effective == 1.5);
 }

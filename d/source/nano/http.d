@@ -9,24 +9,24 @@ import std.format : format;
 import std.string : indexOf, strip, startsWith, toLower;
 import core.time : seconds, msecs, Duration;
 import core.thread : Thread;
+import nano.retry : ErrorInfo, RetryPolicy, retryDelay, retryableError = retryable;
 
 class ApiError : Exception
 {
     int status;
     string body_;
+    /// The body's normalized error (code, type, message).
+    ErrorInfo info;
     this(int status, string body_, string what)
     {
         this.status = status;
         this.body_ = body_;
+        info = ErrorInfo.fromBody(status, body_);
         auto shown = body_.length > 600 ? body_[0 .. 600] ~ "…" : body_;
         super(format("%s failed (HTTP %s): %s", what, status, shown));
     }
 }
 
-bool retryable(int status)
-{
-    return status == 408 || status == 409 || status == 429 || (status >= 500 && status <= 599);
-}
 
 struct Request
 {
@@ -40,7 +40,20 @@ struct Request
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
 /// arrives. Returns the status and the full body.
+/// Response headers `perform` reports.
+struct ResponseMeta
+{
+    string contentType, retryAfter;
+}
+
 int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) onChunk = null)
+{
+    ResponseMeta meta;
+    return perform(req, body_, meta, onChunk);
+}
+
+int perform(const ref Request req, out string body_, out ResponseMeta meta,
+    scope void delegate(const(char)[]) onChunk = null)
 {
     auto http = HTTP(req.url);
     http.method = req.method == "GET" ? HTTP.Method.get : HTTP.Method.post;
@@ -60,6 +73,13 @@ int perform(const ref Request req, out string body_, scope void delegate(const(c
     // and on every chunk).
     http.onProgress = (size_t a, size_t b, size_t c, size_t d) => cancelRequested() ? 1 : 0;
     char[] buf;
+    // Headers of the final response only (a redirect or 100 resets them).
+    http.onReceiveStatusLine = (HTTP.StatusLine) { meta = ResponseMeta.init; };
+    http.onReceiveHeader = (in char[] key, in char[] value) {
+        auto k = key.idup.toLower;
+        if (k == "content-type") meta.contentType = value.idup;
+        else if (k == "retry-after") meta.retryAfter = value.idup;
+    };
     http.onReceive = (ubyte[] data) {
         buf ~= cast(char[]) data;
         if (onChunk !is null) onChunk(cast(const(char)[]) data);
@@ -70,27 +90,41 @@ int perform(const ref Request req, out string body_, scope void delegate(const(c
     return http.statusLine.code;
 }
 
-/// POST JSON, retrying transient failures. `stream` gets SSE `data:` payloads
-/// when set; streamed requests retry only if nothing was received yet.
-string postJson(string url, string[string] headers, JSONValue body_, string what, long maxRetries,
-        long timeoutSecs, scope void delegate(string data) onEvent = null)
+/// POST JSON, retrying transient failures per the provider's retry policy
+/// (status classification, `Retry-After` and "try again in" hints).
+///
+/// With `onEvent`, the request asks for server-sent events and each `data:`
+/// payload goes to `onEvent`; a stream that fails before any event arrived
+/// is retried. A server that answers a stream request with plain JSON gets
+/// that body returned (parse it whole); an SSE reply returns null.
+string postJson(string url, string[string] headers, JSONValue body_, string what, RetryPolicy policy,
+        const(ushort)[] statuses, long timeoutSecs, scope void delegate(string data) onEvent = null)
 {
+    import std.random : uniform01;
+    import std.datetime.systime : Clock;
+    import std.stdio : stderr;
     Request req;
     req.url = url;
     req.headers = headers.dup;
     req.headers["Content-Type"] = "application/json";
+    if (onEvent !is null) req.headers["Accept"] = "text/event-stream";
     req.body_ = body_.toString;
     req.idleTimeout = timeoutSecs.seconds;
-    Duration backoff = 1000.msecs;
     for (long attempt = 0;; attempt++)
     {
         bool received;
         SseParser sse;
         string text;
         int status;
+        ResponseMeta meta;
+        Exception failure;
+        ErrorInfo info;
+        bool haveInfo;
         try
         {
-            status = perform(req, text, onEvent is null ? null : (const(char)[] chunk) {
+            status = perform(req, text, meta, onEvent is null ? null : (const(char)[] chunk) {
+                // Only an event-stream 2xx is parsed as events.
+                if (meta.contentType.indexOf("event-stream") < 0) return;
                 received = true;
                 sse.feed(chunk, onEvent);
             });
@@ -98,27 +132,57 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         catch (CurlException e)
         {
             if (cancelRequested()) throw new Cancelled;
-            if (attempt < maxRetries && !received)
+            // Connection resets, timeouts, DNS: transient, unless the stream
+            // already delivered events (a restart would duplicate them).
+            if (received || attempt >= policy.maxRetries) throw new Exception(format("%s: %s", what, e.msg));
+            failure = e;
+        }
+        if (failure is null)
+        {
+            bool ok = status >= 200 && status < 300;
+            bool isSse = meta.contentType.indexOf("event-stream") >= 0;
+            if (ok && onEvent !is null && isSse)
             {
-                pause(backoff);
-                backoff = backoff * 2;
-                continue;
+                sse.finish(onEvent);
+                return null;
             }
-            throw new Exception(format("%s: %s", what, e.msg));
+            if (ok)
+            {
+                // An error inside a 2xx JSON body.
+                JSONValue j;
+                try j = parseJSON(text);
+                catch (Exception) throw new Exception(format("%s: invalid JSON response: %s", what,
+                    text.length > 500 ? text[0 .. 500] : text));
+                auto e = j.type == JSONType.object ? "error" in j.object : null;
+                if (e is null || e.type == JSONType.null_) return text;
+                auto err = new ApiError(status, text, what);
+                if (onEvent !is null || attempt >= policy.maxRetries || !retryableError(err.info, statuses)) throw err;
+                failure = err;
+                info = err.info;
+                haveInfo = true;
+            }
+            else
+            {
+                auto err = new ApiError(status, text, what);
+                if (attempt >= policy.maxRetries || !retryableError(err.info, statuses)) throw err;
+                failure = err;
+                info = err.info;
+                haveInfo = true;
+            }
         }
-        if (status >= 200 && status < 300)
-        {
-            if (onEvent !is null) sse.finish(onEvent);
-            return text;
-        }
-        if (attempt < maxRetries && retryable(status))
-        {
-            pause(backoff);
-            backoff = backoff * 2;
-            continue;
-        }
-        throw new ApiError(status, text, what);
+        auto delay = retryDelay(policy, attempt, haveInfo ? &info : null, meta.retryAfter,
+            Clock.currTime.toUnixTime, uniform01());
+        stderr.writefln("[%s] attempt %s failed: %s; retrying in %.1fs", what, attempt + 1, failure.msg,
+            delay.total!"msecs" / 1000.0);
+        pause(delay);
     }
+}
+
+/// `postJson` with a provider's retry policy, retryable statuses and timeout.
+string postProvider(string url, string[string] headers, JSONValue body_, string what,
+        const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) onEvent = null)
+{
+    return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, onEvent);
 }
 
 /// Sleep for a retry backoff, cut short (with Cancelled) by a cancel.

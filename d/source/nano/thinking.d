@@ -79,6 +79,16 @@ enum Wire { chatCompletions, responses, anthropicMessages }
 
 Wire wireFor(ProviderKind kind, string model)
 {
+    if (kind == ProviderKind.githubCopilot)
+    {
+        import nano.copilot : CopilotApi, apiForModel;
+        final switch (apiForModel(model))
+        {
+            case CopilotApi.completions: return Wire.chatCompletions;
+            case CopilotApi.responses: return Wire.responses;
+            case CopilotApi.messages: return Wire.anthropicMessages;
+        }
+    }
     return kind == ProviderKind.anthropic ? Wire.anthropicMessages : Wire.chatCompletions;
 }
 

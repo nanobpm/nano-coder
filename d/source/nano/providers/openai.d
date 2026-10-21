@@ -159,7 +159,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
         auto what = format("%s chat request", p.name);
         if (!p.config.stream || sink is null)
         {
-            auto text = postJson(url, headers(req), requestBody(req, false), what, p.config.maxRetries, p.config.timeoutSecs);
+            auto text = postProvider(url, headers(req), requestBody(req, false), what, p.config);
             auto r = parseWhole(parseJSON(text), p.replayReasoning);
             if (sink !is null)
             {
@@ -171,8 +171,9 @@ class OpenAIClient : LLMClient, CapabilityProbe
         StreamState st;
         st.sink = sink;
         st.replay = p.replayReasoning;
-        postJson(url, headers(req), requestBody(req, true), what, p.config.maxRetries, p.config.timeoutSecs,
+        auto whole = postProvider(url, headers(req), requestBody(req, true), what, p.config,
                 (string data) { st.event(data); });
+        if (whole !is null) return reportWhole(parseWhole(parseJSON(whole), p.replayReasoning), sink);
         return st.finish();
     }
 
@@ -390,61 +391,43 @@ struct StreamState
 /// token, then speaks Chat Completions with editor headers.
 class CopilotClient : OpenAIClient
 {
-    private string sessionToken;
-    private string apiBase;
-    private long refreshAt;
+    import nano.copilot : Endpoints, SessionToken, editorHeaders;
 
-    this(ResolvedProvider p) { super(p); }
+    private string oauth;
+    /// Where the OAuth token is exchanged (tests point this at a mock).
+    Endpoints endpoints;
+    private SessionToken session;
+    private bool forceRefresh;
 
-    static immutable string[2][] editorHeaders = [
-        ["User-Agent", "GitHubCopilotChat/0.35.0"],
-        ["Editor-Version", "vscode/1.107.0"],
-        ["Editor-Plugin-Version", "copilot-chat/0.35.0"],
-        ["Copilot-Integration-Id", "vscode-chat"],
-    ];
-
-    private static string oauthToken(out string domain)
+    this(ResolvedProvider p)
     {
-        import std.process : environment;
-        import std.file : exists, readText;
-        import std.path : buildPath, expandTilde;
-        domain = "github.com";
-        if (auto t = environment.get("GITHUB_COPILOT_OAUTH_TOKEN")) return t;
-        foreach (path; [
-            buildPath(expandTilde("~"), "Library", "Application Support", "nano-coder", "github-copilot.json"),
-            buildPath(environment.get("XDG_DATA_HOME", buildPath(expandTilde("~"), ".local", "share")), "nano-coder", "github-copilot.json"),
-        ])
-            if (path.exists)
-            {
-                auto j = parseJSON(readText(path));
-                if (auto d = "domain" in j) if (d.type == JSONType.string && d.str.length) domain = d.str;
-                return j["oauth_token"].str;
-            }
-        throw new Exception("no GitHub Copilot login found; run `nano-coder --login github-copilot` (Rust build) or set GITHUB_COPILOT_OAUTH_TOKEN");
+        import nano.copilot : domain, loadCredentials, StoredCredentials;
+        super(p);
+        auto d = domain();
+        // `api_key` (GITHUB_COPILOT_OAUTH_TOKEN by default), else the saved
+        // login for this domain.
+        oauth = p.apiKey;
+        StoredCredentials c;
+        if (!oauth.length && loadCredentials(c) && c.domain == d) oauth = c.oauthToken;
+        if (!oauth.length)
+            throw new Exception("not logged in to GitHub Copilot: run `nano-coder-d --login github-copilot` "
+                ~ "or set GITHUB_COPILOT_OAUTH_TOKEN");
+        endpoints = Endpoints.forDomain(d);
     }
 
     private void ensureToken()
     {
+        import nano.copilot : exchange;
         import std.datetime.systime : Clock;
-        auto now = Clock.currTime.toUnixTime;
-        if (sessionToken.length && now < refreshAt) return;
-        string domain;
-        auto oauth = oauthToken(domain);
-        Request req;
-        req.method = "GET";
-        req.url = format("https://api.%s/copilot_internal/v2/token", domain);
-        foreach (h; editorHeaders) req.headers[h[0]] = h[1];
-        req.headers["Accept"] = "application/json";
-        req.headers["Authorization"] = "Bearer " ~ oauth;
-        string text;
-        auto status = perform(req, text);
-        if (status < 200 || status >= 300) throw new ApiError(status, text, "Copilot token exchange");
-        auto j = parseJSON(text);
-        sessionToken = j["token"].str;
-        refreshAt = ("expires_at" in j ? j["expires_at"].integer : now + 1500) - 120;
-        apiBase = p.config.baseUrl.stripRight("/");
-        if (auto e = "endpoints" in j)
-            if (auto api = "api" in *e) apiBase = api.str.stripRight("/");
+        if (!forceRefresh && session.token.length && Clock.currTime.toUnixTime < session.refreshAt) return;
+        session = exchange(endpoints, oauth);
+        forceRefresh = false;
+    }
+
+    /// A configured `base_url` wins over the session's endpoint.
+    private string apiBase()
+    {
+        return p.config.baseUrl.length ? p.config.baseUrl.stripRight("/") : session.baseUrl;
     }
 
     override protected bool shouldProbe() { return true; }
@@ -452,7 +435,7 @@ class CopilotClient : OpenAIClient
     override protected string baseUrl()
     {
         ensureToken();
-        return apiBase;
+        return apiBase();
     }
 
     override protected string[string] headers(const ref ChatRequest req)
@@ -460,7 +443,7 @@ class CopilotClient : OpenAIClient
         ensureToken();
         string[string] h;
         foreach (e; editorHeaders) h[e[0]] = e[1];
-        h["Authorization"] = "Bearer " ~ sessionToken;
+        h["Authorization"] = "Bearer " ~ session.token;
         h["Openai-Intent"] = "conversation-edits";
         // The last message decides who initiated this request: a tool result
         // is the agent continuing, anything else is the user.
@@ -469,7 +452,57 @@ class CopilotClient : OpenAIClient
         foreach (k, v; p.config.headers) h[k] = v;
         return h;
     }
+
+    /// Copilot serves each model family through one API; calling the wrong
+    /// one fails with `unsupported_api_for_model`.
+    override LLMResponse chat(const ref ChatRequest req, StreamSink sink)
+    {
+        // A revoked or early-expired session token: re-exchange once.
+        try return route(req, sink);
+        catch (ApiError e)
+        {
+            if (e.status != 401) throw e;
+            forceRefresh = true;
+            return route(req, sink);
+        }
+    }
+
+    private LLMResponse route(const ref ChatRequest req, StreamSink sink)
+    {
+        import nano.copilot : CopilotApi, apiForModel, path;
+        auto api = apiForModel(p.model);
+        if (api == CopilotApi.completions) return super.chat(req, sink);
+        auto url = baseUrl ~ path(api);
+        auto h = headers(req);
+        auto what = format("%s chat request", p.name);
+        bool stream = p.config.stream && sink !is null;
+        if (api == CopilotApi.responses)
+        {
+            import nano.providers.responses : responsesBody, parseResponses, ResponsesStream;
+            auto body_ = responsesBody(req, p, stream);
+            if (!stream)
+                return reportWhole(parseResponses(parseJSON(postProvider(url, h, body_, what, p.config)),
+                    p.replayReasoning), sink);
+            ResponsesStream st;
+            st.sink = sink;
+            st.replay = p.replayReasoning;
+            auto whole = postProvider(url, h, body_, what, p.config, (string data) { st.event(data); });
+            if (whole !is null) return reportWhole(parseResponses(parseJSON(whole), p.replayReasoning), sink);
+            return st.finish();
+        }
+        import nano.providers.anthropic : AnthropicClient, AnthropicStream;
+        h["anthropic-version"] = "2023-06-01";
+        auto body_ = new AnthropicClient(p).requestBody(req, stream);
+        if (!stream)
+            return reportWhole(AnthropicClient.parseWhole(parseJSON(postProvider(url, h, body_, what, p.config))), sink);
+        AnthropicStream st;
+        st.sink = sink;
+        auto whole = postProvider(url, h, body_, what, p.config, (string data) { st.event(data); });
+        if (whole !is null) return reportWhole(AnthropicClient.parseWhole(parseJSON(whole)), sink);
+        return st.finish();
+    }
 }
+
 
 unittest
 {
