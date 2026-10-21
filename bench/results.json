@@ -1,0 +1,92 @@
+{
+  "commit": "9649b69",
+  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "ldc2": "LDC - the LLVM D compiler (1.43.0):",
+  "machine": "Apple M4 Pro",
+  "build": {
+    "rust_clean_release_s": 68.51748845796101,
+    "rust_touch_one_file_release_s": 46.31798983295448,
+    "rust_clean_debug_s": 29.576199458213523,
+    "rust_touch_one_file_debug_s": 2.3219655831344426,
+    "d_clean_debug_s": 1.603240291820839,
+    "d_touch_one_file_debug_s": 1.0067699579522014,
+    "d_clean_release_s": 3.218642916996032,
+    "d_touch_one_file_release_s": 3.2280368751380593
+  },
+  "size": {
+    "rust_binary_bytes": 5989776,
+    "rust_stripped_bytes": 5989800,
+    "rust_linked_libs": [
+      "/System/Library/Frameworks/Security.framework/Versions/A/Security",
+      "/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration",
+      "/usr/lib/libiconv.2.dylib",
+      "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+      "/usr/lib/libSystem.B.dylib"
+    ],
+    "d_binary_bytes": 2569696,
+    "d_stripped_bytes": 2323696,
+    "d_linked_libs": [
+      "/usr/lib/libcurl.4.dylib",
+      "/usr/lib/libSystem.B.dylib",
+      "/usr/lib/libobjc.A.dylib"
+    ]
+  },
+  "runtime": {
+    "rust": {
+      "real_s": {
+        "median": 0.07,
+        "min": 0.07,
+        "max": 0.08
+      },
+      "max_rss_bytes": {
+        "median": 14139392.0,
+        "min": 14057472.0,
+        "max": 14204928.0
+      },
+      "peak_footprint_bytes": {
+        "median": 5308872.0,
+        "min": 5243360.0,
+        "max": 5374432.0
+      },
+      "instructions": {
+        "median": 130610755.0,
+        "min": 130128782.0,
+        "max": 132207148.0
+      },
+      "startup_exit": {
+        "real_s": 0.03,
+        "max_rss_bytes": 12075008.0,
+        "peak_footprint_bytes": 3785160.0,
+        "instructions": 57437529.0
+      }
+    },
+    "d": {
+      "real_s": {
+        "median": 0.04,
+        "min": 0.04,
+        "max": 0.04
+      },
+      "max_rss_bytes": {
+        "median": 11567104.0,
+        "min": 11550720.0,
+        "max": 11616256.0
+      },
+      "peak_footprint_bytes": {
+        "median": 4260344.0,
+        "min": 4243960.0,
+        "max": 4309496.0
+      },
+      "instructions": {
+        "median": 170693985.0,
+        "min": 170558120.0,
+        "max": 170911215.0
+      },
+      "startup_exit": {
+        "real_s": 0.01,
+        "max_rss_bytes": 7929856.0,
+        "peak_footprint_bytes": 2064816.0,
+        "instructions": 127779556.0
+      }
+    }
+  }
+}
