@@ -464,7 +464,8 @@ struct EditState
 // ---------------------------------------------------------------------------
 // Terminal reader
 
-enum Outcome { line, eof, interrupt, stopped, cancel }
+/// `queue`: Ctrl/Cmd-Enter during a turn (queue the line for a later turn).
+enum Outcome { line, eof, interrupt, stopped, cancel, queue }
 
 struct Result
 {
@@ -534,7 +535,19 @@ final class LineEditor
                     }
                     if (turn) erase(); else finish();
                     return Result(Outcome.line, state.take());
-                case K.newline: state.insert("\n"); break;
+                case K.newline:
+                    if (!turn)
+                    {
+                        state.insert("\n");
+                        break;
+                    }
+                    if (auto note = commands.rejection(state.text))
+                    {
+                        notice = "\x1b[2m" ~ note ~ "\x1b[0m";
+                        break;
+                    }
+                    erase();
+                    return Result(Outcome.queue, state.take());
                 case K.insert, K.paste: state.insert(key.text); break;
                 case K.left: state.left(); break;
                 case K.right: state.right(); break;
@@ -894,6 +907,21 @@ unittest // select
     assert(e.select("Pick", ["a", "b", "c"]) == 2);
     e = editor("\x1b\xff", screen);
     assert(e.select("Pick", ["a"]) == -1);
+}
+
+unittest // Enter steers and Ctrl-Enter queues during a turn (Rust enter_steers_and_ctrl_enter_queues_during_a_turn)
+{
+    string screen;
+    auto r = editor("go left\r", screen).readLine("", "", true);
+    assert(r.outcome == Outcome.line && r.text == "go left");
+    foreach (seq; ["\x1b[27;5;13~", "\x1b[13;5u", "\x1b[27;9;13~"])
+    {
+        r = editor("later" ~ seq, screen).readLine("", "", true);
+        assert(r.outcome == Outcome.queue && r.text == "later", seq);
+        // At the prompt the same keys insert a newline.
+        r = editor("a" ~ seq ~ "b\r", screen).readLine("", "");
+        assert(r.outcome == Outcome.line && r.text == "a\nb", seq);
+    }
 }
 
 unittest // stop keeps the typed text

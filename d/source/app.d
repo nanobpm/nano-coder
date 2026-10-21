@@ -21,6 +21,7 @@ import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
 import nano.plan : Plan, checklist;
+import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe;
 import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
@@ -228,7 +229,24 @@ final class Inbox
 }
 
 /// Keys during a turn (runs on its own thread until `done`).
-void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions)
+/// `/queue …` (not `/queueX`): the parsed edit, or null.
+string queueArgs(string text)
+{
+    if (!text.startsWith("/queue")) return null;
+    auto rest = text["/queue".length .. $];
+    if (rest.length && rest[0] != ' ' && rest[0] != '\t') return null;
+    return rest ~ "\0"; // non-null even when empty; the NUL is stripped by the caller
+}
+
+/// Run a `/queue` edit and say what happened.
+string runQueueCommand(MessageQueue queue, string args)
+{
+    try return queueApply(queue, queueParse(args));
+    catch (QueueUsage e) return "[" ~ e.msg ~ "]";
+}
+
+void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions,
+    MessageQueue queue)
 {
     while (!atomicLoad(*done))
     {
@@ -254,13 +272,25 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                     stderr.writeln(console.dim("[cancelling...]"));
                 }
                 break;
-            case Outcome.line:
+            case Outcome.line, Outcome.queue:
                 auto text = r.text.strip;
                 if (!text.length) break;
-                if (text.startsWith("/"))
+                if (auto qa = queueArgs(text))
+                {
+                    // `/queue` only touches the queue, so it runs at once.
+                    stderr.writeln(console.dim(runQueueCommand(queue, qa[0 .. $ - 1])));
+                    break;
+                }
+                if (text.startsWith("/") && unescapePrompt(text) is null)
                 {
                     held ~= text;
                     stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+                }
+                else if (r.outcome == Outcome.queue)
+                {
+                    auto id = queue.push(text);
+                    stderr.writeln(console.dim(format("↧ queued #%s (%s waiting) — /queue remove %s to drop",
+                        id, queue.length, id)));
                 }
                 else
                 {
@@ -603,6 +633,7 @@ int main(string[] args)
     Inbox inbox;
     LineEditor editor;
     string[] held; // lines to run before reading the prompt again
+    auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
 
     bool turn(string input)
     {
@@ -615,7 +646,10 @@ int main(string[] args)
         Thread keys;
         if (editor !is null)
         {
-            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions));
+            if (o.verbose)
+                stderr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
+                    ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
+            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions, queue));
             keys.start();
         }
         scope (exit)
@@ -664,10 +698,16 @@ int main(string[] args)
     for (;;)
     {
         string line;
+        QueuedMessage next;
         if (held.length)
         {
             line = held[0];
             held = held[1 .. $];
+        }
+        else if (queue.pop(next))
+        {
+            writeln(console.dim(format("↧ queued #%s: %s", next.id, next.text.strip)));
+            line = next.text;
         }
         else if (editor !is null)
         {
@@ -707,6 +747,9 @@ int main(string[] args)
                 case "/usage":
                     writefln("last request: %s input (%s cached), %s output tokens", agent.lastUsage.inputTokens,
                             agent.lastUsage.cachedInputTokens, agent.lastUsage.outputTokens);
+                    continue;
+                case "/queue":
+                    writeln(runQueueCommand(queue, arg));
                     continue;
                 case "/plan":
                     if (agent.plan.empty) writeln("No plan yet. The agent makes one with the plan_add tool.");
