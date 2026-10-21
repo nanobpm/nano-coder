@@ -60,10 +60,23 @@ string readFile(JSONValue args, ReadState state)
     auto data = cast(ubyte[]) read(path);
     import std.path : extension;
     import std.uni : toLower;
-    auto ext = path.extension.toLower;
-    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp")
-        throw new ToolError(format("read_file: %s is an image; image viewing is not ported to nano-coder-d yet", path));
-    if (looksBinary(data)) throw new ToolError(format("read_file: %s looks binary", path));
+    // An image returns its metadata only, as `{"image": {...}}`; the agent
+    // re-reads it by path, fits it to the model and attaches it (or reports
+    // that the model can't view images). Text output never starts with `{`.
+    import nano.attachment : sniff, dimensions, mediaType, extension_ = extension;
+    auto fmt = sniff(data);
+    if (!fmt.isNull)
+    {
+        uint[2] dims;
+        try dims = dimensions(data);
+        catch (Exception e) throw new ToolError(format("read_file: %s: read image dimensions: %s", path, e.msg));
+        JSONValue img = ["media_type": fmt.get.mediaType, "extension": fmt.get.extension_, "path": path];
+        img["width"] = dims[0];
+        img["height"] = dims[1];
+        img["bytes"] = data.length;
+        return JSONValue(["image": img]).toString;
+    }
+    if (looksBinary(data)) throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, data.length));
     import std.utf : validate, UTFException;
     auto text = cast(string) data;
     try validate(text);

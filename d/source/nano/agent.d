@@ -19,6 +19,14 @@ import nano.instructions : ProjectInstructions;
 import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported;
 import temp = nano.temperature;
 import nano.vision : Vision, resolveVision = resolve;
+import nano.llm : Attachment;
+
+/// A tool result as displayed: the text plus each attached image's placeholder.
+string toolResultDisplay(string text, const(Attachment)[] attachments)
+{
+    foreach (ref a; attachments) text ~= (text.length ? "\n" : "") ~ a.placeholder;
+    return text;
+}
 import nano.config : ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
@@ -267,6 +275,8 @@ class Agent
                 req.maxTokens = requestMaxTokens();
                 auto th = thinking();
                 req.thinking = th.request();
+                req.vision = vision();
+                req.attachmentsDir = attachmentsDir();
                 req.temperature = temperatureFor(th.anthropicThinkingOn).effective;
                 try
                 {
@@ -351,11 +361,13 @@ class Agent
                 ev.toolStart(call);
                 bool isError = true;
                 string result;
+                Attachment[] attachments;
                 if (control.isCancelled) result = cancelledToolResult;
                 else if (loopStop !is null) result = loopStoppedToolResult;
                 else
                 {
                     result = runTool(call, r.stopReason, isError);
+                    if (call.name == "read_file") result = imageResult(result, isError, attachments);
                     // Deeper instruction files and scoped rules attach to the first
                     // file-tool result that touches a matching path.
                     if (!isError && instructions !is null
@@ -374,8 +386,10 @@ class Agent
                     }
                     if (remindersEnabled) result ~= remind(call, !isError, result, loopStop);
                 }
-                ev.toolEnd(call, result, isError);
-                push(Message.toolResult(call.id, call.name, result, isError));
+                ev.toolEnd(call, toolResultDisplay(result, attachments), isError);
+                auto msg = Message.toolResult(call.id, call.name, result, isError);
+                msg.attachments = attachments;
+                push(msg);
             }
             if (loopStop !is null)
             {
@@ -475,11 +489,11 @@ class Agent
     size_t estimateContextTokens(out bool calibrated)
     {
         calibrated = calibLen && calibLen <= messages.length;
-        if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $]);
+        if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], imageSlots);
         size_t tools_;
         foreach (d; offeredTools())
             tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() @trusted { return d.parameters.toString; }());
-        return ctx.messagesTokens(messages) + tools_;
+        return ctx.messagesTokens(messages, imageSlots) + tools_;
     }
 
     size_t estimateContextTokens() { bool _; return estimateContextTokens(_); }
@@ -573,6 +587,79 @@ class Agent
             capabilities.vision.isNull ? null : &v);
     }
 
+    /// How many images a request may carry (0 without vision).
+    private size_t imageSlots() @trusted
+    {
+        auto v = vision();
+        return v.isNull ? 0 : v.get.maxImages;
+    }
+
+    /// Records an image read so a later write to it passes the freshness
+    /// check (set by the host to the file tools' read state).
+    void delegate(string path, const(ubyte)[] bytes) markRead;
+
+    /// Where this session's images are stored: beside a persisted log (so
+    /// its references stay valid), else a process-local temp dir.
+    string attachmentsDir() @trusted
+    {
+        import std.path : buildPath, dirName;
+        import std.file : tempDir;
+        import std.process : thisProcessID;
+        if (log !is null && log.path.length) return buildPath(dirName(log.path), log.id ~ ".attachments");
+        return buildPath(tempDir, format("nano-coder-attachments-%s", thisProcessID));
+    }
+
+    /// Turn a `read_file` image result (`{"image": {...}}`, metadata only)
+    /// into the tool-result text plus its attachment: re-read the file, fit
+    /// it to the model's limits and store it. Without vision, or when the
+    /// image can't be prepared, the result becomes a tool error. A non-image
+    /// binary file gets a hint about the model's image capability.
+    private string imageResult(string result, ref bool isError, ref Attachment[] attachments) @trusted
+    {
+        import std.algorithm : startsWith, canFind;
+        import nano.attachment : sniff, prepare, sha256Hex, store, mediaType, extension;
+        import std.file : read;
+        if (isError)
+        {
+            if (result.canFind("looks like a binary file"))
+                result ~= vision().isNull
+                    ? " (the current model can't view images; switch to a vision model or set `vision = true`)"
+                    : " (the current model can view images, but this is not a supported image type: PNG, JPEG, GIF or WebP)";
+            return result;
+        }
+        if (!result.startsWith(`{"image":`)) return result;
+        JSONValue image;
+        try image = parseJSON(result)["image"];
+        catch (Exception) return result;
+        string str(string k) { auto p = k in image.object; return p && p.type == JSONType.string ? p.str : ""; }
+        auto path = str("path");
+        auto v = vision();
+        isError = true;
+        if (v.isNull)
+            return format("%s is an image (%s), but the current model can't view images; "
+                ~ "switch to a vision model or set `vision = true`", path, str("media_type").length ? str("media_type") : "unknown type");
+        if (!path.length) return "image result had no path";
+        immutable(ubyte)[] bytes;
+        try bytes = cast(immutable(ubyte)[]) read(path);
+        catch (Exception e) return format("%s: could not read image: %s", path, e.msg);
+        auto fmt = sniff(bytes);
+        if (fmt.isNull) return format("%s: unrecognised image data", path);
+        auto limits = v.get.imageLimits;
+        Attachment a;
+        try
+        {
+            auto p = prepare(bytes, fmt.get, limits);
+            a = Attachment(p.mediaType, path, sha256Hex(p.bytes), p.width, p.height, p.bytes.length, p.extension);
+            try store(attachmentsDir(), a, p.bytes);
+            catch (Exception e) return format("%s: could not store image: %s", path, e.msg);
+        }
+        catch (Exception e) return format("%s: could not process image: %s", path, e.msg);
+        if (markRead !is null) markRead(path, bytes);
+        isError = false;
+        attachments = [a];
+        return format("%s, %s×%s, %s", a.mediaType, a.width, a.height, ctx.formatBytes(a.bytes));
+    }
+
     private long requestMaxTokens()
     {
         if (maxTokens <= 0) return maxTokens;
@@ -607,7 +694,7 @@ class Agent
         auto split = boundaries[$ - 1];
         foreach_reverse (b; boundaries)
         {
-            if (ctx.messagesTokens(messages[b .. $]) > keepBudget) break;
+            if (ctx.messagesTokens(messages[b .. $], imageSlots) > keepBudget) break;
             split = b;
         }
         if (split == boundaries[0]) split = boundaries[$ - 1];
@@ -1218,4 +1305,59 @@ unittest
     d.maxTokens = 64_000;
     d.configuredWindow = 1_000_000;
     assert(d.run("go", new NullEvents) == "fine" && d.learnedMaxOutput == 32_000);
+}
+
+@trusted unittest
+{
+    // read_file on an image: attached for a vision model, an error otherwise.
+    import nano.providers.mock : MockClient;
+    import nano.tools.files : ReadState, registerFiles = register;
+    import nano.attachment : fakePng, exists_ = exists;
+    import std.file : tempDir, write, mkdirRecurse, rmdirRecurse, exists;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.algorithm : canFind;
+    auto dir = buildPath(tempDir, format("nano-agent-img-%s", thisProcessID));
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    auto png = buildPath(dir, "shot.png");
+    write(png, fakePng(20, 10));
+    auto call = ToolCall.fromRaw("r1", "read_file", JSONValue(["path": png]).toString);
+    Agent make(bool vision)
+    {
+        auto reg = new ToolRegistry;
+        auto st = new ReadState;
+        registerFiles(reg, st);
+        auto agent = new Agent(new MockClient([LLMResponse("", "", [call]), LLMResponse("seen")]), reg, Policy.init, "sys");
+        agent.globalVision = vision;
+        agent.markRead = (string p, const(ubyte)[] b) { st.record(p, b); };
+        return agent;
+    }
+
+    auto blind = make(false);
+    blind.run("look", new NullEvents);
+    auto t = blind.messages[$ - 2];
+    assert(t.isError && t.content.canFind("can't view images") && !t.attachments.length, t.content);
+
+    auto agent = make(true);
+    scope (exit) if (exists(agent.attachmentsDir)) rmdirRecurse(agent.attachmentsDir);
+    agent.run("look", new NullEvents);
+    t = agent.messages[$ - 2];
+    assert(!t.isError && t.content == "image/png, 20×10, 64 B" && t.attachments.length == 1, t.content);
+    assert(exists_(agent.attachmentsDir, t.attachments[0]));
+
+    // The wire plan sends the newest image; one past the quota is a placeholder.
+    auto older = t;
+    ChatRequest req;
+    req.messages = [older, t];
+    req.vision = agent.vision;
+    req.attachmentsDir = agent.attachmentsDir;
+    auto plan = req.attachmentPlan;
+    auto first = req.resolveAttachments(0, plan), second = req.resolveAttachments(1, plan);
+    assert(!first[0].isImage && first[0].text == "[image omitted: " ~ png ~ " (sent earlier)]");
+    assert(second[0].isImage && second[0].image.mediaType == "image/png");
+    req.attachmentsDir = buildPath(dir, "missing");
+    auto gone = req.attachmentPlan;
+    assert(req.resolveAttachments(1, gone)[0].text.canFind("no longer available"));
+    assert(toolResultDisplay("x", t.attachments) == "x\n[image: " ~ png ~ ", 20×10]");
 }

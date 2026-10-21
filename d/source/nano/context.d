@@ -101,6 +101,14 @@ string formatTokens(size_t tokens)
     return format("%.2fM", tokens / 1_000_000.0);
 }
 
+/// `512 B` / `14 KB` / `2.3 MB`.
+string formatBytes(size_t bytes)
+{
+    if (bytes < 1024) return format("%s B", bytes);
+    if (bytes < 1_048_576) return format("%.0f KB", bytes / 1024.0);
+    return format("%.1f MB", bytes / 1_048_576.0);
+}
+
 /// Rough token count for text (about four characters per token).
 size_t textTokens(string text) { return (text.length + 3) / 4; }
 
@@ -112,11 +120,47 @@ size_t messageTokens(const ref Message m) @trusted
     return textTokens(m.content) + calls + 4;
 }
 
-size_t messagesTokens(const Message[] ms)
+/// Token estimate for one image from its dimensions (Anthropic's ~w*h/750),
+/// capped at the largest image `read_file` sends.
+size_t imageTokens(const ref imported!"nano.attachment".Attachment a)
 {
-    size_t n;
-    foreach (ref m; ms) n += messageTokens(m);
+    import nano.attachment : MAX_DIMENSION;
+    enum size_t max = (cast(size_t) MAX_DIMENSION * MAX_DIMENSION + 749) / 750;
+    auto e = (cast(size_t) a.width * a.height + 749) / 750;
+    return e < 1 ? 1 : e > max ? max : e;
+}
+
+/// Tokens for `ms`, mirroring the wire plan: the newest `maxImages`
+/// attachments count as images, the rest as their placeholder text. (Rust
+/// also leaves out of the quota attachments whose stored file is gone; D
+/// assumes they are all present.)
+size_t messagesTokens(const Message[] ms, size_t maxImages = 0)
+{
+    size_t total, n;
+    foreach (ref m; ms) total += m.attachments.length;
+    auto omitted = total > maxImages ? total - maxImages : 0;
+    foreach (ref m; ms)
+    {
+        n += messageTokens(m);
+        foreach (ref a; m.attachments)
+        {
+            if (omitted) { omitted--; n += textTokens(a.placeholder); }
+            else n += imageTokens(a);
+        }
+    }
     return n;
+}
+
+unittest
+{
+    import nano.llm : Message, Role, Attachment;
+    auto m = Message(Role.tool, "x");
+    m.attachments = [Attachment("image/png", "/a.png", "", 750, 750), Attachment("image/png", "/b.png", "", 75, 10)];
+    auto base = messageTokens(m);
+    // One image slot: the newest is an image (1 token), the older a placeholder.
+    assert(messagesTokens([m], 1) == base + textTokens(m.attachments[0].placeholder) + 1);
+    assert(messagesTokens([m], 2) == base + 750 + 1);
+    assert(messagesTokens([m]) == base + textTokens(m.attachments[0].placeholder) + textTokens(m.attachments[1].placeholder));
 }
 
 /// Context window by model family, for models whose provider config has none.
@@ -223,6 +267,8 @@ string renderTranscript(const Message[] messages, size_t maxChars, bool ids) @tr
             case Role.tool:
                 block = format("TOOL %s (%s):\n%s", m.isError ? "failed" : "result", m.toolName.length ? m.toolName : "tool",
                     clip(m.content, 2_000));
+                // The summary request carries no images; note each one seen.
+                foreach (ref a; m.attachments) block ~= "\n" ~ a.placeholder;
                 break;
         }
         if (ids && m.logLine) block = format("[#%s] %s", m.logLine, block);

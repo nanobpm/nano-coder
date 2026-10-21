@@ -661,6 +661,7 @@ int main(string[] args)
     agent.temperature = cfg.temperature;
     agent.globalThinking = cfg.thinking;
     agent.globalVision = cfg.vision;
+    agent.markRead = (string p, const(ubyte)[] b) { readState.record(p, b); };
     agent.providerLookup = (string name) => name in cfg.providers;
     agent.refreshCapabilities();
     // A configured temperature or thinking level that is adjusted or ignored.

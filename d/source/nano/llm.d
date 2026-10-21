@@ -65,6 +65,9 @@ struct Message
     string toolCallId;
     string toolName;
     bool isError;
+    /// Images attached to a tool result (`read_file`). Not sent as text:
+    /// request builders encode the newest few per the model.
+    Attachment[] attachments;
 
     // Session-log metadata (not sent to providers), as in Rust's `Message`.
     /// When the message joined the conversation (RFC 3339 with offset).
@@ -174,6 +177,79 @@ struct ChatRequest
     /// The resolved thinking control (kind `none` sends nothing).
     import nano.thinking : ThinkingRequest = Request;
     ThinkingRequest thinking;
+    /// The model's vision capability; null sends every attachment as text.
+    import std.typecons : Nullable;
+    import nano.vision : Vision;
+    Nullable!Vision vision;
+    /// Where attachments are stored; null for requests that carry no images
+    /// (compaction).
+    string attachmentsDir;
+
+    /// The attachment occurrences this request sends as images: the newest
+    /// `vision.maxImages` that are intact on disk. Keyed by occurrence
+    /// (message index, attachment index), so the same image read twice
+    /// counts twice. Computed once per request (it hashes the stored files).
+    AttachmentPlan attachmentPlan() const @trusted
+    {
+        import nano.attachment : exists;
+        AttachmentPlan plan;
+        size_t[2][] available;
+        foreach (mi, ref m; messages)
+            foreach (ai, ref a; m.attachments)
+                if (attachmentsDir.length && exists(attachmentsDir, a))
+                {
+                    available ~= [mi, ai];
+                    plan.available[[mi, ai]] = true;
+                }
+        size_t max = vision.isNull ? 0 : vision.get.maxImages;
+        auto keep = max < available.length ? max : available.length;
+        foreach (k; available[$ - keep .. $]) plan.sendable[k] = true;
+        return plan;
+    }
+
+    /// Message `mi`'s attachments for the wire: image data, or the text
+    /// standing in for it (sent earlier, or no longer available).
+    ResolvedAttachment[] resolveAttachments(size_t mi, const ref AttachmentPlan plan) const @trusted
+    {
+        import nano.attachment : readForLimits, ImageLimits;
+        import std.format : format;
+        ResolvedAttachment[] out_;
+        foreach (ai, ref a; messages[mi].attachments)
+        {
+            auto gone = format("[image: %s, %s×%s (no longer available)]", a.path, a.width, a.height);
+            size_t[2] key = [mi, ai];
+            if (key in plan.sendable)
+            {
+                // Fit the stored bytes to the *active* model's limits.
+                auto limits = vision.isNull ? ImageLimits.init : vision.get.imageLimits;
+                auto ready = readForLimits(attachmentsDir, a, limits);
+                out_ ~= ready.isNull ? ResolvedAttachment(false, ImageData.init, gone) : ResolvedAttachment(true, ready.get, null);
+            }
+            else if (key in plan.available)
+                out_ ~= ResolvedAttachment(false, ImageData.init, format("[image omitted: %s (sent earlier)]", a.path));
+            else out_ ~= ResolvedAttachment(false, ImageData.init, gone);
+        }
+        return out_;
+    }
+}
+
+public import nano.attachment : Attachment, ImageData;
+
+/// One attachment on the wire: an image, or placeholder text.
+struct ResolvedAttachment
+{
+    bool isImage;
+    ImageData image;
+    string text;
+}
+
+/// Which attachment occurrences are intact on disk, and which of those are
+/// within the image quota.
+struct AttachmentPlan
+{
+    bool[size_t[2]] available, sendable;
+    /// Whether the request carries at least one real image.
+    bool carriesImage() const { return sendable.length > 0; }
 }
 
 /// Receives streamed text: `reasoning` is true for thinking output.

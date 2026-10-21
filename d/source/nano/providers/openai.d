@@ -35,9 +35,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
     JSONValue requestBody(const ref ChatRequest req, bool stream)
     {
         JSONValue b = ["model": p.model];
-        JSONValue[] msgs;
-        foreach (m; req.messages) msgs ~= encode(m);
-        b["messages"] = msgs;
+        b["messages"] = encodeMessages(req);
         if (req.tools.length)
         {
             JSONValue[] tools;
@@ -94,6 +92,50 @@ class OpenAIClient : LLMClient, CapabilityProbe
                 break;
         }
         return j;
+    }
+
+    /// Chat Completions messages. `tool` messages carry only text, so a tool
+    /// result's images go in one `user` message after the run of tool
+    /// results (as `image_url` parts); omitted ones become placeholder text.
+    JSONValue[] encodeMessages(const ref ChatRequest req) @trusted
+    {
+        JSONValue[] out_;
+        JSONValue[] pending;
+        void flush()
+        {
+            if (!pending.length) return;
+            JSONValue[] content = [JSONValue(["type": "text", "text": "[attached image]"])];
+            content ~= pending;
+            out_ ~= JSONValue(["role": JSONValue("user"), "content": JSONValue(content)]);
+            pending = null;
+        }
+        auto plan = req.attachmentPlan();
+        foreach (i, m; req.messages)
+        {
+            if (m.role != Role.tool) flush();
+            auto j = encode(m);
+            if (m.role == Role.tool && m.attachments.length)
+            {
+                string content = m.content;
+                bool added;
+                foreach (r; req.resolveAttachments(i, plan))
+                {
+                    if (r.isImage)
+                    {
+                        JSONValue part = ["type": "image_url"];
+                        part["image_url"] = ["url": "data:" ~ r.image.mediaType ~ ";base64," ~ r.image.dataBase64];
+                        pending ~= part;
+                        added = true;
+                    }
+                    else content ~= "\n" ~ r.text;
+                }
+                // Says *its own* image follows, after the whole tool-result run.
+                j["content"] = added ? content ~ "\n[image attached after the tool results]" : content;
+            }
+            out_ ~= j;
+        }
+        flush();
+        return out_;
     }
 
     LLMResponse chat(const ref ChatRequest req, StreamSink sink)
@@ -395,6 +437,7 @@ class CopilotClient : OpenAIClient
         // The last message decides who initiated this request: a tool result
         // is the agent continuing, anything else is the user.
         h["X-Initiator"] = req.messages.length && req.messages[$ - 1].role == Role.tool ? "agent" : "user";
+        if (req.attachmentPlan().carriesImage) h["Copilot-Vision-Request"] = "true";
         foreach (k, v; p.config.headers) h[k] = v;
         return h;
     }

@@ -80,6 +80,12 @@ JSONValue messageRecord(const ref Message m)
         }
         j["tool_calls"] = calls;
     }
+    if (m.attachments.length)
+    {
+        JSONValue[] list;
+        foreach (ref a; m.attachments) list ~= a.toJSON;
+        j["attachments"] = list;
+    }
     if (m.toolCallId.length) j["tool_call_id"] = m.toolCallId;
     if (m.toolName.length) j["name"] = m.toolName;
     if (m.isError) j["is_error"] = true;
@@ -117,6 +123,11 @@ Message messageFromRecord(JSONValue j)
                 m.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["name"].str,
                     args.type == JSONType.string ? args.str : args.toString);
             }
+            break;
+        case "attachments":
+            if (v.type == JSONType.array)
+                foreach (a; v.array)
+                    if (a.type == JSONType.object) m.attachments ~= Attachment.fromJSON(a);
             break;
         case "tool_call_id": m.toolCallId = v.str; break;
         case "name": m.toolName = v.str; break;

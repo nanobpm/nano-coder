@@ -34,7 +34,8 @@ class AnthropicClient : LLMClient
         b["max_tokens"] = req.maxTokens > 0 ? req.maxTokens : 32_000;
         string system;
         JSONValue[] msgs;
-        foreach (m; req.messages)
+        auto plan = req.attachmentPlan();
+        foreach (i, m; req.messages)
         {
             final switch (m.role)
             {
@@ -59,6 +60,19 @@ class AnthropicClient : LLMClient
                 case Role.tool:
                     JSONValue tr = ["type": "tool_result", "tool_use_id": m.toolCallId];
                     tr["content"] = m.content.length ? m.content : "(no output)";
+                    if (m.attachments.length)
+                    {
+                        // Images ride in the tool result as content blocks.
+                        JSONValue[] content = [textBlock(m.content)];
+                        foreach (r; req.resolveAttachments(i, plan))
+                        {
+                            if (!r.isImage) { content ~= textBlock(r.text); continue; }
+                            JSONValue img = ["type": "image"];
+                            img["source"] = ["type": "base64", "media_type": r.image.mediaType, "data": r.image.dataBase64];
+                            content ~= img;
+                        }
+                        tr["content"] = content;
+                    }
                     if (m.isError) tr["is_error"] = true;
                     push(msgs, "user", tr);
                     break;

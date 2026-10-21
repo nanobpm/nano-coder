@@ -14,8 +14,7 @@ import std.typecons : Nullable;
 import nano.config : ProviderConfig, ProviderKind;
 import nano.thinking : objGet;
 
-/// Default image byte cap (Rust `attachment::DEFAULT_MAX_BYTES`).
-enum size_t DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
+import nano.attachment : DEFAULT_MAX_BYTES, MAX_DIMENSION, ImageLimits;
 
 struct Vision
 {
@@ -24,6 +23,12 @@ struct Vision
     string[] mediaTypes;
 
     static Vision capable() { return Vision.init; }
+
+    /// The limits an image is prepared against for this model.
+    ImageLimits imageLimits() const
+    {
+        return ImageLimits(MAX_DIMENSION, maxImageBytes, mediaTypes.dup);
+    }
 
     static Nullable!Vision fromModelEntry(const JSONValue entry) @trusted
     {
