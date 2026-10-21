@@ -75,7 +75,7 @@ directory works; it's kept separate by default so the port can't damage real ses
 
 Roughly in dependency order. Sizes are Rust lines.
 
-1. ~~**Agent loop features**~~: modes and turn caps, `report_outcome`, `/queue`, reminders, context accounting with auto/smart compaction and the history tools are all ported. Still to do: OpenAI-style output-cap learning (`max_output` from capped-output errors) only clamps the request; it isn't persisted per model.
+1. ~~**Agent loop features**~~: modes and turn caps, `report_outcome`, `/queue`, reminders, context accounting with auto/smart compaction and the history tools are all ported. An output cap learned from a provider error (`max_tokens: N > M`) lowers later requests' `max_tokens` until `/model` switches. Rust also persists it per model; D does not yet (item 25).
 2. ~~**Permissions vs. sandbox**~~: file-tool writes are held to the sandbox's writable roots (lexical and symlink-resolved path), as in Rust.
 3. ~~**Sandbox**~~: Seatbelt done in `nano/sandbox.d`. Still to do: the Linux Landlock backend (until then the D build fails closed on Linux when a sandbox is configured).
 4. **Providers.** OpenAI Responses (`openai_responses.rs` 1.0k), Copilot model routing

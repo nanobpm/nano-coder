@@ -886,6 +886,7 @@ int main(string[] args)
                         agent.client = client;
                         agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
                         agent.learnedWindow = 0;
+                        agent.learnedMaxOutput = 0;
                         writeln("model: ", client.providerName, "/", client.modelName);
                     }
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));

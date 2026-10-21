@@ -240,7 +240,7 @@ class Agent
             LLMResponse r;
             import std.datetime.stopwatch : StopWatch, AutoStart;
             auto sw = StopWatch(AutoStart.yes);
-            bool overflowRetried;
+            bool overflowRetried, capRetried;
             for (;;)
             {
                 ChatRequest req;
@@ -257,6 +257,17 @@ class Agent
                 catch (Exception e)
                 {
                     if (control.isCancelled) return cancelled(ev);
+                    if (!capRetried && maxTokens > 0 && ctx.isOutputCapError(e.msg) && !ctx.isContextOverflow(e.msg))
+                    {
+                        // The provider caps output below max_tokens: learn it and retry.
+                        auto cap = ctx.outputCapFromError(e.msg);
+                        if (cap > 0 && (learnedMaxOutput == 0 || cap < learnedMaxOutput))
+                        {
+                            capRetried = true;
+                            learnedMaxOutput = cap;
+                            continue;
+                        }
+                    }
                     if (overflowRetried || !ctx.isContextOverflow(e.msg)) throw e;
                     // The request did not fit: learn the window, compact, retry once.
                     overflowRetried = true;
@@ -461,9 +472,13 @@ class Agent
 
     /// `max_tokens` for the next request: the configured value lowered so the
     /// prompt plus output fits the window. 0 (unset) stays unset.
+    /// An output cap learned from a provider error (0 = none); /model resets it.
+    long learnedMaxOutput;
+
     private long requestMaxTokens()
     {
         if (maxTokens <= 0) return maxTokens;
+        auto maxTokens = learnedMaxOutput > 0 && learnedMaxOutput < this.maxTokens ? learnedMaxOutput : this.maxTokens;
         auto window = contextWindow();
         auto used = estimateContextTokens() + ctx.outputMargin(window);
         long room = window > used ? cast(long)(window - used) : 0;
@@ -1092,4 +1107,12 @@ unittest
     try c.run("again", new NullEvents);
     catch (Exception e) threw = true;
     assert(threw);
+
+    // An output-cap error lowers max_tokens and retries once.
+    auto capped = new MockClient([LLMResponse("!error:max_tokens: 64000 > 32000, which is the maximum allowed"),
+        LLMResponse("fine")]);
+    auto d = new Agent(capped, new ToolRegistry, Policy.init, "sys");
+    d.maxTokens = 64_000;
+    d.configuredWindow = 1_000_000;
+    assert(d.run("go", new NullEvents) == "fine" && d.learnedMaxOutput == 32_000);
 }
