@@ -35,7 +35,7 @@ import nano.skills : Skills, skillsDefinition = definition;
 import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
-import core.atomic : atomicLoad, atomicStore;
+import core.atomic : atomicLoad, atomicStore, cas;
 import core.sync.mutex : Mutex;
 import core.sync.condition : Condition;
 
@@ -386,6 +386,52 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
 /// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).
 shared bool gThinkingExpanded;
 
+// The pinned status line (status.rs), when installed, and what it shows.
+import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
+__gshared StatusLine gStatus;
+__gshared Stats gStats;
+__gshared Object gStatsLock;
+shared bool gResized;
+shared static this() { gStatsLock = new Object; }
+
+/// Change the status line's stats and redraw it (no-op without one).
+void updateStatus(scope void delegate(ref Stats) @safe f) @trusted
+{
+    if (gStatus is null) return;
+    synchronized (gStatsLock) f(gStats);
+    gStatus.draw();
+}
+
+/// The agent's side of the status line: model, context, plan, mode, tokens.
+void statusFromAgent(ref Stats s, Agent agent, string cwdShown) @trusted
+{
+    import nano.thinking : wireValue;
+    import nano.context : CompactionMode;
+    s.provider = agent.client.providerName;
+    s.model = agent.client.modelName;
+    s.cwd = cwdShown;
+    bool calibrated;
+    s.tokens = agent.estimateContextTokens(calibrated);
+    s.calibrated = calibrated;
+    string source;
+    s.window = agent.contextWindow(source);
+    s.messages = agent.messages.length;
+    auto progress = agent.plan.progress;
+    s.hasPlan = progress[1] > 0;
+    s.planDone = progress[0];
+    s.planTotal = progress[1];
+    s.mode = agent.control.mode;
+    auto th = agent.thinking();
+    auto w = wireValue(th);
+    s.thinking = w.isNull ? null : w.str;
+    s.sessionInputTokens = agent.sessionInputTokens;
+    s.sessionOutputTokens = agent.sessionOutputTokens;
+    s.autoCompact = agent.autoCompact;
+    s.threshold = agent.autoCompactThreshold;
+    s.smartCompact = agent.compactionMode == CompactionMode.smart;
+    s.compactions = agent.compactions;
+}
+
 class Console : AgentEvents
 {
     bool color, verbose, tty;
@@ -520,8 +566,15 @@ class Console : AgentEvents
     string bold(string s) { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
     string red(string s) { return color ? "\x1b[31m" ~ s ~ "\x1b[0m" : s; }
 
+    private RateMeter meter;
+
     void text(bool reasoning, string chunk)
     {
+        if (gStatus !is null)
+        {
+            auto rate = meter.record(chunk.length, nowMs);
+            if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
+        }
         synchronized (this)
         {
             if (reasoning)
@@ -566,6 +619,15 @@ class Console : AgentEvents
 
     void toolStart(const ref ToolCall call)
     {
+        string name = call.name;
+        updateStatus((ref Stats s) {
+            s.activity = Activity.tool;
+            s.tool = name;
+            s.tokensPerSec = 0;
+            if (name == "history_search") s.historySearches++;
+            if (name == "history_read") s.historyReads++;
+        });
+        meter.reset();
         if (quiet(call)) return;
         endLine();
         writeln(bold("● " ~ call.name), " ", dim(summary(call)));
@@ -578,6 +640,7 @@ class Console : AgentEvents
     void toolEnd(const ref ToolCall call, string result, bool isError)
     {
         scope (exit) if (afterStep !is null) afterStep();
+        updateStatus((ref Stats s) { s.activity = Activity.thinking; });
         if (quiet(call) && !isError) return;
         auto lines = result.lineCount;
         if (isError) writeln("  ", red("✗ " ~ result.firstLine));
@@ -754,6 +817,30 @@ string contextReport(Agent agent)
         : "Auto-compact: off";
     out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
+}
+
+/// Redraw the status line after the terminal is resized (SIGWINCH sets a
+/// flag; a daemon thread redraws, as signal handlers can't write safely).
+void watchResize() @trusted
+{
+    import core.sys.posix.signal : sigaction, sigaction_t, sigemptyset;
+    enum SIGWINCH = 28; // macOS and Linux
+    import core.thread : Thread;
+    import core.time : msecs;
+    extern (C) static void onWinch(int) nothrow @nogc { atomicStore(gResized, true); }
+    sigaction_t sa;
+    sa.sa_handler = &onWinch;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGWINCH, &sa, null);
+    auto t = new Thread({
+        for (;;)
+        {
+            Thread.sleep(100.msecs);
+            if (cas(&gResized, true, false) && gStatus !is null) gStatus.draw();
+        }
+    });
+    t.isDaemon = true;
+    t.start();
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
@@ -1120,6 +1207,13 @@ int runMain(string[] args)
         catch (Exception e) console.note(console.red(format("[/model %s: %s]", spec, e.msg)));
     };
 
+    // The status line's agent stats (cwd shown with ~ for home).
+    string cwdShown = tildePath(cwd, environment.get("HOME", ""));
+    void refreshStatus()
+    {
+        updateStatus((ref Stats s) { statusFromAgent(s, agent, cwdShown); });
+    }
+
     // Read-only commands typed mid-turn show this, rendered on the agent thread.
     auto view = new LiveView;
     void refreshView()
@@ -1130,6 +1224,7 @@ int runMain(string[] args)
         view.set("/plan", planText(agent));
         view.set("/context", contextReport(agent));
         view.set("log", agent.log is null ? null : agent.log.path);
+        refreshStatus();
     }
     console.afterStep = &refreshView;
 
@@ -1198,6 +1293,12 @@ int runMain(string[] args)
         syncMode();
         atomicStore(gTurnRunning, true);
         scope (exit) atomicStore(gTurnRunning, false);
+        updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
+        scope (exit)
+        {
+            refreshStatus();
+            updateStatus((ref Stats s) { s.activity = Activity.idle; s.tokensPerSec = 0; });
+        }
         bool ok = true;
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
@@ -1240,7 +1341,11 @@ int runMain(string[] args)
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
-        editor = new LineEditor(fdSource(0), (string s) => writeFd(1, s), () => terminalWidth());
+        editor = new LineEditor(fdSource(0), (string s) @trusted {
+            import std.algorithm.searching : canFind;
+            // The editor's erase-to-end-of-screen wipes the status row too.
+            writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
+        }, () => terminalWidth());
         editor.onAction = (K k) @trusted {
             bool inTurn = atomicLoad(gTurnRunning);
             if (k == K.toggleThinking)
@@ -1250,6 +1355,7 @@ int runMain(string[] args)
             }
             AgentMode m = nextMode(agent.control.mode());
             agent.control.mode = m;
+            updateStatus((ref Stats s) { s.mode = m; });
             if (inTurn) console.note(console.dim(format("[mode: %s — %s]", m.name, m.describe)));
             else
             {
@@ -1260,6 +1366,16 @@ int runMain(string[] args)
         questions.interactive = true;
     }
     scope (exit) leaveKeyMode();
+    if (editor !is null)
+    {
+        gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
+        if (gStatus !is null)
+        {
+            refreshStatus();
+            watchResize();
+        }
+    }
+    scope (exit) if (gStatus !is null) gStatus.teardown();
     if (interactive && editor is null)
     {
         import core.thread : Thread;
@@ -1287,6 +1403,7 @@ int runMain(string[] args)
         }
         else if (editor !is null)
         {
+            refreshStatus();
             write("\n");
             stdout.flush();
             auto r = editor.readLine("› ", console.bold("› "));
@@ -1319,6 +1436,8 @@ int runMain(string[] args)
                     if (agent.log !is null) agent.log.replace(agent.messages);
                     if (!agent.plan.empty) agent.setPlan(Plan.init, false);
                     agent.historyAvailable = agent.historyHintPending = false;
+                    if (gStatus !is null) gStatus.clear();
+                    refreshStatus();
                     writeln("conversation cleared");
                     continue;
                 case "/compact":
