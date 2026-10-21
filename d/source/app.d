@@ -315,10 +315,12 @@ int main(string[] args)
     auto bashTimeout = cfg.bashTimeoutSecs;
     tools.register(bashDefinition(bashTimeout), (JSONValue a) => bashExecute(a, bashTimeout));
     registerFiles(tools, readState);
-    registerSearch(tools);
+    Agent agent;
+    // Read-deny rules hide paths from search results (Policy.readDenied).
+    registerSearch(tools, (string path) => agent.policy.readDenied(path, getcwd()));
 
     auto cwd = getcwd();
-    auto agent = new Agent(client, tools, policy, buildSystemPrompt(cfg, cwd, o.plan));
+    agent = new Agent(client, tools, policy, buildSystemPrompt(cfg, cwd, o.plan));
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
     agent.temperature = cfg.temperature;

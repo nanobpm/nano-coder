@@ -68,7 +68,7 @@ Roughly in dependency order. Sizes are Rust lines.
    history tools), system reminders (`reminders.rs` 1.8k), turn caps and
    modes (`mode.rs`), the editable `/queue` (`queue.rs` 0.3k), and `report_outcome`
    (`goal.rs`).
-2. **Permissions vs. sandbox.** The parser and guards are fully ported, but file-tool writes are not held to sandbox roots, and the search tools don't call `readDenied` for each file yet.
+2. **Permissions vs. sandbox.** The parser and guards are fully ported, but file-tool writes are not held to sandbox roots. The search tools filter results through `readDenied`, as in Rust.
 3. **Sandbox** (`sandbox.rs` 0.8k): Seatbelt on macOS, Landlock on Linux.
 4. **Providers.** OpenAI Responses (`openai_responses.rs` 1.0k), Copilot model routing
    and login (`--login`, device flow), Muse (`muse.rs` 1.9k), Qwen

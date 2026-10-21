@@ -102,11 +102,15 @@ struct IgnoreRule
 struct Ignores
 {
     IgnoreRule[] rules;
+    Denied denied;
 
     void load(string root, string relDir)
     {
         auto file = buildPath(root, relDir, ".gitignore");
-        if (!file.exists || !file.isFile) return;
+        // Same checks as discovered files: no symlinks or special files, deny
+        // rules apply, and the read is bounded.
+        if (!file.exists || file.isSymlink || !file.isFile || file.getSize > 1 << 20) return;
+        if (denied !is null && denied(file)) return;
         foreach (raw; readText(file).lineSplitter)
         {
             auto line = raw.strip;
@@ -145,11 +149,16 @@ struct Ignores
     }
 }
 
-/// Every regular file under `root` (relative paths, sorted), honouring .gitignore.
-string[] walk(string root)
+/// Whether Read-deny rules hide an absolute path (null: nothing is hidden).
+alias Denied = bool delegate(string path);
+
+/// Every regular file under `root` (relative paths, sorted), honouring
+/// .gitignore and leaving out paths `denied` hides.
+string[] walk(string root, Denied denied = null)
 {
     string[] found;
     Ignores ig;
+    ig.denied = denied;
     void visit(string relDir)
     {
         ig.load(root, relDir);
@@ -166,6 +175,7 @@ string[] walk(string root)
             if (full.isSymlink) continue;
             bool dir = full.isDir;
             if (ig.ignored(rel, dir)) continue;
+            if (denied !is null && denied(full)) continue;
             if (dir) visit(rel);
             else if (full.isFile) found ~= rel;
         }
@@ -191,7 +201,7 @@ private bool delegate(string) globFilter(string pattern)
     return (string rel) => !matchFirst(byName ? baseName(rel) : rel, re).empty;
 }
 
-string grep(JSONValue args)
+string grep(JSONValue args, Denied denied = null)
 {
     auto pattern = requireString(args, "pattern", "grep");
     auto root = resolvePath(optString(args, "path", "."));
@@ -206,8 +216,9 @@ string grep(JSONValue args)
     auto filter = globFilter(optString(args, "glob", ""));
     string[] files;
     string base;
-    if (root.isFile) { files = [baseName(root)]; base = dirName(root); }
-    else { files = walk(root); base = root; }
+    // A named file is searched even if .gitignore would skip it; deny rules still apply.
+    if (root.isFile) { files = denied !is null && denied(root) ? null : [baseName(root)]; base = dirName(root); }
+    else { files = walk(root, denied); base = root; }
     auto out_ = appender!string;
     long results;
     bool capped;
@@ -252,7 +263,7 @@ string grep(JSONValue args)
     return out_.data;
 }
 
-string glob(JSONValue args)
+string glob(JSONValue args, Denied denied = null)
 {
     auto pattern = requireString(args, "pattern", "glob");
     auto root = resolvePath(optString(args, "path", "."));
@@ -263,7 +274,7 @@ string glob(JSONValue args)
     auto out_ = appender!string;
     long n;
     auto cwd = getcwd();
-    foreach (rel; walk(root))
+    foreach (rel; walk(root, denied))
     {
         if (!filter(rel)) continue;
         if (n >= limit)
@@ -278,7 +289,8 @@ string glob(JSONValue args)
     return n ? out_.data : "(no matches)";
 }
 
-void register(ToolRegistry tools)
+/// `denied` reports paths Read-deny rules hide from search results.
+void register(ToolRegistry tools, Denied denied = null)
 {
     tools.register(ToolDefinition("grep",
         "Search file contents under a path for a regular expression. Read-only. Respects .gitignore, skips .git, symlinks and binary files. "
@@ -291,7 +303,7 @@ void register(ToolRegistry tools)
             "output_mode":{"type":"string","enum":["content","files","count"],"description":"Default content"},
             "limit":{"type":"integer","description":"Max results to return (default 250, max 5000)"}},
             "required":["pattern"]}`)),
-        (JSONValue a) => grep(a));
+        (JSONValue a) => grep(a, denied));
     tools.register(ToolDefinition("glob",
         "List files under a path whose name matches a glob pattern. Read-only. A pattern without `/` matches the file name at any depth (\"*.rs\"); "
         ~ "a pattern with `/` matches the path relative to the search root, where `*` stays within one directory and `**` crosses directories (\"src/**/*.rs\"). "
@@ -301,7 +313,7 @@ void register(ToolRegistry tools)
             "path":{"type":"string","description":"Directory to list from (default: working directory)"},
             "limit":{"type":"integer","description":"Max paths to return (default 250, max 5000)"}},
             "required":["pattern"]}`)),
-        (JSONValue a) => glob(a));
+        (JSONValue a) => glob(a, denied));
 }
 
 unittest
@@ -337,4 +349,25 @@ unittest
     JSONValue l = ["pattern": "needle", "path": root];
     l["limit"] = 1;
     assert(grep(l).indexOf("limit of 1 reached") >= 0);
+}
+
+unittest
+{
+    import std.file : mkdirRecurse, write, rmdirRecurse, tempDir;
+    auto root = buildPath(tempDir, "nano-d-search-deny");
+    if (root.exists) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "secrets"));
+    write(buildPath(root, "a.txt"), "token\n");
+    write(buildPath(root, ".env"), "token\n");
+    write(buildPath(root, "secrets", "k"), "token\n");
+    scope (exit) rmdirRecurse(root);
+    Denied d = (string p) => p.baseName == ".env" || p.baseName == "secrets";
+    auto args = (string extra) => parseJSON(`{"pattern":"token","path":` ~ JSONValue(root).toString ~ extra ~ `}`);
+    assert(walk(root, d) == ["a.txt"]);
+    auto g = grep(args(`,"output_mode":"files"`), d);
+    assert(g.canFind("a.txt") && !g.canFind(".env") && !g.canFind("secrets"), g);
+    // A denied file named explicitly is not searched either.
+    auto e = grep(parseJSON(`{"pattern":"token","path":` ~ JSONValue(buildPath(root, ".env")).toString ~ `}`), d);
+    assert(e == "(no matches)", e);
+    assert(!glob(parseJSON(`{"pattern":"*","path":` ~ JSONValue(root).toString ~ `}`), d).canFind(".env"));
 }
