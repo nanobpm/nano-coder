@@ -438,6 +438,17 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
     return s;
 }
 
+/// Warnings for the current model's temperature and thinking settings.
+string[] settingWarnings(Agent agent)
+{
+    string[] w;
+    auto t = agent.temperatureNow;
+    if (t.warning.length) w ~= t.warning;
+    auto th = agent.thinking();
+    if (th.warning.length) w ~= th.warning;
+    return w;
+}
+
 /// The instruction files for `dir`, or null when disabled (config
 /// `project_instructions`, env `AGENTIC_NO_PROJECT_INSTRUCTIONS`).
 ProjectInstructions discoverInstructions(const ref Config c, string dir)
@@ -467,6 +478,10 @@ string contextReport(Agent agent)
         window ? tokens * 100.0 / window : 0.0, calibrated ? ", anchored to reported usage" : ", estimated");
     out_ ~= format("Window:       %s (%s)", formatTokens(window), source);
     out_ ~= format("Messages:     %s", agent.messages.length);
+    out_ ~= "Temperature:  " ~ agent.temperatureNow.describe;
+    out_ ~= "Thinking:     " ~ agent.thinking().describe;
+    auto vision = agent.vision;
+    out_ ~= "Vision:       " ~ (vision.isNull ? "no" : format("yes (up to %s image(s), %s bytes each)", vision.get.maxImages, vision.get.maxImageBytes));
     if (agent.instructions is null || !agent.instructions.loadedPaths.length)
         out_ ~= "Instructions: none (no AGENTS.md, CLAUDE.md or .github/copilot-instructions.md found)";
     else out_ ~= "Instructions: " ~ agent.instructions.loadedPaths.join(", ");
@@ -644,6 +659,12 @@ int main(string[] args)
         if (!compactingByHand) stderr.writeln("[agent] auto-", r.toString);
     };
     agent.temperature = cfg.temperature;
+    agent.globalThinking = cfg.thinking;
+    agent.globalVision = cfg.vision;
+    agent.providerLookup = (string name) => name in cfg.providers;
+    agent.refreshCapabilities();
+    // A configured temperature or thinking level that is adjusted or ignored.
+    if (!o.acp && !o.prompt.length) foreach (w; settingWarnings(agent)) stderr.writeln("Warning: ", w);
 
     if (o.acp)
     {
@@ -845,6 +866,22 @@ int main(string[] args)
                     writeln(done ? "Conversation " ~ rep.toString : "Nothing to compact");
                     continue;
                 }
+                case "/thinking":
+                    import nano.thinking : statusText, setSession;
+                    if (arg.length)
+                    {
+                        try setSession(agent.sessionThinking, arg);
+                        catch (Exception e) { writeln(e.msg); continue; }
+                        auto r = agent.thinking();
+                        writeln("Thinking set to ", r.describe);
+                        if (r.warning.length) writeln("Warning: ", r.warning);
+                    }
+                    else
+                    {
+                        auto r = agent.thinking();
+                        writeln(statusText(r, client.modelName));
+                    }
+                    continue;
                 case "/context":
                     writeln(contextReport(agent));
                     continue;
@@ -923,7 +960,9 @@ int main(string[] args)
                         agent.configuredWindow = rp.config.contextWindow > 0 ? cast(size_t) rp.config.contextWindow : 0;
                         agent.learnedWindow = 0;
                         agent.learnedMaxOutput = 0;
-                        writeln("model: ", client.providerName, "/", client.modelName);
+                        agent.refreshCapabilities();
+                        writefln("Model set to %s (provider %s)", client.modelName, client.providerName);
+                        foreach (w; settingWarnings(agent)) writeln("Warning: ", w);
                     }
                     catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
                     continue;

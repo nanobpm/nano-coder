@@ -19,7 +19,8 @@ which macOS and most Linux distributions already have.
 | D module | Rust source | Status |
 |---|---|---|
 | `nano/toml.d` | (the `toml` crate) | A TOML subset with tables, dotted/quoted keys, all string forms, ints, floats, bools, arrays, inline tables and arrays of tables. Values come back as a std.json tree. |
-| `nano/config.d` | `config.rs`, `providers/mod.rs` (presets, `parse_model_spec`, resolve) | Supports `model`, `default_provider`, `temperature`, `max_tokens`, `system_prompt`, `max_iterations` and `bash_timeout_secs`. `[providers.*]` supports kind, base_url, api_key / api_key_env / api_key_command, default_model, headers, extra_body, drop_params, max_tokens_param, stream, temperature, timeout_secs and max_retries. Built-in presets are included. Any other key is ignored. |
+| `nano/config.d` | `config.rs`, `providers/mod.rs` (presets, `parse_model_spec`, resolve) | Supports `model`, `default_provider`, `temperature`, `max_tokens`, `system_prompt`, `max_iterations` and `bash_timeout_secs`. `[providers.*]` supports kind, base_url, api_key / api_key_env / api_key_command, default_model, headers, extra_body, drop_params, max_tokens_param, stream, temperature, thinking, thinking_levels, vision, timeout_secs and max_retries. `[providers.X.models."M"]` supports temperature, thinking, thinking_levels and vision. Global `thinking` and `vision` are supported too. `extra_body` is deep-merged as in Rust's `finish_body` (it never sets `temperature`), then `drop_params` are stripped. Built-in presets are included. Any other key is ignored. |
+| `nano/thinking.d`, `nano/temperature.d`, `nano/vision.d` | `thinking.rs`, `temperature.rs`, `vision.rs`, detection in `providers/openai.rs` | The most specific setting wins: session `/thinking`, then model, provider, global. Levels come from `thinking_levels`, else the endpoint, else the built-in Claude/GPT/o-series table, and are fitted to the nearest one with Rust's warnings. Request fields are `reasoning_effort`, llama.cpp `chat_template_kwargs`, and Anthropic adaptive `output_config.effort` or a fixed `budget_tokens` kept below `max_tokens`. `extra_body` overrides, `drop_params` drops, and the Anthropic temperature lock are handled (including the `output_config.effort` field-level override). Temperature resolves model → provider → global, with an `extra_body` override, a `drop_params` fixed default and Anthropic's 0..1 clamp. Detection reads Copilot-style `/models` capabilities, llama.cpp `/props` and Ollama `/api/show`. It runs at startup and after `/model`, synchronously with 3 s timeouts, and only for Copilot and local or loopback servers. Rust probes in the background for every provider. Output: `/thinking [level\|default\|off\|reset]`, ACP `/thinking`, and `/model` replies with the temperature/thinking fields and warnings. `/context` shows the Temperature, Thinking and Vision lines. Banner warnings appear as in Rust. |
 | `nano/http.d` | `providers/retry.rs`, transport | Uses libcurl (std.net.curl). It has an idle timeout via the low-speed limit and backoff retries on 408/409/429/5xx and connection errors (streams retry only before their first byte), plus an incremental SSE parser. |
 | `nano/llm.d` | `llm.rs` | Message, ToolCall (invalid-argument preservation), LLMResponse, ChatRequest, the `LLMClient` interface and `ThinkSplitter`. |
 | `nano/providers/openai.d` | `providers/openai.rs`, `providers/github_copilot.rs` | Chat Completions, streaming and non-streaming. It handles streamed tool calls, `reasoning_content`, `<think>` splitting and usage. The Copilot client exchanges the OAuth token, sends editor headers and sets X-Initiator. Copilot always goes through `/chat/completions`. |
@@ -81,10 +82,11 @@ Roughly in dependency order. Sizes are Rust lines.
 3. ~~**Sandbox**~~: Seatbelt done in `nano/sandbox.d`. Still to do: the Linux Landlock backend (until then the D build fails closed on Linux when a sandbox is configured).
 4. **Providers.** OpenAI Responses (`openai_responses.rs` 1.0k), Copilot model routing
    and login (`--login`, device flow), Muse (`muse.rs` 1.9k), Qwen
-   (`qwen.rs` 0.3k), and capability detection (context window, thinking levels,
-   vision) from `providers/mod.rs` 1.9k and `llm.rs`.
-5. **Thinking, temperature and vision settings**, including per-model
-   `[providers.X.models."M"]` (`thinking.rs` 2.2k, `temperature.rs` 0.6k, `vision.rs` 0.5k).
+   (`qwen.rs` 0.3k), and context-window detection from `/models`. Thinking-level
+   and vision detection are done (see item 5).
+5. ~~**Thinking, temperature and vision settings**~~: done (`nano/thinking.d`, `nano/temperature.d`, `nano/vision.d`).
+   Still differs: with no `max_tokens` configured, D sends none, while Rust sends the model's
+   published output cap or a large default (issue #114). D doesn't read the `/models` output cap.
 6. **Image attachments** (`attachment.rs` 1.1k), for `read_file` images.
 7. ~~**Instructions, full version**~~: done (`nano/instructions.d`).
 8. ~~**Skills**~~, ~~**Memory**~~, ~~**plan tools**~~ and the ~~**question tool**~~: done (`nano/skills.d`, `nano/memory.d`, `nano/plan.d`, `nano/question.d`).

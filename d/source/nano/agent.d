@@ -16,6 +16,11 @@ import nano.reminders : Reminders, wrap;
 import ctx = nano.context;
 import hist = nano.session_history;
 import nano.instructions : ProjectInstructions;
+import nano.thinking : Thinking, ThinkingResolved = Resolved, resolveThinking = resolve, Request, cappedBudget, Reported;
+import temp = nano.temperature;
+import nano.vision : Vision, resolveVision = resolve;
+import nano.config : ProviderConfig, ProviderKind;
+import std.typecons : Nullable;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
 import nano.permissions;
 import nano.session;
@@ -88,7 +93,19 @@ class Agent
     Message[] messages;
     long maxIterations;
     long maxTokens;
+    /// The global temperature (NaN = default); provider and model settings
+    /// and `extra_body` are resolved per request (`temperatureFor`).
     double temperature = double.nan;
+    /// The global thinking level and vision override.
+    Thinking globalThinking;
+    Nullable!bool globalVision;
+    /// `/thinking LEVEL` for this session (null = use the config).
+    Nullable!Thinking sessionThinking;
+    /// The provider settings for a provider name (null when unknown).
+    const(ProviderConfig)* delegate(string name) providerLookup;
+    /// What the endpoint reports about the current model.
+    Capabilities capabilities;
+    private ProviderConfig noProvider;
     SessionLog log;
     TokenUsage lastUsage;
     /// Steer or cancel the running turn from another thread.
@@ -248,7 +265,9 @@ class Agent
                 req.messages = messages;
                 req.tools = offeredTools();
                 req.maxTokens = requestMaxTokens();
-                req.temperature = temperature;
+                auto th = thinking();
+                req.thinking = th.request();
+                req.temperature = temperatureFor(th.anthropicThinkingOn).effective;
                 try
                 {
                     r = client.chat(req, (bool t, string s) { ev.text(t, s); });
@@ -486,6 +505,74 @@ class Agent
     /// An output cap learned from a provider error (0 = none); /model resets it.
     long learnedMaxOutput;
 
+    private const(ProviderConfig)* providerEntry() @trusted
+    {
+        auto pc = providerLookup is null ? null : providerLookup(client.providerName);
+        return pc is null ? &noProvider : pc;
+    }
+
+    private ProviderKind providerKind() @trusted
+    {
+        auto pc = providerEntry();
+        return pc.hasKind ? pc.kind : ProviderKind.openai;
+    }
+
+    /// Ask the endpoint what the current model supports (after a model change).
+    void refreshCapabilities() @trusted
+    {
+        capabilities = Capabilities.init;
+        if (auto probe = cast(CapabilityProbe) client) capabilities = probe.probeCapabilities();
+    }
+
+    /// The thinking level the current model is sent, and why. A fixed budget
+    /// must stay below the output cap: one that can't fit sends no level.
+    ThinkingResolved thinking() @trusted
+    {
+        Thinking st;
+        if (!sessionThinking.isNull) st = sessionThinking.get;
+        Reported rep;
+        if (!capabilities.thinking.isNull) rep = capabilities.thinking.get;
+        auto r = resolveThinking(globalThinking, sessionThinking.isNull ? null : &st, providerKind,
+            *providerEntry, client.modelName, capabilities.thinking.isNull ? null : &rep);
+        auto req = r.request();
+        if (req.kind == Request.Kind.budget)
+        {
+            auto maxTok = requestMaxTokens();
+            if (maxTok <= 0) maxTok = 32_000;
+            auto sent = cappedBudget(req.budget, maxTok);
+            string extra;
+            if (sent == 0)
+            {
+                r.effective = Thinking.init;
+                extra = format("max_tokens %s leaves no room for a thinking budget; thinking stays off", maxTok);
+            }
+            else if (sent < req.budget)
+                extra = format("max_tokens %s caps the %s thinking budget at %s of %s tokens; raise max_tokens for the full budget",
+                    maxTok, r.effective, sent, req.budget);
+            if (extra.length) r.warning = r.warning.length ? r.warning ~ "\n" ~ extra : extra;
+        }
+        return r;
+    }
+
+    /// The temperature for a request whose Anthropic thinking state is `on`.
+    temp.Resolved temperatureFor(bool on) @trusted
+    {
+        auto r = temp.resolve(temperature, providerKind, *providerEntry, client.modelName);
+        return on ? r.fixedBy("thinking is on, and Anthropic then requires the default temperature") : r;
+    }
+
+    /// The temperature the current model is sent, and why.
+    temp.Resolved temperatureNow() { return temperatureFor(thinking().anthropicThinkingOn); }
+
+    /// Whether (and how) the current model can view images.
+    Nullable!Vision vision() @trusted
+    {
+        Vision v;
+        if (!capabilities.vision.isNull) v = capabilities.vision.get;
+        return resolveVision(globalVision, providerKind, *providerEntry, client.modelName,
+            capabilities.vision.isNull ? null : &v);
+    }
+
     private long requestMaxTokens()
     {
         if (maxTokens <= 0) return maxTokens;
@@ -548,7 +635,8 @@ class Agent
             req.messages = [Message.system(ctx.summarySystemPrompt ~ (smart ? ctx.smartSummaryInstructions : "")),
                 Message.user(request)];
             req.maxTokens = budget;
-            req.temperature = temperature;
+            // No thinking field: only a model that thinks anyway locks the temperature.
+            req.temperature = temperatureFor(thinking().alwaysAnthropicThinking).effective;
             try
             {
                 auto r = client.chat(req, (bool, string) {});

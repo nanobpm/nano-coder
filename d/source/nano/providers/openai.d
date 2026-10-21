@@ -5,14 +5,15 @@ module nano.providers.openai;
 
 import std.json;
 import std.format : format;
-import std.string : stripRight, strip, startsWith;
+import std.string : stripRight, strip, startsWith, endsWith;
 import std.math : isNaN;
 import std.algorithm : canFind, sort;
 import nano.llm;
 import nano.http;
 import nano.config;
+import nano.thinking : applyChat, applyAnthropic;
 
-class OpenAIClient : LLMClient
+class OpenAIClient : LLMClient, CapabilityProbe
 {
     protected ResolvedProvider p;
 
@@ -58,9 +59,8 @@ class OpenAIClient : LLMClient
             b["stream"] = true;
             b["stream_options"] = ["include_usage": true];
         }
-        if (p.config.extraBody.type == JSONType.object)
-            foreach (k, v; p.config.extraBody.object) b[k] = v;
-        foreach (d; p.config.dropParams) b.object.remove(d);
+        applyChat(req.thinking, b);
+        p.config.finishBody(b);
         return b;
     }
 
@@ -149,6 +149,80 @@ class OpenAIClient : LLMClient
         s.finish(&emit);
         r.content = said.strip;
         r.reasoning ~= thought;
+    }
+
+    /// GET/POST `url` with a short timeout; null on any failure.
+    private JSONValue probe(string url, string body_ = null) @trusted
+    {
+        import core.time : seconds;
+        Request req;
+        req.method = body_ is null ? "GET" : "POST";
+        req.url = url;
+        ChatRequest none;
+        req.headers = headers(none);
+        if (body_ !is null) { req.headers["Content-Type"] = "application/json"; req.body_ = body_; }
+        req.connectTimeout = 3.seconds;
+        req.idleTimeout = 3.seconds;
+        try
+        {
+            string text;
+            auto status = perform(req, text);
+            if (status < 200 || status >= 300) return JSONValue.init;
+            return parseJSON(text);
+        }
+        catch (Exception) return JSONValue.init;
+    }
+
+    /// Whether probing is worth a startup round trip: Copilot, or a local
+    /// server (Ollama, llama.cpp, LM Studio, or any loopback endpoint).
+    protected bool shouldProbe()
+    {
+        import nano.vision : baseUrlHost;
+        auto host = baseUrlHost(p.config.baseUrl);
+        return p.name == "ollama" || p.name == "llamacpp" || p.name == "lmstudio"
+            || host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]";
+    }
+
+    /// Thinking levels and vision from `/models`, then (by server) llama.cpp
+    /// `/props` or Ollama `/api/show` (port of `detect_capabilities`).
+    Capabilities probeCapabilities() @trusted
+    {
+        import nano.thinking : Reported;
+        import nano.vision : Vision;
+        import std.uri : encodeComponent;
+        Capabilities c;
+        if (!shouldProbe()) return c;
+        auto base = baseUrl;
+        auto root = base.length > 3 && base[$ - 3 .. $] == "/v1" ? base[0 .. $ - 3] : base;
+        auto models = probe(base ~ "/models");
+        JSONValue entry;
+        if (models.type == JSONType.object)
+            if (auto d = "data" in models)
+                if (d.type == JSONType.array)
+                    foreach (m; d.array)
+                        if (m.type == JSONType.object)
+                            if (auto id = "id" in m) if (id.type == JSONType.string && id.str == p.model) { entry = m; break; }
+        if (entry.type == JSONType.object)
+        {
+            c.thinking = Reported.fromModelEntry(entry);
+            c.vision = Vision.fromModelEntry(entry);
+        }
+        string owner;
+        if (entry.type == JSONType.object)
+            if (auto o = "owned_by" in entry) if (o.type == JSONType.string) owner = o.str;
+        if (owner == "llamacpp" || p.name == "llamacpp")
+        {
+            auto props = probe(root ~ "/props?model=" ~ encodeComponent(p.model));
+            if (c.thinking.isNull) c.thinking = Reported.fromLlamacppProps(props);
+            if (c.vision.isNull) c.vision = Vision.fromLlamacppProps(props);
+        }
+        else if (p.name == "ollama" || root.endsWith(":11434") || owner == "library" || owner == "ollama")
+        {
+            auto show = probe(root ~ "/api/show", JSONValue(["model": p.model]).toString);
+            if (c.thinking.isNull) c.thinking = Reported.fromOllamaShow(show);
+            if (c.vision.isNull) c.vision = Vision.fromOllamaShow(show);
+        }
+        return c;
     }
 
     string[] listModels()
@@ -302,6 +376,8 @@ class CopilotClient : OpenAIClient
         if (auto e = "endpoints" in j)
             if (auto api = "api" in *e) apiBase = api.str.stripRight("/");
     }
+
+    override protected bool shouldProbe() { return true; }
 
     override protected string baseUrl()
     {

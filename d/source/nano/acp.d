@@ -30,6 +30,9 @@ import nano.session;
 enum int protocolVersion = 1;
 
 import nano.paths : debugQuote;
+import nano.thinking : wireValue, setSession, label;
+import nano.temperature : label;
+import std.array : join;
 
 /// Commands `handle` services over ACP. Reaching the slash fallback with one
 /// of these means only its arguments were not accepted.
@@ -447,8 +450,37 @@ final class AcpServer : AgentEvents
         {
             try agent.client = host.makeClient(text[7 .. $].strip);
             catch (Exception e) return rpcError(id, -32602, e.msg);
-            return rpcResult(id, JSONValue(["stopReason": "end_turn", "provider": agent.client.providerName,
-                "model": agent.client.modelName]));
+            agent.refreshCapabilities();
+            auto temp = agent.temperatureNow;
+            auto th = agent.thinking();
+            JSONValue body_ = ["stopReason": "end_turn", "provider": agent.client.providerName,
+                "model": agent.client.modelName];
+            import std.math : isNaN;
+            body_["temperature"] = isNaN(temp.effective) ? JSONValue(null) : JSONValue(temp.effective);
+            body_["temperature_source"] = label(temp.source);
+            body_["thinking"] = wireValue(th);
+            body_["thinking_source"] = label(th.source);
+            string[] warnings;
+            if (temp.warning.length) warnings ~= temp.warning;
+            if (th.warning.length) warnings ~= th.warning;
+            if (warnings.length) body_["warning"] = warnings.join("\n");
+            return rpcResult(id, body_);
+        }
+        if (text == "/thinking" || text.startsWith("/thinking "))
+        {
+            auto arg = text["/thinking".length .. $].strip;
+            if (arg.length)
+            {
+                try setSession(agent.sessionThinking, arg);
+                catch (Exception e) return rpcError(id, -32602, e.msg);
+            }
+            auto th = agent.thinking();
+            JSONValue body_ = ["stopReason": "end_turn"];
+            body_["thinking"] = wireValue(th);
+            body_["thinking_source"] = label(th.source);
+            body_["thinking_levels"] = JSONValue(th.levels);
+            if (th.warning.length) body_["warning"] = th.warning;
+            return rpcResult(id, body_);
         }
         return JSONValue.init;
     }

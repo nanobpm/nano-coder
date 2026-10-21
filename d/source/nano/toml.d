@@ -207,7 +207,7 @@ private struct Parser
                 return JSONValue(clean[2 .. $].to!long(radix));
             }
             if (clean.canFind('.') || clean.canFind('e') || clean.canFind('E'))
-                return JSONValue(clean.to!double);
+                return JSONValue(parseDouble(clean));
             if (clean.length >= 10 && clean[4] == '-') return JSONValue(raw); // dates: keep as text
             return JSONValue(clean.to!long);
         }
@@ -411,4 +411,23 @@ unittest
     bool threw;
     try parseToml("x = 1\nx = 2\n"); catch (TomlException) threw = true;
     assert(threw);
+}
+
+/// A correctly rounded double (`std.conv.to!double` is not: "0.7" came back
+/// as 0.700000000000000067); throws on trailing junk.
+private double parseDouble(string s) @trusted
+{
+    import core.stdc.stdlib : strtod;
+    import std.string : toStringz;
+    auto z = s.toStringz;
+    immutable(char)* end;
+    auto v = strtod(z, &end);
+    if (end != z + s.length || !s.length) throw new Exception("bad number " ~ s);
+    return v;
+}
+
+unittest
+{
+    assert(parseToml("t = 0.7")["t"].floating == 0.7);
+    assert(parseToml("t = 1e-3")["t"].floating == 1e-3);
 }

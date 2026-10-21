@@ -15,6 +15,40 @@ import std.string : strip, indexOf, startsWith;
 import std.format : format;
 import std.math : isNaN;
 import nano.toml;
+import std.typecons : Nullable;
+import nano.thinking : Thinking;
+
+/// A temperature setting: null = unset, NaN = "default" (send none).
+alias TemperatureSetting = Nullable!double;
+
+/// Settings for one model of a provider (`[providers.NAME.models."MODEL"]`).
+struct ModelSettings
+{
+    TemperatureSetting temperature;
+    Nullable!Thinking thinking;
+    /// Whether this model can view images (overrides detection).
+    Nullable!bool vision;
+    /// Levels this model accepts; set only when `hasThinkingLevels`.
+    string[] thinkingLevels;
+    bool hasThinkingLevels;
+
+    static ModelSettings fromJSON(JSONValue o)
+    {
+        ModelSettings m;
+        if (auto v = "temperature" in o) m.temperature = numberOrDefault(*v);
+        if (auto v = "thinking" in o) m.thinking = Thinking.parse(v.str);
+        if (auto v = "vision" in o) m.vision = v.boolean;
+        if (auto v = "thinking_levels" in o) m.thinkingLevels = strings(*v), m.hasThinkingLevels = true;
+        return m;
+    }
+}
+
+string[] strings(JSONValue v)
+{
+    string[] o;
+    foreach (x; v.array) o ~= x.str;
+    return o;
+}
 
 enum ProviderKind { openai, anthropic, githubCopilot }
 
@@ -45,9 +79,39 @@ struct ProviderConfig
     string maxTokensParam;
     long contextWindow;
     bool stream = true;
-    double temperature = double.nan;
+    TemperatureSetting temperature;
+    Nullable!Thinking thinking;
+    Nullable!bool vision;
+    string[] thinkingLevels;
+    bool hasThinkingLevels;
+    ModelSettings[string] models;
     long timeoutSecs = 600;
     long maxRetries = 3;
+
+    /// Merge `extra_body` into a built request body (nested objects field by
+    /// field, so an unrelated option doesn't clobber a generated sibling), then
+    /// strip `drop_params`. `temperature` is owned by the resolver and skipped.
+    void finishBody(ref JSONValue b) const @trusted
+    {
+        static void mergeObject(ref JSONValue into, const JSONValue from)
+        {
+            foreach (k, v; from.object)
+            {
+                if (auto e = k in into.object)
+                    if (e.type == JSONType.object && v.type == JSONType.object) { mergeObject(*e, v); continue; }
+                into.object[k] = cast(JSONValue) v;
+            }
+        }
+        if (extraBody.type == JSONType.object)
+            foreach (k, v; extraBody.object)
+            {
+                if (k == "temperature") continue;
+                if (auto e = k in b.object)
+                    if (e.type == JSONType.object && v.type == JSONType.object) { mergeObject(*e, v); continue; }
+                b.object[k] = cast(JSONValue) v;
+            }
+        foreach (d; dropParams) b.object.remove(d);
+    }
 
     /// Overlay the fields set in `o` (a user table) onto this preset.
     void merge(JSONValue o)
@@ -65,6 +129,11 @@ struct ProviderConfig
         if (auto v = "context_window" in o) contextWindow = v.integer;
         if (auto v = "stream" in o) stream = v.boolean;
         if (auto v = "temperature" in o) temperature = numberOrDefault(*v);
+        if (auto v = "thinking" in o) thinking = Thinking.parse(v.str);
+        if (auto v = "vision" in o) vision = v.boolean;
+        if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
+        if (auto v = "models" in o)
+            foreach (name, m; v.object) models[name] = ModelSettings.fromJSON(m);
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
     }
@@ -117,6 +186,9 @@ struct Config
     string model = "openai/gpt-5";
     string defaultProvider = "openai";
     double temperature = double.nan;
+    /// Global thinking level and vision override.
+    Thinking thinking;
+    Nullable!bool vision;
     long maxTokens = 0;
     string systemPrompt;
     long maxIterations = 0;
@@ -171,6 +243,8 @@ struct Config
         if (auto v = "default_provider" in doc) c.defaultProvider = v.str;
         if (auto v = "temperature" in doc) c.temperature = numberOrDefault(*v);
         if (auto v = "max_tokens" in doc) c.maxTokens = v.integer;
+        if (auto v = "thinking" in doc) c.thinking = Thinking.parse(v.str);
+        if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;

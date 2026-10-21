@@ -35,6 +35,7 @@ struct Request
     string[string] headers;
     string body_;
     Duration idleTimeout = 600.seconds;
+    Duration connectTimeout = 30.seconds;
 }
 
 /// Perform `req`; each received chunk goes to `onChunk` (when set) as it
@@ -44,7 +45,7 @@ int perform(const ref Request req, out string body_, scope void delegate(const(c
     auto http = HTTP(req.url);
     http.method = req.method == "GET" ? HTTP.Method.get : HTTP.Method.post;
     foreach (k, v; req.headers) http.addRequestHeader(k, v);
-    http.connectTimeout = 30.seconds;
+    http.connectTimeout = req.connectTimeout;
     // libcurl's low-speed limit acts as an idle timeout: fail after `idleTimeout`
     // seconds below 1 byte/s, without capping a slow but steady stream.
     import etc.c.curl : CurlOption;

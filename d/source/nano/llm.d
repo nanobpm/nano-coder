@@ -171,10 +171,29 @@ struct ChatRequest
     long maxTokens;
     /// NaN means "send none".
     double temperature = double.nan;
+    /// The resolved thinking control (kind `none` sends nothing).
+    import nano.thinking : ThinkingRequest = Request;
+    ThinkingRequest thinking;
 }
 
 /// Receives streamed text: `reasoning` is true for thinking output.
 alias StreamSink = void delegate(bool reasoning, string text);
+
+/// What an endpoint reports about the current model.
+struct Capabilities
+{
+    import std.typecons : Nullable;
+    import nano.thinking : Reported;
+    import nano.vision : Vision;
+    Nullable!Reported thinking;
+    Nullable!Vision vision;
+}
+
+/// A client that can ask its endpoint what the model supports.
+interface CapabilityProbe
+{
+    Capabilities probeCapabilities();
+}
 
 interface LLMClient
 {

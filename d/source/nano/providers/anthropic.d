@@ -8,6 +8,7 @@ import std.math : isNaN;
 import nano.llm;
 import nano.http;
 import nano.config;
+import nano.thinking : applyChat, applyAnthropic;
 
 class AnthropicClient : LLMClient
 {
@@ -87,11 +88,12 @@ class AnthropicClient : LLMClient
             }
             b["tools"] = tools;
         }
-        if (!isNaN(req.temperature)) b["temperature"] = req.temperature;
+        // Anthropic's range is 0..1.
+        if (!isNaN(req.temperature)) b["temperature"] = req.temperature < 0 ? 0.0 : req.temperature > 1 ? 1.0 : req.temperature;
         if (stream) b["stream"] = true;
-        if (p.config.extraBody.type == JSONType.object)
-            foreach (k, v; p.config.extraBody.object) b[k] = v;
-        foreach (d; p.config.dropParams) b.object.remove(d);
+        // Thinking rules out a custom temperature.
+        if (applyAnthropic(req.thinking, b, b["max_tokens"].integer)) b.object.remove("temperature");
+        p.config.finishBody(b);
         return b;
     }
 
