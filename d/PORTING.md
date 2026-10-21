@@ -98,8 +98,7 @@ Roughly in dependency order. Sizes are Rust lines.
 7. ~~**Instructions, full version**~~: done (`nano/instructions.d`).
 8. ~~**Skills**~~, ~~**Memory**~~, ~~**plan tools**~~ and the ~~**question tool**~~: done (`nano/skills.d`, `nano/memory.d`, `nano/plan.d`, `nano/question.d`).
 9. ~~**Hooks**~~: done in `nano/claude_hooks.d` (project hooks run inside the sandbox).
-10. **Sessions, rest** (`session_index.rs` cache and titles, `resume.rs` picker,
-    `trajectory.rs` 1.3k). The format and `--list-sessions` are done.
+10. ~~**Sessions, rest**~~: done (`nano/session_index.d`, `nano/resume.d`, `nano/trajectory.d`).
 11. ~~**ACP server**~~ (`acp.rs` 0.9k): done in `nano/acp.d`, except the commands listed above.
 12. **Terminal UI, rest**: the line editor, input history and slash menu
     are done (see the table above). Still to do: `frame.rs` (a frame that

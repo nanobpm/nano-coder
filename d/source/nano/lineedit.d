@@ -25,6 +25,10 @@ enum K
 {
     none, insert, submit, newline, left, right, home, end, wordLeft, wordRight, up, down,
     backspace, delete_, killEnd, clearLine, eraseWord, tab, escape, interrupt, eof, paste, ignored, closed,
+    /// Shift-Tab (CSI Z): cycle the agent mode.
+    cycleMode,
+    /// Ctrl-O: show or hide the model's thinking.
+    toggleThinking,
 }
 
 struct Key
@@ -60,6 +64,7 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
         case 0x09: return Key(K.tab);
         case 0x0b: return Key(K.killEnd);
         case 0x0e: return Key(K.down);
+        case 0x0f: return Key(K.toggleThinking);
         case 0x10: return Key(K.up);
         case 0x15: return Key(K.clearLine);
         case 0x17: return Key(K.eraseWord);
@@ -108,6 +113,7 @@ private Key decodeEscape(ByteSource next)
         }
         auto s = (() @trusted => cast(string) seq.idup)();
         if (s == "\x1b[200~") return Key(K.paste, readPaste(next));
+        if (s == "\x1b[Z") return Key(K.cycleMode); // Shift-Tab (backtab)
         if (s == "\x1b[M") // legacy mouse report: drop its three coordinate bytes
             foreach (_; 0 .. 3) if (next(0) < 0) break;
         return parseEscape(s);
@@ -176,7 +182,7 @@ Key parseEscape(string seq)
             default: return Key(K.end);
         }
     }
-    return Key(K.ignored); // includes Shift-Tab (CSI Z) and focus reports
+    return Key(K.ignored); // includes focus reports
 }
 
 /// `key` with an xterm/kitty `modifier` (lock bits masked off).
@@ -490,6 +496,8 @@ final class LineEditor
     private int pushback = -1;
     private long lastEscMs = long.min / 2;
     long delegate() @safe nowMs;
+    /// Shift-Tab / Ctrl-O: run with the input erased, then the input is redrawn.
+    void delegate(K) @safe onAction;
 
     this(ByteSource src, void delegate(string) @safe out_, size_t delegate() @safe width)
     {
@@ -563,6 +571,12 @@ final class LineEditor
                 case K.clearLine: state.clear(); break;
                 case K.eraseWord: state.eraseWord(); break;
                 case K.tab: state.tab(); break;
+                case K.cycleMode, K.toggleThinking:
+                    if (onAction is null) break;
+                    erase();
+                    onAction(key.kind);
+                    if (turn && !state.buf.length) continue; // no empty prompt amid the output
+                    break;
                 case K.interrupt:
                     state.clear();
                     erase();
@@ -845,6 +859,22 @@ unittest // editing keys
     assert(e.readLine("> ", "> ").text == "XfooY bar");
     e = editor("x\x15y\r", screen); // Ctrl-U
     assert(e.readLine("> ", "> ").text == "y");
+}
+
+unittest // Shift-Tab and Ctrl-O run the action with the input erased, keeping the text
+{
+    import std.algorithm : endsWith;
+    string screen;
+    K[] seen;
+    auto e = editor("ab\x1b[Zc\x0f\x1b[111;5u\r", screen);
+    e.onAction = (K k) { seen ~= k; screen ~= "<ACT>"; };
+    assert(e.readLine("> ", "> ").text == "abc");
+    assert(seen == [K.cycleMode, K.toggleThinking, K.toggleThinking]);
+    // Erased (cursor to column 0, clear below) right before the action.
+    assert(screen.canFind("\r\x1b[J<ACT>"));
+    // Without a handler they do nothing.
+    e = editor("a\x1b[Zb\x0f\r", screen);
+    assert(e.readLine("> ", "> ").text == "ab");
 }
 
 unittest // UTF-8, wide characters and combining marks

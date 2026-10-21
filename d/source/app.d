@@ -6,6 +6,7 @@ import std.stdio;
 import std.json;
 import std.format : format;
 import std.string : strip, stripRight, startsWith, indexOf;
+static import std.string;
 import std.file : getcwd, exists, readText;
 import std.process : environment;
 import core.stdc.stdlib : exit;
@@ -22,9 +23,9 @@ import nano.session;
 import nano.toml : parseToml;
 import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
-import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe;
+import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
-import nano.lineedit : LineEditor, Outcome, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
+import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth;
 import nano.commands : helpText, unescapePrompt;
 import core.thread : Thread;
 import nano.claude_hooks : HookManager, listingField, label, isProject;
@@ -373,12 +374,138 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
     return Answer(Answer.Kind.answers, answers);
 }
 
+/// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).
+shared bool gThinkingExpanded;
+
 class Console : AgentEvents
 {
-    bool color, verbose;
+    bool color, verbose, tty;
     private bool inReasoning, midLine;
+    // The reasoning block being shown (as in Rust's legacy renderer): a live
+    // one-line view redrawn in place, then "∴ Thought for Ns · N chars", or
+    // the full text when expanded (Ctrl-O or --verbose).
+    private bool thinking, blockExpanded, streamedThinking;
+    private string thinkText, lastThinking;
+    private long thinkStart, lastDraw;
 
-    this(bool color, bool verbose) { this.color = color; this.verbose = verbose; }
+    this(bool color, bool verbose, bool tty = false)
+    {
+        this.color = color;
+        this.verbose = verbose;
+        this.tty = tty;
+    }
+
+    private static long nowMs() @trusted
+    {
+        import core.time : MonoTime;
+        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+    }
+
+    private string thinkStyle(string s) { return color ? "\x1b[38;5;245m" ~ s ~ "\x1b[0m" : s; }
+
+    /// The one-line view of a streaming block.
+    private string collapsedLine()
+    {
+        import std.array : split, join;
+        import std.range : walkLength, drop;
+        import std.conv : to;
+        enum prefix = "∴ Thinking: ", suffix = "  (ctrl+o to expand)";
+        auto w = isTerminal(1) ? terminalWidth() : 80;
+        auto fixed = prefix.walkLength + suffix.length + 1;
+        auto room = w > fixed ? w - fixed : 0;
+        auto flat = sanitizeLine(thinkText.split.join(" "));
+        auto count = flat.walkLength;
+        auto tail = count > room ? "…" ~ flat.drop(count - room + 1).to!string : flat;
+        return color ? "\r\x1b[2K\x1b[38;5;245m" ~ prefix ~ "\x1b[2m" ~ tail ~ suffix ~ "\x1b[0m"
+            : "\r\x1b[2K" ~ prefix ~ tail ~ suffix;
+    }
+
+    private void thinkingDelta(string chunk)
+    {
+        import std.string : stripLeft;
+        if (!thinking)
+        {
+            if (midLine) { write("\n"); midLine = false; }
+            thinking = true;
+            thinkText = null;
+            thinkStart = nowMs();
+            lastDraw = long.min / 2;
+            blockExpanded = verbose || atomicLoad(gThinkingExpanded);
+            if (blockExpanded) write(thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
+        }
+        bool first = !thinkText.length;
+        thinkText ~= chunk;
+        if (blockExpanded)
+        {
+            auto t = first ? chunk.stripLeft : chunk;
+            write(thinkStyle(t));
+            if (t.length) midLine = t[$ - 1] != '\n';
+        }
+        else if (tty && nowMs() - lastDraw >= 50)
+        {
+            lastDraw = nowMs();
+            write(collapsedLine());
+            midLine = true;
+        }
+        stdout.flush();
+    }
+
+    private void finishThinking()
+    {
+        import std.string : strip;
+        import std.range : walkLength;
+        if (!thinking) return;
+        thinking = false;
+        if (blockExpanded)
+        {
+            if (midLine) write("\n");
+        }
+        else
+        {
+            auto secs = (nowMs() - thinkStart) / 1000.0;
+            auto chars = thinkText.strip.walkLength;
+            auto clear = tty ? "\r\x1b[2K" : "";
+            write(clear ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars (ctrl+o to expand)", chars))
+                ~ "\n");
+        }
+        midLine = false;
+        auto t = thinkText.strip;
+        if (t.length) lastThinking = sanitizeBlock(t);
+        stdout.flush();
+    }
+
+    /// Ctrl-O. Mid-block it switches the live view; between turns it prints a
+    /// note (with the last thinking when expanding). Returns whether it printed.
+    bool toggleThinking(bool inTurn)
+    {
+        synchronized (this)
+        {
+            bool expanded = !atomicLoad(gThinkingExpanded);
+            atomicStore(gThinkingExpanded, expanded);
+            if (thinking)
+            {
+                blockExpanded = expanded;
+                if (expanded)
+                    write((tty ? "\r\x1b[2K" : "\n") ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n"
+                        ~ thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))));
+                else
+                {
+                    write("\n" ~ collapsedLine());
+                }
+                midLine = true;
+                stdout.flush();
+                return false;
+            }
+            if (inTurn) return false;
+            string note = !expanded ? dim("thinking will be collapsed") ~ "\n"
+                : !lastThinking.length ? dim("thinking will be shown in full (no thinking yet)") ~ "\n"
+                : thinkStyle("∴ Last thinking ") ~ dim("(shown in full from now on; ctrl+o to collapse)") ~ "\n"
+                    ~ thinkStyle(lastThinking) ~ "\n";
+            write("\r\x1b[2K" ~ note);
+            stdout.flush();
+            return true;
+        }
+    }
 
     string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
     string bold(string s) { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
@@ -386,19 +513,43 @@ class Console : AgentEvents
 
     void text(bool reasoning, string chunk)
     {
-        if (reasoning && !verbose) return;
-        if (reasoning != inReasoning && midLine) { write("\n"); midLine = false; }
-        inReasoning = reasoning;
-        write(reasoning ? dim(chunk) : chunk);
-        if (chunk.length) midLine = chunk[$ - 1] != '\n';
-        stdout.flush();
+        synchronized (this)
+        {
+            if (reasoning)
+            {
+                streamedThinking = true;
+                thinkingDelta(chunk);
+                return;
+            }
+            if (!chunk.length) return;
+            finishThinking();
+            write(chunk);
+            midLine = chunk[$ - 1] != '\n';
+            stdout.flush();
+        }
+    }
+
+    /// A line of its own, mid-stream or not (the live thinking line redraws below it).
+    void note(string text)
+    {
+        synchronized (this)
+        {
+            if (midLine) write("\n");
+            midLine = false;
+            writeln(text);
+            stdout.flush();
+        }
     }
 
     void endLine()
     {
-        if (midLine) writeln();
-        midLine = false;
-        inReasoning = false;
+        synchronized (this)
+        {
+            finishThinking();
+            if (midLine) writeln();
+            midLine = false;
+            inReasoning = false;
+        }
     }
 
     /// plan_add/plan_update show as the checklist, not as calls.
@@ -424,7 +575,16 @@ class Console : AgentEvents
 
     void usage(TokenUsage u) {}
     void userMessage(string text) { endLine(); writeln(dim("↪ " ~ text)); }
-    void assistantMessage(string text, string reasoning) {}
+    void assistantMessage(string text, string reasoning)
+    {
+        synchronized (this)
+        {
+            // Reasoning that didn't stream shows now, like a block that just ended.
+            if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
+            finishThinking();
+            streamedThinking = false;
+        }
+    }
 
     static string summary(const ref ToolCall c)
     {
@@ -438,6 +598,16 @@ class Console : AgentEvents
                 }
         return c.encodedArguments;
     }
+}
+
+/// Untrusted multi-line text for the terminal: lines kept, every other
+/// control character (so any escape sequence) dropped, tabs expanded.
+string sanitizeBlock(string s)
+{
+    import nano.trajectory : sanitizeTerminal;
+    import std.algorithm : map;
+    import std.array : join, split;
+    return s.split('\n').map!sanitizeTerminal.join("\n");
 }
 
 size_t lineCount(string s)
@@ -811,7 +981,7 @@ int runMain(string[] args)
     catch (Exception e) die(e.msg);
     agent.useHooks(loadHooks(cwd), o.hasResume);
 
-    auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose);
+    auto console = new Console(isTerminal(1) && environment.get("NO_COLOR") is null, o.verbose, isTerminal(1));
     agent.onPlanChanged = () {
         console.endLine();
         write(checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4, console.color));
@@ -831,8 +1001,20 @@ int runMain(string[] args)
     string[] held; // lines to run before reading the prompt again
     auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
 
+    // The system prompt's plan section follows the mode; Shift-Tab mid-turn
+    // only switches the live mode, so the prompt catches up at the next turn.
+    bool sysPlan = o.plan;
+    void syncMode()
+    {
+        bool plan = agent.control.mode == AgentMode.plan;
+        if (plan == sysPlan) return;
+        agent.messages[0].content = systemFor(cwd, plan);
+        sysPlan = plan;
+    }
+
     bool turn(string input)
     {
+        syncMode();
         atomicStore(gTurnRunning, true);
         scope (exit) atomicStore(gTurnRunning, false);
         bool ok = true;
@@ -877,6 +1059,22 @@ int runMain(string[] args)
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
         editor = new LineEditor(fdSource(0), (string s) => writeFd(1, s), () => terminalWidth());
+        editor.onAction = (K k) @trusted {
+            bool inTurn = atomicLoad(gTurnRunning);
+            if (k == K.toggleThinking)
+            {
+                console.toggleThinking(inTurn);
+                return;
+            }
+            AgentMode m = nextMode(agent.control.mode());
+            agent.control.mode = m;
+            if (inTurn) console.note(console.dim(format("[mode: %s — %s]", m.name, m.describe)));
+            else
+            {
+                syncMode();
+                console.note(format("Mode: %s (%s)", m.name, m.describe));
+            }
+        };
         questions.interactive = true;
     }
     scope (exit) leaveKeyMode();
@@ -1002,7 +1200,7 @@ int runMain(string[] args)
                     {
                         auto m = parseMode(arg);
                         agent.control.mode = m;
-                        agent.messages[0].content = systemFor(cwd, m == AgentMode.plan);
+                        syncMode();
                         writefln("Mode set to %s (%s)", m.name, m.describe);
                     }
                     catch (Exception e) writeln(e.msg);
