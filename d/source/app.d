@@ -21,6 +21,7 @@ import nano.permissions;
 import nano.session;
 import nano.toml : parseToml;
 import nano.skills : Skills, skillsDefinition = definition;
+import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = definitions, runMemory = run, memoryDefaultDir = defaultDir, projectKey, Scope;
 import nano.control : TurnControl, FdLineReader;
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
@@ -38,7 +39,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
-REPL commands: /help /model [spec] /plan /normal /clear /usage /quit
+REPL commands: /help /model [spec] /plan /normal /clear /usage /memory [forget ID] /quit
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
 struct Options
@@ -267,7 +268,7 @@ class Console : AgentEvents
     static string summary(const ref ToolCall c)
     {
         if (c.invalidArguments.length) return "(invalid arguments)";
-        foreach (k; ["command", "path", "pattern"])
+        foreach (k; ["command", "path", "pattern", "text", "name", "id"])
             if (auto v = k in c.arguments)
                 if (v.type == JSONType.string)
                 {
@@ -301,7 +302,7 @@ string indent(string s)
 enum string planNote = "\n\nYou are in PLAN MODE: read-only. Do not create, modify or delete files or run commands with side effects; "
     ~ "investigate with the read-only tools and present a plan.";
 
-string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null)
+string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills skills = null, string memoryIndex = null)
 {
     import std.datetime.systime : Clock;
     auto base = c.systemPrompt.length ? c.systemPrompt : "You are a helpful assistant with access to tools.";
@@ -312,6 +313,7 @@ string buildSystemPrompt(const ref Config c, string cwd, bool plan, const Skills
             Clock.currTime.toISOExtString[0 .. 10]);
     s ~= projectInstructions(cwd);
     if (skills !is null) s ~= skills.renderIndex;
+    s ~= memoryIndex;
     if (plan) s ~= planNote;
     return s;
 }
@@ -378,7 +380,33 @@ int main(string[] args)
     skills = discoverSkills(cwd);
     if (cfg.skills.enabled && (o.acp || !skills.empty))
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
-    agent = new Agent(client, tools, policy, buildSystemPrompt(cfg, cwd, o.plan, skills));
+    // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
+    MemoryStore memory;
+    bool memoryWritable = cfg.memory == MemoryMode.on && !o.acp && !o.prompt.length && isTerminal(0) && isTerminal(1);
+    if (cfg.memory != MemoryMode.off)
+    {
+        auto dir = cfg.memoryDir.length ? cfg.memoryDir : memoryDefaultDir();
+        if (dir.length) memory = new MemoryStore(dir, projectKey(cwd), cfg.memoryExpiryDays < 0 ? 0 : cfg.memoryExpiryDays);
+    }
+    if (memory !is null)
+    {
+        // A helper, not a foreach-body delegate: D closures share the loop variable.
+        ToolHandler memoryHandler(string name)
+        {
+            return (JSONValue a) {
+                bool ro = !memoryWritable || agent.policy.mode == Mode.plan;
+                try return runMemory(memory, name, a, agent.log !is null ? agent.log.id : null, ro);
+                catch (Exception e) throw new ToolError(e.msg);
+            };
+        }
+        foreach (d; memoryDefinitions(memoryWritable)) tools.register(d, memoryHandler(d.name));
+    }
+    string systemFor(string dir, bool plan)
+    {
+        auto index = memory !is null ? memory.index(memoryWritable && !plan) : null;
+        return buildSystemPrompt(cfg, dir, plan, skills, index);
+    }
+    agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     agent.maxIterations = cfg.maxIterations;
     agent.maxTokens = cfg.maxTokens;
     agent.temperature = cfg.temperature;
@@ -390,7 +418,7 @@ int main(string[] args)
         bool plan = o.plan;
         host.systemPrompt = (string dir) {
             if (dir != cwd) skills = discoverSkills(dir);
-            return buildSystemPrompt(cfg, dir, plan, skills);
+            return systemFor(dir, plan);
         };
         host.makeClient = (string s) => makeClient(resolve(cfg, s));
         host.sessionDir = o.noSession ? null : sessionDir;
@@ -500,8 +528,29 @@ int main(string[] args)
                 case "/plan", "/normal":
                     bool plan = cmd == "/plan";
                     agent.policy.mode = plan ? Mode.plan : Mode.normal;
-                    agent.messages[0].content = buildSystemPrompt(cfg, cwd, plan);
+                    agent.messages[0].content = systemFor(cwd, plan);
                     writeln(plan ? "plan mode: read-only" : "normal mode");
+                    continue;
+                case "/memory":
+                    if (memory is null) { writeln("memory is off"); continue; }
+                    try
+                    {
+                        if (arg.startsWith("forget "))
+                        {
+                            writeln(memory.forget(arg[7 .. $]));
+                            continue;
+                        }
+                        auto all = memory.all();
+                        if (!all.length) writeln("no memories saved");
+                        foreach (x; all)
+                        {
+                            import nano.memory : scopeName = name;
+                            writefln("%-7s %s %s%s", scopeName(x.s), x.e.label, x.e.text,
+                                x.e.evidence !is null ? " (check: " ~ x.e.evidence ~ ")" : "");
+                        }
+                        writefln("store: %s (remove one with /memory forget <id>)", memory.root);
+                    }
+                    catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 case "/model":
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }

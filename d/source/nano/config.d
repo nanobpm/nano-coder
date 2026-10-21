@@ -4,6 +4,7 @@
 module nano.config;
 
 import nano.skills : SkillsConfig;
+import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
 
 import std.json;
 import std.file : exists, readText;
@@ -121,6 +122,9 @@ struct Config
     long bashTimeoutSecs = 600;
     ProviderConfig[string] providers;
     SkillsConfig skills;
+    MemoryMode memory = MemoryMode.on;
+    string memoryDir;
+    long memoryExpiryDays = defaultExpiryDays;
     string path;
 
     static string defaultPath()
@@ -144,6 +148,9 @@ struct Config
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
         if (auto v = "bash_timeout_secs" in doc) c.bashTimeoutSecs = v.integer;
+        if (auto v = "memory" in doc) c.memory = parseMemoryMode(v.str);
+        if (auto v = "memory_dir" in doc) c.memoryDir = expandTilde(v.str);
+        if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
         if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
             foreach (name, table; ps.object)
