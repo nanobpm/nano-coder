@@ -240,6 +240,9 @@ impl RateMeter {
 pub struct Steer {
     pub text: String,
     pub tag: Option<Value>,
+    /// The interactive queue id (shared with queued messages) so `/queue`
+    /// can list, edit or withdraw the steer before the agent reads it.
+    pub id: Option<usize>,
 }
 
 /// Why a turn ended.
@@ -333,7 +336,49 @@ impl Default for TurnControl {
 impl TurnControl {
     /// Queue a message for the running turn; it is added before the next model call.
     pub fn steer(&self, text: &str, tag: Option<Value>) {
-        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag });
+        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag, id: None });
+    }
+
+    /// Queue a steer carrying a `/queue` id, so it can be edited or withdrawn
+    /// until the agent reads it.
+    pub fn steer_with_id(&self, text: &str, id: usize) {
+        self.inner.steers.lock().unwrap().push_back(Steer { text: text.to_string(), tag: None, id: Some(id) });
+    }
+
+    /// Id-carrying steers the agent has not read yet, oldest first.
+    pub fn pending_steers(&self) -> Vec<(usize, String)> {
+        let steers = self.inner.steers.lock().unwrap();
+        steers.iter().filter_map(|s| s.id.map(|id| (id, s.text.clone()))).collect()
+    }
+
+    /// Withdraw unread steers by id; returns how many were removed. A steer
+    /// the agent already read is gone from the list, so it is not counted.
+    pub fn remove_steers(&self, ids: &[usize]) -> usize {
+        let mut steers = self.inner.steers.lock().unwrap();
+        let before = steers.len();
+        steers.retain(|s| !s.id.is_some_and(|id| ids.contains(&id)));
+        before - steers.len()
+    }
+
+    /// Rewrite an unread steer; false when none has that id (never sent, or
+    /// already read by the agent).
+    pub fn edit_steer(&self, id: usize, text: &str) -> bool {
+        let mut steers = self.inner.steers.lock().unwrap();
+        match steers.iter_mut().find(|s| s.id == Some(id)) {
+            Some(steer) => {
+                steer.text = text.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Withdraw every unread id-carrying steer; returns how many.
+    pub fn clear_steers(&self) -> usize {
+        let mut steers = self.inner.steers.lock().unwrap();
+        let before = steers.len();
+        steers.retain(|s| s.id.is_none());
+        before - steers.len()
     }
 
     pub fn has_steers(&self) -> bool {

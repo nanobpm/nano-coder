@@ -718,7 +718,7 @@ mod tests {
     use super::*;
 
     fn steer(text: &str, tag: i64) -> Steer {
-        Steer { text: text.to_string(), tag: Some(json!(tag)) }
+        Steer { text: text.to_string(), tag: Some(json!(tag)), id: None }
     }
 
     fn order(deferred: &VecDeque<Value>) -> Vec<String> {

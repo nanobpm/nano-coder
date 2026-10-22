@@ -52,7 +52,10 @@ xterm, kitty, WezTerm, Ghostty, iTerm2); elsewhere use `/queue add message`. The
 line shows how many are waiting. Edit the queue at any time
 (even mid-turn) with `/queue`: `/queue` lists the waiting messages, `/queue remove N`
 drops one (or several, `/queue remove N M`), `/queue edit N new text` rewrites one, and
-`/queue clear` empties the queue. A queued message is never injected while the agent is
+`/queue clear` empties the queue. Steers you have sent but the agent has not read yet
+show in the same list (marked `steer`, with the id from the `↪ steer #N` note), and
+`remove`/`edit`/`clear` apply to them too — so a steer the running turn has made stale can
+be withdrawn or rewritten before the agent's next step. A queued message is never injected while the agent is
 asking for input (the `question` tool's picker owns the terminal until you answer).
 Slash commands work mid-turn too, where it is safe:
 - **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
@@ -411,7 +414,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/plan` - Show the agent's task plan with all notes
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
-- `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages. Works while a turn runs, so a queued message can be removed or rewritten before it is sent.
+- `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
 - `/model [provider/model]` - Show the current model and pick a new one. The list starts with the last four models you used (the current one marked; the previous one highlighted, so `/model` then Enter switches back), then the providers: pick a provider to scroll its model list (Esc steps back). With an argument, switches directly (conversation is kept). Typing `/model ` shows a type-ahead of the current model, recently used models, and each configured provider's default model; Tab completes (a bare provider name completes to its default model). Recently used models are kept in `~/.local/share/nano-coder/recent-models.json`
 - `/mode [normal|plan|auto]` - Show or set the agent mode (Shift+Tab cycles it, at the prompt or mid-turn):
   - **normal** - full tools; reaching a positive turn cap asks whether to keep going

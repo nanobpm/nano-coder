@@ -554,8 +554,8 @@ impl Terminal {
     }
 
     /// Apply a `/queue` edit (`remove`/`edit`/`clear`) and say what happened.
-    fn edit_queue(&mut self, op: &queue::QueueOp) -> String {
-        let result = queue::apply(&mut self.messages, op);
+    fn edit_queue(&mut self, steers: Option<&dyn queue::PendingSteers>, op: &queue::QueueOp) -> String {
+        let result = queue::apply(&mut self.messages, steers, op);
         self.set_queue_status();
         result
     }
@@ -747,7 +747,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 // `/queue` only touches the message queue, so it is
                                 // safe — and most useful — while a turn is running.
                                 match op {
-                                    Ok(op) => renderer.note(&terminal.edit_queue(&op)),
+                                    Ok(op) => renderer.note(&terminal.edit_queue(Some(&control), &op)),
                                     Err(usage) => renderer.note(&format!("[{usage}]")),
                                 }
                             }
@@ -810,14 +810,19 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 // queued (see below).
                                 // `//…` steers with a message that starts with `/`.
                                 let text = commands::unescape_prompt(text).unwrap_or(text);
-                                control.steer(text, None);
+                                let id = terminal.messages.reserve_id();
+                                control.steer_with_id(text, id);
                                 // The frame renderer shows the steer as a user
                                 // message once absorbed; plain output shows only
                                 // this note, so it carries the text.
                                 if renderer.is_frame() {
-                                    renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
+                                    renderer.note(&format!(
+                                        "↪ steer #{id}: the agent reads this at its next step — /queue remove {id} to withdraw"
+                                    ));
                                 } else {
-                                    renderer.note(&format!("↪ steer: {text} — read at the agent's next step (Ctrl-Enter queues instead)"));
+                                    renderer.note(&format!(
+                                        "↪ steer #{id}: {text} — read at the agent's next step; /queue remove {id} to withdraw"
+                                    ));
                                 }
                             }
                             SteerRoute::Enqueue => {
@@ -864,7 +869,15 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
             // Queued lines run through `run_command`: re-escape a steer that
             // starts with `/` so it is sent as a message, not refused.
             let text = if steer.text.starts_with('/') { format!("/{}", steer.text) } else { steer.text.clone() };
-            terminal.queue_message(&text);
+            match steer.id {
+                Some(id) => {
+                    terminal.messages.push_with_id(id, text);
+                    terminal.set_queue_status();
+                }
+                None => {
+                    terminal.queue_message(&text);
+                }
+            }
         }
     }
     outcome
@@ -1265,7 +1278,7 @@ async fn run_compaction(
                         terminal.renderer.clear_transient();
                         match op {
                             Ok(op) => {
-                                let result = terminal.edit_queue(&op);
+                                let result = terminal.edit_queue(None, &op);
                                 terminal.renderer.note(&result);
                             }
                             Err(usage) => terminal.renderer.note(&format!("[{usage}]")),
@@ -1632,9 +1645,9 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // already applied mid-turn when typed then, and apply here at the
             // prompt.
             match op {
-                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages)),
+                Ok(queue::QueueOp::List) => terminal.renderer.print_block(&queue::describe(&terminal.messages, None)),
                 Ok(op) => {
-                    let msg = terminal.edit_queue(&op);
+                    let msg = terminal.edit_queue(None, &op);
                     terminal.renderer.print_block(&msg);
                 }
                 Err(usage) => terminal.renderer.print_block(&usage),
