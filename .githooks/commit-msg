@@ -1,4 +1,7 @@
 #!/bin/sh
 # Lint the commit message with commitlint (Conventional Commits).
 # Enable once per clone: git config core.hooksPath .githooks
-exec npx --yes -p @commitlint/cli@21 -p @commitlint/config-conventional@21 commitlint --edit "$1"
+# --no-audit: npm 12's npx audits even a cached install and waits on the
+# registry's advisories endpoint with no timeout, so an outage there hangs
+# every commit. Auditing the linter's own dependencies here gains nothing.
+exec npx --yes --no-audit -p @commitlint/cli@21 -p @commitlint/config-conventional@21 commitlint --edit "$1"
