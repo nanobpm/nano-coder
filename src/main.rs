@@ -20,6 +20,7 @@ mod context;
 mod files;
 mod frame;
 mod goal;
+mod herdr;
 mod history;
 mod hooks;
 mod input_history;
@@ -598,6 +599,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
         println!();
     }
     renderer.begin_turn();
+    herdr::report(herdr::State::Working, None, None);
     // Keep the prompt's busy spinner moving while the turn runs, even when no
     // output arrives (frame renderer only; `tick` is a no-op otherwise).
     // A picker (a question from the agent, the turn cap) holds `picker_lock`
@@ -666,6 +668,8 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // Yield stdin to the picker so the line reader does not
                         // race it for the answer keystrokes.
                         let gate = terminal.suspend_input();
+                        let reason = request.questions().first().map(|q| sanitize_terminal_line(&q.question));
+                        herdr::report(herdr::State::Blocked, reason.as_deref(), None);
                         // The picker's clock is the user's, not the agent's:
                         // stop counting working time while it owns the terminal.
                         let work = WorkClock::pause(&renderer);
@@ -675,6 +679,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                         // reader never resumes while a dialoguer is still active.
                         let answer = prompt_question(request.questions(), &control, &renderer, terminal.picker_lock(), gate).await;
                         questions.resolve(answer);
+                        herdr::report(herdr::State::Working, None, None);
                         drop(work);
                         // The picker wrote over the owned frame via dialoguer;
                         // force a full redraw so the next differential render
@@ -693,8 +698,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                     }
                     let gate = terminal.suspend_input();
                     let work = WorkClock::pause(&renderer);
+                    herdr::report(herdr::State::Blocked, Some("turn limit reached: continue?"), None);
                     let decision = prompt_cap_reached(&renderer, terminal.picker_lock(), gate).await;
                     cap.decide(decision);
+                    herdr::report(herdr::State::Working, None, None);
                     drop(work);
                     // Repaint after the dialoguer picker clobbered the frame,
                     // deferred behind the picker lock so it never races an
@@ -910,6 +917,19 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
 /// or move an interactive selector's cursor.
 pub(crate) fn sanitize_terminal_line(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
+}
+
+/// The current session as Herdr should resume it, if it is saved to disk
+/// (an unsaved session cannot be resumed).
+fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
+    if !herdr::active() {
+        return None;
+    }
+    agent.session_path()?;
+    let id = agent.session_id()?;
+    let model = format!("{}/{}", agent.provider_name(), agent.model_name());
+    let resume = herdr::resume_argv(id, Some(&model), extra)?;
+    Some(herdr::Session { id: id.to_string(), resume })
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -2203,6 +2223,15 @@ async fn main() -> Result<()> {
         }
         banner.push("Type /help for commands".to_string());
 
+        // Flags a resumed session needs to behave the same under Herdr.
+        let herdr_extra: Vec<String> = match &args.config {
+            Some(path) => {
+                let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+                vec!["--config".into(), path.display().to_string()]
+            }
+            None => Vec::new(),
+        };
+
         // Main loop
         let status = status::StatusLine::install(agent.context_stats());
         let _terminal_guard = TerminalGuard;
@@ -2361,6 +2390,9 @@ async fn main() -> Result<()> {
             };
             prompt(&terminal, separate);
             separate = false;
+            // Ready for input: tell Herdr, with the session to resume (re-read
+            // each time so `/resume` and `/restart` are picked up).
+            herdr::report(herdr::State::Idle, None, herdr_session(&agent, &herdr_extra));
 
             let input = loop {
                 let next = terminal.next(&agent);
@@ -2454,6 +2486,7 @@ async fn main() -> Result<()> {
             separate = true;
         }
 
+        herdr::release();
         println!("\nGoodbye!");
         // Repeat the resume instruction on exit so it is still on screen (and
         // in scrollback) after a long session has pushed the start-up banner

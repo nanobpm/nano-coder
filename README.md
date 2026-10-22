@@ -27,6 +27,7 @@ cargo install nano-coder             # or build from source
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
 - **Project instructions**: `AGENTS.md` (or `CLAUDE.md`, `.github/copilot-instructions.md`) from the repository is added to the system prompt
 - **Safety**: built-in guards block destructive commands (`rm -rf /`, `DROP DATABASE`, force-pushing `main`, ...), user allow/deny rules, and an optional OS sandbox (Seatbelt on macOS, Landlock on Linux)
+- **Herdr**: inside a [Herdr](https://herdr.dev) pane, reports idle/working/blocked state and the resume command
 - **Skills**: `SKILL.md` folders from the repository, `~/.agents/skills`, and an spm `ai.lock`, loaded on demand with `load_skill`
 
 ## Two Execution Modes
@@ -1233,6 +1234,16 @@ Record times and each message's `timestamp` are RFC 3339 with the local UTC offs
 - Input IDs are remembered. Redelivering a completed input returns its recorded response.
   Redelivering an input whose turn was interrupted resumes that turn without duplicating
   the user message.
+
+## Herdr
+
+Run inside a [Herdr](https://herdr.dev) pane (`HERDR_ENV=1`, `HERDR_PANE_ID` and
+`HERDR_BIN_PATH` set), the interactive CLI reports itself to Herdr: `working` while a
+turn runs, `blocked` while a question or the turn limit waits for you, and `idle` at the
+prompt. A saved session is reported with the command that resumes it
+(`nano-coder --resume <id> --model <provider/model>`, plus `--config` if given), so Herdr
+can reopen it after a restart (Herdr 0.9.2 or later). The pane is released on exit.
+Reports run in the background and failures are ignored; outside Herdr nothing is sent.
 
 ## Formal Verification
 
