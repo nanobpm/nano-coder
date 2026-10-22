@@ -1517,6 +1517,13 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     Ok(())
 }
 
+/// A copy of the agent's context stats with the live mode. A function, not an
+/// inline expression, so the stats lock is released before it returns.
+fn live_stats(agent: &Agent) -> context::ContextStats {
+    let stats = agent.context_stats().lock().unwrap().clone();
+    context::ContextStats { mode: agent.mode(), ..stats }
+}
+
 async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
     // Split name from argument on ANY whitespace, the same rule `timing` and
     // `Snapshot::output` use, so a tab/newline-separated form (e.g.
@@ -1560,7 +1567,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         // restrict which forms run — that restriction (see `timing`) exists
         // only to decide what is safe *mid-turn*.
         _ if name == "/trajectory" => {
-            let stats = context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() };
+            let stats = live_stats(agent);
             match turn_commands::Snapshot::capture(agent)
                 .output(cmd, &stats, agent.plan())
                 .expect("/trajectory always produces an output")
@@ -1576,7 +1583,11 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ if turn_commands::timing(cmd) == turn_commands::Timing::Immediate
             && let Some(output) = turn_commands::Snapshot::capture(agent).output(
                 cmd,
-                &context::ContextStats { mode: agent.mode(), ..agent.context_stats().lock().unwrap().clone() },
+                // Not an inline `lock()`: a temporary in an `if let` guard
+                // lives through the arm body, so the guard would still hold
+                // the stats mutex when `print_block` redraws the status line,
+                // which locks it again and deadlocks.
+                &live_stats(agent),
                 agent.plan(),
             ) =>
         {
