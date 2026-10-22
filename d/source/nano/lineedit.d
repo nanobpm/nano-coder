@@ -947,16 +947,19 @@ version (unittest)
         };
     }
 
-    LineEditor editor(string keys, ref string screen, size_t w = 40)
+    /// Heap-allocated so the editor's output delegate can outlive the test frame (DIP1000).
+    final class Screen { string text; }
+
+    LineEditor editor(string keys, Screen screen, size_t w = 40)
     {
-        auto e = new LineEditor(script(keys), (string s) { screen ~= s; }, () => w);
+        auto e = new LineEditor(script(keys), (string s) { screen.text ~= s; }, () => w);
         return e;
     }
 }
 
 unittest // editing keys
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("helo\x02l\x01X\x05!\r", screen);
     assert(e.readLine("› ", "› ") == Result(Outcome.line, "Xhello!"));
     e = editor("one two three\x17\x17four\r", screen);
@@ -974,14 +977,14 @@ unittest // editing keys
 unittest // Shift-Tab and Ctrl-O run the action with the input erased, keeping the text
 {
     import std.algorithm : endsWith;
-    string screen;
+    auto screen = new Screen;
     K[] seen;
     auto e = editor("ab\x1b[Zc\x0f\x1b[111;5u\r", screen);
-    e.onAction = (K k) { seen ~= k; screen ~= "<ACT>"; };
+    e.onAction = (K k) { seen ~= k; screen.text ~= "<ACT>"; };
     assert(e.readLine("> ", "> ").text == "abc");
     assert(seen == [K.cycleMode, K.toggleThinking, K.toggleThinking]);
     // Erased (cursor to column 0, clear below) right before the action.
-    assert(screen.canFind("\r\x1b[J<ACT>"));
+    assert(screen.text.canFind("\r\x1b[J<ACT>"));
     // Without a handler they do nothing.
     e = editor("a\x1b[Zb\x0f\r", screen);
     assert(e.readLine("> ", "> ").text == "ab");
@@ -989,7 +992,7 @@ unittest // Shift-Tab and Ctrl-O run the action with the input erased, keeping t
 
 unittest // UTF-8, wide characters and combining marks
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("h\xc3\xa9llo \xe4\xb8\x96\x7f\x7f\r", screen);
     assert(e.readLine("> ", "> ").text == "héllo");
     e = editor("e\xcc\x81x\x1b[D\x7f\r", screen); // e + combining acute: one backspace removes both
@@ -999,7 +1002,7 @@ unittest // UTF-8, wide characters and combining marks
 
 unittest // multi-line input: Ctrl-J, Alt-Enter, kitty/modifyOtherKeys Ctrl-Enter, paste
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("a\nb\x1b\rc\x1b[13;5ud\x1b[27;5;13~e\r", screen);
     assert(e.readLine("> ", "> ").text == "a\nb\nc\nd\ne");
     e = editor("x\x1b[200~line1\r\nline2\tz\x1b[201~\r", screen);
@@ -1011,7 +1014,7 @@ unittest // multi-line input: Ctrl-J, Alt-Enter, kitty/modifyOtherKeys Ctrl-Ente
 
 unittest // history recall; Ctrl-D; Ctrl-C
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("first\rsecond\r\x1b[A\x1b[A\rdraft\x1b[A\x1b[B\r", screen);
     assert(e.readLine("> ", "> ").text == "first");
     assert(e.readLine("> ", "> ").text == "second");
@@ -1029,17 +1032,17 @@ unittest // history recall; Ctrl-D; Ctrl-C
 
 unittest // slash commands: Tab, menu, rejection, Esc
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("/mod\tl\t gpt\r", screen);
     assert(e.readLine("> ", "> ").text == "/model  gpt");
-    screen = null;
+    screen.text = null;
     e = editor("/he", screen);
     e.readLine("> ", "> ");
-    assert(screen.canFind("Show this"), "menu drawn while typing");
-    screen = null;
+    assert(screen.text.canFind("Show this"), "menu drawn while typing");
+    screen.text = null;
     e = editor("/exin\r\x7f\x7fit\r", screen);
     assert(e.readLine("> ", "> ").text == "/exit");
-    assert(screen.canFind("Did you mean /exit?"));
+    assert(screen.text.canFind("Did you mean /exit?"));
     // Esc hides the menu; Esc Esc clears at the prompt and cancels in a turn.
     long t;
     e = editor("/h\x1b\x1b\xffok\r", screen);
@@ -1052,7 +1055,7 @@ unittest // slash commands: Tab, menu, rejection, Esc
 
 unittest // select
 {
-    string screen;
+    auto screen = new Screen;
     auto e = editor("\x1b[B\x1b[B\x1b[A\r", screen);
     assert(e.select("Pick", ["a", "b", "c"]) == 1);
     e = editor("3\r", screen);
@@ -1063,7 +1066,7 @@ unittest // select
 
 unittest // Enter steers and Ctrl-Enter queues during a turn (Rust enter_steers_and_ctrl_enter_queues_during_a_turn)
 {
-    string screen;
+    auto screen = new Screen;
     auto r = editor("go left\r", screen).readLine("", "", true);
     assert(r.outcome == Outcome.line && r.text == "go left");
     foreach (seq; ["\x1b[27;5;13~", "\x1b[13;5u", "\x1b[27;9;13~"])

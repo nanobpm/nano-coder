@@ -28,7 +28,10 @@
     }
   },
   "dflags-ldc": [
-    "-allinst"
+    "-allinst",
+    "-preview=dip1000",
+    "-preview=nosharedaccess",
+    "-fno-delete-null-pointer-checks"
   ],
   "preBuildCommands": [
     "$PACKAGE_DIR/scripts/check-safe.sh"
