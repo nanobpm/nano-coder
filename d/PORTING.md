@@ -80,6 +80,10 @@ directory works; it's kept separate by default so the port can't damage real ses
   but there is no prompt queue UI.
 - **Anthropic** has only unit tests and a mock. The Copilot/OpenAI path was tested live.
   Signed `thinking` and `redacted_thinking` blocks are kept and replayed, as in Rust.
+- **macOS linking.** `dub.json` exports only `_main` (`lflags-osx`). D emits thousands
+  of weak template symbols; when they are exported, dyld coalesces each one against
+  every loaded image at launch, which cost about 140M instructions per start.
+  Exporting only `main` lets the linker bind them locally. Stack traces are unaffected.
 
 ## Not ported yet (by Rust module)
 

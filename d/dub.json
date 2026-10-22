@@ -10,6 +10,10 @@
   "libs-linux": [
     "z"
   ],
+  "lflags-osx": [
+    "-exported_symbol",
+    "_main"
+  ],
   "buildTypes": {
     "release": {
       "buildOptions": [
