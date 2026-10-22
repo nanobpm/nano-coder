@@ -28,6 +28,12 @@ dub build -b release   # ./nano-coder-d
 dub test               # unit tests
 ```
 
+All code is `@safe`: every module starts with `@safe:`, and calls the
+compiler can't check are wrapped in small `@trusted` functions (shared ones
+live in `source/nano/safeio.d`). `scripts/check-safe.sh` runs before every
+`dub build` and `dub test` and fails the build on a module without `@safe:`,
+a `@system:`/`@trusted:` label, or `@system` outside `extern (C)`.
+
 ## Status
 
 - `PORTING.md` maps every Rust module to its D counterpart and lists the known
