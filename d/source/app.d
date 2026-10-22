@@ -1684,6 +1684,10 @@ int runMain(string[] args)
         banner ~= "Type /help for commands";
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
+    import core.time : MonoTime, msecs;
+    enum exitWindow = 2000.msecs; // Rust's DOUBLE_INTERRUPT_WINDOW
+    MonoTime exitArmedAt;         // first idle Ctrl-C of a pending pair (zero = disarmed)
+    bool quietPrompt;             // redraw the prompt in place (no separating blank line)
     for (;;)
     {
         string line;
@@ -1701,13 +1705,34 @@ int runMain(string[] args)
         else if (editor !is null)
         {
             refreshStatus();
-            write("\n");
+            if (!quietPrompt) write("\n");
+            quietPrompt = false;
             stdout.flush();
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             editor.restyle = () @trusted => console.stamp() ~ console.bold("› ");
-            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ console.bold("› "));
+            // While the Ctrl-C exit hint is armed, end the read when the window
+            // lapses so the stale hint is cleared (Rust's DoublePress deadline).
+            bool delegate() @safe lapse = null;
+            if (exitArmedAt != MonoTime.zero)
+                lapse = () @safe => MonoTime.currTime - exitArmedAt > exitWindow;
+            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ console.bold("› "), false, lapse);
             editor.restyle = null;
             if (r.outcome == Outcome.eof) break;
+            if (r.outcome == Outcome.stopped)
+            {
+                exitArmedAt = MonoTime.zero; // window lapsed: drop the hint, re-arm on the next press
+                quietPrompt = true;
+                continue;
+            }
+            if (r.outcome == Outcome.interrupt)
+            {
+                auto now = MonoTime.currTime;
+                if (exitArmedAt != MonoTime.zero && now - exitArmedAt <= exitWindow) break;
+                exitArmedAt = now;
+                editor.hint = console.dim("(Ctrl-C again to exit)");
+                quietPrompt = true;
+                continue;
+            }
             if (r.outcome != Outcome.line) continue;
             line = r.text;
             if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /

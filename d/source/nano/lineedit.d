@@ -494,6 +494,9 @@ final class LineEditor
     private size_t drawnRow;
     private bool drawn;
     private string prompt, styledPrompt, notice;
+    /// A dim hint shown under the next prompt until a key is pressed
+    /// (e.g. "(Ctrl-C again to exit)"); consumed by the next read.
+    string hint;
     private size_t promptW;
     private ubyte[] utf8;
     private int pushback = -1;
@@ -569,7 +572,8 @@ final class LineEditor
         this.prompt = prompt;
         this.styledPrompt = styledPrompt;
         promptW = textWidth(prompt);
-        notice = null;
+        notice = hint;
+        hint = null;
         if (!turn || state.buf.length || frameDraw !is null) render();
         for (;;)
         {
