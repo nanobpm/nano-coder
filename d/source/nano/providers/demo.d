@@ -3,6 +3,8 @@
 /// model endpoint. (Unit tests script replies with `MockClient` instead.)
 module nano.providers.demo;
 
+@safe:
+
 import nano.llm;
 import std.format : format;
 import std.json;

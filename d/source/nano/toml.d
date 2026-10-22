@@ -4,6 +4,8 @@
 /// Values are returned as a std.json tree. Dates are read as strings.
 module nano.toml;
 
+@safe:
+
 import std.json;
 import std.conv : to;
 import std.array : appender;
@@ -95,12 +97,10 @@ private struct Parser
                 endOfLine();
                 if (arrayTable)
                 {
-                    auto parent = tableAt(root, path[0 .. $ - 1]);
                     auto k = path[$ - 1];
-                    if (k !in parent.object) parent.object[k] = JSONValue(JSONValue[].init);
-                    if (parent.object[k].type != JSONType.array) fail("not an array of tables: " ~ k);
-                    parent.object[k].array ~= JSONValue(string[string].init);
-                    current = path ~ "\0" ~ (parent.object[k].array.length - 1).to!string;
+                    auto at = appendTable(tableAt(root, path[0 .. $ - 1]), k);
+                    if (at < 0) fail("not an array of tables: " ~ k);
+                    current = path ~ "\0" ~ at.to!string;
                 }
                 else
                 {
@@ -115,17 +115,52 @@ private struct Parser
             i++;
             skipWs();
             auto v = value();
-            auto t = tableAt(root, current ~ path[0 .. $ - 1]);
-            if (path[$ - 1] in t.object) fail("duplicate key " ~ path[$ - 1]);
-            t.object[path[$ - 1]] = v;
+            if (!putNew(tableAt(root, current ~ path[0 .. $ - 1]), path[$ - 1], v)) fail("duplicate key " ~ path[$ - 1]);
             endOfLine();
         }
         return root;
     }
 
+    // The tree under construction is walked with pointers to its tables (the
+    // values of GC-allocated maps and arrays, or the caller's root). Each
+    // pointer is used at once and dropped before anything that could move the
+    // value it points at, so it never dangles.
+
+    /// Append an empty table to the array of tables `parent[k]` (created if
+    /// missing); its index, or -1 when `parent[k]` is not an array.
+    static ptrdiff_t appendTable(JSONValue* parent, string k) @trusted
+    {
+        if (k !in parent.object) parent.object[k] = JSONValue(JSONValue[].init);
+        auto a = &parent.object[k];
+        if (a.type != JSONType.array) return -1;
+        a.array ~= JSONValue(string[string].init);
+        return a.array.length - 1;
+    }
+
+    /// Set `t[k] = v` unless `k` is already there (false).
+    static bool putNew(JSONValue* t, string k, JSONValue v) @trusted
+    {
+        if (k in t.object) return false;
+        t.object[k] = v;
+        return true;
+    }
+
     /// The table at `path`, created on demand. A "\0" segment followed by an
     /// index selects an element of an array of tables.
-    JSONValue* tableAt(ref JSONValue root, string[] path)
+    /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
+    /// the intermediate tables.
+    static void setDotted(ref JSONValue t, string[] path, JSONValue v) @trusted
+    {
+        JSONValue* cur = &t;
+        foreach (k; path[0 .. $ - 1])
+        {
+            if (k !in cur.object) cur.object[k] = JSONValue(string[string].init);
+            cur = &cur.object[k];
+        }
+        cur.object[path[$ - 1]] = v;
+    }
+
+    JSONValue* tableAt(ref JSONValue root, string[] path) @trusted
     {
         JSONValue* t = &root;
         for (size_t k = 0; k < path.length; k++)
@@ -249,13 +284,7 @@ private struct Parser
             i++;
             skipWs();
             auto v = value();
-            JSONValue* cur = &t;
-            foreach (k; path[0 .. $ - 1])
-            {
-                if (k !in cur.object) cur.object[k] = JSONValue(string[string].init);
-                cur = &cur.object[k];
-            }
-            cur.object[path[$ - 1]] = v;
+            setDotted(t, path, v);
             skipWs();
             if (peek == ',') { i++; continue; }
             if (peek == '}') { i++; break; }
@@ -398,7 +427,7 @@ line"""
     assert(doc["auto_compact"].boolean);
     assert(doc["threshold"].floating == 0.8);
     assert(doc["max_tokens"].integer == 16384);
-    assert(doc["tags"].array.length == 2 && doc["tags"][1].str == "b");
+    assert(doc["tags"].arrayNoRef.length == 2 && doc["tags"][1].str == "b");
     assert(doc["providers"]["macbook"]["kind"].str == "openai");
     assert(doc["providers"]["macbook"]["headers"]["X-Title"].str == "nano");
     assert(doc["providers"]["quoted.name"]["base_url"].str == "multi\nline");
@@ -407,7 +436,7 @@ line"""
 unittest
 {
     auto doc = parseToml("[[rules]]\nname = \"a\"\n[[rules]]\nname = \"b\"\n");
-    assert(doc["rules"].array.length == 2 && doc["rules"][1]["name"].str == "b");
+    assert(doc["rules"].arrayNoRef.length == 2 && doc["rules"][1]["name"].str == "b");
     bool threw;
     try parseToml("x = 1\nx = 2\n"); catch (TomlException) threw = true;
     assert(threw);

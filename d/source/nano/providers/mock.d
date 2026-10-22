@@ -2,6 +2,8 @@
 /// every request it was given.
 module nano.providers.mock;
 
+@safe:
+
 import nano.llm;
 
 class MockClient : LLMClient
@@ -16,7 +18,8 @@ class MockClient : LLMClient
     LLMResponse chat(const ref ChatRequest req, StreamSink sink)
     {
         Message[] copy;
-        foreach (m; req.messages) copy ~= cast(Message) m;
+        // The recorded copies are only read back by tests.
+        foreach (m; req.messages) copy ~= () @trusted { return cast(Message) m; }();
         seen ~= copy;
         string[] names;
         foreach (ref t; req.tools) names ~= t.name;

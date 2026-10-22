@@ -2,6 +2,10 @@
 /// project instructions (AGENTS.md and friends).
 module nano.session;
 
+@safe:
+
+import nano.safeio : readBytes;
+
 import std.json;
 import std.format : format;
 import std.file;
@@ -73,7 +77,7 @@ JSONValue messageRecord(const ref Message m)
 {
     JSONValue j = ["role": roleName(m.role), "content": m.content];
     if (m.extra.type == JSONType.object)
-        foreach (k, v; m.extra.object) j[k] = v;
+        foreach (k, v; m.extra.objectNoRef) j[k] = v;
     if (m.toolCalls.length)
     {
         JSONValue[] calls;
@@ -124,14 +128,14 @@ Message messageFromRecord(JSONValue j)
     if (r < 0) throw new Exception("unknown role " ~ j["role"].str);
     m.role = cast(Role) r;
     JSONValue extra = string[string].init;
-    foreach (k, v; j.object)
+    foreach (k, v; j.objectNoRef)
     {
         switch (k)
         {
         case "role": break;
         case "content": m.content = v.type == JSONType.string ? v.str : ""; break;
         case "tool_calls":
-            foreach (c; v.array)
+            foreach (c; v.arrayNoRef)
             {
                 auto args = c["arguments"];
                 auto mal = "malformed_arguments" in c;
@@ -145,7 +149,7 @@ Message messageFromRecord(JSONValue j)
             break;
         case "attachments":
             if (v.type == JSONType.array)
-                foreach (a; v.array)
+                foreach (a; v.arrayNoRef)
                     if (a.type == JSONType.object) m.attachments ~= Attachment.fromJSON(a);
             break;
         case "tool_call_id": m.toolCallId = v.str; break;
@@ -154,7 +158,7 @@ Message messageFromRecord(JSONValue j)
         case "timestamp": m.timestamp = v.str; break;
         case "thinking": m.thinking = v.str; break;
         case "thinking_blocks":
-            if (v.type == JSONType.array) m.thinkingBlocks = v.array.dup;
+            if (v.type == JSONType.array) m.thinkingBlocks = v.arrayNoRef.dup;
             break;
         case "usage":
             m.hasUsage = true;
@@ -167,7 +171,7 @@ Message messageFromRecord(JSONValue j)
         default: extra[k] = v;
         }
     }
-    if (extra.object.length) m.extra = extra;
+    if (extra.objectNoRef.length) m.extra = extra;
     return m;
 }
 
@@ -210,7 +214,7 @@ class SessionLog
         path = existingPath;
         id = existingPath.baseName.stripExtension;
         validateId(id);
-        auto bytes = cast(ubyte[]) read(path);
+        auto bytes = readBytes(path);
         size_t committed = bytes.length;
         while (committed && bytes[committed - 1] != '\n') committed--;
         if (committed < bytes.length)
@@ -375,7 +379,7 @@ Restored restore(string path)
             break;
         case "replace":
             r.conversation = null;
-            foreach (m; data["messages"].array) r.conversation ~= messageFromRecord(m);
+            foreach (m; data["messages"].arrayNoRef) r.conversation ~= messageFromRecord(m);
             {
                 auto mode = "mode" in data;
                 r.historyAvailable = mode !is null && mode.type == JSONType.string && mode.str == "smart";

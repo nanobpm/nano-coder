@@ -2,6 +2,10 @@
 /// flags of the Rust CLI that this port implements.
 module app;
 
+@safe:
+
+import nano.safeio : exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
+
 import std.stdio;
 import std.json;
 import std.format : format;
@@ -56,7 +60,7 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
---acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdout.
+--acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
 
@@ -108,8 +112,8 @@ Options parseArgs(string[] args)
                 else if (i + 1 < args.length && !args[i + 1].startsWith("-")) o.resume = args[++i];
                 else o.resume = "";
                 break;
-            case "--version", "-V": writeln(versionString); exit(0);
-            case "--help", "-h": writeln(usage); exit(0);
+            case "--version", "-V": writeln(versionString); exitProcess(0);
+            case "--help", "-h": writeln(usage); exitProcess(0);
             default: die("unknown argument " ~ a ~ "\n\n" ~ usage);
         }
     }
@@ -131,7 +135,7 @@ int runLogin(string provider)
     import core.thread : Thread;
     import core.time : seconds;
     import std.functional : toDelegate;
-    void delegate(string) @safe note = toDelegate((string s) @trusted { stderr.writeln(s); });
+    void delegate(string) @safe note = toDelegate((string s) @trusted { stdErr.writeln(s); });
     void delegate(long) @safe sleep = toDelegate((long n) @trusted { Thread.sleep(n.seconds); });
     try
     {
@@ -199,22 +203,38 @@ void showTrajectory(const ref imported!"nano.trajectory".Trajectory t)
 
 noreturn die(string msg)
 {
-    stderr.writeln("nano-coder-d: ", msg);
-    exit(2);
+    stdErr.writeln("nano-coder-d: ", msg);
+    exitProcess(2);
 }
 
 bool isTerminal(int fd)
 {
     import core.sys.posix.unistd : isatty;
     import nano.lineedit : ttyOut;
-    if (fd == 1 || fd == 2) if (gFrame !is null) fd = ttyOut;
+    // `ttyOut` is set by the main thread when the frame renderer starts.
+    if (fd == 1 || fd == 2) if (gFrame !is null) fd = () @trusted { return ttyOut; }();
     return isatty(fd) != 0;
 }
 
 /// Renders agent events on the terminal.
 // Ctrl-C handling: cancel the running turn, or exit when idle.
-__gshared TurnControl gControl;
+__gshared TurnControl gControl_;
+/// `gControl_` through @safe code: the reference is written once at startup (or
+/// by the main thread) and read by the others; the object locks itself.
+@property TurnControl gControl() @trusted nothrow @nogc { return gControl_; }
+/// ditto
+@property void gControl(TurnControl v) @trusted nothrow @nogc { gControl_ = v; }
 shared bool gTurnRunning;
+
+/// Route SIGINT to `onInterrupt`.
+void installSigint() @trusted
+{
+    import core.sys.posix.signal : sigaction, sigaction_t, SIGINT, sigemptyset;
+    sigaction_t sa;
+    sa.sa_handler = &onInterrupt;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, null);
+}
 
 extern (C) void onInterrupt(int) nothrow @nogc @system
 {
@@ -246,7 +266,7 @@ final class Inbox
         scope (exit) lock.unlock();
         if (line is null) eof = true;
         else lines = front ? line ~ lines : lines ~ line;
-        ready.notify();
+        ready.signalOne();
     }
 
     /// The next line, or null at end of input.
@@ -254,7 +274,7 @@ final class Inbox
     {
         lock.lock();
         scope (exit) lock.unlock();
-        while (!lines.length && !eof) ready.wait();
+        while (!lines.length && !eof) ready.waitOn();
         if (!lines.length) return null;
         auto l = lines[0];
         lines = lines[1 .. $];
@@ -273,12 +293,12 @@ final class Inbox
             if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
             {
                 gControl.steer(text);
-                stderr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+                stdErr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
             }
             else
             {
                 if (atomicLoad(gTurnRunning) && text.length)
-                    stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+                    stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
                 put(text);
             }
         }
@@ -303,7 +323,7 @@ string runQueueCommand(MessageQueue queue, string args)
 }
 
 void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions,
-    MessageQueue queue, string delegate(string) midTurn = null)
+    MessageQueue queue, string delegate(string) @safe midTurn = null)
 {
     while (!atomicLoad(*done))
     {
@@ -326,7 +346,7 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 if (!gControl.isCancelled)
                 {
                     gControl.cancel();
-                    stderr.writeln(console.dim("[cancelling...]"));
+                    stdErr.writeln(console.dim("[cancelling...]"));
                 }
                 break;
             case Outcome.line, Outcome.queue:
@@ -335,7 +355,7 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 if (auto qa = queueArgs(text))
                 {
                     // `/queue` only touches the queue, so it runs at once.
-                    stderr.writeln(console.dim(runQueueCommand(queue, qa[0 .. $ - 1])));
+                    stdErr.writeln(console.dim(runQueueCommand(queue, qa[0 .. $ - 1])));
                     break;
                 }
                 if (text.startsWith("/") && unescapePrompt(text) is null)
@@ -348,18 +368,18 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                             break;
                         }
                     held ~= text;
-                    stderr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
+                    stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
                 }
                 else if (r.outcome == Outcome.queue)
                 {
                     auto id = queue.push(text);
-                    stderr.writeln(console.dim(format("↧ queued #%s (%s waiting) — /queue remove %s to drop",
+                    stdErr.writeln(console.dim(format("↧ queued #%s (%s waiting) — /queue remove %s to drop",
                         id, queue.length, id)));
                 }
                 else
                 {
                     gControl.steer(text);
-                    stderr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+                    stdErr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
                 }
                 break;
         }
@@ -414,7 +434,7 @@ final class EditorUi : SettingsUi
 
     string input(string prompt, string initial) { return value(prompt, initial, false); }
     string secret(string prompt) { return value(prompt, "", true); }
-    void say(string line) @trusted { writeln(line); stdout.flush(); }
+    void say(string line) @trusted { writeln(line); stdOut.flush(); }
 
     private string value(string prompt, string initial, bool masked) @trusted
     {
@@ -459,9 +479,19 @@ void setVerbosity(Verbosity v) @trusted { atomicStore(gVerbosity, v); }
 
 // The pinned status line (status.rs), when installed, and what it shows.
 import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
-__gshared StatusLine gStatus;
+__gshared StatusLine gStatus_;
+/// `gStatus_` through @safe code: the reference is written once at startup (or
+/// by the main thread) and read by the others; the object locks itself.
+@property StatusLine gStatus() @trusted nothrow @nogc { return gStatus_; }
+/// ditto
+@property void gStatus(StatusLine v) @trusted nothrow @nogc { gStatus_ = v; }
 /// The frame renderer, when `renderer = "frame"` drives the terminal.
-__gshared FrameUi gFrame;
+__gshared FrameUi gFrame_;
+/// `gFrame_` through @safe code: the reference is written once at startup (or
+/// by the main thread) and read by the others; the object locks itself.
+@property FrameUi gFrame() @trusted nothrow @nogc { return gFrame_; }
+/// ditto
+@property void gFrame(FrameUi v) @trusted nothrow @nogc { gFrame_ = v; }
 
 /// The status bar text for the frame's last line.
 string frameStatus(size_t width) @trusted
@@ -471,9 +501,10 @@ string frameStatus(size_t width) @trusted
     synchronized (gStatsLock) return renderStatus(gStats, width);
 }
 __gshared Stats gStats;
-__gshared Object gStatsLock;
+/// Guards `gStats`. Set once, before any other thread runs.
+immutable Object gStatsLock;
 shared bool gResized;
-shared static this() { gStatsLock = new Object; }
+shared static this() { gStatsLock = new immutable Object; }
 
 /// Change the status line's stats and redraw it (no-op without one).
 void updateStatus(scope void delegate(ref Stats) @safe f) @trusted
@@ -616,7 +647,7 @@ class Console : AgentEvents
             write(collapsedLine());
             midLine = true;
         }
-        stdout.flush();
+        stdOut.flush();
     }
 
     private void finishThinking()
@@ -640,7 +671,7 @@ class Console : AgentEvents
         midLine = false;
         auto t = thinkText.strip;
         if (t.length) lastThinking = sanitizeBlock(t);
-        stdout.flush();
+        stdOut.flush();
     }
 
     /// Ctrl-O. Mid-block it switches the live view; between turns it prints a
@@ -665,7 +696,7 @@ class Console : AgentEvents
                     write("\n" ~ collapsedLine());
                 }
                 midLine = true;
-                stdout.flush();
+                stdOut.flush();
                 return false;
             }
             if (inTurn) return false;
@@ -674,7 +705,7 @@ class Console : AgentEvents
                 : thinkStyle("∴ Last thinking ") ~ dim("(shown in full from now on; ctrl+o to collapse)") ~ "\n"
                     ~ thinkStyle(lastThinking) ~ "\n";
             write("\r\x1b[2K" ~ note);
-            stdout.flush();
+            stdOut.flush();
             return true;
         }
     }
@@ -717,7 +748,7 @@ class Console : AgentEvents
                 answering = true;
             }
             writeAligned(chunk, atomicLoad(gTimestamps) ? stampWidth : 0);
-            stdout.flush();
+            stdOut.flush();
         }
     }
 
@@ -730,7 +761,7 @@ class Console : AgentEvents
             midLine = false;
             answering = false;
             writeln(stampBlock(stamp(), text));
-            stdout.flush();
+            stdOut.flush();
         }
     }
 
@@ -763,7 +794,7 @@ class Console : AgentEvents
         if (quiet || quietTool(call)) return;
         endLine();
         writeln(stamp(), color ? "\x1b[38;5;114m●\x1b[0m " : "● ", bold(call.name), " ", dim(summary(call)));
-        stdout.flush();
+        stdOut.flush();
     }
 
     /// Runs on the agent's thread after each model call and tool (refreshes the live view).
@@ -777,7 +808,7 @@ class Console : AgentEvents
         auto st = stamp();
         auto w = (isTerminal(1) ? terminalWidth() : 80);
         write(stampBlock(st, toolResult(!isError, sanitizeBlock(result), verbose, w > 8 + st.length ? w - 8 - (st.length ? stampWidth : 0) : 1)));
-        stdout.flush();
+        stdOut.flush();
     }
 
     void usage(TokenUsage u)
@@ -1035,7 +1066,12 @@ void watchResize() @trusted
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
-__gshared Agent mainAgent;
+__gshared Agent mainAgent_;
+/// `mainAgent_` through @safe code: the reference is written once at startup (or
+/// by the main thread) and read by the others; the object locks itself.
+@property Agent mainAgent() @trusted nothrow @nogc { return mainAgent_; }
+/// ditto
+@property void mainAgent(Agent v) @trusted nothrow @nogc { mainAgent_ = v; }
 
 int main(string[] args)
 {
@@ -1046,8 +1082,8 @@ int main(string[] args)
         // A title request is still running: druntime teardown would race the
         // thread, so leave without it (Rust likewise drops pending tasks).
         import core.sys.posix.unistd : _exit;
-        stdout.flush();
-        stderr.flush();
+        stdOut.flush();
+        stdErr.flush();
         _exit(rc);
     }
     return rc;
@@ -1153,7 +1189,7 @@ int runMain(string[] args)
     {
         if (!cfg.skills.enabled) return null;
         auto s = Skills.discover(dir, cfg.skills);
-        foreach (w; s.warnings) stderr.writeln("nano-coder-d: skills: ", w);
+        foreach (w; s.warnings) stdErr.writeln("nano-coder-d: skills: ", w);
         return s;
     }
     skills = discoverSkills(cwd);
@@ -1217,10 +1253,10 @@ int runMain(string[] args)
         lo.nanoHooks = cfg.hooks;
         lo.sandbox = cfg.sandbox;
         auto m = HookManager.load(lo, dir);
-        if (auto notice = m.startupNotice) stderr.writeln(notice);
+        if (auto notice = m.startupNotice) stdErr.writeln(notice);
         foreach (sk; m.skipped)
             if (!sk.source.isProject)
-                stderr.writefln("hooks: skipped %s (%s): %s", listingField(sk.eventName), sk.source.label, listingField(sk.reason));
+                stdErr.writefln("hooks: skipped %s (%s): %s", listingField(sk.eventName), sk.source.label, listingField(sk.reason));
         return m;
     }
     agent.maxIterations = cfg.maxIterations;
@@ -1236,7 +1272,7 @@ int runMain(string[] args)
     bool compactingByHand;
     agent.onCompacted = (ref const CompactReport r) {
         // Manual compactions are reported by /compact itself.
-        if (!compactingByHand) stderr.writeln("[agent] auto-", r.toString);
+        if (!compactingByHand) stdErr.writeln("[agent] auto-", r.toString);
     };
     agent.temperature = cfg.temperature;
     agent.globalThinking = cfg.thinking;
@@ -1245,7 +1281,7 @@ int runMain(string[] args)
     agent.providerLookup = (string name) => name in cfg.providers;
     agent.refreshCapabilities();
     // A configured temperature or thinking level that is adjusted or ignored.
-    if (!o.acp && !o.prompt.length) foreach (w; settingWarnings(agent)) stderr.writeln("Warning: ", w);
+    if (!o.acp && !o.prompt.length) foreach (w; settingWarnings(agent)) stdErr.writeln("Warning: ", w);
 
     if (o.acp)
     {
@@ -1277,7 +1313,7 @@ int runMain(string[] args)
         auto server = new AcpServer(agent, host);
         if (!server.serveStdio())
         {
-            stderr.writeln("nano-coder-d: no ACP JSON-RPC request received on stdin");
+            stdErr.writeln("nano-coder-d: no ACP JSON-RPC request received on stdin");
             return 1;
         }
         return 0;
@@ -1297,11 +1333,11 @@ int runMain(string[] args)
         if (restored.plan.type == JSONType.object)
         {
             try agent.plan = Plan.fromJSON(restored.plan);
-            catch (Exception e) stderr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
+            catch (Exception e) stdErr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
         }
-        stderr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
+        stdErr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
         if (restored.pendingInput.length)
-            stderr.writefln("the last prompt never finished (the session was interrupted): %s",
+            stdErr.writefln("the last prompt never finished (the session was interrupted): %s",
                 oneLine(restored.pendingInput));
     }
 
@@ -1331,17 +1367,11 @@ int runMain(string[] args)
         auto st = console.stamp();
         write(stampBlock(st, checklist(agent.plan, (isTerminal(1) ? terminalWidth() : 80) - 4 - (st.length ? stampWidth : 0),
             console.color)));
-        stdout.flush();
+        stdOut.flush();
     };
 
     gControl = agent.control;
-    {
-        import core.sys.posix.signal : sigaction, sigaction_t, SIGINT, sigemptyset;
-        sigaction_t sa;
-        sa.sa_handler = &onInterrupt;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGINT, &sa, null);
-    }
+    installSigint();
     Inbox inbox;
     LineEditor editor;
     string[] held; // lines to run before reading the prompt again
@@ -1510,7 +1540,9 @@ int runMain(string[] args)
         sysPlan = plan;
     }
 
-    SettingsHost settingsHost()
+    // @trusted: `h.cfg` points at runMain's `cfg`, which outlives every
+    // settings dialog (they all run inside runMain).
+    SettingsHost settingsHost() @trusted
     {
         SettingsHost h;
         h.cfg = &cfg;
@@ -1532,7 +1564,7 @@ int runMain(string[] args)
         return h;
     }
 
-    bool turn(string input)
+    bool turn(string input) @safe
     {
         syncMode();
         atomicStore(gTurnRunning, true);
@@ -1551,17 +1583,17 @@ int runMain(string[] args)
         if (editor !is null)
         {
             if (verbosity >= Verbosity.verbose)
-                stderr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
+                stdErr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
             keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions, queue, &midTurn));
-            keys.start();
+            keys.startThread();
         }
         scope (exit)
             if (keys !is null)
             {
                 atomicStore(turnDone, true);
-                keys.join();
+                keys.joinThread();
             }
         console.finalAnswer = null;
         console.droppedAnswer = false;
@@ -1569,7 +1601,7 @@ int runMain(string[] args)
         catch (Exception e)
         {
             console.endLine();
-            stderr.writeln(console.red("error: " ~ e.msg));
+            stdErr.writeln(console.red("error: " ~ e.msg));
             ok = false;
         }
         console.endLine();
@@ -1578,7 +1610,7 @@ int runMain(string[] args)
         if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
         {
             writeln(console.finalAnswer);
-            stdout.flush();
+            stdOut.flush();
         }
         // Steers that arrived after the agent's last step run as the next prompts.
         auto late = agent.control.takePending;
@@ -1643,7 +1675,7 @@ int runMain(string[] args)
             // The frame's redraws cleared the scrollback: replay its transcript.
             write("\x1b[H\x1b[2J\x1b[3J");
             foreach (l; lines) writeln(l);
-            stdout.flush();
+            stdOut.flush();
             gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
             if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
@@ -1662,7 +1694,7 @@ int runMain(string[] args)
         inbox = new Inbox;
         auto reader = new Thread(() => inbox.readLoop(console));
         reader.isDaemon = true;
-        reader.start();
+        reader.startThread();
     }
     if (interactive)
     {
@@ -1707,7 +1739,7 @@ int runMain(string[] args)
             refreshStatus();
             if (!quietPrompt) write("\n");
             quietPrompt = false;
-            stdout.flush();
+            stdOut.flush();
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             editor.restyle = () @trusted => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
@@ -1739,8 +1771,8 @@ int runMain(string[] args)
         }
         else
         {
-            if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdout.flush(); }
-            line = inbox !is null ? inbox.take() : readln();
+            if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
+            line = inbox !is null ? inbox.take() : stdinLine();
         }
         if (line is null) break;
         bool literal = line.startsWith("\x00");
@@ -1774,7 +1806,7 @@ int runMain(string[] args)
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame !is null) gFrame.clear();
                     else if (gStatus !is null) gStatus.clear();
-                    else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdout.flush(); }
+                    else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdOut.flush(); }
                     refreshStatus();
                     if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
                     else writefln("Session: %s", newSessionId());
@@ -1809,8 +1841,8 @@ int runMain(string[] args)
                     scope (exit) compactingByHand = false;
                     agent.control.startTurn();
                     bool done;
-                    try done = agent.compact(rep, CompactTrigger.manual, hasMode ? &mode : null, focus);
-                    catch (Exception e) { stderr.writeln(console.red("error: " ~ e.msg)); continue; }
+                    try done = agent.compact(rep, CompactTrigger.manual, hasMode ? new CompactionMode(mode) : null, focus);
+                    catch (Exception e) { stdErr.writeln(console.red("error: " ~ e.msg)); continue; }
                     writeln(done ? "Conversation " ~ rep.toString : "Nothing to compact");
                     continue;
                 }
@@ -1943,7 +1975,7 @@ int runMain(string[] args)
                         }
                         writefln("store: %s (remove one with /memory forget <id>)", memory.root);
                     }
-                    catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
+                    catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 case "/settings":
                     if (editor is null) { writeln("/settings needs an interactive terminal"); continue; }
@@ -1961,16 +1993,16 @@ int runMain(string[] args)
                         if (auto picked = pickModel(new EditorUi(editor), h))
                         {
                             try writeln(switchModel(picked));
-                            catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
+                            catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                         }
                         continue;
                     }
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }
                     try writeln(switchModel(arg));
-                    catch (Exception e) stderr.writeln(console.red("error: " ~ e.msg));
+                    catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                     continue;
                 default:
-                    stderr.writeln("unknown command ", cmd, " (/help)");
+                    stdErr.writeln("unknown command ", cmd, " (/help)");
                     continue;
             }
         }

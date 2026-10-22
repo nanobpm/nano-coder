@@ -8,6 +8,10 @@
 /// tool call (fail-safe) rather than silently letting it through.
 module nano.claude_hooks;
 
+@safe:
+
+import nano.safeio : ignoreSigpipe, killGroup, pollFds, readFd, setNonBlocking, writeFd;
+
 import std.json;
 import std.algorithm : canFind, any, map, sort, uniq;
 import std.array : array, join, replace;
@@ -273,7 +277,7 @@ class HookManager
 
     private void ingestGroups(JSONValue groups, Source source)
     {
-        foreach (eventName; groups.object.keys.sort.release)
+        foreach (eventName; groups.objectNoRef.keys.sort.release)
         {
             auto list = groups[eventName];
             Event event;
@@ -283,13 +287,13 @@ class HookManager
                 skipped ~= Skipped(eventName, "expected a list of matcher groups", source);
                 continue;
             }
-            foreach (group; list.array)
+            foreach (group; list.arrayNoRef)
             {
                 if (group.type != JSONType.object) continue;
                 auto matcher = optString(group, "matcher");
                 auto entries = "hooks" in group;
                 if (entries is null || entries.type != JSONType.array) continue;
-                foreach (entry; entries.array)
+                foreach (entry; entries.arrayNoRef)
                 {
                     if (entry.type != JSONType.object) continue;
                     if (!known)
@@ -329,7 +333,7 @@ class HookManager
                         if (a.type == JSONType.array)
                         {
                             h.hasArgs = true;
-                            foreach (x; a.array) h.args ~= x.type == JSONType.string ? x.str : x.toString;
+                            foreach (x; a.arrayNoRef) h.args ~= x.type == JSONType.string ? x.str : x.toString;
                         }
                     if (auto t = "timeout" in entry)
                     {
@@ -593,9 +597,9 @@ JSONValue applyUpdatedInput(string nanoTool, JSONValue original, JSONValue updat
     if (updated.type != JSONType.object) return original;
     JSONValue r = JSONValue(string[string].init);
     if (original.type == JSONType.object)
-        foreach (k, v; original.object) r[k] = v;
+        foreach (k, v; original.objectNoRef) r[k] = v;
     bool fileTool = nanoTool == "read_file" || nanoTool == "write_file" || nanoTool == "edit_file";
-    foreach (k, v; updated.object) r[fileTool && k == "file_path" ? "path" : k] = v;
+    foreach (k, v; updated.objectNoRef) r[fileTool && k == "file_path" ? "path" : k] = v;
     return r;
 }
 
@@ -667,7 +671,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
     }
 
     // A hook that exits without reading stdin must not kill nano with SIGPIPE.
-    signal(SIGPIPE, SIG_IGN);
+    ignoreSigpipe();
     auto inP = pipe(), outP = pipe(), errP = pipe();
     Config cfg;
     cfg.preExecFunction = () @trusted nothrow @nogc { setsid(); return true; };
@@ -680,7 +684,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
         return r;
     }
     int inFd = inP.writeEnd.fileno, outFd = outP.readEnd.fileno, errFd = errP.readEnd.fileno;
-    foreach (fd; [inFd, outFd, errFd]) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    foreach (fd; [inFd, outFd, errFd]) setNonBlocking(fd);
 
     auto bytes = cast(const(ubyte)[]) input;
     size_t written;
@@ -696,13 +700,14 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
     auto deadline = start + hook.timeout;
     bool exited;
     MonoTime exitedAt;
-    ubyte[8192] chunk;
+    auto chunk = new ubyte[8192];
+    auto fds = new pollfd[3];
 
     void drain(int fd, ref ubyte[] buf, ref bool open)
     {
         for (;;)
         {
-            auto n = read(fd, chunk.ptr, chunk.length);
+            auto n = readFd(fd, chunk);
             if (n > 0)
             {
                 auto room = buf.length < outputCap ? outputCap - buf.length : 0;
@@ -739,7 +744,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
         auto now = MonoTime.currTime;
         if (!exited && now >= deadline)
         {
-            killpg(pid.processID, SIGKILL);
+            killGroup(pid.processID, SIGKILL);
             // Bounded reap; a stuck reap is abandoned.
             auto reapBy = MonoTime.currTime + graceTime;
             while (!tryWait(pid).terminated && MonoTime.currTime < reapBy) {
@@ -755,21 +760,20 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
         auto ioLimit = (deadline > exitedAt ? deadline : exitedAt) + graceTime;
         if (exited && now >= ioLimit)
         {
-            killpg(pid.processID, SIGKILL);
+            killGroup(pid.processID, SIGKILL);
             r.launchError = "hook did not finish its I/O before the deadline; a descendant may still be running";
             break;
         }
-        pollfd[3] fds;
         size_t nfds;
         if (outOpen) fds[nfds++] = pollfd(outFd, POLLIN);
         if (errOpen) fds[nfds++] = pollfd(errFd, POLLIN);
         if (inOpen) fds[nfds++] = pollfd(inFd, POLLOUT);
-        poll(fds.ptr, cast(uint) nfds, 20);
+        pollFds(fds[0 .. nfds], 20);
         if (outOpen) drain(outFd, outBuf, outOpen);
         if (errOpen) drain(errFd, errBuf, errOpen);
         if (inOpen)
         {
-            auto n = write(inFd, bytes.ptr + written, bytes.length - written);
+            auto n = writeFd(inFd, bytes[written .. $]);
             if (n > 0) written += n;
             else if (n < 0 && errno != EAGAIN && errno != EINTR) written = bytes.length; // EPIPE: hook closed stdin
             if (written >= bytes.length)

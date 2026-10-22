@@ -3,6 +3,10 @@
 /// the model never overwrites content it hasn't seen.
 module nano.tools.files;
 
+@safe:
+
+import nano.safeio : ownText, readBytes;
+
 import std.json;
 import std.format : format;
 import std.file;
@@ -57,7 +61,7 @@ string readFile(JSONValue args, ReadState state)
     if (limit < 1) throw new ToolError("read_file: limit must be 1 or more");
     if (!path.exists) throw new ToolError(format("read_file: %s does not exist", path));
     if (path.isDir) throw new ToolError(format("read_file: %s is a directory; use glob or bash ls", path));
-    auto data = cast(ubyte[]) read(path);
+    auto data = readBytes(path);
     import std.path : extension;
     import std.uni : toLower;
     // An image returns its metadata only, as `{"image": {...}}`; the agent
@@ -78,7 +82,7 @@ string readFile(JSONValue args, ReadState state)
     }
     if (looksBinary(data)) throw new ToolError(format("read_file: %s looks like a binary file (%s bytes)", path, data.length));
     import std.utf : validate, UTFException;
-    auto text = cast(string) data;
+    auto text = ownText(data);
     try validate(text);
     catch (UTFException) throw new ToolError(format("read_file: %s is not valid UTF-8 text", path));
     state.record(path, data);

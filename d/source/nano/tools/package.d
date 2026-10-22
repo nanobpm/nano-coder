@@ -1,6 +1,10 @@
 /// Tool registry, shared argument helpers and output truncation.
 module nano.tools;
 
+@safe:
+
+import nano.safeio : ownText;
+
 import std.json;
 import std.format : format;
 import std.algorithm : sort;
@@ -155,7 +159,7 @@ unittest
 {
     auto big = new char[1000];
     big[] = 'x';
-    auto t = truncateOutput(cast(string) big, 100, "test");
+    auto t = truncateOutput(ownText(big), 100, "test");
     import std.string : indexOf;
     assert(t.indexOf("900 characters omitted") > 0);
     assert(truncateOutput("short", 100, "test") == "short");

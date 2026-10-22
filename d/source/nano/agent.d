@@ -2,6 +2,10 @@
 /// calls it asks for (after permission checks), feed results back, repeat.
 module nano.agent;
 
+@safe:
+
+import nano.safeio : stdErr, stdOut;
+
 import std.json;
 import std.format : format;
 import std.string : strip, stripLeft;
@@ -187,7 +191,7 @@ class Agent
             if (auto done = givenId in completedInputs)
             {
                 import std.stdio : stderr;
-                stderr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
+                stdErr.writefln("[agent] input %s already processed; returning recorded response", JSONValue(givenId).toString);
                 auto st = givenId in completedStops;
                 lastStop = st is null ? StopReason.endTurn : (*st).to!StopReason;
                 auto oc = givenId in completedOutcomes;
@@ -415,7 +419,7 @@ class Agent
                         {
                             learnedMaxOutput = cap;
                             import std.stdio : stderr;
-                            stderr.writefln("[agent] output-limit rejection (%s); retrying with max_tokens=%s", e.msg, cap);
+                            stdErr.writefln("[agent] output-limit rejection (%s); retrying with max_tokens=%s", e.msg, cap);
                             continue;
                         }
                     }

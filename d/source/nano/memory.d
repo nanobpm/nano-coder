@@ -13,6 +13,10 @@
 /// lines that don't parse are kept byte for byte.
 module nano.memory;
 
+@safe:
+
+import nano.safeio : chmodPath, fchmodFd, openPath, statMode, writeFd;
+
 import std.algorithm : any, canFind, count, countUntil, filter, map, sort, startsWith, endsWith;
 import std.array : array, join, appender;
 import std.conv : to;
@@ -96,7 +100,7 @@ struct Entry
         try j = parseJSON(text);
         catch (Exception) return false;
         if (j.type != JSONType.object) return false;
-        foreach (k, v; j.object)
+        foreach (k, v; j.objectNoRef)
         {
             switch (k)
             {
@@ -589,7 +593,7 @@ private void createDirAllPrivate(string dir)
         c = up;
     }
     mkdirRecurse(dir);
-    foreach (p; created) chmod(p.toStringz, octal!700);
+    foreach (p; created) chmodPath(p, octal!700);
 }
 
 import std.conv : octal;
@@ -608,17 +612,17 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
     foreach (e; entries) { body_ ~= cast(const(ubyte)[]) e.toJson; body_ ~= cast(ubyte) '\n'; }
     foreach (l; unknown) { body_ ~= l; body_ ~= cast(ubyte) '\n'; }
     auto tmp = format("%s.tmp.%s.%08x", p.setExtension("jsonl"), getpid(), uniform!uint);
-    auto fd = open(tmp.toStringz, O_WRONLY | O_CREAT | O_EXCL, octal!600);
+    auto fd = openPath(tmp, O_WRONLY | O_CREAT | O_EXCL, octal!600);
     if (fd < 0) throw new Exception("creating " ~ tmp);
     bool ok;
     scope (exit) { close(fd); if (!ok) collectRemove(tmp); }
-    stat_t st;
-    if (stat(p.toStringz, &st) == 0 && fchmod(fd, st.st_mode & octal!7777) != 0)
+    uint mode;
+    if (statMode(p, mode) && fchmodFd(fd, mode & octal!7777) != 0)
         throw new Exception("setting permissions on " ~ tmp);
     auto data = body_.data;
     while (data.length)
     {
-        auto n = write(fd, data.ptr, data.length);
+        auto n = writeFd(fd, data);
         if (n <= 0) throw new Exception("writing " ~ tmp);
         data = data[n .. $];
     }
@@ -650,7 +654,7 @@ struct FileLock
         import std.string : toStringz;
         auto lock = scopePath.setExtension("jsonl.lock");
         createDirAllPrivate(lock.dirName);
-        fd = open(lock.toStringz, O_WRONLY | O_CREAT, octal!600);
+        fd = openPath(lock, O_WRONLY | O_CREAT, octal!600);
         if (fd < 0) throw new Exception("opening " ~ lock);
         auto deadline = MonoTime.currTime + 5.seconds;
         for (;;)

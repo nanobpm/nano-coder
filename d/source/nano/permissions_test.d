@@ -2,6 +2,8 @@
 /// `/work/project` unless a test sets up a real directory.
 module nano.permissions_test;
 
+@safe:
+
 version (unittest):
 
 import std.algorithm : canFind;
@@ -55,19 +57,11 @@ string tmpDir(string prefix)
     return buildPath(tempDir, format("%s-%s-%s-%s", prefix, thisProcessID, Clock.currStdTime, atomicOp!"+="(counter, 1)));
 }
 
-string realPath(string p)
-{
-    import core.sys.posix.stdlib : realpath;
-    import core.stdc.stdlib : free;
-    import std.string : toStringz, fromStringz;
-    auto r = realpath(p.toStringz, null);
-    scope (exit) free(r);
-    return r.fromStringz.idup;
-}
+public import nano.safeio : realPath;
 
 void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
 
-@system unittest // static_guard_is_advisory_and_fails_closed_on_uninspectable_input
+unittest // static_guard_is_advisory_and_fails_closed_on_uninspectable_input
 {
     // Defect-CLASS invariant (see SECURITY.md): the static guard is a
     // best-effort ADVISORY layer, not the security boundary. It is NOT
@@ -81,7 +75,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("sh -c \"$(cat payload)\"").canFind("computed at run time"));
 }
 
-@system unittest // readonly_loop_bodies_are_allowed_by_effect
+unittest // readonly_loop_bodies_are_allowed_by_effect
 {
     // Regression from #119: counting tests per file is a read-only
     // inspection even though the value bound to `f` is not tracked.
@@ -121,7 +115,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("for f in *; do PATH=/tmp/evil grep x \"$f\"; done").canFind("assigns `PATH`"));
 }
 
-@system unittest // readonly_loop_closes_review_round2_safety_gaps
+unittest // readonly_loop_closes_review_round2_safety_gaps
 {
     // #1 A command substitution in a loop header or condition runs on the
     // parent shell. The parser emits it before the loop, so it must still be
@@ -173,7 +167,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in input; do sort -- *; done");
 }
 
-@system unittest // readonly_loop_closes_review_round3_safety_gaps
+unittest // readonly_loop_closes_review_round3_safety_gaps
 {
     // #1 A `for`/`select` header rebinds its variable, and a loop body can
     // rebind any name. Command lookup, redirect sinks and `cd` read the
@@ -231,7 +225,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("while read line < \"$(echo input)\"; do cat input; break; done");
 }
 
-@system unittest // readonly_loop_closes_review_round4_safety_gaps
+unittest // readonly_loop_closes_review_round4_safety_gaps
 {
     // #1 A header substitution is itself a command sequence, so a read-only
     // `if` or nested `for` inside it must be classified command-by-command,
@@ -287,7 +281,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in input; do sort -t : -- input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round5_safety_gaps
+unittest // readonly_loop_closes_review_round5_safety_gaps
 {
     // #1 A header substitution is reclassified from its cloned records (flags
     // cleared), not its display text, so a write *redirection* inside a
@@ -341,7 +335,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
             .canFind("loop variable"));
 }
 
-@system unittest // readonly_loop_closes_review_round6_safety_gaps
+unittest // readonly_loop_closes_review_round6_safety_gaps
 {
     // #1 Inside `[[ ... ]]`, `>` and `<` are string-comparison operators, not
     // redirections, so a read-only comparison loop is allowed; a genuine
@@ -371,7 +365,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for p in x; do read -p \"$p\"; cat input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round7_safety_gaps
+unittest // readonly_loop_closes_review_round7_safety_gaps
 {
     // #1 `[[` is conditional syntax only in command position. As an operand
     // it is ordinary text, so `echo [[ > out` really writes `out` — inside
@@ -434,7 +428,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("for f in x; do read -p \"${@}\"; cat input; done").canFind("cannot be inspected"));
 }
 
-@system unittest // readonly_loop_closes_review_round8_safety_gaps
+unittest // readonly_loop_closes_review_round8_safety_gaps
 {
     // #1 `[[` numeric comparisons (`-eq`, `-lt`, …) evaluate their operands
     // as arithmetic, so an operand can assign a shell variable the guard
@@ -485,7 +479,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("until [[ z > m ]]; do echo z; break; done");
 }
 
-@system unittest // readonly_loop_closes_review_round9_safety_gaps
+unittest // readonly_loop_closes_review_round9_safety_gaps
 {
     // #1 An unquoted brace expansion yields one argument per alternative,
     // so a `{...,...}` option value smuggles extra options past the
@@ -514,7 +508,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("until [[ -f a || -f b ]]; do cat a; break; done");
 }
 
-@system unittest // readonly_loop_closes_review_round10_safety_gaps
+unittest // readonly_loop_closes_review_round10_safety_gaps
 {
     // #1 (new thread) The brace scanner must parse quotes, command
     // substitutions and parameter expansions inside `{...}` normally, not
@@ -544,7 +538,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in x; do echo \"${text:0:3}\"; cat input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round11_safety_gaps
+unittest // readonly_loop_closes_review_round11_safety_gaps
 {
     // #1 (new thread) An expanding here-document body is an assignment
     // surface: its parameter expansions run when the heredoc is delivered,
@@ -572,7 +566,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in x; do echo {1..9}; cat input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round12_safety_gaps
+unittest // readonly_loop_closes_review_round12_safety_gaps
 {
     // #1 (previously missed) An indirect parameter expansion `${!ref:=/etc}`
     // assigns the variable `ref` points to, but the parser consumed `!` as
@@ -596,7 +590,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in x; do echo {{a}}; cat input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round13_safety_gaps
+unittest // readonly_loop_closes_review_round13_safety_gaps
 {
     // #1 (previously missed) A positional/array-list expansion nested in a
     // quoted default still expands to one argument per element, so the
@@ -622,7 +616,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in x; do echo -o{ab}; cat input; done");
 }
 
-@system unittest // readonly_loop_closes_review_round14_safety_gaps
+unittest // readonly_loop_closes_review_round14_safety_gaps
 {
     // (previously missed) A positional/array list can hide behind *several*
     // levels of nested scalar defaults. Skipping to the closing brace of an
@@ -644,7 +638,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("for f in x; do sort -T \"${outer:-${#arr[@]}}\" input; done");
 }
 
-@system unittest // blocks_catastrophic_deletes
+unittest // blocks_catastrophic_deletes
 {
     foreach (command; [
         "rm -rf /",
@@ -688,7 +682,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("rm -rf *").canFind("working directory"));
 }
 
-@system unittest // follows_cd_and_assignments_in_the_command
+unittest // follows_cd_and_assignments_in_the_command
 {
     foreach (command; [
         "cd .. && rm -rf project",
@@ -718,7 +712,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     }
 }
 
-@system unittest // workspace_under_a_system_directory
+unittest // workspace_under_a_system_directory
 {
     auto cwd = ("/var/lib/jenkins/workspace/job");
     auto policy = Policy.init;
@@ -729,7 +723,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(run("rm -rf /var/lib/dpkg").isErr);
 }
 
-@system unittest // allows_ordinary_deletes
+unittest // allows_ordinary_deletes
 {
     foreach (command; [
         "rm -rf build target/debug node_modules",
@@ -751,7 +745,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     }
 }
 
-@system unittest // blocks_disk_and_device_writes
+unittest // blocks_disk_and_device_writes
 {
     foreach (command; [
         "mkfs.ext4 /dev/sda1",
@@ -769,7 +763,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("diskutil list");
 }
 
-@system unittest // blocks_destructive_database_commands
+unittest // blocks_destructive_database_commands
 {
     foreach (command; [
         "psql -c 'DROP DATABASE prod'",
@@ -806,7 +800,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("terraform plan");
 }
 
-@system unittest // guards_protected_branches
+unittest // guards_protected_branches
 {
     foreach (command; [
         "git push --force origin main",
@@ -831,7 +825,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("git push origin --delete old-feature");
 }
 
-@system unittest // fails_closed_on_uninspectable_commands
+unittest // fails_closed_on_uninspectable_commands
 {
     assert(blocked("echo 'unterminated").canFind("could not inspect"));
     assert(blocked("bash -c \"$CMD\"").canFind("computed at run time"));
@@ -840,7 +834,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("bash scripts/build.sh");
 }
 
-@system unittest // computed_program_words_do_not_bypass_guards
+unittest // computed_program_words_do_not_bypass_guards
 {
     // A program word computed at run time is not the literal executable the shell runs,
     // so the guard must not treat it as an unknown (allowed) command. A quoted literal
@@ -856,7 +850,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("RM=rm; $RM -rf /").canFind("would affect"));
 }
 
-@system unittest // user_rules_deny_and_allow
+unittest // user_rules_deny_and_allow
 {
     auto p = policy(["Bash(sqlite3 test.db *)", "Bash(rm -rf /tmp/*)"], ["Bash(git push:*)", "Bash(curl *)"]);
     assert(check(p, "git push origin feature").unwrapErr.canFind("git push:*"));
@@ -874,7 +868,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     check(p, "rm -rf /").unwrapOk;
 }
 
-@system unittest // allow_list_still_guards_redirection_only_commands
+unittest // allow_list_still_guards_redirection_only_commands
 {
     // A redirection-only command (empty words) must not be auto-approved by an
     // unrelated allow rule; the builtin device-write guard must still run.
@@ -883,7 +877,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(check(p, "echo hi > /dev/null").isOk);
 }
 
-@system unittest // guards_wrapper_long_options_and_qualified_targets
+unittest // guards_wrapper_long_options_and_qualified_targets
 {
     // Long wrapper options that take a value must not be mistaken for the
     // wrapped program, or the destructive command escapes inspection.
@@ -921,7 +915,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("find ./build -path '*/tmp/*' -delete");
 }
 
-@system unittest // round5_guard_hardening
+unittest // round5_guard_hardening
 {
     // #1 A broad allow rule matches on words only; the device-write guard must
     // still run on a redirect it does not cover.
@@ -945,7 +939,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("chmod \"-R\" 777 /").canFind("filesystem root"));
 }
 
-@system unittest // round6_guard_hardening
+unittest // round6_guard_hardening
 {
     // #1 A device reached through `..` or an unnormalized path must still be
     // caught even though it does not literally start with `/dev/`. `/usr` is a
@@ -977,7 +971,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("find -P . -name '*.log' -delete");
 }
 
-@system unittest // round7_guard_hardening
+unittest // round7_guard_hardening
 {
     // #1 A device write reached through a proven command-local assignment must
     // be caught: the guard substitutes `$D` before judging the target.
@@ -995,7 +989,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(p.checkIn("bash", cmdArgs("find / -name x -delete"), root).isErr);
 }
 
-@system unittest // round8_guard_hardening
+unittest // round8_guard_hardening
 {
     // #2 `>&` is combined output redirection, so it must run the device guard.
     assert(blocked("echo hi >& /dev/sda").canFind("device"));
@@ -1035,7 +1029,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(check(Policy.init, "find .git -name '*' -delete").isErr);
 }
 
-@system unittest // round10_guard_hardening
+unittest // round10_guard_hardening
 {
     // #2 A command substitution in an *unquoted* here-document body is run by
     // the parent shell before the utility starts, so it must be inspected for
@@ -1075,7 +1069,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("echo x > $NANO_UNSET_TARGET").canFind("computed at run time"));
 }
 
-@system unittest // round11_guard_hardening
+unittest // round11_guard_hardening
 {
     // #1 A shell nested under a container wrapper (`docker exec c sh -c '...'`)
     // is unwrapped so its DB client and destructive SQL are inspected.
@@ -1130,7 +1124,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     rmrf(base);
 }
 
-@system unittest // round12_guard_hardening
+unittest // round12_guard_hardening
 {
     // #2 Loops may now run when their bodies are provably read-only, but a
     // destructive body must still fail closed: inspecting `rm -rf "$x"`
@@ -1147,7 +1141,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
 
 }
 
-@system unittest // round13_guard_hardening
+unittest // round13_guard_hardening
 {
     // #1 A container invocation is a separate, unsandboxed process: host bind
     // mounts, `--privileged`, host namespaces, `--device`, `--cap-add` and
@@ -1176,7 +1170,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(blocked("bash <<< 'rm -rf /'").canFind("filesystem root"));
 }
 
-@system unittest // resolve_collapses_parent_after_symlink
+unittest // resolve_collapses_parent_after_symlink
 {
     // #1 A `..` that follows a symlink must be resolved through the link's real
     // target before it is collapsed, or a path can escape its rules. Here
@@ -1195,7 +1189,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(denied);
 }
 
-@system unittest // cd_into_symlink_tracks_physical_base
+unittest // cd_into_symlink_tracks_physical_base
 {
     // #6 `cd link` (with `link -> /etc`) physically moves into the target, so a
     // later relative destructive path operates in `/etc`, not `cwd/link`.
@@ -1213,7 +1207,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(find_blocked);
 }
 
-@system unittest // find_follow_and_mv_symlink_dest_are_resolved
+unittest // find_follow_and_mv_symlink_dest_are_resolved
 {
     // #6/#7 `find -L link ... -delete` and `mv x link` (with `link -> /etc`)
     // dereference the symlink, so the guard must judge the real target.
@@ -1232,7 +1226,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(find_default_ok);
 }
 
-@system unittest // shred_normalizes_device_paths
+unittest // shred_normalizes_device_paths
 {
     // #9 `shred`/`blkdiscard` operands go through the resolving device guard,
     // not a literal `/dev/` prefix test. `/usr` is real on both Linux and macOS
@@ -1242,7 +1236,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     allowed("shred -n 3 -u scratch.txt");
 }
 
-@system unittest // path_rules_follow_symlink_targets
+unittest // path_rules_follow_symlink_targets
 {
     // #1 File tools dereference symlinks, so a link to a protected file must be
     // caught by the rule even though its lexical path does not match.
@@ -1264,7 +1258,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(via_link);
 }
 
-@system unittest // wildcard_parent_follows_symlink_out_of_workspace
+unittest // wildcard_parent_follows_symlink_out_of_workspace
 {
     // #6 `rm -rf link/*` expands through `link`; if it points outside the
     // workspace (here $HOME) the deletion must be blocked, while a wildcard
@@ -1283,7 +1277,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(isAllowed);
 }
 
-@system unittest // trailing_slash_follows_symlink_out_of_workspace
+unittest // trailing_slash_follows_symlink_out_of_workspace
 {
     // #5 A trailing slash makes the shell follow a symlink in the final
     // component, so `rm -rf link/` reaches the link's target (here $HOME) and
@@ -1302,7 +1296,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(isAllowed);
 }
 
-@system unittest // path_rules_and_tool_names
+unittest // path_rules_and_tool_names
 {
     auto p = policy([], ["Edit(**/.env)", "Read(~/.ssh/**)", "web_fetch"]);
     auto cwd = ("/work/project");
@@ -1315,7 +1309,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(validateRule("Bash(rm") !is null);
 }
 
-@system unittest // read_rules_cover_grep_and_glob
+unittest // read_rules_cover_grep_and_glob
 {
     auto cwd = ("/work/project");
     auto p = policy([], ["Read(**/.env)", "Read(~/.ssh/**)"]);
@@ -1338,7 +1332,7 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
     assert(p.checkIn("glob", parseJSON(`{"pattern": "*"}`), cwd).isOk);
 }
 
-@system unittest // read_denied_is_false_without_read_deny_rules
+unittest // read_denied_is_false_without_read_deny_rules
 {
     // With no Read-deny path rule, every discovered entry short-circuits to
     // `false` without touching the filesystem (the hot path for the default
@@ -1351,14 +1345,14 @@ void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
 }
 
 
-@system unittest // builtin_rules_can_be_disabled
+unittest // builtin_rules_can_be_disabled
 {
     Policy p;
     p.builtinRules = false;
     assert(check(p, "rm -rf /").isOk);
 }
 
-@system unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexically-inside paths)
+unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexically-inside paths)
 {
     import nano.sandbox : SandboxConfig, SandboxMode;
     import nano.paths : canonicalize;

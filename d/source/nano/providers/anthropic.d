@@ -1,6 +1,8 @@
 /// Anthropic Messages API.
 module nano.providers.anthropic;
 
+@safe:
+
 import std.json;
 import std.format : format;
 import std.string : stripRight;
@@ -93,8 +95,7 @@ class AnthropicClient : LLMClient
         // Cache the conversation prefix up to the latest message.
         if (msgs.length)
         {
-            auto last = &msgs[$ - 1]["content"].array[$ - 1];
-            last.object["cache_control"] = JSONValue(["type": "ephemeral"]);
+            msgs[$ - 1]["content"].arrayNoRef[$ - 1]["cache_control"] = JSONValue(["type": "ephemeral"]);
         }
         b["messages"] = msgs;
         if (req.tools.length)
@@ -112,7 +113,7 @@ class AnthropicClient : LLMClient
         if (!isNaN(req.temperature)) b["temperature"] = req.temperature < 0 ? 0.0 : req.temperature > 1 ? 1.0 : req.temperature;
         if (stream) b["stream"] = true;
         // Thinking rules out a custom temperature.
-        if (applyAnthropic(req.thinking, b, b["max_tokens"].integer)) b.object.remove("temperature");
+        if (applyAnthropic(req.thinking, b, b["max_tokens"].integer)) b.objectNoRef.remove("temperature");
         p.config.finishBody(b);
         return b;
     }
@@ -128,7 +129,7 @@ class AnthropicClient : LLMClient
     {
         if (msgs.length && msgs[$ - 1]["role"].str == role)
         {
-            msgs[$ - 1]["content"].array ~= block;
+            msgs[$ - 1]["content"] = msgs[$ - 1]["content"].arrayNoRef ~ block;
             return;
         }
         JSONValue m = ["role": role];
@@ -162,7 +163,7 @@ class AnthropicClient : LLMClient
     static LLMResponse parseWhole(JSONValue j)
     {
         LLMResponse r;
-        foreach (block; j["content"].array)
+        foreach (block; j["content"].arrayNoRef)
         {
             auto t = block["type"].str;
             if (t == "text") r.content ~= block["text"].str;
@@ -194,7 +195,7 @@ class AnthropicClient : LLMClient
         auto status = perform(req, text);
         if (status < 200 || status >= 300) throw new ApiError(status, text, p.name ~ " model list");
         string[] ids;
-        foreach (m; parseJSON(text)["data"].array) ids ~= m["id"].str;
+        foreach (m; parseJSON(text)["data"].arrayNoRef) ids ~= m["id"].str;
         return ids;
     }
 }
@@ -311,9 +312,9 @@ unittest
     req.messages = msgs;
     auto b = c.requestBody(req, false);
     assert(b["system"][0]["text"].str == "sys");
-    assert(b["messages"].array.length == 3);
-    assert(b["messages"][1]["content"].array.length == 3);
-    assert(b["messages"][2]["content"].array.length == 2 && b["messages"][2]["content"][1]["is_error"].boolean);
+    assert(b["messages"].arrayNoRef.length == 3);
+    assert(b["messages"][1]["content"].arrayNoRef.length == 3);
+    assert(b["messages"][2]["content"].arrayNoRef.length == 2 && b["messages"][2]["content"][1]["is_error"].boolean);
     assert("cache_control" in b["messages"][2]["content"][1]);
 }
 
@@ -364,7 +365,7 @@ unittest
     ChatRequest req;
     req.messages = [Message.user("q"), reply, Message.toolResult("t1", "glob", "none")];
     auto body_ = new AnthropicClient(p).requestBody(req, false);
-    auto content = body_["messages"][1]["content"].array;
+    auto content = body_["messages"][1]["content"].arrayNoRef;
     assert(content.length == 3 && content[0]["type"].str == "thinking" && content[0]["signature"].str == "sig");
     assert(content[1]["type"].str == "redacted_thinking" && content[2]["type"].str == "tool_use");
 }

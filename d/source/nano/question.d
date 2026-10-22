@@ -7,6 +7,8 @@
 /// the tool returns an error instead.
 module nano.question;
 
+@safe:
+
 import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
 import std.algorithm : canFind, filter, map;

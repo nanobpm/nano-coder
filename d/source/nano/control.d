@@ -10,6 +10,8 @@
 /// polls is process-wide.
 module nano.control;
 
+@safe:
+
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
 

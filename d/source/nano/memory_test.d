@@ -2,6 +2,11 @@
 /// from the Rust assertions by a script, so they match one for one).
 module nano.memory_test;
 
+@safe:
+
+import nano.safeio : ownText, readBytes;
+import std.string : representation;
+
 version (unittest):
 
 import nano.memory;
@@ -48,9 +53,9 @@ unittest // saves_searches_and_forgets_across_scopes
     s.save(Scope.project, "tests run with `cargo test`, not make", "Cargo.toml", null);
     auto out_ = s.search("cargo test", null);
     assert(out_.canFind("project") && out_.canFind("cargo test") && out_.canFind("evidence: Cargo.toml"), out_);
-    auto u = Scope.user, p = Scope.project;
-    assert(s.search("uv", &u).canFind("python comes from uv"));
-    assert(s.search("uv", &p).startsWith("No memories match"));
+    auto u = new Scope(Scope.user), p = new Scope(Scope.project);
+    assert(s.search("uv", u).canFind("python comes from uv"));
+    assert(s.search("uv", p).startsWith("No memories match"));
     assert(s.forget(user.id).canFind("forgot user memory"));
     assert(s.search("uv", null).startsWith("No memories match"));
     assert(fails(s.forget(user.id)));
@@ -233,22 +238,21 @@ unittest // search sanitises evidence and control chars
 
 unittest // file and directory permissions; stale lock file
 {
-    import core.sys.posix.sys.stat : stat_t, stat, chmod;
+    import nano.safeio : chmodPath, statMode;
     import std.conv : octal;
-    import std.string : toStringz;
-    uint mode(string p) { stat_t st; stat(p.toStringz, &st); return st.st_mode & octal!777; }
+    uint mode(string p) { uint m; statMode(p, m); return m & octal!777; }
     auto dir = tmp("perms");
     auto root = buildPath(dir, "memory");
     auto s = new Store(root, "github.com/nanobpm/nano-coder", 0);
     auto e = s.save(Scope.project, "dir privacy fact", null, null);
     assert(mode(s.path(Scope.project)) == octal!600);
     assert(mode(root) == octal!700 && mode(buildPath(root, "projects")) == octal!700);
-    chmod(s.path(Scope.project).toStringz, octal!640);
+    chmodPath(s.path(Scope.project), octal!640);
     writeAll(s.path(Scope.project), [e], null);
     assert(mode(s.path(Scope.project)) == octal!640, "rewrite keeps the target's mode");
     auto dir2 = buildPath(tmp("perms2"), "memory");
     mkdirRecurse(dir2);
-    chmod(dir2.toStringz, octal!755);
+    chmodPath(dir2, octal!755);
     new Store(dir2, null, 0).save(Scope.user, "preserve dir perms", null, null);
     assert(mode(dir2) == octal!755);
     auto path = s.path(Scope.user);
@@ -315,14 +319,14 @@ unittest // preserves unknown, malformed UTF-8 and extra-field records
     auto path = s.path(Scope.user);
     auto now = stamp(Clock.currTime);
     auto torn = cast(immutable(ubyte)[]) "{\"id\":\"torn\",\"text\":\"bad \xF0\x9F bytes\"}";
-    auto raw = cast(ubyte[]) read(path) ~ cast(ubyte[]) "not even json\n{\"unknown_future_field\":true}\n" ~ torn ~ cast(ubyte) '\n'
-        ~ cast(ubyte[]) ("{\"id\":\"fut1\",\"text\":\"future fact\",\"created\":\"" ~ now ~ "\",\"last_used\":\"" ~ now ~ "\",\"future_field\":42}\n");
+    auto raw = readBytes(path) ~ "not even json\n{\"unknown_future_field\":true}\n".representation ~ torn ~ cast(ubyte) '\n'
+        ~ ("{\"id\":\"fut1\",\"text\":\"future fact\",\"created\":\"" ~ now ~ "\",\"last_used\":\"" ~ now ~ "\",\"future_field\":42}\n").representation;
     std.file.write(path, raw);
     s.save(Scope.user, "another fact", null, null);
-    auto after = cast(ubyte[]) read(path);
+    auto after = readBytes(path);
     import std.algorithm : find;
     assert(!find(after, torn).length == false, "malformed UTF-8 kept byte for byte");
-    auto text = cast(string) after;
+    auto text = ownText(after);
     assert(text.canFind("not even json") && text.canFind("unknown_future_field") && text.canFind("future_field"));
     string[] ids;
     foreach (x; s.all()) ids ~= x.e.id;
@@ -338,8 +342,8 @@ unittest // absurd_expiry_days_errors, project_scope_needs_a_repo_key
     catch (Exception e) assert(e.msg.canFind("expiry_days"));
     auto s2 = new Store(buildPath(tmp("noproj"), "memory"), null, 0);
     assert(fails(s2.save(Scope.project, "x", null, null)));
-    auto p = Scope.project;
-    assert(s2.search("x", &p).startsWith("No memories match"));
+    auto p = new Scope(Scope.project);
+    assert(s2.search("x", p).startsWith("No memories match"));
     s2.save(Scope.user, "a user fact", null, null);
     assert(s2.search("user fact", null).canFind("a user fact"));
 }

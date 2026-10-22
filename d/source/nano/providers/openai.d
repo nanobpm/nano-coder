@@ -3,6 +3,8 @@
 /// token exchange.
 module nano.providers.openai;
 
+@safe:
+
 import std.json;
 import std.format : format;
 import std.string : stripRight, strip, startsWith, endsWith;
@@ -195,7 +197,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
                 if (c.type == JSONType.string && c.str.length) r.thinkingBlocks ~= reasoningBlock(c.str);
         if (auto calls = "tool_calls" in msg)
             if (calls.type == JSONType.array)
-                foreach (c; calls.array)
+                foreach (c; calls.arrayNoRef)
                     r.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["function"]["name"].str, c["function"]["arguments"].str);
         if (auto f = "finish_reason" in choice) if (f.type == JSONType.string) r.stopReason = f.str;
         if (auto u = "usage" in j) readUsage(*u, r.usage);
@@ -321,7 +323,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
         auto status = perform(req, text);
         if (status < 200 || status >= 300) throw new ApiError(status, text, p.name ~ " model list");
         string[] ids;
-        foreach (m; parseJSON(text)["data"].array) ids ~= m["id"].str;
+        foreach (m; parseJSON(text)["data"].arrayNoRef) ids ~= m["id"].str;
         ids.sort();
         return ids;
     }
@@ -356,8 +358,8 @@ struct StreamState
         if (auto e = "error" in j) throw new Exception("provider stream error: " ~ e.toString);
         if (auto u = "usage" in j) readUsage(*u, r.usage);
         auto choices = "choices" in j;
-        if (choices is null || choices.type != JSONType.array || choices.array.length == 0) return;
-        auto c = choices.array[0];
+        if (choices is null || choices.type != JSONType.array || choices.arrayNoRef.length == 0) return;
+        auto c = choices.arrayNoRef[0];
         if (auto f = "finish_reason" in c) if (f.type == JSONType.string) r.stopReason = f.str;
         auto delta = "delta" in c;
         if (delta is null || delta.type != JSONType.object) return;
@@ -375,7 +377,7 @@ struct StreamState
                 think.push(v.str, (bool t, string x) { emit(t, x); });
         if (auto calls = "tool_calls" in *delta)
             if (calls.type == JSONType.array)
-                foreach (tc; calls.array)
+                foreach (tc; calls.arrayNoRef)
                 {
                     size_t idx = "index" in tc ? cast(size_t) tc["index"].integer : order.length;
                     if (idx !in args) { order ~= idx; args[idx] = ""; names[idx] = ""; ids[idx] = ""; }

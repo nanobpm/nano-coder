@@ -17,6 +17,10 @@
 /// A later skill with the same name as an earlier one is ignored.
 module nano.skills;
 
+@safe:
+
+import nano.safeio : listDir, readBytes;
+
 import std.algorithm : all, any, canFind, sort, startsWith, endsWith, filter, map, countUntil;
 import std.array : array, join, split;
 import std.conv : to;
@@ -64,7 +68,7 @@ struct SkillsConfig
     {
         SkillsConfig c;
         if (t.type != JSONType.object) return c;
-        string[] strs(JSONValue v) { return v.array.map!(x => x.str).array; }
+        string[] strs(JSONValue v) { return v.arrayNoRef.map!(x => x.str).array; }
         if (auto v = "enabled" in t) c.enabled = v.boolean;
         if (auto v = "dirs" in t) c.dirs = strs(*v);
         if (auto v = "user_dirs" in t) c.userDirs = strs(*v);
@@ -208,7 +212,7 @@ final class Skills
             auto table = lock[kind];
             if (table.type != JSONType.object) { warnings ~= format("%s: `%s` must be a table", lockFile, kind); continue; }
             // BTreeMap order, as in Rust.
-            auto names = table.object.keys.sort.array;
+            auto names = table.objectNoRef.keys.sort.array;
             foreach (name; names)
             {
                 try loadLocked(name, table[name], kind == "plugins", config, locations);
@@ -241,7 +245,7 @@ final class Skills
         auto skillsRel = pluginSkillsDir(content);
         auto skillsDir = within(checkout, buildPath(content, skillsRel));
         if (skillsDir is null || !skillsDir.isDir) return;
-        auto dirs = dirEntries(skillsDir, SpanMode.shallow, false).map!(e => e.name).array.sort.array;
+        auto dirs = listDir(skillsDir, SpanMode.shallow).map!(e => e.name).array.sort.array;
         foreach (d; dirs)
         {
             auto rp = within(checkout, d);
@@ -295,7 +299,7 @@ final class Skills
         auto file = within(skill.dir, buildPath(skill.dir, skillFile));
         if (file is null || !file.isFile)
             throw new ToolError(format("%s is not a regular file inside the skill directory", buildPath(skill.dir, skillFile)));
-        auto text = lossyUtf8(cast(ubyte[]) read(file));
+        auto text = lossyUtf8(readBytes(file));
         string[2][] fields;
         auto body_ = frontMatter(text, fields);
         auto out_ = format("Skill: %s\nSource: %s\nDirectory: %s\n\n%s", skill.name, skill.source.label, skill.dir,
@@ -370,7 +374,7 @@ private void scan(string root, string dir, size_t depth, ref string[] out_)
     if (depth >= maxScanDepth) return;
     string[] dirs;
     try
-        foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+        foreach (DirEntry e; listDir(dir, SpanMode.shallow))
         {
             if (e.name.baseName.startsWith(".")) continue;
             auto rp = within(root, e.name);
@@ -384,7 +388,7 @@ private void scan(string root, string dir, size_t depth, ref string[] out_)
 private bool readSkill(string dir, string nameOverride, Source source, out Skill sk)
 {
     string text;
-    try text = lossyUtf8(cast(ubyte[]) read(buildPath(dir, skillFile)));
+    try text = lossyUtf8(readBytes(buildPath(dir, skillFile)));
     catch (Exception) return false;
     string[2][] fields;
     auto body_ = frontMatter(text, fields);
@@ -492,7 +496,7 @@ private void listFiles(string root, string dir, size_t depth, ref string[] out_)
     if (depth > maxScanDepth || out_.length > maxListedFiles * 4) return;
     string[] paths;
     try
-        foreach (DirEntry e; dirEntries(dir, SpanMode.shallow, false))
+        foreach (DirEntry e; listDir(dir, SpanMode.shallow))
             if (!e.name.baseName.startsWith(".")) paths ~= e.name;
     catch (FileException) return;
     paths.sort();
@@ -691,7 +695,8 @@ private void git(string dir, string[] args)
         }
         if (MonoTime.currTime > deadline)
         {
-            kill(pid);
+            // std.process.kill is @system only for its Pid class handle.
+            () @trusted { kill(pid); }();
             wait(pid);
             throw new Exception(format("git %s timed out", args.join(" ")));
         }
@@ -826,7 +831,7 @@ unittest // loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
     assert(s.skills[0].source.kind == Source.Kind.lock && s.skills[0].source.commit == sha);
     assert(headIs(buildPath(dir, "cache", storeKey(url, sha)), sha));
     // The workspace is left alone.
-    assert(dirEntries(repo, SpanMode.shallow).array.length == 2);
+    assert(listDir(repo, SpanMode.shallow, true).length == 2);
     // Second run reads the cache; fetching is not needed.
     c.fetch = false;
     assert(Skills.discoverIn(repo, c, locs(dir)).names == ["lint", "triage"]);

@@ -2,6 +2,8 @@
 /// OpenAI Responses API with a minted Meta API key and Muse's client headers.
 module nano.providers.muse;
 
+@safe:
+
 import nano.llm;
 import nano.config;
 import nano.http;

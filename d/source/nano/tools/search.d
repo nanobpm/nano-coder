@@ -3,6 +3,10 @@
 /// and return results sorted by path, capped by `limit`.
 module nano.tools.search;
 
+@safe:
+
+import nano.safeio : listDir, ownText, readBytes;
+
 import std.json;
 import std.format : format;
 import std.file;
@@ -150,7 +154,7 @@ struct Ignores
 }
 
 /// Whether Read-deny rules hide an absolute path (null: nothing is hidden).
-alias Denied = bool delegate(string path);
+alias Denied = bool delegate(string path) @safe;
 
 /// Every regular file under `root` (relative paths, sorted), honouring
 /// .gitignore and leaving out paths `denied` hides.
@@ -164,7 +168,7 @@ string[] walk(string root, Denied denied = null)
         ig.load(root, relDir);
         auto saved = ig.rules.length;
         string[] names;
-        foreach (DirEntry e; dirEntries(relDir.length ? buildPath(root, relDir) : root, SpanMode.shallow, false))
+        foreach (DirEntry e; listDir(relDir.length ? buildPath(root, relDir) : root, SpanMode.shallow))
             names ~= e.name.baseName;
         names.sort();
         foreach (name; names)
@@ -193,7 +197,7 @@ private void readLimit(JSONValue args, out long limit)
 }
 
 /// A filename filter: patterns without `/` match the basename at any depth.
-private bool delegate(string) globFilter(string pattern)
+private bool delegate(string) @safe globFilter(string pattern)
 {
     if (!pattern.length) return (string) => true;
     auto re = regex(globToRegex(pattern));
@@ -228,13 +232,13 @@ string grep(JSONValue args, Denied denied = null)
         if (!filter(rel)) continue;
         auto full = buildPath(base, rel);
         ubyte[] data;
-        try data = cast(ubyte[]) read(full);
+        try data = readBytes(full);
         catch (Exception) continue;
         if (looksBinary(data)) continue;
         auto shown = full.startsWith(cwd ~ "/") ? full[cwd.length + 1 .. $] : full;
         long n;
         size_t lineNo;
-        foreach (line; (cast(string) data).lineSplitter)
+        foreach (line; ownText(data).lineSplitter)
         {
             lineNo++;
             bool hit;

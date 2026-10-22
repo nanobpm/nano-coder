@@ -2,6 +2,10 @@
 /// retries with exponential backoff for transient failures.
 module nano.http;
 
+@safe:
+
+import nano.safeio : stdErr, stdOut;
+
 import std.net.curl : HTTP, CurlException;
 import nano.control : cancelRequested, Cancelled;
 import std.json;
@@ -46,14 +50,17 @@ struct ResponseMeta
     string contentType, retryAfter;
 }
 
-int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) onChunk = null)
+int perform(const ref Request req, out string body_, scope void delegate(const(char)[]) @safe onChunk = null)
 {
     ResponseMeta meta;
     return perform(req, body_, meta, onChunk);
 }
 
+/// `@trusted`: std.net.curl's API is @system throughout. This only hands it
+/// values it reads or copies (the request strings, the payload) and copies
+/// every buffer it hands back before keeping it.
 int perform(const ref Request req, out string body_, out ResponseMeta meta,
-    scope void delegate(const(char)[]) onChunk = null)
+    scope void delegate(const(char)[]) @safe onChunk = null) @trusted
 {
     auto http = HTTP(req.url);
     http.method = req.method == "GET" ? HTTP.Method.get : HTTP.Method.post;
@@ -98,7 +105,7 @@ int perform(const ref Request req, out string body_, out ResponseMeta meta,
 /// is retried. A server that answers a stream request with plain JSON gets
 /// that body returned (parse it whole); an SSE reply returns null.
 string postJson(string url, string[string] headers, JSONValue body_, string what, RetryPolicy policy,
-        const(ushort)[] statuses, long timeoutSecs, scope void delegate(string data) onEvent = null)
+        const(ushort)[] statuses, long timeoutSecs, scope void delegate(string data) @safe onEvent = null)
 {
     import std.random : uniform01;
     import std.datetime.systime : Clock;
@@ -118,8 +125,8 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         int status;
         ResponseMeta meta;
         Exception failure;
-        ErrorInfo info;
-        bool haveInfo;
+        // The failed request's error details (in a GC-owned ApiError), if any.
+        const(ErrorInfo)* info;
         try
         {
             status = perform(req, text, meta, onEvent is null ? null : (const(char)[] chunk) {
@@ -153,26 +160,24 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
                 try j = parseJSON(text);
                 catch (Exception) throw new Exception(format("%s: invalid JSON response: %s", what,
                     text.length > 500 ? text[0 .. 500] : text));
-                auto e = j.type == JSONType.object ? "error" in j.object : null;
+                auto e = j.type == JSONType.object ? "error" in j.objectNoRef : null;
                 if (e is null || e.type == JSONType.null_) return text;
                 auto err = new ApiError(status, text, what);
                 if (onEvent !is null || attempt >= policy.maxRetries || !retryableError(err.info, statuses)) throw err;
                 failure = err;
-                info = err.info;
-                haveInfo = true;
+                info = &err.info;
             }
             else
             {
                 auto err = new ApiError(status, text, what);
                 if (attempt >= policy.maxRetries || !retryableError(err.info, statuses)) throw err;
                 failure = err;
-                info = err.info;
-                haveInfo = true;
+                info = &err.info;
             }
         }
-        auto delay = retryDelay(policy, attempt, haveInfo ? &info : null, meta.retryAfter,
+        auto delay = retryDelay(policy, attempt, info, meta.retryAfter,
             Clock.currTime.toUnixTime, uniform01());
-        stderr.writefln("[%s] attempt %s failed: %s; retrying in %.1fs", what, attempt + 1, failure.msg,
+        stdErr.writefln("[%s] attempt %s failed: %s; retrying in %.1fs", what, attempt + 1, failure.msg,
             delay.total!"msecs" / 1000.0);
         pause(delay);
     }
@@ -180,12 +185,12 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
 
 /// `postJson` with a provider's retry policy, retryable statuses and timeout.
 string postProvider(string url, string[string] headers, JSONValue body_, string what,
-        const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) onEvent = null)
+        const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) @safe onEvent = null)
 {
     // Drop the OpenAI-style `[DONE]` terminator for every provider, as the Rust
     // shared SSE layer does: GitHub Copilot's Anthropic Messages endpoint sends
     // it too, and the Messages/Responses parsers would fail to parse it as JSON.
-    void delegate(string) filtered = null;
+    void delegate(string) @safe filtered = null;
     if (onEvent !is null)
         filtered = (string data) { if (!isStreamEnd(data)) onEvent(data); };
     return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, filtered);
@@ -223,7 +228,7 @@ struct SseParser
     private string data;
     private bool hasData;
 
-    void feed(const(char)[] chunk, scope void delegate(string) emit)
+    void feed(const(char)[] chunk, scope void delegate(string) @safe emit)
     {
         pending ~= chunk;
         for (;;)
@@ -248,13 +253,13 @@ struct SseParser
         }
     }
 
-    void finish(scope void delegate(string) emit)
+    void finish(scope void delegate(string) @safe emit)
     {
         if (pending.length) feed("\n", emit);
         dispatch(emit);
     }
 
-    private void dispatch(scope void delegate(string) emit)
+    private void dispatch(scope void delegate(string) @safe emit)
     {
         if (!hasData) return;
         auto d = data;

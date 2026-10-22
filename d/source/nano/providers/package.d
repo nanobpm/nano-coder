@@ -1,6 +1,8 @@
 /// Provider construction.
 module nano.providers;
 
+@safe:
+
 public import nano.providers.openai;
 public import nano.providers.anthropic;
 public import nano.providers.mock;

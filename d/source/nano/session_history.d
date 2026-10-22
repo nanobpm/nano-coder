@@ -3,6 +3,8 @@
 /// (port of `history.rs`). IDs are physical session-log lines.
 module nano.session_history;
 
+@safe:
+
 import std.algorithm : canFind, startsWith, min;
 import std.array : join, split;
 import std.conv : to, ConvException;

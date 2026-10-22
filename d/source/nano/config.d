@@ -3,6 +3,8 @@
 /// built-in provider presets.
 module nano.config;
 
+@safe:
+
 import nano.skills : SkillsConfig;
 import nano.memory : MemoryMode, parseMemoryMode, defaultExpiryDays;
 
@@ -47,7 +49,7 @@ struct ModelSettings
 string[] strings(JSONValue v)
 {
     string[] o;
-    foreach (x; v.array) o ~= x.str;
+    foreach (x; v.arrayNoRef) o ~= x.str;
     return o;
 }
 
@@ -149,9 +151,9 @@ struct ProviderConfig
         if (auto v = "api_key_env" in o) { apiKeyEnv = v.str; apiKeyEnvSet = true; }
         if (auto v = "api_key_command" in o) apiKeyCommand = v.str;
         if (auto v = "default_model" in o) defaultModel = v.str;
-        if (auto v = "headers" in o) foreach (k, h; v.object) headers[k] = h.str;
+        if (auto v = "headers" in o) foreach (k, h; v.objectNoRef) headers[k] = h.str;
         if (auto v = "extra_body" in o) extraBody = *v;
-        if (auto v = "drop_params" in o) { dropParams = null; foreach (p; v.array) dropParams ~= p.str; }
+        if (auto v = "drop_params" in o) { dropParams = null; foreach (p; v.arrayNoRef) dropParams ~= p.str; }
         if (auto v = "max_tokens_param" in o) maxTokensParam = v.str;
         if (auto v = "context_window" in o) contextWindow = v.integer;
         if (auto v = "stream" in o) stream = v.boolean;
@@ -160,7 +162,7 @@ struct ProviderConfig
         if (auto v = "vision" in o) vision = v.boolean;
         if (auto v = "thinking_levels" in o) thinkingLevels = strings(*v), hasThinkingLevels = true;
         if (auto v = "models" in o)
-            foreach (name, m; v.object) models[name] = ModelSettings.fromJSON(m);
+            foreach (name, m; v.objectNoRef) models[name] = ModelSettings.fromJSON(m);
         if (auto v = "timeout_secs" in o) timeoutSecs = v.integer;
         if (auto v = "max_retries" in o) maxRetries = v.integer;
         if (auto v = "retry_initial_backoff_ms" in o) retryInitialBackoffMs = v.integer;
@@ -169,7 +171,7 @@ struct ProviderConfig
         {
             hasRetryableStatuses = true;
             retryableStatuses = null;
-            foreach (st; v.array) retryableStatuses ~= cast(ushort) st.integer;
+            foreach (st; v.arrayNoRef) retryableStatuses ~= cast(ushort) st.integer;
         }
         if (auto v = "replay_reasoning" in o) replayReasoning = v.boolean;
     }
@@ -328,7 +330,7 @@ struct Config
         if (auto v = "reminders" in doc) c.reminders = v.boolean;
         if (auto v = "auto_compact" in doc) c.autoCompact = v.boolean;
         if (auto v = "project_instructions" in doc) c.projectInstructions = v.boolean;
-        static string[] strs(JSONValue v) { string[] o; foreach (x; v.array) o ~= x.str; return o; }
+        static string[] strs(JSONValue v) { string[] o; foreach (x; v.arrayNoRef) o ~= x.str; return o; }
         if (auto v = "project_instruction_files" in doc) c.projectInstructionFiles = strs(*v);
         if (auto v = "user_instruction_files" in doc) c.userInstructionFiles = strs(*v);
         if (auto v = "user_rules_dirs" in doc) c.userRulesDirs = strs(*v);
@@ -350,7 +352,7 @@ struct Config
         if (auto v = "memory_expiry_days" in doc) c.memoryExpiryDays = v.integer;
         if (auto v = "skills" in doc) c.skills = SkillsConfig.fromToml(*v);
         if (auto ps = "providers" in doc)
-            foreach (name, table; ps.object)
+            foreach (name, table; ps.objectNoRef)
             {
                 auto p = name in c.providers ? c.providers[name] : ProviderConfig.init;
                 p.merge(table);
@@ -364,10 +366,10 @@ struct Config
         {
             if (c.defaultProvider == "mock") c.defaultProvider = "openai";
             auto own = "providers" in doc;
-            auto table = own is null ? null : c.defaultProvider in own.object;
+            auto table = own is null ? null : c.defaultProvider in own.objectNoRef;
             auto p = c.defaultProvider in c.providers ? c.providers[c.defaultProvider] : ProviderConfig.init;
-            if (apiKey !is null && (table is null || "api_key" !in table.object)) p.apiKey = apiKey.str;
-            if (baseUrl !is null && (table is null || "base_url" !in table.object)) p.baseUrl = baseUrl.str;
+            if (apiKey !is null && (table is null || "api_key" !in table.objectNoRef)) p.apiKey = apiKey.str;
+            if (baseUrl !is null && (table is null || "base_url" !in table.objectNoRef)) p.baseUrl = baseUrl.str;
             c.providers[c.defaultProvider] = p;
         }
         return c;
@@ -451,7 +453,9 @@ ResolvedProvider resolve(const ref Config c, string spec)
     }
     ResolvedProvider r;
     r.name = name;
-    r.config = cast(ProviderConfig) *pc;
+    // Shallow copy out of the const table. Callers only reassign the arrays
+    // and maps it shares (never write into them), so the table is unchanged.
+    r.config = () @trusted { return cast(ProviderConfig) *pc; }();
     r.model = model.length ? model : pc.defaultModel;
     if (!r.model.length)
         throw new Exception(format("no model given for provider \"%s\" and it has no default_model", name));

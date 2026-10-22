@@ -10,6 +10,8 @@
 /// `.index` is not a valid session id, so it can never hide a real log.
 module nano.session_index;
 
+@safe:
+
 import std.json;
 import std.file;
 import std.path;

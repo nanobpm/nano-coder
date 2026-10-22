@@ -2,6 +2,10 @@
 /// `/resume` and `--list-sessions` (Rust `resume.rs`).
 module nano.resume;
 
+@safe:
+
+import nano.safeio : stdErr, stdOut;
+
 import std.format : format;
 import std.array : join, split, array;
 import std.algorithm : filter, map, sort, min, max;
@@ -396,7 +400,7 @@ private string stripAnsi(string line)
 /// Run `p` on the terminal: draw on `out_`, read keys from `src`, clear the
 /// frame by its rendered height after each key and at the end. The chosen
 /// index, or -1 when cancelled.
-long runPicker(ref Picker p, ByteSource src, void delegate(string) out_, size_t rows, size_t cols, size_t maxVisible)
+long runPicker(ref Picker p, ByteSource src, void delegate(string) @safe out_, size_t rows, size_t cols, size_t maxVisible)
 {
     size_t drawn;
     ubyte[] utf8;
@@ -440,7 +444,7 @@ Pick pickOutcome(string dir, string cwd, string exclude, out string id)
     auto sessions = list(dir).filter!(s => s.id != exclude).array;
     if (!sessions.length)
     {
-        stderr.writeln("No saved sessions to resume.");
+        stdErr.writeln("No saved sessions to resume.");
         return Pick.empty;
     }
     auto now = Clock.currTime;
@@ -477,19 +481,19 @@ void printList(string dir, string cwd, bool all, bool json)
     auto shown = all ? sessions : inDir(sessions, cwd);
     if (json)
     {
-        if (!shown.length) { stdout.writeln("[]"); return; }
+        if (!shown.length) { stdOut.writeln("[]"); return; }
         string o = "[\n";
         foreach (i, ref s; shown) o ~= "  " ~ s.toPrettyJson(2) ~ (i + 1 < shown.length ? ",\n" : "\n");
-        stdout.writeln(o ~ "]");
+        stdOut.writeln(o ~ "]");
         return;
     }
     if (!shown.length)
     {
-        stderr.writefln("No saved sessions%s.", all ? "" : " for " ~ sanitize(cwd) ~ " (--all lists every directory)");
+        stdErr.writefln("No saved sessions%s.", all ? "" : " for " ~ sanitize(cwd) ~ " (--all lists every directory)");
         return;
     }
     auto now = Clock.currTime;
-    foreach (ref s; shown) stdout.writeln(idRow(s, now));
+    foreach (ref s; shown) stdOut.writeln(idRow(s, now));
 }
 
 unittest

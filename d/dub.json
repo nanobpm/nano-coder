@@ -25,5 +25,8 @@
   },
   "dflags-ldc": [
     "-allinst"
+  ],
+  "preBuildCommands": [
+    "$PACKAGE_DIR/scripts/check-safe.sh"
   ]
 }

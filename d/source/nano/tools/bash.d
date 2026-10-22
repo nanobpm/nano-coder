@@ -2,6 +2,10 @@
 /// with a timeout and head/tail output truncation.
 module nano.tools.bash;
 
+@safe:
+
+import nano.safeio : killPid;
+
 import std.json;
 import std.format : format;
 import std.process;
@@ -89,7 +93,7 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
         if (cancelled || MonoTime.currTime >= deadline)
         {
             import core.sys.posix.signal : kill, SIGKILL;
-            kill(-pid.processID, SIGKILL);
+            killPid(-pid.processID, SIGKILL);
             r.exitCode = wait(pid);
             r.cancelled = cancelled;
             r.timedOut = !cancelled;

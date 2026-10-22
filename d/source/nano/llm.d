@@ -1,6 +1,8 @@
 /// Provider-neutral conversation types and the client interface.
 module nano.llm;
 
+@safe:
+
 import std.json;
 
 enum Role { system, user, assistant, tool }
@@ -140,7 +142,7 @@ struct Message
         m.role = cast(Role) r;
         if (auto c = "content" in j) m.content = c.type == JSONType.string ? c.str : "";
         if (auto calls = "tool_calls" in j)
-            foreach (c; calls.array)
+            foreach (c; calls.arrayNoRef)
                 m.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["name"].str, c["arguments"].str);
         if (auto v = "tool_call_id" in j) m.toolCallId = v.str;
         if (auto v = "name" in j) m.toolName = v.str;
@@ -262,7 +264,7 @@ struct AttachmentPlan
 }
 
 /// Receives streamed text: `reasoning` is true for thinking output.
-alias StreamSink = void delegate(bool reasoning, string text);
+alias StreamSink = void delegate(bool reasoning, string text) @safe;
 
 /// What an endpoint reports about the current model.
 struct Capabilities
@@ -303,7 +305,7 @@ struct ThinkSplitter
     private bool inThink;
     private string pending;
 
-    void push(string text, scope void delegate(bool, string) emit)
+    void push(string text, scope void delegate(bool, string) @safe emit)
     {
         import std.string : indexOf;
         pending ~= text;
@@ -328,7 +330,7 @@ struct ThinkSplitter
         }
     }
 
-    void finish(scope void delegate(bool, string) emit)
+    void finish(scope void delegate(bool, string) @safe emit)
     {
         if (pending.length) emit(inThink, pending);
         pending = null;

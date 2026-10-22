@@ -4,6 +4,8 @@
 /// stripped from the URL before it names a file).
 module nano.memsecret;
 
+@safe:
+
 import std.algorithm : all, any, canFind, filter, map, endsWith, startsWith;
 import std.array : array, join, split;
 import std.ascii : isAlphaNum, isAlpha, isDigit, toLower;

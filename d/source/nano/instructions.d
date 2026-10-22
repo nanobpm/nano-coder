@@ -13,6 +13,8 @@
 /// not be able to send `~/.ssh/...` to the model provider.
 module nano.instructions;
 
+@safe:
+
 import std.algorithm : canFind, startsWith, endsWith, countUntil, sort, filter;
 import std.array : array, join, split;
 import std.format : format;

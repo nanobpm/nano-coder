@@ -14,6 +14,10 @@
 /// arrived (or dropped, with a `cancelled` reply, if the turn was cancelled).
 module nano.acp;
 
+@safe:
+
+import nano.safeio : signalOne, startThread, waitOn, stdErr, stdOut;
+
 import std.json;
 import std.format : format;
 import std.string : strip, startsWith, indexOf;
@@ -74,7 +78,7 @@ string promptText(JSONValue params)
     string out_;
     auto p = get(params, "prompt");
     if (p.type == JSONType.array)
-        foreach (item; p.array) if (auto t = getStr(item, "text")) out_ ~= t;
+        foreach (item; p.arrayNoRef) if (auto t = getStr(item, "text")) out_ ~= t;
     return out_;
 }
 
@@ -205,7 +209,7 @@ private final class Inbox
         lock.lock();
         scope (exit) lock.unlock();
         items ~= m;
-        ready.notify();
+        ready.signalOne();
     }
 
     void close()
@@ -213,7 +217,7 @@ private final class Inbox
         lock.lock();
         scope (exit) lock.unlock();
         eof = true;
-        ready.notify();
+        ready.signalOne();
     }
 
     /// The next message; false at end of input.
@@ -221,7 +225,7 @@ private final class Inbox
     {
         lock.lock();
         scope (exit) lock.unlock();
-        while (!items.length && !eof) ready.wait();
+        while (!items.length && !eof) ready.waitOn();
         if (!items.length) return false;
         m = items[0];
         items = items[1 .. $];
@@ -244,16 +248,15 @@ final class AcpServer : AgentEvents
     private bool sawValid;
 
     /// `writeLine` gets one JSON message per call (defaults to stdout).
-    this(Agent agent, Host host, void delegate(string) writeLine = null)
+    this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
     {
         this.agent = agent;
         this.host = host;
         outLock = new Mutex;
         inbox = new Inbox;
         writeLine_ = writeLine !is null ? writeLine : (string l) {
-            import std.stdio : stdout;
-            stdout.writeln(l);
-            stdout.flush();
+            stdOut.writeln(l);
+            stdOut.flush();
         };
         agent.onPlanChanged = () {
             JSONValue u = ["sessionUpdate": "plan"];
@@ -335,7 +338,7 @@ final class AcpServer : AgentEvents
         try msg = parseJSON(l);
         catch (Exception e)
         {
-            stderr.writeln(sawValid ? "ACP parse error: " ~ e.msg
+            stdErr.writeln(sawValid ? "ACP parse error: " ~ e.msg
                 : "input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): " ~ e.msg);
             return;
         }
@@ -361,7 +364,7 @@ final class AcpServer : AgentEvents
             }
         }
         inbox.items ~= msg;
-        inbox.ready.notify();
+        inbox.ready.signalOne();
     }
 
     /// Input has ended.
@@ -386,7 +389,7 @@ final class AcpServer : AgentEvents
             close();
         });
         reader.isDaemon = true;
-        reader.start();
+        reader.startThread();
         return run();
     }
 
@@ -417,15 +420,15 @@ final class AcpServer : AgentEvents
                 Plan seed;
                 bool seeded;
                 if (params.type == JSONType.object)
-                    if (auto m = "_meta" in params.object)
+                    if (auto m = "_meta" in params.objectNoRef)
                         if (m.type == JSONType.object)
-                            if (auto p = "plan" in m.object)
+                            if (auto p = "plan" in m.objectNoRef)
                                 if (p.type != JSONType.null_) { seed = Plan.fromJSON(*p); seeded = true; }
                 newSession();
                 if (seeded)
                 {
                     // The client already showed the model the plan (e.g. in a resume prompt).
-                    auto inPrompt = "planInPrompt" in params["_meta"].object;
+                    auto inPrompt = "planInPrompt" in params["_meta"].objectNoRef;
                     agent.setPlan(seed, !(inPrompt !is null && inPrompt.type == JSONType.true_));
                 }
                 auto meta = sessionMeta();
@@ -494,7 +497,7 @@ final class AcpServer : AgentEvents
             auto notice = agent.onCompacted;
             agent.onCompacted = null;
             scope (exit) agent.onCompacted = notice;
-            try done = agent.compact(rep, CompactTrigger.manual, hasMode ? &mode : null, focus.length ? focus : null);
+            try done = agent.compact(rep, CompactTrigger.manual, hasMode ? new CompactionMode(mode) : null, focus.length ? focus : null);
             catch (Exception e) return rpcError(id, -32603, e.msg);
             if (!done) return rpcResult(id, JSONValue(["stopReason": JSONValue("end_turn"), "compacted": JSONValue(false)]));
             JSONValue b = ["stopReason": JSONValue("end_turn"), "compacted": JSONValue(true)];
