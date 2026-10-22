@@ -258,6 +258,9 @@ struct State {
     /// Width of the current streamed answer's stamp, so continuation lines
     /// can be indented to align under it.
     stream_pad: usize,
+    /// Holds back streamed lines that may form a markdown table, so tables
+    /// are laid out for the terminal instead of printed as raw pipe rows.
+    tables: crate::mdtable::TableStream,
     /// Output held back until the streamed line it would interrupt ends, in
     /// submission order. Notes are stamped and dimmed; raw payloads (e.g.
     /// `/trajectory --json`) go out verbatim — no stamp, no DIM — so the
@@ -554,7 +557,10 @@ impl Renderer {
                 self.newline(state);
                 match role {
                     crate::frame::Role::User => self.out(state, &format!("{stamp}> {text}\n")),
-                    crate::frame::Role::Assistant => self.out(state, &stamp_block_with(stamp, &format!("{text}\n"))),
+                    crate::frame::Role::Assistant => {
+                        let text = self.display_text(text, visible_width(stamp));
+                        self.out(state, &stamp_block_with(stamp, &format!("{text}\n")));
+                    }
                 }
             }
             Item::Thinking { chars, seconds } => {
@@ -1129,6 +1135,24 @@ impl Renderer {
         println!("{text}");
     }
 
+    /// An assistant message as shown in legacy mode: markdown tables laid out
+    /// for the terminal (`indent` cells narrower, for the stamp) when stdout is
+    /// a terminal; verbatim otherwise, so piped output keeps the markdown.
+    pub fn display_text(&self, text: &str, indent: usize) -> String {
+        if self.tty { crate::mdtable::render(text, self.width().saturating_sub(indent)) } else { text.to_string() }
+    }
+
+    /// Print any streamed table text still held back (the message ended, or
+    /// the turn stopped mid-table).
+    fn flush_tables(&self, state: &mut State) {
+        if !state.tables.holding() {
+            return;
+        }
+        let pad = state.stream_pad;
+        let rest = state.tables.finish(self.width().saturating_sub(pad));
+        self.out_aligned(state, &rest, pad);
+    }
+
     fn width(&self) -> usize {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }
@@ -1324,6 +1348,8 @@ impl Renderer {
         }
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
+        // A cancelled or failed turn may end mid-table: print what was held.
+        self.flush_tables(&mut state);
         self.newline(&mut state);
         // Everything queued mid-turn goes out in submission order: notes
         // stamped and dimmed, raw exports verbatim (no stamp/DIM), each on its
@@ -1485,6 +1511,7 @@ impl Renderer {
                     // normal-verbosity `AssistantMessage` arm does.
                     let mut state = self.state.lock().unwrap();
                     self.finish_thinking(&mut state);
+                    self.flush_tables(&mut state);
                     if state.streamed_text {
                         self.newline(&mut state);
                     }
@@ -1529,11 +1556,18 @@ impl Renderer {
                     }
                     state.streamed_text = true;
                     let pad = state.stream_pad;
-                    self.out_aligned(&mut state, text, pad);
+                    let shown = if self.tty {
+                        let width = self.width().saturating_sub(pad);
+                        state.tables.push(text, width)
+                    } else {
+                        (*text).to_string()
+                    };
+                    self.out_aligned(&mut state, &shown, pad);
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
+                self.flush_tables(&mut state);
                 if !state.streamed_text && !text.is_empty() {
                     // This non-streamed message is the full, authoritative
                     // answer and is printed here in its entirety. Drop any
@@ -1546,7 +1580,8 @@ impl Renderer {
                     // set for the reprint.
                     self.touched_quiet.store(false, Ordering::Relaxed);
                     self.newline(&mut state);
-                    self.out(&mut state, &stamp_block(text));
+                    let text = self.display_text(text, visible_width(&stamp()));
+                    self.out(&mut state, &stamp_block(&text));
                 }
                 self.newline(&mut state);
                 state.streamed_text = false;

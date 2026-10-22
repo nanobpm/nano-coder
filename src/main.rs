@@ -26,6 +26,7 @@ mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod mdtable;
 mod memory;
 mod mode;
 mod output;
@@ -2000,7 +2001,10 @@ fn turn_print(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) -> TurnPrin
 fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
     match turn_print(outcome, renderer) {
         TurnPrint::Nothing => {}
-        TurnPrint::Full { dim: false } => println!("{}", ui::stamp_block(&outcome.response)),
+        TurnPrint::Full { dim: false } => {
+            let text = renderer.display_text(&outcome.response, ui::visible_width(&ui::stamp()));
+            println!("{}", ui::stamp_block(&text));
+        }
         TurnPrint::Full { dim: true } => {
             println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
         }

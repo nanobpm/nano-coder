@@ -178,7 +178,12 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
             // Reserve the `› ` marker column for the first line so no row
             // overflows `width`; continuation rows start at column 0.
             let inner = width.saturating_sub(prefix.chars().count()).max(1);
-            let body = wrap_block(text, inner);
+            // Assistant text gets its markdown tables laid out at this width;
+            // a width change re-renders the item, so they reflow too.
+            let body = match role {
+                Role::Assistant => wrap_block(&crate::mdtable::render(text, inner), inner),
+                Role::User => wrap_block(text, inner),
+            };
             body.into_iter()
                 .enumerate()
                 .map(
@@ -839,6 +844,22 @@ impl Debouncer {
 mod tests {
     use super::*;
     use crate::plan::PlanItem;
+
+    #[test]
+    fn assistant_tables_are_laid_out_and_reflow_with_width() {
+        let text = "Sizes:\n| Name | Notes |\n|---|---|\n| alpha | first entry in the list |";
+        let item = Item::Message { role: Role::Assistant, text: text.into() };
+        let wide: Vec<String> = render_item(&item, 80).iter().map(|l| strip(l)).collect();
+        assert_eq!(wide[0], "Sizes:");
+        assert_eq!(wide[1], "┌───────┬─────────────────────────┐");
+        assert_eq!(wide[4], "│ alpha │ first entry in the list │");
+        let narrow: Vec<String> = render_item(&item, 24).iter().map(|l| strip(l)).collect();
+        assert!(narrow.len() > wide.len(), "{narrow:?}");
+        assert!(narrow.iter().all(|l| visible_width(l) <= 24), "{narrow:?}");
+        // A user's own message is shown as typed.
+        let user = Item::Message { role: Role::User, text: text.into() };
+        assert!(render_item(&user, 80).iter().any(|l| strip(l).contains("| Name | Notes |")));
+    }
 
     fn strip(text: &str) -> String {
         let mut out = String::new();
