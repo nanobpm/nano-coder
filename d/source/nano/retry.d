@@ -115,7 +115,7 @@ Duration retryDelay(RetryPolicy policy, long attempt, const(ErrorInfo)* err, str
 private Duration usecsOf(double n) { return (cast(long) n).usecs; }
 
 /// `Retry-After`: seconds (integer or decimal) or an HTTP date.
-Duration parseRetryAfterHeader(string value, long nowUnix) @trusted
+Duration parseRetryAfterHeader(string value, long nowUnix)
 {
     import std.string : strip;
     import std.conv : to;
@@ -140,7 +140,7 @@ Duration parseRetryAfterHeader(string value, long nowUnix) @trusted
 }
 
 /// "try again in 1.5s" / "250ms" / "2 seconds" in an error message.
-Duration parseRetryAfterMessage(string message) @trusted
+Duration parseRetryAfterMessage(string message)
 {
     import std.regex : regex, matchFirst;
     import std.conv : to;

@@ -48,19 +48,19 @@ final class TurnControl
     private Steer[] steers;
     private Steer[] absorbed_;
 
-    this() @trusted { lock = new Mutex; }
+    this() { lock = new Mutex; }
 
     private shared int mode_;
 
     /// The live agent mode; the running turn reads it at each iteration.
-    AgentMode mode() @trusted
+    AgentMode mode()
     {
         import core.atomic : atomicLoad;
         return cast(AgentMode) atomicLoad(mode_);
     }
 
     /// ditto
-    void mode(AgentMode m) @trusted
+    void mode(AgentMode m)
     {
         import core.atomic : atomicStore;
         atomicStore(mode_, cast(int) m);
@@ -69,7 +69,7 @@ final class TurnControl
     private string modelRequest;
 
     /// `/model SPEC` typed mid-turn: switch before the next model call.
-    void requestModel(string spec) @trusted
+    void requestModel(string spec)
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -77,7 +77,7 @@ final class TurnControl
     }
 
     /// The pending model switch, cleared (null when there is none).
-    string takeModelRequest() @trusted
+    string takeModelRequest()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -87,17 +87,17 @@ final class TurnControl
     }
 
     /// Queue a message for the running turn. It is added before the next model call.
-    void steer(string text) @trusted { steer(Steer(text)); }
+    void steer(string text) { steer(Steer(text)); }
 
     /// ditto
-    void steer(Steer s) @trusted
+    void steer(Steer s)
     {
         lock.lock();
         scope (exit) lock.unlock();
         steers ~= s;
     }
 
-    bool hasSteers() @trusted
+    bool hasSteers()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -105,7 +105,7 @@ final class TurnControl
     }
 
     /// Steers not yet added to the conversation, oldest first.
-    Steer[] takePending() @trusted
+    Steer[] takePending()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -115,7 +115,7 @@ final class TurnControl
     }
 
     /// Record a steer the agent added to the conversation.
-    void absorbed(Steer s) @trusted
+    void absorbed(Steer s)
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -123,7 +123,7 @@ final class TurnControl
     }
 
     /// Steers added to the conversation since the turn began.
-    Steer[] takeAbsorbed() @trusted
+    Steer[] takeAbsorbed()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -138,7 +138,7 @@ final class TurnControl
     bool isCancelled() @safe nothrow @nogc { return cancelRequested(); }
 
     /// Clear a previous cancel. Called when a turn begins.
-    void startTurn() @trusted
+    void startTurn()
     {
         atomicStore(gCancel, false);
         lock.lock();

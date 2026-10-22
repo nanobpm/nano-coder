@@ -135,7 +135,7 @@ struct Trajectory
 
     /// Rebuild the ledger from a log's committed records (each with its
     /// physical 1-based line number).
-    static Trajectory fromRecords(const JSONValue[] records, const ulong[] lines, const string[] raws = null) @trusted
+    static Trajectory fromRecords(const JSONValue[] records, const ulong[] lines, const string[] raws = null)
     {
         Trajectory t;
         auto current = Turn(0);
@@ -347,7 +347,7 @@ Trajectory load(string path, string expectedId = null) @trusted
 
 private:
 
-string str(const JSONValue j, string key, string dflt) @trusted
+string str(const JSONValue j, string key, string dflt)
 {
     if (j.type != JSONType.object) return dflt;
     if (auto v = key in j) if (v.type == JSONType.string) return v.str;
@@ -468,7 +468,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
     if (ts !is null) prevTs = ts;
 }
 
-string scalarText(const JSONValue m, string key) @trusted
+string scalarText(const JSONValue m, string key)
 {
     if (auto v = key in m)
     {
@@ -479,7 +479,7 @@ string scalarText(const JSONValue m, string key) @trusted
 }
 
 /// Milliseconds from `a` to `b` (RFC 3339), or -1 when negative/unparseable.
-long millisBetween(string a, string b) @trusted
+long millisBetween(string a, string b)
 {
     import std.datetime.systime : SysTime;
     try
@@ -615,7 +615,7 @@ string sanitizeMarkdown(string text)
 
 /// Drop control characters (C0/C1, so no escape sequence survives) and expand
 /// tabs to 8-column stops.
-public string sanitizeTerminal(string text) @trusted
+public string sanitizeTerminal(string text)
 {
     import std.uni : isControl;
     import std.utf : encode;
@@ -683,26 +683,23 @@ string rawNumber(string line, string key)
     return i > start ? line[start .. i] : null;
 }
 
-double strtodOf(string text) @trusted
+double strtodOf(string text)
 {
-    import core.stdc.stdlib : strtod;
-    import std.string : toStringz;
-    return strtod(text.toStringz, null);
+    import nano.safeio : cStrtod;
+    return cStrtod(text);
 }
 
 /// Whether decimal `text` reads back as exactly `d` (C `strtod` is correctly
 /// rounded; `std.conv.to!double` isn't always).
-bool parsesTo(string text, double d) @trusted
+bool parsesTo(string text, double d)
 {
-    import core.stdc.stdlib : strtod;
-    import std.string : toStringz;
-    return strtod(text.toStringz, null) == d;
+    return strtodOf(text) == d;
 }
 
 /// A finite double the way serde_json (ryu) prints it: the shortest digits
 /// that round-trip, always with a fraction or exponent (`2.0`, `1.3876`,
 /// `1e-7`, `1.5e300`).
-public string serdeFloat(double d) @trusted
+public string serdeFloat(double d)
 {
     import std.math : isFinite, fabs;
     import std.conv : to;
@@ -841,12 +838,10 @@ bool page(string text) @trusted
 }
 
 /// Rows and columns of the terminal on `fd`, or zeros when unknown.
-size_t[2] terminalSize(int fd = 1) @trusted
+size_t[2] terminalSize(int fd = 1)
 {
-    import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
-    winsize ws;
-    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) return [ws.ws_row, ws.ws_col];
-    return [0, 0];
+    import safeio = nano.safeio;
+    return safeio.terminalSize(fd);
 }
 
 bool pagerRan(int code) { return code != 126 && code != 127; }
@@ -867,7 +862,7 @@ bool needsPager(string text, size_t rows, size_t cols)
 
 /// Terminal rows `line` takes when wrapped at `cols` (a wide glyph never
 /// straddles the boundary).
-size_t wrappedRows(string line, size_t cols) @trusted
+size_t wrappedRows(string line, size_t cols)
 {
     import std.utf : encode;
     import nano.resume : cells;
@@ -883,7 +878,7 @@ size_t wrappedRows(string line, size_t cols) @trusted
     return rows;
 }
 
-@trusted unittest
+ unittest
 {
     import std.algorithm : canFind;
     string[] lines = [
@@ -928,7 +923,7 @@ size_t wrappedRows(string line, size_t cols) @trusted
     assert(t.toJson.canFind(`"kind": "tool",` ~ "\n" ~ `          "name": "bash",`));
 }
 
-@trusted unittest
+ unittest
 {
     // Synthetic final answer after report_outcome isn't a model call.
     Turn t = Turn(1, "go");

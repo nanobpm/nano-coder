@@ -80,7 +80,7 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
                 if (c < 0 || (c & 0xC0) != 0x80) { utf8 = null; return Key(K.ignored); }
                 utf8 ~= cast(ubyte) c;
             }
-            auto s = (() @trusted => cast(string) utf8.idup)();
+            auto s = (() => cast(string) utf8.idup)();
             utf8 = null;
             import std.utf : validate;
             try validate(s); catch (Exception) return Key(K.ignored);
@@ -111,7 +111,7 @@ private Key decodeEscape(ByteSource next)
             seq ~= cast(ubyte) c;
             if (c >= 0x40 && c <= 0x7e) break;
         }
-        auto s = (() @trusted => cast(string) seq.idup)();
+        auto s = (() => cast(string) seq.idup)();
         if (s == "\x1b[200~") return Key(K.paste, readPaste(next));
         if (s == "\x1b[Z") return Key(K.cycleMode); // Shift-Tab (backtab)
         if (s == "\x1b[M") // legacy mouse report: drop its three coordinate bytes
@@ -238,7 +238,7 @@ string readPaste(ByteSource next)
         }
     }
     import std.utf : byDchar;
-    auto raw = (() @trusted => cast(string) buf.idup)();
+    auto raw = (() => cast(string) buf.idup)();
     string out_;
     bool cr;
     foreach (dchar ch; raw.byDchar)
@@ -517,7 +517,7 @@ final class LineEditor
         };
         this.out_ = out_;
         this.width = width;
-        nowMs = () @trusted {
+        nowMs = () {
             import core.time : MonoTime;
             return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
         };
@@ -882,30 +882,32 @@ version (Posix)
 
     /// The terminal's output fd: 1, or the saved one while the frame
     /// renderer has fd 1 pointing at its pipe.
-    __gshared int ttyOut = 1;
+    shared int ttyOut_ = 1;
+    /// ditto
+    @property int ttyOut() nothrow @nogc { import core.atomic : atomicLoad; return atomicLoad(ttyOut_); }
+    /// ditto
+    @property void ttyOut(int fd) nothrow @nogc { import core.atomic : atomicStore; atomicStore(ttyOut_, fd); }
 
     /// Terminal height of `fd` (24 when unknown).
-    size_t terminalHeight(int fd = 1) @trusted
+    size_t terminalHeight(int fd = 1)
     {
+        import safeio = nano.safeio;
         if (fd == 1) fd = ttyOut;
-        import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
-        winsize ws;
-        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return ws.ws_row;
-        return 24;
+        auto n = safeio.terminalSize(fd)[0];
+        return n ? n : 24;
     }
 
     /// Terminal width of `fd` (80 when unknown).
-    size_t terminalWidth(int fd = 1) @trusted
+    size_t terminalWidth(int fd = 1)
     {
+        import safeio = nano.safeio;
         if (fd == 1) fd = ttyOut;
-        import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
-        winsize ws;
-        if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
-        return 80;
+        auto n = safeio.terminalSize(fd)[1];
+        return n ? n : 80;
     }
 
     /// A ByteSource reading `fd` with poll.
-    ByteSource fdSource(int fd) @trusted
+    ByteSource fdSource(int fd)
     {
         import core.sys.posix.poll : pollfd, poll, POLLIN;
         import core.sys.posix.unistd : read;

@@ -29,10 +29,10 @@ final class MessageQueue
     private size_t nextId;
     private Mutex lock;
 
-    this() @trusted { lock = new Mutex; }
+    this() { lock = new Mutex; }
 
     /// Add a message; returns its id.
-    size_t push(string text) @trusted
+    size_t push(string text)
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -42,7 +42,7 @@ final class MessageQueue
     }
 
     /// The next message to run, if any.
-    bool pop(out QueuedMessage m) @trusted
+    bool pop(out QueuedMessage m)
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -53,14 +53,14 @@ final class MessageQueue
     }
 
     /// The waiting messages, oldest first.
-    QueuedMessage[] list() @trusted
+    QueuedMessage[] list()
     {
         lock.lock();
         scope (exit) lock.unlock();
         return entries.dup;
     }
 
-    size_t length() @trusted
+    size_t length()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -70,7 +70,7 @@ final class MessageQueue
     bool empty() { return length == 0; }
 
     /// Drop the entries with these ids; returns how many were removed.
-    size_t remove(const size_t[] ids) @trusted
+    size_t remove(const size_t[] ids)
     {
         import std.algorithm : canFind, filter;
         import std.array : array;
@@ -82,7 +82,7 @@ final class MessageQueue
     }
 
     /// Replace one entry's text; false when no entry has that id.
-    bool edit(size_t id, string text) @trusted
+    bool edit(size_t id, string text)
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -96,7 +96,7 @@ final class MessageQueue
     }
 
     /// Drop everything waiting; returns how many were removed.
-    size_t clear() @trusted
+    size_t clear()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -267,7 +267,7 @@ unittest // pop is FIFO and edit rewrites in place
     assert(!q.pop(m));
 }
 
-@trusted unittest // parse covers the subcommands
+ unittest // parse covers the subcommands
 {
     import std.exception : assertThrown;
     assert(parse("").kind == QueueOp.Kind.list && parse("  ").kind == QueueOp.Kind.list);

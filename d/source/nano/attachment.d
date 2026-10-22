@@ -238,7 +238,7 @@ struct Attachment
     string placeholder() const { return format("[image: %s, %s×%s]", path, width, height); }
 
     import std.json : JSONValue, JSONType;
-    JSONValue toJSON() const @trusted
+    JSONValue toJSON() const
     {
         JSONValue j = ["media_type": mediaType, "path": path, "sha256": sha256, "extension": extension];
         j["width"] = width;
@@ -285,7 +285,7 @@ alias Encoder = immutable(ubyte)[] delegate(const(ubyte)[] src, ImageFormat code
 
 /// The platform encoder: `sips` (macOS) or ImageMagick (`magick`/`convert`).
 /// Null when none is available.
-Encoder platformEncoder() @trusted
+Encoder platformEncoder()
 {
     import std.file : exists;
     import std.process : environment;
@@ -413,7 +413,7 @@ string storedFilename(const ref Attachment a)
 
 /// Store prepared bytes under `dir` by hash (reusing an intact copy,
 /// repairing a corrupt one atomically). Returns the path.
-string store(string dir, const ref Attachment a, const(ubyte)[] bytes) @trusted
+string store(string dir, const ref Attachment a, const(ubyte)[] bytes)
 {
     import std.file : mkdirRecurse, read, write, rename, exists, remove;
     import std.path : buildPath;
@@ -531,7 +531,7 @@ unittest
     assert(scaledDimensions(3000, 1500, 1568) == [1568, 784]);
 }
 
-@trusted unittest
+ unittest
 {
     // Passthrough keeps the bytes; a quarter-turn EXIF reports display size.
     ImageLimits lim;
@@ -572,7 +572,7 @@ unittest
     assert(threw);
 }
 
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, rmdirRecurse, write, exists_ = exists;
     import std.path : buildPath;

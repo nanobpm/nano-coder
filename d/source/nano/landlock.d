@@ -97,7 +97,7 @@ string check(bool network)
 }
 
 /// The argv that runs `shell -c script` confined to `roots`.
-string[] argv(bool network, const string[] roots, string shell, string script) @trusted
+string[] argv(bool network, const string[] roots, string shell, string script)
 {
     import std.file : thisExePath;
     import std.conv : to;

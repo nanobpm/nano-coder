@@ -289,7 +289,7 @@ string resizeSequence(ushort rows)
 bool parseCursorReport(const(ubyte)[] bytes, out ushort row, out ushort col)
 {
     import std.string : lastIndexOf, indexOf;
-    auto s = (() @trusted => cast(string) bytes.idup)();
+    auto s = (() => cast(string) bytes.idup)();
     auto start = s.lastIndexOf("\x1b[");
     if (start < 0 || !s.length || s[$ - 1] != 'R') return false;
     auto body_ = s[start + 2 .. $ - 1];
@@ -305,12 +305,11 @@ bool parseCursorReport(const(ubyte)[] bytes, out ushort row, out ushort col)
 }
 
 /// The terminal's rows and columns (0, 0 when fd 1 is not a terminal).
-ushort[2] terminalSize() @trusted
+ushort[2] terminalSize()
 {
-    import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
-    winsize ws;
-    if (ioctl(1, TIOCGWINSZ, &ws) != 0 || ws.ws_row == 0 || ws.ws_col == 0) return [0, 0];
-    return [ws.ws_row, ws.ws_col];
+    import safeio = nano.safeio;
+    auto rc = safeio.terminalSize(1);
+    return [cast(ushort) rc[0], cast(ushort) rc[1]];
 }
 
 /// Ask the terminal where the cursor is, reading the reply straight from
@@ -363,7 +362,7 @@ final class StatusLine
 
     /// Reserve the bottom row when stdin and stdout are terminals of at least
     /// five rows and `AGENTIC_NO_STATUS` is unset; null otherwise.
-    static StatusLine install(Stats delegate() @safe stats) @trusted
+    static StatusLine install(Stats delegate() @safe stats)
     {
         import core.sys.posix.unistd : isatty;
         import std.process : environment;
@@ -380,7 +379,7 @@ final class StatusLine
 
     /// Redraw against the current terminal size; a changed size re-pins the
     /// region first, in the same write.
-    void draw() @trusted
+    void draw()
     {
         synchronized (this) writeFd(1, sequence());
     }
@@ -388,7 +387,7 @@ final class StatusLine
     /// The bytes that redraw the bar (re-pinning first after a resize), for
     /// writers that must emit them in the same write as their own output (the
     /// line editor's erase-to-end-of-screen wipes the bar's row).
-    string sequence() @trusted
+    string sequence()
     {
         synchronized (this)
         {
@@ -408,7 +407,7 @@ final class StatusLine
     }
 
     /// Clear the screen and scrollback for a fresh conversation and re-pin.
-    void clear() @trusted
+    void clear()
     {
         synchronized (this)
         {
@@ -420,7 +419,7 @@ final class StatusLine
     }
 
     /// Clear the status line and give the whole screen back.
-    void teardown() @trusted
+    void teardown()
     {
         synchronized (this)
         {

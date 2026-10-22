@@ -183,7 +183,7 @@ class Agent
     /// too late for this turn stay in `control` for the caller to queue.
     /// Pass `resetControl = false` when the caller already called
     /// `control.startTurn()`, so a cancel routed before `run` began is kept.
-    string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null) @trusted
+    string run(string input, AgentEvents ev, bool resetControl = true, string givenId = null)
     {
         import std.datetime.systime : Clock;
         import std.conv : to;
@@ -236,7 +236,7 @@ class Agent
     LLMClient delegate(string spec) titleClient;
     private bool[string] titlesRequested;
 
-    private ulong logSize() @trusted
+    private ulong logSize()
     {
         import std.file : getSize;
         try return getSize(log.path);
@@ -245,7 +245,7 @@ class Agent
 
     /// Keep the `--resume` picker's summary current (only a cache: the picker
     /// rebuilds a missing or stale summary), then maybe request a title.
-    private void indexTurn(ulong from) @trusted
+    private void indexTurn(ulong from)
     {
         import nano.session_index : update, Summary;
         Summary s;
@@ -619,7 +619,7 @@ class Agent
         if (calibrated) return calibTokens + ctx.messagesTokens(messages[calibLen .. $], imageSlots);
         size_t tools_;
         foreach (d; offeredTools())
-            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() @trusted { return d.parameters.toString; }());
+            tools_ += ctx.textTokens(d.name) + ctx.textTokens(d.description) + ctx.textTokens(() { return d.parameters.toString; }());
         return ctx.messagesTokens(messages, imageSlots) + tools_;
     }
 
@@ -673,20 +673,20 @@ class Agent
     /// An output cap learned from a provider error (0 = none); /model resets it.
     long learnedMaxOutput;
 
-    private const(ProviderConfig)* providerEntry() @trusted
+    private const(ProviderConfig)* providerEntry()
     {
         auto pc = providerLookup is null ? null : providerLookup(client.providerName);
         return pc is null ? &noProvider : pc;
     }
 
-    private ProviderKind providerKind() @trusted
+    private ProviderKind providerKind()
     {
         auto pc = providerEntry();
         return pc.hasKind ? pc.kind : ProviderKind.openai;
     }
 
     /// Ask the endpoint what the current model supports (after a model change).
-    void refreshCapabilities() @trusted
+    void refreshCapabilities()
     {
         capabilities = Capabilities.init;
         if (auto probe = cast(CapabilityProbe) client) capabilities = probe.probeCapabilities();
@@ -723,7 +723,7 @@ class Agent
     }
 
     /// The temperature for a request whose Anthropic thinking state is `on`.
-    temp.Resolved temperatureFor(bool on) @trusted
+    temp.Resolved temperatureFor(bool on)
     {
         auto r = temp.resolve(temperature, providerKind, *providerEntry, client.modelName);
         return on ? r.fixedBy("thinking is on, and Anthropic then requires the default temperature") : r;
@@ -742,7 +742,7 @@ class Agent
     }
 
     /// How many images a request may carry (0 without vision).
-    private size_t imageSlots() @trusted
+    private size_t imageSlots()
     {
         auto v = vision();
         return v.isNull ? 0 : v.get.maxImages;
@@ -754,7 +754,7 @@ class Agent
 
     /// Where this session's images are stored: beside a persisted log (so
     /// its references stay valid), else a process-local temp dir.
-    string attachmentsDir() @trusted
+    string attachmentsDir()
     {
         import std.path : buildPath, dirName;
         import std.file : tempDir;
@@ -1517,7 +1517,7 @@ unittest
     assert(f.requestMaxTokens < 2_000);
 }
 
-@trusted unittest
+ unittest
 {
     // read_file on an image: attached for a vision model, an error otherwise.
     import nano.providers.mock : MockClient;

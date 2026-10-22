@@ -85,7 +85,7 @@ class MuseClient : LLMClient, CapabilityProbe
         return session.get;
     }
 
-    private static long nowSecs() @trusted
+    private static long nowSecs()
     {
         import std.datetime.systime : Clock;
         return Clock.currTime.toUnixTime;
@@ -133,7 +133,7 @@ class MuseClient : LLMClient, CapabilityProbe
     }
 
     /// `GET {mint}/muse-code/models` with the key; ApiError on failure.
-    private JSONValue fetchCatalog(const SessionKey s, bool probing) @trusted
+    private JSONValue fetchCatalog(const SessionKey s, bool probing)
     {
         import core.time : seconds;
         Request req;
@@ -174,7 +174,7 @@ class MuseClient : LLMClient, CapabilityProbe
     string[] listModels() { return listableModels(catalogJson(false)); }
 
     /// Thinking levels and vision from the model's catalog row.
-    Capabilities probeCapabilities() @trusted
+    Capabilities probeCapabilities()
     {
         import nano.thinking : Reported, Format;
         import nano.vision : Vision;

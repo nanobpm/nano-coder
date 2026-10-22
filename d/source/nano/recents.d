@@ -17,7 +17,7 @@ enum formatVersion = 1;
 /// `spec` as `provider/model` (or a bare provider without a default model),
 /// parsed the way every model spec is, so a slash-containing model on the
 /// default provider keeps its real provider prefix.
-string canonical(string spec, const ProviderConfig[string] all, string defaultProvider) @trusted
+string canonical(string spec, const ProviderConfig[string] all, string defaultProvider)
 {
     string provider, model;
     parseModelSpec(spec, all, defaultProvider, provider, model);
@@ -67,7 +67,7 @@ struct Recents
     string toJson() const
     {
         import nano.trajectory : serdeString;
-        auto s = "{\n  \"version\": " ~ (() @trusted { import std.conv : to; return version_.to!string; })() ~ ",\n  \"models\": ";
+        auto s = "{\n  \"version\": " ~ (() { import std.conv : to; return version_.to!string; })() ~ ",\n  \"models\": ";
         if (!models.length) return s ~ "[]\n}";
         s ~= "[";
         foreach (i, m; models) s ~= (i ? "," : "") ~ "\n    " ~ serdeString(m);
@@ -112,7 +112,7 @@ Recents load(string path) @trusted
 }
 
 /// Write the list, creating the parent directory; errors are ignored.
-void save(string path, const Recents r) @trusted
+void save(string path, const Recents r)
 {
     import std.file : mkdirRecurse, write;
     import std.path : dirName;
@@ -124,7 +124,7 @@ void save(string path, const Recents r) @trusted
     catch (Exception) {}
 }
 
-@trusted unittest
+ unittest
 {
     ProviderConfig[string] all;
     foreach (n; ["openai", "together", "ollama"]) all[n] = ProviderConfig.init;

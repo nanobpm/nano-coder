@@ -329,15 +329,10 @@ ToolDefinition definition()
 // ---- helpers ----
 
 /// The rp path of `p` (symlinks resolved), or null if it doesn't exist.
-string canonical(string p) @trusted
+string canonical(string p)
 {
-    import core.sys.posix.stdlib : realpath;
-    import core.stdc.stdlib : free;
-    import std.string : toStringz, fromStringz;
-    auto r = realpath(p.toStringz, null);
-    if (r is null) return null;
-    scope (exit) free(r);
-    return r.fromStringz.idup;
+    import nano.safeio : realPath;
+    return realPath(p);
 }
 
 private bool startsWithPath(string path, string root)

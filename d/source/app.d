@@ -4,7 +4,7 @@ module app;
 
 @safe:
 
-import nano.safeio : exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
+import nano.safeio : GsharedRef, exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
 
 import std.stdio;
 import std.json;
@@ -136,8 +136,8 @@ int runLogin(string provider)
     import core.thread : Thread;
     import core.time : seconds;
     import std.functional : toDelegate;
-    void delegate(string) @safe note = toDelegate((string s) @trusted { stdErr.writeln(s); });
-    void delegate(long) @safe sleep = toDelegate((long n) @trusted { Thread.sleep(n.seconds); });
+    void delegate(string) @safe note = toDelegate((string s) { stdErr.writeln(s); });
+    void delegate(long) @safe sleep = toDelegate((long n) { Thread.sleep(n.seconds); });
     try
     {
         switch (provider)
@@ -213,18 +213,13 @@ bool isTerminal(int fd)
     import core.sys.posix.unistd : isatty;
     import nano.lineedit : ttyOut;
     // `ttyOut` is set by the main thread when the frame renderer starts.
-    if (fd == 1 || fd == 2) if (gFrame !is null) fd = () @trusted { return ttyOut; }();
+    if (fd == 1 || fd == 2) if (gFrame !is null) fd = ttyOut;
     return isatty(fd) != 0;
 }
 
 /// Renders agent events on the terminal.
 // Ctrl-C handling: cancel the running turn, or exit when idle.
-__gshared TurnControl gControl_;
-/// `gControl_` through @safe code: the reference is written once at startup (or
-/// by the main thread) and read by the others; the object locks itself.
-@property TurnControl gControl() @trusted nothrow @nogc { return gControl_; }
-/// ditto
-@property void gControl(TurnControl v) @trusted nothrow @nogc { gControl_ = v; }
+mixin GsharedRef!(TurnControl, "gControl"); /// written by the main thread, read by others; the object locks itself
 shared bool gTurnRunning;
 
 /// Route SIGINT to `onInterrupt`.
@@ -329,7 +324,7 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
     while (!atomicLoad(*done))
     {
         auto r = editor.readLine("↪ ", console.dim("↪ "), true,
-            () @trusted => atomicLoad(*done) || questions.pending !is null);
+            () => atomicLoad(*done) || questions.pending !is null);
         final switch (r.outcome)
         {
             case Outcome.stopped:
@@ -435,9 +430,9 @@ final class EditorUi : SettingsUi
 
     string input(string prompt, string initial) { return value(prompt, initial, false); }
     string secret(string prompt) { return value(prompt, "", true); }
-    void say(string line) @trusted { writeln(line); stdOut.flush(); }
+    void say(string line) { writeln(line); stdOut.flush(); }
 
-    private string value(string prompt, string initial, bool masked) @trusted
+    private string value(string prompt, string initial, bool masked)
     {
         auto p = prompt ~ ": ";
         auto r = e.readValue(p, "\x1b[1m" ~ p ~ "\x1b[0m", initial, masked);
@@ -455,7 +450,7 @@ shared bool gTimestamps = true;
 /// The visible width of a non-empty stamp ("HH:MM:SS ").
 enum size_t stampWidth = 9;
 
-string stamp(bool color) @trusted
+string stamp(bool color)
 {
     import std.datetime.systime : Clock;
     if (!atomicLoad(gTimestamps)) return "";
@@ -475,24 +470,14 @@ string stampBlock(string stamp, string text)
 }
 
 private string spaces(size_t n) { import std.array : replicate; return " ".replicate(n); }
-Verbosity verbosity() @trusted { return atomicLoad(gVerbosity); }
-void setVerbosity(Verbosity v) @trusted { atomicStore(gVerbosity, v); }
+Verbosity verbosity() { return atomicLoad(gVerbosity); }
+void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 
 // The pinned status line (status.rs), when installed, and what it shows.
 import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
-__gshared StatusLine gStatus_;
-/// `gStatus_` through @safe code: the reference is written once at startup (or
-/// by the main thread) and read by the others; the object locks itself.
-@property StatusLine gStatus() @trusted nothrow @nogc { return gStatus_; }
-/// ditto
-@property void gStatus(StatusLine v) @trusted nothrow @nogc { gStatus_ = v; }
+mixin GsharedRef!(StatusLine, "gStatus"); /// written by the main thread, read by others; the object locks itself
 /// The frame renderer, when `renderer = "frame"` drives the terminal.
-__gshared FrameUi gFrame_;
-/// `gFrame_` through @safe code: the reference is written once at startup (or
-/// by the main thread) and read by the others; the object locks itself.
-@property FrameUi gFrame() @trusted nothrow @nogc { return gFrame_; }
-/// ditto
-@property void gFrame(FrameUi v) @trusted nothrow @nogc { gFrame_ = v; }
+mixin GsharedRef!(FrameUi, "gFrame"); /// written by the main thread, read by others; the object locks itself
 
 /// The status bar text for the frame's last line.
 string frameStatus(size_t width) @trusted
@@ -517,7 +502,7 @@ void updateStatus(scope void delegate(ref Stats) @safe f) @trusted
 }
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
-void statusFromAgent(ref Stats s, Agent agent, string cwdShown) @trusted
+void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
 {
     import nano.thinking : wireValue;
     import nano.context : CompactionMode;
@@ -618,7 +603,7 @@ class Console : AgentEvents
         this.tty = tty;
     }
 
-    private static long nowMs() @trusted
+    private static long nowMs()
     {
         import core.time : MonoTime;
         return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
@@ -1095,12 +1080,7 @@ void watchResize() @trusted
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
-__gshared Agent mainAgent_;
-/// `mainAgent_` through @safe code: the reference is written once at startup (or
-/// by the main thread) and read by the others; the object locks itself.
-@property Agent mainAgent() @trusted nothrow @nogc { return mainAgent_; }
-/// ditto
-@property void mainAgent(Agent v) @trusted nothrow @nogc { mainAgent_ = v; }
+mixin GsharedRef!(Agent, "mainAgent"); /// written by the main thread, read by others; the object locks itself
 
 int main(string[] args)
 {
@@ -1328,7 +1308,7 @@ int runMain(string[] args)
         host.providerNames = () => cfg.providers.keys;
         host.configModel = cfg.model;
         host.configSystemPrompt = cfg.systemPrompt;
-        host.sessionMeta = () @trusted {
+        host.sessionMeta = () {
             JSONValue meta = ["projectInstructions": JSONValue(instructions !is null ? instructions.loadedPaths : null),
                 "skills": JSONValue(skills !is null ? skills.names : null)];
             if (instructions !is null)
@@ -1413,7 +1393,7 @@ int runMain(string[] args)
     auto recents = nano.recents.load(recentsPath);
     if (recents.canonicalize(cfg.providers, cfg.defaultProvider)) nano.recents.save(recentsPath, recents);
     string currentSpec() { return nano.recents.canonical(client.providerName ~ "/" ~ client.modelName, cfg.providers, cfg.defaultProvider); }
-    modelSuggestionSource = () @trusted {
+    modelSuggestionSource = () {
         import std.algorithm : canFind, sort;
         Suggestion[] out_;
         void push(string value, string note)
@@ -1569,27 +1549,27 @@ int runMain(string[] args)
         sysPlan = plan;
     }
 
-    // @trusted: `h.cfg` points at runMain's `cfg`, which outlives every
-    // settings dialog (they all run inside runMain).
-    SettingsHost settingsHost() @trusted
+    // `h.cfg` points at runMain's `cfg`, which outlives every settings
+    // dialog (they all run inside runMain).
+    SettingsHost settingsHost()
     {
         SettingsHost h;
         h.cfg = &cfg;
         h.agent = agent;
         h.configPath = cfgPath;
-        h.recents = () @trusted => recents.models;
-        h.switchModel = (string spec) @trusted {
+        h.recents = () => recents.models;
+        h.switchModel = (string spec) {
             try { switchModel(spec); return cast(string) null; }
             catch (Exception e) return e.msg;
         };
-        h.listModels = (string name) @trusted => makeClient(resolve(cfg, name)).listModels();
-        h.refreshSystem = () @trusted { agent.messages[0].content = systemFor(cwd, sysPlan); };
-        h.refreshClient = (string name) @trusted {
+        h.listModels = (string name) => makeClient(resolve(cfg, name)).listModels();
+        h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, sysPlan); };
+        h.refreshClient = (string name) {
             if (agent.client.providerName != name) return cast(string) null;
             try { switchModel(name ~ "/" ~ agent.client.modelName); return cast(string) null; }
             catch (Exception e) return e.msg;
         };
-        onVerbosity = (Verbosity v) @trusted { setVerbosity(v); };
+        onVerbosity = (Verbosity v) { setVerbosity(v); };
         return h;
     }
 
@@ -1655,13 +1635,13 @@ int runMain(string[] args)
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
-        editor = new LineEditor(fdSource(0), (string s) @trusted {
+        editor = new LineEditor(fdSource(0), (string s) {
             import std.algorithm.searching : canFind;
             // The editor's erase-to-end-of-screen wipes the status row too.
             writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
         }, () => terminalWidth());
         editor.rows = () => terminalHeight();
-        editor.onAction = (K k) @trusted {
+        editor.onAction = (K k) {
             bool inTurn = atomicLoad(gTurnRunning);
             if (k == K.toggleThinking)
             {
@@ -1689,10 +1669,10 @@ int runMain(string[] args)
         if (mode == "frame" && gFrame is null)
         {
             if (gStatus !is null) { gStatus.teardown(); gStatus = null; }
-            gFrame = FrameUi.install((size_t w) @trusted => frameStatus(w));
+            gFrame = FrameUi.install((size_t w) => frameStatus(w));
             if (gFrame is null) return;
-            editor.frameDraw = (string[] rows) @trusted { gFrame.draw(rows); };
-            editor.frameCommit = (string line) @trusted { gFrame.commit(line); };
+            editor.frameDraw = (string[] rows) { gFrame.draw(rows); };
+            editor.frameCommit = (string line) { gFrame.commit(line); };
             refreshStatus();
         }
         else if (mode == "legacy" && gFrame !is null)
@@ -1770,7 +1750,7 @@ int runMain(string[] args)
             quietPrompt = false;
             stdOut.flush();
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
-            editor.restyle = () @trusted => console.stamp() ~ console.bold("› ");
+            editor.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
             // lapses so the stale hint is cleared (Rust's DoublePress deadline).
             bool delegate() @safe lapse = null;

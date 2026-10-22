@@ -511,7 +511,7 @@ unittest
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
 }
 
-@trusted unittest
+ unittest
 {
     import nano.toml : parseToml;
     // replay_reasoning defaults on only for Copilot reasoning models.
@@ -527,7 +527,7 @@ unittest
     assert(resolve(c, "deepseek/deepseek-reasoner").replayReasoning);
 }
 
-@trusted unittest
+ unittest
 {
     import std.algorithm : canFind;
     import std.exception : collectExceptionMsg;
@@ -552,7 +552,7 @@ unittest
     assert(parseKind("muse-code") == ProviderKind.muse && parseKind("openai-compatible") == ProviderKind.openai);
 }
 
-@trusted unittest
+ unittest
 {
     import std.algorithm : canFind;
     import std.exception : collectExceptionMsg;
@@ -570,7 +570,7 @@ unittest
     assert(collectExceptionMsg(resolve(c, "local/m")).canFind("has no base_url"));
 }
 
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, write, remove;
     import std.path : buildPath;

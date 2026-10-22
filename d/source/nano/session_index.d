@@ -98,7 +98,7 @@ struct Summary
     }
 
     /// Parse one index line; throws on anything malformed.
-    static Summary fromJson(const(char)[] line) @trusted
+    static Summary fromJson(const(char)[] line)
     {
         auto j = parseJSON(line);
         Summary s;
@@ -161,7 +161,7 @@ private bool missingTellingPrompt(const ref Summary s)
 }
 
 /// Committed (newline-terminated) lines of `bytes`.
-private const(char)[][] committedLines(const(ubyte)[] bytes) @trusted
+private const(char)[][] committedLines(const(ubyte)[] bytes)
 {
     size_t committed = bytes.length;
     while (committed && bytes[committed - 1] != '\n') committed--;
@@ -169,7 +169,7 @@ private const(char)[][] committedLines(const(ubyte)[] bytes) @trusted
 }
 
 /// The input text of a committed log line, or null when it isn't an input record.
-private string inputText(const(char)[] line) @trusted
+private string inputText(const(char)[] line)
 {
     if (!line.startsWith(`{"type":"input"`)) return null;
     try
@@ -236,7 +236,7 @@ private string indexPath(string dir)
     return buildPath(dir, indexFile);
 }
 
-private ulong sizeOr0(string path) @trusted
+private ulong sizeOr0(string path)
 {
     try return getSize(path);
     catch (Exception) return 0;
@@ -244,7 +244,7 @@ private ulong sizeOr0(string path) @trusted
 
 /// Index lines parsed into `map` (latest wins, titles monotonic). Unreadable
 /// lines are skipped: the index is only a cache.
-private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines) @trusted
+private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_t lines)
 {
     foreach (raw; (cast(const(char)[]) bytes).split('\n'))
     {
@@ -326,7 +326,7 @@ private void rewrite(string dir, const Summary[string] summaries, ulong since) @
 /// appended: when the cached summary covers exactly that much, only the tail
 /// is folded; otherwise the summary is rebuilt from the whole log. `model` is
 /// the `provider/model` now in use (null keeps the recorded one).
-Summary update(string path, ulong from, string model) @trusted
+Summary update(string path, ulong from, string model)
 {
     auto dir = path.dirName;
     auto id = path.baseName.stripExtension;
@@ -367,7 +367,7 @@ Summary update(string path, ulong from, string model) @trusted
 
 /// Give the session log at `path` a title in the index. False when the index
 /// already has one (another process won the race), which is left alone.
-bool setTitle(string path, string title) @trusted
+bool setTitle(string path, string title)
 {
     auto dir = path.dirName;
     auto s = summarize(path);
@@ -443,7 +443,7 @@ string cleanTitle(string reply)
 /// Sessions the index lacks, or whose log changed since it was indexed, are
 /// summarized from their logs, and the index is updated. A missing directory
 /// is no sessions; other filesystem errors propagate.
-Summary[] list(string dir) @trusted
+Summary[] list(string dir)
 {
     if (!dir.exists) return null;
     auto indexLen = sizeOr0(indexPath(dir));
@@ -493,7 +493,7 @@ Summary[] list(string dir) @trusted
 
 version (unittest)
 {
-    private string testDir(string name) @trusted
+    private string testDir(string name)
     {
         auto d = buildPath(tempDir, "nano-d-index-" ~ name);
         if (d.exists) rmdirRecurse(d);
@@ -501,7 +501,7 @@ version (unittest)
         return d;
     }
 
-    private string writeLog(string dir, string id, string[] prompts, string cwd = "/w") @trusted
+    private string writeLog(string dir, string id, string[] prompts, string cwd = "/w")
     {
         import nano.session : SessionLog;
         auto log = new SessionLog(dir, "p/m", cwd, id);
@@ -510,7 +510,7 @@ version (unittest)
     }
 }
 
-@trusted unittest
+ unittest
 {
     // Terse and telling prompts, and the context shown for a terse last one.
     Summary s;
@@ -532,7 +532,7 @@ version (unittest)
     assert(big.firstPrompt.length == 600);
 }
 
-@trusted unittest
+ unittest
 {
     assert(cleanTitle("\"Fixing the deploy test.\"\nmore") == "Fixing the deploy test");
     assert(cleanTitle("Title: **Port nano-coder to D**") == "Port nano-coder to D");
@@ -544,7 +544,7 @@ version (unittest)
     assert(long_.walkLength == 60 && long_[$ - 3 .. $] == "…");
 }
 
-@trusted unittest
+ unittest
 {
     auto dir = testDir("list");
     writeLog(dir, "s1", ["first prompt that is telling enough here", "go"]);
@@ -581,7 +581,7 @@ version (unittest)
     assert(list(dir)[0].title == "Deploy fix");
 }
 
-@trusted unittest
+ unittest
 {
     // A stale cache (log grew behind the index) falls back to a full scan.
     auto dir = testDir("stale");
@@ -601,7 +601,7 @@ version (unittest)
     assert(update(path, from, null).prompts == 5);
 }
 
-@trusted unittest
+ unittest
 {
     // The index compacts once it grows well past one line per session.
     auto dir = testDir("compact");

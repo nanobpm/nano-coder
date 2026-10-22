@@ -149,14 +149,14 @@ final class QuestionBroker
     private Answer answer;
     private shared bool interactive_;
 
-    this() @trusted
+    this()
     {
         lock = new Mutex;
         cond = new Condition(lock);
     }
 
-    void interactive(bool on) @trusted { import core.atomic : atomicStore; atomicStore(interactive_, on); }
-    bool interactive() @trusted { import core.atomic : atomicLoad; return atomicLoad(interactive_); }
+    void interactive(bool on) { import core.atomic : atomicStore; atomicStore(interactive_, on); }
+    bool interactive() { import core.atomic : atomicLoad; return atomicLoad(interactive_); }
 
     /// Register questions and block until `resolve`.
     Answer ask(Question[] questions) @trusted
@@ -173,7 +173,7 @@ final class QuestionBroker
     }
 
     /// The waiting questions, or null.
-    Question[] pending() @trusted
+    Question[] pending()
     {
         lock.lock();
         scope (exit) lock.unlock();
@@ -192,7 +192,7 @@ final class QuestionBroker
     }
 
     /// The tool handler.
-    string run(JSONValue args) @trusted
+    string run(JSONValue args)
     {
         if (!interactive) throw new QuestionError(headlessError);
         auto qs = parse(args);
@@ -200,7 +200,7 @@ final class QuestionBroker
     }
 }
 
-ToolDefinition definition() @trusted
+ToolDefinition definition()
 {
     return ToolDefinition(toolName,
         "Ask the user a question and wait for the answer, without ending your turn. Use when you need a "
@@ -210,7 +210,7 @@ ToolDefinition definition() @trusted
         parseJSON(`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string","description":"The complete question to ask"},"header":{"type":"string","description":"Very short label (max 30 chars)"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"custom":{"type":"boolean","description":"Allow a custom typed answer (default true)"}},"required":["question"]}}},"required":["questions"]}`));
 }
 
-@trusted unittest // parses_questions_and_requires_text
+ unittest // parses_questions_and_requires_text
 {
     import std.exception : assertThrown, assertNotThrown;
     auto qs = parse(parseJSON(`{ "questions": [ { "question": "Which DB?", "options": [ {"label": "Postgres"}, {"label": "SQLite"} ] } ] }`));
@@ -242,7 +242,7 @@ ToolDefinition definition() @trusted
     }
 }
 
-@trusted unittest // wording, and control sequences/newlines stripped
+ unittest // wording, and control sequences/newlines stripped
 {
     auto qs = [Question("Q")];
     assert(resultText(qs, Answer(Answer.Kind.away)).canFind("away from the keyboard"));

@@ -67,7 +67,7 @@ struct Vision
         return Nullable!Vision.init;
     }
 
-    static Nullable!Vision fromLlamacppProps(const JSONValue props) @trusted
+    static Nullable!Vision fromLlamacppProps(const JSONValue props)
     {
         auto m = objGet(props, "modalities");
         auto v = m is null ? null : objGet(*m, "vision");
@@ -80,7 +80,7 @@ enum Source { model, provider, global, detected }
 private Vision copy(const Vision v) { return Vision(v.maxImages, v.maxImageBytes, v.mediaTypes.dup); }
 
 /// The configured override (model, provider, global) and where it came from.
-Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model, out Source source) @trusted
+Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig provider, string model, out Source source)
 {
     if (auto ms = model in provider.models)
         if (!ms.vision.isNull) { source = Source.model; return Nullable!bool(ms.vision.get); }

@@ -203,3 +203,68 @@ unittest
     assert(ownText(readBytes(p)) == "hi");
     assert(stdOut.isOpen && stdErr.isOpen);
 }
+
+
+/// A `__gshared` class reference read and written through @safe code, as
+/// `name` (getter and setter) over the storage `name_`. `@trusted` because a
+/// reference load or store is atomic on every target we build for; the
+/// referenced objects lock themselves, so only the reference is shared.
+mixin template GsharedRef(T, string name)
+{
+    mixin("__gshared T " ~ name ~ "_;");
+    mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
+    mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
+}
+
+/// Rows and columns of the terminal on `fd` (TIOCGWINSZ), or zeros when
+/// unknown. `ioctl` only writes the local `winsize`.
+size_t[2] terminalSize(int fd = 1) @trusted nothrow @nogc
+{
+    import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
+    winsize ws;
+    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) return [ws.ws_row, ws.ws_col];
+    return [0, 0];
+}
+
+/// C `strtod` (correctly rounded, unlike `std.conv.to!double`) on `text`;
+/// `consumed` is how many characters it read. The string is copied to a
+/// NUL-terminated buffer, and `end` only points into that copy.
+double cStrtod(string text, out size_t consumed) @trusted
+{
+    import core.stdc.stdlib : strtod;
+    import std.string : toStringz;
+    auto z = text.toStringz;
+    immutable(char)* end;
+    auto v = strtod(z, &end);
+    consumed = end - z;
+    return v;
+}
+
+/// ditto
+double cStrtod(string text)
+{
+    size_t n;
+    return cStrtod(text, n);
+}
+
+import std.json : JSONValue, JSONType;
+/// `v[key]` when `v` is an object holding it, else null. Phobos marks
+/// `JSONValue.object` @system because it returns the AA by reference; this
+/// only looks a key up and returns a pointer into the GC-owned table.
+const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trusted
+{
+    if (v.type != JSONType.object) return null;
+    return key in v.object;
+}
+
+@safe unittest
+{
+    import std.json : parseJSON;
+    size_t n;
+    assert(cStrtod("0.7") == 0.7);
+    assert(cStrtod("1.5x", n) == 1.5 && n == 3);
+    auto j = parseJSON(`{"a":1}`);
+    assert(jsonGet(j, "a").integer == 1 && jsonGet(j, "b") is null);
+    auto n1 = JSONValue(1);
+    assert(jsonGet(n1, "a") is null);
+}

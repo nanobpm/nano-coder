@@ -50,7 +50,7 @@ bool consumesHint(const ref Message m) @safe
     return false;
 }
 
-ToolDefinition[] definitions() @trusted
+ToolDefinition[] definitions()
 {
     return [
         ToolDefinition(searchTool,
@@ -74,7 +74,7 @@ struct Entry
 }
 
 /// The log's message records with their IDs. Torn or unknown lines are skipped.
-Entry[] load(string path) @trusted
+Entry[] load(string path)
 {
     import std.file : readText;
     import std.string : lineSplitter;
@@ -117,7 +117,7 @@ private string label(ulong id, const ref Message m) @safe
 }
 
 /// Text and tool calls, leaving out history lookups so a search can't find itself.
-private string searchable(const ref Message m) @trusted
+private string searchable(const ref Message m)
 {
     if (isHistoryTool(m.toolName)) return "";
     string text = m.content;
@@ -147,7 +147,7 @@ private ulong idArg(JSONValue args, string key, bool required) @trusted
 }
 
 /// ~240 characters around a match, whitespace collapsed, `…` where cut.
-private string snippet(string text, size_t start, size_t end) @trusted
+private string snippet(string text, size_t start, size_t end)
 {
     import std.utf : toUTF32, toUTF8, count;
     auto pre = text[0 .. start].toUTF32;
@@ -294,7 +294,7 @@ string read(string path, JSONValue args) @trusted
     return truncateOutput(text, limit, format("history-%s", id));
 }
 
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, mkdirRecurse, rmdirRecurse;
     import std.path : buildPath;

@@ -283,7 +283,7 @@ struct Reported
     }
 
     /// llama.cpp `/props`: what the chat template accepts.
-    static Nullable!Reported fromLlamacppProps(const JSONValue props) @trusted
+    static Nullable!Reported fromLlamacppProps(const JSONValue props)
     {
         auto t = objGet(props, "chat_template");
         if (t is null || t.type != JSONType.string) return Nullable!Reported.init;
@@ -296,11 +296,7 @@ struct Reported
 }
 
 /// `v[key]` when `v` is an object holding it.
-const(JSONValue)* objGet(const ref JSONValue v, string key) @trusted
-{
-    if (v.type != JSONType.object) return null;
-    return key in v.object;
-}
+public import nano.safeio : objGet = jsonGet;
 
 /// `extra_body` keys that carry a thinking setting for `wire`.
 immutable(string[]) extraBodyKeys(Wire wire)
@@ -317,7 +313,7 @@ immutable(string[]) extraBodyKeys(Wire wire)
 /// thinking. A present control thinks unless it explicitly turns thinking off
 /// (`disabled`, `off`, `none` or `false`); `output_config` counts only through
 /// its `effort` field (null otherwise: not a thinking control).
-Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v) @trusted
+Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v)
 {
     static bool isOff(string s)
     {
@@ -350,7 +346,7 @@ Nullable!bool anthropicExtraBodyThinks(string key, const JSONValue v) @trusted
 
 /// Whether `extra_body[key]` replaces the generated control (not just an
 /// unrelated sibling field of a nested one).
-private bool extraBodyOverridesGenerated(string key, Wire wire, Format fmt, const(JSONValue)* value) @trusted
+private bool extraBodyOverridesGenerated(string key, Wire wire, Format fmt, const(JSONValue)* value)
 {
     string nested;
     if (wire == Wire.responses && key == "reasoning") nested = "effort";
@@ -493,7 +489,7 @@ struct Resolved
 }
 
 /// The level sent, for ACP and logs: null when nothing reaches the wire.
-JSONValue wireValue(const ref Resolved r) @trusted
+JSONValue wireValue(const ref Resolved r)
 {
     if (r.overridden || r.dropped || r.effective.isDefault) return JSONValue(null);
     return JSONValue(r.effective.toString);
@@ -679,7 +675,7 @@ Resolved resolve(const Thinking global, const(Thinking)* session, ProviderKind k
 }
 
 /// Write `req` into a Chat Completions body.
-void applyChat(const Request req, ref JSONValue body) @trusted
+void applyChat(const Request req, ref JSONValue body)
 {
     alias K = Request.Kind;
     final switch (req.kind)
@@ -694,7 +690,7 @@ void applyChat(const Request req, ref JSONValue body) @trusted
 
 /// Write `req` into an Anthropic Messages body; returns whether thinking is on
 /// (which rules out a custom temperature).
-bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) @trusted
+bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens)
 {
     alias K = Request.Kind;
     final switch (req.kind)
@@ -722,7 +718,7 @@ bool applyAnthropic(const Request req, ref JSONValue body, long maxTokens) @trus
 
 version (unittest)
 {
-    private ProviderConfig prov(string toml) @trusted
+    private ProviderConfig prov(string toml)
     {
         import nano.toml : parseToml;
         ProviderConfig p;
@@ -735,7 +731,7 @@ version (unittest)
         auto p = builtin(m);
         return p.isNull ? null : p.get.levels.join(",");
     }
-    private Resolved res(Thinking global, Thinking* session, ProviderKind kind, ProviderConfig p, string model) @trusted
+    private Resolved res(Thinking global, Thinking* session, ProviderKind kind, ProviderConfig p, string model)
     {
         return resolve(global, session, kind, p, model);
     }

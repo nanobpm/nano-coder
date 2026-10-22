@@ -444,14 +444,12 @@ unittest
 
 /// A correctly rounded double (`std.conv.to!double` is not: "0.7" came back
 /// as 0.700000000000000067); throws on trailing junk.
-private double parseDouble(string s) @trusted
+private double parseDouble(string s)
 {
-    import core.stdc.stdlib : strtod;
-    import std.string : toStringz;
-    auto z = s.toStringz;
-    immutable(char)* end;
-    auto v = strtod(z, &end);
-    if (end != z + s.length || !s.length) throw new Exception("bad number " ~ s);
+    import nano.safeio : cStrtod;
+    size_t used;
+    auto v = cStrtod(s, used);
+    if (used != s.length || !s.length) throw new Exception("bad number " ~ s);
     return v;
 }
 

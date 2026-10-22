@@ -67,7 +67,7 @@ BashResult run(string command, Duration timeout, string cwd = null, const Sandbo
     }
     auto outF = File(outPath, "w"), errF = File(errPath, "w"), inF = File("/dev/null", "r");
     Config cfg;
-    cfg.preExecFunction = () @trusted nothrow @nogc { newSession(); return true; };
+    cfg.preExecFunction = () nothrow @nogc { newSession(); return true; };
     // The sandbox fails closed: ToolError when it can't be applied.
     string[] argv = ["bash", "-c", command];
     if (sandbox.active)

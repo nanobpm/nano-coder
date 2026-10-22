@@ -115,7 +115,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
     /// Chat Completions messages. `tool` messages carry only text, so a tool
     /// result's images go in one `user` message after the run of tool
     /// results (as `image_url` parts); omitted ones become placeholder text.
-    JSONValue[] encodeMessages(const ref ChatRequest req) @trusted
+    JSONValue[] encodeMessages(const ref ChatRequest req)
     {
         JSONValue[] out_;
         JSONValue[] pending;
@@ -220,7 +220,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
     }
 
     /// GET/POST `url` with a short timeout; null on any failure.
-    private JSONValue probe(string url, string body_ = null) @trusted
+    private JSONValue probe(string url, string body_ = null)
     {
         import core.time : seconds;
         Request req;
@@ -256,7 +256,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
 
     /// Thinking levels and vision from `/models`, then (by server) llama.cpp
     /// `/props` or Ollama `/api/show` (port of `detect_capabilities`).
-    Capabilities probeCapabilities() @trusted
+    Capabilities probeCapabilities()
     {
         import nano.thinking : Reported;
         import nano.vision : Vision;

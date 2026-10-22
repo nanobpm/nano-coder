@@ -58,7 +58,7 @@ immutable QwenEndpoint[] endpoints = [
 immutable(QwenEndpoint) defaultEndpoint() { return endpoints[0]; }
 
 /// The endpoint whose base URL is exactly `url` (ignoring a trailing slash).
-immutable(QwenEndpoint)* endpointForUrl(string url) @trusted
+immutable(QwenEndpoint)* endpointForUrl(string url)
 {
     url = url.stripRight('/');
     foreach (ref e; endpoints) if (e.baseUrl == url) return &e;

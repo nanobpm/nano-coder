@@ -44,7 +44,7 @@ class DemoClient : LLMClient
         return r;
     }
 
-    private static void pause(long ms) @trusted
+    private static void pause(long ms)
     {
         import core.thread : Thread;
         import core.time : msecs;

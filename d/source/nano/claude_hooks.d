@@ -674,7 +674,7 @@ ProcessRun execute(const ref Hook hook, string input, string projectDir, const S
     ignoreSigpipe();
     auto inP = pipe(), outP = pipe(), errP = pipe();
     Config cfg;
-    cfg.preExecFunction = () @trusted nothrow @nogc { setsid(); return true; };
+    cfg.preExecFunction = () nothrow @nogc { setsid(); return true; };
     Pid pid;
     try pid = spawnProcess(argv, inP.readEnd, outP.writeEnd, errP.writeEnd,
         ["CLAUDE_PROJECT_DIR": projectDir, "NANO_CODER": "1"], cfg, projectDir);

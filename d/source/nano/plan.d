@@ -430,14 +430,11 @@ struct Plan
     }
 }
 
-private const(JSONValue)* field(const ref JSONValue v, string key) @trusted
-{
-    if (v.type != JSONType.object) return null;
-    return key in v.object;
-}
+import nano.safeio : jsonGet;
+private alias field = jsonGet;
 
 /// Models sometimes send a nested list as a JSON string; decode it.
-private JSONValue decoded(const JSONValue v) @trusted
+private JSONValue decoded(const JSONValue v)
 {
     if (v.type == JSONType.string)
     {
@@ -453,7 +450,7 @@ private JSONValue decoded(const JSONValue v) @trusted
     return cast(JSONValue) v;
 }
 
-private bool idOf(const JSONValue v, out uint id) @trusted
+private bool idOf(const JSONValue v, out uint id)
 {
     try
     {
@@ -502,7 +499,7 @@ private string capitalize(string text)
     return text[0 .. n].toUpper ~ text[n .. $];
 }
 
-ToolDefinition[] definitions() @trusted
+ToolDefinition[] definitions()
 {
     return [
         ToolDefinition("plan_add",
@@ -521,7 +518,7 @@ ToolDefinition[] definitions() @trusted
     ];
 }
 
-@trusted unittest // adds_updates_and_tracks_what_is_next
+ unittest // adds_updates_and_tracks_what_is_next
 {
     Plan plan;
     auto o = plan.apply("plan_add",
@@ -545,7 +542,7 @@ ToolDefinition[] definitions() @trusted
     assert(plan.render(false, size_t.max).endsWith("All items are done.\n"));
 }
 
-@trusted unittest // rejects_bad_calls_without_changing_the_plan
+ unittest // rejects_bad_calls_without_changing_the_plan
 {
     import std.exception : collectExceptionMsg, assertThrown;
     Plan plan;
@@ -568,7 +565,7 @@ ToolDefinition[] definitions() @trusted
     assertThrown(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending", "after": [3]}]}`)));
 }
 
-@trusted unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
+ unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
 {
     import std.array : replicate;
     Plan plan;
@@ -640,7 +637,7 @@ private string fitWidth(string s, size_t width)
     return out_ ~ "…";
 }
 
-@trusted unittest // checklist
+ unittest // checklist
 {
     Plan plan;
     plan.apply("plan_add", parseJSON(`{"items": ["one", "two\u001b[2J", "three"]}`));

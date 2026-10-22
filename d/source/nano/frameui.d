@@ -44,7 +44,7 @@ final class FrameUi
         // Line-buffered: a pipe would otherwise hold whole blocks back.
         import core.stdc.stdio : _IOLBF;
         stdout.setvbuf(4096, _IOLBF);
-        f.renderer = new FrameRenderer((string s) @trusted { writeFd(f.tty, s); });
+        f.renderer = new FrameRenderer((string s) { writeFd(f.tty, s); });
         writeFd(f.tty, "\x1b[?25l");
         auto reader = new Thread(&f.readLoop);
         reader.isDaemon = true;
@@ -199,14 +199,14 @@ final class FrameUi
         }
     }
 
-    private static long nowMs() @trusted
+    private static long nowMs()
     {
         import core.time : MonoTime;
         return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
     /// Watches the size; a burst of changes renders once, 150 ms after the last.
-    private void tickLoop() @trusted
+    private void tickLoop()
     {
         import core.time : msecs;
         for (;;)

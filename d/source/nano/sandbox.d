@@ -284,14 +284,14 @@ string baseOf(string p) pure nothrow
     return p;
 }
 
-void ensureDir(string path) @trusted
+void ensureDir(string path)
 {
     import std.file : exists, mkdirRecurse;
     try if (!exists(path)) mkdirRecurse(path);
     catch (Exception) {}
 }
 
-string tempDirectory() @trusted
+string tempDirectory()
 {
     import std.process : environment;
     auto t = environment.get("TMPDIR");
@@ -320,7 +320,7 @@ string[] gitDirs(string cwd) @trusted
 
 /// Whether `gitDir` is the per-worktree git directory of the worktree rooted
 /// at `cwdReal` (its `gitdir` back-pointer resolves into it).
-bool worktreeBackpointerWithin(string gitDir, string cwdReal) @trusted
+bool worktreeBackpointerWithin(string gitDir, string cwdReal)
 {
     import std.file : readText;
     try
@@ -334,7 +334,7 @@ bool worktreeBackpointerWithin(string gitDir, string cwdReal) @trusted
 version (unittest)
 {
     /// A fresh directory outside the temp roots (which are always writable).
-    string outsideDir() @trusted
+    string outsideDir()
     {
         import std.file : getcwd, mkdirRecurse;
         import std.process : thisProcessID;
@@ -364,14 +364,14 @@ version (unittest)
         return true;
     }
 
-    void rmTree(string d) @trusted
+    void rmTree(string d)
     {
         import std.file : rmdirRecurse, exists;
         if (exists(d)) rmdirRecurse(d);
     }
 }
 
-@trusted unittest
+ unittest
 {
     assert(parseMode("workspace") == SandboxMode.workspace);
     assert(parseMode("read-only") == SandboxMode.readOnly);
@@ -383,7 +383,7 @@ version (unittest)
     assert(c.mode == SandboxMode.readOnly && !c.network && c.toolCaches);
 }
 
-version (HasOsSandbox) @trusted unittest // workspace mode confines writes
+version (HasOsSandbox) unittest // workspace mode confines writes
 {
     import std.file : write, exists;
     auto ws = outsideDir(), other = outsideDir();
@@ -406,7 +406,7 @@ version (HasOsSandbox) @trusted unittest // workspace mode confines writes
     assert(!c.allowsWrite("../x", ws));
 }
 
-version (HasOsSandbox) @trusted unittest // read-only mode blocks workspace writes
+version (HasOsSandbox) unittest // read-only mode blocks workspace writes
 {
     import std.file : exists;
     auto ws = outsideDir();
@@ -421,7 +421,7 @@ version (HasOsSandbox) @trusted unittest // read-only mode blocks workspace writ
     assert(!c.allowsWrite("inside.txt", ws));
 }
 
-version (HasOsSandbox) @trusted unittest // extra writable paths
+version (HasOsSandbox) unittest // extra writable paths
 {
     import std.file : exists;
     auto ws = outsideDir(), extra = outsideDir();
@@ -435,7 +435,7 @@ version (HasOsSandbox) @trusted unittest // extra writable paths
     }
 }
 
-@trusted unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
+ unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
 {
     import std.file : exists;
     auto ws = outsideDir();
@@ -452,7 +452,7 @@ version (HasOsSandbox) @trusted unittest // extra writable paths
     assert(!w.allowsWrite("/dev/shm/x", ws));
 }
 
-@trusted unittest // a poisoned .git pointer to an external repo isn't granted
+ unittest // a poisoned .git pointer to an external repo isn't granted
 {
     import std.file : write, mkdirRecurse;
     auto ws = outsideDir(), outsider = outsideDir();
@@ -464,7 +464,7 @@ version (HasOsSandbox) @trusted unittest // extra writable paths
     foreach (r; c.writableRoots(ws)) assert(!within(r, canonicalize(fake)), r);
 }
 
-@trusted unittest // a linked worktree's git dirs are granted
+ unittest // a linked worktree's git dirs are granted
 {
     import std.file : write, mkdirRecurse;
     import std.process : execute, Config;
@@ -488,7 +488,7 @@ version (HasOsSandbox) @trusted unittest // extra writable paths
     assert(c.writableRoots(wt).any!(r => within(r, common)), c.writableRoots(wt).join(" "));
 }
 
-version (HasOsSandbox) @trusted unittest // the OS sandbox contains what the static guard can't see
+version (HasOsSandbox) unittest // the OS sandbox contains what the static guard can't see
 {
     import std.file : exists;
     auto ws = outsideDir(), other = outsideDir();

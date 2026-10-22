@@ -88,34 +88,29 @@ string normalize(string path) pure
 }
 
 /// `realpath(3)`, or null when the path does not exist.
-string canonicalize(string path) @trusted
+string canonicalize(string path)
 {
-    import core.stdc.stdlib : free;
-    import core.sys.posix.stdlib : realpath;
-    import std.string : toStringz, fromStringz;
+    import nano.safeio : realPath;
     if (!path.length) return null;
-    auto p = realpath(path.toStringz, null);
-    if (p is null) return null;
-    scope (exit) free(p);
-    return fromStringz(p).idup;
+    return realPath(path);
 }
 
 /// The target of a symlink, or null when `path` is not one.
-string readLink(string path) @trusted
+string readLink(string path)
 {
     import std.file : readLink_ = readLink;
     try return readLink_(path);
     catch (Exception) return null;
 }
 
-bool isSymlink(string path) @trusted
+bool isSymlink(string path)
 {
     import std.file : isSymlink_ = isSymlink;
     try return isSymlink_(path);
     catch (Exception) return false;
 }
 
-bool isDir(string path) @trusted
+bool isDir(string path)
 {
     import std.file : exists, isDir_ = isDir;
     try return exists(path) && isDir_(path);
@@ -123,7 +118,7 @@ bool isDir(string path) @trusted
 }
 
 /// The user's home directory, or null.
-string homeDir() @trusted
+string homeDir()
 {
     import std.process : environment;
     auto h = environment.get("HOME");

@@ -113,7 +113,7 @@ string formatBytes(size_t bytes)
 size_t textTokens(string text) { return (text.length + 3) / 4; }
 
 /// Tokens for one message: content, each tool call, framing overhead.
-size_t messageTokens(const ref Message m) @trusted
+size_t messageTokens(const ref Message m)
 {
     size_t calls;
     foreach (ref c; m.toolCalls) calls += textTokens(c.name) + textTokens(c.arguments.toString) + 4;
@@ -209,7 +209,7 @@ bool isContextOverflow(string error)
     return false;
 }
 
-private size_t firstCapture(string error, const string[] patterns) @trusted
+private size_t firstCapture(string error, const string[] patterns)
 {
     import std.regex : regex, matchFirst;
     foreach (p; patterns)
@@ -251,7 +251,7 @@ size_t outputCapFromError(string error)
 }
 
 /// Keep the head (2/3) and tail (1/3) of text longer than `maxChars`.
-string clip(string text, size_t maxChars) @trusted
+string clip(string text, size_t maxChars)
 {
     import std.utf : toUTF32, toUTF8;
     if (text.length <= maxChars) return text;
@@ -271,7 +271,7 @@ bool clipMessage(ref Message m, size_t maxTokens)
 
 /// Render messages as a plain transcript for the summarizer, newest content
 /// kept when it exceeds `maxChars`. With `ids`, blocks carry `[#N]` labels.
-string renderTranscript(const Message[] messages, size_t maxChars, bool ids) @trusted
+string renderTranscript(const Message[] messages, size_t maxChars, bool ids)
 {
     string[] blocks;
     foreach (ref m; messages)
@@ -338,7 +338,7 @@ unittest
     assert(c == "abcd\n…[4 characters omitted]…\nij", c);
 }
 
-@trusted unittest // transcripts: roles, tool calls, ids, newest kept
+ unittest // transcripts: roles, tool calls, ids, newest kept
 {
     import std.json : parseJSON;
     import nano.llm : ToolCall;

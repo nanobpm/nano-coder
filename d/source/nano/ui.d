@@ -56,7 +56,7 @@ string verbosityListing(Verbosity current)
 
 /// How a provider's key is found, for `/providers` and `/settings`.
 /// `dataDir` overrides the credentials directory (tests).
-string keyStatus(const ref ProviderConfig p, string dataDir = null) @trusted
+string keyStatus(const ref ProviderConfig p, string dataDir = null)
 {
     import std.process : environment;
     string envVar = p.apiKeyEnv.length ? p.apiKeyEnv : null;
@@ -85,7 +85,7 @@ string keyStatus(const ref ProviderConfig p, string dataDir = null) @trusted
 }
 
 /// Where a provider with no `base_url` gets its endpoint.
-string derivedEndpointSource(const ref ProviderConfig p) @trusted
+string derivedEndpointSource(const ref ProviderConfig p)
 {
     import std.process : environment;
     if (p.hasKind && p.kind == ProviderKind.githubCopilot) return "(from session token)";
@@ -113,7 +113,7 @@ private string kindLabel(const ref ProviderConfig p)
 }
 
 /// `/providers`: every effective provider in name order.
-string providersListing(const ProviderConfig[string] providers, string defaultProvider, string dataDir = null) @trusted
+string providersListing(const ProviderConfig[string] providers, string defaultProvider, string dataDir = null)
 {
     import std.algorithm : sort;
     auto names = providers.keys;

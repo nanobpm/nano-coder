@@ -200,7 +200,7 @@ struct ChatRequest
     /// `vision.maxImages` that are intact on disk. Keyed by occurrence
     /// (message index, attachment index), so the same image read twice
     /// counts twice. Computed once per request (it hashes the stored files).
-    AttachmentPlan attachmentPlan() const @trusted
+    AttachmentPlan attachmentPlan() const
     {
         import nano.attachment : exists;
         AttachmentPlan plan;
@@ -220,7 +220,7 @@ struct ChatRequest
 
     /// Message `mi`'s attachments for the wire: image data, or the text
     /// standing in for it (sent earlier, or no longer available).
-    ResolvedAttachment[] resolveAttachments(size_t mi, const ref AttachmentPlan plan) const @trusted
+    ResolvedAttachment[] resolveAttachments(size_t mi, const ref AttachmentPlan plan) const
     {
         import nano.attachment : readForLimits, ImageLimits;
         import std.format : format;

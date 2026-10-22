@@ -71,7 +71,7 @@ struct ProviderRow
 /// status, then Cancel; and the row to preselect: the newest recent model
 /// that isn't current (so Enter flips back), else the current provider.
 ProviderRow[] providerRows(const string[] recent, string currentSpec, string currentProvider,
-    const ProviderConfig[string] all, out size_t initial, string dataDir = null) @trusted
+    const ProviderConfig[string] all, out size_t initial, string dataDir = null)
 {
     import std.algorithm : sort, countUntil;
     import nano.ui : keyStatus;
@@ -154,14 +154,14 @@ string kindName(ProviderKind k)
 
 private string temperatureLiteral(double t) { return isNaN(t) ? tomlString("default") : tomlFloat(t); }
 
-private string thinkingLiteral(const Nullable!Thinking t) @trusted
+private string thinkingLiteral(const Nullable!Thinking t)
 {
     return t.isNull ? null : tomlString(t.get.toString);
 }
 
 /// The config text with `changes` applied (settings.rs `save`, minus the
 /// write). `user` holds each changed provider's own entry.
-string applyChanges(string doc, const ref Config c, const ref Changes ch, const ProviderConfig[string] user) @trusted
+string applyChanges(string doc, const ref Config c, const ref Changes ch, const ProviderConfig[string] user)
 {
     import std.string : indexOf;
     import nano.ui : vname = name;

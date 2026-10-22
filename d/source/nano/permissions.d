@@ -207,14 +207,14 @@ string validateRule(string ruleSrc)
     return null;
 }
 
-private string stringArg(JSONValue args, string key) @trusted
+private string stringArg(JSONValue args, string key)
 {
     if (args.type != JSONType.object) return null;
     auto v = key in args;
     return v !is null && v.type == JSONType.string ? v.str : null;
 }
 
-private string currentDir() @trusted
+private string currentDir()
 {
     import std.file : getcwd;
     try return getcwd();

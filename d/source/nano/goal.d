@@ -88,7 +88,7 @@ struct Outcome
     }
 
     /// The latest successful `report_outcome` call among one turn's messages.
-    static bool reportedIn(const Message[] messages, out Outcome found) @trusted
+    static bool reportedIn(const Message[] messages, out Outcome found)
     {
         bool succeeded(string id)
         {
@@ -114,7 +114,7 @@ struct Outcome
     }
 }
 
-ToolDefinition definition() @trusted
+ToolDefinition definition()
 {
     return ToolDefinition(toolName,
         "Report the outcome of the task you were given. This ends your turn: the summary becomes your final "
@@ -137,7 +137,7 @@ ToolDefinition definition() @trusted
         }`));
 }
 
-@trusted unittest // parses arguments leniently
+ unittest // parses arguments leniently
 {
     import std.exception : assertThrown;
     auto o = Outcome.fromArgs(parseJSON(`{"status": "Done", "summary": " opened #12 "}`));
@@ -149,7 +149,7 @@ ToolDefinition definition() @trusted
     assertThrown(Outcome.fromArgs(parseJSON(`{}`)));
 }
 
-@trusted unittest // finds the last successful report
+ unittest // finds the last successful report
 {
     import nano.llm : ToolCall;
     ToolCall call(string id, string status)

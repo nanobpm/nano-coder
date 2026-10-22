@@ -140,7 +140,7 @@ bool regexReaches(string pattern, const string[] targets)
 
 /// Whether a `.git` directory exists at or below `root` (symlinks not
 /// followed; a tree larger than the budget is treated as containing one).
-bool containsGitDir(string root) @trusted
+bool containsGitDir(string root)
 {
     import std.file : dirEntries, SpanMode, DirEntry;
     import std.path : baseName;

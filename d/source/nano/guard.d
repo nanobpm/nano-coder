@@ -80,7 +80,7 @@ string mvTargetDir(const Word[] args) pure
 }
 
 /// The checked-out branch in `dir`, or null.
-string currentBranch(string dir) @trusted
+string currentBranch(string dir)
 {
     import std.process : execute, Config;
     try
@@ -632,7 +632,7 @@ struct Guard
     }
 }
 
-private string envGet(string name) @trusted
+private string envGet(string name)
 {
     import std.process : environment;
     return environment.get(name);

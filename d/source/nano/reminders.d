@@ -170,7 +170,7 @@ struct Reminders
 
 /// Fingerprint one call: tool, normalised arguments, error flag, result hash.
 private string fingerprint(string tool, JSONValue args, string rawArgs, bool ok, string result,
-        const string[] attachments) @trusted
+        const string[] attachments)
 {
     import std.digest.sha : SHA256, toHexString;
     auto a = rawArgs !is null ? rawArgs : normalisedArgs(tool, args);
@@ -190,7 +190,7 @@ private string fingerprint(string tool, JSONValue args, string rawArgs, bool ok,
 /// (`[... N characters omitted; full output saved to PATH ...]`), so two
 /// identical large outputs still match. Only the marker's own path is
 /// rewritten; the omitted count, head and tail stay in the hash.
-private string normaliseSpillPaths(string result) @trusted
+private string normaliseSpillPaths(string result)
 {
     import std.regex : regex, replaceAll;
     static re = regex(`(characters omitted; full output saved to )[^\n]*?(-\d+-\d+-\d+\.txt) \.\.\.\]`);
@@ -316,7 +316,7 @@ string[] splitPipeline(string command)
 
 version (unittest)
 {
-    private RepeatVerdict call(ref Reminders r, string cmd, bool ok, string result, string extra = "") @trusted
+    private RepeatVerdict call(ref Reminders r, string cmd, bool ok, string result, string extra = "")
     {
         return r.afterRepeatCall("bash", parseJSON(`{"command": ` ~ JSONValue(cmd).toString ~ extra ~ `}`), null, ok, result);
     }
@@ -329,7 +329,7 @@ version (unittest)
     }
 }
 
-@trusted unittest // suggests a plan once per session; memory once unless saved
+ unittest // suggests a plan once per session; memory once unless saved
 {
     Plan plan;
     Reminders r;
@@ -353,7 +353,7 @@ version (unittest)
     assert(memoryNotes(c, true) == 0);
 }
 
-@trusted unittest // nudges a stale plan until it changes
+ unittest // nudges a stale plan until it changes
 {
     Plan plan;
     plan.apply("plan_add", parseJSON(`{"items": ["read", "fix"]}`));
@@ -454,7 +454,7 @@ unittest // changing execution arguments is not a repeat; the same ones are
     assert(last.warning);
 }
 
-@trusted unittest // distinct malformed payloads, exempt tools, reset, images
+ unittest // distinct malformed payloads, exempt tools, reset, images
 {
     Reminders r;
     auto empty = parseJSON(`{}`);

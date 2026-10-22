@@ -52,13 +52,13 @@ final class LiveView
 {
     private string[string] texts;
 
-    void set(string name, string text) @trusted
+    void set(string name, string text)
     {
         synchronized (this) texts[name] = text;
     }
 
     /// The text for `/name`, or null when none was rendered.
-    string get(string name) @trusted
+    string get(string name)
     {
         synchronized (this)
         {

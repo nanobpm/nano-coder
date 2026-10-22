@@ -106,14 +106,14 @@ string expandHome(string path)
     return path;
 }
 
-private bool isFile_(string p) @trusted
+private bool isFile_(string p)
 {
     import std.file : exists, isFile;
     try return exists(p) && isFile(p);
     catch (Exception) return false;
 }
 
-private bool isDir_(string p) @trusted
+private bool isDir_(string p)
 {
     import std.file : exists, isDir;
     try return exists(p) && isDir(p);
@@ -444,7 +444,7 @@ private Regex!char[] compilePatterns(const string[] patterns)
 
 /// `.md` files under `dir`, sorted, following symlinks without looping; with
 /// `allowOutside` false, directories whose real path leaves `root` are skipped.
-private string[] markdownFiles(string dir, string root, bool allowOutside) @trusted
+private string[] markdownFiles(string dir, string root, bool allowOutside)
 {
     import std.file : dirEntries, SpanMode;
     bool[string] visited;
@@ -871,7 +871,7 @@ class ProjectInstructions
 
 version (unittest)
 {
-    private string testDir(string name) @trusted
+    private string testDir(string name)
     {
         import std.file : tempDir, mkdirRecurse, rmdirRecurse, exists;
         auto d = buildPath(canonicalize(tempDir), "nano-d-instr-" ~ name);
@@ -880,7 +880,7 @@ version (unittest)
         return d;
     }
 
-    private void put(string path, string text) @trusted
+    private void put(string path, string text)
     {
         import std.file : mkdirRecurse, write;
         mkdirRecurse(path.dirName);

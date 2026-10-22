@@ -49,7 +49,7 @@ struct SettingsHost
 
 /// The bare `/model` picker: a recent model or a provider, then its model.
 /// Returns the chosen spec, or null.
-string pickModel(SettingsUi ui, ref SettingsHost h) @trusted
+string pickModel(SettingsUi ui, ref SettingsHost h)
 {
     import nano.recents : canonical;
     auto cfg = h.cfg;
@@ -75,7 +75,7 @@ string pickModel(SettingsUi ui, ref SettingsHost h) @trusted
 }
 
 /// A model from `name`'s list (or typed); null goes back to the providers.
-string pickFromProvider(SettingsUi ui, ref SettingsHost h, string name) @trusted
+string pickFromProvider(SettingsUi ui, ref SettingsHost h, string name)
 {
     import std.algorithm : countUntil;
     auto p = name in h.cfg.providers;
@@ -100,7 +100,7 @@ string pickFromProvider(SettingsUi ui, ref SettingsHost h, string name) @trusted
 }
 
 /// The dialog. Returns notices to show after it closes.
-string[] runSettings(SettingsUi ui, ref SettingsHost h) @trusted
+string[] runSettings(SettingsUi ui, ref SettingsHost h)
 {
     import nano.ui : Verbosity, allVerbosities, vname = name, vdescribe = describe;
     import nano.context : formatTokens;
@@ -211,7 +211,7 @@ private bool parseCount(string t, out long v)
     catch (Exception) return false;
 }
 
-private void switchTo(SettingsUi ui, ref SettingsHost h, string spec, ref Changes changes, ref string[] notices) @trusted
+private void switchTo(SettingsUi ui, ref SettingsHost h, string spec, ref Changes changes, ref string[] notices)
 {
     import std.algorithm : filter, startsWith;
     import std.array : array;
@@ -227,7 +227,7 @@ private void switchTo(SettingsUi ui, ref SettingsHost h, string spec, ref Change
     if (auto w = a.thinking.warning) ui.say("Warning: " ~ w);
 }
 
-private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes changes, ref string[] notices) @trusted
+private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes changes, ref string[] notices)
 {
     ProviderConfig[string] user;
     foreach (n; changes.providers.byKey) if (auto p = n in h.cfg.providers) user[n] = *p;
@@ -244,7 +244,7 @@ private void saveAndReport(SettingsUi ui, ref SettingsHost h, ref Changes change
 /// The user's own entries for providers edited this visit (the diff from presets).
 private ProviderConfig[string] userEntries;
 
-private bool editContext(SettingsUi ui, ref SettingsHost h) @trusted
+private bool editContext(SettingsUi ui, ref SettingsHost h)
 {
     import nano.context : CompactionMode;
     auto cfg = h.cfg;
@@ -283,13 +283,13 @@ private bool editContext(SettingsUi ui, ref SettingsHost h) @trusted
     return true;
 }
 
-private string[] scopes(Agent a) @trusted
+private string[] scopes(Agent a)
 {
     auto p = a.client.providerName, m = a.client.modelName;
     return [format("This model (%s/%s)", p, m), format("All %s models", p), "All models (global)"];
 }
 
-private void editTemperature(SettingsUi ui, ref SettingsHost h, ref Changes changes) @trusted
+private void editTemperature(SettingsUi ui, ref SettingsHost h, ref Changes changes)
 {
     import nano.temperature : maxTemperature = MAX, show;
     auto a = h.agent;
@@ -348,7 +348,7 @@ private void editTemperature(SettingsUi ui, ref SettingsHost h, ref Changes chan
     if (now.warning.length) ui.say("Note: " ~ now.warning);
 }
 
-private void editThinking(SettingsUi ui, ref SettingsHost h, ref Changes changes) @trusted
+private void editThinking(SettingsUi ui, ref SettingsHost h, ref Changes changes)
 {
     import nano.thinking : Thinking, Source;
     auto a = h.agent;
@@ -394,7 +394,7 @@ private void editThinking(SettingsUi ui, ref SettingsHost h, ref Changes changes
 }
 
 /// Add or edit a provider; returns its name, or null when cancelled.
-private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] notices) @trusted
+private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] notices)
 {
     import std.algorithm : sort, canFind, filter, startsWith;
     import std.array : array;

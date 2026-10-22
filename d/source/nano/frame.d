@@ -386,7 +386,7 @@ struct Transcript
         cr = false;
     }
 
-    void feed(const(ubyte)[] bytes) @trusted
+    void feed(const(ubyte)[] bytes)
     {
         auto buf = pending ~ bytes;
         // Hold back an incomplete UTF-8 sequence for the next call.

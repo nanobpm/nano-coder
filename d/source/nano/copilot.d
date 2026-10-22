@@ -102,7 +102,7 @@ static immutable string[2][] editorHeaders = [
 ];
 
 /// GitHub host: `github.com`, or a GHE.com domain via `GITHUB_COPILOT_DOMAIN`.
-string domain() @trusted
+string domain()
 {
     import std.algorithm : stripLeft;
     auto d = environment.get("GITHUB_COPILOT_DOMAIN", "").strip;
@@ -111,7 +111,7 @@ string domain() @trusted
     return d.length ? d : "github.com";
 }
 
-private string clientId() @trusted
+private string clientId()
 {
     auto id = environment.get("GITHUB_COPILOT_CLIENT_ID", "");
     return id.length ? id : defaultClientId;
@@ -131,7 +131,7 @@ struct Endpoints
 /// The platform data dir (`~/Library/Application Support/nano-coder` or
 /// `$XDG_DATA_HOME/nano-coder`), shared with the Rust build; the legacy
 /// `agentic-harness` dir when only that exists.
-string appDataDir() @trusted
+string appDataDir()
 {
     import std.path : buildPath, expandTilde;
     import std.file : exists;
@@ -142,7 +142,7 @@ string appDataDir() @trusted
 }
 
 /// `github-copilot.json` in the platform data dir, shared with the Rust build.
-string credentialsPath(string dataDir = null) @trusted
+string credentialsPath(string dataDir = null)
 {
     import std.path : buildPath;
     return buildPath(dataDir.length ? dataDir : appDataDir(), "github-copilot.json");
@@ -189,7 +189,7 @@ struct StoredCredentials
 }
 
 /// The saved login, if any (and parseable).
-bool loadCredentials(out StoredCredentials c, string dataDir = null) @trusted
+bool loadCredentials(out StoredCredentials c, string dataDir = null)
 {
     import std.file : exists, readText;
     auto path = credentialsPath(dataDir);
@@ -206,7 +206,7 @@ bool loadCredentials(out StoredCredentials c, string dataDir = null) @trusted
 }
 
 /// Write the login with owner-only permissions; returns the path.
-string saveCredentials(const StoredCredentials c, string dataDir = null) @trusted
+string saveCredentials(const StoredCredentials c, string dataDir = null)
 {
     auto path = credentialsPath(dataDir);
     JSONValue j = ["oauth_token": c.oauthToken, "domain": c.domain, "created_at": c.createdAt];
@@ -236,7 +236,7 @@ struct SessionToken
 }
 
 /// Exchange a GitHub OAuth token for a Copilot session token.
-SessionToken exchange(const Endpoints e, string oauth) @trusted
+SessionToken exchange(const Endpoints e, string oauth)
 {
     import nano.http : Request, perform;
     import std.datetime.systime : Clock;
@@ -269,7 +269,7 @@ SessionToken exchange(const Endpoints e, string oauth) @trusted
 }
 
 /// POST a form with editor headers; the parsed JSON reply.
-private JSONValue postForm(string url, string[2][] fields, bool requireOk) @trusted
+private JSONValue postForm(string url, string[2][] fields, bool requireOk)
 {
     import nano.http : Request, perform;
     import std.uri : encodeComponent;
@@ -292,7 +292,7 @@ private JSONValue postForm(string url, string[2][] fields, bool requireOk) @trus
 /// Interactive device-flow login; saves the OAuth token and returns its path.
 /// `note` prints progress (stderr in the CLI); `sleep` waits between polls.
 string login(scope void delegate(string) @safe note, scope void delegate(long secs) @safe sleep,
-    Endpoints e = Endpoints.init, string dataDir = null) @trusted
+    Endpoints e = Endpoints.init, string dataDir = null)
 {
     import std.datetime.systime : Clock;
     auto d = domain();
@@ -352,7 +352,7 @@ unittest
     assert(e.deviceCode == "https://acme.ghe.com/login/device/code");
 }
 
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, rmdirRecurse, getAttributes, exists;
     import std.path : buildPath;

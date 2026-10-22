@@ -14,17 +14,17 @@ import nano.llm;
 import nano.config : ResolvedProvider, reasonsOverResponses;
 import thinking = nano.thinking;
 
-private string strOf(const JSONValue v, string key) @trusted
+private string strOf(const JSONValue v, string key)
 {
-    if (v.type != JSONType.object) return "";
-    auto p = key in v.object;
+    import nano.safeio : jsonGet;
+    auto p = jsonGet(v, key);
     return p && p.type == JSONType.string ? p.str : "";
 }
 
 private string typeOf(const JSONValue v) { return strOf(v, "type"); }
 
 /// The Responses request body for `req`, with provider overrides applied.
-JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p, bool stream) @trusted
+JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p, bool stream)
 {
     auto replay = p.replayReasoning;
     string[] instructions;
@@ -144,7 +144,7 @@ private void readUsage(const JSONValue u, ref TokenUsage usage) @trusted
             if (auto v = "cached_tokens" in d.object) if (v.type == JSONType.integer) usage.cachedInputTokens = v.integer;
 }
 
-private ToolCall callFrom(const JSONValue item, string raw) @trusted
+private ToolCall callFrom(const JSONValue item, string raw)
 {
     auto id = strOf(item, "call_id");
     if (!id.length) id = strOf(item, "id");
@@ -192,7 +192,7 @@ struct ResponsesStream
     private string[long] args;
     private long[] order;
 
-    void event(string data) @trusted
+    void event(string data)
     {
         auto j = parseJSON(data);
         long index = "output_index" in j && j["output_index"].type == JSONType.integer ? j["output_index"].integer : 0;
@@ -243,7 +243,7 @@ struct ResponsesStream
         }
     }
 
-    LLMResponse finish() @trusted
+    LLMResponse finish()
     {
         import std.algorithm : sort;
         size_t position;
@@ -298,7 +298,7 @@ struct ResponsesStream
     assert(b2["temperature"].floating == 0.3 && b2["reasoning"]["effort"].str == "none");
 }
 
-@trusted unittest
+ unittest
 {
     auto r = parseResponses(parseJSON(`{"status":"completed","output":[
         {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Think."}]},
@@ -316,7 +316,7 @@ struct ResponsesStream
     assert(threw);
 }
 
-@trusted unittest
+ unittest
 {
     ResponsesStream st;
     string shown, thought;

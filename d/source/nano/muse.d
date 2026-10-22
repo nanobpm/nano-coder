@@ -33,7 +33,7 @@ immutable string[2][] clientHeaders = [
     ["x-client-id", "tbh:exec"],
 ];
 
-private string envBase(string var, string dflt) @trusted
+private string envBase(string var, string dflt)
 {
     auto v = environment.get(var, "").strip.stripRight('/');
     return v.length ? v : dflt;
@@ -44,7 +44,7 @@ string authBase() { return envBase("MUSE_AUTH_BASE_URL", defaultAuthBase); }
 /// Mint and catalog host (`MUSE_MINT_BASE_URL` overrides).
 string mintBase() { return envBase("MUSE_MINT_BASE_URL", defaultMintBase); }
 
-private string clientId() @trusted
+private string clientId()
 {
     auto id = environment.get("MUSE_CLIENT_ID", "");
     return id.length ? id : defaultClientId;
@@ -88,7 +88,7 @@ struct StoredCredentials
 
     OauthGrant grant() const { return OauthGrant(oauthToken, refreshToken, expiresAt); }
 
-    JSONValue toJSON() const @trusted
+    JSONValue toJSON() const
     {
         JSONValue j = ["oauth_token": oauthToken];
         if (refreshToken !is null) j["refresh_token"] = refreshToken;
@@ -99,7 +99,7 @@ struct StoredCredentials
         return j;
     }
 
-    static StoredCredentials fromJSON(const JSONValue j) @trusted
+    static StoredCredentials fromJSON(const JSONValue j)
     {
         string str(string k)
         {
@@ -125,7 +125,7 @@ string credentialsPath(string dataDir = null)
     return buildPath(dataDir.length ? dataDir : appDataDir(), "muse.json");
 }
 
-bool loadCredentials(out StoredCredentials c, string dataDir = null) @trusted
+bool loadCredentials(out StoredCredentials c, string dataDir = null)
 {
     import std.file : exists, readText;
     auto path = credentialsPath(dataDir);
@@ -194,7 +194,7 @@ string[string] withClientHeaders(string[string] h, const string[string] override
     return h;
 }
 
-private JSONValue postForm(string url, string[2][] fields, bool requireOk, out int status) @trusted
+private JSONValue postForm(string url, string[2][] fields, bool requireOk, out int status)
 {
     import nano.http : Request, perform;
     import std.uri : encodeComponent;
@@ -220,14 +220,14 @@ private JSONValue postForm(string url, string[2][] fields, bool requireOk, out i
     }
 }
 
-private string strField(const JSONValue j, string k) @trusted
+private string strField(const JSONValue j, string k)
 {
     if (j.type != JSONType.object) return null;
     auto v = k in j;
     return v && v.type == JSONType.string ? v.str : null;
 }
 
-private Nullable!long intField(const JSONValue j, string k) @trusted
+private Nullable!long intField(const JSONValue j, string k)
 {
     if (j.type != JSONType.object) return Nullable!long.init;
     auto v = k in j;
@@ -235,7 +235,7 @@ private Nullable!long intField(const JSONValue j, string k) @trusted
     return Nullable!long.init;
 }
 
-private long now() @trusted
+private long now()
 {
     import std.datetime.systime : Clock;
     return Clock.currTime.toUnixTime;
@@ -249,7 +249,7 @@ struct MintedKey
 
 /// Exchange an OAuth access token for a Meta API key. `onboard` only for
 /// the interactive login (the account may be new).
-MintedKey mint(const Endpoints e, string oauth, bool onboard) @trusted
+MintedKey mint(const Endpoints e, string oauth, bool onboard)
 {
     import nano.http : Request, perform, ApiError;
     Request req;
@@ -289,7 +289,7 @@ MintedKey mint(const Endpoints e, string oauth, bool onboard) @trusted
 
 /// An actionable message for a refused mint. Never echoes the body: a
 /// refused 2xx can still carry the key.
-string mintRefusal(int status, const JSONValue v) @trusted
+string mintRefusal(int status, const JSONValue v)
 {
     string field(string k)
     {
@@ -334,7 +334,7 @@ Nullable!OauthGrant refreshGrant(const Endpoints e, const OauthGrant grant)
 /// Interactive device-code login; mints a key to prove the account works,
 /// saves both and returns the path.
 string login(scope void delegate(string) @safe note, scope void delegate(long secs) @safe sleep,
-    Endpoints e = Endpoints.init, string dataDir = null) @trusted
+    Endpoints e = Endpoints.init, string dataDir = null)
 {
     import std.datetime.systime : Clock;
     import std.datetime.timezone : UTC;
@@ -410,7 +410,7 @@ string modelId(const JSONValue row)
 }
 
 /// `metadata["muse-code"].is_hidden`, or `visibility: "hidden"`.
-bool isHiddenRow(const JSONValue row) @trusted
+bool isHiddenRow(const JSONValue row)
 {
     if (row.type != JSONType.object) return false;
     if (auto m = "metadata" in row)
@@ -424,7 +424,7 @@ bool isHiddenRow(const JSONValue row) @trusted
 }
 
 /// An image-generation model (its image flag is not input vision).
-bool isImageGenerationRow(const JSONValue row) @trusted
+bool isImageGenerationRow(const JSONValue row)
 {
     if (row.type != JSONType.object) return false;
     foreach (k; ["supports_image_generation", "supportsImageGeneration"])
@@ -444,7 +444,7 @@ bool museVision(const JSONValue row)
     return !isImageGenerationRow(row) && !isHiddenRow(row) && !isContributorRow(row);
 }
 
-private long positive(const JSONValue row, string[] keys) @trusted
+private long positive(const JSONValue row, string[] keys)
 {
     if (row.type != JSONType.object) return 0;
     foreach (k; keys)
@@ -513,7 +513,7 @@ unittest
     assert("User-Agent" !in h && h["x-client-id"] == "tbh:exec");
 }
 
-@trusted unittest
+ unittest
 {
     auto refused = mintRefusal(403, parseJSON(`{"api_key":"sk-secret","require_payment":true,"action_url":"https://pay"}`));
     assert(!refused.canFind("sk-secret") && refused.canFind("subscription is required") && refused.canFind("https://pay"));
@@ -521,7 +521,7 @@ unittest
     assert(mintRefusal(500, JSONValue.init).canFind("no usable API key"));
 }
 
-@trusted unittest
+ unittest
 {
     OauthGrant g = OauthGrant("a", "r", Nullable!long(100));
     assert(g.needsRefresh(50) && !g.needsRefresh(39));
@@ -530,7 +530,7 @@ unittest
     assert(isFresher(OauthGrant("b", "r"), g) && !isFresher(OauthGrant("b", "r"), OauthGrant("a", "r")));
 }
 
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, getAttributes;
     import std.path : buildPath;
@@ -560,7 +560,7 @@ unittest
     assert(reloadRenewedGrant(OauthGrant("old", "other", Nullable!long(1)), dir).isNull);
 }
 
-@trusted unittest
+ unittest
 {
     auto cat = parseJSON(`{"data":[
         {"id":"muse-spark-1.3","context_limit":200000,"output_limit":32000,
