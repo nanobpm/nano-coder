@@ -32,7 +32,9 @@ All code is `@safe`: every module starts with `@safe:`, and calls the
 compiler can't check are wrapped in small `@trusted` functions (shared ones
 live in `source/nano/safeio.d`). `scripts/check-safe.sh` runs before every
 `dub build` and `dub test` and fails the build on a module without `@safe:`,
-a `@system:`/`@trusted:` label, or `@system` outside `extern (C)`.
+a `@system:`/`@trusted:` label, `@system` outside `extern (C)`, or more
+`@trusted` outside `safeio.d` than `scripts/trusted-budget` allows. The build
+uses `-preview=dip1000` and `-preview=nosharedaccess`.
 
 ## Status
 
