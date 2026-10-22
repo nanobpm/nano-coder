@@ -11,6 +11,7 @@ import std.json;
 import std.format : format;
 import std.string : strip, stripRight, startsWith, indexOf;
 import nano.turn_commands : LiveView, splitCmd, timing, Timing;
+import nano.markdown : MarkdownStream, renderMarkdownText = render;
 import std.array : join;
 static import std.string;
 import std.file : getcwd, exists, readText;
@@ -567,6 +568,29 @@ class Console : AgentEvents
     // (its first line got a stamp, so later lines are padded under it).
     private string blockStamp;
     private bool answering;
+    // Answers on a color terminal have their markdown rendered a block at a
+    // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
+    private MarkdownStream markdown;
+    bool renderMarkdown() const { return tty && color; }
+    private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
+    private size_t answerWidth()
+    {
+        auto w = terminalWidth(), pad = answerPad();
+        return w > pad + 10 ? w - pad : 10;
+    }
+
+    /// Prints any streamed markdown still held back (the answer segment
+    /// ended, or the turn stopped mid-block).
+    private void flushMarkdown()
+    {
+        if (!markdown.holding) return;
+        auto rest = markdown.finish(answerWidth());
+        if (rest.length) writeAligned(rest, answerPad());
+    }
+
+    /// A whole answer as shown on this console: markdown rendered for a
+    /// color terminal, verbatim otherwise.
+    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
 
     string stamp() { return .stamp(color); }
 
@@ -624,6 +648,7 @@ class Console : AgentEvents
         import std.string : stripLeft;
         if (!thinking)
         {
+            flushMarkdown();
             if (midLine) { write("\n"); midLine = false; }
             thinking = true;
             answering = false;
@@ -747,7 +772,8 @@ class Console : AgentEvents
                 midLine = st.length > 0;
                 answering = true;
             }
-            writeAligned(chunk, atomicLoad(gTimestamps) ? stampWidth : 0);
+            auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : chunk;
+            if (shown.length) writeAligned(shown, answerPad());
             stdOut.flush();
         }
     }
@@ -757,6 +783,7 @@ class Console : AgentEvents
     {
         synchronized (this)
         {
+            flushMarkdown();
             if (midLine) write("\n");
             midLine = false;
             answering = false;
@@ -770,6 +797,7 @@ class Console : AgentEvents
         synchronized (this)
         {
             finishThinking();
+            flushMarkdown();
             if (midLine) writeln();
             midLine = false;
             answering = false;
@@ -828,6 +856,7 @@ class Console : AgentEvents
         synchronized (this)
         {
             // Reasoning that didn't stream shows now, like a block that just ended.
+            flushMarkdown();
             if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
             finishThinking();
             streamedThinking = false;
@@ -1609,7 +1638,7 @@ int runMain(string[] args)
         // answer deltas were dropped reprints the whole answer (ui.rs).
         if ((console.quiet || console.droppedAnswer) && console.finalAnswer.length)
         {
-            writeln(console.finalAnswer);
+            writeln(console.display(console.finalAnswer));
             stdOut.flush();
         }
         // Steers that arrived after the agent's last step run as the next prompts.
