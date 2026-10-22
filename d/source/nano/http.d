@@ -182,7 +182,26 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
 string postProvider(string url, string[string] headers, JSONValue body_, string what,
         const ref imported!"nano.config".ProviderConfig c, scope void delegate(string data) onEvent = null)
 {
-    return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, onEvent);
+    // Drop the OpenAI-style `[DONE]` terminator for every provider, as the Rust
+    // shared SSE layer does: GitHub Copilot's Anthropic Messages endpoint sends
+    // it too, and the Messages/Responses parsers would fail to parse it as JSON.
+    void delegate(string) filtered = null;
+    if (onEvent !is null)
+        filtered = (string data) { if (!isStreamEnd(data)) onEvent(data); };
+    return postJson(url, headers, body_, what, c.retryPolicy, c.statuses, c.timeoutSecs, filtered);
+}
+
+/// The `data: [DONE]` end-of-stream marker (not a JSON event).
+bool isStreamEnd(string data) pure @safe
+{
+    import std.string : strip;
+    return data.strip == "[DONE]";
+}
+
+unittest
+{
+    assert(isStreamEnd("[DONE]") && isStreamEnd(" [DONE]\r"));
+    assert(!isStreamEnd(`{"type":"message_stop"}`) && !isStreamEnd("[DONE] x"));
 }
 
 /// Sleep for a retry backoff, cut short (with Cancelled) by a cancel.
