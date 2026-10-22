@@ -26,6 +26,7 @@ mod input_history;
 mod instructions;
 mod lineedit;
 mod llm;
+mod markdown;
 mod mdtable;
 mod memory;
 mod mode;
