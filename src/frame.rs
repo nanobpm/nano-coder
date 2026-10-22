@@ -1,7 +1,8 @@
-//! App-owned frame renderer (approach (a) from #46).
+//! App-owned frame renderer (approach (a) from #46), used whenever stdout is a
+//! terminal (piped output is plain text, see `ui::Renderer`).
 //!
-//! Instead of writing output into the terminal's scrollback and pinning the
-//! status bar with a scroll region, this renderer *owns* the screen: every
+//! Instead of writing output into the terminal's scrollback, this renderer
+//! *owns* the screen: every
 //! render turns the current state into a `Vec<String>` of lines at the current
 //! width (the transcript, then the input editor, then the status bar as the
 //! last line), diffs it against the previous frame and rewrites only what
@@ -17,52 +18,9 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 use crate::plan::{Plan, Status};
-
-/// Which renderer the interactive CLI drives.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RendererMode {
-    /// The scroll-region renderer: the terminal owns scrollback and reflow.
-    Legacy,
-    /// The app-owned frame renderer: nano-coder re-renders on a width change.
-    #[default]
-    Frame,
-}
-
-impl RendererMode {
-    pub const ALL: [RendererMode; 2] = [RendererMode::Legacy, RendererMode::Frame];
-
-    pub fn describe(self) -> &'static str {
-        match self {
-            RendererMode::Legacy => "terminal owns scrollback and reflow (scroll region)",
-            RendererMode::Frame => "app re-renders the frame on a width change",
-        }
-    }
-}
-
-impl std::fmt::Display for RendererMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            RendererMode::Legacy => "legacy",
-            RendererMode::Frame => "frame",
-        })
-    }
-}
-
-impl std::str::FromStr for RendererMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        RendererMode::ALL
-            .into_iter()
-            .find(|m| m.to_string() == s.trim().to_lowercase())
-            .ok_or_else(|| format!("unknown renderer {s:?} (legacy, frame)"))
-    }
-}
 
 // Synchronized output: the terminal buffers everything between these and paints
 // it in one go, so a half-drawn frame is never visible. Terminals that don't
@@ -77,7 +35,7 @@ const GREEN: &str = "\x1b[38;5;114m";
 const RED: &str = "\x1b[38;5;203m";
 const RESET: &str = "\x1b[0m";
 
-/// Result-preview lines shown per tool result (matches the legacy renderer).
+/// Result-preview lines shown per tool result (matches plain output).
 const PREVIEW_LINES: usize = 10;
 
 // --- The transcript model: items → lines at a width -----------------------
@@ -108,11 +66,7 @@ pub enum Item {
     Note(String),
     /// The `report_outcome` status marker (`✔ completed` etc.). Distinct from
     /// [`Item::Note`] because it is derived from a CONVERSATION event (the
-    /// tool call), not renderer-only output. It is part of the captured
-    /// transcript all the same: on a frame → legacy switch `set_mode` copies
-    /// the WHOLE `items` list and `replay_transcript` reprints it directly
-    /// (the caller does not re-derive history from the conversation on that
-    /// path), so this marker is restored in place, exactly once.
+    /// tool call), not renderer-only output.
     OutcomeMark(String),
     /// Verbatim command / informational output (e.g. `/help`, `/context`),
     /// captured into the transcript so it can't corrupt the owned frame.
@@ -130,7 +84,7 @@ pub enum Item {
 /// created (empty when timestamps are off). Pairing the stamp with the item —
 /// rather than storing it per-variant — keeps every transcript item (messages,
 /// tool calls, results, plans, thinking, notes, and command output) stamped
-/// consistently, mirroring the legacy renderer's `ui::stamp_block`.
+/// consistently, mirroring plain output's `ui::stamp_block`.
 #[derive(Debug, Clone)]
 pub struct StampedItem {
     pub stamp: String,
@@ -139,7 +93,7 @@ pub struct StampedItem {
 
 /// Render one stamped transcript item: its content at the reduced width, with
 /// the timestamp on the first row and continuation rows indented under it
-/// (mirroring the legacy `ui::stamp_block`). Every assembled row is bounded to
+/// (mirroring plain output's `ui::stamp_block`). Every assembled row is bounded to
 /// `width` so an extremely narrow frame can't overflow and wrap natively. With
 /// timestamps off the stamp is empty, so this collapses to plain `render_item`.
 pub fn render_stamped(si: &StampedItem, width: usize) -> Vec<String> {
@@ -331,8 +285,8 @@ pub fn compose(transcript: &[String], editor: &[String], status: &str) -> Vec<St
     frame
 }
 
-/// The dim queue indicator row shown under the editor in frame mode, mirroring
-/// the legacy status line's `⏸N queued · /queue to edit` hint. Returns `None`
+/// The dim queue indicator row shown under the editor (`⏸N queued · /queue to
+/// edit`). Returns `None`
 /// when nothing is queued.
 pub fn queue_indicator(queued: usize, width: usize) -> Option<String> {
     (queued > 0).then(|| fit(&format!("{DIM}⏸{queued} queued · /queue to edit{RESET}"), width.max(1)))
@@ -520,34 +474,6 @@ fn sanitize(line: &str) -> String {
     out
 }
 
-/// Sanitize one captured transcript field for the legacy replay on a frame →
-/// legacy switch, sharing the frame layout's per-line rules so the reprinted
-/// text matches what the frame showed. Unlike
-/// [`crate::sanitize_terminal_text`] — which deletes `\t` outright and strips
-/// only the ESC byte (leaving a literal `[32m` fragment behind) — this expands
-/// tabs to spaces (8-stop) and keeps SGR styling sequences, so a replayed
-/// `read_file` result keeps its indentation and a styled line keeps its colour
-/// instead of degrading to `[32mhello[0m`. Newlines are kept (a transcript
-/// field is multi-line content), the U+2028/U+2029 forged-line-break protection
-/// is preserved, and every other cursor/erase/OSC escape and C0/C1/DEL control
-/// is dropped so model/tool-controlled text cannot move the legacy cursor or
-/// clear the screen. `Item::Raw` exports do NOT come here — they stay
-/// byte-exact.
-pub(crate) fn sanitize_replay(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.split('\n') {
-        // `sanitize` expands tabs and keeps SGR styling but drops every
-        // control, `\n` included; re-add the line feed between logical lines.
-        out.push_str(&sanitize(line));
-        out.push('\n');
-    }
-    out.pop(); // drop the trailing newline `split` does not imply
-    // `sanitize` keeps control chars it has a rule for; U+2028/U+2029 are not
-    // control chars, so strip the forged line breaks here to match
-    // `sanitize_terminal_text`.
-    out.chars().filter(|c| *c != '\u{2028}' && *c != '\u{2029}').collect()
-}
-
 /// Wrap one logical line to `width` visible columns, preserving ANSI escape
 /// sequences (they take no columns) and breaking on spaces where possible.
 fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
@@ -677,10 +603,9 @@ impl<W: Write> FrameRenderer<W> {
 
     fn full_redraw(&mut self, frame: &[String], width: usize, height: usize) -> std::io::Result<()> {
         let mut buf = String::from(SYNC_START);
-        // Drop any scroll region a prior renderer (e.g. `StatusLine::install`,
-        // which pins DECSTBM to rows 1..rows-1) left set: this renderer owns
-        // the whole screen, so `CRLF` scrolling must span every row or the
-        // bottom status line can be pushed out of place.
+        // Drop any scroll region a previous program left set: this renderer
+        // owns the whole screen, so `CRLF` scrolling must span every row or
+        // the bottom status line can be pushed out of place.
         buf.push_str("\x1b[r");
         // Clear the screen AND scrollback: a full redraw re-emits the whole
         // transcript, so any surplus that scrolls off must not sit behind a
@@ -883,52 +808,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_displays_renderer_mode() {
-        assert_eq!("frame".parse::<RendererMode>(), Ok(RendererMode::Frame));
-        assert_eq!("Legacy".parse::<RendererMode>(), Ok(RendererMode::Legacy));
-        assert!("fancy".parse::<RendererMode>().is_err());
-        assert_eq!(RendererMode::default(), RendererMode::Frame);
-        assert_eq!(RendererMode::Frame.to_string(), "frame");
-    }
-
-    #[test]
-    fn sanitize_replay_expands_tabs_and_keeps_sgr_styling() {
-        // A replayed `read_file` result keeps its tab indentation (expanded to
-        // the next 8-stop) instead of losing it, and a styled line keeps its
-        // SGR colour instead of degrading to a literal `[32m` fragment.
-        // `"     1"` is 7 visible columns, so the tab adds 2 spaces (7 → 8).
-        assert_eq!(sanitize_replay("     1\treturn 1"), "     1  return 1");
-        assert_eq!(sanitize_replay("\x1b[32mhello\x1b[0m"), "\x1b[32mhello\x1b[0m");
-        assert_eq!(sanitize_replay("\thello"), "        hello");
-    }
-
-    #[test]
-    fn sanitize_replay_keeps_newlines_but_drops_cursor_erase_and_controls() {
-        // Newlines are multi-line content to keep; cursor/erase CSI and stray
-        // C0 controls are dropped so replayed text cannot move the legacy
-        // cursor or clear the screen. This shares `frame::sanitize`, which only
-        // special-cases CSI escapes — matching exactly what the frame displayed.
-        assert_eq!(sanitize_replay("line one\nline two"), "line one\nline two");
-        assert_eq!(sanitize_replay("a\x1b[2Jb"), "ab");
-        assert_eq!(sanitize_replay("a\x1b[Hb"), "ab");
-        assert_eq!(sanitize_replay("a\x07\x08b"), "ab");
-        // The forged-line-break protection matches `sanitize_terminal_text`.
-        assert_eq!(sanitize_replay("a\u{2028}b\u{2029}c"), "abc");
-    }
-
-    #[test]
-    fn sanitize_replay_rejects_malformed_sgr_parameters() {
+    fn sanitize_rejects_malformed_sgr_parameters() {
         // A CSI sequence that ends in `m` but hides a control byte in its
-        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT be replayed: the
-        // embedded CR would execute during replay and let model/tool output
+        // parameters (e.g. a `\r` in `\x1b[\r31m`) must NOT survive: the
+        // embedded CR would execute when drawn and let model/tool output
         // overwrite earlier content. Only digits, `;` and `:` are valid SGR
         // params, so the whole malformed sequence is dropped.
-        assert_eq!(sanitize_replay("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
-        assert_eq!(sanitize_replay("a\x1b[31\x08mb"), "ab");
+        assert_eq!(sanitize("prefix\x1b[\r31mOVERWRITE"), "prefixOVERWRITE");
+        assert_eq!(sanitize("a\x1b[31\x08mb"), "ab");
         // A space (an SGR intermediate byte, not a parameter byte) is rejected.
-        assert_eq!(sanitize_replay("a\x1b[31 mb"), "ab");
+        assert_eq!(sanitize("a\x1b[31 mb"), "ab");
         // A real, well-formed SGR sequence with digits/`;`/`:` still survives.
-        assert_eq!(sanitize_replay("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
+        assert_eq!(sanitize("\x1b[1;38:5:200mhi\x1b[0m"), "\x1b[1;38:5:200mhi\x1b[0m");
     }
 
     #[test]

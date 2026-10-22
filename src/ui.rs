@@ -218,8 +218,8 @@ pub fn stamp() -> String {
 
 /// Pair a frame transcript item with the current timestamp, so every item
 /// (message, tool call/result, plan, thinking, note, output) is stamped
-/// consistently — matching the legacy renderer, where `ui::stamp()` prefixes
-/// every interactive item when `timestamps` is on (the default).
+/// consistently — matching plain output, where `ui::stamp()` prefixes
+/// every item when `timestamps` is on (the default).
 fn stamped(item: Item) -> StampedItem {
     StampedItem { stamp: stamp(), item }
 }
@@ -231,7 +231,6 @@ const GREEN: &str = "\x1b[38;5;114m";
 const RED: &str = "\x1b[38;5;203m";
 const YELLOW: &str = "\x1b[38;5;179m";
 const RESET: &str = "\x1b[0m";
-const REDRAW_EVERY: Duration = Duration::from_millis(50);
 const PREVIEW_LINES: usize = 10;
 
 /// A reasoning block that is streaming in.
@@ -240,16 +239,11 @@ struct ThinkBlock {
     started: Instant,
     /// `stamp()` from when the block started.
     stamp: String,
-    /// Printed in full (otherwise shown as one updating line).
-    expanded: bool,
-    last_draw: Option<Instant>,
 }
 
 #[derive(Default)]
 struct State {
     thinking: Option<ThinkBlock>,
-    /// The most recent complete reasoning, for Ctrl-O at the prompt.
-    last_thinking: String,
     streamed_text: bool,
     streamed_thinking: bool,
     /// The cursor is at the start of a line.
@@ -258,23 +252,12 @@ struct State {
     /// Width of the current streamed answer's stamp, so continuation lines
     /// can be indented to align under it.
     stream_pad: usize,
-    /// Renders the streamed answer's markdown a block at a time (see
-    /// [`crate::markdown::MarkdownStream`]).
-    markdown: crate::markdown::MarkdownStream,
     /// Output held back until the streamed line it would interrupt ends, in
     /// submission order. Notes are stamped and dimmed; raw payloads (e.g.
     /// `/trajectory --json`) go out verbatim — no stamp, no DIM — so the
     /// export stays byte-exact. One ordered queue keeps a raw export queued
     /// between two notes from leapfrogging them at `end_turn`.
     deferred: Vec<Deferred>,
-    /// The dropped frame's full transcript, in original on-screen order,
-    /// captured by `set_mode(Legacy)` for `replay_transcript` to reprint after
-    /// the post-switch screen+scrollback clear. Replaying THIS — not the
-    /// (possibly compacted) conversation — keeps frame-only items, turns and
-    /// plan updates in their shown order and restores the real pre-compaction
-    /// turns instead of the synthetic summary. Byte-exact `Raw` exports ride
-    /// along in order; they are printed after the clear, so they survive it.
-    transcript: Vec<crate::frame::StampedItem>,
 }
 
 /// A held-back line of output: a dimmed note, or a verbatim raw payload.
@@ -285,15 +268,13 @@ enum Deferred {
 
 pub struct Renderer {
     state: Mutex<State>,
+    /// The context stats shown on the frame's status bar (none off a tty).
     status: Option<Arc<StatusLine>>,
-    /// Stdout is a terminal (in-place redraws are possible).
-    tty: bool,
-    expanded: AtomicBool,
     /// Set when the turn's live answer stream may have been left incomplete by
     /// a mid-turn verbosity change. Only `quiet` suppresses streamed deltas, so
     /// a turn that is `quiet` for part of a streamed answer but ends at another
     /// level loses the suppressed deltas. The frame renderer reconciles the
-    /// final `AssistantMessage` in place regardless; the legacy renderer, which
+    /// final `AssistantMessage` in place regardless; plain output, which
     /// streams straight to the terminal and can't retract, uses this flag to
     /// reprint the authoritative full response at turn end. Reset at
     /// `begin_turn`, then raised the moment a non-empty answer delta is
@@ -310,14 +291,10 @@ pub struct Renderer {
     /// normally-streamed final answer no longer spuriously reprints it. Reset
     /// at `begin_turn`.
     answer_segment_closed: AtomicBool,
-    /// The app-owned frame renderer, when `renderer = "frame"` and stdout is a
-    /// terminal. When set, all output is composed into one frame (transcript,
-    /// editor, status as the last line) and diff-rendered by a single writer,
-    /// instead of streaming into the terminal's scrollback. Wrapped in a
-    /// `Mutex<Option<..>>` (rather than `Option<Mutex<..>>`) so the frame can
-    /// be enabled or dropped at runtime — a live `renderer` switch in
-    /// `/settings` — behind the shared `Arc<Renderer>`; the `Mutex` supplies
-    /// the interior mutability, so the field itself stays shared-borrowed.
+    /// The app-owned frame renderer, whenever stdout is a terminal: all output
+    /// is composed into one frame (transcript, editor, status as the last
+    /// line) and diff-rendered by a single writer. `None` off a terminal
+    /// (piped/headless runs), where output is printed as plain lines.
     frame: Mutex<Option<FrameState>>,
 }
 
@@ -346,9 +323,7 @@ struct FrameState {
     /// The timestamp shown on the editor prompt, captured when a fresh prompt
     /// starts and held stable while the user types. Regenerating it on every
     /// render (keystroke, live status tick) would make the prompt stamp — and
-    /// its width — drift mid-line; the legacy editor stamps once at prompt draw
-    /// and only restamps on submission, so mirror that by refreshing this only
-    /// at a turn boundary.
+    /// its width — drift mid-line, so it is refreshed only at a turn boundary.
     prompt_stamp: String,
     /// The running turn's working clock; `None` while the prompt waits for the
     /// user. Drives the busy spinner in place of the `›` prompt glyph, and
@@ -417,15 +392,11 @@ impl Renderer {
         }
     }
 
-    pub fn new(status: Option<Arc<StatusLine>>, mode: crate::frame::RendererMode) -> Arc<Self> {
-        let tty = io::stdout().is_terminal();
-        let frame =
-            Mutex::new(if mode == crate::frame::RendererMode::Frame && tty { Some(Self::fresh_frame()) } else { None });
+    pub fn new(status: Option<Arc<StatusLine>>) -> Arc<Self> {
+        let frame = Mutex::new(io::stdout().is_terminal().then(Self::fresh_frame));
         Arc::new(Self {
             state: Mutex::new(State { at_line_start: true, ..Default::default() }),
             status,
-            tty,
-            expanded: AtomicBool::new(false),
             touched_quiet: AtomicBool::new(false),
             answer_segment_closed: AtomicBool::new(false),
             frame,
@@ -435,192 +406,6 @@ impl Renderer {
     /// Whether the app-owned frame renderer is active.
     pub fn is_frame(&self) -> bool {
         self.frame.lock().unwrap().is_some()
-    }
-
-    /// Turn the app-owned frame renderer on or off at runtime (a live
-    /// `renderer` switch in `/settings`). On a tty the frame is created or
-    /// dropped in place; off a tty it is always off. The transcript and
-    /// in-flight stream state are preserved across the switch, and the
-    /// caller is expected to re-render (a resize / replay) afterwards.
-    ///
-    /// Switching OFF captures the WHOLE frame transcript (`fs.items`, in
-    /// on-screen order) so `replay_transcript` can reprint it once legacy owns
-    /// the screen again. The frame holds the visible history exactly as shown
-    /// — frame-only output (the startup banner, `/help` or `/tools` text,
-    /// renderer notes) lives ONLY in `FrameState.items`, and frame redraws have
-    /// already cleared the old scrollback, so dropping the frame would lose it.
-    /// Conversation items (messages, tool calls/results, the plan) and the
-    /// conversation-derived `report_outcome` markers (`Item::OutcomeMark`) are
-    /// captured and replayed too: the caller does NOT re-derive the visible
-    /// history from `Agent::conversation` on this path, so nothing is printed
-    /// twice and nothing is dropped. Replaying the captured transcript — rather
-    /// than the conversation — is what keeps the switch lossless: it restores
-    /// the real pre-compaction turns (compaction only appends a note; it never
-    /// rewrites `fs.items`) where the compacted conversation would print the
-    /// synthetic summary as a user turn and lose the compacted-away turns, and
-    /// the current plan prints exactly once (it is simply the last
-    /// `Item::Plan`). `Item::Raw` holds verbatim machine-readable output
-    /// (`/trajectory --json`); it is replayed byte-exact (never routed through
-    /// the deferred-note queue, which would trim trailing newlines and add DIM
-    /// styling, corrupting the export). Nothing prints here: the caller clears
-    /// the screen+scrollback AFTER `set_mode` returns, so `replay_transcript`
-    /// does the printing.
-    pub fn set_mode(&self, mode: crate::frame::RendererMode) {
-        let on = mode == crate::frame::RendererMode::Frame && self.tty;
-        let mut frame = self.frame.lock().unwrap();
-        if on {
-            if frame.is_none() {
-                *frame = Some(Self::fresh_frame());
-            }
-        } else if let Some(fs) = frame.take() {
-            // Capture the WHOLE transcript in on-screen order. The frame holds
-            // the visible history exactly as shown — including the real
-            // pre-compaction turns (compaction only appends a note; it never
-            // rewrites `fs.items`) — so replaying it restores what the user
-            // saw, in order, where re-deriving from `Agent::conversation`
-            // would print the synthetic summary as a user turn and lose the
-            // compacted-away turns. Nothing prints here: the caller clears the
-            // screen+scrollback AFTER `set_mode` returns, so `replay_transcript`
-            // does the printing.
-            self.state.lock().unwrap().transcript = fs.items;
-        }
-    }
-
-    /// Reprint the dropped frame's transcript, in original on-screen order,
-    /// now that legacy owns the screen again. The caller runs this AFTER the
-    /// post-switch screen+scrollback clear (`repin_scroll_region` /
-    /// `clear_display`), so everything printed here survives the transition.
-    ///
-    /// Replaying the captured transcript — rather than re-deriving the visible
-    /// history from `Agent::conversation` — is what keeps a frame → legacy
-    /// switch lossless:
-    /// * ORDER: frame-only items (`/help`, banner, notes), turns and plan
-    ///   updates are reprinted where they were shown, not grouped ahead of or
-    ///   behind the conversation (the old `flush_pending` /
-    ///   `replay_plan_snapshots` split reordered them).
-    /// * COMPACTION: the frame kept the real pre-compaction turns, so they are
-    ///   restored instead of the synthetic summary the compacted conversation
-    ///   would print as a user turn — and the summary is never exposed.
-    /// * The CURRENT plan is simply the last `Item::Plan` in the transcript,
-    ///   so it prints exactly once with no special-casing.
-    ///
-    /// No-op in frame mode or when nothing was captured. Goes through `out()`
-    /// so a partial streamed line is ended first.
-    ///
-    /// Lock order is `frame` → `state`, matching `set_mode`, `event`,
-    /// `urgent_note` and `clear_screen`: the `frame` guard is acquired FIRST
-    /// and held for the whole replay. Taking `state` first here while a legacy
-    /// writer holds `frame` and waits on `state` would deadlock the two
-    /// threads; holding `frame` throughout is self-deadlock-safe because the
-    /// replay only writes through `out()`/`newline()`/`tool_result()`, none of
-    /// which lock `frame` again.
-    pub fn replay_transcript(&self) {
-        let frame = self.frame.lock().unwrap();
-        let mut state = self.state.lock().unwrap();
-        if frame.is_some() || state.transcript.is_empty() {
-            return;
-        }
-        // Replay even in quiet mode. Leaving the frame clears the screen AND
-        // scrollback, and in quiet mode the frame only ever recorded what it
-        // displayed — final assistant replies and `print_raw` exports (both
-        // printed regardless of verbosity). Dropping the transcript here would
-        // erase those already-visible lines; replaying restores exactly them.
-        let items = std::mem::take(&mut state.transcript);
-        for si in &items {
-            self.replay_item(&mut state, si);
-        }
-    }
-
-    /// Print one captured transcript item through the legacy path, mirroring
-    /// what [`Self::event`] emits for the equivalent live event so the
-    /// transition looks seamless. `si.stamp` is reused (not a fresh `stamp()`)
-    /// so each line keeps the timestamp it was originally shown with.
-    ///
-    /// The frame layout strips cursor/erase escapes from model/tool text before
-    /// displaying it, so the captured fields are still RAW — replaying them
-    /// straight into legacy `out()` would emit those controls now (a tool
-    /// result holding `\x1b[2J` is safe in the frame yet clears the terminal
-    /// here). Run every model/tool-controlled field through
-    /// [`crate::sanitize_terminal_text`] first — the same filter live output
-    /// applies — leaving the intentional styling (colours, bold) and the
-    /// byte-exact `Raw` export untouched.
-    fn replay_item(&self, state: &mut State, si: &crate::frame::StampedItem) {
-        use crate::frame::Item;
-        let stamp = &si.stamp;
-        match &si.item {
-            Item::Message { role, text } => {
-                let text = crate::frame::sanitize_replay(text);
-                let text = text.trim_end();
-                if text.trim().is_empty() {
-                    return;
-                }
-                self.newline(state);
-                match role {
-                    crate::frame::Role::User => self.out(state, &format!("{stamp}> {text}\n")),
-                    crate::frame::Role::Assistant => {
-                        let text = self.display_text(text, visible_width(stamp));
-                        self.out(state, &stamp_block_with(stamp, &format!("{text}\n")));
-                    }
-                }
-            }
-            Item::Thinking { chars, seconds } => {
-                self.newline(state);
-                self.out(state, &format!("{stamp}{DIM}∴ Thought for {seconds:.1}s · {chars} chars{RESET}\n"));
-            }
-            Item::ToolCall { name, summary } => {
-                self.newline(state);
-                // Name and summary share one status row, so a `\n` would inject
-                // an unprefixed extra line (the frame layout drops it); use the
-                // single-line sanitizer to match what live output shows.
-                let name = crate::sanitize_terminal_line(name);
-                let summary = crate::sanitize_terminal_line(summary);
-                // Fit the summary to the row's remaining width: the frame
-                // truncated it to one row (and live legacy output fits it too),
-                // so replaying the raw captured value would wrap across rows and
-                // the frame → legacy replay would not preserve the transcript.
-                let used = strip_ansi(stamp).chars().count() + name.chars().count() + 4;
-                let summary = fit(&summary, self.width().saturating_sub(used));
-                self.out(state, &format!("{stamp}{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}\n"));
-            }
-            Item::ToolResult { ok, output, verbose } => {
-                self.newline(state);
-                let output = crate::frame::sanitize_replay(output);
-                // Format from the verbosity captured WITH the result, not the
-                // current global: if the user changed verbosity and renderer in
-                // the same settings visit, replaying with today's verbosity would
-                // show more (or fewer) lines than the frame ever did, so the
-                // captured transcript would not be lossless.
-                let text = stamp_block_with(stamp, &self.tool_result(*ok, &output, *verbose));
-                self.out(state, &text);
-            }
-            Item::Plan(plan) => {
-                self.newline(state);
-                let width = self.width().saturating_sub(4 + visible_width(stamp));
-                let text = plan_checklist(plan, width);
-                self.out(state, &stamp_block_with(stamp, &text));
-            }
-            Item::Note(text) | Item::OutcomeMark(text) => {
-                self.newline(state);
-                let text = crate::frame::sanitize_replay(text);
-                self.out(state, &format!("{stamp}{DIM}{}{RESET}\n", text.trim_end()));
-            }
-            Item::Output(text) => {
-                self.newline(state);
-                let text = crate::frame::sanitize_replay(text);
-                self.out(state, &format!("{}\n", text.trim_end()));
-            }
-            // Byte-exact, unstyled, untrimmed, UNSANITIZED: the export must
-            // survive intact for whatever pipeline reads it. `print_raw`
-            // originally emitted it with `println!`, which ALWAYS appends one
-            // newline after the text — so write that suffix newline
-            // unconditionally (`newline()` would skip it when the raw text
-            // already ends in `\n`, dropping the blank line `println!` added).
-            Item::Raw(text) => {
-                self.newline(state);
-                self.out(state, text);
-                self.out(state, "\n");
-            }
-        }
     }
 
     /// Update the editor row (called by the line editor's frame hook) and
@@ -670,7 +455,7 @@ impl Renderer {
         // disagree about the elapsed second around a boundary.
         let now = Instant::now();
         // Prefix the editor prompt with the timestamp when timestamps are on,
-        // matching the legacy prompt so switching renderers keeps the setting.
+        // as plain output's prompt line is.
         // Use the stamp captured at prompt start (not `stamp()`), so it stays
         // fixed while the user types rather than ticking every render.
         let prompt = format!("{}{} ", fs.prompt_stamp, prompt_glyph(fs.busy.as_ref().map(|c| (c, now))));
@@ -707,18 +492,6 @@ impl Renderer {
                     seconds: started.elapsed().as_secs_f64(),
                 }));
                 fs.touch_transcript();
-                // A cancelled/failed stream can finalize accumulated reasoning
-                // here (or in `TextDelta`) without the closing `Thinking` event
-                // ever arriving. That event is the only other place the frame
-                // caches `last_thinking`, so without caching here too a
-                // frame → legacy switch after a partial stream leaves Ctrl-O
-                // expanding older reasoning (or none). Sanitize before caching:
-                // the frame never displayed this raw model text, and
-                // `toggle_thinking` writes the cache straight through `out()`.
-                let trimmed = crate::sanitize_terminal_text(text);
-                if !trimmed.is_empty() {
-                    self.state.lock().unwrap().last_thinking = trimmed;
-                }
             }
         }
     }
@@ -756,23 +529,6 @@ impl Renderer {
                     None => {}
                 }
                 fs.think_streamed = false;
-                // Cache the reasoning for legacy Ctrl-O. The frame keeps only
-                // the collapsed char count (`Item::Thinking`), discarding the
-                // text, and frame events never reach `finish_thinking` — so
-                // without this a frame → legacy switch leaves Ctrl-O reporting
-                // "no thinking yet" (or expanding a stale legacy turn) even
-                // though reasoning just ran. Unlike the legacy path, the frame
-                // never displayed this text, so it is raw model-controlled
-                // input: sanitize it before caching, because `toggle_thinking`
-                // writes the cache straight through `out()` and would otherwise
-                // let cursor/erase/OSC escapes reach the real terminal on
-                // expand. `event()` already holds `frame` here, and `set_mode`
-                // establishes the `frame` → `state` lock order, so taking
-                // `state` to store the text is deadlock-free.
-                let trimmed = crate::sanitize_terminal_text(text.trim());
-                if !trimmed.is_empty() {
-                    self.state.lock().unwrap().last_thinking = trimmed;
-                }
                 // Do NOT reset `fs.stream` here: a streamed assistant message
                 // may already be in flight (reasoning can arrive after the
                 // answer starts). Only `AssistantMessage` finalizes the stream;
@@ -795,17 +551,6 @@ impl Renderer {
                             seconds: started.elapsed().as_secs_f64(),
                         }));
                         fs.touch_transcript();
-                        // The answer is starting without a closing `Thinking`
-                        // event, so this finalization is the only place the
-                        // streamed reasoning is consumed — cache it for legacy
-                        // Ctrl-O here too, or a frame → legacy switch expands a
-                        // stale turn. Sanitize: the frame never displayed this
-                        // raw model text. `event()` already holds `frame`, and
-                        // the lock order is `frame` → `state`, so this is safe.
-                        let trimmed = crate::sanitize_terminal_text(think);
-                        if !trimmed.is_empty() {
-                            self.state.lock().unwrap().last_thinking = trimmed;
-                        }
                     }
                 }
                 match fs.stream {
@@ -859,7 +604,7 @@ impl Renderer {
                 fs.items.push(stamped(Item::Plan((*plan).clone())));
                 fs.touch_transcript();
             }
-            // Mirror the legacy renderer's user-facing filtering: plan_add /
+            // Mirror plain output's user-facing filtering: plan_add /
             // plan_update are shown as the Plan checklist (the `Plan` event),
             // not as raw tool calls, and report_outcome's summary follows as
             // the answer, so only its status marker is shown.
@@ -883,10 +628,8 @@ impl Renderer {
                 // Derive the status from the parsed outcome so an invalid
                 // `report_outcome` is not rendered as a success. Record it as
                 // an `OutcomeMark` rather than a renderer-only `Note` to mark
-                // it conversation-derived (it comes from the tool call). Both
-                // are captured in `fs.items` and, on a frame → legacy switch,
-                // replayed directly and in place exactly once, so the choice is
-                // semantic — the marker is neither dropped nor reprinted.
+                // it conversation-derived (it comes from the tool call).
+
                 let mark = match crate::goal::Status::from_args(&call.arguments) {
                     Some(crate::goal::Status::Blocked) => "■ blocked".to_string(),
                     Some(crate::goal::Status::NeedsInput) => "? needs input".to_string(),
@@ -956,9 +699,9 @@ impl Renderer {
     /// Batch a run of frame events (a history replay) into ONE render: set the
     /// batch flag, run `feed` (which emits the events), then clear the flag and
     /// render the completed frame a single time. Without this each replayed
-    /// event triggers a full transcript layout, so switching to frame mode (or
-    /// resuming into it) does O(events²) work and one terminal write per event.
-    /// No-op in legacy mode: `feed` then emits nothing frame-bound.
+    /// event triggers a full transcript layout, so resuming a session does
+    /// O(events²) work and one terminal write per event.
+    /// With plain output it just runs `feed`.
     pub fn frame_batch(&self, feed: impl FnOnce()) {
         let mut frame = self.frame.lock().unwrap();
         let Some(fs) = frame.as_mut() else {
@@ -976,43 +719,6 @@ impl Renderer {
         }
     }
 
-    /// Hand legacy-mode output that exists only in renderer state (not yet in
-    /// scrollback) to the frame transcript, so the frame's first full redraw —
-    /// which clears scrollback — cannot erase it: notes deferred behind an
-    /// in-progress streamed line, and the collapsed reasoning Ctrl-O would
-    /// reprint. Returns the drained items; the caller pushes them into the
-    /// frame before replaying history so they land ahead of the conversation.
-    /// Empty in frame mode (everything is already in the transcript).
-    pub fn drain_pending(&self) -> Vec<Item> {
-        if self.frame.lock().unwrap().is_some() {
-            return Vec::new();
-        }
-        let mut state = self.state.lock().unwrap();
-        // Only notes move to the frame; raw exports stay queued (in order) and
-        // are emitted verbatim by the normal deferred flush.
-        let (notes, raws): (Vec<Deferred>, Vec<Deferred>) =
-            std::mem::take(&mut state.deferred).into_iter().partition(|d| matches!(d, Deferred::Note(_)));
-        state.deferred = raws;
-        let mut items: Vec<Item> = notes
-            .into_iter()
-            .filter_map(|d| match d {
-                Deferred::Note(n) => Some(Item::Note(n)),
-                Deferred::Raw(_) => None,
-            })
-            .collect();
-        // Borrow the cached reasoning, don't take it: `last_thinking` is the
-        // legacy Ctrl-O cache, and clearing it here means a legacy → frame →
-        // legacy round trip with no intervening turn leaves Ctrl-O reporting
-        // "no thinking yet" instead of expanding the reasoning that was shown
-        // before the switch. The frame only needs the char count for its
-        // collapsed `Item::Thinking`; cloning keeps the legacy cache intact.
-        let thinking = state.last_thinking.clone();
-        if !thinking.trim().is_empty() {
-            items.push(Item::Thinking { chars: thinking.trim().chars().count(), seconds: 0.0 });
-        }
-        items
-    }
-
     /// Record a submitted user message in the transcript (frame mode).
     pub fn frame_user_message(&self, text: &str) {
         let mut frame = self.frame.lock().unwrap();
@@ -1023,26 +729,11 @@ impl Renderer {
         }
     }
 
-    /// Append drained legacy output (see `drain_pending`) to the frame
-    /// transcript without rendering: called just before a batched history
-    /// replay, whose closing render draws these items too. No-op in legacy
-    /// mode (no frame to hold them).
-    pub fn push_items(&self, items: Vec<Item>) {
-        if items.is_empty() {
-            return;
-        }
-        let mut frame = self.frame.lock().unwrap();
-        if let Some(fs) = frame.as_mut() {
-            fs.items.extend(items.into_iter().map(stamped));
-            fs.touch_transcript();
-        }
-    }
-
     /// Emit command / informational output (e.g. slash-command replies). In
     /// frame mode it is captured as a transcript item so direct writes can't
     /// corrupt the owned frame; otherwise it prints inline as before.
     /// Output of a command run while a turn is streaming. The frame renderer
-    /// adds it to the transcript as usual; the legacy renderer prints it as a
+    /// adds it to the transcript as usual; plain output prints it as a
     /// note, which waits for a half-streamed line to end rather than landing
     /// in the middle of it (`print_block` there is a bare `println!`).
     pub fn turn_block(&self, text: &str) {
@@ -1055,7 +746,7 @@ impl Renderer {
 
     /// Raw output of a command run while a turn is streaming (e.g.
     /// `/trajectory --json`). The frame renderer emits it verbatim via
-    /// `print_raw`. The legacy renderer must not route it through `note` —
+    /// `print_raw`. Plain output must not route it through `note` —
     /// that would prepend a timestamp and wrap it in DIM/reset escapes,
     /// corrupting JSON and Markdown — but it also can't print it straight away
     /// without landing in the middle of a half-streamed line. So it is held
@@ -1083,12 +774,6 @@ impl Renderer {
         self.out(&mut state, "\n");
     }
 
-    ///
-    /// DOCUMENTED LIMITATION: in legacy mode this writes straight to scrollback
-    /// and is NOT recorded, so it does not survive a live legacy → frame switch
-    /// (the frame's first redraw clears scrollback and rebuilds only the
-    /// conversation). This is an accepted tradeoff — see the note at the
-    /// frame-entry path in `main.rs`.
     pub fn print_block(&self, text: &str) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
@@ -1135,30 +820,12 @@ impl Renderer {
         println!("{text}");
     }
 
-    /// An assistant message as shown in legacy mode: its markdown rendered
-    /// for the terminal (`indent` cells narrower, for the stamp) when stdout is
-    /// a terminal; verbatim otherwise, so piped output keeps the markdown.
-    pub fn display_text(&self, text: &str, indent: usize) -> String {
-        if self.tty { crate::markdown::render(text, self.width().saturating_sub(indent)) } else { text.to_string() }
-    }
-
-    /// Print any streamed markdown still held back (the message ended, or
-    /// the turn stopped mid-block).
-    fn flush_markdown(&self, state: &mut State) {
-        if !state.markdown.holding() {
-            return;
-        }
-        let pad = state.stream_pad;
-        let rest = state.markdown.finish(self.width().saturating_sub(pad));
-        self.out_aligned(state, &rest, pad);
-    }
-
     fn width(&self) -> usize {
         status::terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20)
     }
 
-    /// Wipe the screen and scrollback for a fresh session, re-pinning the
-    /// status line's scroll region, and reset the renderer's line state.
+    /// Start a fresh session: wipe the frame's transcript (and so the screen
+    /// and scrollback), or reset the plain printer's line state.
     pub fn clear_screen(&self) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
@@ -1168,26 +835,7 @@ impl Renderer {
             fs.think = None;
             fs.out.invalidate();
             self.frame_render(fs);
-            // A fresh session must not keep the previous session's reasoning
-            // cache: `frame_event` now stores reasoning into `last_thinking`,
-            // so without this a `/restart` in frame mode leaves the prior
-            // session's thinking expandable via legacy Ctrl-O. The legacy
-            // branch below resets the whole `State`; mirror that here. Lock
-            // order `frame` → `state` matches `set_mode`.
-            let mut state = self.state.lock().unwrap();
-            *state = State { at_line_start: true, ..Default::default() };
             return;
-        }
-        match &self.status {
-            Some(status) => status.clear(),
-            None if self.tty => {
-                crate::status::with_term_lock(|| {
-                    let mut stdout = io::stdout().lock();
-                    let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J");
-                    let _ = stdout.flush();
-                });
-            }
-            None => {}
         }
         let mut state = self.state.lock().unwrap();
         *state = State { at_line_start: true, ..Default::default() };
@@ -1264,7 +912,7 @@ impl Renderer {
 
     /// Set the global verbosity in response to `/verbosity` typed mid-turn.
     /// Applying it immediately keeps the rest of the turn at the new level; the
-    /// final-answer reconciliation (frame: in place; legacy: a turn-end reprint
+    /// final-answer reconciliation (frame: in place; plain: a turn-end reprint
     /// gated on [`Self::answer_may_be_truncated`]) is what prevents a switch
     /// across the `quiet` boundary from truncating the streamed answer.
     ///
@@ -1279,7 +927,7 @@ impl Renderer {
 
     /// Whether the turn's live-streamed answer may be incomplete because the
     /// verbosity was `quiet` for part of it (so some streamed deltas were
-    /// suppressed). The legacy renderer reprints the full response when this is
+    /// suppressed). Plain output reprints the full response when this is
     /// true and the turn did not already reprint via its `quiet` end path.
     pub fn answer_may_be_truncated(&self) -> bool {
         self.touched_quiet.load(Ordering::Relaxed)
@@ -1287,7 +935,7 @@ impl Renderer {
 
     /// Redraw the frame while a turn runs, so the busy spinner and elapsed
     /// time move even when no output arrives (a long tool call or a model
-    /// still reading the prompt). A no-op at the prompt and in legacy mode.
+    /// still reading the prompt). A no-op at the prompt and with plain output.
     pub fn tick(&self) {
         if let Some(fs) = self.frame.lock().unwrap().as_mut()
             && fs.busy.is_some()
@@ -1302,7 +950,7 @@ impl Renderer {
     /// prompt — the spinner and `working 12s` stay on screen, held at their
     /// last drawn values — so this paints nothing: the caller is about to
     /// hand the terminal to another writer (`dialoguer`), which must stay
-    /// the only one. A no-op at the prompt and in legacy mode.
+    /// the only one. A no-op at the prompt and with plain output.
     pub fn pause_work(&self) {
         let Some(mut frame) = self.frame.lock().ok() else { return };
         if let Some(fs) = frame.as_mut()
@@ -1328,8 +976,7 @@ impl Renderer {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut() {
             self.frame_finish_stream(fs);
-            // A fresh prompt starts now the turn is done: restamp it (matching
-            // the legacy editor, which restamps on submission) so the next
+            // A fresh prompt starts now the turn is done: restamp it so the next
             // prompt reflects the current time, then holds steady while typing.
             fs.prompt_stamp = stamp();
             // Back to the user: the prompt glyph stops spinning.
@@ -1337,19 +984,10 @@ impl Renderer {
             // The turn is over; any transient hint no longer applies.
             fs.transient = None;
             self.frame_render(fs);
-            // `begin_turn` sets the legacy `in_turn` flag even in frame mode;
-            // clear it here too, or switching back to legacy leaves Ctrl-O at
-            // the prompt behaving as though a turn is still active.
-            let mut state = self.state.lock().unwrap();
-            state.in_turn = false;
-            state.streamed_text = false;
-            state.streamed_thinking = false;
             return;
         }
         let mut state = self.state.lock().unwrap();
         self.finish_thinking(&mut state);
-        // A cancelled or failed turn may end mid-block: print what was held.
-        self.flush_markdown(&mut state);
         self.newline(&mut state);
         // Everything queued mid-turn goes out in submission order: notes
         // stamped and dimmed, raw exports verbatim (no stamp/DIM), each on its
@@ -1399,8 +1037,8 @@ impl Renderer {
         self.note_now(&mut state, text);
     }
 
-    /// Clear any transient status-bar hint (frame mode only; a no-op in legacy
-    /// mode, where transients are ordinary printed lines).
+    /// Clear any transient status-bar hint (frame mode only; a no-op with plain
+    /// output, where transients are ordinary printed lines).
     pub fn clear_transient(&self) {
         let mut frame = self.frame.lock().unwrap();
         if let Some(fs) = frame.as_mut()
@@ -1413,8 +1051,8 @@ impl Renderer {
     /// Show a short transient hint where the user is looking, without adding
     /// it to the transcript. In frame mode it takes over the status bar (a
     /// transcript `Item::Note` would trigger a full-screen clear and land above
-    /// the editor row, so the user watching the cursor never sees it); in
-    /// legacy mode it prints inline like `note`. Use for cursor-relevant
+    /// the editor row, so the user watching the cursor never sees it); with
+    /// plain output it prints inline like `note`. Use for cursor-relevant
     /// feedback such as "(Ctrl-C again to exit)".
     pub fn transient_note(&self, text: &str) {
         let mut frame = self.frame.lock().unwrap();
@@ -1461,11 +1099,6 @@ impl Renderer {
             self.frame_event(fs, event);
             return;
         }
-        if matches!(event, AgentEvent::Context | AgentEvent::Compacted)
-            && let Some(status) = &self.status
-        {
-            status.draw();
-        }
         if verbosity() == Verbosity::Quiet {
             // A failed mid-turn `/model` switch is user-facing in every
             // verbosity — quiet suppresses streamed output, not warnings.
@@ -1478,7 +1111,7 @@ impl Renderer {
             // Mark the truncation guard only when a non-empty answer delta is
             // actually suppressed here: those deltas never reach the terminal,
             // so if the turn later ends at a louder level the live stream is
-            // incomplete and the legacy renderer reprints the full response.
+            // incomplete and plain output reprints the full response.
             // Merely being quiet (with no delta suppressed yet) must not set
             // this — a turn that switches to a louder level before any delta
             // streams its answer normally, and reprinting would duplicate it.
@@ -1497,7 +1130,7 @@ impl Renderer {
                 // delta begins a fresh segment (see `answer_segment_closed`).
                 AgentEvent::AssistantMessage { .. } => {
                     self.answer_segment_closed.store(true, Ordering::Relaxed);
-                    // Close the legacy renderer's open stream. A message can
+                    // Close plain output's open stream. A message can
                     // begin streaming at a louder level and have only its
                     // terminating `AssistantMessage` arrive after a switch to
                     // quiet; this arm then returns without finalizing the open
@@ -1511,7 +1144,6 @@ impl Renderer {
                     // normal-verbosity `AssistantMessage` arm does.
                     let mut state = self.state.lock().unwrap();
                     self.finish_thinking(&mut state);
-                    self.flush_markdown(&mut state);
                     if state.streamed_text {
                         self.newline(&mut state);
                     }
@@ -1556,18 +1188,11 @@ impl Renderer {
                     }
                     state.streamed_text = true;
                     let pad = state.stream_pad;
-                    let shown = if self.tty {
-                        let width = self.width().saturating_sub(pad);
-                        state.markdown.push(text, width)
-                    } else {
-                        (*text).to_string()
-                    };
-                    self.out_aligned(&mut state, &shown, pad);
+                    self.out_aligned(&mut state, text, pad);
                 }
             }
             AgentEvent::AssistantMessage { text, .. } => {
                 self.finish_thinking(&mut state);
-                self.flush_markdown(&mut state);
                 if !state.streamed_text && !text.is_empty() {
                     // This non-streamed message is the full, authoritative
                     // answer and is printed here in its entirety. Drop any
@@ -1580,8 +1205,7 @@ impl Renderer {
                     // set for the reprint.
                     self.touched_quiet.store(false, Ordering::Relaxed);
                     self.newline(&mut state);
-                    let text = self.display_text(text, visible_width(&stamp()));
-                    self.out(&mut state, &stamp_block(&text));
+                    self.out(&mut state, &stamp_block(text));
                 }
                 self.newline(&mut state);
                 state.streamed_text = false;
@@ -1706,113 +1330,25 @@ impl Renderer {
         format!("  {color}{mark} {}{more}{RESET}\n", fit(lines[0], width.saturating_sub(more.len())))
     }
 
+    /// Accumulate streamed reasoning. Plain output shows only the one-line
+    /// summary once the block ends (see [`Self::finish_thinking`]).
     fn thinking_delta(&self, state: &mut State, text: &str) {
         if state.thinking.is_none() {
             self.newline(state);
-            let expanded = self.expanded.load(Ordering::Relaxed);
-            let stamp = stamp();
-            if expanded {
-                self.out(state, &format!("{stamp}{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n"));
-            }
-            state.thinking =
-                Some(ThinkBlock { text: String::new(), started: Instant::now(), stamp, expanded, last_draw: None });
+            state.thinking = Some(ThinkBlock { text: String::new(), started: Instant::now(), stamp: stamp() });
         }
-        let print = {
-            let block = state.thinking.as_mut().unwrap();
-            let first = block.text.is_empty();
-            block.text.push_str(text);
-            if block.expanded {
-                let pad = strip_ansi(&block.stamp).chars().count();
-                Some((format!("{THINK}{}{RESET}", if first { text.trim_start() } else { text }), pad))
-            } else if self.tty && block.last_draw.is_none_or(|t| t.elapsed() >= REDRAW_EVERY) {
-                block.last_draw = Some(Instant::now());
-                Some((self.collapsed_line(block), 0))
-            } else {
-                None
-            }
-        };
-        if let Some((print, pad)) = print {
-            self.out_aligned(state, &print, pad);
-        }
-    }
-
-    /// The one-line view of a streaming block, redrawn in place.
-    fn collapsed_line(&self, block: &ThinkBlock) -> String {
-        let prefix = "∴ Thinking: ";
-        let suffix = "  (ctrl+o to expand)";
-        let stamp_width = strip_ansi(&block.stamp).chars().count();
-        let room = self.width().saturating_sub(stamp_width + prefix.chars().count() + suffix.len() + 1);
-        let flat: String = block.text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let count = flat.chars().count();
-        let tail: String = if count > room {
-            let skip = count - room + 1;
-            format!("…{}", flat.chars().skip(skip).collect::<String>())
-        } else {
-            flat
-        };
-        format!("\r\x1b[2K{}{THINK}{prefix}{DIM}{tail}{suffix}{RESET}", block.stamp)
+        state.thinking.as_mut().unwrap().text.push_str(text);
     }
 
     fn finish_thinking(&self, state: &mut State) {
         let Some(block) = state.thinking.take() else { return };
-        if block.expanded {
-            self.newline(state);
-        } else {
-            let seconds = block.started.elapsed().as_secs_f64();
-            let clear = if self.tty { "\r\x1b[2K" } else { "" };
-            let line = format!(
-                "{clear}{}{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {} chars (ctrl+o to expand){RESET}\n",
-                block.stamp,
-                block.text.trim().chars().count()
-            );
-            self.out(state, &line);
-        }
-        state.last_thinking = block.text.trim().to_string();
-    }
-
-    /// Ctrl-O: toggle between collapsed and expanded thinking. Returns true
-    /// when it printed something at the prompt (the prompt must be redrawn).
-    pub fn toggle_thinking(&self) -> bool {
-        if self.frame.lock().unwrap().is_some() {
-            // Reasoning is already shown collapsed in the transcript; there is
-            // no in-place expand/collapse in frame mode yet.
-            return false;
-        }
-        let expanded = !self.expanded.fetch_xor(true, Ordering::Relaxed);
-        let mut state = self.state.lock().unwrap();
-        if let Some(block) = state.thinking.as_mut() {
-            block.expanded = expanded;
-            if expanded {
-                let body = format!(
-                    "{THINK}∴ Thinking {DIM}(ctrl+o to collapse){RESET}\n{THINK}{}{RESET}",
-                    block.text.trim_start()
-                );
-                let stamp = block.stamp.clone();
-                let text = format!("{}{}", if self.tty { "\r\x1b[2K" } else { "\n" }, stamp_block_with(&stamp, &body));
-                self.out(&mut state, &text);
-            } else {
-                self.newline(&mut state);
-                let line = self.collapsed_line(state.thinking.as_ref().unwrap());
-                self.out(&mut state, &line);
-            }
-            return false;
-        }
-        if state.in_turn {
-            return false;
-        }
-        let note = if !expanded {
-            format!("{DIM}thinking will be collapsed{RESET}\n")
-        } else if state.last_thinking.is_empty() {
-            format!("{DIM}thinking will be shown in full (no thinking yet){RESET}\n")
-        } else {
-            format!(
-                "{THINK}∴ Last thinking {DIM}(shown in full from now on; ctrl+o to collapse){RESET}\n{THINK}{}{RESET}\n",
-                state.last_thinking
-            )
-        };
-        self.out(&mut state, "\r\x1b[2K");
-        self.out(&mut state, &stamp_block(&note));
-        true
+        let seconds = block.started.elapsed().as_secs_f64();
+        let line = format!(
+            "{}{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {} chars{RESET}\n",
+            block.stamp,
+            block.text.trim().chars().count()
+        );
+        self.out(state, &line);
     }
 }
 
@@ -1839,9 +1375,9 @@ fn plan_checklist(plan: &Plan, width: usize) -> String {
             break;
         }
         // A plan title is model-controlled (`plan_add` / `plan_update`), so it
-        // may embed cursor/erase escapes. This legacy `fit` does NOT sanitize
+        // may embed cursor/erase escapes. This plain `fit` does NOT sanitize
         // (unlike the frame's), so strip them before formatting to keep e.g.
-        // `\x1b[2J` from clearing the terminal on replay or live legacy output.
+        // `\x1b[2J` from clearing the terminal in plain output.
         // Use the single-line sanitizer: a title is one checklist row, so an
         // embedded `\n` must be dropped too (the frame's `fit` also strips it),
         // else it would spill an unprefixed extra terminal row here.
@@ -2020,8 +1556,6 @@ pub(crate) mod tests {
             Arc::new(Self {
                 state: Mutex::new(State { at_line_start: true, ..Default::default() }),
                 status: None,
-                tty: true,
-                expanded: AtomicBool::new(false),
                 touched_quiet: AtomicBool::new(false),
                 answer_segment_closed: AtomicBool::new(false),
                 frame: Mutex::new(Some(Self::fresh_frame())),
@@ -2036,16 +1570,14 @@ pub(crate) mod tests {
             self.frame.lock().unwrap().as_ref().and_then(|fs| fs.busy.map(|clock| clock.since.is_none()))
         }
 
-        /// Build a legacy (non-frame) renderer for driving the legacy `event`
-        /// path in tests. The truncation guard is a legacy-renderer concern:
-        /// the frame renderer reconciles the final `AssistantMessage` in place
-        /// and never consults `touched_quiet`.
-        pub(crate) fn legacy_for_test() -> Arc<Self> {
+        /// Build a plain (non-frame, as for piped stdout) renderer for driving
+        /// the plain `event` path in tests. The truncation guard is a
+        /// plain-output concern: the frame renderer reconciles the final
+        /// `AssistantMessage` in place and never consults `touched_quiet`.
+        pub(crate) fn plain_for_test() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(State { at_line_start: true, ..Default::default() }),
                 status: None,
-                tty: true,
-                expanded: AtomicBool::new(false),
                 touched_quiet: AtomicBool::new(false),
                 answer_segment_closed: AtomicBool::new(false),
                 frame: Mutex::new(None),
@@ -2066,265 +1598,6 @@ pub(crate) mod tests {
         fn frame_batching(&self) -> bool {
             self.frame.lock().unwrap().as_ref().unwrap().batch
         }
-
-        #[cfg(test)]
-        fn pending_transcript(&self) -> Vec<StampedItem> {
-            self.state.lock().unwrap().transcript.clone()
-        }
-
-        #[cfg(test)]
-        fn in_turn(&self) -> bool {
-            self.state.lock().unwrap().in_turn
-        }
-
-        #[cfg(test)]
-        fn cached_last_thinking(&self) -> String {
-            self.state.lock().unwrap().last_thinking.clone()
-        }
-    }
-
-    #[test]
-    fn leaving_frame_mode_captures_the_full_transcript_in_order() {
-        // The whole frame transcript — frame-only output AND conversation
-        // turns — is captured in on-screen order for `replay_transcript`.
-        // Replaying this (not the conversation) is what keeps the switch
-        // lossless: nothing is grouped ahead of or behind the turns.
-        let r = Renderer::frame_for_test();
-        r.print_block("nano-coder v0.0.0\nType /help for commands");
-        r.note("a renderer note");
-        r.event(&AgentEvent::UserMessage { text: "hi" });
-        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "hello" });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        assert!(r.frame.lock().unwrap().is_none(), "frame dropped");
-        let binding = r.pending_transcript();
-        let items: Vec<&Item> = binding.iter().map(|si| &si.item).collect();
-        // Banner + note + user turn + assistant turn, in the order shown.
-        assert!(
-            matches!(
-                items.as_slice(),
-                [
-                    Item::Output(_),
-                    Item::Note(_),
-                    Item::Message { role: Role::User, .. },
-                    Item::Message { role: Role::Assistant, .. }
-                ]
-            ),
-            "full transcript captured in order: {items:?}"
-        );
-        assert!(items.iter().any(|i| matches!(i, Item::Output(t) if t.contains("nano-coder v0.0.0"))), "banner kept");
-        assert!(items.iter().any(|i| matches!(i, Item::Note(t) if t.contains("a renderer note"))), "note kept");
-        assert!(items.iter().any(|i| matches!(i, Item::Message { text, .. } if text == "hi")), "user turn kept");
-        assert!(
-            items.iter().any(|i| matches!(i, Item::Message { text, .. } if text == "hello")),
-            "assistant turn kept"
-        );
-    }
-
-    #[test]
-    fn replay_transcript_consumes_the_queue_and_is_idempotent() {
-        // After a frame → legacy switch the captured transcript must be
-        // reprinted during the transition: a fresh session has no history
-        // events to trigger `out()`'s deferred flush, and the next prompt is
-        // drawn by `EditView`, so the transcript would otherwise stay
-        // invisible until the first turn's output. The replay empties the
-        // queue; a second call (or the next `out()`) reprints nothing.
-        let r = Renderer::frame_for_test();
-        r.print_block("nano-coder v0.0.0");
-        r.event(&AgentEvent::UserMessage { text: "hi" });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        assert!(!r.pending_transcript().is_empty(), "transcript captured");
-        r.replay_transcript();
-        assert!(r.pending_transcript().is_empty(), "replayed during the transition");
-        r.replay_transcript();
-        assert!(r.pending_transcript().is_empty(), "idempotent");
-    }
-
-    #[test]
-    fn leaving_frame_mode_keeps_raw_exports_byte_exact_in_the_transcript() {
-        // `Item::Raw` holds verbatim machine-readable output (`/trajectory
-        // --json`). It rides along in the captured transcript (byte-exact,
-        // never trimmed or DIM-styled like a note) and is printed by
-        // `replay_transcript`, which the caller runs after the clear.
-        let r = Renderer::frame_for_test();
-        r.print_raw("{\"session_id\":\"abc\"}");
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        let items = r.pending_transcript();
-        assert!(
-            items.iter().any(|si| matches!(&si.item, Item::Raw(t) if t == "{\"session_id\":\"abc\"}")),
-            "raw export kept byte-exact in the transcript: {items:?}"
-        );
-        assert!(
-            !items.iter().any(|si| matches!(&si.item, Item::Note(t) if t.contains("session_id"))),
-            "raw output is never restyled as a note: {items:?}"
-        );
-        r.replay_transcript();
-        assert!(r.pending_transcript().is_empty(), "replayed after the clear");
-    }
-
-    #[test]
-    fn replay_transcript_locks_frame_before_state() {
-        // `replay_transcript` must use the canonical `frame` → `state` lock
-        // order (the order `set_mode`, `event`, `urgent_note` and
-        // `clear_screen` all use): correct replay waits for `state` *while
-        // holding* `frame`.
-        //
-        // To actually detect an inverted (`state` → `frame`) regression the
-        // test must build a genuine circular wait — a holder that merely grabs
-        // `state` and lets go cannot, because it never requests `frame`, so no
-        // cycle forms and *both* lock orders would finish. Instead the `holder`
-        // below takes `frame` first and then, on cue, requests `state` (the
-        // canonical order). Against a buggy replay that took `state` first and
-        // then waited on `frame`, that closes the loop — holder holds `frame`
-        // wanting `state`, replay holds `state` wanting `frame` — and the
-        // replay never signals, so the timeout fails the test. Correct replay
-        // simply waits for `frame` (held by the holder) and completes once the
-        // holder releases it.
-        use std::sync::mpsc;
-        use std::time::Duration;
-        let r = Renderer::frame_for_test();
-        r.event(&AgentEvent::UserMessage { text: "hi" });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        assert!(!r.pending_transcript().is_empty(), "transcript captured");
-
-        let (held_tx, held_rx) = mpsc::channel(); // holder signals it owns `frame`
-        let (go_tx, go_rx) = mpsc::channel(); // test tells holder to request `state`
-        let holder = std::thread::spawn({
-            let r = Arc::clone(&r);
-            move || {
-                let frame = r.frame.lock().unwrap();
-                held_tx.send(()).unwrap();
-                go_rx.recv().unwrap();
-                // Request `state` in the canonical order; a buggy replay that
-                // already holds `state` and wants `frame` deadlocks here.
-                let _state = r.state.lock().unwrap();
-                drop(frame);
-            }
-        });
-        held_rx.recv().unwrap(); // holder now owns `frame`
-
-        let (done_tx, done_rx) = mpsc::channel();
-        let replay = std::thread::spawn({
-            let r = Arc::clone(&r);
-            move || {
-                r.replay_transcript();
-                done_tx.send(()).unwrap();
-            }
-        });
-        // Let a buggy replay grab `state` before the holder asks for it, so the
-        // inverted order closes the cycle; correct replay is already parked on
-        // `frame` and unaffected by this delay.
-        std::thread::sleep(Duration::from_millis(50));
-        go_tx.send(()).unwrap();
-
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("replay_transcript deadlocked: it must lock frame before state");
-        replay.join().unwrap();
-        holder.join().unwrap();
-        assert!(r.pending_transcript().is_empty(), "replayed during the transition");
-    }
-
-    #[test]
-    fn leaving_frame_mode_preserves_plan_snapshots_in_order() {
-        // The frame appends an `Item::Plan` per `Plan` event. Capturing the
-        // transcript keeps every snapshot in original order, so the earlier
-        // checklist states survive a frame → legacy switch alongside the turns
-        // they belonged to — and the current plan (the last snapshot) prints
-        // exactly once, with no separate trailing reprint to skip.
-        let r = Renderer::frame_for_test();
-        let first = Plan {
-            goal: String::new(),
-            items: vec![
-                PlanItem { id: 1, title: "one".into(), status: Status::InProgress, notes: vec![], after: vec![] },
-                PlanItem { id: 2, title: "two".into(), status: Status::Pending, notes: vec![], after: vec![] },
-            ],
-        };
-        let second = Plan {
-            goal: String::new(),
-            items: vec![
-                PlanItem { id: 1, title: "one".into(), status: Status::Done, notes: vec![], after: vec![] },
-                PlanItem { id: 2, title: "two".into(), status: Status::InProgress, notes: vec![], after: vec![] },
-            ],
-        };
-        r.event(&AgentEvent::UserMessage { text: "do it" });
-        r.event(&AgentEvent::Plan { plan: &first });
-        r.event(&AgentEvent::Plan { plan: &second });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        let binding = r.pending_transcript();
-        let plans: Vec<&Plan> = binding
-            .iter()
-            .filter_map(|si| match &si.item {
-                Item::Plan(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(plans, vec![&first, &second], "plan snapshots kept in original order");
-    }
-
-    #[test]
-    fn leaving_frame_mode_restores_pre_compaction_turns_not_the_summary() {
-        // After compaction `Agent::conversation` holds a synthetic user-role
-        // summary in place of the folded turns, but the frame still holds the
-        // REAL turns (compaction only appends a note; it never rewrites the
-        // transcript). Replaying the captured transcript therefore restores
-        // the actual displayed history and never exposes the summary.
-        let r = Renderer::frame_for_test();
-        r.event(&AgentEvent::UserMessage { text: "earlier question" });
-        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "earlier answer" });
-        r.event(&AgentEvent::Compacted);
-        r.event(&AgentEvent::UserMessage { text: "later question" });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        let items = r.pending_transcript();
-        assert!(
-            items.iter().any(|si| matches!(&si.item, Item::Message { text, .. } if text == "earlier question")),
-            "real pre-compaction user turn preserved: {items:?}"
-        );
-        assert!(
-            items.iter().any(|si| matches!(&si.item, Item::Message { text, .. } if text == "earlier answer")),
-            "real pre-compaction assistant turn preserved: {items:?}"
-        );
-        assert!(
-            items.iter().any(|si| matches!(&si.item, Item::Note(t) if t.contains("compacted"))),
-            "the compaction marker is shown as a note: {items:?}"
-        );
-        assert!(
-            !items.iter().any(|si| matches!(&si.item, Item::Message { text, .. } if text.starts_with("[Summary of the earlier conversation"))),
-            "no synthetic summary is replayed as a user turn: {items:?}"
-        );
-    }
-
-    #[test]
-    fn leaving_frame_mode_preserves_the_outcome_marker() {
-        // The `report_outcome` status marker is conversation-derived, but the
-        // transcript replay (not `Agent::conversation`) is now the source on a
-        // frame → legacy switch, so the frame's `OutcomeMark` must be kept —
-        // dropping it would lose the marker entirely.
-        let r = Renderer::frame_for_test();
-        let call = ToolCall {
-            id: "call_1".into(),
-            name: crate::goal::TOOL_NAME.into(),
-            arguments: json!({"status": "completed", "summary": "done"}),
-            ..Default::default()
-        };
-        r.event(&AgentEvent::ToolCall { call: &call });
-        r.set_mode(crate::frame::RendererMode::Legacy);
-        let items = r.pending_transcript();
-        assert!(
-            items.iter().any(|si| matches!(&si.item, Item::OutcomeMark(t) if t.contains("completed"))),
-            "the outcome marker is preserved for the transcript replay: {items:?}"
-        );
-    }
-
-    #[test]
-    fn frame_mode_end_turn_clears_the_legacy_turn_flag() {
-        // `begin_turn` sets `in_turn` even in frame mode; if the frame branch
-        // of `end_turn` did not clear it, switching back to legacy would leave
-        // Ctrl-O at the prompt behaving as though a turn were still active.
-        let r = Renderer::frame_for_test();
-        r.begin_turn();
-        assert!(r.in_turn());
-        r.end_turn();
-        assert!(!r.in_turn(), "frame-mode end_turn must clear the legacy flag");
     }
 
     #[test]
@@ -2550,7 +1823,7 @@ pub(crate) mod tests {
         // streams in full and must NOT be reprinted. The guard is raised only
         // once a non-empty delta is actually suppressed while quiet.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
 
         set_verbosity(Verbosity::Quiet);
         r.begin_turn();
@@ -2560,7 +1833,7 @@ pub(crate) mod tests {
         assert!(!r.answer_may_be_truncated(), "a quiet start with no suppressed delta must not flag truncation");
 
         // A fresh turn that genuinely suppresses a non-empty delta while quiet
-        // IS flagged (the legacy renderer then reprints the full response).
+        // IS flagged (plain output then reprints the full response).
         set_verbosity(Verbosity::Quiet);
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "hello" });
@@ -2575,7 +1848,7 @@ pub(crate) mod tests {
         // answer streams in full and reprinting it would duplicate it. Only a
         // genuinely suppressed non-empty delta raises the guard.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
         set_verbosity(Verbosity::Normal);
         r.begin_turn();
         r.set_verbosity_mid_turn(Verbosity::Quiet);
@@ -2591,7 +1864,7 @@ pub(crate) mod tests {
         // so the guard must be clear — otherwise the fully-streamed final answer
         // is duplicated. The guard tracks the final segment, not any earlier one.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
 
         set_verbosity(Verbosity::Quiet);
         r.begin_turn();
@@ -2636,7 +1909,7 @@ pub(crate) mod tests {
         // guard from the earlier segment must be cleared, or turn-end
         // reconciliation reprints (duplicates) the just-printed answer.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
 
         set_verbosity(Verbosity::Quiet);
         r.begin_turn();
@@ -2660,7 +1933,7 @@ pub(crate) mod tests {
         // text in place, so the guard must be cleared — reprinting would
         // duplicate the answer just printed.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
 
         set_verbosity(Verbosity::Quiet);
         r.begin_turn();
@@ -2676,14 +1949,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn quiet_assistant_message_closes_legacy_stream() {
+    fn quiet_assistant_message_closes_the_plain_stream() {
         // A message streams at normal, then verbosity switches to quiet before
         // its terminating `AssistantMessage` arrives. The quiet gate must close
-        // the legacy renderer's open stream (reset `streamed_text`, end the
+        // plain output's open stream (reset `streamed_text`, end the
         // line) so a later normal `TextDelta` begins a fresh segment instead of
         // appending to this message's prefix and merging two messages.
         let _lock = verbosity_lock();
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
 
         set_verbosity(Verbosity::Normal);
         r.begin_turn();
@@ -2695,7 +1968,7 @@ pub(crate) mod tests {
         r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "first" });
         {
             let state = r.state.lock().unwrap();
-            assert!(!state.streamed_text, "the closed segment must reset the legacy stream");
+            assert!(!state.streamed_text, "the closed segment must reset the plain stream");
             assert!(state.at_line_start, "the closed segment must end the line");
         }
 
@@ -2710,32 +1983,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn turn_raw_defers_while_reasoning_is_mid_line() {
-        // A thinking delta leaves the cursor mid-line with `streamed_text`
-        // false. A raw export then must still be deferred (not printed into the
-        // middle of the reasoning line) and flushed verbatim at end_turn.
-        let _lock = verbosity_lock();
-        set_verbosity(Verbosity::Normal);
-        let r = Renderer::legacy_for_test();
-        r.begin_turn();
-        r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
-        assert!(!r.state.lock().unwrap().at_line_start, "a thinking delta leaves the cursor mid-line");
-        r.turn_raw("{\"k\":1}");
-        assert!(
-            matches!(
-                r.state.lock().unwrap().deferred.as_slice(),
-                [Deferred::Raw(payload)] if payload == "{\"k\":1}"
-            ),
-            "a raw export during mid-line reasoning must be deferred"
-        );
-        set_verbosity(Verbosity::Normal);
-    }
-
-    #[test]
     fn turn_raw_defers_while_answer_text_is_mid_line() {
         let _lock = verbosity_lock();
         set_verbosity(Verbosity::Normal);
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "partial answer" });
         r.turn_raw("{\"k\":1}");
@@ -2755,7 +2006,7 @@ pub(crate) mod tests {
         // terminal-locked `out`), leaving nothing queued for end_turn.
         let _lock = verbosity_lock();
         set_verbosity(Verbosity::Normal);
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
         r.begin_turn();
         assert!(r.state.lock().unwrap().at_line_start);
         r.turn_raw("{\"k\":1}");
@@ -2769,7 +2020,7 @@ pub(crate) mod tests {
         // end_turn: one ordered queue drains note, raw, note.
         let _lock = verbosity_lock();
         set_verbosity(Verbosity::Normal);
-        let r = Renderer::legacy_for_test();
+        let r = Renderer::plain_for_test();
         r.begin_turn();
         r.event(&AgentEvent::TextDelta { text: "partial answer" });
         r.note("first");
@@ -2815,75 +2066,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn frame_thinking_is_cached_for_legacy_ctrl_o() {
-        let r = Renderer::frame_for_test();
-        // Reasoning in frame mode shows collapsed (char count only) and never
-        // reaches `finish_thinking`, so without caching it `last_thinking`
-        // stays empty and a frame → legacy switch leaves Ctrl-O reporting
-        // "no thinking yet". The full text must be cached for that expansion.
-        assert!(r.cached_last_thinking().is_empty());
-        r.event(&AgentEvent::Thinking { text: "pondering the plan" });
-        assert_eq!(r.cached_last_thinking(), "pondering the plan");
-        // A later reasoning block supersedes the earlier one.
-        r.event(&AgentEvent::Thinking { text: "a second, newer thought" });
-        assert_eq!(r.cached_last_thinking(), "a second, newer thought");
-    }
-
-    #[test]
-    fn frame_thinking_cache_is_sanitized_before_storing() {
-        let r = Renderer::frame_for_test();
-        // The frame renders reasoning collapsed (char count only), so this text
-        // is never displayed before caching — it is raw model-controlled input.
-        // Ctrl-O writes the cache straight through `out()`, so escapes must be
-        // stripped at cache time or a frame → legacy expand would inject them.
-        r.event(&AgentEvent::Thinking { text: "plan\x1b[2J\x1b[32mOK\x1b[0m\x07 done" });
-        let cached = r.cached_last_thinking();
-        assert!(!cached.contains('\x1b'), "escape survived caching: {cached:?}");
-        assert!(!cached.contains('\x07'), "control char survived caching: {cached:?}");
-        assert_eq!(cached, "plan[2J[32mOK[0m done");
-    }
-
-    #[test]
-    fn partial_reasoning_is_cached_when_text_finalizes_without_thinking_event() {
-        let r = Renderer::frame_for_test();
-        // A cancelled/failed stream can emit `ThinkingDelta` then finalize via
-        // `TextDelta` (the answer starts) without the closing `Thinking` event.
-        // The partial thought must still reach the Ctrl-O cache, or a frame →
-        // legacy switch expands older reasoning / reports none.
-        r.event(&AgentEvent::ThinkingDelta { text: "half-formed plan" });
-        r.event(&AgentEvent::TextDelta { text: "partial answer" });
-        assert_eq!(r.cached_last_thinking(), "half-formed plan");
-    }
-
-    #[test]
-    fn partial_reasoning_is_cached_when_turn_ends_without_thinking_event() {
-        let r = Renderer::frame_for_test();
-        // Same gap, finalized by `end_turn` (`frame_finish_stream`) instead of a
-        // `TextDelta`: reasoning streamed but the turn closed with no `Thinking`
-        // event and no answer text.
-        r.event(&AgentEvent::ThinkingDelta { text: "interrupted thought" });
-        r.end_turn();
-        assert_eq!(r.cached_last_thinking(), "interrupted thought");
-    }
-
-    #[test]
-    fn clear_screen_in_frame_mode_resets_cached_reasoning() {
-        let r = Renderer::frame_for_test();
-        r.event(&AgentEvent::Thinking { text: "prior session reasoning" });
-        assert_eq!(r.cached_last_thinking(), "prior session reasoning");
-        // `/restart` calls clear_screen; the frame branch must clear the shared
-        // reasoning cache too, or the prior session's thinking stays expandable.
-        r.clear_screen();
-        assert!(r.cached_last_thinking().is_empty(), "reasoning survived /restart");
-    }
-
-    #[test]
     fn frame_quiet_preserves_a_model_switch_failure() {
         // A failed mid-turn `/model` switch is user-facing in every verbosity.
         // In frame mode the quiet gate returns before `frame_event` for all but
         // a few events; `ModelSwitchFailed` must be exempt so the warning still
         // lands in the transcript instead of being silently dropped — exactly
-        // the mode where the legacy path explicitly preserves it.
+        // the mode where plain output explicitly preserves it.
         let _lock = verbosity_lock();
         set_verbosity(Verbosity::Quiet);
         let r = Renderer::frame_for_test();
@@ -3025,7 +2213,7 @@ pub(crate) mod tests {
     #[test]
     fn plan_checklist_sanitizes_model_controlled_titles() {
         // A plan title comes from a model's `plan_add` / `plan_update`, so the
-        // legacy checklist (used on frame→legacy replay and live legacy output)
+        // plain checklist
         // must strip cursor/erase escapes before printing — otherwise a title
         // like `\x1b[2J` would clear the terminal.
         let plan = Plan {

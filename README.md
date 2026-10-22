@@ -22,8 +22,8 @@ cargo install nano-coder             # or build from source
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
 - **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
-- **Streaming output**: answers stream in, thinking shows collapsed (Ctrl-O expands it), tool calls show inline
-- **Status line** pinned to the bottom of the terminal, plus manual and automatic context compaction
+- **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
+- **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
 - **Project instructions**: `AGENTS.md` (or `CLAUDE.md`, `.github/copilot-instructions.md`) from the repository is added to the system prompt
 - **Safety**: built-in guards block destructive commands (`rm -rf /`, `DROP DATABASE`, force-pushing `main`, ...), user allow/deny rules, and an optional OS sandbox (Seatbelt on macOS, Landlock on Linux)
@@ -177,10 +177,10 @@ src/
 ├── session_index.rs # Session summaries (.index.jsonl) for the --resume picker
 ├── resume.rs    # --resume picker, --resume last, --list-sessions
 ├── context.rs   # Token accounting, context-window heuristics, overflow detection
-├── status.rs    # Bottom-of-terminal status line
+├── status.rs    # Status bar contents (the frame's last row)
 ├── ui.rs        # Verbosity levels and the streaming output renderer
-├── frame.rs     # App-owned frame renderer (renderer = "frame"): full redraw on resize
-├── lineedit.rs  # Key-by-key prompt input (Ctrl-O, mid-turn input on the status line)
+├── frame.rs     # App-owned frame renderer: full redraw on resize
+├── lineedit.rs  # Key-by-key prompt input (editing, history, mid-turn steer/queue)
 ├── input_history.rs # Up/Down recall of submitted lines (session-scoped)
 ├── instructions.rs # AGENTS.md / CLAUDE.md discovery for the system prompt
 ├── plan.rs      # Task plan and the plan_add / plan_update / plan_show tools
@@ -420,7 +420,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/thinking [level|default|off|reset]` - Show the thinking level in use and the levels the current model takes, or set one for this session (`reset` goes back to the configured level). See [Thinking](#thinking)
 - `/providers` - List providers, endpoints and whether their API key is available
 - `/session` - Show the session ID and log path
-- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt with the frame renderer: invoked mid-turn (while a turn runs) or under the legacy renderer it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
+- `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
@@ -493,7 +493,6 @@ auto_compact_threshold = 0.8            # fraction of the context window
 compaction_mode = "standard"            # standard | smart (experimental, see Smart compaction)
 # context_window = 128000               # override the window (providers can set it too)
 verbosity = "normal"                    # quiet | normal | verbose | debug (or --verbosity)
-renderer = "frame"                      # frame (default: app-owned redraw on resize) | legacy
 timestamps = true                       # prefix CLI messages with the local time (HH:MM:SS)
 project_instructions = true             # load AGENTS.md etc. (see Project Instructions)
 project_instruction_files = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", ".github/copilot-instructions.md"]
@@ -857,10 +856,8 @@ with `/verbosity`, `--verbosity`, or `verbosity` in the config (default `normal`
 | `verbose` | Also the first lines of each tool's output |
 | `debug` | Also lifecycle hook events (`[hook] ...`) |
 
-**Thinking.** Reasoning streams as a single line that updates in place
-(`∴ Thinking: ...`) and becomes `∴ Thought for 3.1s · 812 chars` when the answer starts.
-**Ctrl-O** switches to showing thinking in full, including the block that is streaming. At
-the prompt it prints the last thinking in full. Press it again to collapse. Reasoning is read
+**Thinking.** Reasoning shows as a single collapsed line while it streams and becomes
+`∴ Thought for 3.1s · 812 chars` when the answer starts. Reasoning is read
 from `reasoning_content` / `reasoning` fields (DeepSeek, llama.cpp, vLLM, OpenRouter, Ollama),
 from `<think>...</think>` in the content, and from Anthropic `thinking` blocks. Anthropic
 thinking blocks are kept with the conversation so tool use keeps working when thinking is
@@ -870,7 +867,7 @@ enabled (e.g. `extra_body = { thinking = { type = "enabled", budget_tokens = 400
 error).
 
 **Input.** On a terminal, input is read key by key. While a turn runs, what you type shows
-on the status line; Enter sends it to steer the running turn, Ctrl-Enter (or Cmd-Enter)
+in the input editor; Enter sends it to steer the running turn, Ctrl-Enter (or Cmd-Enter)
 adds it to the message queue (one queued message runs per following turn; `/queue` lists,
 edits and removes them), and Esc Esc or Ctrl-C cancels the turn. The prompt supports
 editing: Left/Right move the cursor, Home/End (or Ctrl-A/Ctrl-E) jump to the start/end,
@@ -890,8 +887,7 @@ Every message (your prompt, answers, tool calls and results, thinking, notes) st
 the local time as `HH:MM:SS`. The prompt's time is rewritten when you press Enter, so it
 shows when the message was sent. Turn this off with `timestamps = false`.
 
-**Renderer.** By default (`renderer = "frame"`) nano-coder uses an **app-owned frame
-renderer**: it composes the whole screen — transcript, input
+**Renderer.** In a terminal nano-coder uses an **app-owned frame renderer**: it composes the whole screen — transcript, input
 editor, then the status bar as the last line — into one frame and diff-renders it through a
 single writer, wrapped in synchronized-output markers so a half-drawn frame is never visible.
 On a width change it re-renders the entire frame (clearing the screen and scrollback) instead
@@ -902,9 +898,9 @@ when nano-coder is waiting for you, and a spinner with `working 12s · Enter ste
 cancels` while a turn runs (the hint shows while the input is empty). The `working` count is
 working time, not wall time: while the turn is blocked waiting for a picker — the agent
 asking a question, or the turn-cap prompt — the clock pauses, so the time you spend
-answering does not inflate it. It never captures the mouse. Setting `renderer = "legacy"` (or picking it in
-`/settings`) switches back to the scroll-region renderer, where the terminal owns the
-scrollback and reflows history itself on a resize, with the status line pinned to the bottom.
+answering does not inflate it. It never captures the mouse. When stdout is not a terminal
+(piped or redirected), output is plain text instead. The scroll-region `renderer = "legacy"`
+option was removed; a config that still sets `renderer` loads, with a one-line notice.
 
 ## Status Line and Compaction
 
@@ -915,9 +911,8 @@ In an interactive terminal the bottom row shows the provider/model, the working 
 a fill bar, message count, session input/output tokens, the auto-compaction threshold and
 count (labelled `smart-compact` when compactions are smart, else `auto-compact`), the active mode when it is `plan` or `auto` (the default `normal` is not shown, to
 save space), and what the agent is doing. With a GitHub Copilot model it also shows the session's
-AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. In the legacy
-renderer it uses a terminal scroll region (DECSTBM); the default frame renderer instead composes
-the bar as the frame's final row. Either way it follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
+AI Credits (`0.4 AIC`), summed from the `total_nano_aiu` each response reports. The frame
+renderer draws the bar as the frame's final row; it follows resizes, and is off when stdin/stdout isn't a TTY or `AGENTIC_NO_STATUS` is set. The conversation is kept
 directly above the status line (empty space collects at the top), so shrinking the window
 drops empty rows rather than pushing the conversation out of view.
 

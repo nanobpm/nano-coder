@@ -35,7 +35,6 @@ struct Changes {
     system_prompt: bool,
     compaction: bool,
     verbosity: bool,
-    renderer: bool,
     providers: BTreeSet<String>,
 }
 
@@ -53,7 +52,6 @@ impl Changes {
             || self.system_prompt
             || self.compaction
             || self.verbosity
-            || self.renderer
             || !self.providers.is_empty()
     }
 }
@@ -189,7 +187,6 @@ pub async fn run(
                 config.compaction_mode.as_str()
             ),
             format!("Verbosity        {} ({})", config.verbosity, config.verbosity.describe()),
-            format!("Renderer         {} ({})", config.renderer, config.renderer.describe()),
             format!("Save to config file{}", if changes.any() { " (unsaved changes)" } else { "" }),
             "Done".to_string(),
         ];
@@ -376,29 +373,7 @@ pub async fn run(
                     Err(e) => return (notices, Err(e.into())),
                 }
             }
-            9 => {
-                let modes = crate::frame::RendererMode::ALL;
-                let labels: Vec<String> = modes.iter().map(|m| format!("{m:<7} {}", m.describe())).collect();
-                let current = modes.iter().position(|m| *m == agent.config().renderer).unwrap_or(0);
-                // Esc keeps the current renderer (`Ok(None)`); only a genuine I/O
-                // failure is `Err` and must surface.
-                match Select::new().with_prompt("Renderer").items(&labels).default(current).interact_opt() {
-                    Ok(Some(choice)) => {
-                        let previous = agent.config().renderer;
-                        agent.config_mut().renderer = modes[choice];
-                        changes.renderer = true;
-                        if modes[choice] != previous {
-                            // The switch is applied live by `main` (which detects the
-                            // changed `renderer` after the dialog returns and flips the
-                            // frame renderer, the line editor, and the scroll region).
-                            println!("Renderer set to {} — taking effect now.", modes[choice]);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => return (notices, Err(e.into())),
-                }
-            }
-            10 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
+            9 => save_and_report(agent.config(), &mut changes, config_path, &mut notices),
             // `Done` and Esc share the one completion path (`finish!`), so both
             // offer to save when `changes.any()` before returning.
             _ => finish!(),
@@ -1069,7 +1044,7 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
             // the saved settings no longer match the live client — is returned
             // for `main` to re-show through the renderer after the dialog's
             // exit redraw. It is NOT printed here: in frame mode a plain
-            // `println!` is wiped by `frame_resize`, and in legacy mode (where
+            // `println!` is wiped by `frame_resize`, and with plain output (where
             // `frame_resize` is a no-op) printing here too would show the same
             // warning twice — once inline and once via the retained notice.
             Err(e) => {
@@ -1412,9 +1387,9 @@ fn save(config: &Config, changes: &Changes, path: &Path) -> Result<()> {
     if changes.verbosity {
         doc["verbosity"] = toml_edit::value(config.verbosity.to_string());
     }
-    if changes.renderer {
-        doc["renderer"] = toml_edit::value(config.renderer.to_string());
-    }
+    // The renderer setting is retired (only the frame renderer remains): drop
+    // a stale key whenever the file is rewritten.
+    doc.remove("renderer");
     if changes.compaction {
         doc["auto_compact"] = toml_edit::value(config.auto_compact);
         doc["auto_compact_threshold"] = toml_edit::value(config.auto_compact_threshold);

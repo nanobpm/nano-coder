@@ -1517,8 +1517,9 @@ fn snippet(regex: &regex::Regex, text: &str) -> String {
     let to = text[end..].char_indices().nth(room).map_or(text.len(), |(i, _)| end + i);
     // `split_whitespace` collapses whitespace but keeps escaped C0/C1 controls
     // (ESC, BEL, …) that a hand-edited JSONL `text` can carry (e.g. `\^[[2J`).
-    // The legacy renderer writes this tool result straight to the terminal, so
-    // unlike `/memory` this path could clear or manipulate it. Map every line
+    // Plain output writes this tool result straight to the terminal (or a
+    // pipe someone may `cat`), so unlike `/memory` this path could clear or
+    // manipulate it. Map every line
     // break / control char to a space before joining, exactly as the prompt
     // index does, so the returned snippet is terminal-safe (Copilot finding,
     // src/memory.rs).

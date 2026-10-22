@@ -154,8 +154,6 @@ enum TermInput {
     Queue(String),
     Eof,
     Interrupt,
-    /// Ctrl-O: expand or collapse thinking.
-    ToggleThinking,
     /// A lone Esc press.
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
@@ -335,21 +333,6 @@ impl DoublePress {
 /// gesture does not need.
 type DoubleEscape = lineedit::DoubleEscape;
 
-/// The terminal-owning state shared between the SIGWINCH resize task and a live
-/// renderer switch (`Terminal::renderer_switched`). Both must serialise against
-/// each other: a resize that passes its `is_frame()` check and then debounces
-/// must not draw while a transition is mid flip/clear/replay (on frame → legacy
-/// that would reprint the prompt before `replay_transcript`, placing history
-/// after it). `lock` is that serialisation point; the remaining fields are the
-/// state the two draw paths touch, grouped so `Terminal::start` stays lean.
-#[derive(Clone)]
-struct TransitionShared {
-    view: lineedit::SharedView,
-    status: Option<std::sync::Arc<status::StatusLine>>,
-    renderer: std::sync::Arc<ui::Renderer>,
-    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-}
-
 struct Terminal {
     want: std::sync::mpsc::Sender<()>,
     outstanding: bool,
@@ -361,7 +344,7 @@ struct Terminal {
     /// Editable mid-turn with `/queue` (including removing entries).
     messages: queue::MessageQueue,
     /// Lines typed during a turn join the message queue (only when stdin is a
-    /// terminal); piped lines keep the legacy "queued as later prompts" path.
+    /// terminal); piped lines keep the "queued as later prompts" path.
     steerable: bool,
     /// Where `/settings` saves changes.
     config_path: std::path::PathBuf,
@@ -372,12 +355,6 @@ struct Terminal {
     recents: recents::SharedRecents,
     recents_path: std::path::PathBuf,
     renderer: std::sync::Arc<ui::Renderer>,
-    /// The renderer mode active when the session started; a live `renderer`
-    /// switch in `/settings` is detected against it.
-    renderer_before: crate::frame::RendererMode,
-    /// The status line, kept so a live renderer switch can re-anchor the
-    /// scroll region (legacy) or let the frame clear it (frame).
-    status: Option<std::sync::Arc<status::StatusLine>>,
     /// Set to make the stdin reader yield the terminal to a foreground picker
     /// (a `question`/turn-cap prompt), so the two never race for keystrokes.
     suspend: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -418,10 +395,10 @@ impl Terminal {
         config_path: std::path::PathBuf,
         recents: recents::SharedRecents,
         recents_path: std::path::PathBuf,
-        renderer_before: crate::frame::RendererMode,
-        transition: TransitionShared,
+        view: lineedit::SharedView,
+        renderer: std::sync::Arc<ui::Renderer>,
+        picker_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
-        let TransitionShared { view, status, renderer, lock: picker_lock } = transition;
         let (tx, events) = mpsc::unbounded_channel();
         let (want, want_rx) = std::sync::mpsc::channel::<()>();
         let lines = tx.clone();
@@ -438,7 +415,6 @@ impl Terminal {
                         lineedit::Key::Queue(line) => TermInput::Queue(line),
                         lineedit::Key::Eof => TermInput::Eof,
                         lineedit::Key::Interrupt => TermInput::Interrupt,
-                        lineedit::Key::ToggleThinking => TermInput::ToggleThinking,
                         lineedit::Key::Escape => TermInput::Escape,
                         lineedit::Key::CycleMode => TermInput::CycleMode,
                         lineedit::Key::Rejected(note) => TermInput::Rejected(note),
@@ -488,8 +464,6 @@ impl Terminal {
             recents,
             recents_path,
             renderer,
-            renderer_before,
-            status,
             suspend,
             suspend_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             picker_lock,
@@ -526,145 +500,6 @@ impl Terminal {
     fn sync_context(&mut self, agent: &Agent) {
         let context = self.view.lock().unwrap().context_handle();
         context.lock().unwrap().config = agent.config().clone();
-    }
-
-    /// Apply a live `renderer` switch from `/settings`: flip the app-owned
-    /// frame renderer, match the line editor's drawing path (frame hook vs
-    /// inline), re-anchor the status line / scroll region, and replay the
-    /// transcript into the now-active renderer. No-op when the mode is
-    /// unchanged. The transcript state is preserved across the flip, so the
-    /// conversation is simply re-emitted into whichever renderer is active.
-    ///
-    /// The whole flip/clear/replay runs under `picker_lock` — the same lock the
-    /// SIGWINCH resize task takes before drawing — so a resize cannot pass its
-    /// `is_frame()` check, finish debouncing mid-transition, and `view.resize()`
-    /// while the screen is being cleared/replayed (which on frame → legacy would
-    /// redraw the prompt before `replay_transcript`, placing history after it).
-    async fn renderer_switched(&mut self, agent: &mut Agent) {
-        let mode = agent.config().renderer;
-        if mode == self.renderer_before {
-            return;
-        }
-        // Serialize against the SIGWINCH resize task: hold the terminal-owning
-        // lock for the whole multi-step transition so no resize redraw can
-        // interleave with the mode flip, screen clear, and transcript replay.
-        let _transition_guard = self.picker_lock.lock().await;
-        self.renderer_before = mode;
-        let switching_to_frame = mode == crate::frame::RendererMode::Frame;
-        // Leaving frame mode: the frame's full redraws cleared the legacy
-        // scrollback, so the legacy transcript is gone — the conversation is
-        // replayed below, once legacy owns the screen again. The interactive
-        // prompt's current line is NOT in the conversation (it is recorded
-        // only when submitted), so replaying every user message cannot
-        // duplicate the line being edited.
-        //
-        // Entering frame mode: legacy output that exists only in renderer
-        // state (deferred notes, the collapsed thinking summary) must move
-        // into the frame transcript BEFORE the frame is activated — once it
-        // is, `drain_pending` (a legacy-state accessor) returns empty, and
-        // the frame's first full redraw clears the scrollback those notes
-        // were headed for.
-        let pending = if switching_to_frame { self.renderer.drain_pending() } else { Vec::new() };
-        // Whether a frame is ACTIVE right now (before the switch). Off a tty
-        // `set_mode(Frame)` leaves `is_frame()` false, so this — not the
-        // configured mode — tells whether the post-switch replay/cleanup is
-        // needed: with no frame ever active, legacy scrollback was never
-        // cleared and replaying would print the whole conversation again.
-        let frame_was_active = self.renderer.is_frame();
-        self.renderer.set_mode(mode);
-        let on = self.renderer.is_frame();
-        // Rebuild the frame hook to match: frame routes every edit through the
-        // single frame writer; legacy draws inline with its own command menu.
-        let renderer = self.renderer.clone();
-        let hook: Option<lineedit::EditHook> = on.then(|| {
-            let h: lineedit::EditHook =
-                std::sync::Arc::new(move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
-                    renderer.set_editor(line, cursor, queued, menu)
-                });
-            h
-        });
-        self.view.lock().unwrap().set_frame_mode(on, hook);
-        // Leaving an active frame: re-own the screen for legacy BEFORE the
-        // editor/status redraw below. The frame's last redraw is still
-        // visible (dropping it emits nothing), so this clears the screen and
-        // scrollback — the replay and the migrated frame-only items reprint
-        // everything — then re-pins the scroll region the frame's redraws
-        // reset, leaving the cursor on the last scrollable row. Doing it
-        // before `view.resize()` (not after) means there is no fresh prompt
-        // for the clear to wipe, and the replay can't start writing on the
-        // reserved status row. When no status line is installed (a TTY with
-        // `AGENTIC_NO_STATUS` or fewer than five rows) there is no region to
-        // re-pin, but the frame's display must STILL be cleared — skipping it
-        // would leave the replay writing over the stale frame copy.
-        if !on && frame_was_active {
-            match &self.status {
-                Some(status) => status.repin_scroll_region(),
-                None => crate::status::clear_display(),
-            }
-        }
-        // Re-anchor the scroll region (legacy) / let the frame re-own the
-        // screen (frame), and recompute the prompt at the current size.
-        if let Some(status) = &self.status {
-            status.resize();
-        }
-        if !on {
-            // The frame left the cursor on the bottom row and the editor's
-            // drawn state refers to rows the frame owned: reset it to the
-            // single prompt row the next loop print establishes, or the
-            // resize redraw would climb into the status row / frame content.
-            self.view.lock().unwrap().reset_drawing();
-        }
-        // Leaving an ACTIVE frame, skip the editor's resize redraw: it would
-        // reprint the inline prompt NOW, before `replay_transcript` below
-        // restores the history — the renderer still counts itself at a line
-        // start, so the first restored item lands after that prompt and the
-        // next loop print draws a second one. `reset_drawing` above already
-        // re-anchored the editor to the single prompt row, so replaying first
-        // and letting the next loop print the prompt keeps it where it
-        // belongs. Every other path (entering frame mode, or legacy with no
-        // frame ever active) still needs the redraw to recompute the prompt at
-        // the current size.
-        if on || !frame_was_active {
-            self.view.lock().unwrap().resize();
-        }
-        if on {
-            // A fresh frame starts empty, so the transcript must be rebuilt
-            // into it (its first full redraw clears scrollback and re-owns the
-            // screen). Seed the drained legacy output first so it lands ahead
-            // of the conversation, then replay the conversation as one batch:
-            // rendering per event would redo the whole transcript layout each
-            // time (O(events²) on a long session). The emitted events reach the
-            // installed sink (`Renderer::event`), which routes them into the
-            // now-active frame — no separate per-event tap is needed (a tap via
-            // `replay_event` would no-op here: it early-returns while the frame
-            // is active).
-            //
-            // DOCUMENTED LIMITATION: only `drain_pending` (deferred notes + the
-            // collapsed reasoning summary) migrates into the frame here.
-            // Transient legacy output that `print_block`/`print_raw` wrote
-            // straight to scrollback in legacy mode — `/help`, the banner, raw
-            // JSON exports — was never recorded, so it is erased when the
-            // frame's first redraw clears scrollback. Keeping a renderer-owned
-            // ordered transcript in BOTH modes and replaying it here without
-            // duplicating the conversation entries `replay_history` re-derives
-            // is a substantial redesign with real double-print hazards; we
-            // accept the incidental loss on a live legacy → frame switch.
-            self.renderer.push_items(pending);
-            self.renderer.frame_batch(|| agent.replay_history());
-        } else if frame_was_active {
-            // Legacy scrollback was cleared by the frame's redraws: reprint
-            // the visible transcript so it stays accessible. `set_mode`
-            // captured the frame's full transcript (in on-screen order), and
-            // `replay_transcript` reprints it now — AFTER the clear above, so
-            // nothing is erased. Replaying the captured transcript rather than
-            // `Agent::conversation` keeps the switch lossless: frame-only
-            // items, turns and plan updates stay in their shown order, the
-            // real pre-compaction turns are restored (the compacted
-            // conversation would print the synthetic summary as a user turn
-            // and drop the compacted-away turns), and the current plan prints
-            // exactly once (it is simply the last `Item::Plan`).
-            self.renderer.replay_transcript();
-        }
     }
 
     /// Make the stdin reader yield the terminal so a foreground picker can own
@@ -725,7 +560,7 @@ impl Terminal {
         result
     }
 
-    /// Keep the status line's queue count in sync (None hides the segment).
+    /// Keep the editor's queue count in sync (None hides the indicator).
     fn set_queue_status(&self) {
         let count = self.messages.len();
         self.view.lock().unwrap().set_queue_count((count > 0).then_some(count));
@@ -739,14 +574,7 @@ impl Terminal {
         // or the next `request_line` would queue a second concurrent reader
         // that could race a dialoguer picker for stdin. CycleMode (Shift+Tab)
         // is emitted the same way and belongs in this set.
-        if !matches!(
-            input,
-            TermInput::Interrupt
-                | TermInput::ToggleThinking
-                | TermInput::Escape
-                | TermInput::CycleMode
-                | TermInput::Rejected(_)
-        ) {
+        if !matches!(input, TermInput::Interrupt | TermInput::Escape | TermInput::CycleMode | TermInput::Rejected(_)) {
             self.outstanding = false;
         }
         input
@@ -762,10 +590,10 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
     let stats = agent.context_stats();
     let renderer = terminal.renderer.clone();
     if terminal.steerable && ui::verbosity() >= ui::Verbosity::Verbose {
-        renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel, Ctrl-O to expand thinking]");
+        renderer.note("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later (/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]");
     }
-    // Blank line after LLM output (legacy renderer only; the frame renderer
-    // owns the screen and must not receive stray direct writes).
+    // Blank line after LLM output (plain output only; the frame renderer owns
+    // the screen and must not receive stray direct writes).
     if !renderer.is_frame() {
         println!();
     }
@@ -887,9 +715,6 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                             renderer.urgent_note("[Esc again to cancel]");
                         }
                     }
-                    TermInput::ToggleThinking => {
-                        renderer.toggle_thinking();
-                    }
                     TermInput::Rejected(note) => renderer.transient_note(&note),
                     TermInput::CycleMode => {
                         // `control` is a shared handle, so this works while the
@@ -964,7 +789,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                         // Raw exports must stay byte-exact: route
                                         // them through `turn_raw`, which prints
                                         // verbatim in frame mode and defers a
-                                        // stamp/DIM-free write in legacy mode
+                                        // stamp/DIM-free write in plain output
                                         // (routing via `turn_block` would decorate
                                         // the payload and corrupt JSON/Markdown).
                                         Some(turn_commands::Output::Raw(out)) => renderer.turn_raw(&out),
@@ -987,7 +812,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 let text = commands::unescape_prompt(text).unwrap_or(text);
                                 control.steer(text, None);
                                 // The frame renderer shows the steer as a user
-                                // message once absorbed; the legacy one shows only
+                                // message once absorbed; plain output shows only
                                 // this note, so it carries the text.
                                 if renderer.is_frame() {
                                     renderer.note("↪ steering: the agent reads this at its next step (Ctrl-Enter queues instead)");
@@ -1418,9 +1243,6 @@ async fn run_compaction(
                         diag(&terminal.renderer, "[Esc again to cancel]");
                     }
                 }
-                TermInput::ToggleThinking => {
-                    terminal.renderer.toggle_thinking();
-                }
                 TermInput::Rejected(note) => terminal.renderer.transient_note(&note),
                 TermInput::CycleMode => {
                     let mode = control.cycle_mode();
@@ -1564,7 +1386,7 @@ fn memory_command(agent: &mut Agent, args: &str) -> String {
     for (scope, entry) in &entries {
         // Sanitise every interpolated field before it reaches the terminal: the
         // JSONL is documented as human-editable, so a record can carry `\r`, ESC,
-        // or other control bytes that the legacy renderer would otherwise print
+        // or other control bytes that plain output would otherwise print
         // verbatim (`print_block` → `println!`), enabling terminal escape
         // sequences or forged list lines. The ID and evidence are single-line
         // fields, so they use `sanitize_terminal_line`, which drops `\n` too:
@@ -1624,7 +1446,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
                 resume::Pick::Selected(id) => id,
                 // The picker already printed "No saved sessions to resume." to
                 // stderr. In frame mode the repaint above painted over it, so
-                // repeat it where the user can see it; with the legacy renderer
+                // repeat it where the user can see it; with plain output
                 // frame_resize() is a no-op and the stderr notice is still on
                 // screen, so printing again would duplicate it. Keep
                 // "Session unchanged" for an actual Esc.
@@ -1654,7 +1476,7 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     agent.load_session(&id)?;
     terminal.renderer.clear_screen();
     // As at startup with --resume: the frame renderer rebuilds the
-    // transcript from the loaded conversation; the legacy one starts clean.
+    // transcript from the loaded conversation; plain output starts clean.
     if terminal.renderer.is_frame() {
         agent.replay_history();
     }
@@ -1680,8 +1502,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // renderer's next differential render isn't diffed against what
             // the pager left (as /settings does). Typed during a turn, a stdin
             // read is still pending and would race the pager for keys, so it
-            // prints instead (below); the legacy renderer's status line pins a
-            // scroll region a full-screen pager would disturb, so it prints too.
+            // prints instead (below), as it does for plain output.
             match turn_commands::Snapshot::capture(agent).load_trajectory() {
                 Err(note) => terminal.renderer.print_block(&note),
                 Ok(traj) => {
@@ -1763,32 +1584,19 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             Ok(true)
         }
         "/settings" => {
-            let renderer_before = agent.config().renderer;
-            // Capture the dialog result rather than `?`-returning it: when the
-            // user changed `renderer` and a LATER prompt errors or is
-            // cancelled, the config already records the new mode, so the
-            // switch must still be applied here — returning early would leave
-            // the renderer and editor in the old mode with no diff left to
-            // retrigger the switch on the next visit.
+            // Capture the dialog result rather than `?`-returning it, so the
+            // redraw and the retained notices below happen on every exit.
             let (notices, outcome) =
                 settings::run(agent, &terminal.config_path, &terminal.recents, &terminal.recents_path).await;
             // The settings dialog (dialoguer) wrote directly over the owned
             // frame; force a full redraw so the frame renderer's next update
             // isn't diffed against stale screen coordinates.
             terminal.renderer.frame_resize();
-            // A renderer switch in the settings dialog takes effect live: flip
-            // the frame renderer, the line editor's drawing path, and the
-            // scroll region, and replay the transcript into the new renderer.
-            if agent.config().renderer != renderer_before {
-                terminal.renderer_switched(agent).await;
-            }
             // Re-show any notice the dialog retained (e.g. a client-rebuild
             // failure) THROUGH the renderer, now that the redraw has run. The
             // dialog does NOT print these itself (a plain `println!` would be
-            // wiped by `frame_resize` in frame mode, and would double-print in
-            // legacy); `print_block` captures the notice into the frame
-            // transcript (or prints inline in legacy) so it is shown exactly
-            // once. `run` returns the notices on EVERY exit — even a
+            // wiped by `frame_resize`); `print_block` captures the notice into
+            // the frame transcript so it is shown exactly once. `run` returns the notices on EVERY exit — even a
             // cancel/error at a later prompt — so a rebuild failure already
             // recorded is never dropped.
             for notice in &notices {
@@ -1811,7 +1619,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         }
         "/hooks" => {
             // The listing embeds config-derived commands, matchers, skip
-            // reasons and paths. In legacy renderer mode `print_block` writes
+            // reasons and paths. In plain output `print_block` writes
             // straight to the terminal (`println!`), so an escaped
             // terminal-control sequence in project settings would become active
             // when `/hooks` is displayed. Sanitize before printing; the frame
@@ -1960,7 +1768,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
     }
 }
 
-/// What the legacy turn-end print should emit for a finished turn.
+/// What the plain turn-end print should emit for a finished turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnPrint {
     /// Frame mode: the response is already rendered from its events; print
@@ -1972,7 +1780,7 @@ enum TurnPrint {
     LastLineDim,
 }
 
-/// Chooses what the legacy turn-end print emits. The truncation repair runs
+/// Chooses what the plain turn-end print emits. The truncation repair runs
 /// before the max-turn fallback: a response stopped at the request cap still
 /// carries its full final content in `outcome.response`, so when part of it was
 /// quiet-suppressed the authoritative full text must be reprinted — printing
@@ -1997,14 +1805,14 @@ fn turn_print(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) -> TurnPrin
     }
 }
 
-/// Prints a finished turn's response in legacy (non-frame) mode per
+/// Prints a finished turn's response in plain (non-frame) mode per
 /// [`turn_print`].
 fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
     match turn_print(outcome, renderer) {
         TurnPrint::Nothing => {}
         TurnPrint::Full { dim: false } => {
-            let text = renderer.display_text(&outcome.response, ui::visible_width(&ui::stamp()));
-            println!("{}", ui::stamp_block(&text));
+            // Plain output keeps the response's markdown verbatim.
+            println!("{}", ui::stamp_block(&outcome.response));
         }
         TurnPrint::Full { dim: true } => {
             println!("{}", ui::stamp_block(&format!("\x1b[2m{}\x1b[0m", outcome.response)));
@@ -2016,15 +1824,12 @@ fn print_turn_outcome(outcome: &agent::TurnOutcome, renderer: &ui::Renderer) {
     }
 }
 
-/// Restores the full screen and terminal modes when the interactive loop ends.
-struct StatusGuard(Option<std::sync::Arc<status::StatusLine>>);
+/// Restores the terminal modes when the interactive loop ends.
+struct TerminalGuard;
 
-impl Drop for StatusGuard {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
         lineedit::restore_terminal();
-        if let Some(status) = &self.0 {
-            status.teardown();
-        }
     }
 }
 
@@ -2364,7 +2169,7 @@ async fn main() -> Result<()> {
         // scrollback, so `println!`-ing the banner here would wipe it before it
         // is ever seen. Collect the lines now and emit them once the renderer
         // exists (below): seeded into the owned transcript in frame mode, or
-        // printed inline as before in legacy mode.
+        // printed inline for plain output.
         let mut banner = vec![
             format!("nano-coder v{}", env!("CARGO_PKG_VERSION")),
             format!("Model: {} (provider: {})", agent.model_name(), agent.provider_name()),
@@ -2400,13 +2205,13 @@ async fn main() -> Result<()> {
 
         // Main loop
         let status = status::StatusLine::install(agent.context_stats());
-        let _status_guard = StatusGuard(status.clone());
+        let _terminal_guard = TerminalGuard;
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             lineedit::restore_terminal();
             previous_hook(info);
         }));
-        let renderer = ui::Renderer::new(status.clone(), agent.config().renderer);
+        let renderer = ui::Renderer::new(status);
         ui::install(renderer.clone());
         let recents_path = recents::default_path();
         let recents: recents::SharedRecents = {
@@ -2444,9 +2249,13 @@ async fn main() -> Result<()> {
         agent.set_streaming(true);
         agent.refresh_stats();
         let frame_mode = renderer.is_frame();
+        // A config still naming the removed legacy renderer loads, with a note.
+        if let Some(notice) = agent.config().retired_renderer_notice() {
+            banner.push(notice);
+        }
         // Emit the startup banner now the renderer exists. In frame mode seed it
         // into the owned transcript via `print_block` so the first full redraw
-        // (which clears the scrollback) cannot erase it; in legacy mode print it
+        // (which clears the scrollback) cannot erase it; plain output prints it
         // inline, with the trailing blank line the banner has always had.
         if frame_mode {
             renderer.print_block(&banner.join("\n"));
@@ -2458,11 +2267,10 @@ async fn main() -> Result<()> {
                 config: agent.config().clone(),
                 recents: recents.clone(),
             }));
-            lineedit::EditView::shared(status.clone(), context)
+            lineedit::EditView::shared(context)
         };
         if frame_mode {
-            // The app-owned frame renderer draws the editor row itself; route
-            // every edit through it instead of the inline/scroll-region path.
+            // The frame renderer draws the editor row; route every edit to it.
             let renderer = renderer.clone();
             view.lock().unwrap().set_edit_hook(Arc::new(
                 move |line: &str, cursor: usize, queued: usize, menu: &[String]| {
@@ -2470,43 +2278,21 @@ async fn main() -> Result<()> {
                 },
             ));
         }
-        // Serialises every terminal-owning operation that must not interleave
-        // with a multi-step renderer transition: the SIGWINCH resize task takes
-        // it before drawing, and `Terminal::renderer_switched` holds it across
-        // the flip/clear/replay. Created here (before `Terminal::start`) so both
-        // sides share one lock. The SIGWINCH task and `Terminal` each get a clone.
-        let transition = TransitionShared {
-            view: view.clone(),
-            status: status.clone(),
-            renderer: renderer.clone(),
-            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        };
-        if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-            let transition = transition.clone();
+        // Serialises the SIGWINCH redraw against foreground pickers, which own
+        // the terminal while they run (see `Terminal::picker_lock`).
+        let picker_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        if frame_mode
+            && let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        {
+            let view = view.clone();
+            let picker_lock = picker_lock.clone();
             tokio::spawn(async move {
-                let TransitionShared { view, status, renderer, lock: transition_lock } = &transition;
                 // Debounce a burst of resizes (a window drag) into one render at
                 // the final size: after a resize, wait for ~40 ms of quiet.
                 let quiet = std::time::Duration::from_millis(40);
                 let mut debounce = frame::Debouncer::new(quiet);
                 while resized.recv().await.is_some() {
-                    // Hold the transition lock from the `is_frame()` check through
-                    // the draw, so a renderer switch cannot flip the mode, clear
-                    // the screen, and replay the transcript in between (which would
-                    // let this redraw interleave with the transition — on frame →
-                    // legacy it would reprint the prompt before `replay_transcript`,
-                    // placing history after it). The lock is uncontended except
-                    // during that brief transition, so this costs nothing in the
-                    // common case.
-                    let _transition_guard = transition_lock.lock().await;
-                    if !renderer.is_frame() {
-                        // Legacy: re-anchor immediately, as before.
-                        if let Some(status) = &status {
-                            status.resize();
-                        }
-                        view.lock().unwrap().resize();
-                        continue;
-                    }
+                    let _picker_guard = picker_lock.lock().await;
                     debounce.record(std::time::Instant::now());
                     // Coalesce further resizes arriving within the quiet window.
                     while debounce.pending() {
@@ -2533,7 +2319,7 @@ async fn main() -> Result<()> {
                     // entire transcript a second time — a redundant O(history)
                     // redraw on every resize — so the hook-driven redraw is the
                     // sole one here.
-                    view.lock().unwrap().resize();
+                    view.lock().unwrap().redraw();
                 }
             });
         }
@@ -2541,14 +2327,14 @@ async fn main() -> Result<()> {
         // so the app-owned frame opens empty. Replay the loaded history now
         // (the sink is installed) to reconstruct the transcript into
         // `FrameState`; `frame_event` populates user, assistant, tool and plan
-        // items. Only in frame mode — the legacy renderer would dump the whole
-        // conversation inline, which it has never done on resume. Batched into
+        // items. Only in frame mode — plain output never reprints the
+        // conversation on resume. Batched into
         // one render: per-event renders would redo the whole transcript layout
         // for every replayed event.
         if frame_mode && args.resume.is_some() {
             renderer.frame_batch(|| agent.replay_history());
         }
-        let mut terminal = Terminal::start(config_path, recents, recents_path, agent.config().renderer, transition);
+        let mut terminal = Terminal::start(config_path, recents, recents_path, view, renderer.clone(), picker_lock);
         let mut running = true;
         // Ctrl-C twice within the window exits; time-based so an interleaved
         // key or a queued/empty line cannot silently disarm it (see
@@ -2556,36 +2342,21 @@ async fn main() -> Result<()> {
         let mut exit_press = DoublePress::new(DOUBLE_INTERRUPT_WINDOW);
         let mut separate = false;
         while running {
-            if let Some(status) = &status
-                && !terminal.renderer.is_frame()
-            {
-                status.draw();
-            }
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
-                    let mut view = terminal.view.lock().unwrap();
                     if terminal.renderer.is_frame() {
-                        // The frame renderer owns the screen: refresh the editor
-                        // row (and thus the whole frame) instead of writing an
-                        // inline prompt.
-                        // `prompt_redrawn` re-renders the editor (and its
-                        // command menu) through the edit hook.
-                        view.prompt_redrawn();
+                        // Refresh the editor row (and its command menu), and
+                        // with it the whole frame.
+                        terminal.view.lock().unwrap().redraw();
                         return;
                     }
-                    let prompt = view.prompt();
-                    // Serialise the prompt write under the terminal lock so it
-                    // cannot move the cursor mid-way through the SIGWINCH
-                    // anchor's query-to-scroll critical section (status::anchor).
+                    // Plain output: print the prompt line.
+                    let prompt = format!("{}{}> ", if separate { "\n" } else { "" }, ui::stamp());
                     crate::status::with_term_lock(|| {
                         let mut out = io::stdout().lock();
-                        if separate {
-                            let _ = out.write_all(b"\n");
-                        }
                         let _ = out.write_all(prompt.as_bytes());
                         let _ = out.flush();
                     });
-                    view.prompt_redrawn();
                 }
             };
             prompt(&terminal, separate);
@@ -2611,27 +2382,11 @@ async fn main() -> Result<()> {
                     next.await
                 };
                 match event {
-                    TermInput::ToggleThinking => {
-                        if terminal.renderer.toggle_thinking() {
-                            prompt(&terminal, false);
-                        }
-                    }
-                    TermInput::Rejected(note) => {
-                        terminal.renderer.transient_note(&note);
-                        if !frame_mode {
-                            // Legacy: the note printed a line; redraw the
-                            // prompt with the refused text still in it.
-                            prompt(&terminal, false);
-                        }
-                    }
+                    TermInput::Rejected(note) => terminal.renderer.transient_note(&note),
                     TermInput::CycleMode => {
                         let mode = agent.control().cycle_mode();
                         agent.set_mode(mode);
-                        if terminal.renderer.is_frame() {
-                            terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
-                        } else {
-                            println!("\nMode: {mode} ({})", mode.describe());
-                        }
+                        terminal.renderer.note(&format!("Mode: {mode} ({})", mode.describe()));
                         prompt(&terminal, false);
                     }
                     TermInput::Escape => {
@@ -2640,7 +2395,7 @@ async fn main() -> Result<()> {
                         // place that sees every Esc. An Escape that surfaces
                         // here means the buffer was already empty, so there is
                         // nothing to clear. Consume it in place like the other
-                        // mid-line events (ToggleThinking/CycleMode) rather than
+                        // mid-line events (CycleMode/Rejected) rather than
                         // breaking out to the outer loop's `continue`, which
                         // would restart the loop and re-emit `prompt()` — a
                         // spurious redraw that contradicts the inert-empty
@@ -2667,10 +2422,10 @@ async fn main() -> Result<()> {
                     // Escape is now consumed in the inner event loop above (a
                     // true no-op on an empty buffer), so it never breaks out to
                     // here. This arm is retained only for match exhaustiveness,
-                    // mirroring the ToggleThinking/CycleMode/Rejected arm below.
+                    // mirroring the CycleMode/Rejected arm below.
                     continue;
                 }
-                TermInput::ToggleThinking | TermInput::CycleMode | TermInput::Rejected(_) => {
+                TermInput::CycleMode | TermInput::Rejected(_) => {
                     continue;
                 }
                 TermInput::Line(line) | TermInput::Queue(line) => line.trim().to_string(),
@@ -2953,7 +2708,7 @@ mod tests {
         // tab- or newline-separated line, silently dropping the switch.
         let control = agent::TurnControl::default();
         let stats: context::SharedStats = std::sync::Arc::new(std::sync::Mutex::new(context::ContextStats::default()));
-        let renderer = ui::Renderer::legacy_for_test();
+        let renderer = ui::Renderer::plain_for_test();
         let snapshot = turn_commands::Snapshot::default();
 
         // Every NextStep command, separated by a tab rather than a space.
@@ -2979,7 +2734,7 @@ mod tests {
     #[test]
     fn turn_print_repairs_truncation_before_the_max_turn_fallback() {
         let _lock = ui::tests::verbosity_lock();
-        let r = ui::Renderer::legacy_for_test();
+        let r = ui::Renderer::plain_for_test();
         let outcome = agent::TurnOutcome {
             response: "full final answer\n[stopped after 3 LLM calls without a final answer]".into(),
             stop_reason: agent::StopReason::MaxTurnRequests,
@@ -3002,7 +2757,7 @@ mod tests {
 
         // Without the truncation flag the max-turn fallback still prints only
         // the dimmed stop-note line.
-        let r2 = ui::Renderer::legacy_for_test();
+        let r2 = ui::Renderer::plain_for_test();
         r2.begin_turn();
         assert_eq!(
             turn_print(&outcome, &r2),
@@ -3125,7 +2880,7 @@ mod tests {
     fn the_work_clock_guard_brackets_a_picker() {
         // The guard the question/cap pickers hold: the clock only counts while
         // it is not held, and it is harmless when no turn is running (the
-        // picker paths run at the prompt too, and in legacy mode).
+        // picker paths run at the prompt too, and with plain output).
         let renderer = ui::Renderer::frame_for_test();
         renderer.begin_turn();
         assert_eq!(renderer.work_paused_for_test(), Some(false), "a running turn counts working time");
@@ -3138,7 +2893,7 @@ mod tests {
         assert_eq!(renderer.work_paused_for_test(), Some(false), "dropping the guard resumes the working clock");
         renderer.end_turn();
         assert_eq!(renderer.work_paused_for_test(), None, "no turn, no clock");
-        // Idle/legacy: the guard is a no-op, not a panic.
+        // Idle: the guard is a no-op, not a panic.
         let _work = WorkClock::pause(&renderer);
     }
 }

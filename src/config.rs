@@ -62,9 +62,11 @@ pub struct Config {
     pub compaction_mode: CompactionMode,
     /// How much the interactive CLI prints (and whether hook events are logged).
     pub verbosity: crate::ui::Verbosity,
-    /// Which interactive renderer to use: `frame` (the default; app-owned,
-    /// re-renders on a width change) or `legacy` (scroll region).
-    pub renderer: crate::frame::RendererMode,
+    /// The retired `renderer` setting. Only the frame renderer remains (#133);
+    /// the key is still read so an old `renderer = "legacy"` loads and gets a
+    /// one-line notice instead of silently changing nothing. Never written.
+    #[serde(rename = "renderer", skip_serializing)]
+    pub retired_renderer: Option<String>,
     /// Start each message in the interactive CLI with the local time.
     pub timestamps: bool,
     /// Add AGENTS.md (and the like) from the git root down to the working
@@ -168,7 +170,7 @@ impl Default for Config {
             auto_compact_threshold: 0.8,
             compaction_mode: CompactionMode::Standard,
             verbosity: crate::ui::Verbosity::Normal,
-            renderer: crate::frame::RendererMode::default(),
+            retired_renderer: None,
             timestamps: true,
             project_instructions: true,
             project_instruction_files: crate::instructions::DEFAULT_FILES.iter().map(|s| s.to_string()).collect(),
@@ -193,6 +195,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// A notice for a config that still sets the retired `renderer` option to
+    /// anything but `frame` (the only renderer left).
+    pub fn retired_renderer_notice(&self) -> Option<String> {
+        let value = self.retired_renderer.as_deref()?;
+        (value.trim() != "frame").then(|| {
+            format!("Note: renderer = {value:?} is no longer available; using the frame renderer (remove the setting)")
+        })
+    }
+
     /// Provider table and default provider after applying legacy
     /// top-level `api_key` / `base_url`.
     pub fn effective_providers(&self) -> (HashMap<String, ProviderConfig>, String) {
@@ -594,10 +605,13 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_the_frame_renderer_and_parses_legacy() {
+    fn a_retired_legacy_renderer_setting_still_loads_with_a_notice() {
         let default: Config = toml::from_str("model = \"work/x\"").unwrap();
-        assert_eq!(default.renderer, crate::frame::RendererMode::Frame);
+        assert_eq!(default.retired_renderer_notice(), None);
+        let frame: Config = toml::from_str("model = \"work/x\"\nrenderer = \"frame\"").unwrap();
+        assert_eq!(frame.retired_renderer_notice(), None);
         let legacy: Config = toml::from_str("model = \"work/x\"\nrenderer = \"legacy\"").unwrap();
-        assert_eq!(legacy.renderer, crate::frame::RendererMode::Legacy);
+        assert!(legacy.retired_renderer_notice().unwrap().contains("no longer available"));
+        assert!(!toml::to_string(&legacy).unwrap().contains("renderer"));
     }
 }
