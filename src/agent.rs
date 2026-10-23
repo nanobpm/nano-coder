@@ -4211,6 +4211,18 @@ impl Agent {
                 break;
             }
             if reported.is_some() {
+                // A steer that arrived while the outcome was being written gets
+                // a reply in this turn, as after a tool-free answer: show the
+                // reported answer, then continue so the next step reads the
+                // steer. Models that put the whole answer in the summary would
+                // otherwise leave every steer for the next turn.
+                if iteration < budget && self.control.has_steers() && !self.control.is_cancelled() {
+                    let response = reported.take().expect("checked").response();
+                    self.push(Message::assistant(&response))?;
+                    self.emit_assistant_text(&response);
+                    last_content = response;
+                    continue;
+                }
                 // A reported outcome ends the turn like a tool-free answer, so it
                 // must pass the same Stop gate: a Stop hook may ask the agent to
                 // keep going (capped). If it does, clear the reported outcome —
@@ -10840,6 +10852,40 @@ mod tests {
         let n = conversation.len();
         assert_eq!(conversation[n - 3].content, "first draft");
         assert_eq!(conversation[n - 2].content, "make it shorter");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steer_during_a_reported_outcome_extends_the_turn() {
+        // Some models (Claude through Claude Code) write the whole answer as
+        // the `report_outcome` summary; a steer sent meanwhile must join this
+        // turn, not wait for the next one.
+        let dir = tempfile::tempdir().unwrap();
+        let first = LLMResponse { tool_calls: vec![report("o1", "completed", "12-week plan")], ..Default::default() };
+        let second = LLMResponse { tool_calls: vec![report("o2", "completed", "2-week plan")], ..Default::default() };
+        let (mut agent, seen) = interfering(
+            vec![first, second],
+            dir.path(),
+            |call, control| {
+                if call == 1 {
+                    control.steer("make it two weeks", None);
+                }
+            },
+            None,
+        );
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(None, "plan").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.response, "2-week plan");
+        assert_eq!(outcome.outcome, Some(Outcome { status: goal::Status::Completed, summary: "2-week plan".into() }));
+        let second_request = seen.lock().unwrap()[1].clone();
+        let tail: Vec<(Role, &str)> =
+            second_request.iter().rev().take(2).map(|m| (m.role.clone(), m.content.as_str())).collect();
+        assert_eq!(
+            tail,
+            [(Role::User, "make it two weeks"), (Role::Assistant, "12-week plan")],
+            "the first answer is kept, then the steer"
+        );
+        assert!(!agent.control().has_steers(), "the steer was read in this turn");
     }
 
     #[tokio::test(flavor = "multi_thread")]

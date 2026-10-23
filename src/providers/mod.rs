@@ -7,6 +7,7 @@
 //! otherwise the whole string is a model on `default_provider`.
 
 pub mod anthropic;
+pub mod claude_code;
 pub mod github_copilot;
 pub mod mock;
 pub mod muse;
@@ -48,6 +49,9 @@ pub enum ProviderKind {
     /// subscription, authenticated the way the `muse` CLI does (see `muse`).
     #[serde(alias = "muse-code")]
     Muse,
+    /// The user's installed Claude Code CLI in headless mode (`claude -p`),
+    /// signed in with their Claude plan (see `claude_code`).
+    ClaudeCode,
     /// Offline scripted client for demos and tests.
     Mock,
 }
@@ -234,6 +238,12 @@ pub fn presets() -> BTreeMap<String, ProviderConfig> {
         },
     );
     add(
+        "claude-code",
+        // Runs the local `claude` CLI, which keeps its own login; there is no
+        // endpoint or key to configure.
+        ProviderConfig { kind: Some(ClaudeCode), default_model: Some("sonnet".into()), ..Default::default() },
+    );
+    add(
         "qwen",
         // The endpoint (host and API-key variable) is derived from the Qwen
         // plan/region table in `qwen`, so a new Model Studio region appears
@@ -354,7 +364,7 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     match (kind, &config.base_url) {
-        // Mock derives (or does not need) an endpoint, so any/no base_url is
+        // Mock and Claude Code (a local CLI) need no endpoint, so any/no base_url is
         // fine. Copilot derives its endpoint from the session token *unless
         // overridden*, and Muse from the minted key *unless overridden*; a
         // present non-empty override is used verbatim by their `api_base`, so it
@@ -370,7 +380,7 @@ pub fn validate_spec(spec: &str, providers: &BTreeMap<String, ProviderConfig>, d
         // still treats it as present and uses it verbatim — reopening the
         // fail-open gap. Using `!url.is_empty()` routes any present-but-whitespace
         // override into `validate_http_base_url`, which rejects it.
-        (ProviderKind::Mock, _) => {}
+        (ProviderKind::Mock | ProviderKind::ClaudeCode, _) => {}
         (ProviderKind::GithubCopilot | ProviderKind::Muse, Some(url)) if !url.is_empty() => {
             validate_http_base_url(name, url)?
         }
@@ -453,7 +463,7 @@ pub fn resolve_cancellable(
         .or_else(|| config.default_model.clone())
         .ok_or_else(|| anyhow!("no model given for provider {name:?} and it has no default_model"))?;
     let base_url = match (kind, &config.base_url) {
-        // Mock needs no endpoint. Copilot derives its endpoint from the
+        // Mock and Claude Code need no endpoint. Copilot derives its endpoint from the
         // session token unless overridden, and Muse from the minted key unless
         // overridden; a present non-empty override is used verbatim by their
         // `api_base`, so validate it like any other HTTP endpoint (sharing the
@@ -461,7 +471,9 @@ pub fn resolve_cancellable(
         // guard must match `api_base`'s `is_empty()` test (not a trimming one) so
         // a whitespace-only override is validated (and rejected) rather than
         // exempted here yet used there.
-        (ProviderKind::Mock, url) => url.clone().unwrap_or_default().trim_end_matches('/').to_string(),
+        (ProviderKind::Mock | ProviderKind::ClaudeCode, url) => {
+            url.clone().unwrap_or_default().trim_end_matches('/').to_string()
+        }
         (ProviderKind::GithubCopilot | ProviderKind::Muse, Some(url)) if !url.is_empty() => {
             validate_http_base_url(name, url)?;
             url.trim_end_matches('/').to_string()
@@ -818,6 +830,7 @@ pub fn build_client_cancellable(
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicClient::new(resolved)?),
         ProviderKind::GithubCopilot => Box::new(github_copilot::GithubCopilotClient::new(resolved)?),
         ProviderKind::Muse => Box::new(muse::MuseClient::new(resolved)?),
+        ProviderKind::ClaudeCode => Box::new(claude_code::ClaudeCodeClient::new(resolved)?),
         ProviderKind::Mock => Box::new(mock::MockLLMClient::new(&resolved.name, &resolved.model)),
     })
 }
@@ -1851,6 +1864,19 @@ mod tests {
             validate_spec("muse/muse-spark-1.3", &effective_providers(&HashMap::new()), "muse").is_ok(),
             "the built-in muse preset derives its endpoint"
         );
+    }
+
+    #[test]
+    fn claude_code_preset_needs_no_endpoint_or_key() {
+        let user = HashMap::new();
+        let providers = effective_providers(&user);
+        assert!(validate_spec("claude-code/opus", &providers, "openai").is_ok());
+        let resolved = resolve("claude-code", &user, "openai").unwrap();
+        assert_eq!(resolved.kind, ProviderKind::ClaudeCode);
+        assert_eq!(resolved.model, "sonnet");
+        assert_eq!(resolved.base_url, "");
+        assert_eq!(resolved.api_key, None);
+        assert!(build_client("claude-code/haiku", &user, "openai").is_ok());
     }
 
     #[test]

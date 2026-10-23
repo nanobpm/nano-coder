@@ -2057,6 +2057,12 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Claude Code starts this binary as the tool stub of the `claude-code`
+    // provider; serve it before touching the config or the terminal.
+    if env::args().nth(1).as_deref() == Some(providers::claude_code::TOOL_STUB_FLAG) {
+        let tools = env::args().nth(2).ok_or_else(|| anyhow::anyhow!("the tool stub needs a tool list path"))?;
+        return providers::claude_code::run_tool_stub(std::path::Path::new(&tools));
+    }
     // Detect execution mode from command-line args
     let mut args = parse_args()?;
     // Before anything reads the config or data directories.

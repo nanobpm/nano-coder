@@ -90,6 +90,8 @@ fn stored_login_status(provider: &ProviderConfig, env_var: Option<&String>, data
         Some(ProviderKind::Muse) => {
             (providers::muse::load_credentials_in_dir(data_dir).is_some(), Some("--login muse"))
         }
+        // The local `claude` CLI signs in on its own.
+        Some(ProviderKind::ClaudeCode) => return "uses your Claude Code login".to_string(),
         _ => (false, None),
     };
     if stored {
@@ -113,6 +115,7 @@ fn stored_login_status(provider: &ProviderConfig, env_var: Option<&String>, data
 pub fn derived_endpoint_source(provider: &ProviderConfig) -> String {
     match provider.kind {
         Some(ProviderKind::GithubCopilot) => "(from session token)".to_string(),
+        Some(ProviderKind::ClaudeCode) => "(local claude CLI)".to_string(),
         Some(ProviderKind::Muse) => {
             let direct_key = provider.api_key.is_some()
                 || provider.api_key_command.is_some()
@@ -851,12 +854,19 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
         if name == "qwen" { providers::presets().remove(&name).and_then(|preset| preset.base_url) } else { None };
     let current_url = current.base_url.clone().or(preset_url).unwrap_or_default();
 
-    let kinds = [ProviderKind::Openai, ProviderKind::Anthropic, ProviderKind::GithubCopilot, ProviderKind::Muse];
+    let kinds = [
+        ProviderKind::Openai,
+        ProviderKind::Anthropic,
+        ProviderKind::GithubCopilot,
+        ProviderKind::Muse,
+        ProviderKind::ClaudeCode,
+    ];
     let kind_labels = [
         "OpenAI-compatible (/chat/completions)",
         "Anthropic (/messages)",
         "GitHub Copilot (unofficial)",
         "Muse Code (unofficial)",
+        "Claude Code CLI (your Claude plan)",
     ];
     let kind_default = kinds.iter().position(|k| Some(*k) == current.kind).unwrap_or(0);
     let kind = kinds[Select::new().with_prompt("API kind").items(&kind_labels).default(kind_default).interact()?];
@@ -913,6 +923,9 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     }
     let base_url = if let Some(endpoint) = chosen_endpoint {
         endpoint.base_url.to_string()
+    } else if kind == ProviderKind::ClaudeCode {
+        // A local CLI: there is no endpoint to ask for.
+        String::new()
     } else {
         base_url.interact_text()?.trim().trim_end_matches('/').to_string()
     };
@@ -940,12 +953,17 @@ async fn edit_provider(agent: &mut Agent) -> Result<Option<ProviderEdit>> {
     if let Some(endpoint) = chosen_endpoint {
         apply_qwen_endpoint(&mut updated, endpoint);
     }
-    match Select::new()
-        .with_prompt(format!("API key ({})", key_status(&updated)))
-        .items(&sources)
-        .default(source_default)
-        .interact()?
-    {
+    // Claude Code signs in on its own, so it takes no key ("No key").
+    let source = if kind == ProviderKind::ClaudeCode {
+        3
+    } else {
+        Select::new()
+            .with_prompt(format!("API key ({})", key_status(&updated)))
+            .items(&sources)
+            .default(source_default)
+            .interact()?
+    };
+    match source {
         0 => {
             let mut input = Input::<String>::new().with_prompt("Variable name");
             // Seed from the (possibly retargeted) variable so accepting the
@@ -1694,6 +1712,14 @@ mod tests {
         let dir = muse_login_dir();
         let muse = ProviderConfig { kind: Some(ProviderKind::Muse), ..Default::default() };
         assert_eq!(key_status_in(&muse, Some(dir.path())), "logged in (unofficial)");
+    }
+
+    #[test]
+    fn claude_code_uses_its_own_login_and_has_no_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = ProviderConfig { kind: Some(ProviderKind::ClaudeCode), ..Default::default() };
+        assert_eq!(key_status_in(&claude, Some(dir.path())), "uses your Claude Code login");
+        assert_eq!(derived_endpoint_source(&claude), "(local claude CLI)");
     }
 
     #[test]
