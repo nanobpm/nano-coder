@@ -13,7 +13,6 @@ module nano.control;
 @safe:
 
 import core.atomic : atomicLoad, atomicStore;
-import core.sync.mutex : Mutex;
 
 /// The result recorded for tool calls skipped because of a cancel.
 enum string cancelledToolResult = "Error: the turn was cancelled before this tool call ran.";
@@ -32,124 +31,110 @@ class Cancelled : Exception
     this() pure nothrow @safe { super(cancelledResponse); }
 }
 
-/// A steering message. `tag` is the ACP request id that sent it, if any.
+/// A steering message. `tag` is the ACP request id that sent it, if any. It is
+/// kept as JSON text so a `Steer` holds no mutable references and can cross
+/// threads.
 struct Steer
 {
-    string text;
     import std.json : JSONValue;
-    JSONValue tag;
+    string text;
+    private string tagJson;
+
+    this(string text, JSONValue tag = JSONValue.init)
+    {
+        import std.json : JSONType;
+        this.text = text;
+        if (tag.type != JSONType.null_) tagJson = tag.toString;
+    }
+
+    /// The ACP request id, or JSON null.
+    JSONValue tag() const
+    {
+        import std.json : parseJSON;
+        return tagJson is null ? JSONValue.init : parseJSON(tagJson);
+    }
 }
 
 import nano.mode : AgentMode;
 
+/// Live controls for the running turn, shared by the turn and the threads
+/// that steer or cancel it. Every member is `shared`: state sits in a
+/// `Locked`, the mode in an atomic, so the compiler checks each access.
 final class TurnControl
 {
-    private Mutex lock;
-    private Steer[] steers;
-    private Steer[] absorbed_;
+    import nano.safeio : Locked;
+    private static struct State
+    {
+        immutable(Steer)[] steers, absorbed;
+        string modelRequest;
+    }
+    private Locked!State state;
+    private int mode_;
 
-    this() { lock = new Mutex; }
-
-    private shared int mode_;
+    this() shared { state = new shared Locked!State; }
 
     /// The live agent mode; the running turn reads it at each iteration.
-    AgentMode mode()
+    AgentMode mode() shared { return cast(AgentMode) atomicLoad(mode_); }
+
+    /// Change the live mode (from the key reader or a command).
+    void mode(AgentMode m) shared { atomicStore(mode_, cast(int) m); }
+
+    /// Ask the running turn to switch model (`/model` mid-turn).
+    void requestModel(string spec) shared { state.update((ref State s) { s.modelRequest = spec; }); }
+
+    /// The pending model request, cleared; null when none.
+    string takeModelRequest() shared
     {
-        import core.atomic : atomicLoad;
-        return cast(AgentMode) atomicLoad(mode_);
+        string r;
+        state.update((ref State s) { r = s.modelRequest; s.modelRequest = null; });
+        return r;
     }
+
+    /// Queue a steering message for the running turn.
+    void steer(string text) shared { steer(Steer(text)); }
 
     /// ditto
-    void mode(AgentMode m)
+    void steer(Steer m) shared { state.update((ref State s) { s.steers ~= m; }); }
+
+    /// Whether steering messages are waiting.
+    bool hasSteers() shared { return state.get.steers.length > 0; }
+
+    /// The waiting steering messages, cleared.
+    Steer[] takePending() shared
     {
-        import core.atomic : atomicStore;
-        atomicStore(mode_, cast(int) m);
+        Steer[] r;
+        state.update((ref State s) { r = s.steers.dup; s.steers = null; });
+        return r;
     }
 
-    private string modelRequest;
+    /// Record a steering message the turn took in.
+    void absorbed(Steer m) shared { state.update((ref State s) { s.absorbed ~= m; }); }
 
-    /// `/model SPEC` typed mid-turn: switch before the next model call.
-    void requestModel(string spec)
+    /// The steering messages taken in this turn, cleared.
+    Steer[] takeAbsorbed() shared
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        modelRequest = spec;
+        Steer[] r;
+        state.update((ref State s) { r = s.absorbed.dup; s.absorbed = null; });
+        return r;
     }
 
-    /// The pending model switch, cleared (null when there is none).
-    string takeModelRequest()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto s = modelRequest;
-        modelRequest = null;
-        return s;
-    }
+    /// Cancel the running turn. Safe from a signal handler.
+    void cancel() shared nothrow @nogc { atomicStore(gCancel, true); }
 
-    /// Queue a message for the running turn. It is added before the next model call.
-    void steer(string text) { steer(Steer(text)); }
-
-    /// ditto
-    void steer(Steer s)
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        steers ~= s;
-    }
-
-    bool hasSteers()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        return steers.length > 0;
-    }
-
-    /// Steers not yet added to the conversation, oldest first.
-    Steer[] takePending()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto out_ = steers;
-        steers = null;
-        return out_;
-    }
-
-    /// Record a steer the agent added to the conversation.
-    void absorbed(Steer s)
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        absorbed_ ~= s;
-    }
-
-    /// Steers added to the conversation since the turn began.
-    Steer[] takeAbsorbed()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto out_ = absorbed_;
-        absorbed_ = null;
-        return out_;
-    }
-
-    /// Stop the turn at the next opportunity. Also safe from a signal handler.
-    void cancel() @safe nothrow @nogc { atomicStore(gCancel, true); }
-
-    bool isCancelled() @safe nothrow @nogc { return cancelRequested(); }
+    /// Whether the running turn was cancelled.
+    bool isCancelled() shared nothrow @nogc { return cancelRequested(); }
 
     /// Clear a previous cancel. Called when a turn begins.
-    void startTurn()
+    void startTurn() shared
     {
         atomicStore(gCancel, false);
-        lock.lock();
-        scope (exit) lock.unlock();
-        absorbed_ = null;
+        state.update((ref State s) { s.absorbed = null; });
     }
 }
 
 unittest
 {
-    auto c = new TurnControl;
+    auto c = new shared TurnControl;
     c.startTurn();
     assert(!c.isCancelled && !c.hasSteers);
     c.steer("a");

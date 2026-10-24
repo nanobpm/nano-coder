@@ -369,6 +369,44 @@ unittest
 }
 
 
+/// A value shared between threads that is only reachable under its lock.
+/// Declare it `shared` (`shared Locked!T x = new shared Locked!T;`): the
+/// compiler then rejects any access that bypasses `get`/`update`. `T` may
+/// not hold unshared mutable references, so neither a copy out of `get` nor
+/// anything `update` stores can alias the locked value from another thread.
+import std.traits : hasUnsharedAliasing;
+final class Locked(T) if (!hasUnsharedAliasing!T)
+{
+    private T value;
+
+    /// `@trusted`: casts away `shared` only on a freshly built object.
+    this(T v = T.init) shared @trusted { (cast() this).value = v; }
+
+    /// A copy of the value.
+    /// `@trusted`: the unshared view of `value` is used only under the lock.
+    T get() shared @trusted
+    {
+        synchronized (cast() this) return (cast() this).value;
+    }
+
+    /// Run `f` on the value under the lock. `f` is `scope`: it can't keep the
+    /// reference.
+    /// `@trusted`: as for `get`; the `ref` can't outlive `f` (DIP1000).
+    void update(scope void delegate(ref T) @safe f) shared @trusted
+    {
+        synchronized (cast() this) f((cast() this).value);
+    }
+}
+
+@safe unittest
+{
+    static struct S { int n; string s; }
+    shared Locked!S l = new shared Locked!S(S(1, "a"));
+    l.update((ref S v) { v.n++; });
+    assert(l.get == S(2, "a"));
+    static assert(!__traits(compiles, new shared Locked!(int[])));
+}
+
 /// A `__gshared` class reference read and written through @safe code, as
 /// `name` (getter and setter) over the storage `name_`. `@trusted` because a
 /// reference load or store is atomic on every target we build for; the

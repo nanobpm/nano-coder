@@ -341,21 +341,26 @@ private bool queryCursorDirect(out ushort row, out ushort col)
 /// The pinned status line. `stats` is read at each draw (on any thread).
 final class StatusLine
 {
-    private Stats delegate() @safe stats;
-    private ushort rows, cols;
-    private bool live;
-
-    private this(Stats delegate() @safe stats, ushort rows, ushort cols)
+    import nano.safeio : Locked;
+    private static struct State
     {
-        this.stats = stats;
-        this.rows = rows;
-        this.cols = cols;
-        live = true;
+        ushort rows, cols;
+        bool live;
+    }
+    private Locked!State state;
+    private Locked!Stats stats;
+
+    private this(shared Locked!Stats stats, ushort rows, ushort cols) shared
+    {
+        import core.atomic : atomicLoad;
+        this.stats = atomicLoad(stats);
+        state = new shared Locked!State(State(rows, cols, true));
     }
 
     /// Reserve the bottom row when stdin and stdout are terminals of at least
-    /// five rows and `AGENTIC_NO_STATUS` is unset; null otherwise.
-    static StatusLine install(Stats delegate() @safe stats)
+    /// five rows and `AGENTIC_NO_STATUS` is unset; null otherwise. The bar
+    /// shows `stats`.
+    static shared(StatusLine) install(shared Locked!Stats stats)
     {
         import core.sys.posix.unistd : isatty;
         import std.process : environment;
@@ -365,61 +370,64 @@ final class StatusLine
         ushort row, col;
         bool known = queryCursorDirect(row, col);
         writeFd(1, installSequence(size[0], known ? row : 0, col));
-        auto s = new StatusLine(stats, size[0], size[1]);
+        import core.atomic : atomicLoad;
+        auto s = new shared StatusLine(atomicLoad(stats), size[0], size[1]);
         s.draw();
-        return s;
+        return atomicLoad(s);
     }
 
     /// Redraw against the current terminal size; a changed size re-pins the
     /// region first, in the same write.
-    void draw()
+    void draw() shared
     {
-        synchronized (this) writeFd(1, sequence());
+        state.update((ref State st) { writeFd(1, sequenceLocked(st)); });
     }
 
     /// The bytes that redraw the bar (re-pinning first after a resize), for
     /// writers that must emit them in the same write as their own output (the
     /// line editor's erase-to-end-of-screen wipes the bar's row).
-    string sequence()
+    string sequence() shared
     {
-        synchronized (this)
+        string r;
+        state.update((ref State st) { r = sequenceLocked(st); });
+        return r;
+    }
+
+    private string sequenceLocked(ref State st) shared
+    {
+        if (!st.live) return "";
+        auto size = terminalSize();
+        if (size[0] == 0) return "";
+        string prefix;
+        if (size[0] != st.rows || size[1] != st.cols)
         {
-            if (!live) return "";
-            auto size = terminalSize();
-            if (size[0] == 0) return "";
-            string prefix;
-            if (size[0] != rows || size[1] != cols)
-            {
-                rows = size[0];
-                cols = size[1];
-                prefix = resizeSequence(rows);
-            }
-            auto st = stats();
-            return format("%s\x1b7\x1b[%s;1H\x1b[2K%s\x1b8", prefix, rows, render(st, cols));
+            st.rows = size[0];
+            st.cols = size[1];
+            prefix = resizeSequence(st.rows);
         }
+        auto figures = stats.get();
+        return format("%s\x1b7\x1b[%s;1H\x1b[2K%s\x1b8", prefix, st.rows, render(figures, st.cols));
     }
 
     /// Clear the screen and scrollback for a fresh conversation and re-pin.
-    void clear()
+    void clear() shared
     {
-        synchronized (this)
-        {
-            if (!live) return;
-            auto bottom = scrollRegionBottom(rows);
+        state.update((ref State st) {
+            if (!st.live) return;
+            auto bottom = scrollRegionBottom(st.rows);
             writeFd(1, format("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;%sr\x1b[%s;1H", bottom, bottom));
-        }
+        });
         draw();
     }
 
     /// Clear the status line and give the whole screen back.
-    void teardown()
+    void teardown() shared
     {
-        synchronized (this)
-        {
-            if (!live) return;
-            live = false;
-            writeFd(1, format("\x1b7\x1b[%s;1H\x1b[2K\x1b[r\x1b8", rows));
-        }
+        state.update((ref State st) {
+            if (!st.live) return;
+            st.live = false;
+            writeFd(1, format("\x1b7\x1b[%s;1H\x1b[2K\x1b[r\x1b8", st.rows));
+        });
     }
 }
 

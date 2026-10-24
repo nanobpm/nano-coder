@@ -124,7 +124,7 @@ class Agent
     SessionLog log;
     TokenUsage lastUsage;
     /// Steer or cancel the running turn from another thread.
-    TurnControl control;
+    shared TurnControl control;
     /// Why the last `run` ended.
     StopReason lastStop;
     /// Finished turns by input id (see `Restored.completed`): redelivering
@@ -166,7 +166,7 @@ class Agent
         this.client = client;
         this.tools = tools;
         this.policy = policy;
-        this.control = new TurnControl;
+        this.control = new shared TurnControl;
         if (systemPrompt.length) push(Message.system(systemPrompt));
     }
 

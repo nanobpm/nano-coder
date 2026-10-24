@@ -4,7 +4,7 @@ module app;
 
 @safe:
 
-import nano.safeio : GsharedRef, exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
+import nano.safeio : GsharedRef, Locked, exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
 
 import std.stdio;
 import std.json;
@@ -219,7 +219,10 @@ bool isTerminal(int fd)
 
 /// Renders agent events on the terminal.
 // Ctrl-C handling: cancel the running turn, or exit when idle.
-mixin GsharedRef!(TurnControl, "gControl"); /// written by the main thread, read by others; the object locks itself
+/// The running agent's controls, for the key reader and the SIGINT handler.
+shared TurnControl gControl_;
+shared(TurnControl) gControl() nothrow @nogc { return atomicLoad(gControl_); }
+void gControl(shared TurnControl c) nothrow @nogc { atomicStore(gControl_, c); }
 shared bool gTurnRunning;
 
 /// Route SIGINT to `onInterrupt`.
@@ -473,7 +476,10 @@ void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 
 // The pinned status line (status.rs), when installed, and what it shows.
 import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
-mixin GsharedRef!(StatusLine, "gStatus"); /// written by the main thread, read by others; the object locks itself
+/// The legacy status bar, if installed; redrawn by the resize watcher.
+shared StatusLine gStatus_;
+shared(StatusLine) gStatus() nothrow @nogc { return atomicLoad(gStatus_); }
+void gStatus(shared StatusLine s) nothrow @nogc { atomicStore(gStatus_, s); }
 /// The frame renderer, when `renderer = "frame"` drives the terminal.
 mixin GsharedRef!(FrameUi, "gFrame"); /// written by the main thread, read by others; the object locks itself
 
@@ -486,17 +492,11 @@ string frameStatus(size_t width)
     return renderStatus(stats, width);
 }
 
-/// The status bar's figures, read and changed under the object's own lock
-/// by the turn, the resize watcher and the renderers.
-final class StatsCell
-{
-    private Stats stats;
-    Stats get() { synchronized (this) return stats; }
-    void update(scope void delegate(ref Stats) @safe f) { synchronized (this) f(stats); }
-}
-mixin GsharedRef!(StatsCell, "gStats"); /// set once, before any other thread runs
+/// The status bar's figures, read and changed under their lock by the turn,
+/// the resize watcher and the renderers.
+shared Locked!Stats gStats;
 shared bool gResized;
-shared static this() { gStats = new StatsCell; }
+shared static this() { gStats = new shared Locked!Stats; }
 
 /// Change the status line's stats and redraw it (no-op without one).
 void updateStatus(scope void delegate(ref Stats) @safe f)
@@ -1083,7 +1083,7 @@ void watchResize()
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
-mixin GsharedRef!(Agent, "mainAgent"); /// written by the main thread, read by others; the object locks itself
+Agent mainAgent; /// the REPL's agent (main thread only)
 
 int main(string[] args)
 {
@@ -1382,7 +1382,7 @@ int runMain(string[] args)
         stdOut.flush();
     };
 
-    gControl = agent.control;
+    gControl = atomicLoad(agent.control);
     installSigint();
     Inbox inbox;
     LineEditor editor;
@@ -1688,12 +1688,12 @@ int runMain(string[] args)
             write("\x1b[H\x1b[2J\x1b[3J");
             foreach (l; lines) writeln(l);
             stdOut.flush();
-            gStatus = StatusLine.install(() => gStats.get);
+            gStatus = StatusLine.install(atomicLoad(gStats));
             if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
         else if (mode == "legacy" && gStatus is null)
         {
-            gStatus = StatusLine.install(() => gStats.get);
+            gStatus = StatusLine.install(atomicLoad(gStats));
             if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
     }
