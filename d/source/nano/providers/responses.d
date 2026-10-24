@@ -177,7 +177,7 @@ LLMResponse parseResponses(JSONValue v, bool replay)
             default:
                 break;
         }
-    if (auto u = "usage" in v) readUsage(*u, r.usage);
+    if (auto u = "usage" in v) { readUsage(*u, r.usage); readCopilotAic(v, r.usage); }
     r.stopReason = stopReason(v);
     return r;
 }
@@ -228,7 +228,8 @@ struct ResponsesStream
             case "response.completed", "response.incomplete":
                 if (auto resp = "response" in j)
                 {
-                    if (auto u = "usage" in *resp) readUsage(*u, r.usage);
+                    // Copilot's `copilot_usage` is a sibling of `response`.
+                    if (auto u = "usage" in *resp) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
                     auto s = stopReason(*resp);
                     if (s.length) r.stopReason = s;
                 }
@@ -304,10 +305,11 @@ struct ResponsesStream
         {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Think."}]},
         {"type":"message","content":[{"type":"output_text","text":"Hi"},{"type":"refusal","refusal":"no"}]},
         {"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash","arguments":"{\"command\":\"ls\"}"}],
-        "usage":{"input_tokens":10,"output_tokens":5}}`), true);
+        "usage":{"input_tokens":10,"output_tokens":5},"copilot_usage":{"total_nano_aiu":250000000}}`), true);
     assert(r.content == "Hi" && r.reasoning == "Think." && r.thinkingBlocks.length == 1);
     assert(r.toolCalls[0].id == "call_1" && r.toolCalls[0].itemId == "fc_1" && r.toolCalls[0].arguments["command"].str == "ls");
     assert(r.usage.inputTokens == 10 && r.stopReason == "completed");
+    assert(r.usage.hasAic && r.usage.aic == 0.25);
     auto inc = parseResponses(parseJSON(`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`), false);
     assert(inc.stopReason == "max_output_tokens");
     bool threw;
@@ -330,7 +332,7 @@ struct ResponsesStream
         `{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_9","call_id":"call_9","name":"glob"}}`,
         `{"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"pattern\":"}`,
         `{"type":"response.function_call_arguments.delta","output_index":2,"delta":"\"*\"}"}`,
-        `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}`,
+        `{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":7,"output_tokens":3}},"copilot_usage":{"total_nano_aiu":1000000000}}`,
     ])
         st.event(e);
     auto r = st.finish();
@@ -338,6 +340,7 @@ struct ResponsesStream
     assert(r.thinkingBlocks.length == 1 && r.thinkingBlocks[0]["id"].str == "rs_1");
     assert(r.toolCalls.length == 1 && r.toolCalls[0].id == "call_9" && r.toolCalls[0].itemId == "fc_9");
     assert(r.toolCalls[0].arguments["pattern"].str == "*" && r.usage.outputTokens == 3);
+    assert(r.usage.hasAic && r.usage.aic == 1);
     ResponsesStream bad;
     bad.sink = (bool t, string x) {};
     bool threw;

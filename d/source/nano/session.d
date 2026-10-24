@@ -112,6 +112,7 @@ JSONValue messageRecord(const ref Message m)
     if (m.hasUsage)
         j["usage"] = JSONValue(["prompt_tokens": m.usage.inputTokens, "completion_tokens": m.usage.outputTokens,
             "total_tokens": m.usage.inputTokens + m.usage.outputTokens]);
+    if (m.hasUsage && m.usage.hasAic) j["usage"]["aic"] = m.usage.aic;
     if (m.durationMs >= 0) j["duration_ms"] = m.durationMs;
     if (m.stopReason.length) j["stop_reason"] = m.stopReason;
     if (m.logLine) j["log_line"] = m.logLine;
@@ -164,6 +165,11 @@ Message messageFromRecord(JSONValue j)
             m.hasUsage = true;
             if (auto p = "prompt_tokens" in v) m.usage.inputTokens = p.integer;
             if (auto p = "completion_tokens" in v) m.usage.outputTokens = p.integer;
+            if (auto p = "aic" in v)
+            {
+                if (p.type == JSONType.float_) { m.usage.hasAic = true; m.usage.aic = p.floating; }
+                else if (p.type == JSONType.integer) { m.usage.hasAic = true; m.usage.aic = p.integer; }
+            }
             break;
         case "duration_ms": m.durationMs = v.integer; break;
         case "stop_reason": m.stopReason = v.str; break;
@@ -477,6 +483,8 @@ unittest
     auto m2 = Message.assistant("", [ToolCall.fromRaw("c", "bash", `{"command":"ls"}`)]);
     m2.hasUsage = true;
     m2.usage.inputTokens = 5;
+    m2.usage.hasAic = true;
+    m2.usage.aic = 0.25;
     m2.stopReason = "tool_use";
     log.input("in-1", "hello");
     log.append(m1);
@@ -495,6 +503,7 @@ unittest
     auto r = restore(findSession(dir, "last", "/x"));
     assert(r.conversation.length == 2 && r.conversation[1].toolCalls[0].name == "bash");
     assert(r.conversation[1].hasUsage && r.conversation[1].usage.inputTokens == 5);
+    assert(r.conversation[1].usage.hasAic && r.conversation[1].usage.aic == 0.25);
     assert(r.pendingInput == "crash here" && r.model == "mock/m" && r.cwd == "/x");
     auto again = new SessionLog(log.path);
     again.append(m1);

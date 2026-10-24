@@ -154,6 +154,9 @@ class Agent
     uint compactions;
     /// Session token totals.
     ulong sessionInputTokens, sessionOutputTokens;
+    /// AI Credits used this session; `hasSessionAic` once a provider reported any.
+    bool hasSessionAic;
+    double sessionAic = 0;
     /// Called after every compaction with its report (the UI prints it).
     void delegate(const ref CompactReport) onCompacted;
     /// Usage-anchored estimate: messages[0 .. calibLen] cost `calibTokens`.
@@ -974,6 +977,21 @@ class Agent
     {
         sessionInputTokens += u.inputTokens;
         sessionOutputTokens += u.outputTokens;
+        if (u.hasAic)
+        {
+            hasSessionAic = true;
+            sessionAic += u.aic;
+        }
+    }
+
+    /// Zero the per-session totals (tokens, credits, compactions), as a new
+    /// or resumed session starts counting from scratch.
+    void resetSessionCounters()
+    {
+        sessionInputTokens = sessionOutputTokens = 0;
+        hasSessionAic = false;
+        sessionAic = 0;
+        compactions = 0;
     }
 
     private string cancelled(AgentEvents ev)
@@ -1084,8 +1102,7 @@ class Agent
         calibLen = calibTokens = 0;
         compactFloor = 0;
         historyAvailable = historyHintPending = false;
-        sessionInputTokens = sessionOutputTokens = 0;
-        compactions = 0;
+        resetSessionCounters();
         lastUsage = TokenUsage.init;
         hasOutcome = hasReported = false;
     }
@@ -1623,4 +1640,29 @@ unittest
     assert(agent.titleThreads.length == 1);
     auto s = list(dir)[0];
     assert(s.title == "Fixing the deploy test" && s.prompts == 3 && s.model == "mock/mock");
+}
+
+// AI Credits add up across responses that report them and reset with the session.
+unittest
+{
+    import std.math : isClose;
+    auto reg = new ToolRegistry;
+    LLMResponse credited(string text, bool aic)
+    {
+        auto r = LLMResponse(text);
+        r.usage = TokenUsage(10, 5);
+        if (aic) { r.usage.hasAic = true; r.usage.aic = 0.0216; }
+        return r;
+    }
+    auto mock = new MockClient([credited("a", true), credited("b", false), credited("c", true)]);
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    auto ev = new NullEvents;
+    agent.run("one", ev);
+    assert(agent.hasSessionAic && isClose(agent.sessionAic, 0.0216));
+    agent.run("two", ev);
+    assert(isClose(agent.sessionAic, 0.0216));
+    agent.run("three", ev);
+    assert(isClose(agent.sessionAic, 0.0432) && agent.sessionInputTokens == 30);
+    agent.resetSessionCounters();
+    assert(!agent.hasSessionAic && agent.sessionAic == 0 && agent.sessionInputTokens == 0);
 }

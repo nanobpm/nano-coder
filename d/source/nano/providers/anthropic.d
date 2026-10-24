@@ -181,7 +181,7 @@ class AnthropicClient : LLMClient
             }
         }
         if (auto s = "stop_reason" in j) if (s.type == JSONType.string) r.stopReason = s.str;
-        if (auto u = "usage" in j) readUsage(*u, r.usage);
+        if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
         return r;
     }
 
@@ -278,7 +278,7 @@ struct AnthropicStream
             case "message_delta":
                 if (auto d = "delta" in j)
                     if (auto s = "stop_reason" in *d) if (s.type == JSONType.string) r.stopReason = s.str;
-                if (auto u = "usage" in j) readUsage(*u, r.usage);
+                if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
                 break;
             case "error":
                 throw new Exception("anthropic stream error: " ~ j["error"].toString);
@@ -330,12 +330,13 @@ unittest
         `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"glob","input":{}}}`,
         `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":"}}`,
         `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"*.d\"}"}}`,
-        `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}`,
+        `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7},"copilot_usage":{"total_nano_aiu":500000000}}`,
     ])
         st.event(ev);
     auto r = st.finish();
     assert(shown == "Hi" && r.toolCalls[0].arguments["pattern"].str == "*.d");
     assert(r.usage.inputTokens == 105 && r.usage.outputTokens == 7 && r.stopReason == "tool_use");
+    assert(r.usage.hasAic && r.usage.aic == 0.5);
 }
 
 unittest

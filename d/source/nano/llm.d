@@ -156,6 +156,47 @@ struct TokenUsage
     long inputTokens;
     long outputTokens;
     long cachedInputTokens;
+    /// AI Credits the request cost, when the provider reports them (GitHub
+    /// Copilot's `copilot_usage.total_nano_aiu`, converted to credits).
+    bool hasAic;
+    double aic = 0;
+}
+
+/// Read GitHub Copilot's `copilot_usage.total_nano_aiu` from a response body
+/// or terminal stream event (the parent of `usage`, or of `response` for the
+/// Responses API) into `usage`, as AI Credits (1 credit = 1e9 nano).
+/// Leaves `usage` alone when the field is absent (other providers).
+void readCopilotAic(const JSONValue parent, ref TokenUsage usage) @safe
+{
+    if (parent.type != JSONType.object) return;
+    auto cu = "copilot_usage" in parent.objectNoRef;
+    if (cu is null || cu.type != JSONType.object) return;
+    auto n = "total_nano_aiu" in cu.objectNoRef;
+    if (n is null) return;
+    double nano;
+    switch (n.type)
+    {
+        case JSONType.integer: nano = n.integer; break;
+        case JSONType.uinteger: nano = n.uinteger; break;
+        case JSONType.float_: nano = n.floating; break;
+        default: return;
+    }
+    usage.hasAic = true;
+    usage.aic = nano / 1e9;
+}
+
+@safe unittest
+{
+    import std.math : isClose;
+    TokenUsage u;
+    readCopilotAic(parseJSON(`{"usage":{},"copilot_usage":{"total_nano_aiu":11600000}}`), u);
+    assert(u.hasAic && isClose(u.aic, 0.0116));
+    TokenUsage none;
+    readCopilotAic(parseJSON(`{"usage":{}}`), none);
+    assert(!none.hasAic);
+    TokenUsage zero;
+    readCopilotAic(parseJSON(`{"copilot_usage":{"total_nano_aiu":0}}`), zero);
+    assert(zero.hasAic && zero.aic == 0);
 }
 
 struct LLMResponse

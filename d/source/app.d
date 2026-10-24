@@ -661,6 +661,8 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.thinking = w.isNull ? null : w.str;
     s.sessionInputTokens = agent.sessionInputTokens;
     s.sessionOutputTokens = agent.sessionOutputTokens;
+    s.hasAic = agent.hasSessionAic;
+    s.aic = agent.sessionAic;
     s.autoCompact = agent.autoCompact;
     s.threshold = agent.autoCompactThreshold;
     s.smartCompact = agent.compactionMode == CompactionMode.smart;
@@ -1151,6 +1153,7 @@ string contextReport(Agent agent)
     if (agent.instructions !is null && agent.instructions.onDemandPaths.length)
         out_ ~= "On-demand rules: " ~ agent.instructions.onDemandPaths.join(", ");
     out_ ~= format("Session:      %s input, %s output tokens", agent.sessionInputTokens, agent.sessionOutputTokens);
+    if (agent.hasSessionAic) out_ ~= format("AI Credits:   %.2f used this session", agent.sessionAic);
     out_ ~= agent.autoCompact
         ? format("Auto-compact: at %.0f%% (~%s tokens); compacted %s time(s)", agent.autoCompactThreshold * 100,
             cast(size_t)(window * agent.autoCompactThreshold), agent.compactions)
@@ -1421,6 +1424,7 @@ int runMain(string[] args)
         agent.historyAvailable = restored.historyAvailable;
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.plan = Plan.init;
+        agent.resetSessionCounters();
         if (restored.plan.type == JSONType.object)
         {
             try agent.plan = Plan.fromJSON(restored.plan);

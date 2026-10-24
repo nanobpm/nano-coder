@@ -200,7 +200,7 @@ class OpenAIClient : LLMClient, CapabilityProbe
                 foreach (c; calls.arrayNoRef)
                     r.toolCalls ~= ToolCall.fromRaw(c["id"].str, c["function"]["name"].str, c["function"]["arguments"].str);
         if (auto f = "finish_reason" in choice) if (f.type == JSONType.string) r.stopReason = f.str;
-        if (auto u = "usage" in j) readUsage(*u, r.usage);
+        if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
         splitThink(r);
         return r;
     }
@@ -356,7 +356,7 @@ struct StreamState
         if (data == "[DONE]") return;
         auto j = parseJSON(data);
         if (auto e = "error" in j) throw new Exception("provider stream error: " ~ e.toString);
-        if (auto u = "usage" in j) readUsage(*u, r.usage);
+        if (auto u = "usage" in j) { readUsage(*u, r.usage); readCopilotAic(j, r.usage); }
         auto choices = "choices" in j;
         if (choices is null || choices.type != JSONType.array || choices.arrayNoRef.length == 0) return;
         auto c = choices.arrayNoRef[0];
@@ -538,7 +538,7 @@ unittest
         `{"choices":[{"delta":{"content":"lo"}}]}`,
         `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"comm"}}]}}]}`,
         `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}`,
-        `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}`,
+        `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3},"copilot_usage":{"total_nano_aiu":11600000}}`,
         `[DONE]`,
     ])
         st.event(ev);
@@ -546,6 +546,7 @@ unittest
     assert(shown == "Hello" && r.content == "Hello");
     assert(r.toolCalls.length == 1 && r.toolCalls[0].arguments["command"].str == "ls");
     assert(r.stopReason == "tool_calls" && r.usage.inputTokens == 10);
+    assert(r.usage.hasAic && imported!"std.math".isClose(r.usage.aic, 0.0116));
 }
 
 unittest
