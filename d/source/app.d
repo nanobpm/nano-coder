@@ -478,23 +478,31 @@ mixin GsharedRef!(StatusLine, "gStatus"); /// written by the main thread, read b
 mixin GsharedRef!(FrameUi, "gFrame"); /// written by the main thread, read by others; the object locks itself
 
 /// The status bar text for the frame's last line.
-string frameStatus(size_t width) @trusted
+string frameStatus(size_t width)
 {
     import nano.status : renderStatus = render;
     if (environment.get("AGENTIC_NO_STATUS") !is null) return "";
-    synchronized (gStatsLock) return renderStatus(gStats, width);
+    auto stats = gStats.get;
+    return renderStatus(stats, width);
 }
-__gshared Stats gStats;
-/// Guards `gStats`. Set once, before any other thread runs.
-immutable Object gStatsLock;
+
+/// The status bar's figures, read and changed under the object's own lock
+/// by the turn, the resize watcher and the renderers.
+final class StatsCell
+{
+    private Stats stats;
+    Stats get() { synchronized (this) return stats; }
+    void update(scope void delegate(ref Stats) @safe f) { synchronized (this) f(stats); }
+}
+mixin GsharedRef!(StatsCell, "gStats"); /// set once, before any other thread runs
 shared bool gResized;
-shared static this() { gStatsLock = new immutable Object; }
+shared static this() { gStats = new StatsCell; }
 
 /// Change the status line's stats and redraw it (no-op without one).
-void updateStatus(scope void delegate(ref Stats) @safe f) @trusted
+void updateStatus(scope void delegate(ref Stats) @safe f)
 {
     if (gStatus is null && gFrame is null) return;
-    synchronized (gStatsLock) f(gStats);
+    gStats.update(f);
     if (gStatus !is null) gStatus.draw();
     if (gFrame !is null) gFrame.redraw();
 }
@@ -1680,12 +1688,12 @@ int runMain(string[] args)
             write("\x1b[H\x1b[2J\x1b[3J");
             foreach (l; lines) writeln(l);
             stdOut.flush();
-            gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
+            gStatus = StatusLine.install(() => gStats.get);
             if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
         else if (mode == "legacy" && gStatus is null)
         {
-            gStatus = StatusLine.install(() @trusted { synchronized (gStatsLock) return gStats; });
+            gStatus = StatusLine.install(() => gStats.get);
             if (gStatus !is null) { refreshStatus(); watchResize(); }
         }
     }

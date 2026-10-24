@@ -61,9 +61,15 @@ struct Rule
 
     bool appliesTo(string tool) const { return tools.canFind(tool); }
 
-    bool matches(string text) const @trusted
+    bool matches(string text) const
     {
-        return patternSource is null || !matchFirst(text, cast() pattern).empty;
+        if (patternSource is null) return true;
+        // A `const` Regex can't be matched with, and copying one out of
+        // `const` needs a cast; reuse a per-thread compiled copy instead.
+        static Regex!char[string] compiled;
+        auto re = patternSource in compiled;
+        if (re is null) { compiled[patternSource] = regex(patternSource, "s"); re = patternSource in compiled; }
+        return !matchFirst(text, *re).empty;
     }
 }
 

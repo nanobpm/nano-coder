@@ -19,7 +19,7 @@ class MockClient : LLMClient
     {
         Message[] copy;
         // The recorded copies are only read back by tests.
-        foreach (m; req.messages) copy ~= () @trusted { return cast(Message) m; }();
+        foreach (ref m; req.messages) copy ~= imported!"nano.safeio".deepCopy(m);
         seen ~= copy;
         string[] names;
         foreach (ref t; req.tools) names ~= t.name;

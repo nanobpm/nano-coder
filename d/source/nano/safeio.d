@@ -444,6 +444,59 @@ JSONValue jsonCopy(const JSONValue v)
     }
 }
 
+/// A mutable deep copy of a `const` value: arrays and maps are rebuilt,
+/// JSON is copied with `jsonCopy`, structs field by field. Data that is
+/// already immutable (strings) is shared. This replaces `cast()` copies out
+/// of `const`, which would let the copy write into the original.
+U deepCopy(U)(const U v)
+{
+    import std.traits : hasIndirections, isAssociativeArray, KeyType, ValueType;
+    import std.typecons : Nullable;
+    static if (!hasIndirections!U) return v;
+    else static if (is(U == JSONValue)) return jsonCopy(v);
+    else static if (is(U == E[], E))
+    {
+        static if (is(E == immutable)) return v;
+        else
+        {
+            U r;
+            r.reserve(v.length);
+            foreach (ref e; v) r ~= deepCopy!E(e);
+            return r;
+        }
+    }
+    else static if (isAssociativeArray!U)
+    {
+        U r;
+        foreach (k, ref e; v) r[deepCopy!(KeyType!U)(k)] = deepCopy!(ValueType!U)(e);
+        return r;
+    }
+    else static if (is(U == Nullable!X, X))
+    {
+        U r;
+        if (!v.isNull) r = deepCopy!X(v.get);
+        return r;
+    }
+    else static if (is(U == struct))
+    {
+        U r;
+        static foreach (i; 0 .. U.tupleof.length)
+            r.tupleof[i] = deepCopy!(typeof(U.tupleof[i]))(v.tupleof[i]);
+        return r;
+    }
+    else static assert(0, "deepCopy: unsupported type " ~ U.stringof);
+}
+
+@safe unittest
+{
+    static struct In { int[] xs; string s; }
+    static struct Out { In[] ins; string[string] m; int n; }
+    const Out o = Out([In([1, 2], "a")], ["k": "v"], 3);
+    auto c = deepCopy(o);
+    c.ins[0].xs[0] = 9;
+    assert(o.ins[0].xs[0] == 1 && c.m["k"] == "v" && c.n == 3 && c.ins[0].s == "a");
+}
+
 @safe unittest
 {
     import std.json : parseJSON;

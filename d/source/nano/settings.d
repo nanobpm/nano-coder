@@ -125,9 +125,9 @@ bool isQwenProvider(string name, const ref ProviderConfig p)
 /// The user's entry after an edit: only fields that differ from the preset,
 /// with key sources replaced and an emptied preset `api_key_env` kept as "".
 ProviderConfig diffFrom(const ref ProviderConfig preset, const ref ProviderConfig existing, const ref ProviderConfig updated)
-    @trusted
 {
-    ProviderConfig e = cast(ProviderConfig) existing;
+    import nano.safeio : deepCopy;
+    ProviderConfig e = deepCopy(existing);
     e.hasKind = updated.hasKind && !(preset.hasKind && preset.kind == updated.kind);
     e.kind = updated.kind;
     e.baseUrl = updated.baseUrl == preset.baseUrl ? null : updated.baseUrl;

@@ -454,9 +454,8 @@ ResolvedProvider resolve(const ref Config c, string spec)
     }
     ResolvedProvider r;
     r.name = name;
-    // Shallow copy out of the const table. Callers only reassign the arrays
-    // and maps it shares (never write into them), so the table is unchanged.
-    r.config = () @trusted { return cast(ProviderConfig) *pc; }();
+    // A deep copy out of the const table, so callers may edit it freely.
+    r.config = imported!"nano.safeio".deepCopy(*pc);
     r.model = model.length ? model : pc.defaultModel;
     if (!r.model.length)
         throw new Exception(format("no model given for provider \"%s\" and it has no default_model", name));
