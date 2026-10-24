@@ -1697,6 +1697,15 @@ int runMain(string[] args)
         if (o.configPath.length) herdrExtra = ["--config", absolutePath(o.configPath)];
     }
     scope (exit) nano.herdr.release();
+    // Repeat the resume instruction on exit, so it is still on screen (and in
+    // scrollback) after a long session pushed the banner away. Re-read the
+    // log: `/restart` and `/resume` may have switched sessions.
+    void goodbye()
+    {
+        writeln("\nGoodbye!");
+        if (agent.log !is null) writefln("Session: %s (resume with --resume %s)", agent.log.id, agent.log.id);
+        stdOut.flush();
+    }
     for (;;)
     {
         string line;
@@ -1774,7 +1783,7 @@ int runMain(string[] args)
             auto arg = sp > 0 ? input[sp + 1 .. $].strip : "";
             switch (cmd)
             {
-                case "/quit", "/exit": return 0;
+                case "/quit", "/exit": goodbye(); return 0;
                 case "/help": writeln(editor !is null ? helpText() : usage); continue;
                 case "/restart":
                 {
@@ -1993,5 +2002,6 @@ int runMain(string[] args)
         }
         turn(input);
     }
+    goodbye();
     return 0;
 }
