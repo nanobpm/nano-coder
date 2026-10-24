@@ -71,6 +71,8 @@ final class TurnControl
     {
         immutable(Steer)[] steers, absorbed;
         string modelRequest;
+        /// A `/thinking` argument typed mid-turn (null: none).
+        string thinkingRequest;
     }
     private Locked!State state;
     private int mode_;
@@ -85,6 +87,18 @@ final class TurnControl
 
     /// Ask the running turn to switch model (`/model` mid-turn).
     void requestModel(string spec) shared { state.update((ref State s) { s.modelRequest = spec; }); }
+
+    /// Ask the running turn to use a thinking level (`/thinking` mid-turn):
+    /// the argument as typed (a level, `default`, `off` or `reset`).
+    void requestThinking(string arg) shared { state.update((ref State s) { s.thinkingRequest = arg; }); }
+
+    /// The pending thinking request, cleared; null when none.
+    string takeThinkingRequest() shared
+    {
+        string r;
+        state.update((ref State s) { r = s.thinkingRequest; s.thinkingRequest = null; });
+        return r;
+    }
 
     /// The pending model request, cleared; null when none.
     string takeModelRequest() shared

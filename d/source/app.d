@@ -33,7 +33,9 @@ import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse,
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
 import nano.frame : glyphMark;
-import nano.question : QuestionBroker, Question, Answer, Answered, Dismissed, sanitizeLine, questionDefinition = definition;
+import core.time : MonoTime, seconds;
+import std.sumtype : match;
+import nano.question : QuestionBroker, Question, Answer, Answered, Away, Dismissed, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
@@ -359,6 +361,17 @@ string midTurnCommand(string text, MidTurn ctx)
                 }
                 catch (Exception e) return e.msg;
             }
+            if (name == "/thinking")
+            {
+                import std.typecons : Nullable;
+                import nano.thinking : Thinking, setSession;
+                Nullable!Thinking check;
+                try setSession(check, arg);
+                catch (Exception e) return format("[thinking: %s]", e.msg);
+                control.requestThinking(arg);
+                auto shown = check.isNull ? "the config level" : check.get.toString;
+                return format("[thinking: %s — from the agent's next step]", shown);
+            }
             if (name == "/model")
             {
                 // Validate now so a bad spec is reported at once and never queued.
@@ -400,7 +413,19 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                     nano.herdr.report(nano.herdr.State.blocked, qs.length ? sanitizeLine(qs[0].question) : null);
                     // The user's time at the picker isn't working time.
                     if (gFrame) gFrame.pauseWork(true);
-                    questions.resolve(askQuestions(editor, qs));
+                    bool delegate() @safe away = null;
+                    if (mid.control.mode() == AgentMode.auto_)
+                    {
+                        // Auto mode: give the user a chance to answer, then
+                        // answer for them (Rust's AUTO_AWAY_SECS).
+                        console.note(format("[auto: answering for you in %ss — the user is away]", autoAwaySecs));
+                        auto deadline = MonoTime.currTime + autoAwaySecs.seconds;
+                        away = () @safe => MonoTime.currTime >= deadline;
+                    }
+                    auto answer = askQuestions(editor, qs, away);
+                    if (answer.match!((Away _) => true, _ => false))
+                        console.note("[auto: no answer — making the best decision]");
+                    questions.resolve(answer);
                     if (gFrame) gFrame.pauseWork(false);
                     nano.herdr.report(nano.herdr.State.working);
                     break;
@@ -448,8 +473,10 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                     if (auto unescaped = unescapePrompt(text)) text = unescaped;
                     auto id = queue.reserveId();
                     gControl.steerWithId(text, id);
-                    stdErr.writeln(console.dim(format("↪ steer #%s: %s — read at the agent's next step; "
-                        ~ "/queue remove %s to withdraw", id, text, id)));
+                    // The frame shows the steer as a user message once the
+                    // agent reads it, so the note needn't repeat the text.
+                    stdErr.writeln(console.dim(format("↪ steer #%s: the agent reads this at its next step — "
+                        ~ "/queue remove %s to withdraw", id, id)));
                 }
                 break;
         }
@@ -483,8 +510,12 @@ immutable(Config) frozenConfig(const ref Config cfg)
     return Isolated!Config.assumeIsolated(deepCopy(cfg)).freeze;
 }
 
+/// How long auto mode waits for the user to answer a question.
+enum autoAwaySecs = 15;
+
 /// Ask each question with a picker; dismissing any one dismisses them all.
-Answer askQuestions(LineEditor editor, const Question[] qs)
+/// When `away` turns true before the user answers, the answer is `Away`.
+Answer askQuestions(LineEditor editor, const Question[] qs, bool delegate() @safe away = null)
 {
     string[] answers;
     foreach (ref q; qs)
@@ -499,11 +530,13 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
             custom = labels.length;
             labels ~= "Type your own answer";
         }
-        auto at = editor.select(sanitizeLine(q.question), labels);
+        auto at = editor.select(sanitizeLine(q.question), labels, 0, away);
+        if (at == -2) return Answer(Away());
         if (at < 0) return Answer(Dismissed());
         if (at == custom)
         {
-            auto r = editor.readLine("Answer: ", "\x1b[1mAnswer:\x1b[0m ");
+            auto r = editor.readLine("Answer: ", "\x1b[1mAnswer:\x1b[0m ", false, away);
+            if (r.outcome == Outcome.stopped) return Answer(Away());
             if (r.outcome != Outcome.line) return Answer(Dismissed());
             answers ~= r.text;
         }
@@ -1367,10 +1400,12 @@ int runMain(string[] args)
             return meta;
         };
         auto server = new AcpServer(agent, host);
+        stdErr.writefln("ACP harness ready (provider: %s, model: %s)", client.providerName, client.modelName);
         if (!server.serveStdio())
         {
-            stdErr.writeln("nano-coder-d: no ACP JSON-RPC request received on stdin");
-            return 1;
+            stdErr.writeln("no valid ACP requests received on stdin — is the client speaking ACP "
+                ~ "(JSON-RPC 2.0, one message per line)?");
+            return 2;
         }
         return 0;
     }
@@ -1552,7 +1587,7 @@ int runMain(string[] args)
         h.refreshSystem = () { agent.messages[0].content = systemFor(cwd, sysPlan); };
         h.refreshClient = (string name) {
             if (agent.client.providerName != name) return cast(string) null;
-            try { switchModel(name ~ "/" ~ agent.client.modelName); return cast(string) null; }
+            try { switchModel(name ~ "/" ~ agent.client.modelName); return ""; }
             catch (Exception e) return e.msg;
         };
         onVerbosity = (Verbosity v) { setVerbosity(v); };
@@ -1624,6 +1659,12 @@ int runMain(string[] args)
         // Steers that arrived after the agent's last step run as the next prompts.
         // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
+        // A cancelled turn drops them (Rust: only a successful cancelled outcome).
+        if (ok && atomicLoad(agent.control).isCancelled)
+        {
+            foreach (t; late) stdErr.writeln(console.dim("[steer dropped: " ~ t.text ~ "]"));
+            late = null;
+        }
         if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);
         if (editor !is null)
@@ -1781,6 +1822,20 @@ int runMain(string[] args)
             auto sp = input.indexOf(' ');
             auto cmd = sp > 0 ? input[0 .. sp] : input;
             auto arg = sp > 0 ? input[sp + 1 .. $].strip : "";
+            {
+                // Never send a `/…` line to the model: refuse unknown commands
+                // and arguments a command doesn't take.
+                import nano.commands : commandTable = commands, commandRejection = rejection;
+                import std.algorithm.searching : find;
+                auto known = commandTable.find!(c => c.name == cmd);
+                if (known.length ? arg.length && !known[0].args.length : true)
+                {
+                    auto note = commandRejection(input);
+                    writeln(note !is null ? note : format("Can't run %s: unexpected arguments "
+                        ~ "(/help lists commands and their arguments)", JSONValue(input).toString(JSONOptions.doNotEscapeSlashes)));
+                    continue;
+                }
+            }
             switch (cmd)
             {
                 case "/quit", "/exit": goodbye(); return 0;
@@ -1960,15 +2015,33 @@ int runMain(string[] args)
                             writeln(memory.forget(arg[7 .. $]));
                             continue;
                         }
+                        if (arg.length)
+                        {
+                            writefln("Unknown /memory argument %s; use /memory or /memory forget <id>.",
+                                JSONValue(arg).toString(JSONOptions.doNotEscapeSlashes));
+                            continue;
+                        }
+                        // Plan mode has no memory_save tool either.
+                        bool writable = memoryWritable && agent.control.mode != AgentMode.plan;
                         auto all = memory.all();
-                        if (!all.length) writeln("no memories saved");
+                        if (!all.length)
+                        {
+                            writefln(writable ? "No memories yet. The model saves them with memory_save; files live under %s."
+                                : "No memories yet. Memory is read-only here, so the model cannot save them; files live under %s.",
+                                memory.root);
+                            continue;
+                        }
+                        writefln("%s memor%s (memory is %s; edit the files under %s%s):", all.length,
+                            all.length == 1 ? "y" : "ies", cfg.memory == MemoryMode.on ? "on" : "read-only",
+                            memory.root, writable ? ", or /memory forget <id>" : "");
                         foreach (x; all)
                         {
                             import nano.memory : scopeName = name;
-                            writefln("%-7s %s %s%s", scopeName(x.s), x.e.label, x.e.text,
-                                x.e.evidence !is null ? " (check: " ~ x.e.evidence ~ ")" : "");
+                            import std.string : lineSplitter;
+                            auto first = x.e.text.lineSplitter.empty ? "" : x.e.text.lineSplitter.front.strip;
+                            writefln("  %s %s %s%s", scopeName(x.s), x.e.label, sanitizeLine(first),
+                                x.e.evidence !is null ? " (check: " ~ sanitizeLine(x.e.evidence) ~ ")" : "");
                         }
-                        writefln("store: %s (remove one with /memory forget <id>)", memory.root);
                     }
                     catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                     continue;
@@ -1989,6 +2062,7 @@ int runMain(string[] args)
                             try writeln(switchModel(picked));
                             catch (Exception e) stdErr.writeln(console.red("error: " ~ e.msg));
                         }
+                        else writefln("Model unchanged: %s (provider %s)", client.modelName, client.providerName);
                         continue;
                     }
                     if (!arg.length) { writeln(client.providerName, "/", client.modelName); continue; }

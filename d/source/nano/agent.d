@@ -388,6 +388,13 @@ class Agent
             }
             if (auto spec = control.takeModelRequest())
                 if (onModelRequest !is null) onModelRequest(spec);
+            if (auto level = control.takeThinkingRequest())
+            {
+                import nano.thinking : setSession;
+                // Checked when it was typed, so this can't fail.
+                try setSession(sessionThinking, level);
+                catch (Exception) {}
+            }
             LLMResponse r;
             import std.datetime.stopwatch : StopWatch, AutoStart;
             auto sw = StopWatch(AutoStart.yes);

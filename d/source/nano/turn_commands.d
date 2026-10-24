@@ -43,6 +43,9 @@ Timing timing(string cmd) nothrow
     if (name == "/trajectory" && ["", "--json", "--markdown", "--md"].canFind(arg)) return Timing.immediate;
     if (name == "/mode" || name == "/verbosity") return arg.length ? Timing.nextStep : Timing.immediate;
     if (name == "/model") return arg.length ? Timing.nextStep : Timing.afterTurn;
+    // `/thinking LEVEL` applies from the agent's next step; bare `/thinking`
+    // lists the levels of the model in use, after the turn.
+    if (name == "/thinking") return arg.length ? Timing.nextStep : Timing.afterTurn;
     return Timing.afterTurn;
 }
 
@@ -94,6 +97,7 @@ unittest
         assert(timing("/trajectory --bogus") == afterTurn);
         assert(timing("/mode") == immediate && timing("/mode plan") == nextStep);
         assert(timing("/model") == afterTurn && timing("/model mock/x") == nextStep);
+        assert(timing("/thinking") == afterTurn && timing("/thinking high") == nextStep);
         assert(timing("/compact") == afterTurn && timing("/restart") == afterTurn && timing("/resume") == afterTurn);
     }
     auto v = LiveView.make;

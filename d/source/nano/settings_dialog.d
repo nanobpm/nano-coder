@@ -41,7 +41,8 @@ struct SettingsHost
     string[] delegate(string provider) @safe listModels;
     /// Rebuilds the system prompt after `system_prompt` changed.
     void delegate() @safe refreshSystem;
-    /// Rebuilds the client when `provider` is the session's; an error or null.
+    /// Rebuilds the client when `provider` is the session's: "" when rebuilt,
+    /// an error message, or null when the session uses another provider.
     string delegate(string provider) @safe refreshClient;
     /// Where `/providers` key status reads stored logins (tests).
     string dataDir;
@@ -519,7 +520,8 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     {
         auto err = h.refreshClient(name);
         if (err is null) {}
-        else if (err.length) notices ~= stale ~ " " ~ err;
+        else if (!err.length) ui.say(format("Rebuilt the session's client for %s.", name));
+        else notices ~= stale ~ " " ~ err;
     }
     return name;
 }

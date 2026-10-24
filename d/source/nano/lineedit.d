@@ -636,7 +636,8 @@ final class LineEditor
 
     /// Pick one of `labels` with Up/Down (or its number) and Enter; Esc or
     /// Ctrl-C dismisses (-1). Leaves the prompt and the choice on screen.
-    ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0)
+    /// When `stop` turns true (polled) the picker is removed and -2 returned.
+    ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0, bool delegate() @safe stop = null)
     {
         size_t at = initial < labels.length ? initial : 0;
         size_t top;
@@ -667,7 +668,12 @@ final class LineEditor
         draw(false);
         for (;;)
         {
-            auto key = decode(src, -1, utf8);
+            auto key = decode(src, stop is null ? -1 : 100, utf8);
+            if (key.kind == K.none && stop !is null && stop())
+            {
+                frameDraw(null);
+                return -2;
+            }
             switch (key.kind)
             {
                 case K.up: at = at ? at - 1 : labels.length - 1; break;
