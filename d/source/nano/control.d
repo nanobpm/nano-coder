@@ -39,6 +39,10 @@ struct Steer
     import std.json : JSONValue;
     string text;
     private string tagJson;
+    /// The interactive queue id (shared with queued messages) so `/queue`
+    /// can list, edit or withdraw the steer before the agent reads it; -1
+    /// for none (ACP and piped steers).
+    long id = -1;
 
     this(string text, JSONValue tag = JSONValue.init)
     {
@@ -95,6 +99,65 @@ final class TurnControl
 
     /// ditto
     void steer(Steer m) shared { state.update((ref State s) { s.steers ~= m; }); }
+
+    /// Queue a steer carrying a `/queue` id, so it can be edited or
+    /// withdrawn until the agent reads it.
+    void steerWithId(string text, size_t id) shared
+    {
+        auto m = Steer(text);
+        m.id = id;
+        steer(m);
+    }
+
+    /// Id-carrying steers the agent has not read yet, oldest first.
+    immutable(Steer)[] pendingSteers() shared
+    {
+        import std.algorithm : filter;
+        import std.array : array;
+        return state.get.steers.filter!(m => m.id >= 0).array;
+    }
+
+    /// Withdraw unread steers by id; returns how many were removed. A steer
+    /// the agent already read is gone from the list, so it is not counted.
+    size_t removeSteers(const size_t[] ids) shared
+    {
+        import std.algorithm : canFind, filter;
+        import std.array : array;
+        return state.update!size_t((ref State s) {
+            auto before = s.steers.length;
+            s.steers = s.steers.filter!(m => m.id < 0 || !ids.canFind(cast(size_t) m.id)).array;
+            return before - s.steers.length;
+        });
+    }
+
+    /// Rewrite an unread steer; false when none has that id (never sent, or
+    /// already read by the agent).
+    bool editSteer(size_t id, string text) shared
+    {
+        return state.update!bool((ref State s) {
+            foreach (i, m; s.steers)
+                if (m.id >= 0 && m.id == id)
+                {
+                    Steer edited = m;
+                    edited.text = text;
+                    s.steers = s.steers[0 .. i] ~ edited ~ s.steers[i + 1 .. $];
+                    return true;
+                }
+            return false;
+        });
+    }
+
+    /// Withdraw every unread id-carrying steer; returns how many.
+    size_t clearSteers() shared
+    {
+        import std.algorithm : filter;
+        import std.array : array;
+        return state.update!size_t((ref State s) {
+            auto before = s.steers.length;
+            s.steers = s.steers.filter!(m => m.id < 0).array;
+            return before - s.steers.length;
+        });
+    }
 
     /// Whether steering messages are waiting.
     bool hasSteers() shared { return state.get.steers.length > 0; }

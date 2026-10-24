@@ -5,6 +5,12 @@
 /// `/queue` lists, edits and removes entries while a turn runs; edits apply
 /// at once, so a removed message is never sent. Ids are monotonic, so an id
 /// read off `/queue` mid-turn still names the same message later.
+///
+/// Steers (plain Enter mid-turn) share the same id space and the same
+/// `/queue` surface: until the agent reads a steer at its next step it is
+/// listed as `steer`, and `remove`/`edit`/`clear` apply to it too, so a
+/// steer the running turn has made stale can be withdrawn or rewritten. A
+/// steer the agent has already read is gone from the list.
 module nano.queue;
 
 @safe:
@@ -14,6 +20,8 @@ import std.format : format;
 import std.string : strip, indexOf;
 import std.conv : to, ConvException;
 import std.array : join, split, replicate;
+import nano.control : TurnControl;
+import core.atomic : atomicLoad;
 
 struct QueuedMessage
 {
@@ -44,6 +52,17 @@ struct MessageQueue
             s.entries ~= QueuedMessage(id, text);
             return id;
         });
+    }
+
+    /// Take an id without queueing anything (for a steer, so steers and
+    /// queued messages never share an id).
+    size_t reserveId() { return state.update!size_t((ref State s) => s.nextId++); }
+
+    /// Queue a message under an id taken earlier with `reserveId` (a steer
+    /// the turn ended before reading keeps its id).
+    void pushWithId(size_t id, string text)
+    {
+        state.update((ref State s) { s.entries ~= QueuedMessage(id, text); });
     }
 
     /// The next message to run, if any.
@@ -186,45 +205,64 @@ QueueOp parse(string args)
     }
 }
 
-/// Apply an edit and say what happened.
-string apply(MessageQueue queue, const QueueOp op)
+/// Apply an edit to the queue and any unread steers (`steers` is the
+/// running turn's controls, or null between turns); says what happened.
+string apply(MessageQueue queue, shared TurnControl steers, const QueueOp op)
 {
     return op.match!(
-        (const ListOp _) => describe(queue),
+        (const ListOp _) => describe(queue, atomicLoad(steers)),
         (const RemoveOp r) {
+            auto withdrawn = steers is null ? 0 : steers.removeSteers(r.ids);
             auto removed = queue.remove(r.ids);
-            return removed == 0
-                ? format!"No queued message with %s (%s)"(idsText(r.ids), summary(queue))
-                : format!"Removed %s queued message%s (%s)"(removed, plural(removed), summary(queue));
+            auto sum = summary(queue, atomicLoad(steers));
+            if (!withdrawn && !removed) return format!"No pending message with %s (%s)"(idsText(r.ids), sum);
+            if (!withdrawn) return format!"Removed %s queued message%s (%s)"(removed, plural(removed), sum);
+            if (!removed) return format!"Withdrew %s steer%s (%s)"(withdrawn, plural(withdrawn), sum);
+            return format!"Withdrew %s steer%s and removed %s queued message%s (%s)"(withdrawn, plural(withdrawn),
+                removed, plural(removed), sum);
         },
-        (const EditOp e) => queue.edit(e.id, e.text)
-            ? format!"Queue #%s updated: %s"(e.id, preview(e.text, 60))
-            : format!"No queued message with id %s (%s)"(e.id, summary(queue)),
+        (const EditOp e) {
+            if (steers !is null && steers.editSteer(e.id, e.text))
+                return format!"Steer #%s updated: %s"(e.id, preview(e.text, 60));
+            if (queue.edit(e.id, e.text)) return format!"Queue #%s updated: %s"(e.id, preview(e.text, 60));
+            return format!"No pending message with id %s (%s)"(e.id, summary(queue, atomicLoad(steers)));
+        },
         (const AddOp a) {
             auto id = queue.push(a.text);
-            return format!"↧ queued #%s (%s) — /queue remove %s to drop"(id, summary(queue), id);
+            return format!"↧ queued #%s (%s) — /queue remove %s to drop"(id, summary(queue, atomicLoad(steers)), id);
         },
         (const ClearOp _) {
+            auto w = steers is null ? 0 : steers.clearSteers();
             auto n = queue.clear();
-            return format!"Cleared %s queued message%s"(n, plural(n));
+            return w == 0 ? format!"Cleared %s queued message%s"(n, plural(n))
+                : format!"Cleared %s queued message%s and withdrew %s steer%s"(n, plural(n), w, plural(w));
         },
     );
 }
 
-string describe(MessageQueue queue)
+enum emptyQueue = "Queue is empty. Enter while a turn runs steers it; Ctrl-Enter (or /queue add) queues a message for after it.";
+
+/// One line per pending message: unread steers first (the agent reads them
+/// at its next step), then queued messages, oldest first.
+string describe(MessageQueue queue, shared TurnControl steers = null)
 {
     auto entries = queue.list;
-    if (!entries.length)
-        return "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.";
-    auto out_ = format!"Queued (%s):"(entries.length);
-    foreach (e; entries) out_ ~= format!"\n  %3s  %s"(e.id, preview(e.text, 80));
+    auto pending = steers is null ? null : steers.pendingSteers;
+    if (!entries.length && !pending.length) return emptyQueue;
+    auto out_ = format!"Pending (%s):"(entries.length + pending.length);
+    foreach (m; pending) out_ ~= format!"\n  %3s  steer   %s"(m.id, preview(m.text, 80));
+    foreach (e; entries) out_ ~= format!"\n  %3s  queued  %s"(e.id, preview(e.text, 80));
+    if (pending.length) out_ ~= "\nSteers go to the agent at its next step; /queue remove or edit them before then.";
     return out_;
 }
 
-private string summary(MessageQueue queue)
+/// "2 steers pending, 1 queued" / "queue is empty", for trailing summaries.
+private string summary(MessageQueue queue, shared TurnControl steers)
 {
+    auto w = steers is null ? 0 : steers.pendingSteers.length;
     auto n = queue.length;
-    return n == 0 ? "queue is empty" : format!"%s queued"(n);
+    if (!w) return n == 0 ? "queue is empty" : format!"%s queued"(n);
+    return n == 0 ? format!"%s steer%s pending"(w, plural(w)) : format!"%s steer%s pending, %s queued"(w, plural(w), n);
 }
 
 private string plural(size_t n) { return n == 1 ? "" : "s"; }
@@ -293,18 +331,62 @@ unittest // apply reports what happened
     q.push("alpha");
     q.push("beta");
     q.push("gamma");
-    auto listed = apply(q, QueueOp(ListOp()));
-    assert(listed.canFind("Queued (3):") && listed.canFind("  0  alpha") && listed.canFind("  2  gamma"), listed);
-    auto removed = apply(q, QueueOp(RemoveOp([1, 9])));
+    auto listed = apply(q, null, QueueOp(ListOp()));
+    assert(listed.canFind("Pending (3):") && listed.canFind("  0  queued  alpha") && listed.canFind("  2  queued  gamma"),
+        listed);
+    auto removed = apply(q, null, QueueOp(RemoveOp([1, 9])));
     assert(removed.canFind("Removed 1 queued message") && removed.canFind("(2 queued)"), removed);
-    assert(apply(q, QueueOp(EditOp(2, "GAMMA"))).canFind("#2"));
+    assert(apply(q, null, QueueOp(EditOp(2, "GAMMA"))).canFind("#2"));
     assert(q.list[1].text == "GAMMA");
-    assert(apply(q, QueueOp(RemoveOp([7]))).canFind("No queued message with id 7"));
-    assert(apply(q, QueueOp(ClearOp())).canFind("Cleared 2"));
-    assert(apply(q, QueueOp(ListOp()))
-        == "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.");
-    auto note = apply(q, QueueOp(AddOp("later")));
+    assert(apply(q, null, QueueOp(RemoveOp([7]))).canFind("No pending message with id 7"));
+    assert(apply(q, null, QueueOp(ClearOp())).canFind("Cleared 2"));
+    assert(apply(q, null, QueueOp(ListOp())) == emptyQueue);
+    auto note = apply(q, null, QueueOp(AddOp("later")));
     assert(note.startsWith("↧ queued #") && note.canFind("/queue remove") && q.length == 1, note);
+}
+
+unittest // edits reach unread steers and share ids with the queue (Rust edits_reach_unread_steers_and_share_ids_with_the_queue)
+{
+    import std.algorithm : canFind, startsWith;
+    import std.json : JSONValue;
+    import nano.control : Steer;
+    auto control = new shared TurnControl;
+    auto q = MessageQueue.make;
+    auto s0 = q.reserveId();
+    control.steerWithId("use the old api", s0);
+    auto q1 = q.push("then write docs");
+    auto s2 = q.reserveId();
+    control.steerWithId("skip the tests", s2);
+    control.steer(Steer("acp steer, not listed", JSONValue(7)));
+    assert(s0 == 0 && q1 == 1 && s2 == 2);
+
+    auto listed = apply(q, atomicLoad(control), QueueOp(ListOp()));
+    assert(listed.startsWith("Pending (3):"), listed);
+    assert(listed.canFind("  0  steer   use the old api") && listed.canFind("  1  queued  then write docs"), listed);
+    assert(!listed.canFind("acp steer"), listed);
+
+    auto edited = apply(q, atomicLoad(control), QueueOp(EditOp(0, "use the new api")));
+    assert(edited.startsWith("Steer #0 updated"), edited);
+    assert(control.pendingSteers[0].text == "use the new api");
+
+    auto removed = apply(q, atomicLoad(control), QueueOp(RemoveOp([2, 1])));
+    assert(removed.canFind("Withdrew 1 steer and removed 1 queued message") && removed.canFind("(1 steer pending)"), removed);
+
+    // Once the agent reads a steer it is no longer editable.
+    auto read = control.takePending;
+    assert(read.length == 2 && read[0].text == "use the new api", "the edited steer and the untracked one are delivered");
+    auto late = apply(q, atomicLoad(control), QueueOp(EditOp(0, "too late")));
+    assert(late.startsWith("No pending message with id 0"), late);
+
+    control.steerWithId("one more", q.reserveId());
+    control.steer("untracked");
+    auto cleared = apply(q, atomicLoad(control), QueueOp(ClearOp()));
+    assert(cleared.canFind("withdrew 1 steer"), cleared);
+    assert(control.takePending.length == 1, "clear leaves untracked (ACP) steers alone");
+
+    // A steer left unread keeps its id in the queue.
+    q.pushWithId(3, "kept");
+    assert(q.list == [QueuedMessage(3, "kept")] && q.push("next") == 4);
 }
 
 unittest // preview flattens and truncates

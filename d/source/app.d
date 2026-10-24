@@ -288,10 +288,11 @@ string queueArgs(string text)
     return rest ~ "\0"; // non-null even when empty; the NUL is stripped by the caller
 }
 
-/// Run a `/queue` edit and say what happened.
-string runQueueCommand(MessageQueue queue, string args)
+/// Run a `/queue` edit and say what happened. `steers`: the running turn's
+/// controls, so unread steers are listed and editable (null between turns).
+string runQueueCommand(MessageQueue queue, shared TurnControl steers, string args)
 {
-    try return queueApply(queue, queueParse(args));
+    try return queueApply(queue, atomicLoad(steers), queueParse(args));
     catch (QueueUsage e) return "[" ~ e.msg ~ "]";
 }
 
@@ -413,7 +414,7 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 if (auto qa = queueArgs(text))
                 {
                     // `/queue` only touches the queue, so it runs at once.
-                    stdErr.writeln(console.dim(runQueueCommand(queue, qa[0 .. $ - 1])));
+                    stdErr.writeln(console.dim(runQueueCommand(queue, gControl, qa[0 .. $ - 1])));
                     break;
                 }
                 if (text.startsWith("/") && unescapePrompt(text) is null)
@@ -435,8 +436,12 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 }
                 else
                 {
-                    gControl.steer(text);
-                    stdErr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+                    // `//…` steers with a message that starts with `/`.
+                    if (auto unescaped = unescapePrompt(text)) text = unescaped;
+                    auto id = queue.reserveId();
+                    gControl.steerWithId(text, id);
+                    stdErr.writeln(console.dim(format("↪ steer #%s: %s — read at the agent's next step; "
+                        ~ "/queue remove %s to withdraw", id, text, id)));
                 }
                 break;
         }
@@ -1606,10 +1611,17 @@ int runMain(string[] args)
             stdOut.flush();
         }
         // Steers that arrived after the agent's last step run as the next prompts.
+        // One the user steered at the prompt keeps its `/queue` id.
         auto late = agent.control.takePending;
         if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);
-        if (editor !is null) foreach_reverse (t; late) held = t.text ~ held;
+        if (editor !is null)
+        {
+            // Re-escape a steer starting with `/` so it runs as a message.
+            string asLine(string text) { return text.startsWith("/") ? "/" ~ text : text; }
+            foreach (t; late) if (t.id >= 0) queue.pushWithId(t.id, asLine(t.text));
+            foreach_reverse (t; late) if (t.id < 0) held = asLine(t.text) ~ held;
+        }
         return ok;
     }
 
@@ -1810,7 +1822,7 @@ int runMain(string[] args)
                     writeln(contextReport(agent));
                     continue;
                 case "/queue":
-                    writeln(runQueueCommand(queue, arg));
+                    writeln(runQueueCommand(queue, null, arg));
                     continue;
                 case "/plan":
                     writeln(planText(agent));
