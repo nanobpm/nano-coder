@@ -104,29 +104,29 @@ JSONValue responsesBody(const ref ChatRequest req, const ref ResolvedProvider p,
 }
 
 /// Text of a content-part list (refusals skipped).
-private string partsText(const JSONValue content) @trusted
+private string partsText(const JSONValue content)
 {
     string s;
     if (content.type == JSONType.array)
-        foreach (ref part; content.array)
+        foreach (ref part; content.arrayNoRef)
             if (typeOf(part) != "refusal") s ~= strOf(part, "text");
     return s;
 }
 
-private string reasoningText(const JSONValue item) @trusted
+private string reasoningText(const JSONValue item)
 {
     string s;
     foreach (key; ["summary", "content"])
-        if (auto v = key in item.object) s ~= partsText(*v);
+        if (auto v = key in item.objectNoRef) s ~= partsText(*v);
     return s;
 }
 
 /// `incomplete` surfaces its nested reason (e.g. `max_output_tokens`).
-private string stopReason(const JSONValue response) @trusted
+private string stopReason(const JSONValue response)
 {
     auto status = strOf(response, "status");
     if (status == "incomplete")
-        if (auto d = "incomplete_details" in response.object)
+        if (auto d = "incomplete_details" in response.objectNoRef)
         {
             auto r = strOf(*d, "reason");
             if (r.length) return r;
@@ -134,14 +134,14 @@ private string stopReason(const JSONValue response) @trusted
     return status;
 }
 
-private void readUsage(const JSONValue u, ref TokenUsage usage) @trusted
+private void readUsage(const JSONValue u, ref TokenUsage usage)
 {
     if (u.type != JSONType.object) return;
-    if (auto v = "input_tokens" in u.object) if (v.type == JSONType.integer) usage.inputTokens = v.integer;
-    if (auto v = "output_tokens" in u.object) if (v.type == JSONType.integer) usage.outputTokens = v.integer;
-    if (auto d = "input_tokens_details" in u.object)
+    if (auto v = "input_tokens" in u.objectNoRef) if (v.type == JSONType.integer) usage.inputTokens = v.integer;
+    if (auto v = "output_tokens" in u.objectNoRef) if (v.type == JSONType.integer) usage.outputTokens = v.integer;
+    if (auto d = "input_tokens_details" in u.objectNoRef)
         if (d.type == JSONType.object)
-            if (auto v = "cached_tokens" in d.object) if (v.type == JSONType.integer) usage.cachedInputTokens = v.integer;
+            if (auto v = "cached_tokens" in d.objectNoRef) if (v.type == JSONType.integer) usage.cachedInputTokens = v.integer;
 }
 
 private ToolCall callFrom(const JSONValue item, string raw)
@@ -154,14 +154,14 @@ private ToolCall callFrom(const JSONValue item, string raw)
 }
 
 /// Parse a whole (non-streamed) Responses payload.
-LLMResponse parseResponses(JSONValue v, bool replay) @trusted
+LLMResponse parseResponses(JSONValue v, bool replay)
 {
     if (strOf(v, "status") == "failed")
         throw new Exception("response failed: " ~ ("error" in v ? v["error"].toString : v.toString));
     auto output = "output" in v;
     if (output is null || output.type != JSONType.array) throw new Exception("response has no output: " ~ v.toString);
     LLMResponse r;
-    foreach (item; output.array)
+    foreach (item; output.arrayNoRef)
         switch (typeOf(item))
         {
             case "message":
@@ -260,7 +260,7 @@ struct ResponsesStream
     }
 }
 
-@trusted unittest
+ unittest
 {
     import nano.config : ProviderKind;
     ResolvedProvider p;
@@ -280,7 +280,7 @@ struct ResponsesStream
     req.thinking.level = "high";
     auto b = responsesBody(req, p, true);
     assert(b["instructions"].str == "sys");
-    auto input = b["input"].array;
+    auto input = b["input"].arrayNoRef;
     assert(input.length == 4);
     assert(input[0]["role"].str == "user" && input[1]["type"].str == "reasoning");
     assert(input[2]["type"].str == "function_call" && input[2]["id"].str == "fc_1" && input[2]["call_id"].str == "call_1");
@@ -294,7 +294,7 @@ struct ResponsesStream
     p.model = "o4-mini";
     req.thinking.kind = thinking.Request.Kind.off;
     auto b2 = responsesBody(req, p, false);
-    assert(b2["input"].array.length == 3 && "include" !in b2 && "stream" !in b2);
+    assert(b2["input"].arrayNoRef.length == 3 && "include" !in b2 && "stream" !in b2);
     assert(b2["temperature"].floating == 0.3 && b2["reasoning"]["effort"].str == "none");
 }
 

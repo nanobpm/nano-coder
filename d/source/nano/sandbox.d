@@ -78,12 +78,12 @@ struct SandboxConfig
     bool toolCaches = true;
 
     /// From the `[sandbox]` table; throws on a bad mode or type.
-    static SandboxConfig fromJSON(JSONValue v) @trusted
+    static SandboxConfig fromJSON(JSONValue v)
     {
         SandboxConfig c;
         if (v.type != JSONType.object) return c;
         if (auto x = "mode" in v) c.mode = parseMode(x.str);
-        if (auto x = "writable" in v) foreach (w; x.array) c.writable ~= w.str;
+        if (auto x = "writable" in v) foreach (w; x.arrayNoRef) c.writable ~= w.str;
         if (auto x = "network" in v) c.network = x.boolean;
         if (auto x = "tool_caches" in v) c.toolCaches = x.boolean;
         return c;

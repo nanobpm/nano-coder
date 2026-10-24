@@ -238,7 +238,7 @@ class SessionLog
     ulong append(const ref Message m)
     {
         auto j = messageRecord(m);
-        if ("log_line" in j) () @trusted { j.object.remove("log_line"); }(); // a direct record's ID is its line
+        if ("log_line" in j) j.objectNoRef.remove("log_line"); // a direct record's ID is its line
         write_(record("message", j));
         return lines;
     }
@@ -523,14 +523,14 @@ unittest
     assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
 }
 
-@trusted unittest
+ unittest
 {
     // Malformed arguments and Responses item ids round-trip in Rust's shape.
     auto m = Message.assistant("", [ToolCall.fromRaw("c1", "bash", "{oops")]);
     m.toolCalls[0].itemId = "fc_1";
     auto rec = messageRecord(m);
     auto call = rec["tool_calls"][0];
-    assert(call["arguments"].object.length == 0 && call["malformed_arguments"].str == "{oops" && call["item_id"].str == "fc_1");
+    assert(call["arguments"].objectNoRef.length == 0 && call["malformed_arguments"].str == "{oops" && call["item_id"].str == "fc_1");
     auto back = messageFromRecord(rec);
     assert(back.toolCalls[0].invalidArguments == "{oops" && back.toolCalls[0].itemId == "fc_1");
     auto legacy = messageFromRecord(parseJSON(`{"role":"assistant","content":"","tool_calls":[{"id":"c","name":"bash","arguments":"{bad"}]}`));

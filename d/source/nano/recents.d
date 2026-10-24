@@ -82,7 +82,7 @@ string defaultPath()
     return buildPath(appDataDir(), "recent-models.json");
 }
 
-Recents load(string path) @trusted
+Recents load(string path)
 {
     import std.file : readText;
     Recents r;
@@ -99,7 +99,7 @@ Recents load(string path) @trusted
         if (auto ms = "models" in j)
         {
             if (ms.type != JSONType.array) return Recents.init;
-            foreach (m; ms.array)
+            foreach (m; ms.arrayNoRef)
             {
                 if (m.type != JSONType.string) return Recents.init;
                 r.models ~= m.str;

@@ -247,13 +247,13 @@ struct Attachment
         return j;
     }
 
-    static Attachment fromJSON(const JSONValue j) @trusted
+    static Attachment fromJSON(const JSONValue j)
     {
         Attachment a;
-        string s(string k) { auto p = k in j.object; return p && p.type == JSONType.string ? p.str : null; }
+        string s(string k) { auto p = k in j.objectNoRef; return p && p.type == JSONType.string ? p.str : null; }
         ulong n(string k)
         {
-            auto p = k in j.object;
+            auto p = k in j.objectNoRef;
             if (p is null) return 0;
             if (p.type == JSONType.uinteger) return p.uinteger;
             if (p.type == JSONType.integer && p.integer > 0) return p.integer;

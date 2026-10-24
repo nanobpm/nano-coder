@@ -594,30 +594,30 @@ unittest
 
 /// The `/models` entry for `model`; a server listing a single model (such
 /// as ds4, which accepts aliases) is taken to be serving it.
-JSONValue modelEntry(JSONValue models, string model) @trusted
+JSONValue modelEntry(JSONValue models, string model)
 {
     JSONValue items = models;
     if (models.type == JSONType.object)
     {
-        auto d = "data" in models.object;
+        auto d = "data" in models.objectNoRef;
         if (d is null) return JSONValue.init;
         items = *d;
     }
     if (items.type != JSONType.array) return JSONValue.init;
-    foreach (m; items.array)
+    foreach (m; items.arrayNoRef)
         if (m.type == JSONType.object)
-            if (auto id = "id" in m.object)
+            if (auto id = "id" in m.objectNoRef)
                 if (id.type == JSONType.string && id.str == model) return m;
-    return items.array.length == 1 ? items.array[0] : JSONValue.init;
+    return items.arrayNoRef.length == 1 ? items.arrayNoRef[0] : JSONValue.init;
 }
 
 /// A positive integer at `path`, else 0.
-size_t tokensAt(JSONValue v, string[] path) @trusted
+size_t tokensAt(JSONValue v, string[] path)
 {
     foreach (k; path)
     {
         if (v.type != JSONType.object) return 0;
-        auto n = k in v.object;
+        auto n = k in v.objectNoRef;
         if (n is null) return 0;
         v = *n;
     }
@@ -673,21 +673,21 @@ void copilotWindow(JSONValue entry, ref Capabilities c)
 
 /// Ollama: the loaded model's context from `/api/ps`, else `num_ctx` from
 /// the model's parameters (the model's maximum is not what Ollama runs with).
-void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c) @trusted
+void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c)
 {
     import std.string : lineSplitter, strip;
     import std.algorithm : startsWith;
     import std.conv : to;
     bool same(string n) { return n == model || n == model ~ ":latest"; }
     if (ps.type == JSONType.object)
-        if (auto ms = "models" in ps.object)
+        if (auto ms = "models" in ps.objectNoRef)
             if (ms.type == JSONType.array)
-                foreach (m; ms.array)
+                foreach (m; ms.arrayNoRef)
                 {
                     bool hit;
                     foreach (k; ["name", "model"])
                         if (m.type == JSONType.object)
-                            if (auto v = k in m.object) if (v.type == JSONType.string && same(v.str)) hit = true;
+                            if (auto v = k in m.objectNoRef) if (v.type == JSONType.string && same(v.str)) hit = true;
                     if (!hit) continue;
                     if (auto n = tokensAt(m, ["context_length"]))
                     {
@@ -698,7 +698,7 @@ void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c
                     break;
                 }
     if (show.type != JSONType.object) return;
-    auto params = "parameters" in show.object;
+    auto params = "parameters" in show.objectNoRef;
     if (params is null || params.type != JSONType.string) return;
     foreach (line; params.str.lineSplitter)
     {

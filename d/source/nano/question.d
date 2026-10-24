@@ -64,7 +64,7 @@ string sanitizeLine(string s) @safe
 }
 
 /// Parse the tool's arguments, tolerating a JSON-string body.
-Question[] parse(JSONValue args) @trusted
+Question[] parse(JSONValue args)
 {
     if (args.type == JSONType.string)
     {
@@ -73,8 +73,8 @@ Question[] parse(JSONValue args) @trusted
     }
     JSONValue[] list;
     if (args.type == JSONType.object)
-        if (auto q = "questions" in args.object)
-            if (q.type == JSONType.array) list = q.array;
+        if (auto q = "questions" in args.objectNoRef)
+            if (q.type == JSONType.array) list = q.arrayNoRef;
     if (!list.length) throw new QuestionError("question needs a non-empty `questions` array");
     Question[] out_;
     foreach (item; list)
@@ -83,7 +83,7 @@ Question[] parse(JSONValue args) @trusted
         Question q;
         string str(string key, bool required)
         {
-            auto v = key in item.object;
+            auto v = key in item.objectNoRef;
             if (v is null)
             {
                 if (required) throw new QuestionError("missing field `" ~ key ~ "`");
@@ -94,20 +94,20 @@ Question[] parse(JSONValue args) @trusted
         }
         q.question = str("question", true);
         q.header = str("header", false);
-        if (auto c = "custom" in item.object)
+        if (auto c = "custom" in item.objectNoRef)
         {
             if (c.type == JSONType.true_) q.custom = true;
             else if (c.type == JSONType.false_) q.custom = false;
             else throw new QuestionError("invalid type for `custom`: expected a boolean");
         }
-        if (auto opts = "options" in item.object)
+        if (auto opts = "options" in item.objectNoRef)
         {
             if (opts.type != JSONType.array) throw new QuestionError("invalid type for `options`: expected a sequence");
-            foreach (o; opts.array)
+            foreach (o; opts.arrayNoRef)
             {
-                auto l = o.type == JSONType.object ? "label" in o.object : null;
+                auto l = o.type == JSONType.object ? "label" in o.objectNoRef : null;
                 if (l is null || l.type != JSONType.string) throw new QuestionError("missing field `label`");
-                auto d = "description" in o.object;
+                auto d = "description" in o.objectNoRef;
                 q.options ~= QuestionOption(l.str, d && d.type == JSONType.string ? d.str : null);
             }
         }

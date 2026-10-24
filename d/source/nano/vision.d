@@ -30,7 +30,7 @@ struct Vision
         return ImageLimits(MAX_DIMENSION, maxImageBytes, mediaTypes.dup);
     }
 
-    static Nullable!Vision fromModelEntry(const JSONValue entry) @trusted
+    static Nullable!Vision fromModelEntry(const JSONValue entry)
     {
         Nullable!Vision none;
         auto caps = objGet(entry, "capabilities");
@@ -54,16 +54,16 @@ struct Vision
                     out_.maxImageBytes = cast(size_t) m.integer;
             if (auto m = objGet(*lv, "supported_media_types"))
                 if (m.type == JSONType.array)
-                    foreach (t; m.array) if (t.type == JSONType.string) out_.mediaTypes ~= t.str;
+                    foreach (t; m.arrayNoRef) if (t.type == JSONType.string) out_.mediaTypes ~= t.str;
         }
         return Nullable!Vision(out_);
     }
 
-    static Nullable!Vision fromOllamaShow(const JSONValue show) @trusted
+    static Nullable!Vision fromOllamaShow(const JSONValue show)
     {
         auto caps = objGet(show, "capabilities");
         if (caps !is null && caps.type == JSONType.array)
-            foreach (c; caps.array) if (c.type == JSONType.string && c.str == "vision") return Nullable!Vision(capable);
+            foreach (c; caps.arrayNoRef) if (c.type == JSONType.string && c.str == "vision") return Nullable!Vision(capable);
         return Nullable!Vision.init;
     }
 

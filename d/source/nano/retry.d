@@ -18,18 +18,18 @@ struct ErrorInfo
     string code, kind, message;
 
     /// `{"error":{"code","type","message"}}` or `{"type":"error","error":{...}}`.
-    static ErrorInfo fromBody(int status, string body_) @trusted
+    static ErrorInfo fromBody(int status, string body_)
     {
         ErrorInfo e;
         e.status = status;
         JSONValue j;
         try j = parseJSON(body_);
         catch (Exception) {}
-        JSONValue* err = j.type == JSONType.object ? "error" in j.object : null;
+        JSONValue* err = j.type == JSONType.object ? "error" in j.objectNoRef : null;
         string field(string name)
         {
             if (err is null || err.type != JSONType.object) return null;
-            auto v = name in err.object;
+            auto v = name in err.objectNoRef;
             if (v is null) return null;
             if (v.type == JSONType.string) return v.str;
             if (v.type == JSONType.integer || v.type == JSONType.uinteger || v.type == JSONType.float_) return v.toString;

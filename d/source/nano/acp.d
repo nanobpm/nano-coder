@@ -176,13 +176,13 @@ struct Host
 }
 
 /// Input id for idempotent prompts: `messageId`, or `_meta.inputId`.
-string inputId(JSONValue params) @trusted
+string inputId(JSONValue params)
 {
     if (params.type != JSONType.object) return null;
-    auto v = "messageId" in params.object;
+    auto v = "messageId" in params.objectNoRef;
     if (v is null)
-        if (auto m = "_meta" in params.object)
-            if (m.type == JSONType.object) v = "inputId" in m.object;
+        if (auto m = "_meta" in params.objectNoRef)
+            if (m.type == JSONType.object) v = "inputId" in m.objectNoRef;
     return v !is null && v.type == JSONType.string && v.str.length ? v.str : null;
 }
 

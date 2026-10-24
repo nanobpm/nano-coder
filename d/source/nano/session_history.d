@@ -126,9 +126,9 @@ private string searchable(const ref Message m)
     return text;
 }
 
-private ulong idArg(JSONValue args, string key, bool required) @trusted
+private ulong idArg(JSONValue args, string key, bool required)
 {
-    auto v = args.type == JSONType.object ? key in args.object : null;
+    auto v = args.type == JSONType.object ? key in args.objectNoRef : null;
     if (v is null || v.type == JSONType.null_)
     {
         if (required) throw new HistoryError(key ~ " is required");
@@ -268,12 +268,12 @@ string search(string path, JSONValue args) @trusted
 }
 
 /// `history_read`: one message in full, bounded (the whole is spilled to a file).
-string read(string path, JSONValue args) @trusted
+string read(string path, JSONValue args)
 {
     import nano.tools : truncateOutput, defaultMaxOutput, maxOutputLimit;
     auto id = idArg(args, "id", true);
     size_t limit = defaultMaxOutput;
-    if (auto l = "max_output_length" in args.object)
+    if (auto l = "max_output_length" in args.objectNoRef)
     {
         long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : -1;
         if (n <= 0) throw new HistoryError("max_output_length must be a positive integer");

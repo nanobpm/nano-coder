@@ -132,7 +132,7 @@ struct Reminders
     /// a call whose argument JSON never decoded) replaces the decoded `args`
     /// in the fingerprint; `attachments` are image content hashes.
     RepeatVerdict afterRepeatCall(string tool, JSONValue args, string rawArgs, bool ok, string result,
-            const string[] attachments = null) @trusted
+            const string[] attachments = null)
     {
         if (repeatExemptTools.canFind(tool))
         {
@@ -142,7 +142,7 @@ struct Reminders
         auto key = fingerprint(tool, args, rawArgs, ok, result, attachments);
         string cmd;
         if (tool == "bash" && args.type == JSONType.object)
-            if (auto c = "command" in args.object)
+            if (auto c = "command" in args.objectNoRef)
                 if (c.type == JSONType.string) cmd = c.str;
         bool sameCmd = (repeatCmd is null && cmd is null)
             || (repeatCmd !is null && cmd !is null && isDiagnosticExtension(repeatCmd, cmd));
@@ -203,14 +203,14 @@ immutable string[] diagnosticStages = ["wc", "head", "tail", "cat", "tac", "sort
 
 /// The argument text a repeat match is based on: for bash, the command with
 /// its trailing read-only diagnostic stages stripped plus the other arguments.
-string normalisedArgs(string tool, JSONValue args) @trusted
+string normalisedArgs(string tool, JSONValue args)
 {
     if (tool == "bash" && args.type == JSONType.object)
-        if (auto c = "command" in args.object)
+        if (auto c = "command" in args.objectNoRef)
             if (c.type == JSONType.string)
             {
                 JSONValue[string] rest;
-                foreach (k, v; args.object) if (k != "command") rest[k] = v;
+                foreach (k, v; args.objectNoRef) if (k != "command") rest[k] = v;
                 return pipelineKey(c.str) ~ "|" ~ JSONValue(rest).toString;
             }
     return args.toString;

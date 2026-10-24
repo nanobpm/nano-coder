@@ -354,7 +354,7 @@ string str(const JSONValue j, string key, string dflt)
     return dflt;
 }
 
-void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string prevTs, string rawLine = null) @trusted
+void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string prevTs, string rawLine = null)
 {
     auto first = turn.rows.length;
     auto role = m["role"].str;
@@ -400,7 +400,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
                 if (blocks.type == JSONType.array)
                 {
                     string[] parts;
-                    foreach (b; blocks.array)
+                    foreach (b; blocks.arrayNoRef)
                         if (b.type == JSONType.object)
                             if (auto th = "thinking" in b)
                                 if (th.type == JSONType.string) parts ~= th.str;
@@ -417,7 +417,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
             turn.rows ~= r;
         }
         const(JSONValue)[] calls;
-        if (auto c = "tool_calls" in m) if (c.type == JSONType.array) calls = c.array;
+        if (auto c = "tool_calls" in m) if (c.type == JSONType.array) calls = c.arrayNoRef;
         Row a;
         a.kind = Kind.assistant;
         a.text = !content.length && calls.length
@@ -454,7 +454,7 @@ void appendMessageRows(ref Turn turn, const JSONValue m, ulong line, ref string 
         auto text = content;
         if (auto atts = "attachments" in m)
             if (atts.type == JSONType.array)
-                foreach (at; atts.array)
+                foreach (at; atts.arrayNoRef)
                     if (at.type == JSONType.object)
                     {
                         if (text.length) text ~= "\n";
@@ -490,16 +490,16 @@ long millisBetween(string a, string b)
     catch (Exception) return -1;
 }
 
-string compactText(const JSONValue data, string mode, string model) @trusted
+string compactText(const JSONValue data, string mode, string model)
 {
     string[] parts;
     if (mode !is null) parts ~= "mode: " ~ mode;
     if (model !is null) parts ~= "model: " ~ model;
     if (auto s = "summarized" in data)
-        if (s.type == JSONType.array && s.array.length == 2)
-            parts ~= format("folded log lines %s–%s", s.array[0].toString, s.array[1].toString);
+        if (s.type == JSONType.array && s.arrayNoRef.length == 2)
+            parts ~= format("folded log lines %s–%s", s.arrayNoRef[0].toString, s.arrayNoRef[1].toString);
     size_t n;
-    if (auto ms = "messages" in data) if (ms.type == JSONType.array) n = ms.array.length;
+    if (auto ms = "messages" in data) if (ms.type == JSONType.array) n = ms.arrayNoRef.length;
     parts ~= format("%s message(s) retained", n);
     return parts.join(", ");
 }

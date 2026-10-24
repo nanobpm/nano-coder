@@ -232,17 +232,17 @@ struct Policy
     SandboxConfig sandbox;
 
     /// Build from the `[permissions]` table; throws RuleError on a bad rule.
-    static Policy fromConfig(JSONValue section) @trusted
+    static Policy fromConfig(JSONValue section)
     {
         Policy p;
         if (section.type != JSONType.object) return p;
-        if (auto v = "allow" in section) foreach (r; v.array) p.allow ~= parseRule(r.str);
-        if (auto v = "deny" in section) foreach (r; v.array) p.deny ~= parseRule(r.str);
+        if (auto v = "allow" in section) foreach (r; v.arrayNoRef) p.allow ~= parseRule(r.str);
+        if (auto v = "deny" in section) foreach (r; v.arrayNoRef) p.deny ~= parseRule(r.str);
         if (auto v = "builtin_rules" in section) p.builtinRules = v.boolean;
         if (auto v = "protected_branches" in section)
         {
             p.protectedBranches = null;
-            foreach (b; v.array) p.protectedBranches ~= b.str;
+            foreach (b; v.arrayNoRef) p.protectedBranches ~= b.str;
         }
         return p;
     }

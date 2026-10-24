@@ -249,7 +249,7 @@ struct Reported
     Format format;
 
     /// Copilot-style `/models` entry: `capabilities.supports.reasoning_effort`.
-    static Nullable!Reported fromModelEntry(const JSONValue entry) @trusted
+    static Nullable!Reported fromModelEntry(const JSONValue entry)
     {
         Nullable!Reported none;
         auto caps = objGet(entry, "capabilities");
@@ -258,7 +258,7 @@ struct Reported
         auto effort = objGet(*supports, "reasoning_effort");
         if (effort is null || effort.type != JSONType.array) return none;
         string[] levels;
-        foreach (l; effort.array)
+        foreach (l; effort.arrayNoRef)
         {
             if (l.type != JSONType.string) continue;
             auto s = l.str.strip.toLower;
@@ -272,11 +272,11 @@ struct Reported
     }
 
     /// Ollama `/api/show`: the `thinking` capability takes `reasoning_effort`.
-    static Nullable!Reported fromOllamaShow(const JSONValue show) @trusted
+    static Nullable!Reported fromOllamaShow(const JSONValue show)
     {
         auto caps = objGet(show, "capabilities");
         if (caps !is null && caps.type == JSONType.array)
-            foreach (c; caps.array)
+            foreach (c; caps.arrayNoRef)
                 if (c.type == JSONType.string && c.str == "thinking")
                     return Nullable!Reported(Reported(["off", "low", "medium", "high"], false, Format.effort));
         return Nullable!Reported.init;

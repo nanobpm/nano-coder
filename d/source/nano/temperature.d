@@ -78,7 +78,7 @@ string fixedReason(ProviderKind kind, const ref ProviderConfig provider, string 
 /// The temperature for `model` on `provider`: the model's, else the
 /// provider's, else `global` (NaN = default); then `extra_body`, the fixed
 /// rules, and Anthropic's 0..1 clamp.
-Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig provider, string model) @trusted
+Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig provider, string model)
 {
     double chosen;
     Source source;
@@ -89,7 +89,7 @@ Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig prov
     double effective = chosen;
     string ebWarning;
     if (provider.extraBody.type == JSONType.object)
-        if (auto v = "temperature" in provider.extraBody.object)
+        if (auto v = "temperature" in provider.extraBody.objectNoRef)
         {
             double t = double.nan;
             bool num = true;

@@ -51,21 +51,21 @@ struct Outcome
     string summary;
 
     /// Parse the tool's arguments, tolerating arguments sent as a JSON string.
-    static Outcome fromArgs(JSONValue args) @trusted
+    static Outcome fromArgs(JSONValue args)
     {
         if (args.type == JSONType.string)
         {
             try args = parseJSON(args.str);
             catch (Exception) args = JSONValue(null);
         }
-        auto st = args.type == JSONType.object ? "status" in args.object : null;
+        auto st = args.type == JSONType.object ? "status" in args.objectNoRef : null;
         if (st is null || st.type != JSONType.string)
             throw new OutcomeError(`report_outcome needs ` ~ "`status`" ~ `: "completed", "blocked" or "needs_input"`);
         Outcome o;
         if (!parseStatus(st.str, o.status))
             throw new OutcomeError(format!`report_outcome %sstatus%s must be "completed", "blocked" or "needs_input", got %s`(
                 "`", "`", JSONValue(st.str).toString));
-        auto sm = "summary" in args.object;
+        auto sm = "summary" in args.objectNoRef;
         o.summary = sm !is null && sm.type == JSONType.string ? sm.str.strip : "";
         if (!o.summary.length) throw new OutcomeError("report_outcome needs a `summary`");
         return o;

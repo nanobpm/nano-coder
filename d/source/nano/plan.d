@@ -175,7 +175,7 @@ struct Plan
         }
     }
 
-    private Outcome add(JSONValue args) @trusted
+    private Outcome add(JSONValue args)
     {
         auto plan = dup();
         string[] summary;
@@ -189,7 +189,7 @@ struct Plan
         if (auto v = field(args, "items"))
         {
             auto d = decoded(*v);
-            if (d.type == JSONType.array) list = d.array;
+            if (d.type == JSONType.array) list = d.arrayNoRef;
             else if (d.type != JSONType.null_) list = [d];
         }
         if (!list.length && !summary.length)
@@ -228,7 +228,7 @@ struct Plan
         return outcome(summary.join(", "));
     }
 
-    private Outcome update(JSONValue args) @trusted
+    private Outcome update(JSONValue args)
     {
         JSONValue[] updates;
         auto u = field(args, "updates");
@@ -236,7 +236,7 @@ struct Plan
         else
         {
             auto d = decoded(*u);
-            if (d.type == JSONType.array) updates = d.array;
+            if (d.type == JSONType.array) updates = d.arrayNoRef;
             else if (d.type == JSONType.null_) updates = [args];
             else updates = [d];
         }
@@ -368,14 +368,14 @@ struct Plan
 
     /// Accept a plan from a client or a session log: this harness's own shape
     /// (`{goal, items}`) or bare ACP entries.
-    static Plan fromJSON(JSONValue v) @trusted
+    static Plan fromJSON(JSONValue v)
     {
         Plan plan;
         if (v.type == JSONType.object && "items" in v)
         {
             if (auto g = field(v, "goal")) if (g.type == JSONType.string) plan.goal = g.str;
             if (v["items"].type != JSONType.array) throw new PlanError("plan must be {goal, items: [{id, title, status}]}");
-            foreach (it; v["items"].array)
+            foreach (it; v["items"].arrayNoRef)
             {
                 PlanItem p;
                 auto idv = field(it, "id");
@@ -389,7 +389,7 @@ struct Plan
                 p.id = cast(uint) raw;
                 p.title = t.str;
                 p.status = parseStatus(s.str);
-                if (auto n = field(it, "notes")) if (n.type == JSONType.array) foreach (x; n.array) p.notes ~= x.str;
+                if (auto n = field(it, "notes")) if (n.type == JSONType.array) foreach (x; n.arrayNoRef) p.notes ~= x.str;
                 if (auto a = field(it, "after")) p.after = idsOf(*a);
                 plan.items ~= p;
             }
@@ -399,7 +399,7 @@ struct Plan
         JSONValue entries = v;
         if (v.type == JSONType.object && "entries" in v) entries = v["entries"];
         if (entries.type != JSONType.array) throw new PlanError("plan must be {goal, items} or a list of ACP plan entries");
-        foreach (index, e; entries.array)
+        foreach (index, e; entries.arrayNoRef)
         {
             string title;
             if (auto c = field(e, "content")) { if (c.type == JSONType.string) title = c.str; }
@@ -468,10 +468,10 @@ private bool idOf(const JSONValue v, out uint id)
     return false;
 }
 
-private uint[] idsOf(const JSONValue v) @trusted
+private uint[] idsOf(const JSONValue v)
 {
     const(JSONValue)[] list;
-    if (v.type == JSONType.array) list = v.array;
+    if (v.type == JSONType.array) list = v.arrayNoRef;
     else if (v.type != JSONType.null_) list = [v];
     uint[] out_;
     foreach (x; list)

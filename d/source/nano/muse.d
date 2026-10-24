@@ -395,12 +395,12 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
 // ---- Catalog rows (`GET {mint}/muse-code/models`) ----
 
 /// Rows of a catalog reply: a bare array, or one under `data`/`models`/`rows`.
-const(JSONValue)[] catalogRows(const JSONValue v) @trusted
+const(JSONValue)[] catalogRows(const JSONValue v)
 {
     if (v.type == JSONType.object)
         foreach (k; ["data", "models", "rows"])
-            if (auto rows = k in v) if (rows.type == JSONType.array) return rows.array;
-    return v.type == JSONType.array ? v.array : null;
+            if (auto rows = k in v) if (rows.type == JSONType.array) return rows.arrayNoRef;
+    return v.type == JSONType.array ? v.arrayNoRef : null;
 }
 
 string modelId(const JSONValue row)
@@ -468,14 +468,14 @@ long outputLimit(const JSONValue row)
 
 /// Reasoning tiers: `reasoning_effort_variants` (`[{tier}]`, `[{effort}]` or
 /// strings), else a flat `reasoning_effort` list; `none` reads as `off`.
-string[] effortLevels(const JSONValue row) @trusted
+string[] effortLevels(const JSONValue row)
 {
     if (row.type != JSONType.object) return null;
     const(JSONValue)[] raw;
     bool found;
     foreach (k; ["reasoning_effort_variants", "reasoningEffortVariants", "reasoning_effort", "reasoningEffort"])
         if (auto v = k in row)
-            if (v.type == JSONType.array) { raw = v.array; found = true; break; }
+            if (v.type == JSONType.array) { raw = v.arrayNoRef; found = true; break; }
     if (!found) return null;
     string[] levels;
     foreach (v; raw)
