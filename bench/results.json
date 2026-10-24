@@ -1,17 +1,17 @@
 {
-  "commit": "3e45293",
+  "commit": "3cf29d3",
   "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
   "ldc2": "LDC - the LLVM D compiler (1.43.0):",
   "machine": "Apple M4 Pro",
   "build": {
-    "rust_clean_release_s": 63.20977079193108,
-    "rust_touch_one_file_release_s": 44.18549950001761,
-    "rust_clean_debug_s": 27.06483033299446,
-    "rust_touch_one_file_debug_s": 2.1537533341906965,
-    "d_clean_debug_s": 4.833995791850612,
-    "d_touch_one_file_debug_s": 3.8574986669700593,
-    "d_clean_release_s": 12.321900541894138,
-    "d_touch_one_file_release_s": 12.193446916062385
+    "rust_clean_release_s": 103.48109804200067,
+    "rust_touch_one_file_release_s": 68.60351912500482,
+    "rust_clean_debug_s": 41.972148041000764,
+    "rust_touch_one_file_debug_s": 3.9594338339957176,
+    "d_clean_debug_s": 8.94710429100087,
+    "d_touch_one_file_debug_s": 7.065060582994192,
+    "d_clean_release_s": 21.396059708000394,
+    "d_touch_one_file_release_s": 16.272407582997403
   },
   "size": {
     "rust_binary_bytes": 5989776,
@@ -23,8 +23,8 @@
       "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
       "/usr/lib/libSystem.B.dylib"
     ],
-    "d_binary_bytes": 4278816,
-    "d_stripped_bytes": 3324080,
+    "d_binary_bytes": 4427600,
+    "d_stripped_bytes": 3440000,
     "d_linked_libs": [
       "/usr/lib/libcurl.4.dylib",
       "/usr/lib/libSystem.B.dylib",
@@ -34,58 +34,58 @@
   "runtime": {
     "rust": {
       "real_s": {
-        "median": 0.06,
-        "min": 0.06,
-        "max": 0.06
+        "median": 0.07,
+        "min": 0.07,
+        "max": 0.1
       },
       "max_rss_bytes": {
-        "median": 14155776.0,
-        "min": 14073856.0,
-        "max": 14188544.0
+        "median": 14295040.0,
+        "min": 14008320.0,
+        "max": 14385152.0
       },
       "peak_footprint_bytes": {
-        "median": 5333448.0,
-        "min": 5259744.0,
-        "max": 5374432.0
+        "median": 5472724.0,
+        "min": 5194208.0,
+        "max": 5554632.0
       },
       "instructions": {
-        "median": 131639278.0,
-        "min": 131097136.0,
-        "max": 132133894.0
+        "median": 134488436.5,
+        "min": 133341878.0,
+        "max": 137453966.0
       },
       "startup_exit": {
         "real_s": 0.03,
-        "max_rss_bytes": 12025856.0,
-        "peak_footprint_bytes": 3719600.0,
-        "instructions": 58194700.0
+        "max_rss_bytes": 12107776.0,
+        "peak_footprint_bytes": 3817928.0,
+        "instructions": 59007096.0
       }
     },
     "d": {
       "real_s": {
-        "median": 0.06,
-        "min": 0.05,
+        "median": 0.07,
+        "min": 0.07,
         "max": 0.07
       },
       "max_rss_bytes": {
-        "median": 12500992.0,
-        "min": 12435456.0,
-        "max": 12533760.0
+        "median": 12738560.0,
+        "min": 12697600.0,
+        "max": 12795904.0
       },
       "peak_footprint_bytes": {
-        "median": 4243960.0,
-        "min": 4178424.0,
-        "max": 4276728.0
+        "median": 4415968.0,
+        "min": 4375008.0,
+        "max": 4489720.0
       },
       "instructions": {
-        "median": 92186555.5,
-        "min": 91926038.0,
-        "max": 92340200.0
+        "median": 93877201.5,
+        "min": 93766119.0,
+        "max": 95071971.0
       },
       "startup_exit": {
-        "real_s": 0.03,
-        "max_rss_bytes": 10780672.0,
-        "peak_footprint_bytes": 2916856.0,
-        "instructions": 50248700.0
+        "real_s": 0.04,
+        "max_rss_bytes": 10878976.0,
+        "peak_footprint_bytes": 2982368.0,
+        "instructions": 51311174.0
       }
     }
   }
