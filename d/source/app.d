@@ -31,7 +31,7 @@ import nano.toml : parseToml;
 import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
-import nano.question : QuestionBroker, Question, Answer, sanitizeLine, questionDefinition = definition;
+import nano.question : QuestionBroker, Question, Answer, Answered, Dismissed, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
 import nano.settings_dialog : SettingsUi, SettingsHost, runSettings, pickModel, onVerbosity;
@@ -400,16 +400,16 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
             labels ~= "Type your own answer";
         }
         auto at = editor.select(sanitizeLine(q.question), labels);
-        if (at < 0) return Answer(Answer.Kind.dismissed);
+        if (at < 0) return Answer(Dismissed());
         if (at == custom)
         {
             auto r = editor.readLine("Answer: ", "\x1b[1mAnswer:\x1b[0m ");
-            if (r.outcome != Outcome.line) return Answer(Answer.Kind.dismissed);
+            if (r.outcome != Outcome.line) return Answer(Dismissed());
             answers ~= r.text;
         }
         else answers ~= q.options[at].label;
     }
-    return Answer(Answer.Kind.answers, answers);
+    return Answer(Answered(answers));
 }
 
 /// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).

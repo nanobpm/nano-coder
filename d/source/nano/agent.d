@@ -16,7 +16,8 @@ import core.thread : Thread;
 import core.time : Duration;
 static import nano.session_index;
 import nano.tools;
-import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer;
+import nano.question : QuestionError, QuestionBroker, Question, QuestionOption, Answer, Answered;
+import std.sumtype : match;
 import nano.mode : AgentMode, planAllows;
 import nano.goal : Outcome, OutcomeError, OutcomeStatus, outcomeToolName = toolName, outcomeDefinition = definition;
 import nano.reminders : Reminders, wrap;
@@ -1112,7 +1113,10 @@ class Agent
             [QuestionOption("No"), QuestionOption("Yes")]);
         q.custom = false;
         auto a = questions.ask([q]);
-        return a.kind == Answer.Kind.answers && a.answers.length && a.answers[0] == "Yes";
+        return a.match!(
+            (Answered got) => got.answers.length && got.answers[0] == "Yes",
+            _ => false,
+        );
     }
 
     /// The task plan (`plan_*` tools), kept outside the conversation.

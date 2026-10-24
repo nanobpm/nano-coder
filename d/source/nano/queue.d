@@ -9,6 +9,7 @@ module nano.queue;
 
 @safe:
 
+import std.sumtype : SumType, match;
 import std.format : format;
 import std.string : strip, indexOf;
 import std.conv : to, ConvException;
@@ -107,13 +108,19 @@ final class MessageQueue
 }
 
 /// One queue edit, parsed from a `/queue ...` command line.
-struct QueueOp
-{
-    enum Kind { list, remove, edit, clear, add }
-    Kind kind;
-    size_t[] ids; /// remove; edit uses ids[0]
-    string text;  /// edit, add
-}
+/// Each variant carries only its own fields, and `apply` must handle every
+/// one (`match` is exhaustive).
+struct ListOp {}
+/// ditto
+struct RemoveOp { size_t[] ids; }
+/// ditto
+struct EditOp { size_t id; string text; }
+/// ditto
+struct ClearOp {}
+/// ditto
+struct AddOp { string text; }
+/// ditto
+alias QueueOp = SumType!(ListOp, RemoveOp, EditOp, ClearOp, AddOp);
 
 enum usage = "usage: /queue [list] | /queue add text | /queue remove N... | /queue edit N text | /queue clear";
 
@@ -154,29 +161,29 @@ private string[2] splitOnce(string s)
 QueueOp parse(string args)
 {
     args = args.strip;
-    if (!args.length || args == "list" || args == "ls") return QueueOp(QueueOp.Kind.list);
+    if (!args.length || args == "list" || args == "ls") return QueueOp(ListOp());
     auto parts = splitOnce(args);
     auto sub = parts[0], rest = parts[1].strip;
     switch (sub)
     {
         case "add":
             if (!rest.length) throw new QueueUsage(usage);
-            return QueueOp(QueueOp.Kind.add, null, rest);
+            return QueueOp(AddOp(rest));
         case "remove", "rm", "delete":
             size_t[] ids;
             foreach (w; words(rest)) ids ~= parseId(w);
             if (!ids.length) throw new QueueUsage(usage);
-            return QueueOp(QueueOp.Kind.remove, ids);
+            return QueueOp(RemoveOp(ids));
         case "edit":
             auto p = splitOnce(rest);
             if (p[0] == rest) throw new QueueUsage(usage);
             auto id = parseId(p[0].strip);
             auto text = p[1].strip;
             if (!text.length) throw new QueueUsage(usage);
-            return QueueOp(QueueOp.Kind.edit, [id], text);
+            return QueueOp(EditOp(id, text));
         case "clear":
             if (rest.length) throw new QueueUsage(usage);
-            return QueueOp(QueueOp.Kind.clear);
+            return QueueOp(ClearOp());
         default:
             throw new QueueUsage(usage);
     }
@@ -185,25 +192,26 @@ QueueOp parse(string args)
 /// Apply an edit and say what happened.
 string apply(MessageQueue queue, const QueueOp op)
 {
-    final switch (op.kind)
-    {
-        case QueueOp.Kind.list: return describe(queue);
-        case QueueOp.Kind.remove:
-            auto removed = queue.remove(op.ids);
+    return op.match!(
+        (const ListOp _) => describe(queue),
+        (const RemoveOp r) {
+            auto removed = queue.remove(r.ids);
             return removed == 0
-                ? format!"No queued message with %s (%s)"(idsText(op.ids), summary(queue))
+                ? format!"No queued message with %s (%s)"(idsText(r.ids), summary(queue))
                 : format!"Removed %s queued message%s (%s)"(removed, plural(removed), summary(queue));
-        case QueueOp.Kind.edit:
-            return queue.edit(op.ids[0], op.text)
-                ? format!"Queue #%s updated: %s"(op.ids[0], preview(op.text, 60))
-                : format!"No queued message with id %s (%s)"(op.ids[0], summary(queue));
-        case QueueOp.Kind.add:
-            auto id = queue.push(op.text);
+        },
+        (const EditOp e) => queue.edit(e.id, e.text)
+            ? format!"Queue #%s updated: %s"(e.id, preview(e.text, 60))
+            : format!"No queued message with id %s (%s)"(e.id, summary(queue)),
+        (const AddOp a) {
+            auto id = queue.push(a.text);
             return format!"↧ queued #%s (%s) — /queue remove %s to drop"(id, summary(queue), id);
-        case QueueOp.Kind.clear:
+        },
+        (const ClearOp _) {
             auto n = queue.clear();
             return format!"Cleared %s queued message%s"(n, plural(n));
-    }
+        },
+    );
 }
 
 string describe(MessageQueue queue)
@@ -270,16 +278,15 @@ unittest // pop is FIFO and edit rewrites in place
  unittest // parse covers the subcommands
 {
     import std.exception : assertThrown;
-    assert(parse("").kind == QueueOp.Kind.list && parse("  ").kind == QueueOp.Kind.list);
-    assert(parse("list").kind == QueueOp.Kind.list && parse("ls").kind == QueueOp.Kind.list);
-    assert(parse("remove 2") == QueueOp(QueueOp.Kind.remove, [2]));
-    assert(parse("rm 2 4") == QueueOp(QueueOp.Kind.remove, [2, 4]));
-    assert(parse("delete 3") == QueueOp(QueueOp.Kind.remove, [3]));
-    assert(parse("edit 2 try this instead") == QueueOp(QueueOp.Kind.edit, [2], "try this instead"));
-    assert(parse("clear").kind == QueueOp.Kind.clear);
+    foreach (l; ["", "  ", "list", "ls"]) assert(parse(l) == QueueOp(ListOp()));
+    assert(parse("remove 2") == QueueOp(RemoveOp([2])));
+    assert(parse("rm 2 4") == QueueOp(RemoveOp([2, 4])));
+    assert(parse("delete 3") == QueueOp(RemoveOp([3])));
+    assert(parse("edit 2 try this instead") == QueueOp(EditOp(2, "try this instead")));
+    assert(parse("clear") == QueueOp(ClearOp()));
     foreach (bad; ["clear keep-this", "remove", "remove x", "edit 2", "edit 2   ", "edit x hi", "frob", "add", "add   "])
         assertThrown!QueueUsage(parse(bad), bad);
-    assert(parse("add fix the build") == QueueOp(QueueOp.Kind.add, null, "fix the build"));
+    assert(parse("add fix the build") == QueueOp(AddOp("fix the build")));
 }
 
 unittest // apply reports what happened
@@ -289,17 +296,17 @@ unittest // apply reports what happened
     q.push("alpha");
     q.push("beta");
     q.push("gamma");
-    auto listed = apply(q, QueueOp(QueueOp.Kind.list));
+    auto listed = apply(q, QueueOp(ListOp()));
     assert(listed.canFind("Queued (3):") && listed.canFind("  0  alpha") && listed.canFind("  2  gamma"), listed);
-    auto removed = apply(q, QueueOp(QueueOp.Kind.remove, [1, 9]));
+    auto removed = apply(q, QueueOp(RemoveOp([1, 9])));
     assert(removed.canFind("Removed 1 queued message") && removed.canFind("(2 queued)"), removed);
-    assert(apply(q, QueueOp(QueueOp.Kind.edit, [2], "GAMMA")).canFind("#2"));
+    assert(apply(q, QueueOp(EditOp(2, "GAMMA"))).canFind("#2"));
     assert(q.list[1].text == "GAMMA");
-    assert(apply(q, QueueOp(QueueOp.Kind.remove, [7])).canFind("No queued message with id 7"));
-    assert(apply(q, QueueOp(QueueOp.Kind.clear)).canFind("Cleared 2"));
-    assert(apply(q, QueueOp(QueueOp.Kind.list))
+    assert(apply(q, QueueOp(RemoveOp([7]))).canFind("No queued message with id 7"));
+    assert(apply(q, QueueOp(ClearOp())).canFind("Cleared 2"));
+    assert(apply(q, QueueOp(ListOp()))
         == "Queue is empty. Ctrl-Enter (or /queue add) while a turn runs queues a message; plain Enter steers.");
-    auto note = apply(q, QueueOp(QueueOp.Kind.add, null, "later"));
+    auto note = apply(q, QueueOp(AddOp("later")));
     assert(note.startsWith("↧ queued #") && note.canFind("/queue remove") && q.length == 1, note);
 }
 

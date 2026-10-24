@@ -9,15 +9,24 @@ module nano.question;
 
 @safe:
 
+import std.sumtype : SumType, match;
 import core.sync.condition : Condition;
+import std.sumtype : SumType, match;
 import core.sync.mutex : Mutex;
+import std.sumtype : SumType, match;
 import std.algorithm : canFind, filter, map;
+import std.sumtype : SumType, match;
 import std.array : array, join;
+import std.sumtype : SumType, match;
 import std.conv : to;
+import std.sumtype : SumType, match;
 import std.json;
+import std.sumtype : SumType, match;
 import std.string : strip;
+import std.sumtype : SumType, match;
 import std.uni : isControl;
 
+import std.sumtype : SumType, match;
 import nano.llm : ToolDefinition;
 
 enum toolName = "question";
@@ -41,12 +50,14 @@ struct Question
 }
 
 /// How a question resolves.
-struct Answer
-{
-    enum Kind { answers, away, dismissed }
-    Kind kind;
-    string[] answers; /// one per question
-}
+/// The user answered: one answer per question.
+struct Answered { string[] answers; }
+/// The user is away from the keyboard.
+struct Away {}
+/// The user dismissed the questions.
+struct Dismissed {}
+/// ditto
+alias Answer = SumType!(Answered, Away, Dismissed);
 
 class QuestionError : Exception
 {
@@ -122,21 +133,19 @@ Question[] parse(JSONValue args)
 /// The tool result text for an answer.
 string resultText(const Question[] questions, Answer a) @safe
 {
-    final switch (a.kind)
-    {
-        case Answer.Kind.away:
-            return "The user is away from the keyboard; make the best decision you can and continue.";
-        case Answer.Kind.dismissed:
-            return "The user dismissed this question without answering; make the best decision you can and continue.";
-        case Answer.Kind.answers:
+    return a.match!(
+        (Away _) => "The user is away from the keyboard; make the best decision you can and continue.",
+        (Dismissed _) => "The user dismissed this question without answering; make the best decision you can and continue.",
+        (Answered got) {
             string[] parts;
             foreach (i, ref q; questions)
             {
-                auto ans = i < a.answers.length && a.answers[i].length ? a.answers[i] : "Unanswered";
+                auto ans = i < got.answers.length && got.answers[i].length ? got.answers[i] : "Unanswered";
                 parts ~= "\"" ~ sanitizeLine(q.question) ~ "\"=\"" ~ sanitizeLine(ans) ~ "\"";
             }
             return "User has answered your questions: " ~ parts.join(", ") ~ ". Continue with the answers in mind.";
-    }
+        },
+    );
 }
 
 /// Shared between the blocked tool (agent thread) and the key reader.
@@ -146,7 +155,10 @@ final class QuestionBroker
     private Condition cond;
     private Question[] pending_;
     private bool waiting, resolved;
-    private Answer answer;
+    // A one-element slice, not an `Answer` field: assigning over a SumType
+    // that holds references is @system (it could retype live references),
+    // while replacing a slice is not.
+    private Answer[] answer;
     private shared bool interactive_;
 
     this()
@@ -170,7 +182,7 @@ final class QuestionBroker
         while (!resolved) waitOn(cond);
         waiting = false;
         pending_ = null;
-        return answer;
+        return answer[0];
     }
 
     /// The waiting questions, or null.
@@ -187,7 +199,7 @@ final class QuestionBroker
         lock.lock();
         scope (exit) lock.unlock();
         if (!waiting || resolved) return;
-        answer = a;
+        answer = [a];
         resolved = true;
         { import nano.safeio : signalAll; signalAll(cond); }
     }
@@ -237,9 +249,9 @@ unittest // ask_blocks_until_resolved, and sequential questions each register
         Question[] req;
         while ((req = broker.pending()) is null) Thread.sleep(1.msecs);
         assert(req[0].question == expected);
-        broker.resolve(Answer(Answer.Kind.answers, ["yes"]));
+        broker.resolve(Answer(Answered(["yes"])));
         joinThread(t);
-        assert(got.answers == ["yes"]);
+        assert(got == Answer(Answered(["yes"])));
         assert(broker.pending() is null);
     }
 }
@@ -247,12 +259,12 @@ unittest // ask_blocks_until_resolved, and sequential questions each register
  unittest // wording, and control sequences/newlines stripped
 {
     auto qs = [Question("Q")];
-    assert(resultText(qs, Answer(Answer.Kind.away)).canFind("away from the keyboard"));
-    assert(resultText(qs, Answer(Answer.Kind.dismissed)).canFind("dismissed"));
-    assert(resultText(qs, Answer(Answer.Kind.answers, ["opt"])).canFind(`"Q"="opt"`));
-    auto a = resultText([Question("pick\x1b[2Jone")], Answer(Answer.Kind.answers, ["ans\x07wer"]));
+    assert(resultText(qs, Answer(Away())).canFind("away from the keyboard"));
+    assert(resultText(qs, Answer(Dismissed())).canFind("dismissed"));
+    assert(resultText(qs, Answer(Answered(["opt"]))).canFind(`"Q"="opt"`));
+    auto a = resultText([Question("pick\x1b[2Jone")], Answer(Answered(["ans\x07wer"])));
     assert(a.canFind(`"pick[2Jone"="answer"`) && !a.canFind('\x1b') && !a.canFind('\x07'));
-    a = resultText([Question("line1\nline2")], Answer(Answer.Kind.answers, ["ans\nwer"]));
+    a = resultText([Question("line1\nline2")], Answer(Answered(["ans\nwer"])));
     assert(a.canFind(`"line1line2"="answer"`) && !a.canFind('\n'));
     assert(sanitizeLine("hi\x1b[2J\nthere") == "hi[2Jthere" && sanitizeLine("plain — label") == "plain — label");
 }
