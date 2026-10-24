@@ -14,7 +14,6 @@ import std.format : format;
 import std.string : strip, indexOf;
 import std.conv : to, ConvException;
 import std.array : join, split, replicate;
-import core.sync.mutex : Mutex;
 
 struct QueuedMessage
 {
@@ -22,51 +21,49 @@ struct QueuedMessage
     string text;
 }
 
-/// FIFO of messages waiting to run as prompts; safe to share between the
-/// turn's key thread and the main loop.
-final class MessageQueue
+/// FIFO of messages waiting to run as prompts: a sendable handle (copies
+/// share the queue), so the turn's key thread and the main loop both use it.
+struct MessageQueue
 {
-    private QueuedMessage[] entries;
-    private size_t nextId;
-    private Mutex lock;
+    import nano.safeio : Shared;
+    private static struct State
+    {
+        immutable(QueuedMessage)[] entries;
+        size_t nextId;
+    }
+    private Shared!State state;
 
-    this() { lock = new Mutex; }
+    /// A new, empty queue.
+    static MessageQueue make() { return MessageQueue(Shared!State.make); }
 
     /// Add a message; returns its id.
     size_t push(string text)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto id = nextId++;
-        entries ~= QueuedMessage(id, text);
-        return id;
+        return state.update!size_t((ref State s) {
+            auto id = s.nextId++;
+            s.entries ~= QueuedMessage(id, text);
+            return id;
+        });
     }
 
     /// The next message to run, if any.
     bool pop(out QueuedMessage m)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        if (!entries.length) return false;
-        m = entries[0];
-        entries = entries[1 .. $];
-        return true;
+        QueuedMessage got;
+        bool ok = state.update!bool((ref State s) {
+            if (!s.entries.length) return false;
+            got = s.entries[0];
+            s.entries = s.entries[1 .. $];
+            return true;
+        });
+        m = got;
+        return ok;
     }
 
     /// The waiting messages, oldest first.
-    QueuedMessage[] list()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        return entries.dup;
-    }
+    immutable(QueuedMessage)[] list() { return state.get.entries; }
 
-    size_t length()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        return entries.length;
-    }
+    size_t length() { return state.get.entries.length; }
 
     bool empty() { return length == 0; }
 
@@ -75,35 +72,35 @@ final class MessageQueue
     {
         import std.algorithm : canFind, filter;
         import std.array : array;
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto before = entries.length;
-        entries = entries.filter!(e => !ids.canFind(e.id)).array;
-        return before - entries.length;
+        return state.update!size_t((ref State s) {
+            auto before = s.entries.length;
+            s.entries = s.entries.filter!(e => !ids.canFind(e.id)).array;
+            return before - s.entries.length;
+        });
     }
 
     /// Replace one entry's text; false when no entry has that id.
     bool edit(size_t id, string text)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        foreach (ref e; entries)
-            if (e.id == id)
-            {
-                e.text = text;
-                return true;
-            }
-        return false;
+        return state.update!bool((ref State s) {
+            foreach (i, ref e; s.entries)
+                if (e.id == id)
+                {
+                    s.entries = s.entries[0 .. i] ~ QueuedMessage(id, text) ~ s.entries[i + 1 .. $];
+                    return true;
+                }
+            return false;
+        });
     }
 
     /// Drop everything waiting; returns how many were removed.
     size_t clear()
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        auto n = entries.length;
-        entries = null;
-        return n;
+        return state.update!size_t((ref State s) {
+            auto n = s.entries.length;
+            s.entries = null;
+            return n;
+        });
     }
 }
 
@@ -254,7 +251,7 @@ string preview(string text, size_t max)
 
 unittest // push assigns monotonic ids that survive removal and clear
 {
-    auto q = new MessageQueue;
+    auto q = MessageQueue.make;
     assert(q.push("first") == 0 && q.push("second") == 1 && q.push("third") == 2);
     assert(q.remove([1]) == 1);
     auto l = q.list;
@@ -265,7 +262,7 @@ unittest // push assigns monotonic ids that survive removal and clear
 
 unittest // pop is FIFO and edit rewrites in place
 {
-    auto q = new MessageQueue;
+    auto q = MessageQueue.make;
     q.push("one");
     q.push("two");
     assert(q.edit(1, "TWO") && !q.edit(9, "nope"));
@@ -292,7 +289,7 @@ unittest // pop is FIFO and edit rewrites in place
 unittest // apply reports what happened
 {
     import std.algorithm : canFind, startsWith;
-    auto q = new MessageQueue;
+    auto q = MessageQueue.make;
     q.push("alpha");
     q.push("beta");
     q.push("gamma");

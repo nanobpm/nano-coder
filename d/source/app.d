@@ -4,7 +4,7 @@ module app;
 
 @safe:
 
-import nano.safeio : Chan, JoinHandle, Locked, spawnDaemon, spawnUnchecked, exitProcess, stdErr, stdinLine, stdOut;
+import nano.safeio : Chan, Isolated, Join, JoinHandle, Locked, Shared, deepCopy, spawn, spawnDaemon, exitProcess, stdErr, stdinLine, stdOut;
 
 import std.stdio;
 import std.json;
@@ -295,8 +295,93 @@ string runQueueCommand(MessageQueue queue, string args)
     catch (QueueUsage e) return "[" ~ e.msg ~ "]";
 }
 
-void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string[] held, QuestionBroker questions,
-    MessageQueue queue, string delegate(string) @safe midTurn = null)
+/// What a `/command` typed mid-turn may use on the key thread: the shared
+/// turn controls, the live view, and a frozen copy of the config.
+struct MidTurn
+{
+    shared TurnControl control;
+    LiveView view;
+    /// One element (a slice keeps `MidTurn` assignable).
+    immutable(Config)[] cfg;
+}
+
+/// A `/command` typed during a turn: its output if it runs now, else null (held).
+string midTurnCommand(string text, MidTurn ctx)
+{
+    auto control = atomicLoad(ctx.control);
+    auto view = ctx.view;
+    static import nano.trajectory;
+    auto p = splitCmd(text);
+    auto name = p[0], arg = p[1];
+    final switch (timing(text))
+    {
+        case Timing.afterTurn:
+            return null;
+        case Timing.immediate:
+            switch (name)
+            {
+                case "/help": return helpText().stripRight;
+                case "/mode": return modeListing(control.mode);
+                case "/verbosity": return verbosityListing(verbosity);
+                case "/providers": return providersListing(ctx.cfg[0].providers, ctx.cfg[0].defaultProvider);
+                case "/trajectory":
+                    auto path = view.get("log");
+                    if (path is null) return "Session persistence is disabled: no trajectory to show";
+                    try
+                    {
+                        auto t = nano.trajectory.load(path);
+                        return arg == "--json" ? t.toJson : arg.length ? t.toMarkdown : t.toPlain;
+                    }
+                    catch (Exception e) return "Could not read the session log: " ~ e.msg;
+                default: return view.get(name);
+            }
+        case Timing.nextStep:
+            if (name == "/mode")
+            {
+                try
+                {
+                    auto m = parseMode(arg);
+                    control.mode = m;
+                    return format("Mode set to %s (%s); applies from the agent's next step", m.name, m.describe);
+                }
+                catch (Exception e) return e.msg;
+            }
+            if (name == "/verbosity")
+            {
+                try
+                {
+                    auto v = parseVerbosity(arg);
+                    setVerbosity(v);
+                    return format("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
+                }
+                catch (Exception e) return e.msg;
+            }
+            if (name == "/model")
+            {
+                // Validate now so a bad spec is reported at once and never queued.
+                try resolve(ctx.cfg[0], arg);
+                catch (Exception e) return format("[%s: %s]", text, e.msg);
+                control.requestModel(arg);
+                return format("Model switch to %s queued; applies at the next model call (the history carries over)", arg);
+            }
+            return null;
+    }
+}
+
+
+/// The turn's key reader (its own thread): owns the line editor until
+/// `*done`, then hands it back. Lines that wait for the turn go to `held`.
+Isolated!LineEditor turnKeys(Isolated!LineEditor owned, ConsoleLink console, shared(bool)* done, Chan!string held,
+    QuestionBroker questions, MessageQueue queue, MidTurn mid)
+{
+    auto editor = owned.unwrap;
+    readTurnKeys(editor, console, done, held, questions, queue, mid);
+    // Isolated: this thread got the editor isolated and kept no other reference.
+    return Isolated!LineEditor.assumeIsolated(editor);
+}
+
+private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* done, Chan!string held,
+    QuestionBroker questions, MessageQueue queue, MidTurn mid)
 {
     while (!atomicLoad(*done))
     {
@@ -334,13 +419,12 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 if (text.startsWith("/") && unescapePrompt(text) is null)
                 {
                     // Read-only commands and settings run now (turn_commands.rs).
-                    if (midTurn !is null)
-                        if (auto shown = midTurn(text))
-                        {
-                            console.note(shown);
-                            break;
-                        }
-                    held ~= text;
+                    if (auto shown = midTurnCommand(text, mid))
+                    {
+                        console.note(shown);
+                        break;
+                    }
+                    held.put(text);
                     stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
                 }
                 else if (r.outcome == Outcome.queue)
@@ -357,6 +441,48 @@ void turnKeys(LineEditor editor, Console console, shared(bool)* done, ref string
                 break;
         }
     }
+}
+
+/// The interactive line editor. Built here, not in `runMain`, so its
+/// callbacks can reach only what is passed in (sendable handles) and
+/// globals: the editor moves to the turn's key reader thread.
+LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
+{
+    auto editor = new LineEditor(fdSource(0), (string s) {
+        import std.algorithm.searching : canFind;
+        // The editor's erase-to-end-of-screen wipes the status row too.
+        writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
+    }, () => terminalWidth());
+    editor.rows = () => terminalHeight();
+    editor.onAction = (K k) {
+        bool inTurn = atomicLoad(gTurnRunning);
+        if (k == K.toggleThinking)
+        {
+            console.toggleThinking(inTurn);
+            return;
+        }
+        // The system prompt follows at the next turn (`syncMode`).
+        AgentMode m = nextMode(control.mode());
+        control.mode = m;
+        updateStatus((ref Stats s) { s.mode = m; });
+        if (inTurn) console.note(console.dim(format("[mode: %s — %s]", m.name, m.describe)));
+        else console.note(format("Mode: %s (%s)", m.name, m.describe));
+    };
+    return editor;
+}
+
+/// Routes the editor's drawing through the frame renderer (or back).
+void attachFrame(LineEditor editor, bool on)
+{
+    editor.frameDraw = on ? (string[] rows) { gFrame.draw(rows); } : null;
+    editor.frameCommit = on ? (string line) { gFrame.commit(line); } : null;
+}
+
+/// A frozen copy of `cfg`, for another thread.
+immutable(Config) frozenConfig(const ref Config cfg)
+{
+    // Isolated: a deep copy made just here.
+    return Isolated!Config.assumeIsolated(deepCopy(cfg)).freeze;
 }
 
 /// Ask each question with a picker; dismissing any one dismisses them all.
@@ -520,21 +646,14 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.compactions = agent.compactions;
 }
 
-class Console : AgentEvents
+/// The console's line state (what's on the current line, the thinking
+/// block, held-back markdown). It lives in a `Shared` cell, so the main
+/// thread and the turn's key reader print through the same state, one at a
+/// time.
+struct Screen
 {
     bool color, tty;
-    private bool inReasoning, midLine;
-    /// Tool output previews and expanded thinking (verbosity verbose or debug).
-    bool verbose() const { return verbosity >= Verbosity.verbose; }
-    /// Quiet shows only final answers: the last assistant text of the turn
-    /// is kept for the end, as are whether answer deltas were dropped (a turn
-    /// that turns louder mid-answer reprints the whole answer).
-    bool quiet() const { return verbosity == Verbosity.quiet; }
-    string finalAnswer;
-    bool droppedAnswer;
-    // The reasoning block being shown (as in Rust's legacy renderer): a live
-    // one-line view redrawn in place, then "∴ Thought for Ns · N chars", or
-    // the full text when expanded (Ctrl-O or --verbose).
+    private bool midLine;
     private bool thinking, blockExpanded, streamedThinking;
     private string thinkText, lastThinking;
     private long thinkStart, lastDraw;
@@ -545,13 +664,8 @@ class Console : AgentEvents
     // Answers on a color terminal have their markdown rendered a block at a
     // time (markdown.rs MarkdownStream); piped and NO_COLOR output keep it raw.
     private MarkdownStream markdown;
+    bool verbose() const { return verbosity >= Verbosity.verbose; }
     bool renderMarkdown() const { return tty && color; }
-    private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
-    private size_t answerWidth()
-    {
-        auto w = terminalWidth(), pad = answerPad();
-        return w > pad + 10 ? w - pad : 10;
-    }
 
     /// Prints any streamed markdown still held back (the answer segment
     /// ended, or the turn stopped mid-block).
@@ -562,11 +676,8 @@ class Console : AgentEvents
         if (rest.length) writeAligned(rest, answerPad());
     }
 
-    /// A whole answer as shown on this console: markdown rendered for a
-    /// color terminal, verbatim otherwise.
-    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
-
     string stamp() { return .stamp(color); }
+    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
 
     /// Writes `t` with every line that starts here indented by `pad`.
     private void writeAligned(string t, size_t pad)
@@ -584,12 +695,6 @@ class Console : AgentEvents
             midLine = seg[$ - 1] != '\n';
             i += seg.length;
         }
-    }
-
-    this(bool color, bool tty = false)
-    {
-        this.color = color;
-        this.tty = tty;
     }
 
     private static long nowMs()
@@ -677,37 +782,147 @@ class Console : AgentEvents
     /// note (with the last thinking when expanding). Returns whether it printed.
     bool toggleThinking(bool inTurn)
     {
-        synchronized (this)
+        bool expanded = !atomicLoad(gThinkingExpanded);
+        atomicStore(gThinkingExpanded, expanded);
+        if (thinking)
         {
-            bool expanded = !atomicLoad(gThinkingExpanded);
-            atomicStore(gThinkingExpanded, expanded);
-            if (thinking)
+            blockExpanded = expanded;
+            if (expanded)
             {
-                blockExpanded = expanded;
-                if (expanded)
-                {
-                    write((tty ? "\r\x1b[2K" : "\n") ~ blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
-                    midLine = false;
-                    writeAligned(thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))), blockStamp.length ? stampWidth : 0);
-                }
-                else
-                {
-                    write("\n" ~ collapsedLine());
-                }
-                midLine = true;
-                stdOut.flush();
-                return false;
+                write((tty ? "\r\x1b[2K" : "\n") ~ blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
+                midLine = false;
+                writeAligned(thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))), blockStamp.length ? stampWidth : 0);
             }
-            if (inTurn) return false;
-            string note = !expanded ? dim("thinking will be collapsed") ~ "\n"
-                : !lastThinking.length ? dim("thinking will be shown in full (no thinking yet)") ~ "\n"
-                : thinkStyle("∴ Last thinking ") ~ dim("(shown in full from now on; ctrl+o to collapse)") ~ "\n"
-                    ~ thinkStyle(lastThinking) ~ "\n";
-            write("\r\x1b[2K" ~ note);
+            else
+            {
+                write("\n" ~ collapsedLine());
+            }
+            midLine = true;
             stdOut.flush();
-            return true;
+            return false;
         }
+        if (inTurn) return false;
+        string note = !expanded ? dim("thinking will be collapsed") ~ "\n"
+            : !lastThinking.length ? dim("thinking will be shown in full (no thinking yet)") ~ "\n"
+            : thinkStyle("∴ Last thinking ") ~ dim("(shown in full from now on; ctrl+o to collapse)") ~ "\n"
+                ~ thinkStyle(lastThinking) ~ "\n";
+        write("\r\x1b[2K" ~ note);
+        stdOut.flush();
+        return true;
     }
+
+    /// A streamed chunk of reasoning or answer.
+    void text(bool reasoning, string chunk)
+    {
+        if (reasoning)
+        {
+            streamedThinking = true;
+            thinkingDelta(chunk);
+            return;
+        }
+        if (!chunk.length) return;
+        finishThinking();
+        if (!answering)
+        {
+            if (midLine) write("\n");
+            midLine = false;
+            auto st = stamp();
+            write(st);
+            midLine = st.length > 0;
+            answering = true;
+        }
+        auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : chunk;
+        if (shown.length) writeAligned(shown, answerPad());
+        stdOut.flush();
+    }
+
+    void note(string text)
+    {
+        flushMarkdown();
+        if (midLine) write("\n");
+        midLine = false;
+        answering = false;
+        writeln(stampBlock(stamp(), text));
+        stdOut.flush();
+    }
+
+    void endLine()
+    {
+        finishThinking();
+        flushMarkdown();
+        if (midLine) writeln();
+        midLine = false;
+        answering = false;
+    }
+
+    /// The model call ended: reasoning that didn't stream shows now, like a
+    /// block that just ended.
+    void endReasoning(string reasoning)
+    {
+        flushMarkdown();
+        if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
+        finishThinking();
+        streamedThinking = false;
+    }
+}
+
+private size_t answerPad() { return atomicLoad(gTimestamps) ? stampWidth : 0; }
+private size_t answerWidth()
+{
+    auto w = terminalWidth(), pad = answerPad();
+    return w > pad + 10 ? w - pad : 10;
+}
+
+/// The console as other threads see it: a sendable handle to its `Screen`.
+struct ConsoleLink
+{
+    private Shared!Screen screen;
+    bool color;
+    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
+    /// A line of its own, mid-stream or not (the live thinking line redraws below it).
+    void note(string text) { screen.update((ref Screen s) { s.note(text); }); }
+    void endLine() { screen.update((ref Screen s) { s.endLine(); }); }
+    /// See `Screen.toggleThinking`.
+    bool toggleThinking(bool inTurn) { return screen.update!bool((ref Screen s) => s.toggleThinking(inTurn)); }
+}
+
+class Console : AgentEvents
+{
+    immutable bool color, tty;
+    /// The shared line state; hand `link` to other threads.
+    ConsoleLink link;
+    /// Tool output previews and expanded thinking (verbosity verbose or debug).
+    bool verbose() const { return verbosity >= Verbosity.verbose; }
+    /// Quiet shows only final answers: the last assistant text of the turn
+    /// is kept for the end, as are whether answer deltas were dropped (a turn
+    /// that turns louder mid-answer reprints the whole answer).
+    bool quiet() const { return verbosity == Verbosity.quiet; }
+    string finalAnswer;
+    bool droppedAnswer;
+    bool renderMarkdown() const { return tty && color; }
+
+    /// A whole answer as shown on this console: markdown rendered for a
+    /// color terminal, verbatim otherwise.
+    string display(string text) { return renderMarkdown ? renderMarkdownText(text, answerWidth()) : text; }
+
+    string stamp() { return .stamp(color); }
+
+    this(bool color, bool tty = false)
+    {
+        this.color = color;
+        this.tty = tty;
+        link = ConsoleLink(Shared!Screen.make(Screen(color, tty)), color);
+    }
+
+    private static long nowMs()
+    {
+        import core.time : MonoTime;
+        return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
+    }
+
+    /// Ctrl-O. Mid-block it switches the live view; between turns it prints a
+    /// note (with the last thinking when expanding). Returns whether it printed.
+    bool toggleThinking(bool inTurn) { return link.toggleThinking(inTurn); }
 
     string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
     string bold(string s) { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
@@ -727,57 +942,13 @@ class Console : AgentEvents
             if (!reasoning && chunk.length) droppedAnswer = true;
             return;
         }
-        synchronized (this)
-        {
-            if (reasoning)
-            {
-                streamedThinking = true;
-                thinkingDelta(chunk);
-                return;
-            }
-            if (!chunk.length) return;
-            finishThinking();
-            if (!answering)
-            {
-                if (midLine) write("\n");
-                midLine = false;
-                auto st = stamp();
-                write(st);
-                midLine = st.length > 0;
-                answering = true;
-            }
-            auto shown = renderMarkdown ? markdown.push(chunk, answerWidth()) : chunk;
-            if (shown.length) writeAligned(shown, answerPad());
-            stdOut.flush();
-        }
+        link.screen.update((ref Screen s) { s.text(reasoning, chunk); });
     }
 
     /// A line of its own, mid-stream or not (the live thinking line redraws below it).
-    void note(string text)
-    {
-        synchronized (this)
-        {
-            flushMarkdown();
-            if (midLine) write("\n");
-            midLine = false;
-            answering = false;
-            writeln(stampBlock(stamp(), text));
-            stdOut.flush();
-        }
-    }
+    void note(string text) { link.note(text); }
 
-    void endLine()
-    {
-        synchronized (this)
-        {
-            finishThinking();
-            flushMarkdown();
-            if (midLine) writeln();
-            midLine = false;
-            answering = false;
-            inReasoning = false;
-        }
-    }
+    void endLine() { link.endLine(); }
 
     /// plan_add/plan_update show as the checklist, not as calls.
     private bool quietTool(const ref ToolCall call) { return !verbose && (call.name == "plan_add" || call.name == "plan_update"); }
@@ -827,14 +998,7 @@ class Console : AgentEvents
     {
         finalAnswer = text;
         if (quiet) return;
-        synchronized (this)
-        {
-            // Reasoning that didn't stream shows now, like a block that just ended.
-            flushMarkdown();
-            if (!streamedThinking && reasoning.length && !thinking) thinkingDelta(reasoning);
-            finishThinking();
-            streamedThinking = false;
-        }
+        link.screen.update((ref Screen s) { s.endReasoning(reasoning); });
     }
 
     static string summary(const ref ToolCall c)
@@ -1370,7 +1534,7 @@ int runMain(string[] args)
     Chan!string inbox;
     LineEditor editor;
     string[] held; // lines to run before reading the prompt again
-    auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
+    auto queue = MessageQueue.make; // Ctrl-Enter messages: one runs per following turn
 
     // Recently used models lead the `/model` type-ahead (recents.rs).
     static import nano.recents;
@@ -1450,7 +1614,7 @@ int runMain(string[] args)
     }
 
     // Read-only commands typed mid-turn show this, rendered on the agent thread.
-    auto view = new LiveView;
+    auto view = LiveView.make;
     void refreshView()
     {
         view.set("/tools", toolsListing(agent));
@@ -1462,67 +1626,6 @@ int runMain(string[] args)
         refreshStatus();
     }
     console.afterStep = &refreshView;
-
-    /// A `/command` typed during a turn: its output if it runs now, else null (held).
-    string midTurn(string text)
-    {
-        static import nano.trajectory;
-        auto p = splitCmd(text);
-        auto name = p[0], arg = p[1];
-        final switch (timing(text))
-        {
-            case Timing.afterTurn:
-                return null;
-            case Timing.immediate:
-                switch (name)
-                {
-                    case "/help": return helpText().stripRight;
-                    case "/mode": return modeListing(agent.control.mode);
-                    case "/verbosity": return verbosityListing(verbosity);
-                    case "/providers": return providersListing(cfg.providers, cfg.defaultProvider);
-                    case "/trajectory":
-                        auto path = view.get("log");
-                        if (path is null) return "Session persistence is disabled: no trajectory to show";
-                        try
-                        {
-                            auto t = nano.trajectory.load(path);
-                            return arg == "--json" ? t.toJson : arg.length ? t.toMarkdown : t.toPlain;
-                        }
-                        catch (Exception e) return "Could not read the session log: " ~ e.msg;
-                    default: return view.get(name);
-                }
-            case Timing.nextStep:
-                if (name == "/mode")
-                {
-                    try
-                    {
-                        auto m = parseMode(arg);
-                        agent.control.mode = m;
-                        return format("Mode set to %s (%s); applies from the agent's next step", m.name, m.describe);
-                    }
-                    catch (Exception e) return e.msg;
-                }
-                if (name == "/verbosity")
-                {
-                    try
-                    {
-                        auto v = parseVerbosity(arg);
-                        setVerbosity(v);
-                        return format("Verbosity set to %s (%s); /settings saves it", nano.ui.name(v), nano.ui.describe(v));
-                    }
-                    catch (Exception e) return e.msg;
-                }
-                if (name == "/model")
-                {
-                    // Validate now so a bad spec is reported at once and never queued.
-                    try resolve(cfg, arg);
-                    catch (Exception e) return format("[%s: %s]", text, e.msg);
-                    agent.control.requestModel(arg);
-                    return format("Model switch to %s queued; applies at the next model call (the history carries over)", arg);
-                }
-                return null;
-        }
-    }
 
     // The system prompt's plan section follows the mode; Shift-Tab mid-turn
     // only switches the live mode, so the prompt catches up at the next turn.
@@ -1573,8 +1676,9 @@ int runMain(string[] args)
         bool ok = true;
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
-        shared bool turnDone;
-        JoinHandle keys;
+        auto turnDone = new shared(bool);
+        Join!(Isolated!LineEditor) keys;
+        Chan!string heldLines;
         bool keysStarted;
         if (editor !is null)
         {
@@ -1582,18 +1686,23 @@ int runMain(string[] args)
                 stdErr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
-            // Unchecked: the key reader shares the line editor and console
-            // (the main thread only prints while it runs), `held` (read
-            // after the join), the question broker and queue (each locked),
-            // and `midTurn`, which runs read-only commands.
-            keys = spawnUnchecked(() => turnKeys(editor, console, &turnDone, held, questions, queue, &midTurn));
+            heldLines = Chan!string.make;
+            auto mid = MidTurn(atomicLoad(agent.control), view, [frozenConfig(cfg)]);
+            // Isolated: `editor` is set to null until the join hands it back,
+            // and its callbacks (built by `makeEditor` and `attachFrame`)
+            // reach only shared state.
+            auto owned = Isolated!LineEditor.assumeIsolated(editor);
+            editor = null;
+            keys = spawn(&turnKeys, imported!"core.lifetime".move(owned), console.link, turnDone, heldLines, questions, queue, mid);
             keysStarted = true;
         }
         scope (exit)
             if (keysStarted)
             {
-                atomicStore(turnDone, true);
-                keys.join();
+                atomicStore(*turnDone, true);
+                editor = keys.join().unwrap;
+                string line;
+                while (heldLines.tryTake(line)) held ~= line;
             }
         console.finalAnswer = null;
         console.droppedAnswer = false;
@@ -1626,29 +1735,7 @@ int runMain(string[] args)
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
-        editor = new LineEditor(fdSource(0), (string s) {
-            import std.algorithm.searching : canFind;
-            // The editor's erase-to-end-of-screen wipes the status row too.
-            writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
-        }, () => terminalWidth());
-        editor.rows = () => terminalHeight();
-        editor.onAction = (K k) {
-            bool inTurn = atomicLoad(gTurnRunning);
-            if (k == K.toggleThinking)
-            {
-                console.toggleThinking(inTurn);
-                return;
-            }
-            AgentMode m = nextMode(agent.control.mode());
-            agent.control.mode = m;
-            updateStatus((ref Stats s) { s.mode = m; });
-            if (inTurn) console.note(console.dim(format("[mode: %s — %s]", m.name, m.describe)));
-            else
-            {
-                syncMode();
-                console.note(format("Mode: %s (%s)", m.name, m.describe));
-            }
-        };
+        editor = makeEditor(console.link, atomicLoad(agent.control));
         questions.interactive = true;
     }
     scope (exit) leaveKeyMode();
@@ -1662,16 +1749,14 @@ int runMain(string[] args)
             if (gStatus !is null) { gStatus.teardown(); gStatus = null; }
             gFrame = FrameUi.install(&frameStatus);
             if (!gFrame) return;
-            editor.frameDraw = (string[] rows) { gFrame.draw(rows); };
-            editor.frameCommit = (string line) { gFrame.commit(line); };
+            attachFrame(editor, true);
             refreshStatus();
         }
         else if (mode == "legacy" && gFrame)
         {
             auto lines = gFrame.uninstall();
             gFrame = FrameUi.init;
-            editor.frameDraw = null;
-            editor.frameCommit = null;
+            attachFrame(editor, false);
             // The frame's redraws cleared the scrollback: replay its transcript.
             write("\x1b[H\x1b[2J\x1b[3J");
             foreach (l; lines) writeln(l);
@@ -1692,7 +1777,8 @@ int runMain(string[] args)
     {
         import core.thread : Thread;
         inbox = Chan!string.make;
-        spawnDaemon(&readStdinLines, inbox, console.color);
+        bool color = console.color;
+        spawnDaemon(&readStdinLines, inbox, color);
     }
     if (interactive)
     {
@@ -1747,6 +1833,7 @@ int runMain(string[] args)
                 lapse = () @safe => MonoTime.currTime - exitArmedAt > exitWindow;
             auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ console.bold("› "), false, lapse);
             editor.restyle = null;
+            syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;
             if (r.outcome == Outcome.stopped)
             {

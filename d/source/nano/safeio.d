@@ -337,8 +337,6 @@ void signalOne(Condition c) @trusted { c.notify(); }
 void signalAll(Condition c) @trusted { c.notifyAll(); }
 /// `c.wait()` (the caller holds `c`'s mutex).
 void waitOn(Condition c) @trusted { c.wait(); }
-/// `t.start()`.
-Thread startThread(Thread t) @trusted { return t.start(); }
 /// `t.join()`; rethrows what the thread threw.
 void joinThread(Thread t) @trusted { t.join(); }
 
@@ -495,6 +493,14 @@ struct Isolated(T)
         payload = T.init;
         return v;
     }
+
+    /// Make it immutable: sound because nothing else can still change it.
+    /// `@trusted`: the cast is what isolation licenses (`assumeUnique`).
+    immutable(T) freeze() @trusted
+    {
+        auto v = unwrap();
+        return cast(immutable) v;
+    }
 }
 
 /// A started thread, to wait for or poll; `join` returns what its function
@@ -579,18 +585,6 @@ private template callArgs(size_t n)
         foreach (i; 0 .. n) r ~= (i ? ", " : "") ~ "cast(Args[" ~ i.to!string ~ "]) move(box.args[" ~ i.to!string ~ "])";
         return r;
     }();
-}
-
-/// Run `dg` on a new thread with no sendability check: its context may be
-/// shared mutable state, synchronised by hand. The escape hatch for threads
-/// not yet converted to `spawn`, like Rust's `unsafe`: check-safe.sh wants a
-/// comment above each call saying what it shares and how that is locked, and
-/// caps the number of calls (scripts/unchecked-thread-budget).
-JoinHandle spawnUnchecked(void delegate() @safe dg, bool daemon = false)
-{
-    auto t = new Thread(dg);
-    t.isDaemon = daemon;
-    return JoinHandle(startThread(t));
 }
 
 /// A handle to a `Channel`: copyable and sendable, so each thread holds its

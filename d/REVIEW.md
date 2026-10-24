@@ -26,7 +26,8 @@ dropped in turn and kept only if the macOS, macOS unittest, and Linux
 (x86_64 and aarch64) builds failed without it. That removed 252 of 376
 outside `safeio.d`. Repeated escapes then moved into `safeio.d`: `realpath`,
 `strtod`, the `TIOCGWINSZ` terminal size, JSON object lookup (`jsonGet`), and
-the `__gshared` class references in `app.d` (`GsharedRef`). The frame's
+the `__gshared` class references in `app.d` (`GsharedRef`, since removed: see
+the E profile below). The frame's
 `ttyOut` became a `shared int` with atomic access, so it needs no `@trusted`.
 
 Read-only JSON code then dropped `@trusted` by switching to Phobos's
@@ -118,9 +119,8 @@ locked copy. That is the closest D gets to `Send`/`Sync`. The turn controls
 bar (`StatusLine`) and its figures (`gStats`) are `shared` objects built on
 it. `Steer` stores its ACP request id as JSON text so it can cross threads.
 
-Two `__gshared` escapes remain, both in `safeio` wrappers: the frame UI
-(`gFrame`, a `FrameUi` whose transcript, renderer and callbacks would need a
-deeper rewrite) and the saved `termios` restored at exit. **R** (narrowing)
+One `__gshared` escape remains, in a `safeio` wrapper: the saved `termios`
+restored at exit. (The frame UI's became an actor thread, below.) **R** (narrowing)
 
 ### The "E profile": sendable-only threads
 
@@ -135,26 +135,53 @@ A prototype of Rust's `Send` rule, enforced by `safeio` types and
   (`assumeIsolated`) that nothing else refers to the value.
 - `Chan!T` is a copyable, sendable handle to a closable blocking queue
   (`Channel`) of sendable values.
+- `Shared!T` is a copyable, sendable handle to a `Locked!T` (Rust's
+  `Arc<Mutex<T>>`), with `await` on a condition. `T` itself must hold no
+  unshared references, so nothing can leak out from under the lock.
+  `spawn` returns `Join!R`, whose `join` hands back the thread's result.
 - Outside `safeio.d` the build fails on `new Thread`, `std.concurrency`,
-  `__gshared` and `union`. The two escape hatches, `spawnUnchecked(delegate)`
-  and `assumeIsolated`, need a comment above each call saying what is shared
-  and how it is locked. They are capped like `@trusted`
-  (`scripts/unchecked-thread-budget`: 5, `scripts/isolation-budget`: 1).
+  `__gshared` and `union`. The one escape hatch, `assumeIsolated`, needs a
+  comment above each call saying why nothing else refers to the value, and
+  is capped like `@trusted` (`scripts/isolation-budget`: 5).
 
-Converted: the resize watcher, the piped-stdin reader (whose inbox is now a
-`Chan!string`) and session-title requests (the client is built on the main
-thread and moved over as `Isolated!LLMClient`; before, the thread built it
-from the live config). Still unchecked: the key reader during a turn (shares
-the line editor, console, held commands and a mid-turn command callback with
-the main thread), the frame UI's reader and ticker (the frame's monitor guards
-everything), the ACP stdin reader (routes cancels and steers under the inbox
-lock), and a question-broker test. Converting them needs those objects
-redesigned as `shared` types or message passing.
+Every thread now starts through `spawn`:
+- resize watcher; piped-stdin reader (inbox is a `Chan!string`).
+- session titles: the client is built on the main thread and moved over as
+  `Isolated!LLMClient`.
+- ACP stdin reader: `AcpRouter`, a handle over `Shared` state (queued
+  messages as JSON text, steer marks, session id). The main loop drains it
+  under the same lock.
+- question broker: `QuestionBroker` over `Shared` state; questions and
+  answers are immutable.
+- frame renderer: an actor. One thread owns the transcript and renderer
+  (moved in as `Isolated`) and serves `Draw`/`Commit`/`Suspend`/... requests
+  from a `Chan`, waking on a pipe. Requests that change the transcript wait
+  for an acknowledgement, so output written after them can't overtake them.
+  `FrameUi` is now a sendable handle and `GsharedRef` is gone.
+- turn key reader: the line editor moves to the reader as
+  `Isolated!LineEditor` (main sets its own reference to null) and comes back
+  through `join`. The editor is built by a free function, so its callbacks
+  can only reach sendable handles and globals. The console's line state
+  (`Screen`) moved into `Shared` with a sendable `ConsoleLink`. The queue and
+  live view are `Shared`-backed handles, held lines come back over a `Chan`,
+  and mid-turn commands are a plain function of `MidTurn` (shared controls,
+  live view, a frozen `immutable Config`).
+
+  Before, the reader thread called a delegate into `runMain`'s frame, which
+  could reach anything there. It was correct by convention: an `inTurn`
+  check kept Shift-Tab's `syncMode` (which rewrites `agent.messages[0]`) on
+  the main thread, and nothing changed the config mid-turn. Now the types
+  check it. `syncMode` runs after the prompt returns instead.
+
+The five isolation claims are: the title client, the frame state, the editor
+handoff and its return, and the frozen config (a fresh deep copy, which
+`Isolated.freeze` turns `immutable`).
 
 What this can't do without compiler support: tell whether a value is really
-isolated (Rust tracks ownership; here it's a claim), or check delegates
-(`spawnUnchecked` exists because D's type system can't see a delegate's
-context). An "E" language would need those two in the compiler.
+isolated (Rust tracks ownership; here it's a claim). It also can't see what
+a delegate stored inside an isolated object reaches; that is why the
+editor's callbacks are built in a separate function. An "E" language would
+need both in the compiler.
 
 Bugs found:
 - **The stdio lock deadlock.** A reader thread blocked in `readln` holds

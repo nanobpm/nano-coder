@@ -40,32 +40,30 @@ ratchet "in safeio.d" "$(trusted source/nano/safeio.d | wc -l | tr -d ' ')" scri
 # The "E profile": threads start through safeio's `spawn`/`spawnDaemon`,
 # which take a context-free function and sendable arguments, so whatever two
 # threads share shows in the types. Outside safeio.d there are no raw
-# threads, no `__gshared` and no unions. The escape hatches, `spawnUnchecked`
-# (a thread over hand-locked shared state) and `Isolated.assumeIsolated` (an
-# unchecked "nothing else refers to this"), are capped like `@trusted`.
+# threads, no `__gshared` and no unions. The one escape hatch,
+# `Isolated.assumeIsolated` (an unchecked "nothing else refers to this"), is
+# capped like `@trusted`.
 code() { grep -rnE "$1" source --include='*.d' | grep -v '^source/nano/safeio.d:' | grep -vE ':[0-9]+:[[:space:]]*(///|//)'; }
 if code '\bnew Thread\b|\bisDaemon\b|\bstd\.concurrency\b' >&2; then
-    echo "Error: start threads with nano.safeio.spawn/spawnDaemon (sendable arguments only), or spawnUnchecked" >&2
+    echo "Error: start threads with nano.safeio.spawn/spawnDaemon (sendable arguments only)" >&2
     status=1
 fi
 if code '\b__gshared\b|(^|[^[:alnum:]_])union\b' >&2; then
     echo "Error: \`__gshared\` and unions are only allowed in safeio.d; use \`shared\` with Locked/atomics, or std.sumtype" >&2
     status=1
 fi
-ratchet "outside safeio.d" "$(code '\bspawnUnchecked\(' | wc -l | tr -d ' ')" scripts/unchecked-thread-budget "\`spawnUnchecked\` calls"
 ratchet "outside safeio.d" "$(code '\bassumeIsolated\(' | wc -l | tr -d ' ')" scripts/isolation-budget "\`assumeIsolated\` calls"
 # Every `@trusted` needs a comment right above its declaration saying why it
 # is memory safe (blank lines and the earlier lines of a wrapped signature
 # may come between). The compiler can't check a `@trusted` body; a reviewer
-# checks it against that comment. The same goes for `spawnUnchecked` (what
-# the thread shares, and how it is locked) and `assumeIsolated` (why nothing
-# else refers to the value).
+# checks it against that comment. The same goes for `assumeIsolated` (why
+# nothing else refers to the value).
 if ! find source -name '*.d' | sort | xargs awk '
     FNR == 1 { ok = 0 }
     /^[[:space:]]*$/ { next }
     /^[[:space:]]*\/\// { ok = 1; next }
-    /(^|[^\/`[:alnum:]])@trusted([^[:alnum:]_]|$)|(^|[^.[:alnum:]_])spawnUnchecked\(|[.]assumeIsolated\(/ {
-        if (!ok && FILENAME !~ /safeio[.]d$/ || !ok && $0 ~ /@trusted/) { printf "%s(%d): Error: `@trusted`, `spawnUnchecked` or `assumeIsolated` without a comment above it saying why it is safe\n", FILENAME, FNR > "/dev/stderr"; bad = 1 }
+    /(^|[^\/`[:alnum:]])@trusted([^[:alnum:]_]|$)|[.]assumeIsolated\(/ {
+        if (!ok && FILENAME !~ /safeio[.]d$/ || !ok && $0 ~ /@trusted/) { printf "%s(%d): Error: `@trusted` or `assumeIsolated` without a comment above it saying why it is safe\n", FILENAME, FNR > "/dev/stderr"; bad = 1 }
         if ($0 ~ /[;{}][[:space:]]*$/) ok = 0
         next
     }

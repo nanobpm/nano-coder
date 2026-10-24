@@ -48,23 +48,36 @@ Timing timing(string cmd) nothrow
 
 /// Text for the read-only commands, rendered on the agent thread and read on
 /// the key reader's.
-final class LiveView
+struct LiveView
 {
-    private string[string] texts;
+    import nano.safeio : Shared;
+    private static struct State { immutable(string)[] names, texts; }
+    private Shared!State state;
+
+    /// A new, empty view.
+    static LiveView make() { return LiveView(Shared!State.make); }
 
     void set(string name, string text)
     {
-        synchronized (this) texts[name] = text;
+        state.update((ref State s) {
+            foreach (i, n; s.names)
+                if (n == name)
+                {
+                    s.texts = s.texts[0 .. i] ~ text ~ s.texts[i + 1 .. $];
+                    return;
+                }
+            s.names ~= name;
+            s.texts ~= text;
+        });
     }
 
     /// The text for `/name`, or null when none was rendered.
     string get(string name)
     {
-        synchronized (this)
-        {
-            if (auto t = name in texts) return *t;
-            return null;
-        }
+        auto s = state.get;
+        foreach (i, n; s.names)
+            if (n == name) return s.texts[i];
+        return null;
     }
 }
 
@@ -83,7 +96,7 @@ unittest
         assert(timing("/model") == afterTurn && timing("/model mock/x") == nextStep);
         assert(timing("/compact") == afterTurn && timing("/restart") == afterTurn && timing("/resume") == afterTurn);
     }
-    auto v = new LiveView;
+    auto v = LiveView.make;
     assert(v.get("/plan") is null);
     v.set("/plan", "p");
     assert(v.get("/plan") == "p");
