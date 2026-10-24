@@ -122,12 +122,11 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
             format("Context          %s window, auto-compact %s, %s compaction", formatTokens(a.contextWindow),
                 cfg.autoCompact ? format("at %.0f%%", cfg.autoCompactThreshold * 100) : "off", cfg.compactionMode),
             format("Verbosity        %s (%s)", cfg.verbosity.vname, cfg.verbosity.vdescribe),
-            format("Renderer         %s (%s)", cfg.renderer, rendererDescribe(cfg.renderer)),
             format("Save to config file%s", changes.any ? " (unsaved changes)" : ""),
             "Done",
         ];
         auto sel = ui.select("Select setting", items, 0);
-        if (sel < 0 || sel == 11)
+        if (sel < 0 || sel == 10)
         {
             if (changes.any && confirm(ui, format("Save changes to %s?", h.configPath), true))
                 saveAndReport(ui, h, changes, notices);
@@ -180,16 +179,7 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
                 if (onVerbosity !is null) onVerbosity(allVerbosities[i]);
                 changes.verbosity = true;
                 break;
-            case 9:
-                auto modes = ["legacy", "frame"];
-                auto i = ui.select("Renderer", [format("%-7s %s", "legacy", rendererDescribe("legacy")),
-                    format("%-7s %s", "frame", rendererDescribe("frame"))], cfg.renderer == "frame" ? 1 : 0);
-                if (i < 0) break;
-                if (modes[i] != cfg.renderer) ui.say(format("Renderer set to %s — taking effect now.", modes[i]));
-                cfg.renderer = modes[i];
-                changes.renderer = true;
-                break;
-            case 10: saveAndReport(ui, h, changes, notices); break;
+            case 9: saveAndReport(ui, h, changes, notices); break;
             default: break;
         }
     }
@@ -197,12 +187,6 @@ string[] runSettings(SettingsUi ui, ref SettingsHost h)
 
 /// Applies a verbosity picked in the dialog (set by the app).
 void delegate(imported!"nano.ui".Verbosity) @safe onVerbosity;
-
-string rendererDescribe(string mode)
-{
-    return mode == "frame" ? "app re-renders the frame on a width change"
-        : "terminal owns scrollback and reflow (scroll region)";
-}
 
 private bool parseCount(string t, out long v)
 {

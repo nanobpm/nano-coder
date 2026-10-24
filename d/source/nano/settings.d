@@ -15,7 +15,7 @@ import nano.toml_edit;
 /// What a visit changed (each saved as its own key).
 struct Changes
 {
-    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity, renderer;
+    bool model, temperature, thinking, maxTokens, maxIterations, systemPrompt, compaction, verbosity;
     bool[string] providerTemperatures, providerThinking, providers;
     /// "provider\0model" pairs.
     bool[string] modelTemperatures, modelThinking;
@@ -23,7 +23,7 @@ struct Changes
     bool any() const
     {
         return model || temperature || thinking || maxTokens || maxIterations || systemPrompt || compaction
-            || verbosity || renderer || providerTemperatures.length || providerThinking.length || providers.length
+            || verbosity || providerTemperatures.length || providerThinking.length || providers.length
             || modelTemperatures.length || modelThinking.length;
     }
 }
@@ -200,7 +200,8 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
     if (ch.maxIterations) doc = tomlSet(doc, [], "max_iterations", format("%s", c.maxIterations));
     if (ch.systemPrompt) doc = tomlSet(doc, [], "system_prompt", tomlString(c.systemPrompt));
     if (ch.verbosity) doc = tomlSet(doc, [], "verbosity", tomlString(c.verbosity.vname));
-    if (ch.renderer) doc = tomlSet(doc, [], "renderer", tomlString(c.renderer));
+    // The retired `renderer` key (Rust #133) is dropped on any save.
+    doc = tomlSet(doc, [], "renderer", null);
     if (ch.compaction)
     {
         doc = tomlSet(doc, [], "auto_compact", c.autoCompact ? "true" : "false");
@@ -283,6 +284,9 @@ unittest
     assert(doc == "# mine\nmodel = \"x/y\"\ntemperature = \"default\"\nmax_tokens = 2048\n\n[providers.work]\n"
         ~ "kind = \"openai\"\nbase_url = \"http://h/v1\"\napi_key_env = \"W_KEY\"\n", doc);
     assert(changes.any && !Changes.init.any);
+    // Saving drops the retired `renderer` key.
+    Changes none_;
+    assert(applyChanges("renderer = \"legacy\"\nmodel = \"a/b\"\n", c, none_, null) == "model = \"a/b\"\n");
 
     ProviderConfig preset;
     preset.hasKind = true;

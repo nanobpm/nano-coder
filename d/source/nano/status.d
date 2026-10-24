@@ -1,10 +1,5 @@
-/// A status line pinned to the bottom row of the terminal: model, cwd,
-/// context use, session tokens and what the agent is doing (status.rs).
-///
-/// The rows above it are made a scroll region (DECSTBM), so ordinary output
-/// scrolls without disturbing it. The conversation is kept bottom-anchored
-/// (directly above the status line) so shrinking the window drops blank rows
-/// rather than conversation.
+/// The status bar on the frame's last row: model, cwd, context use, session
+/// tokens and what the agent is doing (status.rs).
 module nano.status;
 
 @safe:
@@ -12,7 +7,7 @@ module nano.status;
 import std.format : format;
 import std.conv : to;
 import nano.context : formatTokens;
-import nano.lineedit : charWidth, writeFd;
+import nano.lineedit : charWidth;
 import nano.mode : AgentMode;
 
 /// What the agent is doing.
@@ -250,187 +245,6 @@ string render(const ref Stats stats, size_t cols)
     return line ~ RESET;
 }
 
-/// The last scrollable row: the bottom row is the status line's.
-ushort scrollRegionBottom(ushort rows) { return cast(ushort)((rows < 2 ? 2 : rows) - 1); }
-
-/// Scroll the region's content down `gap` rows (blank lines inserted at the
-/// top) and move the cursor with it, so the conversation sits on the status line.
-string anchorSequence(ushort gap)
-{
-    return gap == 0 ? "" : format("\x1b7\x1b[1;1H\x1b[%sL\x1b8\x1b[%sB", gap, gap);
-}
-
-/// Pin the status row and bottom-anchor the conversation, given the cursor
-/// position (rows 0: unknown).
-string installSequence(ushort rows, ushort curRow, ushort curCol)
-{
-    auto bottom = scrollRegionBottom(rows);
-    if (curRow > 0 && curRow < bottom)
-        return format("\x1b[1;%sr\x1b[%s;%sH", bottom, curRow, curCol) ~ anchorSequence(cast(ushort)(bottom - curRow));
-    return format("\n\x1b[1A\x1b7\x1b[1;%sr\x1b8", bottom);
-}
-
-/// After a resize: drop the region, erase below the cursor (a reflowed old
-/// bar may sit there) and re-pin for the new height. DECSTBM homes the cursor,
-/// so it is restored before the erase.
-string resizeSequence(ushort rows)
-{
-    return format("\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;%sr\x1b8", scrollRegionBottom(rows));
-}
-
-/// Parse a cursor position report `ESC [ row ; col R`.
-bool parseCursorReport(const(ubyte)[] bytes, out ushort row, out ushort col)
-{
-    import std.string : lastIndexOf, indexOf;
-    auto s = (() => cast(string) bytes.idup)();
-    auto start = s.lastIndexOf("\x1b[");
-    if (start < 0 || !s.length || s[$ - 1] != 'R') return false;
-    auto body_ = s[start + 2 .. $ - 1];
-    auto semi = body_.indexOf(';');
-    if (semi < 0) return false;
-    try
-    {
-        row = body_[0 .. semi].to!ushort;
-        col = body_[semi + 1 .. $].to!ushort;
-        return true;
-    }
-    catch (Exception) return false;
-}
-
-/// The terminal's rows and columns (0, 0 when fd 1 is not a terminal).
-ushort[2] terminalSize()
-{
-    import safeio = nano.safeio;
-    auto rc = safeio.terminalSize(1);
-    return [cast(ushort) rc[0], cast(ushort) rc[1]];
-}
-
-/// Ask the terminal where the cursor is, reading the reply straight from
-/// stdin with echo, line buffering and signals off. Only before the line
-/// reader runs (it would race for the reply).
-private bool queryCursorDirect(out ushort row, out ushort col)
-{
-    import core.sys.posix.termios;
-    import core.sys.posix.poll : pollfd, POLLIN;
-    import core.time : MonoTime, msecs;
-    import nano.safeio : pollFds, readFd, tcGet, tcSet;
-    termios original;
-    if (!tcGet(0, original)) return false;
-    auto raw = original;
-    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    if (!tcSet(0, raw)) return false;
-    scope (exit) tcSet(0, original);
-    writeFd(1, "\x1b[6n");
-    auto deadline = MonoTime.currTime + 300.msecs;
-    ubyte[] reply;
-    while (!reply.length || reply[$ - 1] != 'R')
-    {
-        auto left = (deadline - MonoTime.currTime).total!"msecs";
-        if (left <= 0) break;
-        pollfd[1] fd = [pollfd(0, POLLIN, 0)];
-        if (pollFds(fd[], cast(int) left) <= 0) break;
-        ubyte[1] b;
-        if (readFd(0, b[]) != 1) break;
-        reply ~= b[0];
-    }
-    return parseCursorReport(reply, row, col);
-}
-
-/// The pinned status line. `stats` is read at each draw (on any thread).
-final class StatusLine
-{
-    import nano.safeio : Locked;
-    private static struct State
-    {
-        ushort rows, cols;
-        bool live;
-    }
-    private Locked!State state;
-    private Locked!Stats stats;
-
-    private this(shared Locked!Stats stats, ushort rows, ushort cols) shared
-    {
-        import core.atomic : atomicLoad;
-        this.stats = atomicLoad(stats);
-        state = new shared Locked!State(State(rows, cols, true));
-    }
-
-    /// Reserve the bottom row when stdin and stdout are terminals of at least
-    /// five rows and `AGENTIC_NO_STATUS` is unset; null otherwise. The bar
-    /// shows `stats`.
-    static shared(StatusLine) install(shared Locked!Stats stats)
-    {
-        import core.sys.posix.unistd : isatty;
-        import std.process : environment;
-        if (!isatty(0) || !isatty(1) || environment.get("AGENTIC_NO_STATUS") !is null) return null;
-        auto size = terminalSize();
-        if (size[0] < 5) return null;
-        ushort row, col;
-        bool known = queryCursorDirect(row, col);
-        writeFd(1, installSequence(size[0], known ? row : 0, col));
-        import core.atomic : atomicLoad;
-        auto s = new shared StatusLine(atomicLoad(stats), size[0], size[1]);
-        s.draw();
-        return atomicLoad(s);
-    }
-
-    /// Redraw against the current terminal size; a changed size re-pins the
-    /// region first, in the same write.
-    void draw() shared
-    {
-        state.update((ref State st) { writeFd(1, sequenceLocked(st)); });
-    }
-
-    /// The bytes that redraw the bar (re-pinning first after a resize), for
-    /// writers that must emit them in the same write as their own output (the
-    /// line editor's erase-to-end-of-screen wipes the bar's row).
-    string sequence() shared
-    {
-        string r;
-        state.update((ref State st) { r = sequenceLocked(st); });
-        return r;
-    }
-
-    private string sequenceLocked(ref State st) shared
-    {
-        if (!st.live) return "";
-        auto size = terminalSize();
-        if (size[0] == 0) return "";
-        string prefix;
-        if (size[0] != st.rows || size[1] != st.cols)
-        {
-            st.rows = size[0];
-            st.cols = size[1];
-            prefix = resizeSequence(st.rows);
-        }
-        auto figures = stats.get();
-        return format("%s\x1b7\x1b[%s;1H\x1b[2K%s\x1b8", prefix, st.rows, render(figures, st.cols));
-    }
-
-    /// Clear the screen and scrollback for a fresh conversation and re-pin.
-    void clear() shared
-    {
-        state.update((ref State st) {
-            if (!st.live) return;
-            auto bottom = scrollRegionBottom(st.rows);
-            writeFd(1, format("\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[1;%sr\x1b[%s;1H", bottom, bottom));
-        });
-        draw();
-    }
-
-    /// Clear the status line and give the whole screen back.
-    void teardown() shared
-    {
-        state.update((ref State st) {
-            if (!st.live) return;
-            st.live = false;
-            writeFd(1, format("\x1b7\x1b[%s;1H\x1b[2K\x1b[r\x1b8", st.rows));
-        });
-    }
-}
-
 /// Live output rate: ceil(bytes / 4) tokens over the time since the first
 /// delta, once deltas span 250 ms, at most every 250 ms (Rust's RateMeter).
 struct RateMeter
@@ -492,13 +306,6 @@ unittest
     assert(tildePath("/home/joshua", "/home/joshua") == "~");
     assert(tildePath("/home/joshua2", "/home/joshua") == "/home/joshua2");
     assert(tildePath("/x", "/") == "/x");
-
-    ushort r, c;
-    assert(parseCursorReport(cast(const(ubyte)[]) "\x1b[12;5R", r, c) && r == 12 && c == 5);
-    assert(!parseCursorReport(cast(const(ubyte)[]) "\x1b[12R", r, c));
-    assert(installSequence(24, 10, 1) == "\x1b[1;23r\x1b[10;1H\x1b7\x1b[1;1H\x1b[13L\x1b8\x1b[13B");
-    assert(installSequence(24, 0, 0) == "\n\x1b[1A\x1b7\x1b[1;23r\x1b8");
-    assert(resizeSequence(30) == "\x1b7\x1b[r\x1b8\x1b[J\x1b7\x1b[1;29r\x1b8");
 
     RateMeter m;
     assert(m.record(400, 0) == 0 && m.record(400, 100) == 0);

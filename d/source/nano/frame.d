@@ -315,8 +315,7 @@ final class FrameRenderer
     private void fullRedraw(const string[] frame, size_t width, size_t height)
     {
         auto buf = appender!string;
-        // Drop a scroll region a status line left, then clear the screen
-        // and scrollback: the frame re-emits the whole transcript.
+        // Drop any scroll region, then clear the screen and scrollback: the frame re-emits the whole transcript.
         buf ~= syncStart ~ "\x1b[r\x1b[H\x1b[2J\x1b[3J";
         auto physical = physicalRows(frame, width);
         buf ~= format("\x1b[%s;1H", physical < height ? height - physical + 1 : 1);

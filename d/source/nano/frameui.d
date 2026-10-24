@@ -84,7 +84,7 @@ struct FrameUi
     }
 
     /// Gives the terminal back (fd 1 and 2 to the tty) and returns the
-    /// transcript's lines, for a legacy replay.
+    /// transcript's lines.
     string[] uninstall()
     {
         stdOut.flush();

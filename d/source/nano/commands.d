@@ -125,7 +125,7 @@ string helpText()
     auto out_ = "Commands:";
     foreach (c; commands) out_ ~= format("\n  %-*s  %s", width, synopsis(c), c.description);
     out_ ~= "\nType / to list commands as you type; Tab completes commands and /model, /mode, /thinking arguments; Esc hides the list. Lines starting with / are never sent to the model: type // to send one that starts with /.";
-    out_ ~= "\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Esc Esc also clears the input at the prompt, Ctrl-O expands/collapses thinking, Shift+Tab cycles the mode (normal/plan/auto)";
+    out_ ~= "\nKeys: Enter during a turn steers the running turn, Ctrl-Enter queues the message (/queue lists, edits, removes), Esc Esc or Ctrl-C cancels the turn, Esc Esc also clears the input at the prompt, Shift+Tab cycles the mode (normal/plan/auto)";
     return out_;
 }
 

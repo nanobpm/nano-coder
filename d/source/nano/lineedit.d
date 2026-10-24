@@ -2,8 +2,9 @@
 /// terminal reader with UTF-8 and wide-character aware editing, multi-line
 /// input, history, bracketed paste, Tab completion and the slash-command menu.
 ///
-/// The editing model, key decoding and layout are pure and unit-tested; the
-/// `LineEditor` class wires them to a terminal.
+/// The editing model and key decoding are pure and unit-tested; the
+/// `LineEditor` class wires them to a terminal and draws only through the
+/// frame renderer (`nano.frame`).
 module nano.lineedit;
 
 import std.algorithm : min, max, canFind, startsWith;
@@ -27,8 +28,6 @@ enum K
     backspace, delete_, killEnd, clearLine, eraseWord, tab, escape, interrupt, eof, paste, ignored, closed,
     /// Shift-Tab (CSI Z): cycle the agent mode.
     cycleMode,
-    /// Ctrl-O: show or hide the model's thinking.
-    toggleThinking,
 }
 
 struct Key
@@ -64,7 +63,6 @@ Key decode(ByteSource next, int timeoutMs, ref ubyte[] utf8)
         case 0x09: return Key(K.tab);
         case 0x0b: return Key(K.killEnd);
         case 0x0e: return Key(K.down);
-        case 0x0f: return Key(K.toggleThinking);
         case 0x10: return Key(K.up);
         case 0x15: return Key(K.clearLine);
         case 0x17: return Key(K.eraseWord);
@@ -277,31 +275,6 @@ size_t textWidth(string s) pure
     return w;
 }
 
-struct Pos { size_t row, col; }
-
-/// Where each position lands when `buf` is drawn after a prompt `promptW`
-/// columns wide in a terminal `width` columns wide. Continuation lines (after
-/// a newline) are indented by `promptW`. Returns the cursor and end positions.
-void layout(const dchar[] buf, size_t promptW, size_t width, size_t cursor, out Pos cur, out Pos end) pure nothrow
-{
-    width = max(width, 2);
-    auto indent = promptW < width ? promptW : 0;
-    size_t row, col = promptW % width;
-    row = promptW / width;
-    Pos norm() { return col >= width ? Pos(row + 1, 0) : Pos(row, col); }
-    foreach (i, ch; buf)
-    {
-        auto w = ch == '\n' ? 0 : charWidth(ch);
-        // Wrap first, so a cursor before a wrapping character sits where it's drawn.
-        if (ch != '\n' && (col >= width || col + w > width)) { ++row; col = 0; }
-        if (i == cursor) cur = norm();
-        if (ch == '\n') { ++row; col = indent; continue; }
-        col += w;
-    }
-    end = norm();
-    if (cursor >= buf.length) cur = end;
-}
-
 /// The editable line: text as code points, a cursor, history.
 struct EditState
 {
@@ -486,36 +459,39 @@ final class LineEditor
 {
     EditState state;
     private ByteSource src;
-    private void delegate(string) @safe out_;
     private size_t delegate() @safe width;
     /// Terminal rows (for `select`'s window); null means 24.
     size_t delegate() @safe rows;
     private size_t height() { return rows is null ? 24 : rows(); }
-    private size_t drawnRow;
     private bool drawn;
     private string prompt, styledPrompt, notice;
     /// A dim hint shown under the next prompt until a key is pressed
     /// (e.g. "(Ctrl-C again to exit)"); consumed by the next read.
     string hint;
-    private size_t promptW;
     private ubyte[] utf8;
     private int pushback = -1;
     private long lastEscMs = long.min / 2;
     long delegate() @safe nowMs;
-    /// Shift-Tab / Ctrl-O: run with the input erased, then the input is redrawn.
+    /// Shift-Tab: run with the input erased, then the input is redrawn.
     void delegate(K) @safe onAction;
     /// On submit, the styled prompt to redraw the line with (Rust's
     /// `restamp_prompt`: the timestamp becomes the submission time). It must
     /// keep the prompt's visible width.
     string delegate() @safe restyle;
 
-    this(ByteSource src, void delegate(string) @safe out_, size_t delegate() @safe width)
+    /// The editor draws only through the frame renderer (`nano.frame`):
+    /// `frameDraw` gets the editor rows (cursor marked) whenever they change
+    /// (null to clear them), and `frameCommit` the line a finished prompt or
+    /// picker leaves behind.
+    this(ByteSource src, void delegate(string[] rows) @safe frameDraw, void delegate(string line) @safe frameCommit,
+        size_t delegate() @safe width)
     {
+        this.frameDraw = frameDraw;
+        this.frameCommit = frameCommit;
         this.src = (int t) {
             if (pushback >= 0) { auto b = pushback; pushback = -1; return b; }
             return src(t);
         };
-        this.out_ = out_;
         this.width = width;
         nowMs = () {
             import core.time : MonoTime;
@@ -548,11 +524,8 @@ final class LineEditor
 
     private bool plain, masked;
 
-    /// Frame mode (`nano.frame`): the editor doesn't draw. `frameDraw` gets
-    /// the editor rows (cursor marked) whenever they change, and
-    /// `frameCommit` the line a finished prompt or picker leaves behind.
-    void delegate(string[] rows) @safe frameDraw;
-    void delegate(string line) @safe frameCommit;
+    private void delegate(string[] rows) @safe frameDraw;
+    private void delegate(string line) @safe frameCommit;
 
     private void drawFrame(string[] menuRows)
     {
@@ -571,10 +544,9 @@ final class LineEditor
     {
         this.prompt = prompt;
         this.styledPrompt = styledPrompt;
-        promptW = textWidth(prompt);
         notice = hint;
         hint = null;
-        if (!turn || state.buf.length || frameDraw !is null) render();
+        render();
         for (;;)
         {
             auto key = decode(src, stop is null ? -1 : 100, utf8);
@@ -624,7 +596,7 @@ final class LineEditor
                 case K.clearLine: state.clear(); break;
                 case K.eraseWord: state.eraseWord(); break;
                 case K.tab: state.tab(); break;
-                case K.cycleMode, K.toggleThinking:
+                case K.cycleMode:
                     if (onAction is null) break;
                     erase();
                     onAction(key.kind);
@@ -662,7 +634,7 @@ final class LineEditor
     ptrdiff_t select(string prompt, const string[] labels, size_t initial = 0)
     {
         size_t at = initial < labels.length ? initial : 0;
-        size_t drawnRows, top;
+        size_t top;
         // At most `visible` rows show; the window scrolls to keep `at` in it.
         size_t visible = labels.length;
         {
@@ -673,41 +645,19 @@ final class LineEditor
         }
         void draw(bool final_)
         {
-            if (frameDraw !is null)
-            {
-                auto fw = max(width(), 2);
-                if (final_)
-                {
-                    frameDraw(null);
-                    frameCommit("\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m");
-                    return;
-                }
-                if (at < top) top = at;
-                if (at >= top + visible) top = at + 1 - visible;
-                string[] rows = ["\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, fw - 3) ~ "\x1b[0m"];
-                foreach (k; top .. top + visible)
-                    rows ~= k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], fw - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], fw - 3);
-                frameDraw(rows);
-                return;
-            }
-            string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
-            s ~= "\r\x1b[J";
-            auto w = max(width(), 2);
+            auto fw = max(width(), 2);
             if (final_)
             {
-                s ~= "\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], w / 2) ~ "\x1b[0m\n";
-                out_(s);
-                drawnRows = 0;
+                frameDraw(null);
+                frameCommit("\x1b[32m?\x1b[0m " ~ prompt ~ " \x1b[36m" ~ fitCols(labels[at], fw / 2) ~ "\x1b[0m");
                 return;
             }
-            s ~= "\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, w - 3) ~ "\x1b[0m";
             if (at < top) top = at;
             if (at >= top + visible) top = at + 1 - visible;
+            string[] rows = ["\x1b[32m?\x1b[0m \x1b[1m" ~ fitCols(prompt, fw - 3) ~ "\x1b[0m"];
             foreach (k; top .. top + visible)
-                s ~= "\r\n" ~ (k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], w - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], w - 3));
-            s ~= "\r";
-            out_(s);
-            drawnRows = visible;
+                rows ~= k == at ? "\x1b[36m❯ " ~ fitCols(labels[k], fw - 3) ~ "\x1b[0m" : "  " ~ fitCols(labels[k], fw - 3);
+            frameDraw(rows);
         }
         draw(false);
         for (;;)
@@ -722,9 +672,7 @@ final class LineEditor
                     return at;
                 case K.escape, K.interrupt, K.eof, K.closed:
                     if (key.kind == K.escape && key.text.length) pushback = 0x1b;
-                    if (frameDraw !is null) { frameDraw(null); return -1; }
-                    string s = drawnRows ? format("\x1b[%sA", drawnRows) : "";
-                    out_(s ~ "\r\x1b[J");
+                    frameDraw(null);
                     return -1;
                 case K.insert:
                     import std.ascii : isDigit;
@@ -752,78 +700,31 @@ final class LineEditor
         return r ~ "…";
     }
 
-    /// Remove what the editor drew (the cursor ends at its first row).
+    /// Remove what the editor drew.
     void erase()
     {
         if (!drawn) return;
-        if (frameDraw !is null) { frameDraw(null); drawn = false; return; }
-        out_((drawnRow ? format("\x1b[%sA", drawnRow) : "") ~ "\r\x1b[J");
+        frameDraw(null);
         drawn = false;
-        drawnRow = 0;
     }
 
     private void finish()
     {
+        import std.conv : to;
         if (restyle !is null) styledPrompt = restyle();
-        if (frameDraw !is null)
-        {
-            import std.conv : to;
-            auto text = masked ? replicateD('*', state.buf.length).to!string : state.text;
-            frameCommit(styledPrompt ~ text);
-            drawn = false;
-            return;
-        }
-        state.cursor = state.buf.length;
-        render(false);
-        out_("\n");
+        auto text = masked ? replicateD('*', state.buf.length).to!string : state.text;
+        frameCommit(styledPrompt ~ text);
         drawn = false;
-        drawnRow = 0;
     }
 
-    private void render(bool extras = true)
+    private void render()
     {
-        if (frameDraw !is null)
-        {
-            string[] extra;
-            if (extras)
-            {
-                if (notice.length) extra = [notice];
-                else if (!plain) extra = state.menu(max(width(), 2), menuRows);
-            }
-            drawFrame(extra);
-            drawn = true;
-            return;
-        }
-        auto w = max(width(), 2);
-        Pos cur, end;
-        layout(state.buf, promptW, w, state.cursor, cur, end);
-        string s = drawn && drawnRow ? format("\x1b[%sA", drawnRow) : "";
-        s ~= "\r\x1b[J" ~ styledPrompt;
-        auto indent = promptW < w ? promptW : 0;
-        foreach (ch; state.buf)
-        {
-            if (ch == '\n') s ~= "\r\n" ~ spaces(indent);
-            else s ~= masked ? "*" : ch.to!string;
-        }
-        // At exactly the right margin the terminal defers the wrap: force it.
-        if (end.col == 0 && end.row > 0 && (state.buf.length ? state.buf[$ - 1] != '\n' : true)) s ~= " \r\x1b[K";
-        string[] rows;
-        if (extras)
-        {
-            if (notice.length) rows = [notice];
-            else if (!plain) rows = state.menu(w, menuRows);
-        }
-        foreach (r; rows) s ~= "\r\n" ~ r;
-        auto up = end.row + rows.length - cur.row;
-        if (up) s ~= format("\x1b[%sA", up);
-        s ~= "\r";
-        if (cur.col) s ~= format("\x1b[%sC", cur.col);
-        out_(s);
+        string[] extra;
+        if (notice.length) extra = [notice];
+        else if (!plain) extra = state.menu(max(width(), 2), menuRows);
+        drawFrame(extra);
         drawn = true;
-        drawnRow = cur.row;
     }
-
-    private static string spaces(size_t n) pure { string r; foreach (_; 0 .. n) r ~= ' '; return r; }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,13 +851,16 @@ version (unittest)
         };
     }
 
-    /// Heap-allocated so the editor's output delegate can outlive the test frame (DIP1000).
+    /// What the editor sent the frame: drawn rows (joined), `<ERASE>` for a
+    /// clear and `<COMMIT …>` for a committed line. Heap-allocated so the
+    /// editor's delegates can outlive the test frame (DIP1000).
     final class Screen { string text; }
 
     LineEditor editor(string keys, Screen screen, size_t w = 40)
     {
-        auto e = new LineEditor(script(keys), (string s) { screen.text ~= s; }, () => w);
-        return e;
+        import std.array : join;
+        return new LineEditor(script(keys), (string[] rows) { screen.text ~= rows is null ? "<ERASE>" : rows.join("\n"); },
+            (string line) { screen.text ~= "<COMMIT " ~ line ~ ">"; }, () => w);
     }
 }
 
@@ -977,18 +881,18 @@ unittest // editing keys
     assert(e.readLine("> ", "> ").text == "y");
 }
 
-unittest // Shift-Tab and Ctrl-O run the action with the input erased, keeping the text
+unittest // Shift-Tab runs the action with the input erased, keeping the text; Ctrl-O does nothing
 {
-    import std.algorithm : endsWith;
     auto screen = new Screen;
     K[] seen;
     auto e = editor("ab\x1b[Zc\x0f\x1b[111;5u\r", screen);
     e.onAction = (K k) { seen ~= k; screen.text ~= "<ACT>"; };
     assert(e.readLine("> ", "> ").text == "abc");
-    assert(seen == [K.cycleMode, K.toggleThinking, K.toggleThinking]);
-    // Erased (cursor to column 0, clear below) right before the action.
-    assert(screen.text.canFind("\r\x1b[J<ACT>"));
-    // Without a handler they do nothing.
+    assert(seen == [K.cycleMode]);
+    // Erased right before the action; the line is committed at the end.
+    assert(screen.text.canFind("<ERASE><ACT>"));
+    assert(screen.text.canFind("<COMMIT > abc>"));
+    // Without a handler it does nothing.
     e = editor("a\x1b[Zb\x0f\r", screen);
     assert(e.readLine("> ", "> ").text == "ab");
 }
@@ -1045,7 +949,7 @@ unittest // slash commands: Tab, menu, rejection, Esc
     screen.text = null;
     e = editor("/exin\r\x7f\x7fit\r", screen);
     assert(e.readLine("> ", "> ").text == "/exit");
-    assert(screen.text.canFind("Did you mean /exit?"));
+    assert(screen.text.canFind("Unknown command /exin"));
     // Esc hides the menu; Esc Esc clears at the prompt and cancels in a turn.
     long t;
     e = editor("/h\x1b\x1b\xffok\r", screen);
@@ -1088,20 +992,10 @@ unittest // stop keeps the typed text
     bool stopNow;
     size_t i;
     auto keys = "dra";
-    auto e = new LineEditor((int) => i < keys.length ? cast(int) keys[i++] : -1, (string s) { screen ~= s; }, () => 40);
+    auto e = new LineEditor((int) => i < keys.length ? cast(int) keys[i++] : -1, (string[] rows) { screen ~= "."; },
+        (string line) { screen ~= line; }, () => 40);
     assert(e.readLine("", "", true, () { stopNow = i >= keys.length; return stopNow; }).outcome == Outcome.stopped);
     assert(e.state.text == "dra");
-}
-
-unittest // layout: wrapping, wide chars, newlines, exact margin
-{
-    Pos c, e;
-    layout("abcdef"d.dup, 2, 4, 6, c, e);
-    assert(e == Pos(2, 0) && c == e);
-    layout("ab世"d.dup, 2, 5, 2, c, e); // 世 doesn't fit at col 4: wraps
-    assert(c == Pos(1, 0) && e == Pos(1, 2));
-    layout("ab\ncd"d.dup, 2, 40, 3, c, e);
-    assert(c == Pos(1, 2) && e == Pos(1, 4));
 }
 
 unittest // escape parsing

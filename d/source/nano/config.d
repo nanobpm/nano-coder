@@ -241,8 +241,10 @@ struct Config
     double temperature = 0.7;
     /// Top-level `context_window`: overrides every provider's.
     long contextWindow;
-    /// The interactive renderer (`renderer`): `legacy` or `frame`.
-    string renderer = "frame";
+    /// The retired `renderer` setting. Only the frame renderer remains (Rust
+    /// #133); the key is still read so an old `renderer = "legacy"` loads and
+    /// gets a one-line notice (`retiredRendererNotice`). Never written.
+    string retiredRenderer;
     /// Dim `HH:MM:SS` stamps on the prompt and transcript (`timestamps`).
     bool timestamps = true;
     /// Output detail (`verbosity`): quiet, normal, verbose or debug.
@@ -299,6 +301,16 @@ struct Config
         return buildPath(expandTilde("~"), ".config", "nano-coder", "config.toml");
     }
 
+    /// A notice for a config that still sets the retired `renderer` option
+    /// to anything but `frame` (the only renderer left).
+    string retiredRendererNotice() const
+    {
+        import std.string : strip;
+        if (retiredRenderer is null || retiredRenderer.strip == "frame") return null;
+        return format("Note: renderer = %s is no longer available; using the frame renderer (remove the setting)",
+            imported!"std.json".JSONValue(retiredRenderer).toString);
+    }
+
     static Config load(string path)
     {
         Config c;
@@ -314,12 +326,7 @@ struct Config
         if (auto v = "vision" in doc) c.vision = v.boolean;
         if (auto v = "timestamps" in doc) c.timestamps = v.boolean;
         if (auto v = "context_window" in doc) c.contextWindow = v.integer;
-        if (auto v = "renderer" in doc)
-        {
-            if (v.str != "legacy" && v.str != "frame")
-                throw new Exception(format("unknown renderer %s (legacy, frame)", v.str));
-            c.renderer = v.str;
-        }
+        if (auto v = "renderer" in doc) c.retiredRenderer = v.str;
         if (auto v = "system_prompt" in doc) c.systemPrompt = v.str;
         if (auto v = "verbosity" in doc) c.verbosity = imported!"nano.ui".parseVerbosity(v.str);
         if (auto v = "max_iterations" in doc) c.maxIterations = v.integer;
@@ -509,6 +516,21 @@ unittest
     assert(isNaN(c.temperature));
     auto a = resolve(c, "anthropic");
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
+}
+
+unittest // a retired `renderer = "legacy"` still loads, with a notice
+{
+    import std.algorithm : canFind;
+    import std.file : write, tempDir, remove;
+    auto path = buildPath(tempDir, "nano-coder-d-renderer-test.toml");
+    scope (exit) remove(path);
+    write(path, "model = \"work/x\"\n");
+    assert(Config.load(path).retiredRendererNotice is null);
+    write(path, "model = \"work/x\"\nrenderer = \"frame\"\n");
+    assert(Config.load(path).retiredRendererNotice is null);
+    write(path, "model = \"work/x\"\nrenderer = \"legacy\"\n");
+    assert(Config.load(path).retiredRendererNotice
+        == `Note: renderer = "legacy" is no longer available; using the frame renderer (remove the setting)`);
 }
 
  unittest

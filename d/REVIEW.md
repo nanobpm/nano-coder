@@ -115,8 +115,8 @@ rejects unsynchronised access at compile time. `safeio.Locked!T` holds a
 value reachable only under its lock, and refuses a `T` with unshared mutable
 references (`hasUnsharedAliasing`), so nothing read out of it can alias the
 locked copy. That is the closest D gets to `Send`/`Sync`. The turn controls
-(`TurnControl`: steering, model requests, mode, cancel), the legacy status
-bar (`StatusLine`) and its figures (`gStats`) are `shared` objects built on
+(`TurnControl`: steering, model requests, mode, cancel) and the status
+bar's figures (`gStats`) are `shared` objects built on
 it. `Steer` stores its ACP request id as JSON text so it can cross threads.
 
 One `__gshared` escape remains, in a `safeio` wrapper: the saved `termios`
@@ -145,7 +145,7 @@ A prototype of Rust's `Send` rule, enforced by `safeio` types and
   is capped like `@trusted` (`scripts/isolation-budget`: 5).
 
 Every thread now starts through `spawn`:
-- resize watcher; piped-stdin reader (inbox is a `Chan!string`).
+- piped-stdin reader (inbox is a `Chan!string`).
 - session titles: the client is built on the main thread and moved over as
   `Isolated!LLMClient`.
 - ACP stdin reader: `AcpRouter`, a handle over `Shared` state (queued

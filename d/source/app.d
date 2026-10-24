@@ -448,19 +448,11 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
 /// globals: the editor moves to the turn's key reader thread.
 LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
 {
-    auto editor = new LineEditor(fdSource(0), (string s) {
-        import std.algorithm.searching : canFind;
-        // The editor's erase-to-end-of-screen wipes the status row too.
-        writeFd(1, gStatus !is null && s.canFind("\x1b[J") ? s ~ gStatus.sequence() : s);
-    }, () => terminalWidth());
+    auto editor = new LineEditor(fdSource(0), (string[] rows) { gFrame.draw(rows); },
+        (string line) { gFrame.commit(line); }, () => terminalWidth());
     editor.rows = () => terminalHeight();
     editor.onAction = (K k) {
         bool inTurn = atomicLoad(gTurnRunning);
-        if (k == K.toggleThinking)
-        {
-            console.toggleThinking(inTurn);
-            return;
-        }
         // The system prompt follows at the next turn (`syncMode`).
         AgentMode m = nextMode(control.mode());
         control.mode = m;
@@ -469,13 +461,6 @@ LineEditor makeEditor(ConsoleLink console, shared TurnControl control)
         else console.note(format("Mode: %s (%s)", m.name, m.describe));
     };
     return editor;
-}
-
-/// Routes the editor's drawing through the frame renderer (or back).
-void attachFrame(LineEditor editor, bool on)
-{
-    editor.frameDraw = on ? (string[] rows) { gFrame.draw(rows); } : null;
-    editor.frameCommit = on ? (string line) { gFrame.commit(line); } : null;
 }
 
 /// A frozen copy of `cfg`, for another thread.
@@ -513,9 +498,6 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
     }
     return Answer(Answered(answers.idup));
 }
-
-/// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).
-shared bool gThinkingExpanded;
 
 // The output detail level (ui.rs's global verbosity), read live by Console.
 import nano.ui : Verbosity, parseVerbosity, verbosityListing, providersListing;
@@ -576,13 +558,8 @@ private string spaces(size_t n) { import std.array : replicate; return " ".repli
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
 void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }
 
-// The pinned status line (status.rs), when installed, and what it shows.
-import nano.status : StatusLine, Stats, Activity, RateMeter, tildePath;
-/// The legacy status bar, if installed; redrawn by the resize watcher.
-shared StatusLine gStatus_;
-shared(StatusLine) gStatus() nothrow @nogc { return atomicLoad(gStatus_); }
-void gStatus(shared StatusLine s) nothrow @nogc { atomicStore(gStatus_, s); }
-/// The frame renderer, when `renderer = "frame"` drives the terminal.
+// What the frame's status bar shows (status.rs).
+import nano.status : Stats, Activity, RateMeter, tildePath;
 /// The frame renderer (`FrameUi.init` when off): set by the main thread,
 /// used by any.
 shared Locked!FrameUi gFrameCell;
@@ -601,19 +578,17 @@ string frameStatus(size_t width)
     return renderStatus(stats, width);
 }
 
-/// The status bar's figures, read and changed under their lock by the turn,
-/// the resize watcher and the renderers.
+/// The status bar's figures, read and changed under their lock by the turn
+/// and the renderer.
 shared Locked!Stats gStats;
-shared bool gResized;
 shared static this() { gStats = new shared Locked!Stats; }
 
-/// Change the status line's stats and redraw it (no-op without one).
+/// Change the status bar's stats and redraw it (no-op without a frame).
 void updateStatus(scope void delegate(ref Stats) @safe f)
 {
-    if (gStatus is null && !gFrame) return;
+    if (!gFrame) return;
     gStats.update(f);
-    if (gStatus !is null) gStatus.draw();
-    if (gFrame) gFrame.redraw();
+    gFrame.redraw();
 }
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
@@ -655,8 +630,8 @@ struct Screen
     bool color, tty;
     private bool midLine;
     private bool thinking, blockExpanded, streamedThinking;
-    private string thinkText, lastThinking;
-    private long thinkStart, lastDraw;
+    private string thinkText;
+    private long thinkStart;
     // The thinking block's stamp, and whether an answer segment is streaming
     // (its first line got a stamp, so later lines are padded under it).
     private string blockStamp;
@@ -705,23 +680,6 @@ struct Screen
 
     private string thinkStyle(string s) { return color ? "\x1b[38;5;245m" ~ s ~ "\x1b[0m" : s; }
 
-    /// The one-line view of a streaming block.
-    private string collapsedLine()
-    {
-        import std.array : split, join;
-        import std.range : walkLength, drop;
-        import std.conv : to;
-        enum prefix = "∴ Thinking: ", suffix = "  (ctrl+o to expand)";
-        auto w = isTerminal(1) ? terminalWidth() : 80;
-        auto fixed = prefix.walkLength + suffix.length + 1 + (blockStamp.length ? stampWidth : 0);
-        auto room = w > fixed ? w - fixed : 0;
-        auto flat = sanitizeLine(thinkText.split.join(" "));
-        auto count = flat.walkLength;
-        auto tail = count > room ? "…" ~ flat.drop(count - room + 1).to!string : flat;
-        return color ? "\r\x1b[2K" ~ blockStamp ~ "\x1b[38;5;245m" ~ prefix ~ "\x1b[2m" ~ tail ~ suffix ~ "\x1b[0m"
-            : "\r\x1b[2K" ~ blockStamp ~ prefix ~ tail ~ suffix;
-    }
-
     private void thinkingDelta(string chunk)
     {
         import std.string : stripLeft;
@@ -734,9 +692,8 @@ struct Screen
             blockStamp = stamp();
             thinkText = null;
             thinkStart = nowMs();
-            lastDraw = long.min / 2;
-            blockExpanded = verbose || atomicLoad(gThinkingExpanded);
-            if (blockExpanded) write(blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
+            blockExpanded = verbose;
+            if (blockExpanded) write(blockStamp ~ thinkStyle("∴ Thinking") ~ "\n");
         }
         bool first = !thinkText.length;
         thinkText ~= chunk;
@@ -744,12 +701,6 @@ struct Screen
         {
             auto t = first ? chunk.stripLeft : chunk;
             if (t.length) writeAligned(thinkStyle(t), blockStamp.length ? stampWidth : 0);
-        }
-        else if (tty && nowMs() - lastDraw >= 50)
-        {
-            lastDraw = nowMs();
-            write(collapsedLine());
-            midLine = true;
         }
         stdOut.flush();
     }
@@ -768,47 +719,10 @@ struct Screen
         {
             auto secs = (nowMs() - thinkStart) / 1000.0;
             auto chars = thinkText.strip.walkLength;
-            auto clear = tty ? "\r\x1b[2K" : "";
-            write(clear ~ blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars (ctrl+o to expand)", chars))
-                ~ "\n");
+            write(blockStamp ~ thinkStyle(format("∴ Thought for %.1fs", secs)) ~ dim(format(" · %s chars", chars)) ~ "\n");
         }
         midLine = false;
-        auto t = thinkText.strip;
-        if (t.length) lastThinking = sanitizeBlock(t);
         stdOut.flush();
-    }
-
-    /// Ctrl-O. Mid-block it switches the live view; between turns it prints a
-    /// note (with the last thinking when expanding). Returns whether it printed.
-    bool toggleThinking(bool inTurn)
-    {
-        bool expanded = !atomicLoad(gThinkingExpanded);
-        atomicStore(gThinkingExpanded, expanded);
-        if (thinking)
-        {
-            blockExpanded = expanded;
-            if (expanded)
-            {
-                write((tty ? "\r\x1b[2K" : "\n") ~ blockStamp ~ thinkStyle("∴ Thinking ") ~ dim("(ctrl+o to collapse)") ~ "\n");
-                midLine = false;
-                writeAligned(thinkStyle(sanitizeBlock(std.string.stripLeft(thinkText))), blockStamp.length ? stampWidth : 0);
-            }
-            else
-            {
-                write("\n" ~ collapsedLine());
-            }
-            midLine = true;
-            stdOut.flush();
-            return false;
-        }
-        if (inTurn) return false;
-        string note = !expanded ? dim("thinking will be collapsed") ~ "\n"
-            : !lastThinking.length ? dim("thinking will be shown in full (no thinking yet)") ~ "\n"
-            : thinkStyle("∴ Last thinking ") ~ dim("(shown in full from now on; ctrl+o to collapse)") ~ "\n"
-                ~ thinkStyle(lastThinking) ~ "\n";
-        write("\r\x1b[2K" ~ note);
-        stdOut.flush();
-        return true;
     }
 
     /// A streamed chunk of reasoning or answer.
@@ -882,8 +796,6 @@ struct ConsoleLink
     /// A line of its own, mid-stream or not (the live thinking line redraws below it).
     void note(string text) { screen.update((ref Screen s) { s.note(text); }); }
     void endLine() { screen.update((ref Screen s) { s.endLine(); }); }
-    /// See `Screen.toggleThinking`.
-    bool toggleThinking(bool inTurn) { return screen.update!bool((ref Screen s) => s.toggleThinking(inTurn)); }
 }
 
 class Console : AgentEvents
@@ -920,10 +832,6 @@ class Console : AgentEvents
         return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
     }
 
-    /// Ctrl-O. Mid-block it switches the live view; between turns it prints a
-    /// note (with the last thinking when expanding). Returns whether it printed.
-    bool toggleThinking(bool inTurn) { return link.toggleThinking(inTurn); }
-
     string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
     string bold(string s) { return color ? "\x1b[1m" ~ s ~ "\x1b[0m" : s; }
     string red(string s) { return color ? "\x1b[31m" ~ s ~ "\x1b[0m" : s; }
@@ -932,7 +840,7 @@ class Console : AgentEvents
 
     void text(bool reasoning, string chunk)
     {
-        if (gStatus !is null || gFrame)
+        if (gFrame)
         {
             auto rate = meter.record(chunk.length, nowMs);
             if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
@@ -1203,30 +1111,6 @@ string contextReport(Agent agent)
         : "Auto-compact: off";
     out_ ~= format("Compaction:   %s mode (/compact --smart or --standard overrides once)", modeName(agent.compactionMode));
     return out_.join("\n");
-}
-
-/// Redraw the status line after the terminal is resized (SIGWINCH sets a
-/// flag; a daemon thread redraws, as signal handlers can't write safely).
-void watchResize()
-{
-    static void redrawOnResize()
-    {
-        import core.thread : Thread;
-        import core.time : msecs;
-        for (;;)
-        {
-            Thread.sleep(100.msecs);
-            if (cas(&gResized, true, false) && gStatus !is null) gStatus.draw();
-        }
-    }
-    import nano.safeio : onSignal;
-    enum SIGWINCH = 28; // macOS and Linux
-    extern (C) static void onWinch(int) nothrow @nogc { atomicStore(gResized, true); }
-    static bool watching;
-    if (watching) return;
-    watching = true;
-    onSignal(SIGWINCH, &onWinch);
-    spawnDaemon(&redrawOnResize);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
@@ -1689,7 +1573,7 @@ int runMain(string[] args)
             heldLines = Chan!string.make;
             auto mid = MidTurn(atomicLoad(agent.control), view, [frozenConfig(cfg)]);
             // Isolated: `editor` is set to null until the join hands it back,
-            // and its callbacks (built by `makeEditor` and `attachFrame`)
+            // and its callbacks (built by `makeEditor`)
             // reach only shared state.
             auto owned = Isolated!LineEditor.assumeIsolated(editor);
             editor = null;
@@ -1735,43 +1619,19 @@ int runMain(string[] args)
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
         && environment.get("NANO_CODER_PLAIN_INPUT") is null && enterKeyMode(0))
     {
+        // The app owns the screen and re-renders it (`nano.frameui`); the
+        // editor draws only through it.
+        gFrame = FrameUi.install(&frameStatus);
+        if (!gFrame)
+        {
+            leaveKeyMode();
+            die("could not start the terminal renderer");
+        }
         editor = makeEditor(console.link, atomicLoad(agent.control));
         questions.interactive = true;
+        refreshStatus();
     }
     scope (exit) leaveKeyMode();
-    // Legacy: a status line pinned under a scroll region. Frame: the app
-    // owns the screen and re-renders it (`renderer`).
-    void useRenderer(string mode)
-    {
-        if (editor is null) return;
-        if (mode == "frame" && !gFrame)
-        {
-            if (gStatus !is null) { gStatus.teardown(); gStatus = null; }
-            gFrame = FrameUi.install(&frameStatus);
-            if (!gFrame) return;
-            attachFrame(editor, true);
-            refreshStatus();
-        }
-        else if (mode == "legacy" && gFrame)
-        {
-            auto lines = gFrame.uninstall();
-            gFrame = FrameUi.init;
-            attachFrame(editor, false);
-            // The frame's redraws cleared the scrollback: replay its transcript.
-            write("\x1b[H\x1b[2J\x1b[3J");
-            foreach (l; lines) writeln(l);
-            stdOut.flush();
-            gStatus = StatusLine.install(atomicLoad(gStats));
-            if (gStatus !is null) { refreshStatus(); watchResize(); }
-        }
-        else if (mode == "legacy" && gStatus is null)
-        {
-            gStatus = StatusLine.install(atomicLoad(gStats));
-            if (gStatus !is null) { refreshStatus(); watchResize(); }
-        }
-    }
-    useRenderer(cfg.renderer);
-    scope (exit) if (gStatus !is null) gStatus.teardown();
     scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
     if (interactive && editor is null)
     {
@@ -1797,6 +1657,7 @@ int runMain(string[] args)
         }
         if (skills !is null && skills.names.length) banner ~= "Skills: " ~ skills.names.join(", ");
         if (skills !is null) foreach (w; skills.warnings) banner ~= "Skills warning: " ~ w;
+        if (auto note = cfg.retiredRendererNotice) banner ~= note;
         banner ~= "Type /help for commands";
         writeln(stampBlock(console.stamp(), banner.join("\n")));
     }
@@ -1890,8 +1751,6 @@ int runMain(string[] args)
                     sysPlan = false;
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();
-                    else if (gStatus !is null) gStatus.clear();
-                    else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdOut.flush(); }
                     refreshStatus();
                     if (log !is null) writefln("Session: %s (resume with --resume %s)", log.id, log.id);
                     else writefln("Session: %s", newSessionId());
@@ -2067,7 +1926,6 @@ int runMain(string[] args)
                     {
                         auto h = settingsHost();
                         foreach (n; runSettings(new EditorUi(editor), h)) writeln(n);
-                        useRenderer(cfg.renderer);
                     }
                     refreshStatus();
                     continue;

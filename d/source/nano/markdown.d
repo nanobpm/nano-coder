@@ -19,8 +19,8 @@
 /// This only changes what the terminal shows: session logs, transcripts, ACP
 /// and piped output keep the original markdown. Rust's frame renderer keeps
 /// typed items and re-renders whole messages; D's transcript is the printed
-/// lines, so the console streams answers through `MarkdownStream` (Rust's
-/// legacy-renderer path) in both renderers.
+/// lines, so the console streams answers through `MarkdownStream` (the path
+/// Rust used for its retired legacy renderer).
 module nano.markdown;
 
 @safe:
