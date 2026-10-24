@@ -87,6 +87,22 @@ directory works; it's kept separate by default so the port can't damage real ses
   every loaded image at launch, which cost about 140M instructions per start.
   Exporting only `main` lets the linker bind them locally. Stack traces are unaffected.
 
+## Parity tracking
+
+The Rust test suite is the feature specification. `parity/manifest.tsv` lists every Rust
+test (`FILE::NAME`) with a status: `test` (a D unittest carries a `// rust: FILE::NAME`
+marker), `claimed` (ported per this file, no linked test yet), `gap` (not ported; the note
+says what's missing), `na` (doesn't apply; the note says why) or `todo` (not triaged).
+`scripts/check-parity.py` (CI job "Rust parity manifest") fails when:
+
+- Rust gains a test the manifest doesn't list (`--update` adds it as `todo`);
+- a `test` row has no marker, or a marker isn't backed by a `test` row;
+- Rust commits touched `src/` after `parity/BASELINE` (triage them, then move it);
+- `todo` + `claimed` rises above `parity/budget` (a ratchet: lower it, never raise it).
+
+So a new Rust feature can't land unnoticed, and "ported" means a named D test. To port a
+behaviour: write the D unittest, put the marker on the line above it, set the row to `test`.
+
 ## Not ported yet (by Rust module)
 
 Roughly in dependency order. Sizes are Rust lines.

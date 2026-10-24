@@ -46,3 +46,17 @@ jobs:
           compiler: ldc-1.43.0
       - run: ./scripts/check-safe.sh
       - run: dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source
+
+  parity:
+    name: Rust parity manifest
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: d
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # Every Rust test must have a row in d/parity/manifest.tsv, and Rust
+      # commits after d/parity/BASELINE must be triaged.
+      - run: git fetch --no-tags origin main && python3 scripts/check-parity.py --ref origin/main

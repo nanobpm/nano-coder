@@ -1,0 +1,3 @@
+0b4ad1f
+# The last Rust commit triaged for the D port. #143 (release the stats lock
+# before printing) is Rust lock scope only: n/a.
