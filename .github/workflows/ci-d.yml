@@ -32,3 +32,17 @@ jobs:
       - run: dub test
       - run: dub build -b release
       - run: ./nano-coder-d --version
+
+  lint:
+    name: D-Scanner
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: d
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-1.43.0
+      - run: ./scripts/check-safe.sh
+      - run: dub run -q dscanner@0.16.0-beta.5 -- --styleCheck --config dscanner.ini source

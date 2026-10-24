@@ -247,7 +247,7 @@ string readPaste(ByteSource next)
         if (ch == '\n' && cr) { cr = false; continue; }
         cr = false;
         if (ch == '\t') out_ ~= "    ";
-        else if (ch == '\n' || ch >= 0x20 && ch != 0x7f && ch != 0xfffd) out_ ~= ch.to!string;
+        else if (ch == '\n' || (ch >= 0x20 && ch != 0x7f && ch != 0xfffd)) out_ ~= ch.to!string;
     }
     return out_;
 }

@@ -189,7 +189,7 @@ private bool htmlStart(string t, out bool interrupts) pure
     if (t.length < 2 || t[0] != '<') return false;
     if (t.length >= 4 && t[0 .. 4] == "<!--") { interrupts = true; return true; }
     size_t j = t[1] == '/' ? 2 : 1, k = j;
-    while (k < t.length && ((t[k] | 0x20) >= 'a' && (t[k] | 0x20) <= 'z' || (k > j && t[k] >= '0' && t[k] <= '9'))) k++;
+    while (k < t.length && (((t[k] | 0x20) >= 'a' && (t[k] | 0x20) <= 'z') || (k > j && t[k] >= '0' && t[k] <= '9'))) k++;
     if (k == j) return false;
     auto name = t[j .. k].toLower;
     bool known;

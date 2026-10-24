@@ -278,7 +278,7 @@ class Agent
                 auto title = cleanTitle(c.chat(req, null).content);
                 if (title !is null) setTitle(path, title); // false: another process won
             }
-            catch (Throwable) {}
+            catch (Exception) {} // a title is optional
         });
         t.isDaemon = true;
         { import nano.safeio : startThread; startThread(t); }
