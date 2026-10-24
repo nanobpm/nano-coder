@@ -63,8 +63,7 @@ The last casts away `const` were replaced too. A generic `@safe`
 copies `ProviderConfig` and `Message` out of `const`. A config resolved for a
 session no longer shares arrays or maps with the loaded table. Permission
 rules match through a per-thread compiled copy of their regex instead of
-`cast() pattern`. The status-bar `gStats` is now a `StatsCell` object that
-holds its own lock, instead of a `__gshared` struct with a separate lock.
+`cast() pattern`.
 
 The 6 left outside `safeio.d` are calls into C:
 
@@ -93,6 +92,8 @@ block.
 | Model | `Result<T, anyhow::Error>` in every signature. A call that can fail can't be ignored without `?` or a visible `unwrap`. | Exceptions. A function's signature doesn't say whether it can fail. **R** |
 | Panics and crashes | 108 `unwrap`/`expect` and 0 `panic!` outside tests. | D's `Error`s (bounds, assert, out of memory) are not `Exception`s, so they end the process, like an uncaught panic. **=** |
 | Tool failures | Typed `ToolError` returned to the model. | Same, plus any other `Exception` becomes "`<tool>` failed: …". **=** |
+| Exhaustive matching | `match` on enums must cover every variant. | `/queue` operations (`QueueOp`) and question answers (`Answer`) are `std.sumtype` types, whose `match` fails to compile if a variant is unhandled; each variant carries only its own fields. Other variants (`Thinking`, `thinking.Request`) are still a kind enum plus fields, checked by `final switch` on the kind only. **R** (narrowing) |
+| No-throw contracts | Errors are values in the signature. | About 150 functions carry `nothrow`, which the compiler checks (48 added by marking every function and keeping it where the build still passed). Everything else may throw without saying so. **R** |
 | Being explicit | Every fallible step shows. | 178 `catch (Exception)` blocks. Most turn failures into Rust's messages or fall back (best-effort file reads, probes), but nothing distinguishes the deliberate ones from the careless ones. **R** |
 
 ## 3. Concurrency
@@ -108,9 +109,20 @@ The D port uses plain threads:
 - the agent waits on a broker when the `question` tool runs;
 - a progress thread drives the status bar.
 
-Shared state goes through mutexes, `shared` and atomics. There are 9
-`__gshared` globals, all for the terminal and status bar. None of this is
-checked the way `Send`/`Sync` is. **R**
+Shared state is typed `shared` wherever practical, so `nosharedaccess`
+rejects unsynchronised access at compile time. `safeio.Locked!T` holds a
+value reachable only under its lock, and refuses a `T` with unshared mutable
+references (`hasUnsharedAliasing`), so nothing read out of it can alias the
+locked copy. That is the closest D gets to `Send`/`Sync`. The turn controls
+(`TurnControl`: steering, model requests, mode, cancel), the legacy status
+bar (`StatusLine`) and its figures (`gStats`) are `shared` objects built on
+it. `Steer` stores its ACP request id as JSON text so it can cross threads.
+
+Two `__gshared` escapes remain, both in `safeio` wrappers: the frame UI
+(`gFrame`, a `FrameUi` whose transcript, renderer and callbacks would need a
+deeper rewrite) and the saved `termios` restored at exit. Thread start and
+join, conditions and the question broker's mutex are still convention, not
+types. **R** (narrowing)
 
 Bugs found:
 - **The stdio lock deadlock.** A reader thread blocked in `readln` holds
