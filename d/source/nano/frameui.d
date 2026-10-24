@@ -9,7 +9,7 @@ module nano.frameui;
 import core.thread : Thread;
 import nano.frame;
 import nano.lineedit : writeFd, ttyOut, terminalWidth, terminalHeight;
-import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, startThread, stdErr, stdOut;
+import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, spawnUnchecked, stdErr, stdOut;
 
 final class FrameUi
 {
@@ -43,12 +43,12 @@ final class FrameUi
         lineBufferStdout();
         f.renderer = new FrameRenderer((string s) { writeFd(f.tty, s); });
         writeFd(f.tty, "\x1b[?25l");
-        auto reader = new Thread(&f.readLoop);
-        reader.isDaemon = true;
-        startThread(reader);
-        auto ticker = new Thread(&f.tickLoop);
-        ticker.isDaemon = true;
-        startThread(ticker);
+        // Unchecked: both loops share the frame with the main thread, and
+        // take its monitor (`synchronized (this)`) around every access; the
+        // `status` callback reads only `shared` state.
+        spawnUnchecked(&f.readLoop, true);
+        // Unchecked: as above.
+        spawnUnchecked(&f.tickLoop, true);
         f.redraw();
         return f;
     }

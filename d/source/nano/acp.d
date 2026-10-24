@@ -16,7 +16,7 @@ module nano.acp;
 
 @safe:
 
-import nano.safeio : signalOne, startThread, waitOn, stdErr, stdOut;
+import nano.safeio : signalOne, spawnUnchecked, waitOn, stdErr, stdOut;
 
 import std.json;
 import std.format : format;
@@ -383,13 +383,15 @@ final class AcpServer : AgentEvents
     {
         import core.thread : Thread;
         // FdLineReader, not std.stdio: see its comment.
-        auto reader = new Thread({
+        // Unchecked: `receive` runs on this thread and touches the server's
+        // turn routing (`steerMarks`, the inbox), all under `inbox.lock`;
+        // `turnActive` is atomic, `agent.control` is `shared`, and `send`
+        // takes `outLock`.
+        spawnUnchecked({
             auto input = FdLineReader(0);
             for (string line; (line = input.next()) !is null;) receive(line);
             close();
-        });
-        reader.isDaemon = true;
-        reader.startThread();
+        }, true);
         return run();
     }
 

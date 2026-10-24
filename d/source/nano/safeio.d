@@ -407,6 +407,223 @@ final class Locked(T) if (!hasUnsharedAliasing!T)
     static assert(!__traits(compiles, new shared Locked!(int[])));
 }
 
+// ---- Sendable-only threads ----------------------------------------------
+//
+// The "E profile": threads start only through `spawn`, which takes a plain
+// `function` (no hidden closure context) and arguments that are sendable,
+// and threads talk through `Channel`s of sendable values or `Locked` state.
+// check-safe.sh bans `new Thread` outside this module (bar a shrinking
+// budget), so data shared between threads is visible in the types.
+
+/// Whether a value of type `T` may be handed to another thread: it holds no
+/// unshared mutable references (immutable, `shared` or plain data, function
+/// pointers), or it is an `Isolated` whose holder gives it up. Delegates are
+/// not sendable: their context can reach anything.
+enum bool isSendable(T) = !hasUnsharedAliasing!T || is(T : Isolated!U, U);
+
+/// A value with exactly one owner: nothing outside it refers to it or to
+/// anything it reaches, so it may move to another thread. It can't be
+/// copied, only moved (`std.algorithm.move`) or taken with `unwrap`.
+struct Isolated(T)
+{
+    private T payload;
+    @disable this(this);
+
+    /// Claim that nothing else refers to `value` (e.g. it was just built).
+    /// The compiler can't check this; check-safe.sh counts every call
+    /// against scripts/isolation-budget, so each claim gets reviewed.
+    static Isolated assumeIsolated(T value)
+    {
+        Isolated r;
+        r.payload = value;
+        return r;
+    }
+
+    /// Take the value out (the holder is left empty).
+    T unwrap()
+    {
+        auto v = payload;
+        payload = T.init;
+        return v;
+    }
+}
+
+/// A started thread, to wait for or poll.
+struct JoinHandle
+{
+    private Thread thread;
+    /// Wait for the thread to finish (rethrows what killed it).
+    void join() { joinThread(thread); }
+    /// Whether the thread is still running.
+    bool running() { return threadRunning(thread); }
+}
+
+/// Run `fn(args)` on a new thread. `fn` is a plain function, so it can only
+/// reach what it is given (and `shared` or thread-local globals), and every
+/// argument must be sendable.
+JoinHandle spawn(Args...)(void function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args))
+{
+    return JoinHandle(startSpawned(fn, args, false));
+}
+
+/// `spawn` for a daemon thread, which doesn't keep the process alive.
+JoinHandle spawnDaemon(Args...)(void function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args))
+{
+    return JoinHandle(startSpawned(fn, args, true));
+}
+
+import std.meta : allSatisfy, staticMap;
+import std.traits : Unqual;
+private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args; }
+
+/// `@trusted`: the arguments (checked sendable by `spawn`) are moved into a
+/// box only the new thread can reach; `shared` is stripped for the move and
+/// restored for the call. `fn` is a context-free function.
+private Thread startSpawned(Args...)(void function(Args) @safe fn, ref Args args, bool daemon) @trusted
+{
+    import core.lifetime : move;
+    auto box = new SpawnBox!Args;
+    static foreach (i; 0 .. Args.length)
+        box.args[i] = move(*cast(Unqual!(Args[i])*) &args[i]);
+    auto t = new Thread({
+        mixin("fn(" ~ callArgs!(Args.length) ~ ");");
+    });
+    t.isDaemon = daemon;
+    return t.start();
+}
+
+private template callArgs(size_t n)
+{
+    import std.conv : to;
+    enum callArgs = () {
+        string r;
+        foreach (i; 0 .. n) r ~= (i ? ", " : "") ~ "cast(Args[" ~ i.to!string ~ "]) move(box.args[" ~ i.to!string ~ "])";
+        return r;
+    }();
+}
+
+/// Run `dg` on a new thread with no sendability check: its context may be
+/// shared mutable state, synchronised by hand. The escape hatch for threads
+/// not yet converted to `spawn`, like Rust's `unsafe`: check-safe.sh wants a
+/// comment above each call saying what it shares and how that is locked, and
+/// caps the number of calls (scripts/unchecked-thread-budget).
+JoinHandle spawnUnchecked(void delegate() @safe dg, bool daemon = false)
+{
+    auto t = new Thread(dg);
+    t.isDaemon = daemon;
+    return JoinHandle(startThread(t));
+}
+
+/// A handle to a `Channel`: copyable and sendable, so each thread holds its
+/// own (like Rust's `Arc<Channel>`). `Chan!T.make` creates one.
+struct Chan(T)
+{
+    import core.atomic : atomicLoad;
+    private shared Channel!T impl;
+
+    /// A new, open channel.
+    static Chan make() { return Chan(new shared Channel!T); }
+    /// Whether this handle refers to a channel.
+    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    /// See `Channel`.
+    void put(T v, bool front = false) { atomicLoad(impl).put(v, front); }
+    /// ditto
+    void close() { atomicLoad(impl).close(); }
+    /// ditto
+    bool take(out T v) { return atomicLoad(impl).take(v); }
+    /// ditto
+    void edit(scope void delegate(ref T[]) @safe f) { atomicLoad(impl).edit(f); }
+}
+
+/// A blocking queue of sendable values between threads, closable. Use it
+/// through `Chan`.
+final class Channel(T) if (!hasUnsharedAliasing!T)
+{
+    import core.sync.mutex : Mutex;
+    private Mutex lock;
+    private Condition ready;
+    private T[] items;
+    private bool closed;
+
+    /// `@trusted`: initialises the fresh object's own lock.
+    this() shared @trusted
+    {
+        auto self = cast() this;
+        self.lock = new Mutex;
+        self.ready = new Condition(self.lock);
+    }
+
+    /// Append `v` (or put it first); wakes one taker.
+    /// `@trusted`: the unshared view is used only while holding `lock`.
+    void put(T v, bool front = false) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        self.items = front ? v ~ self.items : self.items ~ v;
+        self.ready.notify();
+    }
+
+    /// No more values: takers drain what is left, then get false.
+    /// `@trusted`: as for `put`.
+    void close() shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        self.closed = true;
+        self.ready.notifyAll();
+    }
+
+    /// Wait for the next value; false once closed and empty.
+    /// `@trusted`: as for `put`.
+    bool take(out T v) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        while (!self.items.length && !self.closed) self.ready.wait();
+        if (!self.items.length) return false;
+        v = self.items[0];
+        self.items = self.items[1 .. $];
+        return true;
+    }
+
+    /// Run `f` on the queued values under the lock (e.g. to reorder them).
+    /// `@trusted`: as for `put`; `f` can't keep the reference (`scope`).
+    void edit(scope void delegate(ref T[]) @safe f) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        f(self.items);
+    }
+}
+
+@safe unittest // spawn moves an Isolated, Channel carries results back
+{
+    static void worker(Isolated!(int[]) xs, Chan!int ch)
+    {
+        auto a = xs.unwrap;
+        foreach (x; a) ch.put(x * 2);
+        ch.close();
+    }
+    import core.lifetime : move;
+    auto ch = Chan!int.make;
+    auto xs = Isolated!(int[]).assumeIsolated([1, 2, 3]);
+    auto h = spawn(&worker, move(xs), ch);
+    int v, sum;
+    while (ch.take(v)) sum += v;
+    h.join();
+    assert(sum == 12);
+    static assert(isSendable!(immutable(int)[]) && isSendable!string && isSendable!(Chan!int));
+    static assert(!isSendable!(int[]) && !isSendable!(void delegate()) && !isSendable!Object);
+    static void bad(int[] a) {}
+    static assert(!__traits(compiles, spawn(&bad, [1])));
+}
+
 /// A `__gshared` class reference read and written through @safe code, as
 /// `name` (getter and setter) over the storage `name_`. `@trusted` because a
 /// reference load or store is atomic on every target we build for; the

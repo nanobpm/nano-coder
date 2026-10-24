@@ -4,7 +4,7 @@ module app;
 
 @safe:
 
-import nano.safeio : GsharedRef, Locked, exitProcess, joinThread, signalOne, startThread, stdErr, stdinLine, stdOut, waitOn;
+import nano.safeio : Chan, GsharedRef, JoinHandle, Locked, spawnDaemon, spawnUnchecked, exitProcess, stdErr, stdinLine, stdOut;
 
 import std.stdio;
 import std.json;
@@ -43,8 +43,6 @@ import nano.memory : MemoryStore = Store, MemoryMode, memoryDefinitions = defini
 import nano.control : TurnControl, FdLineReader;
 import nano.instructions : ProjectInstructions, InstructionOptions = Options, expandHome;
 import core.atomic : atomicLoad, atomicStore, cas;
-import core.sync.mutex : Mutex;
-import core.sync.condition : Condition;
 
 enum string packageVersion = "0.1.0";
 enum string versionString = "nano-coder-d " ~ packageVersion ~ " (D port of nano-coder; see PORTING.md)";
@@ -245,61 +243,39 @@ extern (C) void onInterrupt(int) nothrow @nogc @system
     else _exit(130);
 }
 
-/// Lines read from the terminal on a background thread, so the user can
-/// steer a running turn: a line typed mid-turn goes to the agent before its
-/// next step; a `/command` waits for the turn to finish.
-final class Inbox
+/// Piped stdin (no line editor): read lines on a thread. Text typed during a
+/// turn steers it; everything else (and `/commands`) goes to `inbox` for the
+/// main loop. `color` styles the notes. Runs via `spawn`: it reaches only
+/// its arguments and `shared` globals.
+void readStdinLines(Chan!string inbox, bool color)
 {
-    private Mutex lock;
-    private Condition ready;
-    private string[] lines;
-    private bool eof;
-
-    this() { lock = new Mutex; ready = new Condition(lock); }
-
-    void put(string line, bool front = false)
+    string dim(string s) { return color ? "\x1b[2m" ~ s ~ "\x1b[0m" : s; }
+    // Not readln: see FdLineReader (a blocked readln deadlocks spawnProcess).
+    auto input = FdLineReader(0);
+    for (;;)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        if (line is null) eof = true;
-        else lines = front ? line ~ lines : lines ~ line;
-        ready.signalOne();
-    }
-
-    /// The next line, or null at end of input.
-    string take()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        while (!lines.length && !eof) ready.waitOn();
-        if (!lines.length) return null;
-        auto l = lines[0];
-        lines = lines[1 .. $];
-        return l;
-    }
-
-    void readLoop(Console console)
-    {
-        // Not readln: see FdLineReader (a blocked readln deadlocks spawnProcess).
-        auto input = FdLineReader(0);
-        for (;;)
+        auto line = input.next();
+        if (line is null) { inbox.close(); return; }
+        auto text = line.strip;
+        if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
         {
-            auto line = input.next();
-            if (line is null) { put(null); return; }
-            auto text = line.strip;
-            if (atomicLoad(gTurnRunning) && text.length && !text.startsWith("/"))
-            {
-                gControl.steer(text);
-                stdErr.writeln(console.dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
-            }
-            else
-            {
-                if (atomicLoad(gTurnRunning) && text.length)
-                    stdErr.writeln(console.dim("[waits for the turn to finish: " ~ text ~ "]"));
-                put(text);
-            }
+            gControl.steer(text);
+            stdErr.writeln(dim("↪ steer: " ~ text ~ " (read at the agent's next step)"));
+        }
+        else
+        {
+            if (atomicLoad(gTurnRunning) && text.length)
+                stdErr.writeln(dim("[waits for the turn to finish: " ~ text ~ "]"));
+            inbox.put(text);
         }
     }
+}
+
+/// The next line from `inbox`, or null at end of input.
+string takeLine(Chan!string inbox)
+{
+    string l;
+    return inbox.take(l) ? l : null;
 }
 
 /// Keys during a turn (runs on its own thread until `done`).
@@ -1062,24 +1038,24 @@ string contextReport(Agent agent)
 /// flag; a daemon thread redraws, as signal handlers can't write safely).
 void watchResize()
 {
-    import nano.safeio : onSignal;
-    enum SIGWINCH = 28; // macOS and Linux
-    import core.thread : Thread;
-    import core.time : msecs;
-    extern (C) static void onWinch(int) nothrow @nogc { atomicStore(gResized, true); }
-    static bool watching;
-    if (watching) return;
-    watching = true;
-    onSignal(SIGWINCH, &onWinch);
-    auto t = new Thread({
+    static void redrawOnResize()
+    {
+        import core.thread : Thread;
+        import core.time : msecs;
         for (;;)
         {
             Thread.sleep(100.msecs);
             if (cas(&gResized, true, false) && gStatus !is null) gStatus.draw();
         }
-    });
-    t.isDaemon = true;
-    startThread(t);
+    }
+    import nano.safeio : onSignal;
+    enum SIGWINCH = 28; // macOS and Linux
+    extern (C) static void onWinch(int) nothrow @nogc { atomicStore(gResized, true); }
+    static bool watching;
+    if (watching) return;
+    watching = true;
+    onSignal(SIGWINCH, &onWinch);
+    spawnDaemon(&redrawOnResize);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).
@@ -1384,7 +1360,7 @@ int runMain(string[] args)
 
     gControl = atomicLoad(agent.control);
     installSigint();
-    Inbox inbox;
+    Chan!string inbox;
     LineEditor editor;
     string[] held; // lines to run before reading the prompt again
     auto queue = new MessageQueue; // Ctrl-Enter messages: one runs per following turn
@@ -1591,21 +1567,26 @@ int runMain(string[] args)
         // With the line editor, keys typed during the turn steer it (a
         // `/command` waits for the turn to end); Ctrl-C or Esc Esc cancels.
         shared bool turnDone;
-        Thread keys;
+        JoinHandle keys;
+        bool keysStarted;
         if (editor !is null)
         {
             if (verbosity >= Verbosity.verbose)
                 stdErr.writeln(console.dim("[running: Enter sends a message to steer the agent, Ctrl-Enter queues it for later "
                     ~ "(/queue lists, edits, removes), Esc Esc or Ctrl-C to cancel]"));
             refreshView();
-            keys = new Thread(() => turnKeys(editor, console, &turnDone, held, questions, queue, &midTurn));
-            keys.startThread();
+            // Unchecked: the key reader shares the line editor and console
+            // (the main thread only prints while it runs), `held` (read
+            // after the join), the question broker and queue (each locked),
+            // and `midTurn`, which runs read-only commands.
+            keys = spawnUnchecked(() => turnKeys(editor, console, &turnDone, held, questions, queue, &midTurn));
+            keysStarted = true;
         }
         scope (exit)
-            if (keys !is null)
+            if (keysStarted)
             {
                 atomicStore(turnDone, true);
-                keys.joinThread();
+                keys.join();
             }
         console.finalAnswer = null;
         console.droppedAnswer = false;
@@ -1626,7 +1607,7 @@ int runMain(string[] args)
         }
         // Steers that arrived after the agent's last step run as the next prompts.
         auto late = agent.control.takePending;
-        if (inbox !is null)
+        if (inbox)
             foreach_reverse (t; late) inbox.put(t.text, true);
         if (editor !is null) foreach_reverse (t; late) held = t.text ~ held;
         return ok;
@@ -1703,10 +1684,8 @@ int runMain(string[] args)
     if (interactive && editor is null)
     {
         import core.thread : Thread;
-        inbox = new Inbox;
-        auto reader = new Thread(() => inbox.readLoop(console));
-        reader.isDaemon = true;
-        reader.startThread();
+        inbox = Chan!string.make;
+        spawnDaemon(&readStdinLines, inbox, console.color);
     }
     if (interactive)
     {
@@ -1784,7 +1763,7 @@ int runMain(string[] args)
         else
         {
             if (interactive) { write("\n" ~ console.stamp() ~ console.bold("› ")); stdOut.flush(); }
-            line = inbox !is null ? inbox.take() : stdinLine();
+            line = inbox ? takeLine(inbox) : stdinLine();
         }
         if (line is null) break;
         bool literal = line.startsWith("\x00");

@@ -4,7 +4,7 @@ module nano.agent;
 
 @safe:
 
-import nano.safeio : stdErr, stdOut;
+import nano.safeio : Isolated, JoinHandle, spawnDaemon, stdErr, stdOut;
 
 import std.json;
 import std.format : format;
@@ -260,43 +260,47 @@ class Agent
     /// a later run tries again.
     private void requestTitle(const ref nano.session_index.Summary s)
     {
-        import nano.session_index : titleSource, cleanTitle, setTitle;
-        import core.thread : Thread;
+        import nano.session_index : titleSource;
         if (!sessionTitles || titleClient is null || s.title !is null || (s.id in titlesRequested)) return;
         auto source = titleSource(s);
         if (source is null) return;
         titlesRequested[s.id] = true;
         auto spec = titleModel !is null ? titleModel : client.providerName ~ "/" ~ client.modelName;
-        auto make = titleClient;
-        auto path = log.path;
-        auto t = new Thread({
-            try
-            {
-                auto c = make(spec);
-                ChatRequest req;
-                req.messages = [Message.system(titlePrompt), Message.user(source)];
-                req.maxTokens = 400; // room for reasoning models that think first
-                auto title = cleanTitle(c.chat(req, null).content);
-                if (title !is null) setTitle(path, title); // false: another process won
-            }
-            catch (Exception) {} // a title is optional
-        });
-        t.isDaemon = true;
-        { import nano.safeio : startThread; startThread(t); }
-        titleThreads ~= t;
+        LLMClient c;
+        try c = titleClient(spec);
+        catch (Exception) return; // a title is optional
+        // Isolated: `titleClient` builds a new client from a resolved
+        // (deep-copied) config, and only the title thread keeps it.
+        titleThreads ~= spawnDaemon(&fetchTitle, Isolated!LLMClient.assumeIsolated(c), source, log.path);
+    }
+
+    /// Ask `client` for a title for `source` and store it in the session at
+    /// `path`. Runs on its own thread (`spawn`).
+    private static void fetchTitle(Isolated!LLMClient client, string source, string path)
+    {
+        import nano.session_index : cleanTitle, setTitle;
+        try
+        {
+            auto c = client.unwrap;
+            ChatRequest req;
+            req.messages = [Message.system(titlePrompt), Message.user(source)];
+            req.maxTokens = 400; // room for reasoning models that think first
+            auto title = cleanTitle(c.chat(req, null).content);
+            if (title !is null) setTitle(path, title); // false: another process won
+        }
+        catch (Exception) {} // a title is optional
     }
 
     /// Title requests in flight (tests join them).
-    Thread[] titleThreads;
+    JoinHandle[] titleThreads;
 
     /// Wait up to `max` for title requests to finish; false if one still runs.
     bool settleTitles(Duration max)
     {
-        import nano.safeio : threadRunning;
         import core.time : MonoTime, msecs;
         auto deadline = MonoTime.currTime + max;
         foreach (t; titleThreads)
-            while (threadRunning(t))
+            while (t.running)
             {
                 if (MonoTime.currTime >= deadline) return false;
                 Thread.sleep(20.msecs);
@@ -1605,7 +1609,7 @@ unittest
     assert(agent.titleThreads.length == 0 && list(dir)[0].prompts == 1);
     agent.run("Fix the flaky deploy test in CI", ev);
     assert(agent.titleThreads.length == 1);
-    { import nano.safeio : joinThread; joinThread(agent.titleThreads[0]); }
+    agent.titleThreads[0].join();
     assert(specs == ["mock/mock"], specs[0]);
     assert(titler.seen[0][0].content == Agent.titlePrompt && titler.seen[0][1].content == "Fix the flaky deploy test in CI");
     agent.run("ok", ev); // titled already: no second request

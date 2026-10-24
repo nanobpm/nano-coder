@@ -120,9 +120,41 @@ it. `Steer` stores its ACP request id as JSON text so it can cross threads.
 
 Two `__gshared` escapes remain, both in `safeio` wrappers: the frame UI
 (`gFrame`, a `FrameUi` whose transcript, renderer and callbacks would need a
-deeper rewrite) and the saved `termios` restored at exit. Thread start and
-join, conditions and the question broker's mutex are still convention, not
-types. **R** (narrowing)
+deeper rewrite) and the saved `termios` restored at exit. **R** (narrowing)
+
+### The "E profile": sendable-only threads
+
+A prototype of Rust's `Send` rule, enforced by `safeio` types and
+`scripts/check-safe.sh`:
+- `spawn`/`spawnDaemon(fn, args...)` start a thread. `fn` must be a plain
+  `function`, so it has no hidden closure context, and every argument must be
+  `isSendable`: no unshared mutable references (immutable, `shared`, plain
+  data), or an `Isolated!T`. Passing a delegate or an `int[]` doesn't compile.
+- `Isolated!T` is a value with one owner. It can't be copied, only moved, so
+  a mutable object can change threads. Creating one is an unchecked claim
+  (`assumeIsolated`) that nothing else refers to the value.
+- `Chan!T` is a copyable, sendable handle to a closable blocking queue
+  (`Channel`) of sendable values.
+- Outside `safeio.d` the build fails on `new Thread`, `std.concurrency`,
+  `__gshared` and `union`. The two escape hatches, `spawnUnchecked(delegate)`
+  and `assumeIsolated`, need a comment above each call saying what is shared
+  and how it is locked. They are capped like `@trusted`
+  (`scripts/unchecked-thread-budget`: 5, `scripts/isolation-budget`: 1).
+
+Converted: the resize watcher, the piped-stdin reader (whose inbox is now a
+`Chan!string`) and session-title requests (the client is built on the main
+thread and moved over as `Isolated!LLMClient`; before, the thread built it
+from the live config). Still unchecked: the key reader during a turn (shares
+the line editor, console, held commands and a mid-turn command callback with
+the main thread), the frame UI's reader and ticker (the frame's monitor guards
+everything), the ACP stdin reader (routes cancels and steers under the inbox
+lock), and a question-broker test. Converting them needs those objects
+redesigned as `shared` types or message passing.
+
+What this can't do without compiler support: tell whether a value is really
+isolated (Rust tracks ownership; here it's a claim), or check delegates
+(`spawnUnchecked` exists because D's type system can't see a delegate's
+context). An "E" language would need those two in the compiler.
 
 Bugs found:
 - **The stdio lock deadlock.** A reader thread blocked in `readln` holds

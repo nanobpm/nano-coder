@@ -238,20 +238,20 @@ ToolDefinition definition()
 unittest // ask_blocks_until_resolved, and sequential questions each register
 {
     import core.thread : Thread;
-    import nano.safeio : joinThread, startThread;
+    import nano.safeio : spawnUnchecked;
     import core.time : msecs;
     auto broker = new QuestionBroker;
     foreach (expected; ["first", "second"])
     {
-        Answer got;
-        auto t = new Thread(() { got = broker.ask([Question(expected)]); });
-        startThread(t);
+        Answer[] got; // a slice: assigning a SumType is not @safe
+        // Unchecked: `got` is read only after the join; the broker locks.
+        auto t = spawnUnchecked(() { got = [broker.ask([Question(expected)])]; });
         Question[] req;
         while ((req = broker.pending()) is null) Thread.sleep(1.msecs);
         assert(req[0].question == expected);
         broker.resolve(Answer(Answered(["yes"])));
-        joinThread(t);
-        assert(got == Answer(Answered(["yes"])));
+        t.join();
+        assert(got == [Answer(Answered(["yes"]))]);
         assert(broker.pending() is null);
     }
 }
