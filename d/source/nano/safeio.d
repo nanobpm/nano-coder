@@ -203,7 +203,9 @@ void atExit(ExitHandler f) @trusted nothrow @nogc
 mixin template GsharedValue(T, string name)
 {
     mixin("private __gshared T " ~ name ~ "_;");
+    // `@trusted`: plain loads and stores of the storage above (see the doc).
     mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
+    // `@trusted`: the matching store.
     mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
 }
 
@@ -260,10 +262,10 @@ string realPath(string path) @trusted
     return p.fromStringz.idup;
 }
 
+import std.file : DirEntry, SpanMode;
 /// `std.file.dirEntries` collected into an array. Phobos marks the iterator
 /// @system only for its reference-counted handle; the entries themselves are
 /// plain values. Throws `FileException` as `dirEntries` does.
-import std.file : DirEntry, SpanMode;
 DirEntry[] listDir(string dir, SpanMode mode, bool followSymlink = false) @trusted
 {
     import std.file : dirEntries;
@@ -313,9 +315,9 @@ T withSigpipeIgnored(T)(scope T delegate() @safe dg) @trusted
     return dg();
 }
 
+import std.process : Pid;
 /// `std.process.kill(pid)`. It is @system only because of the `Pid` class
 /// handle; the signal goes to the pid it holds.
-import std.process : Pid;
 void killProcess(Pid pid) @trusted
 {
     import std.process : kill;
@@ -374,7 +376,9 @@ unittest
 mixin template GsharedRef(T, string name)
 {
     mixin("__gshared T " ~ name ~ "_;");
+    // `@trusted`: single reference loads and stores (see the doc).
     mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
+    // `@trusted`: the matching store.
     mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
 }
 

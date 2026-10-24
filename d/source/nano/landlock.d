@@ -48,11 +48,15 @@ align(1):
 
 static assert(PathBeneathAttr.sizeof == 12);
 
+/// The kernel's Landlock ABI version (negative when unsupported).
+/// `@trusted`: a raw syscall whose only pointer argument is null.
 long abi() @trusted nothrow @nogc
 {
     return syscall(sysCreateRuleset, null, size_t(0), createRulesetVersion);
 }
 
+/// `strerror(errno)` copied into a D string.
+/// `@trusted`: reads the C string before anything else can overwrite it.
 string lastError() @trusted
 {
     import core.stdc.errno : errno;

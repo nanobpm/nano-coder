@@ -27,10 +27,17 @@
       ]
     }
   },
-  "dflags-ldc": [
+  "toolchainRequirements": {
+    "dmd": "no",
+    "gdc": "no",
+    "ldc": ">=1.43.0"
+  },
+  "dflags": [
     "-allinst",
     "-preview=dip1000",
-    "-preview=nosharedaccess",
+    "-preview=nosharedaccess"
+  ],
+  "dflags-ldc": [
     "-fno-delete-null-pointer-checks"
   ],
   "preBuildCommands": [

@@ -19,15 +19,38 @@ if grep -rnE '(^|[^/`[:alnum:]])@system\b' source --include='*.d' | grep -vE ':[
     echo "Error: \`@system\` is only allowed on \`extern (C)\` declarations; use @safe, or @trusted on the smallest function or lambda" >&2
     status=1
 fi
-# `@trusted` outside safeio.d may only go down: the count is capped by
-# scripts/trusted-budget. Move a new escape into safeio.d (or make the code
-# @safe); after removing some, lower the budget to the new count.
-budget=$(cat scripts/trusted-budget)
-count=$(grep -rnE '(^|[^/`[:alnum:]])@trusted\b' source --include='*.d' | grep -v '^source/nano/safeio.d:' | grep -cvE ':[[:space:]]*(///|//)')
-if [ "$count" -gt "$budget" ]; then
-    echo "Error: $count \`@trusted\` outside source/nano/safeio.d, budget is $budget (scripts/trusted-budget); put the escape in safeio.d or make the code @safe" >&2
+# `@trusted` may only go down: the count outside safeio.d is capped by
+# scripts/trusted-budget, and the count inside it by
+# scripts/trusted-budget-safeio. Move a new escape into safeio.d (or make the
+# code @safe), and raise that budget in the same change so review sees it;
+# after removing some, lower the budget to the new count.
+trusted() { grep -nE '(^|[^/`[:alnum:]])@trusted\b' "$@" | grep -vE ':[[:space:]]*(///|//)'; }
+ratchet() { # name count budget-file
+    budget=$(cat "$3")
+    if [ "$2" -gt "$budget" ]; then
+        echo "Error: $2 \`@trusted\` $1, budget is $budget ($3); make the code @safe, or justify the escape and raise the budget" >&2
+        status=1
+    elif [ "$2" -lt "$budget" ]; then
+        echo "check-safe: $2 \`@trusted\` $1, below the budget of $budget; lower $3 to $2" >&2
+    fi
+}
+ratchet "outside safeio.d" "$(trusted -r source --include='*.d' | grep -c -v '^source/nano/safeio.d:')" scripts/trusted-budget
+ratchet "in safeio.d" "$(trusted source/nano/safeio.d | wc -l | tr -d ' ')" scripts/trusted-budget-safeio
+# Every `@trusted` needs a comment right above its declaration saying why it
+# is memory safe (blank lines and the earlier lines of a wrapped signature
+# may come between). The compiler can't check a `@trusted` body; a reviewer
+# checks it against that comment.
+if ! find source -name '*.d' | sort | xargs awk '
+    FNR == 1 { ok = 0 }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*\/\// { ok = 1; next }
+    /(^|[^\/`[:alnum:]])@trusted([^[:alnum:]_]|$)/ {
+        if (!ok) { printf "%s(%d): Error: `@trusted` without a comment above it saying why it is safe\n", FILENAME, FNR > "/dev/stderr"; bad = 1 }
+        if ($0 ~ /[;{}][[:space:]]*$/) ok = 0
+        next
+    }
+    /[;{}][[:space:]]*$/ { ok = 0 }
+    END { exit bad }'; then
     status=1
-elif [ "$count" -lt "$budget" ]; then
-    echo "check-safe: $count \`@trusted\` outside safeio.d, below the budget of $budget; lower scripts/trusted-budget to $count" >&2
 fi
 exit $status
