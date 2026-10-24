@@ -866,15 +866,10 @@ version (Posix)
 
     private extern (C) void restoreAtExit() nothrow { leaveKeyMode(0); }
 
-    void writeFd(int fd, string s) @trusted nothrow
+    void writeFd(int fd, string s) nothrow
     {
-        import core.sys.posix.unistd : write;
-        while (s.length)
-        {
-            auto n = write(fd, s.ptr, s.length);
-            if (n <= 0) return;
-            s = s[n .. $];
-        }
+        import nano.safeio : writeAllFd;
+        writeAllFd(fd, s);
     }
 
     /// Whether key mode is on (so a nested user can leave it as it was).
@@ -909,22 +904,22 @@ version (Posix)
     /// A ByteSource reading `fd` with poll.
     ByteSource fdSource(int fd)
     {
-        import core.sys.posix.poll : pollfd, poll, POLLIN;
-        import core.sys.posix.unistd : read;
+        import core.sys.posix.poll : pollfd, POLLIN;
+        import nano.safeio : pollFds, readFd;
         ubyte[] pending;
-        return (int timeoutMs) @trusted {
+        return (int timeoutMs) {
             if (pending.length)
             {
                 auto b = pending[0];
                 pending = pending[1 .. $];
                 return cast(int) b;
             }
-            pollfd p = pollfd(fd, POLLIN, 0);
-            auto r = poll(&p, 1, timeoutMs);
+            pollfd[1] p = [pollfd(fd, POLLIN, 0)];
+            auto r = pollFds(p[], timeoutMs);
             if (r == 0) return -1;
             if (r < 0) return -1; // EINTR: treat as a timeout, the caller loops
             ubyte[256] buf;
-            auto n = read(fd, buf.ptr, buf.length);
+            auto n = readFd(fd, buf[]);
             if (n <= 0) return -2;
             pending = buf[1 .. n].dup;
             return cast(int) buf[0];

@@ -9,6 +9,7 @@ module nano.frameui;
 import core.thread : Thread;
 import nano.frame;
 import nano.lineedit : writeFd, ttyOut, terminalWidth, terminalHeight;
+import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, startThread, stdErr, stdOut;
 
 final class FrameUi
 {
@@ -23,47 +24,41 @@ final class FrameUi
     string delegate(size_t width) @safe status;
 
     /// Takes over the terminal: fd 1 and 2 now feed the transcript.
-    static FrameUi install(string delegate(size_t) @safe status) @trusted
+    static FrameUi install(string delegate(size_t) @safe status)
     {
-        import core.sys.posix.unistd : dup, dup2, pipe, close;
-        import core.sys.posix.fcntl : fcntl, F_SETFL, F_GETFL, O_NONBLOCK;
-        import std.stdio : stdout, stderr;
         auto f = new FrameUi;
         f.status = status;
-        stdout.flush();
-        stderr.flush();
+        stdOut.flush();
+        stdErr.flush();
         int[2] p;
-        if (pipe(p) != 0) return null;
-        f.tty = dup(1);
+        if (pipeFds(p) != 0) return null;
+        f.tty = dupFd(1);
         f.readFd = p[0];
         f.writeEnd = p[1];
-        fcntl(f.readFd, F_SETFL, fcntl(f.readFd, F_GETFL) | O_NONBLOCK);
-        dup2(f.writeEnd, 1);
-        dup2(f.writeEnd, 2);
+        setNonBlocking(f.readFd);
+        dup2Fd(f.writeEnd, 1);
+        dup2Fd(f.writeEnd, 2);
         ttyOut = f.tty;
         // Line-buffered: a pipe would otherwise hold whole blocks back.
-        import core.stdc.stdio : _IOLBF;
-        stdout.setvbuf(4096, _IOLBF);
+        lineBufferStdout();
         f.renderer = new FrameRenderer((string s) { writeFd(f.tty, s); });
         writeFd(f.tty, "\x1b[?25l");
         auto reader = new Thread(&f.readLoop);
         reader.isDaemon = true;
-        reader.start();
+        startThread(reader);
         auto ticker = new Thread(&f.tickLoop);
         ticker.isDaemon = true;
-        ticker.start();
+        startThread(ticker);
         f.redraw();
         return f;
     }
 
     /// Gives the terminal back (fd 1 and 2 to the tty) and returns the
     /// transcript's lines, for a legacy replay.
-    string[] uninstall() @trusted
+    string[] uninstall()
     {
-        import core.sys.posix.unistd : dup2, close;
-        import std.stdio : stdout, stderr;
-        stdout.flush();
-        stderr.flush();
+        stdOut.flush();
+        stdErr.flush();
         string[] lines;
         synchronized (this)
         {
@@ -73,36 +68,32 @@ final class FrameUi
             lines = transcript.lines.dup;
             if (transcript.cur.length) lines ~= transcript.cur;
         }
-        dup2(tty, 1);
-        dup2(tty, 2);
+        dup2Fd(tty, 1);
+        dup2Fd(tty, 2);
         ttyOut = 1;
-        close(writeEnd);
-        close(tty);
+        closeFd(writeEnd);
+        closeFd(tty);
         writeFd(1, "\x1b[?25h\r\n");
         return lines;
     }
 
     /// Hands the real terminal to a child (a pager) until `resume`.
-    void suspend() @trusted
+    void suspend()
     {
-        import core.sys.posix.unistd : dup2;
-        import std.stdio : stdout, stderr;
-        stdout.flush();
-        stderr.flush();
+        stdOut.flush();
+        stdErr.flush();
         synchronized (this) { drain(); paused = true; }
-        dup2(tty, 1);
-        dup2(tty, 2);
+        dup2Fd(tty, 1);
+        dup2Fd(tty, 2);
         writeFd(tty, "\x1b[?25h");
     }
 
-    void resume() @trusted
+    void resume()
     {
-        import core.sys.posix.unistd : dup2;
-        import std.stdio : stdout, stderr;
-        stdout.flush();
-        stderr.flush();
-        dup2(writeEnd, 1);
-        dup2(writeEnd, 2);
+        stdOut.flush();
+        stdErr.flush();
+        dup2Fd(writeEnd, 1);
+        dup2Fd(writeEnd, 2);
         writeFd(tty, "\x1b[?25l");
         synchronized (this)
         {
@@ -123,10 +114,9 @@ final class FrameUi
     }
 
     /// A line the editor leaves behind (a submitted prompt, a picker answer).
-    void commit(string line) @trusted
+    void commit(string line)
     {
-        import std.stdio : stdout, stderr;
-        stdout.flush();
+        stdOut.flush();
         synchronized (this)
         {
             drain();
@@ -143,10 +133,9 @@ final class FrameUi
     }
 
     /// Empties the transcript (`/restart`).
-    void clear() @trusted
+    void clear()
     {
-        import std.stdio : stdout;
-        stdout.flush();
+        stdOut.flush();
         synchronized (this)
         {
             drain();
@@ -168,26 +157,25 @@ final class FrameUi
     }
 
     /// Reads what's waiting in the pipe into the transcript; false at EOF.
-    private bool drain() @trusted
+    private bool drain()
     {
-        import core.sys.posix.unistd : read;
         ubyte[8192] buf;
         for (;;)
         {
-            auto n = read(readFd, buf.ptr, buf.length);
+            auto n = readFd_(readFd, buf[]);
             if (n > 0) { transcript.feed(buf[0 .. n]); continue; }
             return n != 0;
         }
     }
 
-    private void readLoop() @trusted
+    private void readLoop()
     {
-        import core.sys.posix.poll : poll, pollfd, POLLIN;
-        import core.sys.posix.unistd : close;
+        import core.sys.posix.poll : pollfd, POLLIN;
         for (;;)
         {
-            pollfd p = pollfd(readFd, POLLIN, 0);
-            if (poll(&p, 1, 200) < 0) continue;
+            pollfd[1] ps = [pollfd(readFd, POLLIN, 0)];
+            if (pollFds(ps[], 200) < 0) continue;
+            auto p = ps[0];
             synchronized (this)
             {
                 if (closed) break;

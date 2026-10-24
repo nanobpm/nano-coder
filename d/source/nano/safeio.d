@@ -88,14 +88,62 @@ bool statMode(string path, out uint mode) @trusted
 }
 
 /// `write(2)` of (a prefix of) `data`; returns the bytes written or -1.
-ptrdiff_t writeFd(int fd, const(ubyte)[] data) @trusted
+ptrdiff_t writeFd(int fd, scope const(ubyte)[] data) @trusted
 {
     import core.sys.posix.unistd : write;
     return write(fd, data.ptr, data.length);
 }
 
+/// `dup(2)`; the new fd or -1.
+int dupFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : dup;
+    return dup(fd);
+}
+
+/// `dup2(2)`; `to` or -1.
+int dup2Fd(int from, int to) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : dup2;
+    return dup2(from, to);
+}
+
+/// `close(2)`; 0 or -1.
+int closeFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : close;
+    return close(fd);
+}
+
+/// `pipe(2)` into `fds` (read end, write end); 0 or -1.
+int pipeFds(ref int[2] fds) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : pipe;
+    return pipe(fds);
+}
+
+/// Line-buffer `stdout` (`setvbuf(_IOLBF)`), so a pipe gets whole lines.
+void lineBufferStdout() @trusted
+{
+    import std.stdio : stdout;
+    import core.stdc.stdio : _IOLBF;
+    stdout.setvbuf(4096, _IOLBF);
+}
+
+/// `write(2)` all of `s`, retrying short writes; stops at the first error.
+void writeAllFd(int fd, scope const(char)[] s) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : write;
+    while (s.length)
+    {
+        auto n = write(fd, s.ptr, s.length);
+        if (n <= 0) return;
+        s = s[n .. $];
+    }
+}
+
 /// `read(2)` into `buf`; returns the bytes read, 0 at EOF, or -1.
-ptrdiff_t readFd(int fd, ubyte[] buf) @trusted
+ptrdiff_t readFd(int fd, scope ubyte[] buf) @trusted
 {
     import core.sys.posix.unistd : read;
     return read(fd, buf.ptr, buf.length);
@@ -156,7 +204,7 @@ void ignoreSigpipe() @trusted
 
 import core.sys.posix.poll : pollfd;
 /// `poll(2)` on `fds`; returns the ready count, 0 on timeout, or -1.
-int pollFds(pollfd[] fds, int timeoutMs) @trusted
+int pollFds(scope pollfd[] fds, int timeoutMs) @trusted
 {
     import core.sys.posix.poll : poll, nfds_t;
     return poll(fds.ptr, cast(nfds_t) fds.length, timeoutMs);
