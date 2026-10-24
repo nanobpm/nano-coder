@@ -54,8 +54,8 @@ private struct Segment
     ubyte priority; /// lower is dropped first when too wide
 }
 
-/// Index of the cwd segment (after the model).
-private enum cwdSegment = 1;
+/// Index of the cwd segment (after the port badge and the model).
+private enum cwdSegment = 2;
 /// The narrowest the cwd is elided to before whole segments are dropped.
 private enum cwdMinCells = 16;
 
@@ -172,6 +172,8 @@ string render(const ref Stats stats, size_t cols)
     auto model = stats.model.length ? stats.provider ~ "/" ~ stats.model : stats.provider;
 
     Segment[] segments = [
+        // Marks the D port ("n" for nano, D for the language) apart from the Rust build.
+        Segment(" nD ", "\x1b[1;38;5;208m", 10),
         Segment(" " ~ model ~ " ", "\x1b[1;38;5;255m", 9),
         Segment(" " ~ stats.cwd ~ " ", null, 6),
         Segment(format(" ctx %s%s/%s %.0f%% ", approx, formatTokens(stats.tokens), formatTokens(stats.window), percent), null, 8),
