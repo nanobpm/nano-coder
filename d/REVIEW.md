@@ -13,7 +13,7 @@ Each finding is rated **R** (Rust is stronger), **D** (D is stronger), or
 
 | | Rust | D port |
 |---|---|---|
-| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 89 `@trusted` annotations: 36 in `safeio.d` and 53 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
+| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 87 `@trusted` annotations: 42 in `safeio.d` and 45 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
 | Use-after-free and double free | Prevented by ownership. | Prevented in practice by the GC; the port does no manual memory management. **=** |
 | Bounds checks | Always on; an overrun is a panic. | Found in the first review: dub's `release` build type turned them off in `@system` code. They are on again (`-boundscheck=on`), so an overrun is an `Error` that ends the process, like a panic. **=** |
 | Casts | `as` only between numeric types. Reinterpreting bytes as `str` needs `from_utf8` or `unsafe`. | 221 `cast(...)` expressions, mostly numeric and FFI. Bytes from the network and from tools go through `lossyUtf8`/validation, but the compiler doesn't make that happen. **R** |
@@ -41,12 +41,18 @@ checked. DIP1000 then required `Transcript.feed` to take `scope` bytes, which
 it already respected. The TOML table builder now walks the tree by `ref`
 through JSONValue's `@safe` `opIndex` instead of `JSONValue*`.
 
-The 53 left outside `safeio.d` fall into these groups:
+Terminal settings and signals then moved behind `safeio` too: `tcGet`/`tcSet`,
+`onSignal`, `atExit`, and `GsharedValue` for the key-mode `termios`, which
+only the main thread touches. The key-mode flag is now a `shared bool` with
+atomic access. `config.finishBody` deep-copies with `jsonCopy` instead of
+casting away `const`, so a merged request body no longer shares subtrees with
+the provider's `extra_body`.
+
+The 45 left outside `safeio.d` fall into these groups:
 
 | Group | Where | Why it is `@trusted` |
 |---|---|---|
-| `std.json` edits through pointers | `config.finishBody`, `thinking.resolve`, `agent.imageResult`, `session_history.search` | They take `&x.object[k]` or cast away `const` to share subtrees. These are whole functions, so their bodies aren't checked. |
-| POSIX terminal and fds | `lineedit` (key mode), `status`, `control`, `app` (signals) | `tcsetattr` on `__gshared` saved state, `sigaction` |
+| `std.json` edits through pointers | `thinking.resolve`, `agent.imageResult`, `session_history.search` | They take `&x.object[k]` or cast away `const` to share subtrees. These are whole functions, so their bodies aren't checked. |
 | Processes and files | `sandbox`, `skills`, `attachment`, `copilot`, `settings`, `session_index`, `instructions`, `recents`, `trajectory.page` | `std.process` pipes, `std.file.read` casts, `open`/`O_APPEND` |
 | Landlock | `landlock` | raw `syscall` |
 | HTTP | `http.request` | `std.net.curl` is `@system` throughout |
@@ -54,12 +60,12 @@ The 53 left outside `safeio.d` fall into these groups:
 | Casts away `const` | `config`, `settings`, `mock`, `permissions` | copying `const ProviderConfig`, `cast() Regex` |
 | Unit tests | 7 `@trusted unittest` blocks | test-only setup (pipes, threads, JSON) |
 
-`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (53)
+`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (45)
 and fails the build if the count outside `safeio.d` goes over it.
 
-Recommended next: termios wrappers in `safeio`, plus `shared` atomic state
-for `lineedit`'s key mode. After that, a deep-copy helper so
-`config.finishBody` doesn't need to cast away `const`.
+Recommended next: the largest groups left are processes and files
+(`std.process` pipes, `std.file.read` casts) and threads and locks. Each
+would need a few more single-call `safeio` wrappers.
 
 ## 2. Error handling
 
@@ -125,7 +131,7 @@ Toolchain notes:
 - **Where Rust is stronger:** checking that is on by default (memory safety,
   `Send`/`Sync`, typed JSON, errors in signatures). D has each of these, but
   only as an opt-in. The port has opted in everywhere (`@safe:` in every
-  module, DIP1000, enforced in the build), but 89 `@trusted` escapes are still
+  module, DIP1000, enforced in the build), but 87 `@trusted` escapes are still
   unchecked and nothing gives Rust-style `Send`/`Sync` checking.
 - **Where D is stronger:** build time (about 5x faster for a clean release
   build and 3.5x for an edit) and a much smaller dependency surface.
