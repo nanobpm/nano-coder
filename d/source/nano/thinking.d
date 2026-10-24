@@ -542,8 +542,8 @@ private string quoted(string s) { return format("%s", [s])[1 .. $ - 1]; }
 /// model's setting, else the provider's, else `global`, fitted to the levels
 /// the model supports (config `thinking_levels`, else `reported`, else the
 /// built-in table).
-Resolved resolve(const Thinking global, const(Thinking)* session, ProviderKind kind,
-    const ref ProviderConfig provider, string model, const(Reported)* reported = null) @trusted
+Resolved resolve(const Thinking global, scope const(Thinking)* session, ProviderKind kind,
+    const ref ProviderConfig provider, string model, scope const(Reported)* reported = null)
 {
     Resolved r;
     auto ms = model in provider.models;
@@ -620,7 +620,7 @@ Resolved resolve(const Thinking global, const(Thinking)* session, ProviderKind k
     bool droppedKey(string k) { return provider.dropParams.canFind(k); }
     const(JSONValue)* bodyGet(string k)
     {
-        return provider.extraBody.type == JSONType.object ? k in provider.extraBody.object : null;
+        return objGet(provider.extraBody, k);
     }
     if (!r.requested.isDefault)
         foreach (k; extraBodyKeys(r.wire))
@@ -735,7 +735,7 @@ version (unittest)
     {
         return resolve(global, session, kind, p, model);
     }
-    private Resolved sess(Thinking t, ProviderKind kind, ProviderConfig p, string model) @trusted
+    private Resolved sess(Thinking t, ProviderKind kind, ProviderConfig p, string model)
     {
         return resolve(Thinking.init, &t, kind, p, model);
     }
@@ -891,7 +891,7 @@ unittest
     assert(b["chat_template_kwargs"]["enable_thinking"].boolean == false);
 }
 
-@trusted unittest
+ unittest
 {
     auto e = parseJSON(`{"id":"x","capabilities":{"supports":{"reasoning_effort":["none","Low","high"],"adaptive_thinking":true}}}`);
     auto r = Reported.fromModelEntry(e);

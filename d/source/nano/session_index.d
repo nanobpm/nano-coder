@@ -183,13 +183,10 @@ private string inputText(const(char)[] line)
 
 /// Fold every committed input record in `path` after byte offset `from`
 /// (only the tail is read), so a concurrent writer's prompt is never lost.
-private void foldInputsSince(string path, ulong from, ref Summary s) @trusted
+private void foldInputsSince(string path, ulong from, ref Summary s)
 {
-    import std.stdio : File;
-    auto f = File(path, "rb");
-    f.seek(from);
-    ubyte[] tail;
-    foreach (chunk; f.byChunk(64 * 1024)) tail ~= chunk;
+    import nano.safeio : readFrom;
+    auto tail = readFrom(path, from);
     foreach (line; committedLines(tail))
         if (auto t = inputText(line)) foldInput(s, t);
 }
@@ -197,9 +194,10 @@ private void foldInputsSince(string path, ulong from, ref Summary s) @trusted
 /// Summarize the session log at `path`. Only the header and input records are
 /// decoded. Throws when the log isn't resumable: no valid id, or a first
 /// record that isn't a matching header of this format version.
-Summary summarize(string path) @trusted
+Summary summarize(string path)
 {
-    auto bytes = cast(ubyte[]) read(path);
+    import nano.safeio : readBytes;
+    auto bytes = readBytes(path);
     Summary s;
     s.path = path;
     s.lastUsed = timeLastModified(path);
@@ -262,11 +260,12 @@ private void mergeLines(const(ubyte)[] bytes, ref Summary[string] map, ref size_
 }
 
 /// The index's summaries by id and its line count.
-private Summary[string] load(string dir, out size_t lines) @trusted
+private Summary[string] load(string dir, out size_t lines)
 {
+    import nano.safeio : readBytes;
     Summary[string] map;
     ubyte[] bytes;
-    try bytes = cast(ubyte[]) read(indexPath(dir));
+    try bytes = readBytes(indexPath(dir));
     catch (Exception) return map;
     mergeLines(bytes, map, lines);
     return map;
@@ -274,19 +273,18 @@ private Summary[string] load(string dir, out size_t lines) @trusted
 
 /// Append summaries, one `write` per line so concurrent writers don't
 /// interleave within a line. A short write fails the update (no retry).
-private void append(string dir, const Summary[] summaries) @trusted
+private void append(string dir, const Summary[] summaries)
 {
-    import core.sys.posix.fcntl : open, O_WRONLY, O_CREAT, O_APPEND;
-    import core.sys.posix.unistd : write, close;
-    import std.string : toStringz;
+    import core.sys.posix.fcntl : O_WRONLY, O_CREAT, O_APPEND;
+    import nano.safeio : closeFd, openPath, writeFd;
     if (!summaries.length) return;
-    int fd = open(indexPath(dir).toStringz, O_WRONLY | O_CREAT | O_APPEND, octal!"644");
+    int fd = openPath(indexPath(dir), O_WRONLY | O_CREAT | O_APPEND, octal!"644");
     if (fd < 0) throw new Exception("open session index " ~ indexPath(dir));
-    scope (exit) close(fd);
+    scope (exit) closeFd(fd);
     foreach (ref s; summaries)
     {
         auto line = s.toJson ~ "\n";
-        if (write(fd, line.ptr, line.length) != cast(long) line.length) throw new Exception("short write to session index");
+        if (writeFd(fd, cast(const(ubyte)[]) line) != cast(long) line.length) throw new Exception("short write to session index");
     }
 }
 
@@ -294,8 +292,9 @@ import std.conv : octal;
 
 /// Rewrite the index with one line per session (atomically, via rename),
 /// merging whatever was appended since byte `since` (sampled before the read).
-private void rewrite(string dir, const Summary[string] summaries, ulong since) @trusted
+private void rewrite(string dir, const Summary[string] summaries, ulong since)
 {
+    import nano.safeio : readFrom;
     import std.process : thisProcessID;
     Summary[string] merged;
     foreach (k, v; summaries) merged[k] = cast(Summary) v;
@@ -305,9 +304,7 @@ private void rewrite(string dir, const Summary[string] summaries, ulong since) @
         auto f = File(indexPath(dir), "rb");
         if (f.size >= since)
         {
-            f.seek(since);
-            ubyte[] rest;
-            foreach (chunk; f.byChunk(64 * 1024)) rest ~= chunk;
+            auto rest = readFrom(indexPath(dir), since);
             size_t n;
             mergeLines(rest, merged, n);
         }

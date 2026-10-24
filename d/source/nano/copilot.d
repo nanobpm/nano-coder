@@ -151,31 +151,30 @@ string credentialsPath(string dataDir = null)
 /// Replace `path` with `text` atomically, owner-only (0600): written to a
 /// unique, exclusively created temp file in the same dir, then renamed, so a
 /// failed write never leaves a torn or empty credentials file.
-void writePrivateAtomic(string path, string text) @trusted
+void writePrivateAtomic(string path, string text)
 {
     import std.file : mkdirRecurse, rename, remove, setAttributes, exists;
     import std.path : dirName;
     import std.random : uniform;
     import std.process : thisProcessID;
-    import std.string : toStringz;
-    import core.sys.posix.fcntl : open, O_CREAT, O_EXCL, O_WRONLY;
-    import core.sys.posix.unistd : write, close, fsync;
+    import core.sys.posix.fcntl : O_CREAT, O_EXCL, O_WRONLY;
+    import nano.safeio : closeFd, fsyncFd, openPath, writeFd;
     mkdirRecurse(path.dirName);
     auto tmp = format("%s.tmp.%s.%08x", path, thisProcessID, uniform!uint);
-    int fd = open(tmp.toStringz, O_CREAT | O_EXCL | O_WRONLY, octal!600);
+    int fd = openPath(tmp, O_CREAT | O_EXCL | O_WRONLY, octal!600);
     if (fd < 0) throw new Exception("open " ~ tmp ~ " failed");
     bool ok;
     scope (exit) if (!ok && tmp.exists) remove(tmp);
     {
-        scope (exit) close(fd);
+        scope (exit) closeFd(fd);
         size_t done;
         while (done < text.length)
         {
-            auto n = write(fd, text.ptr + done, text.length - done);
+            auto n = writeFd(fd, cast(const(ubyte)[]) text[done .. $]);
             if (n <= 0) throw new Exception("write " ~ tmp ~ " failed");
             done += n;
         }
-        fsync(fd);
+        fsyncFd(fd);
     }
     rename(tmp, path);
     ok = true;

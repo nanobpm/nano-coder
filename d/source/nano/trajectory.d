@@ -293,12 +293,12 @@ struct Trajectory
 /// Every committed record of the log at `path`, with physical line numbers.
 /// `expectedId`, when given, must match the header (a renamed or misplaced
 /// log is refused). A torn trailing line is dropped, as on resume.
-Trajectory load(string path, string expectedId = null) @trusted
+Trajectory load(string path, string expectedId = null)
 {
-    import std.file : read;
+    import nano.safeio : readRawText;
     import nano.session : formatVersion;
     string text;
-    try text = cast(string) read(path);
+    try text = readRawText(path);
     catch (Exception e)
     {
         // FileException prefixes the path; keep just the OS reason.
@@ -817,24 +817,24 @@ public:
 
 /// Show `text` in `$PAGER` (default `less`, run through `sh -c`). False when
 /// no pager could be started (exit 126/127), so the caller prints instead.
-bool page(string text) @trusted
+bool page(string text)
 {
     import std.process : pipeShell, Redirect, wait, environment;
-    import core.sys.posix.signal : signal, SIGPIPE, SIG_IGN, SIG_DFL;
+    import nano.safeio : withSigpipeIgnored;
     auto pager = environment.get("PAGER", "");
     if (!trim(pager).length) pager = "less";
     string[string] env;
     if (environment.get("LESS") is null) env["LESS"] = "-R";
-    auto old = signal(SIGPIPE, SIG_IGN);
-    scope (exit) signal(SIGPIPE, old);
-    try
-    {
-        auto p = pipeShell(pager, Redirect.stdin, env);
-        try { p.stdin.write(text); p.stdin.close(); }
-        catch (Exception) {}
-        return pagerRan(wait(p.pid));
-    }
-    catch (Exception) return false;
+    return withSigpipeIgnored(() {
+        try
+        {
+            auto p = pipeShell(pager, Redirect.stdin, env);
+            try { p.stdin.write(text); p.stdin.close(); }
+            catch (Exception) {}
+            return pagerRan(wait(p.pid));
+        }
+        catch (Exception) return false;
+    });
 }
 
 /// Rows and columns of the terminal on `fd`, or zeros when unknown.

@@ -159,14 +159,15 @@ final class QuestionBroker
     bool interactive() { import core.atomic : atomicLoad; return atomicLoad(interactive_); }
 
     /// Register questions and block until `resolve`.
-    Answer ask(Question[] questions) @trusted
+    Answer ask(Question[] questions)
     {
+        import nano.safeio : waitOn;
         lock.lock();
         scope (exit) lock.unlock();
         pending_ = questions;
         waiting = true;
         resolved = false;
-        while (!resolved) cond.wait();
+        while (!resolved) waitOn(cond);
         waiting = false;
         pending_ = null;
         return answer;
@@ -181,14 +182,14 @@ final class QuestionBroker
     }
 
     /// Resolve the waiting question (no-op when none).
-    void resolve(Answer a) @trusted
+    void resolve(Answer a)
     {
         lock.lock();
         scope (exit) lock.unlock();
         if (!waiting || resolved) return;
         answer = a;
         resolved = true;
-        cond.notifyAll();
+        { import nano.safeio : signalAll; signalAll(cond); }
     }
 
     /// The tool handler.
@@ -222,21 +223,22 @@ ToolDefinition definition()
     assert(parse(JSONValue(`{"questions":[{"question":"s"}]}`))[0].question == "s");
 }
 
-@trusted unittest // ask_blocks_until_resolved, and sequential questions each register
+unittest // ask_blocks_until_resolved, and sequential questions each register
 {
     import core.thread : Thread;
+    import nano.safeio : joinThread, startThread;
     import core.time : msecs;
     auto broker = new QuestionBroker;
     foreach (expected; ["first", "second"])
     {
         Answer got;
         auto t = new Thread(() { got = broker.ask([Question(expected)]); });
-        t.start();
+        startThread(t);
         Question[] req;
         while ((req = broker.pending()) is null) Thread.sleep(1.msecs);
         assert(req[0].question == expected);
         broker.resolve(Answer(Answer.Kind.answers, ["yes"]));
-        t.join();
+        joinThread(t);
         assert(got.answers == ["yes"]);
         assert(broker.pending() is null);
     }

@@ -227,7 +227,7 @@ string applyChanges(string doc, const ref Config c, const ref Changes ch, const 
 }
 
 /// Writes the changes into `path` atomically (0600 when a key is stored).
-void save(const ref Config c, const ref Changes ch, const ProviderConfig[string] user, string path) @trusted
+void save(const ref Config c, const ref Changes ch, const ProviderConfig[string] user, string path)
 {
     import std.file : exists, readText, mkdirRecurse, rename, write;
     import std.path : dirName;
@@ -241,9 +241,8 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     write(tmp, doc);
     version (Posix)
     {
-        import core.sys.posix.sys.stat : chmod;
-        import std.string : toStringz;
-        if (secret) chmod(tmp.toStringz, octal!600);
+        import nano.safeio : chmodPath;
+        if (secret) chmodPath(tmp, octal!600);
     }
     rename(tmp, path);
 }

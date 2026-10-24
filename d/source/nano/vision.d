@@ -91,7 +91,7 @@ Nullable!bool configuredOverride(Nullable!bool global, const ref ProviderConfig 
 }
 
 Nullable!Vision resolve(Nullable!bool global, ProviderKind kind, const ref ProviderConfig provider, string model,
-    const(Vision)* reported = null)
+    scope const(Vision)* reported = null)
 {
     Source s;
     auto o = configuredOverride(global, provider, model, s);

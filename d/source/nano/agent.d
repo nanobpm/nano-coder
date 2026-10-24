@@ -257,7 +257,7 @@ class Agent
     /// With `session_titles` on, ask the model for a title in the background
     /// once the session has a telling prompt and no title. Failures are silent:
     /// a later run tries again.
-    private void requestTitle(const ref nano.session_index.Summary s) @trusted
+    private void requestTitle(const ref nano.session_index.Summary s)
     {
         import nano.session_index : titleSource, cleanTitle, setTitle;
         import core.thread : Thread;
@@ -281,7 +281,7 @@ class Agent
             catch (Throwable) {}
         });
         t.isDaemon = true;
-        t.start();
+        { import nano.safeio : startThread; startThread(t); }
         titleThreads ~= t;
     }
 
@@ -289,12 +289,13 @@ class Agent
     Thread[] titleThreads;
 
     /// Wait up to `max` for title requests to finish; false if one still runs.
-    bool settleTitles(Duration max) @trusted
+    bool settleTitles(Duration max)
     {
+        import nano.safeio : threadRunning;
         import core.time : MonoTime, msecs;
         auto deadline = MonoTime.currTime + max;
         foreach (t; titleThreads)
-            while (t.isRunning)
+            while (threadRunning(t))
             {
                 if (MonoTime.currTime >= deadline) return false;
                 Thread.sleep(20.msecs);
@@ -694,7 +695,7 @@ class Agent
 
     /// The thinking level the current model is sent, and why. A fixed budget
     /// must stay below the output cap: one that can't fit sends no level.
-    ThinkingResolved thinking() @trusted
+    ThinkingResolved thinking()
     {
         Thinking st;
         if (!sessionThinking.isNull) st = sessionThinking.get;
@@ -733,7 +734,7 @@ class Agent
     temp.Resolved temperatureNow() { return temperatureFor(thinking().anthropicThinkingOn); }
 
     /// Whether (and how) the current model can view images.
-    Nullable!Vision vision() @trusted
+    Nullable!Vision vision()
     {
         Vision v;
         if (!capabilities.vision.isNull) v = capabilities.vision.get;
@@ -768,8 +769,9 @@ class Agent
     /// it to the model's limits and store it. Without vision, or when the
     /// image can't be prepared, the result becomes a tool error. A non-image
     /// binary file gets a hint about the model's image capability.
-    private string imageResult(string result, ref bool isError, ref Attachment[] attachments) @trusted
+    private string imageResult(string result, ref bool isError, ref Attachment[] attachments)
     {
+        import nano.safeio : jsonGet, readImmutableBytes;
         import std.algorithm : startsWith, canFind;
         import nano.attachment : sniff, prepare, sha256Hex, store, mediaType, extension;
         import std.file : read;
@@ -785,7 +787,7 @@ class Agent
         JSONValue image;
         try image = parseJSON(result)["image"];
         catch (Exception) return result;
-        string str(string k) { auto p = k in image.object; return p && p.type == JSONType.string ? p.str : ""; }
+        string str(string k) { auto p = jsonGet(image, k); return p && p.type == JSONType.string ? p.str : ""; }
         auto path = str("path");
         auto v = vision();
         isError = true;
@@ -794,7 +796,7 @@ class Agent
                 ~ "switch to a vision model or set `vision = true`", path, str("media_type").length ? str("media_type") : "unknown type");
         if (!path.length) return "image result had no path";
         immutable(ubyte)[] bytes;
-        try bytes = cast(immutable(ubyte)[]) read(path);
+        try bytes = readImmutableBytes(path);
         catch (Exception e) return format("%s: could not read image: %s", path, e.msg);
         auto fmt = sniff(bytes);
         if (fmt.isNull) return format("%s: unrecognised image data", path);
@@ -1574,7 +1576,7 @@ unittest
 
 // Each turn updates the session index; with session_titles on, a telling
 // prompt gets one background title request, stored cleaned in the index.
-@trusted unittest
+ unittest
 {
     import std.file : tempDir, exists, rmdirRecurse;
     import std.path : buildPath;
@@ -1599,7 +1601,7 @@ unittest
     assert(agent.titleThreads.length == 0 && list(dir)[0].prompts == 1);
     agent.run("Fix the flaky deploy test in CI", ev);
     assert(agent.titleThreads.length == 1);
-    agent.titleThreads[0].join();
+    { import nano.safeio : joinThread; joinThread(agent.titleThreads[0]); }
     assert(specs == ["mock/mock"], specs[0]);
     assert(titler.seen[0][0].content == Agent.titlePrompt && titler.seen[0][1].content == "Fix the flaky deploy test in CI");
     agent.run("ok", ev); // titled already: no second request

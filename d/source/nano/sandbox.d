@@ -299,19 +299,19 @@ string tempDirectory()
 }
 
 /// The repository's git directory and, for a worktree, the shared one.
-string[] gitDirs(string cwd) @trusted
+string[] gitDirs(string cwd)
 {
+    import nano.safeio : readToEnd;
     import std.process : pipeProcess, wait, Redirect, Config;
     import std.array : appender;
     try
     {
         auto p = pipeProcess(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             Redirect.stdout | Redirect.stderr, null, Config.none, cwd);
-        auto output = appender!string;
-        foreach (chunk; p.stdout.byChunk(4096)) output ~= cast(const(char)[]) chunk;
+        auto output = cast(const(char)[]) readToEnd(p.stdout);
         if (wait(p.pid) != 0) return null;
         string[] dirs;
-        foreach (l; output.data.splitLines)
+        foreach (l; output.idup.splitLines)
             if (l.strip.length) dirs ~= joinPath(cwd, l.strip);
         return dirs;
     }
@@ -347,7 +347,7 @@ version (unittest)
 
     /// Run `script` sandboxed in `cwd`: (success, stdout+stderr), or a skip when
     /// the sandbox can't apply (already inside one), announced unless opted in.
-    bool run(const SandboxConfig c, string cwd, string script, out bool ok, out string text) @trusted
+    bool run(const SandboxConfig c, string cwd, string script, out bool ok, out string text)
     {
         import std.process : execute, Config, environment;
         auto r = execute(c.command("bash", script, cwd), null, Config.none, size_t.max, cwd);
@@ -355,10 +355,10 @@ version (unittest)
         ok = r.status == 0;
         if (text.canFind("sandbox_apply: Operation not permitted"))
         {
-            import std.stdio : stderr;
+            import nano.safeio : stdErr;
             if (environment.get("NANO_SKIP_UNAVAILABLE_SANDBOX_TESTS") is null)
                 assert(false, "OS sandbox cannot be applied inside an already-sandboxed process; containment assertions could not run");
-            stderr.writeln("SKIP sandbox test: OS sandbox unavailable");
+            stdErr.writeln("SKIP sandbox test: OS sandbox unavailable");
             return false;
         }
         return true;

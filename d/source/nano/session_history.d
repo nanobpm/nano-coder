@@ -165,27 +165,27 @@ private string snippet(string text, size_t start, size_t end)
 }
 
 /// `history_search`: matching messages, newest first by default.
-string search(string path, JSONValue args) @trusted
+string search(string path, JSONValue args)
 {
     import std.regex : regex, matchAll, escaper, Regex;
     import std.array : array;
-    auto p = args.type == JSONType.object ? "pattern" in args.object : null;
+    auto p = args.type == JSONType.object ? "pattern" in args.objectNoRef : null;
     if (p is null || p.type != JSONType.string || !p.str.length) throw new HistoryError("pattern must be a non-empty string");
     auto pattern = p.str;
     Regex!char re;
     try re = regex(pattern, "i");
     catch (Exception) re = regex(escaper(pattern).to!string, "i");
     string role;
-    if (auto r = "role" in args.object) if (r.type == JSONType.string) role = r.str;
+    if (auto r = "role" in args.objectNoRef) if (r.type == JSONType.string) role = r.str;
     auto before = idArg(args, "before", false), after = idArg(args, "after", false);
     size_t limit = defaultLimit;
-    if (auto l = "limit" in args.object)
+    if (auto l = "limit" in args.objectNoRef)
     {
         long n = l.type == JSONType.integer ? l.integer : l.type == JSONType.uinteger ? cast(long) l.uinteger : 0;
         if (n > 0) limit = min(cast(size_t) n, maxLimit);
     }
     bool oldestFirst;
-    if (auto o = "order" in args.object)
+    if (auto o = "order" in args.objectNoRef)
         if (o.type == JSONType.string)
         {
             if (o.str == "oldest") oldestFirst = true;

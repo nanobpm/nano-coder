@@ -124,13 +124,13 @@ private string canonOr(string p) { auto c = canonicalize(p); return c !is null ?
 
 /// A file's text (HTML comments stripped, trimmed, capped), or null when it is
 /// missing, unreadable or empty.
-string readCapped(string path) @trusted
+string readCapped(string path)
 {
-    import std.file : read;
+    import nano.safeio : readRawText;
     import std.encoding : sanitize;
     if (!isFile_(path)) return null;
     string raw;
-    try raw = sanitize(cast(string) read(path));
+    try raw = sanitize(readRawText(path));
     catch (Exception) return null;
     auto text = stripHtmlComments(raw).strip;
     if (!text.length) return null;

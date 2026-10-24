@@ -16,6 +16,7 @@ module nano.attachment;
 
 @safe:
 
+import nano.safeio : readBytes, readImmutableBytes;
 import std.format : format;
 import std.typecons : Nullable;
 import std.algorithm : canFind;
@@ -305,7 +306,7 @@ Encoder platformEncoder()
 }
 
 private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
-        string[] delegate(string input, string output) @safe argv) @trusted
+        string[] delegate(string input, string output) @safe argv)
 {
     import std.file : write, read, remove, exists, tempDir;
     import std.path : buildPath;
@@ -325,7 +326,7 @@ private immutable(ubyte)[] runEncoder(const(ubyte)[] src, ImageFormat codec,
     auto r = execute(argv(input, output));
     if (r.status != 0 || !exists(output))
         throw new Exception(format("image re-encode failed: %s", r.output.length > 200 ? r.output[0 .. 200] : r.output));
-    return cast(immutable(ubyte)[]) read(output);
+    return readImmutableBytes(output);
 }
 
 private immutable(ubyte)[] sipsEncode(const(ubyte)[] src, ImageFormat codec, uint maxSide) @safe
@@ -425,7 +426,7 @@ string store(string dir, const ref Attachment a, const(ubyte)[] bytes)
     mkdirRecurse(dir);
     auto path = buildPath(dir, name);
     bool intact;
-    try intact = exists(path) && sha256Hex(cast(const(ubyte)[]) read(path)) == a.sha256;
+    try intact = exists(path) && sha256Hex(readBytes(path)) == a.sha256;
     catch (Exception) {}
     if (!intact)
     {
@@ -438,7 +439,7 @@ string store(string dir, const ref Attachment a, const(ubyte)[] bytes)
 }
 
 /// The stored bytes when present and hash-intact, else null.
-private immutable(ubyte)[] readIntact(string dir, const ref Attachment a) @trusted
+private immutable(ubyte)[] readIntact(string dir, const ref Attachment a)
 {
     import std.file : read;
     import std.path : buildPath;
@@ -446,7 +447,7 @@ private immutable(ubyte)[] readIntact(string dir, const ref Attachment a) @trust
     if (name is null || !dir.length) return null;
     try
     {
-        auto b = cast(immutable(ubyte)[]) read(buildPath(dir, name));
+        auto b = readImmutableBytes(buildPath(dir, name));
         return sha256Hex(b) == a.sha256 ? b : null;
     }
     catch (Exception) return null;

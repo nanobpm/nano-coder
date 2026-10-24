@@ -690,8 +690,7 @@ private void git(string dir, string[] args)
         }
         if (MonoTime.currTime > deadline)
         {
-            // std.process.kill is @system only for its Pid class handle.
-            () @trusted { kill(pid); }();
+            { import nano.safeio : killProcess; killProcess(pid); }
             wait(pid);
             throw new Exception(format("git %s timed out", args.join(" ")));
         }

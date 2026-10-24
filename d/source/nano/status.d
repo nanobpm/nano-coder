@@ -91,7 +91,7 @@ string fitCells(string text, size_t budget)
 
 /// `path` with the home directory shown as `~` (whole components only; the
 /// symlink-resolved home matches too, as on macOS `/tmp` is `/private/tmp`).
-string tildePath(string path, string home) @trusted
+string tildePath(string path, string home)
 {
     import std.path : pathSplitter;
     import std.range : walkLength;
@@ -108,16 +108,9 @@ string tildePath(string path, string home) @trusted
     string resolved;
     if (home.length && home.exists)
     {
-        import core.sys.posix.stdlib : realpath;
-        import core.stdc.stdlib : free;
-        import std.string : toStringz, fromStringz;
-        auto r = realpath(home.toStringz, null);
-        if (r !is null)
-        {
-            resolved = r.fromStringz.idup;
-            free(r);
-            if (resolved.pathSplitter.walkLength <= 1) resolved = null;
-        }
+        import nano.safeio : realPath;
+        resolved = realPath(home);
+        if (resolved !is null && resolved.pathSplitter.walkLength <= 1) resolved = null;
     }
     auto r = rest(path, home);
     if (r is null) r = rest(path, resolved);

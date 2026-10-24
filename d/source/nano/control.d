@@ -200,13 +200,14 @@ struct FdLineReader
     }
 }
 
-@trusted unittest
+unittest
 {
-    import core.sys.posix.unistd : pipe, write, close;
+    import nano.safeio : closeFd, pipeFds, writeFd;
+    alias close = closeFd;
     int[2] fds;
-    assert(pipe(fds) == 0);
+    assert(pipeFds(fds) == 0);
     auto data = "a\n\nbc\nlast";
-    write(fds[1], data.ptr, data.length);
+    writeFd(fds[1], cast(const(ubyte)[]) data);
     close(fds[1]);
     auto r = FdLineReader(fds[0]);
     assert(r.next == "a" && r.next == "" && r.next == "bc" && r.next == "last" && r.next is null);

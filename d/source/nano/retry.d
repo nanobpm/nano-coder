@@ -89,7 +89,7 @@ struct RetryPolicy
 /// Delay before the next attempt. Server hints (`Retry-After`, or "try again
 /// in Ns" in a rate-limit message) are honoured exactly, capped at
 /// `maxBackoff`; computed backoffs lose up to 20% to `jitter` in [0, 1).
-Duration retryDelay(RetryPolicy policy, long attempt, const(ErrorInfo)* err, string retryAfterHeader,
+Duration retryDelay(RetryPolicy policy, long attempt, scope const(ErrorInfo)* err, string retryAfterHeader,
     long nowUnix, double jitter)
 {
     Duration hint;
@@ -177,7 +177,7 @@ unittest
     assert(ErrorInfo.fromBody(400, `{"error":"plain"}`).message == "plain");
 }
 
-@trusted unittest
+ unittest
 {
     // 2026-01-01T00:00:00Z
     long now = 1_767_225_600;

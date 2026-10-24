@@ -32,6 +32,41 @@ ubyte[] readBytes(string path) @trusted
     return cast(ubyte[]) read(path);
 }
 
+/// `std.file.read` as immutable bytes: the buffer is freshly allocated and
+/// only this result refers to it.
+immutable(ubyte)[] readImmutableBytes(string path) @trusted
+{
+    import std.file : read;
+    return cast(immutable(ubyte)[]) read(path);
+}
+
+/// `std.file.read` as (possibly invalid) UTF-8 text, without validating it.
+string readRawText(string path) @trusted
+{
+    import std.file : read;
+    return cast(string) read(path);
+}
+
+/// The bytes of `path` from byte `offset` to the end (`File.seek` and
+/// `byChunk`; each chunk is copied before the buffer is reused).
+ubyte[] readFrom(string path, ulong offset) @trusted
+{
+    import std.stdio : File;
+    auto f = File(path, "rb");
+    f.seek(offset);
+    return readToEnd(f);
+}
+
+import std.stdio : File;
+/// Everything left in `f` (a pipe or file), copied out of `byChunk`'s reused
+/// buffer.
+ubyte[] readToEnd(File f) @trusted
+{
+    ubyte[] r;
+    foreach (chunk; f.byChunk(64 * 1024)) r ~= chunk;
+    return r;
+}
+
 /// A byte buffer nothing else references, viewed as (possibly invalid) UTF-8
 /// text. The caller must hand over the only reference: the bytes become
 /// immutable, so a later write through another alias would break that.
@@ -264,6 +299,35 @@ int pollFds(scope pollfd[] fds, int timeoutMs) @trusted
 // @system; they only take the object's own lock and state.
 import core.sync.condition : Condition;
 import core.thread : Thread;
+
+/// `t.isRunning`.
+bool threadRunning(Thread t) @trusted { return t.isRunning; }
+
+/// Run `dg` with SIGPIPE ignored, restoring the previous handler after (so a
+/// child that exits early, like a pager, can't kill the process).
+T withSigpipeIgnored(T)(scope T delegate() @safe dg) @trusted
+{
+    import core.sys.posix.signal : signal, SIGPIPE, SIG_IGN;
+    auto old = signal(SIGPIPE, SIG_IGN);
+    scope (exit) signal(SIGPIPE, old);
+    return dg();
+}
+
+/// `std.process.kill(pid)`. It is @system only because of the `Pid` class
+/// handle; the signal goes to the pid it holds.
+import std.process : Pid;
+void killProcess(Pid pid) @trusted
+{
+    import std.process : kill;
+    kill(pid);
+}
+
+/// `fsync(2)`.
+int fsyncFd(int fd) @trusted nothrow @nogc
+{
+    import core.sys.posix.unistd : fsync;
+    return fsync(fd);
+}
 
 /// `c.notify()`.
 void signalOne(Condition c) @trusted { c.notify(); }
