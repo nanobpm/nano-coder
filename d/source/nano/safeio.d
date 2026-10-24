@@ -122,6 +122,56 @@ int pipeFds(ref int[2] fds) @trusted nothrow @nogc
     return pipe(fds);
 }
 
+import core.sys.posix.termios : termios;
+/// `tcgetattr(3)` into `t`; false on error (not a terminal).
+bool tcGet(int fd, out termios t) @trusted nothrow @nogc
+{
+    import core.sys.posix.termios : tcgetattr;
+    return tcgetattr(fd, &t) == 0;
+}
+
+/// `tcsetattr(3)` with `TCSANOW`; false on error.
+bool tcSet(int fd, const ref termios t) @trusted nothrow @nogc
+{
+    import core.sys.posix.termios : tcsetattr, TCSANOW;
+    return tcsetattr(fd, TCSANOW, &t) == 0;
+}
+
+/// A C signal handler. It runs asynchronously, so it is @system and must
+/// only touch atomics and async-signal-safe calls.
+alias SignalHandler = extern (C) void function(int) nothrow @nogc @system;
+
+/// Install `handler` for `sig` with `sigaction(2)` (empty mask, no flags).
+void onSignal(int sig, SignalHandler handler) @trusted nothrow @nogc
+{
+    import core.sys.posix.signal : sigaction, sigaction_t, sigemptyset;
+    sigaction_t sa;
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, null);
+}
+
+/// An `atexit(3)` handler.
+alias ExitHandler = extern (C) void function() nothrow @system;
+
+/// `atexit(3)`.
+void atExit(ExitHandler f) @trusted nothrow @nogc
+{
+    import core.stdc.stdlib : atexit;
+    atexit(f);
+}
+
+/// A `__gshared` value of a plain struct, read and written through @safe
+/// code as `name` (getter and setter) over the storage `name_`. A struct copy
+/// is not atomic, so this is only for state touched by one thread (or set
+/// before the others start); keep anything shared across threads atomic.
+mixin template GsharedValue(T, string name)
+{
+    mixin("private __gshared T " ~ name ~ "_;");
+    mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
+    mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
+}
+
 /// Line-buffer `stdout` (`setvbuf(_IOLBF)`), so a pipe gets whole lines.
 void lineBufferStdout() @trusted
 {
@@ -303,6 +353,42 @@ const(JSONValue)* jsonGet(return scope const ref JSONValue v, string key) @trust
 {
     if (v.type != JSONType.object) return null;
     return key in v.object;
+}
+
+/// A deep, mutable copy of `v`, so a `const` tree can be merged into a
+/// mutable one without casting `const` away (and without the two sharing
+/// subtrees). Numbers are copied as stored, never re-parsed.
+JSONValue jsonCopy(const JSONValue v)
+{
+    final switch (v.type)
+    {
+        case JSONType.null_: return JSONValue(null);
+        case JSONType.string: return JSONValue(v.str);
+        case JSONType.integer: return JSONValue(v.integer);
+        case JSONType.uinteger: return JSONValue(v.uinteger);
+        case JSONType.float_: return JSONValue(v.floating);
+        case JSONType.true_: return JSONValue(true);
+        case JSONType.false_: return JSONValue(false);
+        case JSONType.array:
+            JSONValue[] a;
+            foreach (e; v.arrayNoRef) a ~= jsonCopy(e);
+            return JSONValue(a);
+        case JSONType.object:
+            JSONValue[string] o;
+            foreach (k, e; v.objectNoRef) o[k] = jsonCopy(e);
+            return JSONValue(o);
+    }
+}
+
+@safe unittest
+{
+    import std.json : parseJSON;
+    auto src = parseJSON(`{"a":[1,2.5,"x",true,null,{"b":18446744073709551615}]}`);
+    const c = src;
+    auto d = jsonCopy(c);
+    assert(d.toString == src.toString);
+    d["a"][0] = 9;
+    assert(src["a"][0].integer == 1);
 }
 
 @safe unittest

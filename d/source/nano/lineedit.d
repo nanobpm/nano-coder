@@ -833,34 +833,40 @@ version (Posix)
 {
     import core.sys.posix.termios;
 
-    private __gshared termios saved;
-    private __gshared bool keyMode;
+    import core.atomic : atomicLoad, atomicStore;
+    import nano.safeio : GsharedValue, atExit, tcGet, tcSet;
+    // The terminal settings key mode replaced; only the main thread (and its
+    // atexit handler) enters and leaves key mode.
+    mixin GsharedValue!(termios, "saved");
+    private shared bool keyMode_;
 
     /// Key mode: no canonical input, echo or signals (Ctrl-C arrives as a
     /// byte), and bracketed paste. Output processing stays on.
-    bool enterKeyMode(int fd) @trusted
+    bool enterKeyMode(int fd)
     {
-        if (keyMode) return true;
-        if (tcgetattr(fd, &saved) != 0) return false;
-        auto t = saved;
+        if (atomicLoad(keyMode_)) return true;
+        termios orig;
+        if (!tcGet(fd, orig)) return false;
+        saved = orig;
+        auto t = orig;
         t.c_lflag &= ~(ICANON | ECHO | ISIG | IEXTEN);
         t.c_iflag &= ~(IXON | ICRNL | INLCR);
         t.c_cc[VMIN] = 1;
         t.c_cc[VTIME] = 0;
-        if (tcsetattr(fd, TCSANOW, &t) != 0) return false;
-        keyMode = true;
+        if (!tcSet(fd, t)) return false;
+        atomicStore(keyMode_, true);
         writeFd(1, "\x1b[?2004h");
-        import core.stdc.stdlib : atexit;
         static bool registered;
-        if (!registered) { registered = true; atexit(&restoreAtExit); }
+        if (!registered) { registered = true; atExit(&restoreAtExit); }
         return true;
     }
 
-    void leaveKeyMode(int fd = 0) @trusted nothrow
+    void leaveKeyMode(int fd = 0) nothrow
     {
-        if (!keyMode) return;
-        tcsetattr(fd, TCSANOW, &saved);
-        keyMode = false;
+        if (!atomicLoad(keyMode_)) return;
+        auto t = saved;
+        tcSet(fd, t);
+        atomicStore(keyMode_, false);
         writeFd(1, "\x1b[?2004l");
     }
 
@@ -873,7 +879,7 @@ version (Posix)
     }
 
     /// Whether key mode is on (so a nested user can leave it as it was).
-    bool inKeyMode() @trusted nothrow { return keyMode; }
+    bool inKeyMode() nothrow { return atomicLoad(keyMode_); }
 
     /// The terminal's output fd: 1, or the saved one while the frame
     /// renderer has fd 1 pointing at its pipe.

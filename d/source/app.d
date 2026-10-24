@@ -223,13 +223,11 @@ mixin GsharedRef!(TurnControl, "gControl"); /// written by the main thread, read
 shared bool gTurnRunning;
 
 /// Route SIGINT to `onInterrupt`.
-void installSigint() @trusted
+void installSigint()
 {
-    import core.sys.posix.signal : sigaction, sigaction_t, SIGINT, sigemptyset;
-    sigaction_t sa;
-    sa.sa_handler = &onInterrupt;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, null);
+    import core.sys.posix.signal : SIGINT;
+    import nano.safeio : onSignal;
+    onSignal(SIGINT, &onInterrupt);
 }
 
 extern (C) void onInterrupt(int) nothrow @nogc @system
@@ -1054,9 +1052,9 @@ string contextReport(Agent agent)
 
 /// Redraw the status line after the terminal is resized (SIGWINCH sets a
 /// flag; a daemon thread redraws, as signal handlers can't write safely).
-void watchResize() @trusted
+void watchResize()
 {
-    import core.sys.posix.signal : sigaction, sigaction_t, sigemptyset;
+    import nano.safeio : onSignal;
     enum SIGWINCH = 28; // macOS and Linux
     import core.thread : Thread;
     import core.time : msecs;
@@ -1064,10 +1062,7 @@ void watchResize() @trusted
     static bool watching;
     if (watching) return;
     watching = true;
-    sigaction_t sa;
-    sa.sa_handler = &onWinch;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGWINCH, &sa, null);
+    onSignal(SIGWINCH, &onWinch);
     auto t = new Thread({
         for (;;)
         {
@@ -1076,7 +1071,7 @@ void watchResize() @trusted
         }
     });
     t.isDaemon = true;
-    t.start();
+    startThread(t);
 }
 
 /// The agent, for `main`'s exit (title requests may still be in flight).

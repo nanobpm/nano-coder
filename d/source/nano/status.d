@@ -315,20 +315,20 @@ ushort[2] terminalSize()
 /// Ask the terminal where the cursor is, reading the reply straight from
 /// stdin with echo, line buffering and signals off. Only before the line
 /// reader runs (it would race for the reply).
-private bool queryCursorDirect(out ushort row, out ushort col) @trusted
+private bool queryCursorDirect(out ushort row, out ushort col)
 {
     import core.sys.posix.termios;
-    import core.sys.posix.poll : poll, pollfd, POLLIN;
-    import core.sys.posix.unistd : read;
+    import core.sys.posix.poll : pollfd, POLLIN;
     import core.time : MonoTime, msecs;
+    import nano.safeio : pollFds, readFd, tcGet, tcSet;
     termios original;
-    if (tcgetattr(0, &original) != 0) return false;
+    if (!tcGet(0, original)) return false;
     auto raw = original;
     raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(0, TCSANOW, &raw) != 0) return false;
-    scope (exit) tcsetattr(0, TCSANOW, &original);
+    if (!tcSet(0, raw)) return false;
+    scope (exit) tcSet(0, original);
     writeFd(1, "\x1b[6n");
     auto deadline = MonoTime.currTime + 300.msecs;
     ubyte[] reply;
@@ -336,11 +336,11 @@ private bool queryCursorDirect(out ushort row, out ushort col) @trusted
     {
         auto left = (deadline - MonoTime.currTime).total!"msecs";
         if (left <= 0) break;
-        auto fd = pollfd(0, POLLIN, 0);
-        if (poll(&fd, 1, cast(int) left) <= 0) break;
-        ubyte b;
-        if (read(0, &b, 1) != 1) break;
-        reply ~= b;
+        pollfd[1] fd = [pollfd(0, POLLIN, 0)];
+        if (pollFds(fd[], cast(int) left) <= 0) break;
+        ubyte[1] b;
+        if (readFd(0, b[]) != 1) break;
+        reply ~= b[0];
     }
     return parseCursorReport(reply, row, col);
 }

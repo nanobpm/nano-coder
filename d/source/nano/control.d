@@ -173,9 +173,9 @@ struct FdLineReader
     private bool eof;
 
     /// The next line without its newline; null at end of input.
-    string next() @trusted
+    string next()
     {
-        import core.sys.posix.unistd : read;
+        import nano.safeio : readFd;
         import std.string : indexOf;
         for (;;)
         {
@@ -193,7 +193,7 @@ struct FdLineReader
                 return rest.length ? rest : null;
             }
             ubyte[65536] buf;
-            auto n = read(fd, buf.ptr, buf.length);
+            auto n = readFd(fd, buf[]);
             if (n <= 0) eof = true;
             else pending ~= cast(string) buf[0 .. n].idup;
         }
