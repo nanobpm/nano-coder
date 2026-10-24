@@ -364,6 +364,9 @@ class Agent
         }
         push(Message.user(input));
         string last;
+        // Output-limit continuations: the cut-off chunks so far, and how many.
+        string continued;
+        size_t truncations;
         // The turn cap: interactive normal mode asks to keep going; auto mode
         // has none; headless runs (ACP, -p) stop at the cap, or at a safety
         // cap when there is none. Re-read from the live mode each iteration.
@@ -487,9 +490,22 @@ class Agent
             if (r.toolCalls.length == 0)
             {
                 bool cut = r.stopReason == "length" || r.stopReason == "max_tokens";
+                // A steer that arrived while the answer was written extends the
+                // turn; the reply after it is a fresh answer.
+                if (control.hasSteers && !control.isCancelled) { continued = null; continue; }
+                // A reply cut off at the output-token limit isn't finished (any
+                // tool call in it was dropped): ask for the rest, in smaller
+                // pieces, up to maxTruncatedContinuations times.
+                if (cut && iteration < budget && !control.isCancelled && truncations < maxTruncatedContinuations)
+                {
+                    truncations++;
+                    continued ~= r.content;
+                    push(Message.user(wrapReminder(truncatedContinuationNote(r.usage.outputTokens))));
+                    continue;
+                }
                 if (cut) ev.text(false, "\n[the reply hit the output-token limit]");
-                // A steer that arrived while the answer was written extends the turn.
-                if (control.hasSteers && !control.isCancelled) continue;
+                // The whole answer: the chunks carried across continuations, then this one.
+                last = continued ~ r.content;
                 // A blocking Stop hook keeps the turn going (capped per turn).
                 if (hooks !is null && !cut && stopBlocks < maxStopBlocks && !control.isCancelled
                     && iteration < budget)
@@ -498,6 +514,7 @@ class Agent
                     if (o.blocked)
                     {
                         stopBlocks++;
+                        continued = null;
                         auto reason = o.blockReason.strip.length ? o.blockReason : "A Stop hook asked the agent to keep going.";
                         push(Message.user(wrapReminder(reason)));
                         ev.userMessage(reason);
@@ -507,6 +524,8 @@ class Agent
                 lastStop = cut ? StopReason.maxTokens : StopReason.endTurn;
                 return last;
             }
+            // Tool calls begin a new answer: dropped call markup mustn't prefix it.
+            continued = null;
             string loopStop;
             foreach (call; r.toolCalls)
             {
@@ -1663,6 +1682,7 @@ unittest
 }
 
 // AI Credits add up across responses that report them and reset with the session.
+// rust: agent.rs::record_usage_accumulates_aic_when_reported, agent.rs::new_session_resets_cumulative_counters
 unittest
 {
     import std.math : isClose;
@@ -1706,6 +1726,7 @@ Message[] danglingRepairs(const Message[] conversation)
     return repairs;
 }
 
+// rust: agent.rs::repairs_interrupted_turns_on_resume
 unittest
 {
     auto calls = [ToolCall.fromRaw("c1", "echo", `{}`), ToolCall.fromRaw("c2", "bash", `{}`)];
@@ -1729,6 +1750,7 @@ private string safeName(string s)
 
 // A long result from a tool that doesn't bound its own output is cut and the
 // whole text kept beside the session's log.
+// rust: agent.rs::persisted_sessions_spill_beside_their_log, agent.rs::long_tool_output_is_cut_and_kept_on_disk
 unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, dirEntries, SpanMode, mkdirRecurse;
@@ -1755,4 +1777,71 @@ unittest
     assert(tool.content.indexOf("characters omitted; full output saved to " ~ buildPath(dir, "sess-x.spill")) > 0,
         tool.content);
     assert(dirEntries(buildPath(dir, "sess-x.spill"), SpanMode.shallow).array.length == 1);
+}
+
+/// Continuations asked for after replies cut off at the output-token limit, per turn.
+enum maxTruncatedContinuations = 3;
+
+/// The nudge after a reply cut off at the output-token limit (Rust's wording).
+string truncatedContinuationNote(long completionTokens)
+{
+    auto at = completionTokens > 0 ? format(" at the output-token limit (%s tokens)", completionTokens)
+        : " at the output-token limit";
+    return "Your previous reply was cut off" ~ at ~ "; any tool call in it was not run. "
+        ~ "Continue from where you left off, and write large outputs in smaller pieces "
+        ~ "(e.g. `write_file` a skeleton, then `edit_file` to fill it in) so each reply "
+        ~ "fits within the limit.";
+}
+
+private LLMResponse cutText(string content, long tokens)
+{
+    auto r = LLMResponse(content);
+    r.stopReason = "length";
+    r.usage.outputTokens = tokens;
+    return r;
+}
+
+// rust: agent.rs::a_reply_cut_off_at_the_output_limit_continues_instead_of_ending
+unittest
+{
+    import std.string : indexOf;
+    auto mock = new MockClient([cutText("half a file", 4096), LLMResponse("all done")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == "half a fileall done");
+    assert(agent.lastStop == StopReason.endTurn);
+    auto note = agent.messages[3];
+    assert(note.role == Role.user && note.content.indexOf("cut off") >= 0 && note.content.indexOf("4096") >= 0);
+    assert(agent.messages[2].content == "half a file" && agent.messages[2].stopReason == "max_tokens");
+}
+
+// rust: agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason
+unittest
+{
+    LLMResponse[] cuts;
+    foreach (_; 0 .. maxTruncatedContinuations + 1) cuts ~= cutText("still going", 100);
+    auto mock = new MockClient(cuts);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    import std.array : replicate;
+    assert(agent.run("go", new NullEvents) == "still going".replicate(maxTruncatedContinuations + 1));
+    assert(agent.lastStop == StopReason.maxTokens);
+}
+
+// rust: agent.rs::output_limit_continuations_accumulate_the_whole_answer
+unittest
+{
+    auto mock = new MockClient([cutText("one ", 100), cutText("two ", 100), LLMResponse("three")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == "one two three");
+    assert(agent.lastStop == StopReason.endTurn);
+}
+
+// rust: agent.rs::a_tool_run_resets_the_continuation_accumulator
+unittest
+{
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)), (JSONValue a) => "pong");
+    auto mock = new MockClient([cutText("lost ", 100), LLMResponse("", "", [ToolCall.fromRaw("c1", "echo", `{}`)]),
+        LLMResponse("fresh")]);
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == "fresh");
 }

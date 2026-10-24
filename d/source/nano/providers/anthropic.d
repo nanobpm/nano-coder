@@ -318,6 +318,7 @@ unittest
     assert("cache_control" in b["messages"][2]["content"][1]);
 }
 
+// rust: providers/anthropic.rs::parses_copilot_aic_from_response_and_stream
 unittest
 {
     AnthropicStream st;

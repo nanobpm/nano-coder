@@ -185,6 +185,7 @@ void readCopilotAic(const JSONValue parent, ref TokenUsage usage) @safe
     usage.aic = nano / 1e9;
 }
 
+// rust: llm.rs::reads_copilot_aic_from_nano
 @safe unittest
 {
     import std.math : isClose;

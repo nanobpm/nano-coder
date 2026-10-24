@@ -488,6 +488,7 @@ unittest // changing execution arguments is not a repeat; the same ones are
     assert(last.warning);
 }
 
+// rust: reminders.rs::identical_large_output_with_per_call_spill_paths_still_counts
 unittest // identical large output with per-call spill paths still counts
 {
     Reminders r;

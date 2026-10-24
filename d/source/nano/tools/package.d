@@ -174,6 +174,7 @@ private string spillFile(string text, string label)
     return path;
 }
 
+// (spill directory selection; the never-overwrite loop is not under test)
 unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, readText;
@@ -191,6 +192,7 @@ unittest
     assert(m && m[1].dirName == dir && readText(m[1]).length == 300);
 }
 
+// rust: output.rs::spills_long_output_to_a_file
 unittest
 {
     auto big = new char[1000];

@@ -528,6 +528,7 @@ class CopilotClient : OpenAIClient
 }
 
 
+// rust: providers/openai.rs::parses_copilot_aic_from_response
 unittest
 {
     StreamState st;

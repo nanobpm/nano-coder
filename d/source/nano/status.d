@@ -315,3 +315,14 @@ unittest
     assert(rate > 999 && rate < 1001); // 300 tokens over 0.3 s
     assert(m.record(4, 400) == 0); // throttled
 }
+
+// rust: status.rs::shows_aic_only_when_reported
+unittest
+{
+    import std.string : indexOf;
+    Stats s;
+    assert(render(s, 200).indexOf("AIC") < 0);
+    s.hasAic = true;
+    s.aic = 1.25;
+    assert(render(s, 200).indexOf("1.2 AIC") >= 0);
+}

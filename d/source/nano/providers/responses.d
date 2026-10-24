@@ -299,6 +299,7 @@ struct ResponsesStream
     assert(b2["temperature"].floating == 0.3 && b2["reasoning"]["effort"].str == "none");
 }
 
+// rust: providers/openai_responses.rs::parses_copilot_aic_from_response_and_stream
  unittest
 {
     auto r = parseResponses(parseJSON(`{"status":"completed","output":[
