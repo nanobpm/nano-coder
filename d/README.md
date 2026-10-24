@@ -32,9 +32,14 @@ All code is `@safe`: every module starts with `@safe:`, and calls the
 compiler can't check are wrapped in small `@trusted` functions (shared ones
 live in `source/nano/safeio.d`). `scripts/check-safe.sh` runs before every
 `dub build` and `dub test` and fails the build on a module without `@safe:`,
-a `@system:`/`@trusted:` label, `@system` outside `extern (C)`, or more
-`@trusted` outside `safeio.d` than `scripts/trusted-budget` allows. The build
-uses `-preview=dip1000` and `-preview=nosharedaccess`.
+a `@system:`/`@trusted:` label, `@system` outside `extern (C)`, a `@trusted`
+without a comment above it saying why it is safe, or more `@trusted` than the
+budgets allow (`scripts/trusted-budget` outside `safeio.d`,
+`scripts/trusted-budget-safeio` inside it). The build uses `-preview=dip1000`
+and `-preview=nosharedaccess` and requires LDC 1.43 or later (dub rejects
+DMD and GDC). CI also runs D-Scanner with the bug-finding checks in
+`dscanner.ini`, and `.github/CODEOWNERS` routes changes to `safeio.d`, the
+budgets and the build settings to the owner for review.
 
 ## Status
 

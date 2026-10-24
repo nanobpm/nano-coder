@@ -1,0 +1,10 @@
+# Changes to the D port's unchecked code need the owner's review: safeio.d
+# holds almost every `@trusted` escape (the D equivalent of `unsafe`), and the
+# budgets and check script decide how many escapes are allowed.
+/d/source/nano/safeio.d @jwulf
+/d/source/nano/landlock.d @jwulf
+/d/source/nano/http.d @jwulf
+/d/scripts/check-safe.sh @jwulf
+/d/scripts/trusted-budget @jwulf
+/d/scripts/trusted-budget-safeio @jwulf
+/d/dub.json @jwulf

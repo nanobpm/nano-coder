@@ -73,8 +73,14 @@ The 6 left outside `safeio.d` are calls into C:
 | Landlock | `landlock` (5) | raw `syscall`, the re-exec helper and its module constructor |
 | HTTP | `http.perform` | `std.net.curl` is `@system` throughout |
 
-`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (6)
-and fails the build if the count outside `safeio.d` goes over it.
+`scripts/check-safe.sh` reads the limits from `scripts/trusted-budget` (6,
+outside `safeio.d`) and `scripts/trusted-budget-safeio` (50) and fails the
+build if either count goes over. It also fails on a `@trusted` with no
+comment above it saying why it is safe. dub refuses compilers other than
+LDC 1.43+, so the DIP1000 flags can't be skipped. CI runs D-Scanner
+(`dscanner.ini`; `trust_too_much` flags `@trusted` on a whole aggregate),
+and `.github/CODEOWNERS` requires the owner's review for `safeio.d`,
+`landlock.d`, `http.d`, the budgets, the check script and `dub.json`.
 
 What remains matches Rust's `unsafe` surface: FFI (Landlock syscalls,
 curl, POSIX in `safeio.d`). Review new code in `safeio.d` like an `unsafe`
