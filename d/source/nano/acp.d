@@ -16,7 +16,7 @@ module nano.acp;
 
 @safe:
 
-import nano.safeio : signalOne, spawnUnchecked, waitOn, stdErr, stdOut;
+import nano.safeio : spawnDaemon, stdErr, stdOut;
 
 import std.json;
 import std.format : format;
@@ -24,7 +24,6 @@ import std.string : strip, startsWith, indexOf;
 import std.algorithm : canFind;
 import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
-import core.sync.condition : Condition;
 import nano.agent;
 import nano.claude_hooks : HookManager;
 import nano.control;
@@ -194,43 +193,133 @@ unittest
     assert(inputId(parseJSON(`{}`)) is null);
 }
 
-/// FIFO of parsed messages shared by the reader thread and the turn loop.
-private final class Inbox
+/// Message routing shared by the stdin reader thread and the turn loop: a
+/// sendable handle (copies share one state). Messages wait as JSON text;
+/// during a turn, cancels and steers bypass the queue.
+struct AcpRouter
 {
-    Mutex lock;
-    Condition ready;
-    JSONValue[] items;
-    bool eof;
-
-    this() { lock = new Mutex; ready = new Condition(lock); }
-
-    void push(JSONValue m)
+    import nano.safeio : Shared;
+    private static struct State
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        items ~= m;
-        ready.signalOne();
+        immutable(string)[] items; /// queued messages, as JSON text
+        bool eof, turnActive, sawValid;
+        string sessionId;
+        immutable(size_t)[] steerMarks; /// queue length when each steer arrived
+    }
+    private Shared!State state;
+    private shared TurnControl control;
+
+    /// Routing for `control` (the agent's).
+    static AcpRouter make(shared TurnControl control) { return AcpRouter(Shared!State.make, control); }
+
+    /// Route one input line. Returns a reply to send at once (a cancel's
+    /// result), or null.
+    string receive(string line)
+    {
+        auto l = line.strip;
+        if (!l.length) return null;
+        JSONValue msg;
+        try msg = parseJSON(l);
+        catch (Exception e)
+        {
+            auto seen = state.get.sawValid;
+            stdErr.writeln(seen ? "ACP parse error: " ~ e.msg
+                : "input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): " ~ e.msg);
+            return null;
+        }
+        immutable valid = isJsonRpcRequest(msg);
+        auto ctl = atomicLoad(control);
+        return state.update!string((ref State st) {
+            if (valid) st.sawValid = true;
+            if (st.turnActive)
+            {
+                string steerText;
+                switch (classifyDuringTurn(msg, st.sessionId, steerText))
+                {
+                case DuringTurn.cancel:
+                    ctl.cancel();
+                    auto id = get(msg, "id");
+                    return id.type != JSONType.null_ ? rpcResult(id, JSONValue(string[string].init)).toString : null;
+                case DuringTurn.steer:
+                    st.steerMarks ~= st.items.length;
+                    ctl.steer(Steer(steerText, get(msg, "id")));
+                    return null;
+                default:
+                    break;
+                }
+            }
+            st.items ~= l;
+            return null;
+        });
     }
 
-    void close()
-    {
-        lock.lock();
-        scope (exit) lock.unlock();
-        eof = true;
-        ready.signalOne();
-    }
+    /// Input has ended.
+    void close() { state.update((ref State st) { st.eof = true; }); }
 
-    /// The next message; false at end of input.
+    /// The next queued message (waits); false at end of input.
     bool pop(out JSONValue m)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        while (!items.length && !eof) ready.waitOn();
-        if (!items.length) return false;
-        m = items[0];
-        items = items[1 .. $];
+        auto text = state.await!string((ref const State st) => st.items.length || st.eof, (ref State st) {
+            if (!st.items.length) return string.init;
+            auto t = st.items[0];
+            st.items = st.items[1 .. $];
+            return t;
+        });
+        if (text is null) return false;
+        m = parseJSON(text);
         return true;
     }
+
+    /// Whether any valid JSON-RPC request arrived.
+    bool sawValid() { return state.get.sawValid; }
+
+    /// The session cancels and steers are matched against.
+    void sessionId(string id) { state.update((ref State st) { st.sessionId = id; }); }
+
+    /// A turn starts: cancels and steers now go to it.
+    void startTurn()
+    {
+        auto ctl = atomicLoad(control);
+        state.update((ref State st) {
+            ctl.startTurn();
+            st.steerMarks = null;
+            st.turnActive = true;
+        });
+    }
+
+    /// The turn ended: messages queue again. `finish` runs under the lock,
+    /// so no message is routed meanwhile; it gets the queue (parsed), the
+    /// steer marks and the session, and returns whether it changed the queue.
+    void endTurn(scope bool delegate(ref JSONValue[] items, const(size_t)[] marks, string session) @safe finish)
+    {
+        state.update((ref State st) {
+            st.turnActive = false;
+            JSONValue[] items;
+            foreach (t; st.items) items ~= parseJSON(t);
+            if (!finish(items, st.steerMarks, st.sessionId)) return;
+            immutable(string)[] back;
+            foreach (m; items) back ~= m.toString;
+            st.items = back;
+        });
+    }
+}
+
+/// The stdin reader (runs via `spawn`): routes each line, writing an
+/// immediate reply straight to stdout.
+private void readAcpStdin(AcpRouter router)
+{
+    // FdLineReader, not std.stdio: see its comment.
+    auto input = FdLineReader(0);
+    for (string line; (line = input.next()) !is null;)
+        if (auto reply = router.receive(line)) writeStdoutLine(reply);
+    router.close();
+}
+
+/// One message to stdout (each line whole: `File` locks per call).
+private void writeStdoutLine(string l)
+{
+    stdOut.writeln(l);
+    stdOut.flush();
 }
 
 final class AcpServer : AgentEvents
@@ -239,13 +328,9 @@ final class AcpServer : AgentEvents
     private Host host;
     private void delegate(string line) writeLine_;
     private Mutex outLock;
-    private Inbox inbox;
-    private string sessionId;
+    private AcpRouter router;
+    private string sessionId_;
     private size_t messageSeq;
-    // Turn routing, shared with the reader thread (guarded by inbox.lock).
-    private shared bool turnActive;
-    private size_t[] steerMarks;
-    private bool sawValid;
 
     /// `writeLine` gets one JSON message per call (defaults to stdout).
     this(Agent agent, Host host, void delegate(string) @safe writeLine = null)
@@ -253,11 +338,8 @@ final class AcpServer : AgentEvents
         this.agent = agent;
         this.host = host;
         outLock = new Mutex;
-        inbox = new Inbox;
-        writeLine_ = writeLine !is null ? writeLine : (string l) {
-            stdOut.writeln(l);
-            stdOut.flush();
-        };
+        router = AcpRouter.make(atomicLoad(agent.control));
+        writeLine_ = writeLine !is null ? writeLine : (string l) => writeStdoutLine(l);
         agent.onPlanChanged = () {
             JSONValue u = ["sessionUpdate": "plan"];
             u["entries"] = agent.plan.acpEntries;
@@ -266,11 +348,13 @@ final class AcpServer : AgentEvents
         };
     }
 
-    void send(JSONValue msg)
+    void send(JSONValue msg) { writeOut(msg.toString); }
+
+    private void writeOut(string line)
     {
         outLock.lock();
         scope (exit) outLock.unlock();
-        writeLine_(msg.toString);
+        writeLine_(line);
     }
 
     void notify(string method, JSONValue params)
@@ -328,72 +412,32 @@ final class AcpServer : AgentEvents
 
     // ---- input ----
 
-    /// Feed one input line (the reader thread calls this for each stdin line).
+    /// Feed one input line (as the reader thread does for each stdin line).
     void receive(string line)
     {
-        import std.stdio : stderr;
-        auto l = line.strip;
-        if (!l.length) return;
-        JSONValue msg;
-        try msg = parseJSON(l);
-        catch (Exception e)
-        {
-            stdErr.writeln(sawValid ? "ACP parse error: " ~ e.msg
-                : "input doesn't look like ACP JSON-RPC (expected JSON-RPC 2.0, one message per line): " ~ e.msg);
-            return;
-        }
-        if (isJsonRpcRequest(msg)) sawValid = true;
-        inbox.lock.lock();
-        scope (exit) inbox.lock.unlock();
-        if (atomicLoad(turnActive))
-        {
-            string steerText;
-            switch (classifyDuringTurn(msg, sessionId, steerText))
-            {
-            case DuringTurn.cancel:
-                agent.control.cancel();
-                auto id = get(msg, "id");
-                if (id.type != JSONType.null_) send(rpcResult(id, JSONValue(string[string].init)));
-                return;
-            case DuringTurn.steer:
-                steerMarks ~= inbox.items.length;
-                agent.control.steer(Steer(steerText, get(msg, "id")));
-                return;
-            default:
-                break;
-            }
-        }
-        inbox.items ~= msg;
-        inbox.ready.signalOne();
+        if (auto reply = router.receive(line)) writeOut(reply);
     }
 
     /// Input has ended.
-    void close() { inbox.close(); }
+    void close() { router.close(); }
 
     /// Run until input ends. Returns whether any valid JSON-RPC request arrived.
     bool run()
     {
         JSONValue msg;
-        while (inbox.pop(msg)) handle(msg);
-        return sawValid;
+        while (router.pop(msg)) handle(msg);
+        return router.sawValid;
     }
 
     /// Serve stdin on a reader thread until it ends.
     bool serveStdio()
     {
-        import core.thread : Thread;
-        // FdLineReader, not std.stdio: see its comment.
-        // Unchecked: `receive` runs on this thread and touches the server's
-        // turn routing (`steerMarks`, the inbox), all under `inbox.lock`;
-        // `turnActive` is atomic, `agent.control` is `shared`, and `send`
-        // takes `outLock`.
-        spawnUnchecked({
-            auto input = FdLineReader(0);
-            for (string line; (line = input.next()) !is null;) receive(line);
-            close();
-        }, true);
+        spawnDaemon(&readAcpStdin, router);
         return run();
     }
+
+    private string sessionId() { return sessionId_; }
+    private void sessionId(string id) { sessionId_ = id; router.sessionId(id); }
 
     // ---- handling ----
 
@@ -673,13 +717,7 @@ final class AcpServer : AgentEvents
     /// Run one prompt turn; the reader thread routes cancels and steers meanwhile.
     private void runTurn(JSONValue id, string text, string givenId = null)
     {
-        {
-            inbox.lock.lock();
-            scope (exit) inbox.lock.unlock();
-            agent.control.startTurn();
-            steerMarks = null;
-            atomicStore(turnActive, true);
-        }
+        router.startTurn();
         string response;
         try response = agent.run(text, this, false, givenId);
         catch (Exception e)
@@ -687,42 +725,42 @@ final class AcpServer : AgentEvents
             response = "Error: " ~ e.msg;
             agent.lastStop = StopReason.endTurn;
         }
-        inbox.lock.lock();
-        scope (exit) inbox.lock.unlock();
-        atomicStore(turnActive, false);
-        auto stop = cast(string) agent.lastStop;
-        if (id.type != JSONType.null_)
-        {
-            auto reply = JSONValue(["stopReason": stop, "response": response]);
-            // Extension: the model's explicit completed/blocked report.
-            if (agent.hasOutcome && stop == "end_turn") reply["_meta"] = JSONValue(["outcome": agent.lastOutcome.toJSON]);
-            send(rpcResult(id, reply));
-        }
-        // Steers folded into this turn are answered by it.
-        foreach (s; agent.control.takeAbsorbed)
-            if (s.tag.type != JSONType.null_)
+        router.endTurn((ref JSONValue[] items, const(size_t)[] marks, string session) {
+            auto stop = cast(string) agent.lastStop;
+            if (id.type != JSONType.null_)
             {
-                JSONValue meta = ["steered": JSONValue(true)];
-                meta["inputOf"] = id;
-                send(rpcResult(s.tag, JSONValue(["stopReason": JSONValue(stop), "_meta": meta])));
+                auto reply = JSONValue(["stopReason": stop, "response": response]);
+                // Extension: the model's explicit completed/blocked report.
+                if (agent.hasOutcome && stop == "end_turn") reply["_meta"] = JSONValue(["outcome": agent.lastOutcome.toJSON]);
+                send(rpcResult(id, reply));
             }
-        // Steers that arrived too late: dropped on cancel, else queued as
-        // prompts at the position each one arrived.
-        auto leftover = agent.control.takePending;
-        if (agent.lastStop == StopReason.cancelled)
-        {
-            foreach (s; leftover)
-                if (s.tag.type != JSONType.null_) send(rpcResult(s.tag, JSONValue(["stopReason": "cancelled"])));
-            return;
-        }
-        inbox.items = requeueSteers(inbox.items, leftover, steerMarks, sessionId);
+            // Steers folded into this turn are answered by it.
+            foreach (s; agent.control.takeAbsorbed)
+                if (s.tag.type != JSONType.null_)
+                {
+                    JSONValue meta = ["steered": JSONValue(true)];
+                    meta["inputOf"] = id;
+                    send(rpcResult(s.tag, JSONValue(["stopReason": JSONValue(stop), "_meta": meta])));
+                }
+            // Steers that arrived too late: dropped on cancel, else queued as
+            // prompts at the position each one arrived.
+            auto leftover = agent.control.takePending;
+            if (agent.lastStop == StopReason.cancelled)
+            {
+                foreach (s; leftover)
+                    if (s.tag.type != JSONType.null_) send(rpcResult(s.tag, JSONValue(["stopReason": "cancelled"])));
+                return false;
+            }
+            items = requeueSteers(items, leftover, marks, session);
+            return true;
+        });
     }
 }
 
 /// Insert steers that missed their turn into `deferred` as prompts, each at
 /// the position `deferred` had when it arrived. `leftover` are the last
 /// steers to arrive, so they match the tail of `marks`.
-JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, size_t[] marks, string active)
+JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, const(size_t)[] marks, string active)
 {
     import std.algorithm : min;
     auto first = marks.length > leftover.length ? marks.length - leftover.length : 0;
