@@ -54,7 +54,7 @@ string tomlKey(string k)
 
 /// The dotted segments of a header like `[providers."my x".models]`, or null
 /// when `line` is not a plain table header (`[[array]]` tables too are null).
-string[] headerPath(string line)
+string[] headerPath(string line) nothrow
 {
     auto t = line.strip;
     if (!t.startsWith("[") || t.startsWith("[[")) return null;
@@ -235,7 +235,7 @@ string tomlSet(string doc, const string[] path, string key, string value)
 }
 
 /// The header path in force at line `row`.
-private string[] tableAt(const string[] lines, size_t row)
+private string[] tableAt(const string[] lines, size_t row) nothrow
 {
     string[] cur;
     foreach (l; lines[0 .. row])

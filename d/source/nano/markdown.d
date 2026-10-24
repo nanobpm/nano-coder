@@ -36,7 +36,7 @@ import nano.mdtable : layout, textWidth = width;
 
 private enum DIM = "\x1b[2m", RESET = "\x1b[0m";
 
-private string sgr(ubyte style) pure
+private string sgr(ubyte style) pure nothrow
 {
     string[] codes;
     if (style & BOLD) codes ~= "1";
@@ -206,7 +206,7 @@ string[] hardLines(string line, size_t width, ubyte style) pure
     return out_;
 }
 
-string fenceOpen(string info) pure { return DIM ~ "```" ~ info ~ RESET; }
+string fenceOpen(string info) pure nothrow { return DIM ~ "```" ~ info ~ RESET; }
 string fenceClose() pure { return DIM ~ "```" ~ RESET; }
 
 private string[] codeLines(string text, size_t width) pure

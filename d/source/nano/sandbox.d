@@ -247,14 +247,14 @@ struct SandboxConfig
 }
 
 /// Whether `output` of a failed sandboxed command looks like a sandbox denial.
-bool looksDenied(string output) pure
+bool looksDenied(string output) pure nothrow
 {
     return ["Operation not permitted", "Read-only file system", "Permission denied"].any!(d => output.canFind(d));
 }
 
 private:
 
-string quote(string path) pure
+string quote(string path) pure nothrow
 {
     return `"` ~ path.replace(`\`, `\\`).replace(`"`, `\"`) ~ `"`;
 }
@@ -299,7 +299,7 @@ string tempDirectory()
 }
 
 /// The repository's git directory and, for a worktree, the shared one.
-string[] gitDirs(string cwd)
+string[] gitDirs(string cwd) nothrow
 {
     import nano.safeio : readToEnd;
     import std.process : pipeProcess, wait, Redirect, Config;
@@ -320,7 +320,7 @@ string[] gitDirs(string cwd)
 
 /// Whether `gitDir` is the per-worktree git directory of the worktree rooted
 /// at `cwdReal` (its `gitdir` back-pointer resolves into it).
-bool worktreeBackpointerWithin(string gitDir, string cwdReal)
+bool worktreeBackpointerWithin(string gitDir, string cwdReal) nothrow
 {
     import std.file : readText;
     try

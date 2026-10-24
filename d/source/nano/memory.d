@@ -630,7 +630,7 @@ void writeAll(string p, const Entry[] entries, const(ubyte[])[] unknown)
     ok = true;
 }
 
-private void collectRemove(string p)
+private void collectRemove(string p) nothrow
 {
     try remove(p);
     catch (Exception) {}

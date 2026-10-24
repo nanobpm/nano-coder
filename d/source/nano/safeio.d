@@ -86,7 +86,7 @@ string ownText(char[] unique) @trusted pure nothrow
 // or writes past memory the caller owns.
 
 /// `open(2)`; returns the fd or -1 (errno set).
-int openPath(string path, int flags, uint mode = 0) @trusted
+int openPath(string path, int flags, uint mode = 0) @trusted nothrow
 {
     import core.sys.posix.fcntl : open;
     import std.string : toStringz;
@@ -95,7 +95,7 @@ int openPath(string path, int flags, uint mode = 0) @trusted
 }
 
 /// `chmod(2)`; returns 0 or -1.
-int chmodPath(string path, uint mode) @trusted
+int chmodPath(string path, uint mode) @trusted nothrow
 {
     import core.sys.posix.sys.stat : chmod;
     import std.string : toStringz;

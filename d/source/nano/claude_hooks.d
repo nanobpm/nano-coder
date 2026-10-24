@@ -902,7 +902,7 @@ private void applyJsonOutput(Event event, JSONValue json, ref HookResult r)
 /// Single-line sanitiser for config-derived text in the `/hooks` listing:
 /// control characters become visible control pictures and U+2028/U+2029
 /// become ␤, so a crafted command cannot forge an extra listing row.
-string listingField(string text)
+string listingField(string text) nothrow
 {
     import std.utf : byDchar;
     string out_;

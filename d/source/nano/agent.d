@@ -56,7 +56,7 @@ interface AgentEvents
 }
 
 /// Wrap text the model should read as a system note, not user words.
-string wrapReminder(string text)
+string wrapReminder(string text) nothrow
 {
     return "<system-reminder>\n" ~ text ~ "\n</system-reminder>";
 }

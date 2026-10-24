@@ -285,7 +285,7 @@ string firstWord(string s)
     return s;
 }
 
-string synopsis(const Command c)
+string synopsis(const Command c) nothrow
 {
     return c.args.length ? c.name ~ " " ~ c.args : c.name;
 }
@@ -406,7 +406,7 @@ unittest // menu rows
     assert(helpText().canFind("/memory [forget ID]"));
 }
 
-string replicateStr(string s, size_t n) pure { string r; foreach (_; 0 .. n) r ~= s; return r; }
+string replicateStr(string s, size_t n) pure nothrow { string r; foreach (_; 0 .. n) r ~= s; return r; }
 
 unittest // argument type-ahead (Rust suggestions / complete_line / suggestion_menu)
 {

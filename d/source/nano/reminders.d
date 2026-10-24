@@ -287,7 +287,7 @@ private bool shortClusterContains(string token, char opt)
 
 /// Split into top-level pipeline stages, quote- and escape-aware. Returns null
 /// when the command contains `||` (not a pipeline).
-string[] splitPipeline(string command)
+string[] splitPipeline(string command) nothrow
 {
     string[] stages;
     size_t start, i;

@@ -58,7 +58,7 @@ struct ErrorInfo
 }
 
 /// Whether an error is worth retrying.
-bool retryable(const ErrorInfo e, const(ushort)[] statuses)
+bool retryable(const ErrorInfo e, const(ushort)[] statuses) nothrow
 {
     static immutable fatalCodes = ["context_length_exceeded", "insufficient_quota", "usage_not_included",
         "usage_limit_reached", "credit_balance_exhausted", "billing_hard_limit_reached", "cyber_policy",

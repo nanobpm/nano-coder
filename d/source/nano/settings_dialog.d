@@ -540,7 +540,7 @@ private string editProvider(SettingsUi ui, ref SettingsHost h, ref string[] noti
     return name;
 }
 
-private string kindLabelOf(ProviderKind k)
+private string kindLabelOf(ProviderKind k) nothrow
 {
     final switch (k)
     {

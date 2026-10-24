@@ -43,9 +43,9 @@ void allowed(string command)
     assert(e is null, command ~ ": " ~ e);
 }
 
-bool isErr(string r) { return r !is null; }
-bool isOk(string r) { return r is null; }
-string unwrapErr(string r) { assert(r !is null, "expected an error"); return r; }
+bool isErr(string r) nothrow { return r !is null; }
+bool isOk(string r) nothrow { return r is null; }
+string unwrapErr(string r) nothrow { assert(r !is null, "expected an error"); return r; }
 void unwrapOk(string r) { assert(r is null, r); }
 
 shared size_t counter;
@@ -59,7 +59,7 @@ string tmpDir(string prefix)
 
 public import nano.safeio : realPath;
 
-void rmrf(string p) { try rmdirRecurse(p); catch (Exception) {} }
+void rmrf(string p) nothrow { try rmdirRecurse(p); catch (Exception) {} }
 
 unittest // static_guard_is_advisory_and_fails_closed_on_uninspectable_input
 {

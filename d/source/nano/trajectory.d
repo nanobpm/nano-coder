@@ -838,13 +838,13 @@ bool page(string text)
 }
 
 /// Rows and columns of the terminal on `fd`, or zeros when unknown.
-size_t[2] terminalSize(int fd = 1)
+size_t[2] terminalSize(int fd = 1) nothrow
 {
     import safeio = nano.safeio;
     return safeio.terminalSize(fd);
 }
 
-bool pagerRan(int code) { return code != 126 && code != 127; }
+bool pagerRan(int code) nothrow { return code != 126 && code != 127; }
 
 /// Whether `text` would not fit on a `rows` x `cols` screen with room for the prompt.
 bool needsPager(string text, size_t rows, size_t cols)

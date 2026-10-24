@@ -13,7 +13,7 @@ import std.array : join;
 import std.string : split;
 
 /// `Path::components`, as strings (`"/"` for the root).
-string[] components(string path) pure
+string[] components(string path) pure nothrow
 {
     string[] out_;
     if (path.startsWith("/")) out_ ~= "/";
@@ -27,7 +27,7 @@ string[] components(string path) pure
 }
 
 /// Rebuild a path from components.
-string fromComponents(const string[] comps) pure
+string fromComponents(const string[] comps) pure nothrow
 {
     if (!comps.length) return "";
     if (comps[0] == "/") return "/" ~ comps[1 .. $].join("/");
@@ -35,7 +35,7 @@ string fromComponents(const string[] comps) pure
 }
 
 /// `Path::parent`: null for the root or an empty path.
-string parent(string path) pure
+string parent(string path) pure nothrow
 {
     auto c = components(path);
     if (!c.length || (c.length == 1 && c[0] == "/")) return null;
@@ -44,7 +44,7 @@ string parent(string path) pure
 }
 
 /// `Path::file_name`: null when the last component is the root, `.` or `..`.
-string fileName(string path) pure
+string fileName(string path) pure nothrow
 {
     auto c = components(path);
     if (!c.length) return null;
@@ -52,10 +52,10 @@ string fileName(string path) pure
     return (last == "/" || last == "." || last == "..") ? null : last;
 }
 
-bool isAbsolute(string path) pure { return path.startsWith("/"); }
+bool isAbsolute(string path) pure nothrow { return path.startsWith("/"); }
 
 /// `Path::join`: an absolute `rel` replaces `base`.
-string joinPath(string base, string rel) pure
+string joinPath(string base, string rel) pure nothrow
 {
     if (rel.isAbsolute || !base.length) return rel;
     if (!rel.length) return base.length && base[$ - 1] == '/' ? base : base ~ "/";
@@ -63,7 +63,7 @@ string joinPath(string base, string rel) pure
 }
 
 /// Component-wise prefix test (`Path::starts_with`).
-bool startsWithPath(string path, string prefix) pure
+bool startsWithPath(string path, string prefix) pure nothrow
 {
     auto p = components(path), q = components(prefix);
     if (q.length > p.length) return false;

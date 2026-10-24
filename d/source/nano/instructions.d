@@ -106,14 +106,14 @@ string expandHome(string path)
     return path;
 }
 
-private bool isFile_(string p)
+private bool isFile_(string p) nothrow
 {
     import std.file : exists, isFile;
     try return exists(p) && isFile(p);
     catch (Exception) return false;
 }
 
-private bool isDir_(string p)
+private bool isDir_(string p) nothrow
 {
     import std.file : exists, isDir;
     try return exists(p) && isDir(p);
@@ -330,7 +330,7 @@ string[] importRefs(string text)
 
 /// `@path` imports expand in Claude-format files only: in `AGENTS.md` an
 /// `@name` is a mention.
-private bool expandsImports(string path, Kind kind)
+private bool expandsImports(string path, Kind kind) nothrow
 {
     auto n = path.baseName;
     return kind == Kind.rule || kind == Kind.imported || n == "CLAUDE.md" || n == "CLAUDE.local.md";
@@ -338,7 +338,7 @@ private bool expandsImports(string path, Kind kind)
 
 /// Split a rule's front matter into its `paths` (hasPaths false: applies
 /// everywhere) and the body. Accepts a YAML list, `[a, b]` or `a, b`.
-string ruleFrontMatter(string text, out bool hasPaths, out string[] paths)
+string ruleFrontMatter(string text, out bool hasPaths, out string[] paths) nothrow
 {
     auto lines = text.lineSplitter!(KeepTerminator.yes).array;
     if (!lines.length || lines[0].stripRight != "---") return text;
@@ -392,7 +392,7 @@ string ruleFrontMatter(string text, out bool hasPaths, out string[] paths)
 }
 
 /// Split on top-level commas only (not inside `{a,b}` or quotes).
-private string[] splitTopLevel(string value)
+private string[] splitTopLevel(string value) nothrow
 {
     string[] out_;
     size_t depth, start;

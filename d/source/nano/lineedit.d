@@ -282,7 +282,7 @@ struct Pos { size_t row, col; }
 /// Where each position lands when `buf` is drawn after a prompt `promptW`
 /// columns wide in a terminal `width` columns wide. Continuation lines (after
 /// a newline) are indented by `promptW`. Returns the cursor and end positions.
-void layout(const dchar[] buf, size_t promptW, size_t width, size_t cursor, out Pos cur, out Pos end) pure
+void layout(const dchar[] buf, size_t promptW, size_t width, size_t cursor, out Pos cur, out Pos end) pure nothrow
 {
     width = max(width, 2);
     auto indent = promptW < width ? promptW : 0;

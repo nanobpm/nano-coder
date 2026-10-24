@@ -82,7 +82,7 @@ string defaultPath()
     return buildPath(appDataDir(), "recent-models.json");
 }
 
-Recents load(string path)
+Recents load(string path) nothrow
 {
     import std.file : readText;
     Recents r;
@@ -112,7 +112,7 @@ Recents load(string path)
 }
 
 /// Write the list, creating the parent directory; errors are ignored.
-void save(string path, const Recents r)
+void save(string path, const Recents r) nothrow
 {
     import std.file : mkdirRecurse, write;
     import std.path : dirName;
@@ -167,4 +167,4 @@ void save(string path, const Recents r)
     assert(load(path) == Recents.init);
 }
 
-private bool startsWith(string s, string p) { return s.length >= p.length && s[0 .. p.length] == p; }
+private bool startsWith(string s, string p) nothrow { return s.length >= p.length && s[0 .. p.length] == p; }

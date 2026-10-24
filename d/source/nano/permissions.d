@@ -220,7 +220,7 @@ private string stringArg(JSONValue args, string key)
     return v !is null && v.type == JSONType.string ? v.str : null;
 }
 
-private string currentDir()
+private string currentDir() nothrow
 {
     import std.file : getcwd;
     try return getcwd();

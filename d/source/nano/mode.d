@@ -24,7 +24,7 @@ enum AgentMode
 immutable AgentMode[] allModes = [AgentMode.normal, AgentMode.plan, AgentMode.auto_];
 
 /// The next mode in the Shift+Tab cycle.
-AgentMode next(AgentMode m)
+AgentMode next(AgentMode m) nothrow
 {
     final switch (m)
     {
@@ -74,7 +74,7 @@ immutable string[] planAllowedTools = [
 ];
 
 /// Whether `tool` may run in plan mode.
-bool planAllows(string tool)
+bool planAllows(string tool) nothrow
 {
     foreach (t; planAllowedTools) if (t == tool) return true;
     return false;

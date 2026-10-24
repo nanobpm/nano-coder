@@ -29,7 +29,7 @@ immutable string[] systemDirs = ["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr
 /// Exact `var` roots (descendants such as `/var/folders` are allowed).
 immutable string[] varRoots = ["/var", "/private/var"];
 
-private auto destructiveSql()
+private auto destructiveSql() nothrow
 {
     static re = ctRegex!(`\b(drop\s+(database|schema|table|user|role|owned\s+by)\b|truncate\s+(table\s+)?[\w"` ~ "`"
         ~ `\[]|delete\s+from\s+[\w."` ~ "`" ~ `\[\]]+\s*($|;|'|"|\))|delete\s+from\s+[\w."` ~ "`"
@@ -54,7 +54,7 @@ void deviceWriteAt(string target, string cwd)
 }
 
 /// Split arguments into flags and operands (everything after `--` is an operand).
-void splitFlags(const Word[] args, out string[] flags, out const(Word)[] operands)
+void splitFlags(const Word[] args, out string[] flags, out const(Word)[] operands) nothrow
 {
     bool onlyOperands = false;
     foreach (arg; args)
@@ -66,7 +66,7 @@ void splitFlags(const Word[] args, out string[] flags, out const(Word)[] operand
 }
 
 /// The `mv`/`cp` destination given via `-t DIR`, `-tDIR` or `--target-directory[=]DIR`.
-string mvTargetDir(const Word[] args) pure
+string mvTargetDir(const Word[] args) pure nothrow
 {
     foreach (i, arg; args)
     {
