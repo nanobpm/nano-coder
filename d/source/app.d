@@ -1279,13 +1279,14 @@ int runMain(string[] args)
     Skills skills;
     Skills discoverSkills(string dir)
     {
-        if (!cfg.skills.enabled) return null;
+        // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
+        if (!cfg.skills.enabled || environment.get("NANO_CODER_NO_SKILLS") !is null) return null;
         auto s = Skills.discover(dir, cfg.skills);
         foreach (w; s.warnings) stdErr.writeln("nano-coder-d: skills: ", w);
         return s;
     }
     skills = discoverSkills(cwd);
-    if (cfg.skills.enabled && (o.acp || !skills.empty))
+    if (cfg.skills.enabled && skills !is null && (o.acp || !skills.empty))
         tools.register(skillsDefinition, (JSONValue a) => skills.load(a));
     // Memory: read-only when no human vets saves live (ACP, -p, piped stdio) and in plan mode.
     MemoryStore memory;
@@ -1425,6 +1426,8 @@ int runMain(string[] args)
         agent.historyHintPending = restored.historyAvailable && !restored.historyHintConsumed;
         agent.plan = Plan.init;
         agent.resetSessionCounters();
+        updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
+        agent.repairDanglingToolCalls();
         if (restored.plan.type == JSONType.object)
         {
             try agent.plan = Plan.fromJSON(restored.plan);
@@ -1858,6 +1861,7 @@ int runMain(string[] args)
                     }
                     catch (Exception e) { writeln(console.red("error: " ~ e.msg)); continue; }
                     agent.restart(systemFor(cwd, false), log);
+                    updateStatus((ref Stats s) { s.historySearches = s.historyReads = 0; });
                     sysPlan = false;
                     agent.useHooks(loadHooks(cwd), false);
                     if (gFrame) gFrame.clear();

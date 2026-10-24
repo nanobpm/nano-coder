@@ -692,6 +692,8 @@ final class AcpServer : AgentEvents
             try agent.plan = Plan.fromJSON(restored.plan);
             catch (Exception) {}
         }
+        agent.resetSessionCounters();
+        agent.repairDanglingToolCalls();
         if (host.loadHooks !is null) agent.useHooks(host.loadHooks(getcwd()), true);
         replayHistory();
     }

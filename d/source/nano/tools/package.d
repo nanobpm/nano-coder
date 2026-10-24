@@ -141,18 +141,54 @@ string truncateOutput(string text, size_t limit, string label)
             chars[0 .. head].toUTF8, chars.length - limit, spill, chars[$ - tail .. $].toUTF8);
 }
 
+/// Where cut outputs are saved: the session's `<id>.spill` directory when
+/// the session is persisted, so the paths in the log stay valid on resume;
+/// null for a per-process temporary directory. Per thread: the agent's.
+private string spillDir_;
+
+/// Set (or clear, with null) the directory cut outputs are saved in.
+void setSpillDir(string dir) { spillDir_ = dir; }
+
+/// The spill directory of the session logged at `logPath` (`<id>.spill`
+/// beside `<id>.jsonl`, as Rust's `session::spill_dir_for`).
+string spillDirFor(string logPath)
+{
+    import std.path : stripExtension;
+    return logPath.stripExtension ~ ".spill";
+}
+
 private string spillFile(string text, string label)
 {
-    import std.file : write, mkdirRecurse, tempDir;
+    import std.file : write, mkdirRecurse, tempDir, exists;
     import std.path : buildPath;
     import std.process : thisProcessID;
     import std.datetime.systime : Clock;
     static size_t counter;
-    auto dir = buildPath(tempDir, "nano-coder-d");
+    auto dir = spillDir_.length ? spillDir_ : buildPath(tempDir, format("nano-coder-d-%s", thisProcessID));
     mkdirRecurse(dir);
-    auto path = buildPath(dir, format("%s-%s-%s-%s.txt", label, thisProcessID, Clock.currStdTime, ++counter));
+    // Never overwrite: a recorded path must keep pointing at its output.
+    auto stem = buildPath(dir, format("%s-%s-%s", label, Clock.currStdTime, ++counter));
+    auto path = stem ~ ".txt";
+    for (size_t n = 2; path.exists; n++) path = format("%s-%s.txt", stem, n);
     write(path, text);
     return path;
+}
+
+unittest
+{
+    import std.file : tempDir, rmdirRecurse, exists, readText;
+    import std.path : buildPath, dirName;
+    import std.process : thisProcessID;
+    auto dir = buildPath(tempDir, format("nano-d-spill-test-%s", thisProcessID));
+    scope (exit) { setSpillDir(null); if (dir.exists) rmdirRecurse(dir); }
+    assert(spillDirFor("/s/sess-1.jsonl") == "/s/sess-1.spill");
+    setSpillDir(dir);
+    auto big = new char[300];
+    big[] = 'y';
+    auto t = truncateOutput(ownText(big), 100, "tool-c1-grep");
+    import std.regex : matchFirst;
+    auto m = t.matchFirst(`saved to (.*\.txt) \.\.\.\]`);
+    assert(m && m[1].dirName == dir && readText(m[1]).length == 300);
 }
 
 unittest

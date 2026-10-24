@@ -193,7 +193,7 @@ private string fingerprint(string tool, JSONValue args, string rawArgs, bool ok,
 private string normaliseSpillPaths(string result)
 {
     import std.regex : regex, replaceAll;
-    static re = regex(`(characters omitted; full output saved to )[^\n]*?(-\d+-\d+-\d+\.txt) \.\.\.\]`);
+    static re = regex(`(characters omitted; full output saved to )[^\n]*?(-\d+-\d+(?:-\d+)?\.txt) \.\.\.\]`);
     return replaceAll(result, re, "$1<spill> ...]");
 }
 

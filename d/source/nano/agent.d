@@ -153,6 +153,8 @@ class Agent
     /// Compactions this session.
     uint compactions;
     /// Session token totals.
+    /// Longest tool result kept whole (characters); longer ones are cut and spilled.
+    size_t toolOutputLimit = 40_000;
     ulong sessionInputTokens, sessionOutputTokens;
     /// AI Credits used this session; `hasSessionAic` once a provider reported any.
     bool hasSessionAic;
@@ -180,6 +182,14 @@ class Agent
         if (!m.timestamp.length) m.timestamp = nowStamp();
         if (log !is null) m.logLine = log.append(m);
         messages ~= m;
+    }
+
+    /// Answer the tool calls of the last assistant message that a crash left
+    /// without results, so a resumed conversation is valid to send (providers
+    /// reject a tool call with no result). Each repair is logged like a push.
+    void repairDanglingToolCalls()
+    {
+        foreach (m; danglingRepairs(messages)) push(m);
     }
 
     /// Run one user input to completion. Returns the final assistant text,
@@ -508,7 +518,17 @@ class Agent
                 else if (loopStop !is null) result = loopStoppedToolResult;
                 else
                 {
-                    result = runTool(call, r.stopReason, isError);
+                    {
+                        import nano.tools : setSpillDir, spillDirFor, truncateOutput;
+                        // Cut outputs are kept beside a persisted session's log.
+                        setSpillDir(log !is null ? spillDirFor(log.path) : null);
+                        result = runTool(call, r.stopReason, isError);
+                        // bash, read_file and history_read bound their own output.
+                        if (call.name != "bash" && call.name != "read_file" && call.name != hist.readTool
+                            && call.name != "load_skill")
+                            result = truncateOutput(result, toolOutputLimit,
+                                format("tool-%s-%s", safeName(call.id), safeName(call.name)));
+                    }
                     if (call.name == "read_file") result = imageResult(result, isError, attachments);
                     // Deeper instruction files and scoped rules attach to the first
                     // file-tool result that touches a matching path.
@@ -1665,4 +1685,74 @@ unittest
     assert(isClose(agent.sessionAic, 0.0432) && agent.sessionInputTokens == 30);
     agent.resetSessionCounters();
     assert(!agent.hasSessionAic && agent.sessionAic == 0 && agent.sessionInputTokens == 0);
+}
+
+/// The tool result a crash left unwritten (Rust's INTERRUPTED_TOOL_RESULT).
+enum interruptedToolResult = "Error: the harness stopped before this tool call completed; its outcome is unknown.";
+
+/// Error results for the tool calls of the last assistant message with calls
+/// that no later message answers.
+Message[] danglingRepairs(const Message[] conversation)
+{
+    ptrdiff_t at = -1;
+    foreach_reverse (i, ref m; conversation)
+        if (m.role == Role.assistant && m.toolCalls.length) { at = i; break; }
+    if (at < 0) return null;
+    bool[string] answered;
+    foreach (ref m; conversation[at + 1 .. $]) if (m.toolCallId.length) answered[m.toolCallId] = true;
+    Message[] repairs;
+    foreach (ref c; conversation[at].toolCalls)
+        if (c.id !in answered) repairs ~= Message.toolResult(c.id, c.name, interruptedToolResult, true);
+    return repairs;
+}
+
+unittest
+{
+    auto calls = [ToolCall.fromRaw("c1", "echo", `{}`), ToolCall.fromRaw("c2", "bash", `{}`)];
+    auto conv = [Message.system("s"), Message.user("run"), Message.assistant("", calls),
+        Message.toolResult("c1", "echo", "ok")];
+    auto r = danglingRepairs(conv);
+    assert(r.length == 1 && r[0].toolCallId == "c2" && r[0].content == interruptedToolResult);
+    assert(danglingRepairs(conv ~ r).length == 0);
+    assert(danglingRepairs([Message.user("x")]).length == 0);
+}
+
+/// `s` with anything but [A-Za-z0-9_-] replaced, for a file name.
+private string safeName(string s)
+{
+    import std.array : appender;
+    auto o = appender!string;
+    foreach (char c; s)
+        o.put((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ? c : '_');
+    return o.data;
+}
+
+// A long result from a tool that doesn't bound its own output is cut and the
+// whole text kept beside the session's log.
+unittest
+{
+    import std.file : tempDir, rmdirRecurse, exists, dirEntries, SpanMode, mkdirRecurse;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.string : indexOf;
+    import std.array : array;
+    import nano.session : SessionLog;
+    auto dir = buildPath(tempDir, format("nano-d-agent-spill-%s", thisProcessID));
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    mkdirRecurse(dir);
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("echo", "echo", parseJSON(`{"type":"object"}`)), (JSONValue a) {
+        auto big = new char[500];
+        big[] = 'z';
+        return big.idup;
+    });
+    auto mock = new MockClient([LLMResponse("", "", [ToolCall.fromRaw("big1", "echo", `{}`)]), LLMResponse("done")]);
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.toolOutputLimit = 10;
+    agent.log = new SessionLog(dir, "m", dir, "sess-x");
+    agent.run("go", new NullEvents);
+    auto tool = agent.messages[3];
+    assert(tool.content.indexOf("characters omitted; full output saved to " ~ buildPath(dir, "sess-x.spill")) > 0,
+        tool.content);
+    assert(dirEntries(buildPath(dir, "sess-x.spill"), SpanMode.shallow).array.length == 1);
 }
