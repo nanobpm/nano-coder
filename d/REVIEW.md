@@ -13,7 +13,7 @@ Each finding is rated **R** (Rust is stronger), **D** (D is stronger), or
 
 | | Rust | D port |
 |---|---|---|
-| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 64 `@trusted` annotations: 50 in `safeio.d` and 14 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
+| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 56 `@trusted` annotations: 50 in `safeio.d` and 6 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
 | Use-after-free and double free | Prevented by ownership. | Prevented in practice by the GC; the port does no manual memory management. **=** |
 | Bounds checks | Always on; an overrun is a panic. | Found in the first review: dub's `release` build type turned them off in `@system` code. They are on again (`-boundscheck=on`), so an overrun is an `Error` that ends the process, like a panic. **=** |
 | Casts | `as` only between numeric types. Reinterpreting bytes as `str` needs `from_utf8` or `unsafe`. | 221 `cast(...)` expressions, mostly numeric and FFI. Bytes from the network and from tools go through `lossyUtf8`/validation, but the compiler doesn't make that happen. **R** |
@@ -58,22 +58,27 @@ writer and the settings writer. `threadRunning`, `waitOn`, `signalAll`,
 timeouts. Marking `resolve`/`retryDelay` pointer parameters `scope` let their
 callers and tests drop `@trusted` under DIP1000.
 
-The 14 left outside `safeio.d`:
+The last casts away `const` were replaced too. A generic `@safe`
+`deepCopy` (arrays, maps, `Nullable`, JSON and structs, field by field) now
+copies `ProviderConfig` and `Message` out of `const`. A config resolved for a
+session no longer shares arrays or maps with the loaded table. Permission
+rules match through a per-thread compiled copy of their regex instead of
+`cast() pattern`. The status-bar `gStats` is now a `StatsCell` object that
+holds its own lock, instead of a `__gshared` struct with a separate lock.
+
+The 6 left outside `safeio.d` are calls into C:
 
 | Group | Where | Why it is `@trusted` |
 |---|---|---|
 | Landlock | `landlock` (5) | raw `syscall`, the re-exec helper and its module constructor |
 | HTTP | `http.perform` | `std.net.curl` is `@system` throughout |
-| Status globals | `app.d` (4) | `gStats` is `__gshared`, read and written under `gStatsLock` |
-| Casts away `const` | `config.resolve`, `settings`, `mock`, `permissions.matches` | copying a `const ProviderConfig` or `Message`, `cast() Regex` |
 
-`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (14)
+`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (6)
 and fails the build if the count outside `safeio.d` goes over it.
 
-Recommended next: give `ProviderConfig` and `Message` `@safe` `dup`
-methods to remove the `const` casts, and move `gStats` into a small locked
-class. Landlock and curl are FFI by nature and stay `@trusted`, as their
-Rust equivalents stay `unsafe`.
+What remains matches Rust's `unsafe` surface: FFI (Landlock syscalls,
+curl, POSIX in `safeio.d`). Review new code in `safeio.d` like an `unsafe`
+block.
 
 ## 2. Error handling
 
@@ -139,7 +144,7 @@ Toolchain notes:
 - **Where Rust is stronger:** checking that is on by default (memory safety,
   `Send`/`Sync`, typed JSON, errors in signatures). D has each of these, but
   only as an opt-in. The port has opted in everywhere (`@safe:` in every
-  module, DIP1000, enforced in the build), but 64 `@trusted` escapes are still
+  module, DIP1000, enforced in the build), but 56 `@trusted` escapes are still
   unchecked and nothing gives Rust-style `Send`/`Sync` checking.
 - **Where D is stronger:** build time (about 5x faster for a clean release
   build and 3.5x for an edit) and a much smaller dependency surface.
