@@ -32,6 +32,7 @@ import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
 static import nano.herdr;
+import nano.frame : glyphMark;
 import nano.question : QuestionBroker, Question, Answer, Answered, Dismissed, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
@@ -387,7 +388,8 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
 {
     while (!atomicLoad(*done))
     {
-        auto r = editor.readLine("↪ ", console.dim("↪ "), true,
+        // The glyph placeholder becomes the busy spinner (nano.frame).
+        auto r = editor.readLine("↪ ", .stamp(true) ~ glyphMark ~ " ", true,
             () => atomicLoad(*done) || questions.pending !is null);
         final switch (r.outcome)
         {
@@ -396,7 +398,10 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 {
                     console.endLine();
                     nano.herdr.report(nano.herdr.State.blocked, qs.length ? sanitizeLine(qs[0].question) : null);
+                    // The user's time at the picker isn't working time.
+                    if (gFrame) gFrame.pauseWork(true);
                     questions.resolve(askQuestions(editor, qs));
+                    if (gFrame) gFrame.pauseWork(false);
                     nano.herdr.report(nano.herdr.State.working);
                     break;
                 }
@@ -1558,6 +1563,8 @@ int runMain(string[] args)
     {
         syncMode();
         nano.herdr.report(nano.herdr.State.working);
+        if (gFrame) gFrame.busy(true);
+        scope (exit) if (gFrame) gFrame.busy(false);
         atomicStore(gTurnRunning, true);
         scope (exit) atomicStore(gTurnRunning, false);
         updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
@@ -1727,7 +1734,7 @@ int runMain(string[] args)
             bool delegate() @safe lapse = null;
             if (exitArmedAt != MonoTime.zero)
                 lapse = () @safe => MonoTime.currTime - exitArmedAt > exitWindow;
-            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ console.bold("› "), false, lapse);
+            auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             editor.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;

@@ -25,7 +25,9 @@ private struct Clear { Chan!bool done; }
 private struct Suspend { Chan!bool done; }
 private struct Resume { Chan!bool done; }
 private struct Close { Chan!(immutable(string)[]) lines; }
-private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close);
+private struct Busy { bool on; }
+private struct WorkPause { bool paused; }
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close, Busy, WorkPause);
 
 /// The frame renderer, as seen from other threads: a sendable handle to the
 /// thread that owns the transcript and the renderer (an actor). Copies
@@ -134,6 +136,14 @@ struct FrameUi
         sendWait((Chan!bool d) => Request(Commit(line, d)));
     }
 
+    /// A turn starts (`true`: the prompt shows a spinner and the working
+    /// time) or ends (back to `›` and the ready hint).
+    void busy(bool on) { send(Request(Busy(on))); }
+
+    /// Stops (or restarts) the working clock while a picker waits for the
+    /// user; the spinner stays.
+    void pauseWork(bool paused) { send(Request(WorkPause(paused))); }
+
     /// Re-renders (the status changed).
     void redraw() { send(Request(Redraw())); }
 
@@ -169,7 +179,10 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                 (Commit c) {
                     f.drain();
                     f.editorRows = null;
-                    f.transcript.feed(cast(const(ubyte)[]) (c.line ~ "\n"));
+                    import std.array : replace;
+                    // A committed prompt keeps the ready glyph, not a spinner frame.
+                    auto line = c.line.replace(glyphMark, promptGlyph(false, 0));
+                    f.transcript.feed(cast(const(ubyte)[]) (line ~ "\n"));
                     f.render();
                     c.done.put(true);
                     return false;
@@ -189,6 +202,17 @@ private void frameThread(Isolated!FrameState state, Chan!Request requests)
                     f.renderer.invalidate();
                     f.render();
                     c.done.put(true);
+                    return false;
+                },
+                (Busy b) {
+                    f.busy = b.on;
+                    if (b.on) f.clock = WorkClock.started(FrameState.nowMs());
+                    f.render();
+                    return false;
+                },
+                (WorkPause p) {
+                    if (p.paused) f.clock.pause(FrameState.nowMs());
+                    else f.clock.resume(FrameState.nowMs());
                     return false;
                 },
                 (Close c) {
@@ -228,6 +252,10 @@ private final class FrameState
     size_t lastW, lastH;
     Debouncer debounce = Debouncer(150);
     StatusFn status;
+    /// A turn is running: the prompt shows the spinner and `clock`.
+    bool busy;
+    WorkClock clock;
+    long lastRenderMs;
 
     void render()
     {
@@ -236,8 +264,11 @@ private final class FrameState
         lastW = w;
         lastH = h;
         debounce.clear();
+        auto now = nowMs();
+        lastRenderMs = now;
         auto lines = transcript.render(w);
-        renderer.render(compose(lines, editorRows.dup, status is null ? "" : status(w)), w, h);
+        auto rows = decorate(editorRows, busy, clock.elapsed(now), w);
+        renderer.render(compose(lines, rows, status is null ? "" : status(w)), w, h);
     }
 
     /// Reads what's waiting in the pipe into the transcript; false at EOF.
@@ -252,7 +283,7 @@ private final class FrameState
         }
     }
 
-    private static long nowMs()
+    static long nowMs()
     {
         import core.time : MonoTime;
         return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
@@ -270,5 +301,8 @@ private final class FrameState
             debounce.record(nowMs());
         }
         if (debounce.pending && debounce.ready(nowMs())) render();
+        // Keep the spinner and the working time moving while a turn runs,
+        // even when no output arrives.
+        else if (busy && nowMs() - lastRenderMs >= spinnerIntervalMs) render();
     }
 }

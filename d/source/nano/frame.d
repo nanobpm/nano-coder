@@ -519,3 +519,132 @@ unittest
     foreach (n; 0 .. 11) small.feed(cast(const(ubyte)[]) "x\n");
     assert(small.lines.length == 9);
 }
+
+// ---- Whose turn it is: the prompt glyph and hint (ui.rs prompt_glyph/prompt_hint) ----
+
+/// Placeholder for the prompt glyph in an editor prompt (one cell). The frame
+/// thread swaps it for a cyan spinner while a turn runs, or a green `›`.
+enum glyphMark = "\uE000";
+/// Placeholder the editor puts after the cursor of an empty editor; the frame
+/// thread swaps it for the dim hint saying whose turn it is.
+enum hintMark = "\uE001";
+
+/// Frames of the busy spinner drawn in place of the prompt glyph.
+immutable dchar[10] spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// How long each spinner frame shows, in ms; the frame is redrawn this often.
+enum long spinnerIntervalMs = 100;
+
+/// The turn's working clock, in ms: when the current run began and the runs
+/// already banked. The count shown is working time, not wall time: while a
+/// picker (the `question` tool, the turn cap) waits for the user the clock is
+/// paused, so the user's thinking time doesn't count as the agent's.
+struct WorkClock
+{
+    long since = -1; /// start of the current run (-1: paused)
+    long banked;     /// completed runs
+
+    static WorkClock started(long now) pure nothrow { return WorkClock(now, 0); }
+
+    long elapsed(long now) const pure nothrow
+    {
+        return banked + (since >= 0 && now > since ? now - since : 0);
+    }
+
+    /// Stop counting. Idempotent, so overlapping pauses never bank twice.
+    void pause(long now) pure nothrow
+    {
+        if (since < 0) return;
+        banked += now > since ? now - since : 0;
+        since = -1;
+    }
+
+    /// Count again from `now`, keeping what was banked. A resume without a
+    /// pause leaves a running clock alone.
+    void resume(long now) pure nothrow
+    {
+        if (since < 0) since = now;
+    }
+}
+
+/// `4s`, `1m 05s`: whole seconds of the running turn.
+string elapsedText(long ms) pure
+{
+    auto secs = ms / 1000;
+    return secs < 60 ? format("%ss", secs) : format("%sm %02ds", secs / 60, secs % 60);
+}
+
+/// The prompt glyph: a cyan spinner while a turn runs (`busy`), a green `›`
+/// while the harness waits for the user. A paused clock keeps its spinner.
+string promptGlyph(bool busy, long elapsedMs) pure
+{
+    import std.conv : to;
+    if (!busy) return "\x1b[38;5;114m›\x1b[39m";
+    auto frame = spinnerFrames[cast(size_t)(elapsedMs / spinnerIntervalMs) % spinnerFrames.length];
+    return "\x1b[38;5;117m" ~ frame.to!string ~ "\x1b[39m";
+}
+
+/// The dim hint after the cursor of an empty editor: whose turn it is.
+string promptHint(bool busy, long elapsedMs) pure
+{
+    return busy ? "working " ~ elapsedText(elapsedMs) ~ " · Enter steers, Esc Esc cancels"
+        : "ready · type a message, /help for commands";
+}
+
+/// The editor rows with the glyph and hint placeholders filled in.
+string[] decorate(const string[] rows, bool busy, long elapsedMs, size_t width) pure
+{
+    import std.algorithm : endsWith;
+    import std.array : replace;
+    string[] out_;
+    foreach (i, r; rows)
+    {
+        string row = r.replace(glyphMark, promptGlyph(busy, elapsedMs));
+        if (row.endsWith(hintMark))
+            row = fit(row[0 .. $ - hintMark.length] ~ " " ~ DIM ~ promptHint(busy, elapsedMs) ~ RESET, width);
+        out_ ~= row;
+    }
+    return out_;
+}
+
+unittest // the working clock pauses and resumes (working_time_excludes_paused_spans)
+{
+    auto c = WorkClock.started(0);
+    assert(c.elapsed(3000) == 3000);
+    c.pause(3000);
+    assert(c.elapsed(63_000) == 3000);
+    c.resume(63_000);
+    assert(c.elapsed(65_000) == 5000, "working resumes from the banked 3s, not the wall clock");
+    c.pause(65_000);
+    assert(elapsedText(c.elapsed(300_000)) == "5s");
+}
+
+unittest // pausing_and_resuming_the_work_clock_is_idempotent
+{
+    auto c = WorkClock.started(0);
+    c.pause(2000);
+    c.pause(9000);
+    assert(c.elapsed(10_000) == 2000);
+    c.resume(10_000);
+    c.resume(12_000);
+    assert(c.elapsed(13_000) == 5000);
+}
+
+unittest // elapsed text, glyph and hint
+{
+    import std.algorithm : canFind;
+    assert(elapsedText(4999) == "4s" && elapsedText(65_000) == "1m 05s");
+    assert(promptGlyph(false, 0).canFind("›"));
+    assert(promptGlyph(true, 0).canFind("⠋") && promptGlyph(true, 150).canFind("⠙"));
+    assert(promptHint(true, 12_000) == "working 12s · Enter steers, Esc Esc cancels");
+    assert(promptHint(false, 0)[0 .. 5] == "ready");
+    assert(cellWidth('\uE000') == 1 && cellWidth('\uE001') == 1);
+}
+
+unittest // decorate fills the placeholders and keeps the row within the width
+{
+    import std.algorithm : canFind;
+    auto rows = decorate([glyphMark ~ " x" ~ hintMark, "more"], true, 2000, 80);
+    assert(!rows[0].canFind(glyphMark) && rows[0].canFind("working 2s"));
+    assert(rows[1] == "more");
+    assert(visibleWidth(decorate([glyphMark ~ " " ~ hintMark], false, 0, 10)[0]) <= 10);
+}

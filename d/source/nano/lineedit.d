@@ -534,6 +534,11 @@ final class LineEditor
         auto w = max(width(), 2);
         auto text = masked ? replicateD('*', state.buf.length) : state.buf.idup;
         auto rows = editorLines(styledPrompt, text, state.cursor, w);
+        // An empty editor with a placeholder glyph says whose turn it is
+        // after the cursor (filled in by the frame thread).
+        import std.algorithm : canFind;
+        import nano.frame : glyphMark, hintMark;
+        if (!text.length && styledPrompt.canFind(glyphMark)) rows[0] ~= hintMark;
         foreach (r; menuRows) rows ~= fit(r, w);
         frameDraw(rows);
     }
