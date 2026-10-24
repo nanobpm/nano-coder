@@ -6,51 +6,81 @@ module nano.frameui;
 
 @safe:
 
-import core.thread : Thread;
 import nano.frame;
 import nano.lineedit : writeFd, ttyOut, terminalWidth, terminalHeight;
-import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, spawnUnchecked, stdErr, stdOut;
+import nano.safeio : closeFd, dup2Fd, dupFd, lineBufferStdout, pipeFds, pollFds, readFd_ = readFd, setNonBlocking, stdErr, stdOut, Chan, Isolated, spawnDaemon;
+import std.sumtype : SumType, match;
 
-final class FrameUi
+/// The status line at a width ("" for none). A plain function: the frame
+/// thread calls it, so it may only read `shared` state.
+alias StatusFn = string function(size_t width) @safe;
+
+// Requests to the frame thread. The ones that change the transcript or the
+// terminal wait for `done`, so output the caller writes afterwards can't
+// overtake them.
+private struct Draw { immutable(string)[] rows; }
+private struct Commit { string line; Chan!bool done; }
+private struct Redraw {}
+private struct Clear { Chan!bool done; }
+private struct Suspend { Chan!bool done; }
+private struct Resume { Chan!bool done; }
+private struct Close { Chan!(immutable(string)[]) lines; }
+private alias Request = SumType!(Draw, Commit, Redraw, Clear, Suspend, Resume, Close);
+
+/// The frame renderer, as seen from other threads: a sendable handle to the
+/// thread that owns the transcript and the renderer (an actor). Copies
+/// refer to the same frame; `FrameUi.init` is "no frame".
+struct FrameUi
 {
-    private int tty = -1, readFd = -1, writeEnd = -1;
-    private Transcript transcript;
-    private string[] editorRows;
-    private FrameRenderer renderer;
-    private bool paused, closed;
-    private size_t lastW, lastH;
-    private Debouncer debounce = Debouncer(150);
-    /// The status line at a width ("" for none).
-    string delegate(size_t width) @safe status;
+    private Chan!Request requests;
+    private int tty = -1, writeEnd = -1, wake = -1;
 
-    /// Takes over the terminal: fd 1 and 2 now feed the transcript.
-    static FrameUi install(string delegate(size_t) @safe status)
+    /// Whether this is a running frame.
+    bool opCast(B : bool)() const { return cast(bool) requests; }
+
+    /// Takes over the terminal: fd 1 and 2 now feed the transcript. Returns
+    /// `FrameUi.init` if it can't.
+    static FrameUi install(StatusFn status)
     {
-        auto f = new FrameUi;
-        f.status = status;
         stdOut.flush();
         stdErr.flush();
-        int[2] p;
-        if (pipeFds(p) != 0) return null;
+        int[2] p, w;
+        if (pipeFds(p) != 0) return FrameUi.init;
+        if (pipeFds(w) != 0) { closeFd(p[0]); closeFd(p[1]); return FrameUi.init; }
+        auto f = new FrameState;
+        f.status = status;
         f.tty = dupFd(1);
         f.readFd = p[0];
-        f.writeEnd = p[1];
+        f.wakeFd = w[0];
         setNonBlocking(f.readFd);
-        dup2Fd(f.writeEnd, 1);
-        dup2Fd(f.writeEnd, 2);
+        setNonBlocking(f.wakeFd);
+        dup2Fd(p[1], 1);
+        dup2Fd(p[1], 2);
         ttyOut = f.tty;
         // Line-buffered: a pipe would otherwise hold whole blocks back.
         lineBufferStdout();
-        f.renderer = new FrameRenderer((string s) { writeFd(f.tty, s); });
+        immutable tty = f.tty;
+        f.renderer = new FrameRenderer((string s) { writeFd(tty, s); });
         writeFd(f.tty, "\x1b[?25l");
-        // Unchecked: both loops share the frame with the main thread, and
-        // take its monitor (`synchronized (this)`) around every access; the
-        // `status` callback reads only `shared` state.
-        spawnUnchecked(&f.readLoop, true);
-        // Unchecked: as above.
-        spawnUnchecked(&f.tickLoop, true);
-        f.redraw();
-        return f;
+        f.render();
+        auto ui = FrameUi(Chan!Request.make, f.tty, p[1], w[1]);
+        // Isolated: `f` was built just above, and only the frame thread keeps it.
+        spawnDaemon(&frameThread, Isolated!FrameState.assumeIsolated(f), ui.requests);
+        return ui;
+    }
+
+    private void send(Request r)
+    {
+        requests.put(r);
+        writeFd(wake, "w");
+    }
+
+    private void sendWait(Request delegate(Chan!bool) @safe make)
+    {
+        auto done = Chan!bool.make;
+        send(make(done));
+        bool ok;
+        done.take(ok);
     }
 
     /// Gives the terminal back (fd 1 and 2 to the tty) and returns the
@@ -59,22 +89,18 @@ final class FrameUi
     {
         stdOut.flush();
         stdErr.flush();
-        string[] lines;
-        synchronized (this)
-        {
-            drain();
-            render();
-            closed = true;
-            lines = transcript.lines.dup;
-            if (transcript.cur.length) lines ~= transcript.cur;
-        }
+        auto reply = Chan!(immutable(string)[]).make;
+        send(Request(Close(reply)));
+        immutable(string)[] lines;
+        reply.take(lines);
         dup2Fd(tty, 1);
         dup2Fd(tty, 2);
         ttyOut = 1;
         closeFd(writeEnd);
+        closeFd(wake);
         closeFd(tty);
         writeFd(1, "\x1b[?25h\r\n");
-        return lines;
+        return lines.dup;
     }
 
     /// Hands the real terminal to a child (a pager) until `resume`.
@@ -82,7 +108,7 @@ final class FrameUi
     {
         stdOut.flush();
         stdErr.flush();
-        synchronized (this) { drain(); paused = true; }
+        sendWait((Chan!bool d) => Request(Suspend(d)));
         dup2Fd(tty, 1);
         dup2Fd(tty, 2);
         writeFd(tty, "\x1b[?25h");
@@ -95,69 +121,127 @@ final class FrameUi
         dup2Fd(writeEnd, 1);
         dup2Fd(writeEnd, 2);
         writeFd(tty, "\x1b[?25l");
-        synchronized (this)
-        {
-            paused = false;
-            renderer.invalidate();
-            render();
-        }
+        sendWait((Chan!bool d) => Request(Resume(d)));
     }
 
-    /// The editor's rows (null hides it).
-    void draw(string[] rows)
-    {
-        synchronized (this)
-        {
-            editorRows = rows;
-            render();
-        }
-    }
+    /// The editor's rows (null hides them).
+    void draw(const string[] rows) { send(Request(Draw(rows.idup))); }
 
     /// A line the editor leaves behind (a submitted prompt, a picker answer).
     void commit(string line)
     {
         stdOut.flush();
-        synchronized (this)
-        {
-            drain();
-            editorRows = null;
-            transcript.feed(cast(const(ubyte)[]) (line ~ "\n"));
-            render();
-        }
+        sendWait((Chan!bool d) => Request(Commit(line, d)));
     }
 
     /// Re-renders (the status changed).
-    void redraw()
-    {
-        synchronized (this) render();
-    }
+    void redraw() { send(Request(Redraw())); }
 
     /// Empties the transcript (`/restart`).
     void clear()
     {
         stdOut.flush();
-        synchronized (this)
-        {
-            drain();
-            transcript.clear();
-            renderer.invalidate();
-            render();
-        }
+        sendWait((Chan!bool d) => Request(Clear(d)));
     }
+}
 
-    private void render()
+/// The frame thread: owns `state`, serves `requests`, follows the pipe and
+/// the terminal size until `Close`.
+private void frameThread(Isolated!FrameState state, Chan!Request requests)
+{
+    import core.sys.posix.poll : pollfd, POLLIN;
+    auto f = state.unwrap;
+    bool pipeOpen = true;
+    for (;;)
     {
-        if (paused || closed) return;
+        pollfd[2] ps = [pollfd(f.wakeFd, POLLIN, 0), pollfd(pipeOpen ? f.readFd : -1, POLLIN, 0)];
+        pollFds(ps[], 50);
+        if (ps[0].revents)
+        {
+            ubyte[64] buf;
+            while (readFd_(f.wakeFd, buf[]) > 0) {}
+        }
+        Request r;
+        while (requests.tryTake(r))
+        {
+            bool closed = r.match!(
+                (Draw d) { f.editorRows = d.rows; f.render(); return false; },
+                (Commit c) {
+                    f.drain();
+                    f.editorRows = null;
+                    f.transcript.feed(cast(const(ubyte)[]) (c.line ~ "\n"));
+                    f.render();
+                    c.done.put(true);
+                    return false;
+                },
+                (Redraw _) { f.render(); return false; },
+                (Clear c) {
+                    f.drain();
+                    f.transcript.clear();
+                    f.renderer.invalidate();
+                    f.render();
+                    c.done.put(true);
+                    return false;
+                },
+                (Suspend c) { f.drain(); f.paused = true; c.done.put(true); return false; },
+                (Resume c) {
+                    f.paused = false;
+                    f.renderer.invalidate();
+                    f.render();
+                    c.done.put(true);
+                    return false;
+                },
+                (Close c) {
+                    f.drain();
+                    f.render();
+                    f.paused = true;
+                    auto lines = f.transcript.lines.idup;
+                    if (f.transcript.cur.length) lines ~= f.transcript.cur.idup;
+                    c.lines.put(lines);
+                    return true;
+                },
+            );
+            if (closed)
+            {
+                closeFd(f.readFd);
+                closeFd(f.wakeFd);
+                return;
+            }
+        }
+        if (pipeOpen && ps[1].revents)
+        {
+            pipeOpen = f.drain();
+            f.render();
+        }
+        f.tick();
+    }
+}
+
+/// The frame's state, owned by the frame thread.
+private final class FrameState
+{
+    int tty = -1, readFd = -1, wakeFd = -1;
+    Transcript transcript;
+    immutable(string)[] editorRows;
+    FrameRenderer renderer;
+    bool paused;
+    size_t lastW, lastH;
+    Debouncer debounce = Debouncer(150);
+    StatusFn status;
+
+    void render()
+    {
+        if (paused) return;
         auto w = terminalWidth(tty), h = terminalHeight(tty);
         lastW = w;
         lastH = h;
         debounce.clear();
         auto lines = transcript.render(w);
-        renderer.render(compose(lines, editorRows, status is null ? "" : status(w)), w, h);
+        renderer.render(compose(lines, editorRows.dup, status is null ? "" : status(w)), w, h);
     }
 
     /// Reads what's waiting in the pipe into the transcript; false at EOF.
-    private bool drain()
+    bool drain()
     {
         ubyte[8192] buf;
         for (;;)
@@ -168,25 +252,6 @@ final class FrameUi
         }
     }
 
-    private void readLoop()
-    {
-        import core.sys.posix.poll : pollfd, POLLIN;
-        for (;;)
-        {
-            pollfd[1] ps = [pollfd(readFd, POLLIN, 0)];
-            if (pollFds(ps[], 200) < 0) continue;
-            auto p = ps[0];
-            synchronized (this)
-            {
-                if (closed) break;
-                if (!p.revents) continue;
-                bool open = drain();
-                render();
-                if (!open) break;
-            }
-        }
-    }
-
     private static long nowMs()
     {
         import core.time : MonoTime;
@@ -194,25 +259,16 @@ final class FrameUi
     }
 
     /// Watches the size; a burst of changes renders once, 150 ms after the last.
-    private void tickLoop()
+    void tick()
     {
-        import core.time : msecs;
-        for (;;)
+        if (paused) return;
+        auto w = terminalWidth(tty), h = terminalHeight(tty);
+        if (w != lastW || h != lastH)
         {
-            Thread.sleep(50.msecs);
-            synchronized (this)
-            {
-                if (closed) return;
-                if (paused) continue;
-                auto w = terminalWidth(tty), h = terminalHeight(tty);
-                if (w != lastW || h != lastH)
-                {
-                    lastW = w;
-                    lastH = h;
-                    debounce.record(nowMs());
-                }
-                if (debounce.pending && debounce.ready(nowMs())) render();
-            }
+            lastW = w;
+            lastH = h;
+            debounce.record(nowMs());
         }
+        if (debounce.pending && debounce.ready(nowMs())) render();
     }
 }

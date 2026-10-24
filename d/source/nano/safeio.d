@@ -611,6 +611,8 @@ struct Chan(T)
     /// ditto
     bool take(out T v) { return atomicLoad(impl).take(v); }
     /// ditto
+    bool tryTake(out T v) { return atomicLoad(impl).tryTake(v); }
+    /// ditto
     void edit(scope void delegate(ref T[]) @safe f) { atomicLoad(impl).edit(f); }
 }
 
@@ -668,6 +670,19 @@ final class Channel(T) if (!hasUnsharedAliasing!T)
         return true;
     }
 
+    /// The next value if one is waiting (doesn't block).
+    /// `@trusted`: as for `put`.
+    bool tryTake(out T v) shared @trusted
+    {
+        auto self = cast() this;
+        self.lock.lock();
+        scope (exit) self.lock.unlock();
+        if (!self.items.length) return false;
+        v = self.items[0];
+        self.items = self.items[1 .. $];
+        return true;
+    }
+
     /// Run `f` on the queued values under the lock (e.g. to reorder them).
     /// `@trusted`: as for `put`; `f` can't keep the reference (`scope`).
     void edit(scope void delegate(ref T[]) @safe f) shared @trusted
@@ -701,19 +716,6 @@ final class Channel(T) if (!hasUnsharedAliasing!T)
     assert(spawn(&add, 2, 3).join() == 5);
     static void bad(int[] a) {}
     static assert(!__traits(compiles, spawn(&bad, [1])));
-}
-
-/// A `__gshared` class reference read and written through @safe code, as
-/// `name` (getter and setter) over the storage `name_`. `@trusted` because a
-/// reference load or store is atomic on every target we build for; the
-/// referenced objects lock themselves, so only the reference is shared.
-mixin template GsharedRef(T, string name)
-{
-    mixin("__gshared T " ~ name ~ "_;");
-    // `@trusted`: single reference loads and stores (see the doc).
-    mixin("@property T " ~ name ~ "() @trusted nothrow @nogc { return " ~ name ~ "_; }");
-    // `@trusted`: the matching store.
-    mixin("@property void " ~ name ~ "(T v) @trusted nothrow @nogc { " ~ name ~ "_ = v; }");
 }
 
 /// Rows and columns of the terminal on `fd` (TIOCGWINSZ), or zeros when

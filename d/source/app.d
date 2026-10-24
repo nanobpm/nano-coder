@@ -4,7 +4,7 @@ module app;
 
 @safe:
 
-import nano.safeio : Chan, GsharedRef, JoinHandle, Locked, spawnDaemon, spawnUnchecked, exitProcess, stdErr, stdinLine, stdOut;
+import nano.safeio : Chan, JoinHandle, Locked, spawnDaemon, spawnUnchecked, exitProcess, stdErr, stdinLine, stdOut;
 
 import std.stdio;
 import std.json;
@@ -193,8 +193,8 @@ void showTrajectory(const ref imported!"nano.trajectory".Trajectory t)
     bool pageable = isTerminal(0) && isTerminal(1) && size[0] && nano.trajectory.needsPager(text, size[0], size[1]);
     if (pageable)
     {
-        if (gFrame !is null) gFrame.suspend();
-        scope (exit) if (gFrame !is null) gFrame.resume();
+        if (gFrame) gFrame.suspend();
+        scope (exit) if (gFrame) gFrame.resume();
         if (nano.trajectory.page(text)) return;
     }
     writeln(text);
@@ -211,7 +211,7 @@ bool isTerminal(int fd)
     import core.sys.posix.unistd : isatty;
     import nano.lineedit : ttyOut;
     // `ttyOut` is set by the main thread when the frame renderer starts.
-    if (fd == 1 || fd == 2) if (gFrame !is null) fd = ttyOut;
+    if (fd == 1 || fd == 2) if (gFrame) fd = ttyOut;
     return isatty(fd) != 0;
 }
 
@@ -457,7 +457,14 @@ shared StatusLine gStatus_;
 shared(StatusLine) gStatus() nothrow @nogc { return atomicLoad(gStatus_); }
 void gStatus(shared StatusLine s) nothrow @nogc { atomicStore(gStatus_, s); }
 /// The frame renderer, when `renderer = "frame"` drives the terminal.
-mixin GsharedRef!(FrameUi, "gFrame"); /// written by the main thread, read by others; the object locks itself
+/// The frame renderer (`FrameUi.init` when off): set by the main thread,
+/// used by any.
+shared Locked!FrameUi gFrameCell;
+shared static this() { gFrameCell = new shared Locked!FrameUi; }
+/// The running frame renderer, or `FrameUi.init`.
+FrameUi gFrame() { return atomicLoad(gFrameCell).get(); }
+/// ditto
+void gFrame(FrameUi f) { atomicLoad(gFrameCell).update((ref FrameUi v) { v = f; }); }
 
 /// The status bar text for the frame's last line.
 string frameStatus(size_t width)
@@ -477,10 +484,10 @@ shared static this() { gStats = new shared Locked!Stats; }
 /// Change the status line's stats and redraw it (no-op without one).
 void updateStatus(scope void delegate(ref Stats) @safe f)
 {
-    if (gStatus is null && gFrame is null) return;
+    if (gStatus is null && !gFrame) return;
     gStats.update(f);
     if (gStatus !is null) gStatus.draw();
-    if (gFrame !is null) gFrame.redraw();
+    if (gFrame) gFrame.redraw();
 }
 
 /// The agent's side of the status line: model, context, plan, mode, tokens.
@@ -710,7 +717,7 @@ class Console : AgentEvents
 
     void text(bool reasoning, string chunk)
     {
-        if (gStatus !is null || gFrame !is null)
+        if (gStatus !is null || gFrame)
         {
             auto rate = meter.record(chunk.length, nowMs);
             if (rate > 0) updateStatus((ref Stats s) { if (s.activity == Activity.thinking) s.tokensPerSec = rate; });
@@ -1650,19 +1657,19 @@ int runMain(string[] args)
     void useRenderer(string mode)
     {
         if (editor is null) return;
-        if (mode == "frame" && gFrame is null)
+        if (mode == "frame" && !gFrame)
         {
             if (gStatus !is null) { gStatus.teardown(); gStatus = null; }
-            gFrame = FrameUi.install((size_t w) => frameStatus(w));
-            if (gFrame is null) return;
+            gFrame = FrameUi.install(&frameStatus);
+            if (!gFrame) return;
             editor.frameDraw = (string[] rows) { gFrame.draw(rows); };
             editor.frameCommit = (string line) { gFrame.commit(line); };
             refreshStatus();
         }
-        else if (mode == "legacy" && gFrame !is null)
+        else if (mode == "legacy" && gFrame)
         {
             auto lines = gFrame.uninstall();
-            gFrame = null;
+            gFrame = FrameUi.init;
             editor.frameDraw = null;
             editor.frameCommit = null;
             // The frame's redraws cleared the scrollback: replay its transcript.
@@ -1680,7 +1687,7 @@ int runMain(string[] args)
     }
     useRenderer(cfg.renderer);
     scope (exit) if (gStatus !is null) gStatus.teardown();
-    scope (exit) if (gFrame !is null) { gFrame.uninstall(); gFrame = null; }
+    scope (exit) if (gFrame) { gFrame.uninstall(); gFrame = FrameUi.init; }
     if (interactive && editor is null)
     {
         import core.thread : Thread;
@@ -1795,7 +1802,7 @@ int runMain(string[] args)
                     agent.restart(systemFor(cwd, false), log);
                     sysPlan = false;
                     agent.useHooks(loadHooks(cwd), false);
-                    if (gFrame !is null) gFrame.clear();
+                    if (gFrame) gFrame.clear();
                     else if (gStatus !is null) gStatus.clear();
                     else if (editor !is null) { write("\x1b[H\x1b[2J\x1b[3J"); stdOut.flush(); }
                     refreshStatus();
