@@ -193,6 +193,43 @@ private struct HookResult
     string systemMessage;
 }
 
+/// Whether `command` runs a hook script installed by a Herdr integration
+/// (`herdr integration install …`): its name is Herdr's `herdr-agent-state.sh`,
+/// or a script it names carries the `HERDR_INTEGRATION_ID=` marker.
+bool isHerdrIntegration(string command)
+{
+    import std.algorithm : splitter, endsWith, canFind, startsWith;
+    import std.ascii : isWhite;
+    import std.path : isAbsolute, buildPath;
+    import std.process : environment;
+    import std.stdio : File;
+    import std.string : strip;
+    foreach (raw; command.splitter!isWhite)
+    {
+        auto word = raw.strip("'\"");
+        if (!word.length) continue;
+        if (word.endsWith("herdr-agent-state.sh")) return true;
+        string path = word;
+        if (word.startsWith("~/"))
+        {
+            auto home = environment.get("HOME");
+            if (!home.length) continue;
+            path = buildPath(home, word[2 .. $]);
+        }
+        if (!path.isAbsolute) continue;
+        try
+        {
+            import std.file : isFile;
+            if (!path.isFile) continue;
+            ubyte[1024] head;
+            auto got = File(path, "rb").rawRead(head[]);
+            if ((cast(const(char)[]) got).canFind("HERDR_INTEGRATION_ID=")) return true;
+        }
+        catch (Exception) continue;
+    }
+    return false;
+}
+
 /// The loaded hook set plus the runtime context for executing them.
 class HookManager
 {
@@ -312,6 +349,14 @@ class HookManager
                     if (command is null || !command.strip.length)
                     {
                         skipped ~= Skipped(eventName, "command hook has no `command`", source);
+                        continue;
+                    }
+                    // Herdr's Claude integration reports this pane to Herdr as
+                    // `claude`, so Herdr would restore a nano session with
+                    // `claude --resume`. nano-coder reports itself (nano.herdr).
+                    if (isHerdrIntegration(command))
+                    {
+                        skipped ~= Skipped(eventName, "Herdr's Claude integration; nano-coder reports to Herdr itself", source);
                         continue;
                     }
                     // Validate the `if` filter now: a malformed rule would
@@ -1270,6 +1315,23 @@ unittest // unrepresentable_timeout_fails_closed_instead_of_panicking; new sessi
     assert(run.launchError is null);
     auto parts = run.stdout_.strip.split(' ');
     assert(parts.length >= 3 && parts[0] == parts[2], "the hook leads its own process group: " ~ run.stdout_);
+}
+
+unittest // herdr_integration_hooks_are_skipped
+{
+    import std.file : write;
+    import std.path : buildPath;
+    auto dir = tdir("herdr");
+    // A renamed script is still recognised by Herdr's marker.
+    auto script = buildPath(dir, "renamed.sh");
+    write(script, "#!/bin/sh\n# installed by herdr\n# HERDR_INTEGRATION_ID=claude\n");
+    auto m = loadProject(dir, `{"hooks":{"SessionStart":[{"matcher":"*","hooks":[
+        {"type":"command","command":"bash '/home/u/.claude/hooks/herdr-agent-state.sh' session"},
+        {"type":"command","command":"sh \"` ~ script ~ `\" session"},
+        {"type":"command","command":"echo mine"}]}]}}`);
+    assert(m.hooks.length == 1 && m.hooks[0].command == "echo mine", "other hooks still load");
+    assert(m.skipped.length == 2);
+    foreach (sk; m.skipped) assert(sk.reason.canFind("Herdr"));
 }
 
 unittest // malformed_if_filter_is_reported_as_skipped; blank_if_filter_is_normalized_to_none

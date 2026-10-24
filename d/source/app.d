@@ -31,6 +31,7 @@ import nano.toml : parseToml;
 import nano.plan : Plan, checklist;
 import nano.queue : MessageQueue, QueuedMessage, QueueUsage, queueParse = parse, queueApply = apply;
 import nano.mode : AgentMode, allModes, parseMode, planPromptNote, name, describe, nextMode = next;
+static import nano.herdr;
 import nano.question : QuestionBroker, Question, Answer, Answered, Dismissed, sanitizeLine, questionDefinition = definition;
 import nano.lineedit : LineEditor, Outcome, K, enterKeyMode, leaveKeyMode, fdSource, writeFd, terminalWidth, terminalHeight;
 import nano.frameui : FrameUi;
@@ -394,7 +395,9 @@ private void readTurnKeys(LineEditor editor, ConsoleLink console, shared(bool)* 
                 if (auto qs = questions.pending)
                 {
                     console.endLine();
+                    nano.herdr.report(nano.herdr.State.blocked, qs.length ? sanitizeLine(qs[0].question) : null);
                     questions.resolve(askQuestions(editor, qs));
+                    nano.herdr.report(nano.herdr.State.working);
                     break;
                 }
                 return;
@@ -1554,6 +1557,7 @@ int runMain(string[] args)
     bool turn(string input) @safe
     {
         syncMode();
+        nano.herdr.report(nano.herdr.State.working);
         atomicStore(gTurnRunning, true);
         scope (exit) atomicStore(gTurnRunning, false);
         updateStatus((ref Stats s) { s.activity = Activity.thinking; s.tokensPerSec = 0; });
@@ -1677,6 +1681,15 @@ int runMain(string[] args)
     enum exitWindow = 2000.msecs; // Rust's DOUBLE_INTERRUPT_WINDOW
     MonoTime exitArmedAt;         // first idle Ctrl-C of a pending pair (zero = disarmed)
     bool quietPrompt;             // redraw the prompt in place (no separating blank line)
+    // Herdr (interactive only): flags a resumed session needs to behave the same.
+    string[] herdrExtra;
+    if (editor !is null)
+    {
+        import std.path : absolutePath;
+        nano.herdr.start();
+        if (o.configPath.length) herdrExtra = ["--config", absolutePath(o.configPath)];
+    }
+    scope (exit) nano.herdr.release();
     for (;;)
     {
         string line;
@@ -1697,6 +1710,16 @@ int runMain(string[] args)
             if (!quietPrompt) write("\n");
             quietPrompt = false;
             stdOut.flush();
+            // Ready for input: tell Herdr, with the session to resume (re-read
+            // each time so `/resume` and `/restart` are picked up).
+            if (nano.herdr.active && agent.log !is null)
+            {
+                auto resume = nano.herdr.resumeArgv(agent.log.id, agent.client.providerName ~ "/" ~ agent.client.modelName, herdrExtra);
+                if (resume !is null)
+                    nano.herdr.report(nano.herdr.State.idle, null, nano.herdr.Session(agent.log.id, resume), true);
+                else nano.herdr.report(nano.herdr.State.idle);
+            }
+            else nano.herdr.report(nano.herdr.State.idle);
             // The prompt's stamp is redrawn with the submission time (Rust's restamp).
             editor.restyle = () => console.stamp() ~ console.bold("› ");
             // While the Ctrl-C exit hint is armed, end the read when the window
