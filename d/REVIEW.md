@@ -13,7 +13,7 @@ Each finding is rated **R** (Rust is stronger), **D** (D is stronger), or
 
 | | Rust | D port |
 |---|---|---|
-| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 133 `@trusted` annotations: 30 in `safeio.d` and 103 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
+| Default | Safe. 27 `unsafe` blocks outside tests, all FFI: signals, `ioctl` window size, `setsid`/`killpg`, Landlock and Seatbelt syscalls. | Enforced. All 70 modules start with `@safe:`, and `scripts/check-safe.sh` fails the build if one doesn't. It builds with `-preview=dip1000` (escaping-reference checks) and `-preview=nosharedaccess`. There are 97 `@trusted` annotations: 30 in `safeio.d` and 67 elsewhere (down from 404). Each `@trusted` is an unchecked promise, so it is still weaker than Rust's 27 `unsafe` blocks; see "`@trusted` audit" below. **R** (narrowing) |
 | Use-after-free and double free | Prevented by ownership. | Prevented in practice by the GC; the port does no manual memory management. **=** |
 | Bounds checks | Always on; an overrun is a panic. | Found in the first review: dub's `release` build type turned them off in `@system` code. They are on again (`-boundscheck=on`), so an overrun is an `Error` that ends the process, like a panic. **=** |
 | Casts | `as` only between numeric types. Reinterpreting bytes as `str` needs `from_utf8` or `unsafe`. | 221 `cast(...)` expressions, mostly numeric and FFI. Bytes from the network and from tools go through `lossyUtf8`/validation, but the compiler doesn't make that happen. **R** |
@@ -29,11 +29,16 @@ outside `safeio.d`. Repeated escapes then moved into `safeio.d`: `realpath`,
 the `__gshared` class references in `app.d` (`GsharedRef`). The frame's
 `ttyOut` became a `shared int` with atomic access, so it needs no `@trusted`.
 
-The 103 left outside `safeio.d` fall into these groups:
+Read-only JSON code then dropped `@trusted` by switching to Phobos's
+`objectNoRef`/`arrayNoRef`. These are `@trusted` in Phobos and return the
+table or slice by value instead of by `ref`. Writes were left on `.object`.
+That made 36 more functions compiler-checked.
+
+The 67 left outside `safeio.d` fall into these groups:
 
 | Group | Where | Why it is `@trusted` |
 |---|---|---|
-| `std.json` reads and edits | providers, `thinking`, `vision`, `plan`, `toml`, `question`, `goal`, `permissions`, `sandbox`, `muse`, `acp`, `retry`, `reminders`, `session_history`, `trajectory` | `JSONValue.object`/`.array` return by `ref` and are `@system`. These are whole functions, so their bodies aren't checked. |
+| `std.json` edits through pointers | `toml` (table builder), `config.finishBody`, `thinking.resolve`, `agent.imageResult`, `session_history.search` | They take `&x.object[k]` or cast away `const` to share subtrees. These are whole functions, so their bodies aren't checked. |
 | POSIX terminal and fds | `frameui`, `lineedit`, `status`, `control`, `app` (signals) | `dup2`, `pipe`, `poll`, `read`, `tcsetattr`, `sigaction` |
 | Processes and files | `sandbox`, `skills`, `attachment`, `copilot`, `settings`, `session_index`, `instructions`, `recents`, `trajectory.page` | `std.process` pipes, `std.file.read` casts, `open`/`O_APPEND` |
 | Landlock | `landlock` | raw `syscall` |
@@ -42,13 +47,12 @@ The 103 left outside `safeio.d` fall into these groups:
 | Casts away `const` | `config`, `settings`, `mock`, `permissions` | copying `const ProviderConfig`, `cast() Regex` |
 | Unit tests | 7 `@trusted unittest` blocks | test-only setup (pipes, threads, JSON) |
 
-`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (103)
+`scripts/check-safe.sh` reads the limit from `scripts/trusted-budget` (67)
 and fails the build if the count outside `safeio.d` goes over it.
 
-Recommended next: a `safeio` JSON layer (`jsonGet`, `jsonArray`, `jsonSet`)
-so the `std.json` functions can drop `@trusted` and be checked by the
-compiler. That group is the largest. After that, push the
-POSIX functions in `frameui`/`lineedit` down to single-call wrappers.
+Recommended next: reduce the POSIX functions in `frameui` and `lineedit` to
+single-call wrappers in `safeio.d`, and rewrite the `toml` table builder to
+use indices instead of `JSONValue*`.
 
 ## 2. Error handling
 
@@ -114,7 +118,7 @@ Toolchain notes:
 - **Where Rust is stronger:** checking that is on by default (memory safety,
   `Send`/`Sync`, typed JSON, errors in signatures). D has each of these, but
   only as an opt-in. The port has opted in everywhere (`@safe:` in every
-  module, DIP1000, enforced in the build), but 133 `@trusted` escapes are still
+  module, DIP1000, enforced in the build), but 97 `@trusted` escapes are still
   unchecked and nothing gives Rust-style `Send`/`Sync` checking.
 - **Where D is stronger:** build time (about 5x faster for a clean release
   build and 3.5x for an edit) and a much smaller dependency surface.
