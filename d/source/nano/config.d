@@ -120,26 +120,27 @@ struct ProviderConfig
     /// Merge `extra_body` into a built request body (nested objects field by
     /// field, so an unrelated option doesn't clobber a generated sibling), then
     /// strip `drop_params`. `temperature` is owned by the resolver and skipped.
-    void finishBody(ref JSONValue b) const @trusted
+    void finishBody(ref JSONValue b) const
     {
-        static void mergeObject(ref JSONValue into, const JSONValue from)
+        import nano.safeio : jsonCopy;
+        static void mergeObject(ref JSONValue into, const JSONValue from) @safe
         {
-            foreach (k, v; from.object)
+            foreach (k, v; from.objectNoRef)
             {
-                if (auto e = k in into.object)
+                if (auto e = k in into.objectNoRef)
                     if (e.type == JSONType.object && v.type == JSONType.object) { mergeObject(*e, v); continue; }
-                into.object[k] = cast(JSONValue) v;
+                into[k] = jsonCopy(v);
             }
         }
         if (extraBody.type == JSONType.object)
-            foreach (k, v; extraBody.object)
+            foreach (k, v; extraBody.objectNoRef)
             {
                 if (k == "temperature") continue;
-                if (auto e = k in b.object)
+                if (auto e = k in b.objectNoRef)
                     if (e.type == JSONType.object && v.type == JSONType.object) { mergeObject(*e, v); continue; }
-                b.object[k] = cast(JSONValue) v;
+                b[k] = jsonCopy(v);
             }
-        foreach (d; dropParams) b.object.remove(d);
+        foreach (string d; dropParams) b.objectNoRef.remove(d);
     }
 
     /// Overlay the fields set in `o` (a user table) onto this preset.
