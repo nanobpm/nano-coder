@@ -45,13 +45,13 @@ struct Question
 {
     string question;
     string header; /// very short label
-    QuestionOption[] options;
+    immutable(QuestionOption)[] options;
     bool custom = true; /// allow a typed answer
 }
 
 /// How a question resolves.
 /// The user answered: one answer per question.
-struct Answered { string[] answers; }
+struct Answered { immutable(string)[] answers; }
 /// The user is away from the keyboard.
 struct Away {}
 /// The user dismissed the questions.
@@ -148,60 +148,81 @@ string resultText(const Question[] questions, Answer a) @safe
     );
 }
 
-/// Shared between the blocked tool (agent thread) and the key reader.
-final class QuestionBroker
+/// An immutable copy of `a`.
+immutable(Answer) immutableAnswer(Answer a)
 {
-    private Mutex lock;
-    private Condition cond;
-    private Question[] pending_;
-    private bool waiting, resolved;
-    // A one-element slice, not an `Answer` field: assigning over a SumType
-    // that holds references is @system (it could retype live references),
-    // while replacing a slice is not.
-    private Answer[] answer;
-    private shared bool interactive_;
+    return a.match!(
+        (Answered x) => immutable Answer(Answered(x.answers)),
+        (Away _) => immutable Answer(Away()),
+        (Dismissed _) => immutable Answer(Dismissed()),
+    );
+}
 
-    this()
+/// A mutable copy of `a`.
+Answer mutableAnswer(immutable Answer a)
+{
+    return a.match!(
+        (immutable Answered x) => Answer(Answered(x.answers)),
+        (immutable Away _) => Answer(Away()),
+        (immutable Dismissed _) => Answer(Dismissed()),
+    );
+}
+
+/// Shared between the blocked tool (agent thread) and the key reader: a
+/// sendable handle (copies refer to the same broker).
+struct QuestionBroker
+{
+    import nano.safeio : Shared;
+    private static struct State
     {
-        lock = new Mutex;
-        cond = new Condition(lock);
+        immutable(Question)[] pending;
+        bool waiting, resolved, interactive;
+        // A one-element slice, not an `Answer` field: assigning over a
+        // SumType that holds references is not @safe, replacing a slice is.
+        immutable(Answer)[] answer;
     }
+    private Shared!State state;
 
-    void interactive(bool on) { import core.atomic : atomicStore; atomicStore(interactive_, on); }
-    bool interactive() { import core.atomic : atomicLoad; return atomicLoad(interactive_); }
+    /// A new broker.
+    static QuestionBroker make() { return QuestionBroker(Shared!State.make); }
+    /// Whether this handle refers to a broker.
+    bool opCast(B : bool)() const { return cast(bool) state; }
+
+    void interactive(bool on) { state.update((ref State s) { s.interactive = on; }); }
+    bool interactive() { return state.get.interactive; }
 
     /// Register questions and block until `resolve`.
-    Answer ask(Question[] questions)
+    Answer ask(const Question[] questions)
     {
-        import nano.safeio : waitOn;
-        lock.lock();
-        scope (exit) lock.unlock();
-        pending_ = questions;
-        waiting = true;
-        resolved = false;
-        while (!resolved) waitOn(cond);
-        waiting = false;
-        pending_ = null;
-        return answer[0];
+        auto qs = questions.idup;
+        state.update((ref State s) {
+            s.pending = qs;
+            s.waiting = true;
+            s.resolved = false;
+        });
+        return state.await!Answer((ref const State s) => s.resolved, (ref State s) {
+            s.waiting = false;
+            s.pending = null;
+            return mutableAnswer(s.answer[0]);
+        });
     }
 
     /// The waiting questions, or null.
-    Question[] pending()
+    immutable(Question)[] pending()
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        return waiting && !resolved ? pending_ : null;
+        auto s = state.get;
+        return s.waiting && !s.resolved ? s.pending : null;
     }
 
     /// Resolve the waiting question (no-op when none).
     void resolve(Answer a)
     {
-        lock.lock();
-        scope (exit) lock.unlock();
-        if (!waiting || resolved) return;
-        answer = [a];
-        resolved = true;
-        { import nano.safeio : signalAll; signalAll(cond); }
+        immutable(Answer)[] boxed = [immutableAnswer(a)];
+        state.update((ref State s) {
+            if (!s.waiting || s.resolved) return;
+            s.answer = boxed;
+            s.resolved = true;
+        });
     }
 
     /// The tool handler.
@@ -238,20 +259,18 @@ ToolDefinition definition()
 unittest // ask_blocks_until_resolved, and sequential questions each register
 {
     import core.thread : Thread;
-    import nano.safeio : spawnUnchecked;
+    import nano.safeio : spawn;
     import core.time : msecs;
-    auto broker = new QuestionBroker;
+    static immutable(Answer)[] askOne(QuestionBroker b, string q) { return [immutableAnswer(b.ask([Question(q)]))]; }
+    auto broker = QuestionBroker.make;
     foreach (expected; ["first", "second"])
     {
-        Answer[] got; // a slice: assigning a SumType is not @safe
-        // Unchecked: `got` is read only after the join; the broker locks.
-        auto t = spawnUnchecked(() { got = [broker.ask([Question(expected)])]; });
-        Question[] req;
+        auto t = spawn(&askOne, broker, expected);
+        immutable(Question)[] req;
         while ((req = broker.pending()) is null) Thread.sleep(1.msecs);
         assert(req[0].question == expected);
         broker.resolve(Answer(Answered(["yes"])));
-        t.join();
-        assert(got == [Answer(Answered(["yes"]))]);
+        assert(mutableAnswer(t.join()[0]) == Answer(Answered(["yes"])));
         assert(broker.pending() is null);
     }
 }

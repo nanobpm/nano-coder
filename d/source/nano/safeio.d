@@ -377,24 +377,73 @@ unittest
 import std.traits : hasUnsharedAliasing;
 final class Locked(T) if (!hasUnsharedAliasing!T)
 {
+    import core.sync.mutex : Mutex;
     private T value;
+    private Mutex mutex;
+    private Condition changed;
 
     /// `@trusted`: casts away `shared` only on a freshly built object.
-    this(T v = T.init) shared @trusted { (cast() this).value = v; }
+    this(T v = T.init) shared @trusted
+    {
+        auto self = cast() this;
+        self.value = v;
+        self.mutex = new Mutex;
+        self.changed = new Condition(self.mutex);
+    }
 
     /// A copy of the value.
     /// `@trusted`: the unshared view of `value` is used only under the lock.
     T get() shared @trusted
     {
-        synchronized (cast() this) return (cast() this).value;
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        return self.value;
     }
 
-    /// Run `f` on the value under the lock. `f` is `scope`: it can't keep the
-    /// reference.
+    /// Run `f` on the value under the lock, and wake `await`ers. `f` is
+    /// `scope`: it can't keep the reference.
     /// `@trusted`: as for `get`; the `ref` can't outlive `f` (DIP1000).
-    void update(scope void delegate(ref T) @safe f) shared @trusted
+    R update(R = void)(scope R delegate(ref T) @safe f) shared @trusted
     {
-        synchronized (cast() this) f((cast() this).value);
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        scope (exit) self.changed.notifyAll();
+        return f(self.value);
+    }
+
+    /// Block until `ready(value)` holds, then run `f` under the same lock.
+    /// `@trusted`: as for `update`.
+    R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f) shared @trusted
+    {
+        auto self = cast() this;
+        self.mutex.lock();
+        scope (exit) self.mutex.unlock();
+        while (!ready(self.value)) self.changed.wait();
+        scope (exit) self.changed.notifyAll();
+        return f(self.value);
+    }
+}
+
+/// A copyable, sendable handle to a `shared Locked!T` (like Rust's
+/// `Arc<Mutex<T>>`), so holders needn't spell `shared` or `atomicLoad`.
+struct Shared(T)
+{
+    import core.atomic : atomicLoad;
+    private shared Locked!T impl;
+    /// A new cell holding `v`.
+    static Shared make(T v = T.init) { return Shared(new shared Locked!T(v)); }
+    /// Whether this handle refers to a cell.
+    bool opCast(B : bool)() const { return atomicLoad(impl) !is null; }
+    /// See `Locked`.
+    T get() { return atomicLoad(impl).get(); }
+    /// ditto
+    R update(R = void)(scope R delegate(ref T) @safe f) { return atomicLoad(impl).update!R(f); }
+    /// ditto
+    R await(R = void)(scope bool delegate(ref const T) @safe ready, scope R delegate(ref T) @safe f)
+    {
+        return atomicLoad(impl).await!R(ready, f);
     }
 }
 
@@ -448,30 +497,51 @@ struct Isolated(T)
     }
 }
 
-/// A started thread, to wait for or poll.
-struct JoinHandle
+/// A started thread, to wait for or poll; `join` returns what its function
+/// returned (an `R`, which must be sendable).
+struct Join(R)
 {
     private Thread thread;
+    static if (!is(R == void)) private ResultBox!R box;
+
     /// Wait for the thread to finish (rethrows what killed it).
-    void join() { joinThread(thread); }
+    R join()
+    {
+        joinThread(thread);
+        static if (!is(R == void)) return takeResult(box);
+    }
+
     /// Whether the thread is still running.
     bool running() { return threadRunning(thread); }
 }
 
+/// A thread whose function returns nothing.
+alias JoinHandle = Join!void;
+
+private final class ResultBox(R) { Unqual!R value; }
+
+/// `@trusted`: the thread wrote `box.value` before it ended, and `join`
+/// waited for that (a happens-before edge), so nothing else touches it now.
+private R takeResult(R)(ResultBox!R box) @trusted
+{
+    import core.lifetime : move;
+    return cast(R) move(box.value);
+}
+
 /// Run `fn(args)` on a new thread. `fn` is a plain function, so it can only
 /// reach what it is given (and `shared` or thread-local globals), and every
-/// argument must be sendable.
-JoinHandle spawn(Args...)(void function(Args) @safe fn, auto ref Args args)
-    if (allSatisfy!(isSendable, Args))
+/// argument, and the result, must be sendable.
+Join!R spawn(R, Args...)(R function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args) && (is(R == void) || isSendable!R))
 {
-    return JoinHandle(startSpawned(fn, args, false));
+    return startSpawned(fn, args, false);
 }
 
 /// `spawn` for a daemon thread, which doesn't keep the process alive.
-JoinHandle spawnDaemon(Args...)(void function(Args) @safe fn, auto ref Args args)
-    if (allSatisfy!(isSendable, Args))
+Join!R spawnDaemon(R, Args...)(R function(Args) @safe fn, auto ref Args args)
+    if (allSatisfy!(isSendable, Args) && (is(R == void) || isSendable!R))
 {
-    return JoinHandle(startSpawned(fn, args, true));
+    return startSpawned(fn, args, true);
 }
 
 import std.meta : allSatisfy, staticMap;
@@ -480,18 +550,25 @@ private final class SpawnBox(Args...) { staticMap!(Unqual, Args) args; }
 
 /// `@trusted`: the arguments (checked sendable by `spawn`) are moved into a
 /// box only the new thread can reach; `shared` is stripped for the move and
-/// restored for the call. `fn` is a context-free function.
-private Thread startSpawned(Args...)(void function(Args) @safe fn, ref Args args, bool daemon) @trusted
+/// restored for the call. `fn` is a context-free function. The result goes
+/// into a box read only after `join`.
+private Join!R startSpawned(R, Args...)(R function(Args) @safe fn, ref Args args, bool daemon) @trusted
 {
     import core.lifetime : move;
     auto box = new SpawnBox!Args;
     static foreach (i; 0 .. Args.length)
         box.args[i] = move(*cast(Unqual!(Args[i])*) &args[i]);
-    auto t = new Thread({
-        mixin("fn(" ~ callArgs!(Args.length) ~ ");");
-    });
+    Join!R h;
+    static if (is(R == void))
+        auto t = new Thread({ mixin("fn(" ~ callArgs!(Args.length) ~ ");"); });
+    else
+    {
+        auto rb = h.box = new ResultBox!R;
+        auto t = new Thread({ mixin("rb.value = cast(Unqual!R) fn(" ~ callArgs!(Args.length) ~ ");"); });
+    }
     t.isDaemon = daemon;
-    return t.start();
+    h.thread = t.start();
+    return h;
 }
 
 private template callArgs(size_t n)
@@ -620,6 +697,8 @@ final class Channel(T) if (!hasUnsharedAliasing!T)
     assert(sum == 12);
     static assert(isSendable!(immutable(int)[]) && isSendable!string && isSendable!(Chan!int));
     static assert(!isSendable!(int[]) && !isSendable!(void delegate()) && !isSendable!Object);
+    static int add(int a, int b) { return a + b; }
+    assert(spawn(&add, 2, 3).join() == 5);
     static void bad(int[] a) {}
     static assert(!__traits(compiles, spawn(&bad, [1])));
 }

@@ -385,7 +385,7 @@ Answer askQuestions(LineEditor editor, const Question[] qs)
         }
         else answers ~= q.options[at].label;
     }
-    return Answer(Answered(answers));
+    return Answer(Answered(answers.idup));
 }
 
 /// Ctrl-O: show thinking in full (shared by the prompt and the turn's key reader).
@@ -1218,7 +1218,7 @@ int runMain(string[] args)
         }
         return buildSystemPrompt(cfg, dir, plan, skills, index, instructions !is null ? instructions.render : null);
     }
-    auto questions = new QuestionBroker;
+    auto questions = QuestionBroker.make;
     tools.register(questionDefinition, (JSONValue a) => questions.run(a));
     agent = new Agent(client, tools, policy, systemFor(cwd, o.plan));
     mainAgent = agent;

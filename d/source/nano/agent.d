@@ -1108,7 +1108,7 @@ class Agent
         return kept;
     }
 
-    private bool headless() { return questions is null || !questions.interactive; }
+    private bool headless() { return !questions || !questions.interactive; }
 
     /// Interactive normal mode: ask whether to keep going past the cap.
     private bool askKeepGoing()
