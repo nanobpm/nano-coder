@@ -121,70 +121,55 @@ private struct Parser
         return root;
     }
 
-    // The tree under construction is walked with pointers to its tables (the
-    // values of GC-allocated maps and arrays, or the caller's root). Each
-    // pointer is used at once and dropped before anything that could move the
-    // value it points at, so it never dangles.
+    // The tree under construction is walked by `ref` (JSONValue's @safe
+    // `opIndex`), so the compiler checks that no reference outlives the table
+    // it points into.
 
     /// Append an empty table to the array of tables `parent[k]` (created if
     /// missing); its index, or -1 when `parent[k]` is not an array.
-    static ptrdiff_t appendTable(JSONValue* parent, string k) @trusted
+    static ptrdiff_t appendTable(ref JSONValue parent, string k)
     {
-        if (k !in parent.object) parent.object[k] = JSONValue(JSONValue[].init);
-        auto a = &parent.object[k];
-        if (a.type != JSONType.array) return -1;
-        a.array ~= JSONValue(string[string].init);
-        return a.array.length - 1;
+        if (k !in parent) parent[k] = JSONValue(JSONValue[].init);
+        if (parent[k].type != JSONType.array) return -1;
+        auto tables = parent[k].arrayNoRef ~ JSONValue(string[string].init);
+        parent[k] = JSONValue(tables);
+        return tables.length - 1;
     }
 
     /// Set `t[k] = v` unless `k` is already there (false).
-    static bool putNew(JSONValue* t, string k, JSONValue v) @trusted
+    static bool putNew(ref JSONValue t, string k, JSONValue v)
     {
-        if (k in t.object) return false;
-        t.object[k] = v;
+        if (k in t) return false;
+        t[k] = v;
         return true;
+    }
+
+    /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
+    /// the intermediate tables.
+    static void setDotted(ref JSONValue t, string[] path, JSONValue v)
+    {
+        if (path.length == 1) { t[path[0]] = v; return; }
+        if (path[0] !in t) t[path[0]] = JSONValue(string[string].init);
+        setDotted(t[path[0]], path[1 .. $], v);
     }
 
     /// The table at `path`, created on demand. A "\0" segment followed by an
     /// index selects an element of an array of tables.
-    /// `t.a.b.c = v` for the dotted key `path` of an inline table, creating
-    /// the intermediate tables.
-    static void setDotted(ref JSONValue t, string[] path, JSONValue v) @trusted
+    ref JSONValue tableAt(return ref JSONValue t, string[] path)
     {
-        JSONValue* cur = &t;
-        foreach (k; path[0 .. $ - 1])
-        {
-            if (k !in cur.object) cur.object[k] = JSONValue(string[string].init);
-            cur = &cur.object[k];
-        }
-        cur.object[path[$ - 1]] = v;
-    }
-
-    JSONValue* tableAt(ref JSONValue root, string[] path) @trusted
-    {
-        JSONValue* t = &root;
-        for (size_t k = 0; k < path.length; k++)
-        {
-            if (path[k] == "\0")
-            {
-                t = &t.array[path[k + 1].to!size_t];
-                k++;
-                continue;
-            }
-            if (k + 1 < path.length && path[k + 1] == "\0")
-            {
-                t = &t.object[path[k]];
-                continue;
-            }
-            auto key = path[k];
-            if (key !in t.object) t.object[key] = JSONValue(string[string].init);
-            t = &t.object[key];
-            if (t.type == JSONType.array && t.array.length && t.array[$ - 1].type == JSONType.object)
-                t = &t.array[$ - 1];
-            else if (t.type != JSONType.object)
-                fail("not a table: " ~ key);
-        }
-        return t;
+        if (!path.length) return t;
+        if (path[0] == "\0")
+            return tableAt(t[path[1].to!size_t], path[2 .. $]);
+        if (path.length > 1 && path[1] == "\0")
+            return tableAt(t[path[0]], path[1 .. $]);
+        auto key = path[0];
+        if (key !in t) t[key] = JSONValue(string[string].init);
+        const n = t[key].type == JSONType.array ? t[key].arrayNoRef.length : 0;
+        if (n && t[key][n - 1].type == JSONType.object)
+            return tableAt(t[key][n - 1], path[1 .. $]);
+        if (t[key].type != JSONType.object)
+            fail("not a table: " ~ key);
+        return tableAt(t[key], path[1 .. $]);
     }
 
     string[] keyPath()
