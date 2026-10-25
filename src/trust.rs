@@ -290,10 +290,24 @@ fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
 /// Append `root` to the trusted-projects file (idempotently). A root whose
 /// path the line-based format cannot represent losslessly is **not** persisted
 /// (see [`trust_key`]); it remains trusted only for the current process.
+///
+/// The append must never splice the new key onto an existing entry: a file
+/// whose final entry lacks a trailing newline would otherwise concatenate the
+/// two absolute paths into one line, so *neither* approved root matches
+/// afterward and a directory at the concatenated path becomes trusted without
+/// consent. Appending therefore happens only when the existing content ends
+/// with a newline (or is empty); a file that does not is left untouched and
+/// the root fails closed — trusted for this process, re-asked next time —
+/// rather than risking a corrupted entry.
 fn remember(root: &Path, trust_file: Option<&Path>) {
     let Some(file) = trust_file else { return };
     let Some(key) = trust_key(root) else { return };
-    if is_remembered(root, Some(file)) {
+    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    // Exact, untrimmed line comparison (see `is_remembered`).
+    if existing.lines().any(|line| line == key) {
+        return;
+    }
+    if !existing.is_empty() && !existing.ends_with('\n') {
         return;
     }
     if let Some(parent) = file.parent() {
@@ -517,6 +531,34 @@ mod tests {
         remember(&root, Some(&trust));
         let recorded = std::fs::read_to_string(&trust).unwrap();
         assert_eq!(recorded.lines().filter(|l| !l.is_empty()).count(), 1, "remembered once");
+    }
+
+    #[test]
+    fn remember_never_splices_onto_a_newline_less_final_entry() {
+        // A trust file whose last entry lacks a trailing newline must not have
+        // a new key concatenated onto it: that would corrupt both approved
+        // roots into one line and authorize a directory at the concatenated
+        // path. `remember` fails closed — the new root stays unpersisted (and
+        // re-asked next time) rather than risking the splice.
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&trust, format!("{}", first.display())).unwrap(); // no trailing newline
+        remember(&second, Some(&trust));
+        let recorded = std::fs::read_to_string(&trust).unwrap();
+        assert_eq!(recorded, format!("{}", first.display()), "the unterminated entry is left untouched");
+        assert!(is_remembered(&first, Some(&trust)), "the original root still matches");
+        assert!(!is_remembered(&second, Some(&trust)), "the new root is not spliced on");
+        let concatenated = PathBuf::from(format!("{}{}", first.display(), second.display()));
+        assert!(!is_remembered(&concatenated, Some(&trust)), "no concatenated path is authorized");
+
+        // A well-formed file (newline-terminated) still appends on a new line.
+        std::fs::write(&trust, format!("{}\n", first.display())).unwrap();
+        remember(&second, Some(&trust));
+        assert!(is_remembered(&first, Some(&trust)));
+        assert!(is_remembered(&second, Some(&trust)), "appended as its own line");
+        assert!(!is_remembered(&concatenated, Some(&trust)));
     }
 
     #[test]
