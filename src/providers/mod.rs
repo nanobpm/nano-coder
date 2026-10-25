@@ -89,6 +89,12 @@ pub struct ProviderConfig {
     pub max_retries: Option<u32>,
     pub retry_initial_backoff_ms: Option<u64>,
     pub retry_max_backoff_ms: Option<u64>,
+    /// How long (milliseconds) to wait out a transport failure with no HTTP
+    /// response (DNS, connection refused/reset, connect/idle timeout) before
+    /// giving up, backing off instead of spending `max_retries`. Unbounded by
+    /// default, so a turn survives an arbitrarily long network outage until the
+    /// user cancels; set it to bound the wait.
+    pub offline_budget_ms: Option<u64>,
     pub retryable_statuses: Option<Vec<u16>>,
     /// Send each assistant message's `reasoning_content` back to the provider,
     /// for thinking models that require it in multi-turn and tool-call
@@ -143,6 +149,7 @@ impl ProviderConfig {
             max_retries,
             retry_initial_backoff_ms,
             retry_max_backoff_ms,
+            offline_budget_ms,
             retryable_statuses,
             replay_reasoning,
             temperature,
@@ -517,6 +524,7 @@ pub fn resolve_cancellable(
                 .map(Duration::from_millis)
                 .unwrap_or(defaults.initial_backoff),
             max_backoff: config.retry_max_backoff_ms.map(Duration::from_millis).unwrap_or(defaults.max_backoff),
+            offline_budget: config.offline_budget_ms.map(Duration::from_millis).unwrap_or(defaults.offline_budget),
         },
         retryable_statuses: config
             .retryable_statuses
@@ -860,6 +868,91 @@ fn merge_object(target: &mut Value, source: &Value) {
     }
 }
 
+/// A stream that broke *after* delivering some events to the caller. Restarting
+/// it would duplicate what already arrived, so the transport surfaces this
+/// distinct error instead of retrying: the agent loop catches it, discards the
+/// partial (unrecorded) reply, and re-sends the same request from scratch (that
+/// re-send then waits out any network outage like a first send). `reason` is the
+/// cleaned transport cause.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamInterrupted {
+    pub reason: String,
+}
+
+impl std::fmt::Display for StreamInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "connection lost mid-reply ({})", self.reason)
+    }
+}
+
+impl std::error::Error for StreamInterrupted {}
+
+/// The [`StreamInterrupted`] cause in an error's chain, if any. The agent loop
+/// uses it to decide whether to discard a partial reply and re-send.
+pub(crate) fn stream_interrupted(err: &anyhow::Error) -> Option<&StreamInterrupted> {
+    err.chain().find_map(|cause| cause.downcast_ref::<StreamInterrupted>())
+}
+
+/// Strip transport noise from an error reason shown to the user. libcurl (and
+/// some HTTP stacks) append a per-request handle id (`… on handle 0x55…`) that
+/// carries no useful signal; drop it so the "network unavailable"/"connection
+/// lost" notices stay readable.
+pub(crate) fn clean_reason(reason: &str) -> String {
+    static HANDLE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\s+on handle\s+[0-9a-fx]+").unwrap());
+    HANDLE.replace_all(reason.trim(), "").trim().to_string()
+}
+
+/// Human backoff duration: whole seconds when it is (near-)integral, else one
+/// decimal place. Used for the "retrying in Ns" notices.
+fn human_secs(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if (s - s.round()).abs() < 0.05 { format!("{}", s.round() as u64) } else { format!("{s:.1}") }
+}
+
+/// Send a request, waiting out *transport* failures that produced no HTTP
+/// response (DNS, connection refused/reset, connect/idle timeout) instead of
+/// spending the caller's `max_retries` budget. Each attempt rebuilds the
+/// request via `build`. Backs off (`initial_backoff` doubling to `max_backoff`)
+/// for as long as `offline_budget` allows, printing a "network unavailable"
+/// notice; a builder error (an unusable request) fails at once. Any HTTP
+/// response — whatever its status — returns immediately for the caller to
+/// classify, which also resets the offline wait for the next call.
+///
+/// Cancellation (Ctrl-C / a cancelled turn) stops the wait by dropping this
+/// future at the caller's `select!`, so the backoff sleep needs no explicit
+/// cancel plumbing.
+pub(crate) async fn send_online(
+    what: &str,
+    policy: &RetryPolicy,
+    mut build: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    let mut attempt: u32 = 0;
+    let mut offline_since: Option<Instant> = None;
+    loop {
+        match build().send().await {
+            Ok(response) => return Ok(response),
+            // A malformed request can never succeed on retry.
+            Err(e) if e.is_builder() => return Err(anyhow!(e)),
+            Err(e) => {
+                let since = *offline_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= policy.offline_budget {
+                    return Err(anyhow!(e).context("network unavailable"));
+                }
+                let factor = 2u32.saturating_pow(attempt.min(20));
+                let delay = policy.initial_backoff.saturating_mul(factor).min(policy.max_backoff);
+                eprintln!(
+                    "[{what}] network unavailable ({}); retrying in {}s (Ctrl-C to stop)",
+                    clean_reason(&e.to_string()),
+                    human_secs(delay),
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 impl HttpTransport {
     pub fn new(provider: ResolvedProvider) -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -949,53 +1042,42 @@ impl HttpTransport {
         auth: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     ) -> Result<Value> {
         let policy = &self.provider.retry;
+        let what = format!("provider {}", self.provider.name);
         let mut attempt = 0;
         loop {
-            let mut request = self.client.post(url).json(body);
-            for (name, value) in &self.provider.headers {
-                request = request.header(name, value);
-            }
-            let outcome = auth(request).send().await;
+            // Transport failures with no HTTP response (DNS, refused/reset,
+            // connect/idle timeout) wait for the network here without spending
+            // `max_retries`; any HTTP response returns for status handling below.
+            let response = send_online(&what, policy, || {
+                let mut request = self.client.post(url).json(body);
+                for (name, value) in &self.provider.headers {
+                    request = request.header(name, value);
+                }
+                auth(request)
+            })
+            .await
+            .map_err(|e| self.wrap(e))?;
             let (err, retry_after): (anyhow::Error, Option<String>) = 'failed: {
-                match outcome {
-                    Ok(response) => {
-                        let status = response.status().as_u16();
-                        let retry_after = response
-                            .headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string);
-                        let text = match response.text().await {
-                            Ok(text) => text,
-                            // The body was cut off (reset, timeout): transient like a send error.
-                            Err(e) => {
-                                let e = anyhow!(e).context(format!("reading HTTP {status} response body"));
-                                if attempt >= policy.max_retries {
-                                    return Err(self.wrap(e));
-                                }
-                                break 'failed (e, retry_after);
-                            }
-                        };
-                        if (200..300).contains(&status) {
-                            match serde_json::from_str::<Value>(&text) {
-                                Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
-                                    let api = ApiError::from_body(status, &text);
-                                    if attempt >= policy.max_retries
-                                        || !retry::retryable(&api, &self.provider.retryable_statuses)
-                                    {
-                                        return Err(self.wrap(api.into()));
-                                    }
-                                    (api.into(), retry_after)
-                                }
-                                Ok(value) => return Ok(value),
-                                Err(e) => {
-                                    return Err(self.wrap(anyhow!(
-                                        "invalid JSON response ({e}): {}",
-                                        text.chars().take(500).collect::<String>()
-                                    )));
-                                }
-                            }
-                        } else {
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let text = match response.text().await {
+                    Ok(text) => text,
+                    // The body was cut off (reset, timeout): transient like a send error.
+                    Err(e) => {
+                        let e = anyhow!(e).context(format!("reading HTTP {status} response body"));
+                        if attempt >= policy.max_retries {
+                            return Err(self.wrap(e));
+                        }
+                        break 'failed (e, retry_after);
+                    }
+                };
+                if (200..300).contains(&status) {
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
                             let api = ApiError::from_body(status, &text);
                             if attempt >= policy.max_retries
                                 || !retry::retryable(&api, &self.provider.retryable_statuses)
@@ -1004,14 +1086,20 @@ impl HttpTransport {
                             }
                             (api.into(), retry_after)
                         }
-                    }
-                    Err(e) => {
-                        // Connection resets, timeouts, DNS: transient by assumption.
-                        if attempt >= policy.max_retries || e.is_builder() {
-                            return Err(self.wrap(anyhow!(e)));
+                        Ok(value) => return Ok(value),
+                        Err(e) => {
+                            return Err(self.wrap(anyhow!(
+                                "invalid JSON response ({e}): {}",
+                                text.chars().take(500).collect::<String>()
+                            )));
                         }
-                        (anyhow!(e), None)
                     }
+                } else {
+                    let api = ApiError::from_body(status, &text);
+                    if attempt >= policy.max_retries || !retry::retryable(&api, &self.provider.retryable_statuses) {
+                        return Err(self.wrap(api.into()));
+                    }
+                    (api.into(), retry_after)
                 }
             };
             let api = err.downcast_ref::<ApiError>();
@@ -1032,15 +1120,16 @@ impl HttpTransport {
     /// to `on_data` as [`StreamAction::Data`], which returns `true` once it has
     /// delivered *visible* output to the caller's sink (text/thinking) rather
     /// than merely consuming metadata-only events (role, usage, tool-call
-    /// deltas). Failures before the stream starts are retried like
-    /// `post_json_to`. A mid-stream failure (e.g. a transient connection reset
-    /// or timeout) is retried the same way *as long as no visible output has
-    /// reached the caller yet* — restarting after visible output would
-    /// duplicate it, so once any is delivered the error is returned. Before
-    /// each retry `on_data` is invoked with [`StreamAction::Reset`] so it can
-    /// discard attempt-local accumulator state and avoid duplicating buffered
-    /// deltas on the restarted stream. If the server answers with plain JSON
-    /// instead, that value is returned.
+    /// deltas). A transport failure with no HTTP response (DNS, refused/reset,
+    /// connect/idle timeout) waits for the network ([`send_online`]) without
+    /// spending `max_retries`. A mid-stream failure *before* any visible output
+    /// reached the caller is retried like `post_json_to`; once visible output
+    /// has been delivered, a restart would duplicate it, so the error surfaces
+    /// as a [`StreamInterrupted`] for the agent loop to retry by re-sending the
+    /// whole request. Before each in-place retry `on_data` is invoked with
+    /// [`StreamAction::Reset`] so it can discard attempt-local accumulator state
+    /// and avoid duplicating buffered deltas on the restarted stream. If the
+    /// server answers with plain JSON instead, that value is returned.
     pub async fn post_stream_to(
         &self,
         url: &str,
@@ -1049,87 +1138,95 @@ impl HttpTransport {
         on_data: &mut (dyn FnMut(StreamAction<'_>) -> Result<bool> + Send),
     ) -> Result<Option<Value>> {
         let policy = &self.provider.retry;
+        let what = format!("provider {}", self.provider.name);
         let mut attempt = 0;
         loop {
-            let mut request = self.client.post(url).json(body).header(reqwest::header::ACCEPT, "text/event-stream");
-            for (name, value) in &self.provider.headers {
-                request = request.header(name, value);
-            }
-            let (err, retry_after): (anyhow::Error, Option<String>) = match auth(request).send().await {
-                Ok(mut response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string);
-                    let is_sse = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|v| v.contains("event-stream"));
-                    if (200..300).contains(&status) && is_sse {
-                        let mut parser = SseParser::default();
-                        let mut emitted = false;
-                        let stream_err = loop {
-                            match response.chunk().await {
-                                Ok(Some(chunk)) => {
-                                    for data in parser.push(&chunk) {
-                                        if data.trim() == "[DONE]" {
-                                            return Ok(None);
-                                        }
-                                        if on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))? {
-                                            emitted = true;
-                                        }
+            let mut response = send_online(&what, policy, || {
+                let mut request = self.client.post(url).json(body).header(reqwest::header::ACCEPT, "text/event-stream");
+                for (name, value) in &self.provider.headers {
+                    request = request.header(name, value);
+                }
+                auth(request)
+            })
+            .await
+            .map_err(|e| self.wrap(e))?;
+            let (err, retry_after): (anyhow::Error, Option<String>) = {
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let is_sse = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("event-stream"));
+                if (200..300).contains(&status) && is_sse {
+                    let mut parser = SseParser::default();
+                    let mut emitted = false;
+                    let stream_err = loop {
+                        match response.chunk().await {
+                            Ok(Some(chunk)) => {
+                                for data in parser.push(&chunk) {
+                                    if data.trim() == "[DONE]" {
+                                        return Ok(None);
+                                    }
+                                    if on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))? {
+                                        emitted = true;
                                     }
                                 }
-                                Ok(None) => {
-                                    if let Some(data) = parser.finish()
-                                        && data.trim() != "[DONE]"
-                                    {
-                                        on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))?;
-                                    }
-                                    return Ok(None);
-                                }
-                                // Connection reset/timeout mid-stream: transient.
-                                Err(e) => break anyhow!(e).context("reading response stream"),
                             }
-                        };
-                        // Retry only if we haven't handed any *visible* output
-                        // to the caller yet; otherwise a restart would duplicate
-                        // it. Metadata-only events (role/usage/tool-call deltas)
-                        // do not count as visible output.
-                        if emitted || attempt >= policy.max_retries {
-                            return Err(self.wrap(stream_err));
+                            Ok(None) => {
+                                if let Some(data) = parser.finish()
+                                    && data.trim() != "[DONE]"
+                                {
+                                    on_data(StreamAction::Data(&data)).map_err(|e| self.wrap(e))?;
+                                }
+                                return Ok(None);
+                            }
+                            // Connection reset/timeout mid-stream: transient.
+                            Err(e) => break anyhow!(e).context("reading response stream"),
                         }
-                        (stream_err, retry_after)
-                    } else {
-                        match response.text().await {
-                            Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
-                            Ok(text) if (200..300).contains(&status) => {
-                                return match serde_json::from_str::<Value>(&text) {
-                                    Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
-                                        Err(self.wrap(ApiError::from_body(status, &text).into()))
-                                    }
-                                    Ok(value) => Ok(Some(value)),
-                                    Err(e) => Err(self.wrap(anyhow!(
-                                        "invalid response ({e}): {}",
-                                        text.chars().take(500).collect::<String>()
-                                    ))),
-                                };
-                            }
-                            Ok(text) => {
-                                let api = ApiError::from_body(status, &text);
-                                if !retry::retryable(&api, &self.provider.retryable_statuses) {
-                                    return Err(self.wrap(api.into()));
+                    };
+                    // If we already handed *visible* output to the caller, a
+                    // restart would duplicate it: surface a distinct
+                    // `StreamInterrupted` so the agent discards the partial
+                    // reply and re-sends the whole request. Metadata-only events
+                    // (role/usage/tool-call deltas) do not count as visible
+                    // output, so a break before any is retried in place below.
+                    if emitted {
+                        let reason = clean_reason(&format!("{:#}", stream_err));
+                        return Err(self.wrap(StreamInterrupted { reason }.into()));
+                    }
+                    if attempt >= policy.max_retries {
+                        return Err(self.wrap(stream_err));
+                    }
+                    (stream_err, retry_after)
+                } else {
+                    match response.text().await {
+                        Err(e) => (anyhow!(e).context(format!("reading HTTP {status} response body")), retry_after),
+                        Ok(text) if (200..300).contains(&status) => {
+                            return match serde_json::from_str::<Value>(&text) {
+                                Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
+                                    Err(self.wrap(ApiError::from_body(status, &text).into()))
                                 }
-                                (api.into(), retry_after)
+                                Ok(value) => Ok(Some(value)),
+                                Err(e) => Err(self.wrap(anyhow!(
+                                    "invalid response ({e}): {}",
+                                    text.chars().take(500).collect::<String>()
+                                ))),
+                            };
+                        }
+                        Ok(text) => {
+                            let api = ApiError::from_body(status, &text);
+                            if !retry::retryable(&api, &self.provider.retryable_statuses) {
+                                return Err(self.wrap(api.into()));
                             }
+                            (api.into(), retry_after)
                         }
                     }
                 }
-                Err(e) if e.is_builder() => return Err(self.wrap(anyhow!(e))),
-                Err(e) => (anyhow!(e), None),
             };
             if attempt >= policy.max_retries {
                 return Err(self.wrap(err));
@@ -1945,5 +2042,56 @@ mod tests {
         assert_eq!(openai.max_tokens_param, "max_completion_tokens");
 
         assert!(resolve("nope/x", &HashMap::new(), "missing").is_err());
+    }
+
+    #[test]
+    fn human_secs_drops_trailing_zero_but_keeps_fractions() {
+        assert_eq!(human_secs(Duration::from_secs(2)), "2");
+        assert_eq!(human_secs(Duration::from_millis(1500)), "1.5");
+        assert_eq!(human_secs(Duration::from_millis(300)), "0.3");
+    }
+
+    #[test]
+    fn clean_reason_strips_curl_handle_noise() {
+        assert_eq!(
+            clean_reason("Could not resolve host: api.example.com on handle 0x55ab12"),
+            "Could not resolve host: api.example.com"
+        );
+        // A reason with no handle noise is returned unchanged (bar trimming).
+        assert_eq!(clean_reason("  connection refused  "), "connection refused");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_waits_out_an_offline_endpoint_past_max_retries_then_fails() {
+        // An unreachable endpoint (a port we bound then freed, so connections
+        // are refused) is a transport failure with no HTTP response. With
+        // `max_retries = 0` the request would normally fail on the first try;
+        // the offline budget instead keeps it backing off for the budget before
+        // giving up — the "wait for the network" behaviour, bounded for the test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let user = HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("http://{addr}")),
+                max_retries: Some(0),
+                retry_initial_backoff_ms: Some(50),
+                retry_max_backoff_ms: Some(50),
+                offline_budget_ms: Some(300),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let start = Instant::now();
+        let result = transport.post_json_to(&url, &serde_json::json!({ "hello": "world" }), |r| r).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "an always-offline endpoint must eventually fail");
+        assert!(elapsed >= Duration::from_millis(250), "gave up before the offline budget: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "waited far past the offline budget: {elapsed:?}");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("network unavailable"), "error should name the outage: {err}");
     }
 }

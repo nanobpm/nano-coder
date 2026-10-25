@@ -35,6 +35,11 @@ const LOOP_STOPPED_TOOL_RESULT: &str =
     "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 
+/// Most times a single model call will be re-sent after the connection drops
+/// mid-reply (a `StreamInterrupted`) before the turn gives up. Bounds the
+/// "network came back but the stream keeps breaking" case.
+const MAX_STREAM_RESTARTS: u32 = 10;
+
 /// Turn cap for a headless (non-interactive) session whose configured cap is
 /// unbounded — `max_iterations = 0`, or Auto mode, which disables the cap.
 /// With no human present nothing else stops a runaway turn, so the cap is a
@@ -3586,6 +3591,10 @@ impl Agent {
             // actually sent, not a stale pre-compaction resolution.
             let mut sent_temperature = None;
             let mut sent_thinking = None;
+            // Re-sends after a mid-reply connection drop (`StreamInterrupted`),
+            // capped per model call so a persistently broken connection still
+            // ends the turn instead of asking forever.
+            let mut stream_restarts: u32 = 0;
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Every attempt is a model call (and the overflow branch below
@@ -3769,6 +3778,23 @@ impl Agent {
                         break Some(response);
                     }
                     Some(Err(e)) => {
+                        // A stream that broke *after* visible output arrived: the
+                        // partial reply was shown but never added to history, so
+                        // discard it and re-send the same request (which itself
+                        // waits out any network outage). Capped per model call so
+                        // a persistently broken connection still ends the turn.
+                        if let Some(interrupted) = providers::stream_interrupted(&e) {
+                            if stream_restarts < MAX_STREAM_RESTARTS {
+                                stream_restarts += 1;
+                                let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                                eprintln!(
+                                    "[agent] {what}: {interrupted}; asking again ({stream_restarts}/{MAX_STREAM_RESTARTS})"
+                                );
+                                continue;
+                            }
+                            self.set_activity(Activity::Idle);
+                            return Err(e);
+                        }
                         let message = format!("{e:#}");
                         // An output-token-limit rejection: the configured or
                         // fallback `max_tokens` exceeds the model's real output
@@ -9654,6 +9680,108 @@ mod tests {
         assert!(crate::acp::update_for(&AgentEvent::TextDelta { text: "r" }).is_none());
     }
 
+    /// A client whose `chat_stream` emits a visible partial delta and then
+    /// drops the connection (`StreamInterrupted`) for its first `breaks`
+    /// attempts, answering in full afterwards. Mirrors a network that cuts out
+    /// mid-reply and then recovers.
+    struct BreaksMidReply {
+        breaks_left: Mutex<u32>,
+        answer: String,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidReply {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone this client")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            // Non-streaming fallback mirrors the streaming path's break/answer.
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some visible output, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial reply "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text(&self.answer));
+            Ok(LLMResponse { content: self.answer.clone(), stop_reason: Some("stop".into()), ..Default::default() })
+        }
+        fn model_name(&self) -> &str {
+            "breaks"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_reply_agent(breaks: u32, answer: &str, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client =
+            BreaksMidReply { breaks_left: Mutex::new(breaks), answer: answer.to_string(), attempts: attempts.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.set_streaming(true);
+        // Streaming is only taken when an event sink is present.
+        agent.set_event_sink(std::sync::Arc::new(|_, _| {}));
+        (agent, attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_drops_are_retried_and_leave_no_partial_text_in_history() {
+        // The stream breaks mid-reply twice, then answers: the agent discards
+        // each partial reply and re-sends, so the turn completes with the full
+        // answer and history holds no partial text.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful answer");
+        let assistant: Vec<&str> =
+            agent.conversation().iter().filter(|m| m.role == Role::Assistant).map(|m| m.content.as_str()).collect();
+        assert_eq!(assistant, ["the full answer"], "only the full answer is recorded");
+        assert!(
+            !agent.conversation().iter().any(|m| m.content.contains("partial reply")),
+            "no partial, mid-reply text reaches history"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_many_mid_reply_drops_end_the_turn() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // the turn ends with an error instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(MAX_STREAM_RESTARTS + 1, "never reached", dir.path());
+        agent.new_session().unwrap();
+        let error = agent.run_turn(Some("in-1"), "hi").await.unwrap_err();
+        assert!(format!("{error:#}").contains("connection lost mid-reply"), "{error:#}");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
+        assert!(
+            agent.conversation().iter().all(|m| m.role != Role::Assistant),
+            "a turn that never completed records no assistant message"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn one_shot_provider_publishes_usage_over_elapsed_rate() {
         // A provider whose `chat_stream` falls back to `report_whole` (default
@@ -11060,10 +11188,13 @@ mod tests {
                         kind: Some(crate::providers::ProviderKind::Openai),
                         default_model: Some("x".to_string()),
                         base_url: Some("http://127.0.0.1:9/v1".to_string()),
-                        // Fail fast: no retries, a short timeout, so the test
-                        // does not wait out the default backoff schedule.
+                        // Fail fast: no retries, a short timeout, and no offline
+                        // wait (`offline_budget_ms: 0`) so the unreachable
+                        // endpoint surfaces its connect failure at once instead
+                        // of waiting for the network to come back.
                         max_retries: Some(0),
                         timeout_secs: Some(2),
+                        offline_budget_ms: Some(0),
                         ..Default::default()
                     },
                 );

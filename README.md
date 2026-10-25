@@ -758,8 +758,19 @@ content hash), so session logs stay small and `--resume` still works; a missing 
 resume is sent as a text placeholder.
 
 Other per-provider fields: `replay_reasoning`, `max_tokens_param` (`max_tokens`, or `max_completion_tokens`
-which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms` and
-`retryable_statuses`.
+which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_ms`,
+`retryable_statuses` and `offline_budget_ms`.
+
+A transport failure with no HTTP response (DNS, connection refused or reset, connect or
+idle timeout) is treated as the network being down rather than a failed attempt: nano-coder
+backs off (`retry_initial_backoff_ms` doubling to `retry_max_backoff_ms`) and keeps waiting,
+printing `network unavailable (…); retrying in Ns (Ctrl-C to stop)`, so a turn survives a
+laptop sleep, a Wi-Fi change or a VPN reconnect instead of failing after about a minute.
+These waits do not consume `max_retries` (which still bounds HTTP-status retries like 429 or
+5xx), and the Copilot session-token refresh waits the same way. If a stream drops after it
+started replying, the partial reply is discarded (nothing reaches history) and the request
+is re-sent, up to ten times per model call. The wait is unbounded by default; set
+`offline_budget_ms` to give up after that many milliseconds offline.
 
 The old top-level `api_key` / `base_url` still work. They apply to `default_provider`,
 which becomes `openai` if it was `mock`.
