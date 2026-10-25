@@ -62,6 +62,10 @@ pub struct Options {
     pub acp: bool,
     /// stdin and stdout are both terminals, so a human can answer.
     pub interactive: bool,
+    /// Whether project hooks can actually load (`!--no-hooks` and not
+    /// `disable_project_hooks`). When false, a repo's `.claude` hooks are not a
+    /// gated resource — nothing would load — so they do not trigger the prompt.
+    pub hooks_enabled: bool,
 }
 
 /// Which gated resources a repository carries.
@@ -74,13 +78,16 @@ pub struct Gated {
 }
 
 impl Gated {
-    /// Detect the gated resources under `root`.
-    pub fn detect(root: &Path, skills: &SkillsConfig) -> Self {
+    /// Detect the gated resources under `root`. `hooks_enabled` reflects whether
+    /// project hooks could actually load; when false, a repo's `.claude` hooks
+    /// are not counted as gated (nothing would load), mirroring how a disabled
+    /// skills config suppresses skill detection.
+    pub fn detect(root: &Path, skills: &SkillsConfig, hooks_enabled: bool) -> Self {
         let skills_present = skills.enabled
             && ((skills.ai_lock && root.join(LOCK_FILE).is_file())
                 || skills.dirs.iter().any(|dir| dir_has_skill(&root.join(dir))));
-        let hooks_present =
-            root.join(".claude/settings.json").is_file() || root.join(".claude/settings.local.json").is_file();
+        let hooks_present = hooks_enabled
+            && (root.join(".claude/settings.json").is_file() || root.join(".claude/settings.local.json").is_file());
         Self { skills: skills_present, hooks: hooks_present }
     }
 
@@ -144,7 +151,7 @@ fn decide_root(
     if is_remembered(root, trust_file) {
         return true;
     }
-    let gated = Gated::detect(root, skills);
+    let gated = Gated::detect(root, skills, opts.hooks_enabled);
     // Nothing to gate right now: there is no question worth asking, but an
     // unapproved root stays untrusted rather than being granted trust. A later
     // `/restart` or hook reload re-detects, so a skill or hook that appears
@@ -157,7 +164,7 @@ fn decide_root(
     if !opts.interactive {
         asker.note(&format!(
             "not loading skills or hooks from untrusted {} (start interactively to trust it, or pass --yolo)",
-            root.display()
+            root.to_string_lossy().escape_debug()
         ));
         return false;
     }
@@ -189,7 +196,7 @@ impl Asker for StdinAsker {
         let _ = writeln!(
             err,
             "Trust this repo? {} has {} that can run commands or steer the agent.",
-            root.display(),
+            root.to_string_lossy().escape_debug(),
             gated.describe()
         );
         let _ = write!(err, "Load its skills and hooks? [y/N] ");
@@ -308,7 +315,9 @@ fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
 /// consent. Appending therefore happens only when the existing content ends
 /// with a newline (or is empty); a file that does not is left untouched and
 /// the root fails closed — trusted for this process, re-asked next time —
-/// rather than risking a corrupted entry.
+/// rather than risking a corrupted entry. A read that outright *fails* (e.g. a
+/// writable-but-unreadable file) is treated the same way: it is never assumed
+/// empty, since that would bypass the terminator guard and splice the key.
 fn remember(root: &Path, trust_file: Option<&Path>) {
     let Some(file) = trust_file else { return };
     let Some(key) = trust_key(root) else { return };
@@ -321,7 +330,11 @@ fn remember(root: &Path, trust_file: Option<&Path>) {
     if f.lock().is_err() {
         return;
     }
-    let existing = std::fs::read_to_string(file).unwrap_or_default();
+    // A failed read must fail closed, not be treated as empty: an existing file
+    // that is writable but unreadable (and may lack a trailing newline) would
+    // otherwise bypass the terminator guard below and concatenate the new key
+    // onto the previous entry. Leave it untouched and trust only this process.
+    let Ok(existing) = std::fs::read_to_string(file) else { return };
     // Exact, untrimmed line comparison (see `is_remembered`).
     if existing.lines().any(|line| line == key) {
         return;
@@ -382,7 +395,7 @@ mod tests {
     }
 
     fn opts(interactive: bool, yolo: bool, acp: bool) -> Options {
-        Options { yolo, acp, interactive }
+        Options { yolo, acp, interactive, hooks_enabled: true }
     }
 
     #[test]
@@ -395,6 +408,34 @@ mod tests {
         assert!(!trusted, "an empty, unapproved root is not granted trust");
         assert!(!asker.asked, "no question when there is nothing to gate");
         assert!(!trust.exists(), "nothing is remembered for an empty root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_interactive_note_escapes_control_characters_in_the_path() {
+        // A repository path can carry terminal control characters on Unix; they
+        // must be escaped before display so a directory name cannot erase or
+        // forge the warning (or inject newlines into logs).
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A subdirectory whose name embeds an ESC and a newline.
+        let weird = dir.path().join(OsStr::from_bytes(b"re\x1bpo\nname"));
+        std::fs::create_dir_all(weird.join(".claude")).unwrap();
+        std::fs::write(
+            weird.join(".claude/settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo hi"}]}]}}"#,
+        )
+        .unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let mut asker = ScriptedAsker::yes();
+        // Non-interactive so the note path (not the question) runs.
+        let trusted = decide_root(&weird, &skills_cfg(), &opts(false, false, false), Some(&trust), &mut asker);
+        assert!(!trusted);
+        let note = asker.noted.expect("a non-interactive note is emitted for a gated repo");
+        assert!(!note.contains('\x1b'), "the ESC control character is escaped: {note:?}");
+        assert!(!note.contains('\n'), "an embedded newline is escaped: {note:?}");
+        assert!(note.contains("re\\u{1b}po\\nname"), "the path is shown escape_debug-escaped: {note:?}");
     }
 
     #[test]
@@ -442,7 +483,7 @@ mod tests {
         // `.claude/skills` is a symlink to the directory holding the skill.
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         symlink(root.join("real"), root.join(".claude/skills")).unwrap();
-        let gated = Gated::detect(&root, &skills_cfg());
+        let gated = Gated::detect(&root, &skills_cfg(), true);
         assert!(gated.skills, "a skill behind a symlinked skills dir is still gated");
     }
 
@@ -545,6 +586,29 @@ mod tests {
         remember(&root, Some(&trust));
         let recorded = std::fs::read_to_string(&trust).unwrap();
         assert_eq!(recorded.lines().filter(|l| !l.is_empty()).count(), 1, "remembered once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remember_fails_closed_when_existing_file_is_unreadable() {
+        // A writable-but-unreadable trust file must not be treated as empty:
+        // doing so would bypass the terminator guard and splice the new key.
+        // Even a newline-terminated file (which would normally append) must be
+        // left untouched when its contents cannot be read.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let existing = dir.path().join("existing");
+        let fresh = dir.path().join("fresh");
+        std::fs::write(&trust, format!("{}\n", existing.display())).unwrap();
+        // Write-only: open-for-append still succeeds, but the read fails.
+        std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o200)).unwrap();
+        remember(&fresh, Some(&trust));
+        // Restore read access to inspect the result.
+        std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let recorded = std::fs::read_to_string(&trust).unwrap();
+        assert_eq!(recorded, format!("{}\n", existing.display()), "the unreadable file is left untouched");
+        assert!(!is_remembered(&fresh, Some(&trust)), "the new root is not persisted on a failed read");
     }
 
     #[test]
@@ -655,13 +719,38 @@ mod tests {
     }
 
     #[test]
+    fn disabled_project_hooks_are_not_gated() {
+        // A repo carrying only a project hook must not be treated as gated when
+        // project hooks cannot load (`--no-hooks` or `disable_project_hooks`),
+        // otherwise it prompts for consent that would gate nothing.
+        let (_dir, root, _trust) = repo_with_hook();
+        let enabled = Gated::detect(&root, &skills_cfg(), true);
+        assert!(enabled.hooks, "an enabled project hook is gated");
+        let disabled = Gated::detect(&root, &skills_cfg(), false);
+        assert!(!disabled.hooks, "a disabled project hook is not gated");
+        assert!(disabled.is_empty(), "nothing is left to gate");
+    }
+
+    #[test]
+    fn hook_only_repo_stays_ungated_when_hooks_disabled() {
+        // End-to-end: with project hooks disabled, a hook-only repo asks no
+        // question and is not trusted (nothing gated), rather than prompting.
+        let (_dir, root, trust) = repo_with_hook();
+        let mut asker = ScriptedAsker::yes();
+        let opts = Options { yolo: false, acp: false, interactive: true, hooks_enabled: false };
+        let trusted = decide_root(&root, &skills_cfg(), &opts, Some(&trust), &mut asker);
+        assert!(!trusted, "a hook-only repo with hooks disabled is not granted trust");
+        assert!(!asker.asked, "no trust question is asked when nothing can load");
+    }
+
+    #[test]
     fn detects_workspace_skills() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let skill = root.join(".claude/skills/x");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "# x\n").unwrap();
-        let gated = Gated::detect(&root, &skills_cfg());
+        let gated = Gated::detect(&root, &skills_cfg(), true);
         assert!(gated.skills);
         assert!(!gated.hooks);
         assert_eq!(gated.describe(), "skills");
@@ -672,7 +761,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
-        let gated = Gated::detect(&root, &skills_cfg());
+        let gated = Gated::detect(&root, &skills_cfg(), true);
         assert!(!gated.skills, "an empty skills dir carries no skill");
         assert!(gated.is_empty());
     }
@@ -682,7 +771,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join(LOCK_FILE), "{}").unwrap();
-        let gated = Gated::detect(&root, &skills_cfg());
+        let gated = Gated::detect(&root, &skills_cfg(), true);
         assert!(gated.skills, "ai.lock is a gated skill source");
     }
 

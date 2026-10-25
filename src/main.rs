@@ -2174,8 +2174,16 @@ async fn main() -> Result<()> {
     // of the agent; user-level skills/hooks and nano's own `[hooks]` are
     // unaffected. `--acp` defers to the client; `--yolo` trusts without asking.
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let trusted =
-        trust::decide(&cwd_path, &config.skills, &trust::Options { yolo: args.yolo, acp: args.acp, interactive });
+    // Project hooks are gated only when they could actually load: `--no-hooks`
+    // (`disable_hooks`) and a configured `disable_project_hooks` both mean a
+    // repo's `.claude` hooks are inert, so they must not drive the trust prompt
+    // or the non-interactive warning.
+    let hooks_enabled = !config.disable_hooks && !config.disable_project_hooks;
+    let trusted = trust::decide(
+        &cwd_path,
+        &config.skills,
+        &trust::Options { yolo: args.yolo, acp: args.acp, interactive, hooks_enabled },
+    );
     if !trusted {
         config.skills.dirs.clear();
         config.skills.ai_lock = false;
