@@ -87,6 +87,13 @@ directory works; it's kept separate by default so the port can't damage real ses
   every loaded image at launch, which cost about 140M instructions per start.
   Exporting only `main` lets the linker bind them locally. Stack traces are unaffected.
 
+- **Repository trust (D first).** A repository's own skills (the workspace skill
+  directories and `ai.lock`) and its `.claude/settings*.json` hooks load only once the
+  repository is trusted (`nano/trust.d`). An interactive start asks "Trust this repo?"
+  once and remembers a yes in `~/.config/nano-coder/trusted-projects`; `-p` and piped
+  runs skip untrusted resources with a note; `--yolo` and `--acp` trust without asking
+  (the previous behaviour). Rust: nanobpm/nano-coder#146.
+
 ## Parity tracking
 
 The Rust test suite is the feature specification. `parity/manifest.tsv` lists every Rust

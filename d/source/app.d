@@ -54,7 +54,7 @@ enum string versionString = "nano-coder-d " ~ packageVersion ~ " (D port of nano
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--no-hooks] [--verbosity quiet|normal|verbose|debug] [--acp]
+                    [--no-session] [--no-hooks] [--yolo] [--verbosity quiet|normal|verbose|debug] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --trajectory SESSION_ID [--json|--markdown]
        nano-coder-d --list-models PROVIDER[/model]
@@ -65,12 +65,15 @@ Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
 -p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
-Ctrl-C cancels a running turn; a line typed during a turn steers it.`;
+Ctrl-C cancels a running turn; a line typed during a turn steers it.
+A repository's own skills and .claude/settings*.json hooks load only once you trust it: an
+interactive start asks "Trust this repo?" and remembers a yes; -p and piped runs skip them.
+--yolo trusts the repository without asking (as --acp does).`;
 
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
-    bool markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    bool yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
 
@@ -107,6 +110,7 @@ Options parseArgs(string[] args)
             case "--trajectory": o.trajectory = value(); break;
             case "--no-session": o.noSession = true; break;
             case "--no-hooks": o.noHooks = true; break;
+            case "--yolo": o.yolo = true; break;
             case "--verbose", "-v": o.verbosity = "verbose"; break;
             case "--verbosity": o.verbosity = value(); break;
             case "--resume":
@@ -1291,13 +1295,39 @@ int runMain(string[] args)
     registerSearch(tools, (string path) => agent.policy.readDenied(path, getcwd()));
 
     auto cwd = getcwd();
+    // Repository trust gates the repo's own skills, skill lock and hooks.
+    bool trusted(string dir)
+    {
+        import nano.trust : trustRoot, projectResources, decideTrust, TrustMode, trustFile;
+        static bool[string] decided;
+        auto root = trustRoot(dir);
+        if (auto d = root in decided) return *d;
+        auto interactive = !o.prompt.length && isTerminal(0) && isTerminal(1);
+        auto mode = o.yolo || o.acp ? TrustMode.yolo : interactive ? TrustMode.ask : TrustMode.deny;
+        auto res = projectResources(root, cfg.skills.dirs);
+        string ask(string q)
+        {
+            stdErr.write(q);
+            stdErr.flush;
+            auto line = stdinLine();
+            return line.length ? line : null;
+        }
+        auto ok = decideTrust(root, res, mode, trustFile, interactive ? &ask : null);
+        if (!ok && res.length)
+            stdErr.writeln("nano-coder-d: not loading skills or hooks from untrusted ", root,
+                interactive ? "" : " (start interactively to trust it, or pass --yolo)");
+        decided[root] = ok;
+        return ok;
+    }
     // Skills: the index goes into the system prompt; `load_skill` reads one.
     Skills skills;
     Skills discoverSkills(string dir)
     {
         // NANO_CODER_NO_SKILLS turns skills off for one run (as in Rust).
         if (!cfg.skills.enabled || environment.get("NANO_CODER_NO_SKILLS") !is null) return null;
-        auto s = Skills.discover(dir, cfg.skills);
+        auto sc = cfg.skills;
+        if (!trusted(dir)) { sc.dirs = null; sc.aiLock = false; }
+        auto s = Skills.discover(dir, sc);
         foreach (w; s.warnings) stdErr.writeln("nano-coder-d: skills: ", w);
         return s;
     }
@@ -1357,7 +1387,7 @@ int runMain(string[] args)
         import nano.claude_hooks : LoadOptions;
         LoadOptions lo;
         lo.disableHooks = cfg.disableHooks || o.noHooks;
-        lo.disableProjectHooks = cfg.disableProjectHooks;
+        lo.disableProjectHooks = cfg.disableProjectHooks || !trusted(dir);
         lo.claudeUserHooks = cfg.claudeUserHooks;
         lo.nanoHooks = cfg.hooks;
         lo.sandbox = cfg.sandbox;
