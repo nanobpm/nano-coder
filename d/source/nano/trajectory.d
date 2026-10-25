@@ -878,6 +878,14 @@ size_t wrappedRows(string line, size_t cols)
     return rows;
 }
 
+// rust: trajectory.rs::tool_invocation_is_counted_once_for_call_and_result
+// rust: trajectory.rs::rows_cite_their_session_log_line
+// rust: trajectory.rs::json_and_markdown_round_trip
+// rust: trajectory.rs::plain_render_sanitizes_untrusted_input
+// rust: trajectory.rs::plain_render_lists_turns_and_summaries
+// rust: trajectory.rs::crashed_input_materializes_opening_user_row
+// rust: trajectory.rs::compaction_becomes_a_row
+// rust: trajectory.rs::groups_records_into_turns_and_rows
 unittest
 {
     import std.algorithm : canFind;
@@ -923,6 +931,7 @@ unittest
     assert(t.toJson.canFind(`"kind": "tool",` ~ "\n" ~ `          "name": "bash",`));
 }
 
+// rust: trajectory.rs::synthetic_final_answer_is_not_a_model_call
 unittest
 {
     // Synthetic final answer after report_outcome isn't a model call.
@@ -944,6 +953,11 @@ unittest
     assert(t.summary == "2 calls");
 }
 
+// rust: trajectory.rs::sanitize_terminal_strips_control_sequences
+// rust: trajectory.rs::a_pager_that_could_not_start_falls_back
+// rust: trajectory.rs::needs_pager_counts_wrapped_rows
+// rust: trajectory.rs::durations_and_tokens_format_readably
+// rust: trajectory.rs::markdown_fences_survive_embedded_backticks
 unittest
 {
     assert(fence("a\n```d\nb\n```") == "````\na\n```d\nb\n```\n````");

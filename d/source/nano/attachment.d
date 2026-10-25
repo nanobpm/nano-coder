@@ -513,6 +513,9 @@ version (unittest)
     }
 }
 
+// rust: attachment.rs::scaled_dimensions_preserve_aspect_and_cap
+// rust: attachment.rs::sha256_is_stable
+// rust: attachment.rs::sniffs_formats_by_magic_bytes
 unittest
 {
     assert(sniff(fakePng(1, 1)).get == ImageFormat.png);
@@ -533,6 +536,12 @@ unittest
 }
 
 // rust: attachment.rs::prepare_errors_when_minimum_size_still_exceeds_byte_cap
+// rust: attachment.rs::prepare_errors_when_no_implemented_codec_is_accepted
+// rust: attachment.rs::prepare_reencodes_unaccepted_source_into_an_accepted_codec
+// rust: attachment.rs::prepare_shrinks_until_under_byte_cap
+// rust: attachment.rs::prepare_downscales_oversized_images
+// rust: attachment.rs::prepare_reports_oriented_dimensions_on_passthrough_path
+// rust: attachment.rs::prepare_keeps_small_images_unchanged
 unittest
 {
     // Passthrough keeps the bytes; a quarter-turn EXIF reports display size.
@@ -574,6 +583,12 @@ unittest
     assert(threw);
 }
 
+// rust: attachment.rs::read_for_limits_passes_compliant_bytes_through
+// rust: attachment.rs::read_for_limits_rejects_missing_and_tampered_files
+// rust: attachment.rs::crafted_metadata_cannot_escape_the_attachments_dir
+// rust: attachment.rs::store_repairs_a_corrupt_existing_file
+// rust: attachment.rs::exists_rejects_a_tampered_stored_file
+// rust: attachment.rs::store_and_read_round_trip_and_dedupe
 unittest
 {
     import std.file : tempDir, rmdirRecurse, write, exists_ = exists;

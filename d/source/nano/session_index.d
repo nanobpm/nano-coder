@@ -507,6 +507,10 @@ version (unittest)
     }
 }
 
+// rust: session_index.rs::prompts_are_clipped_to_the_title_input_size
+// rust: session_index.rs::no_context_when_last_prompt_is_telling
+// rust: session_index.rs::terse_prompts
+// rust: session_index.rs::summarizes_prompts_and_header
 unittest
 {
     // Terse and telling prompts, and the context shown for a terse last one.
@@ -529,6 +533,8 @@ unittest
     assert(big.firstPrompt.length == 600);
 }
 
+// rust: session_index.rs::clean_title_strips_terminal_control_characters
+// rust: session_index.rs::cleans_title_replies
 unittest
 {
     assert(cleanTitle("\"Fixing the deploy test.\"\nmore") == "Fixing the deploy test");
@@ -541,6 +547,10 @@ unittest
     assert(long_.walkLength == 60 && long_[$ - 3 .. $] == "…");
 }
 
+// rust: session_index.rs::update_folds_the_turns_input_into_the_cached_summary
+// rust: session_index.rs::title_survives_updates_and_rebuilds
+// rust: session_index.rs::update_records_current_model_and_list_keeps_it
+// rust: session_index.rs::list_indexes_skips_empty_and_refreshes_stale
 unittest
 {
     auto dir = testDir("list");
@@ -578,6 +588,8 @@ unittest
     assert(list(dir)[0].title == "Deploy fix");
 }
 
+// rust: session_index.rs::update_folds_an_input_a_concurrent_writer_appended_since_from
+// rust: session_index.rs::update_rescans_when_the_cache_is_stale
 unittest
 {
     // A stale cache (log grew behind the index) falls back to a full scan.
@@ -598,6 +610,7 @@ unittest
     assert(update(path, from, null).prompts == 5);
 }
 
+// rust: session_index.rs::update_compacts_the_index_without_a_listing
 unittest
 {
     // The index compacts once it grows well past one line per session.

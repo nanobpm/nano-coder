@@ -328,6 +328,7 @@ unittest
     assert(!matchFirst("x.toml", regex(globToRegex("*.{toml,json}"))).empty);
 }
 
+// rust: search.rs::binary_exclusion_is_independent_of_mode_and_limit
 unittest
 {
     auto root = buildPath(tempDir, "nano-coder-d-search-test");
@@ -355,6 +356,7 @@ unittest
     assert(grep(l).indexOf("limit of 1 reached") >= 0);
 }
 
+// rust: search.rs::read_deny_rules_filter_discovered_files
 unittest
 {
     import std.file : mkdirRecurse, write, rmdirRecurse, tempDir;
@@ -374,4 +376,48 @@ unittest
     auto e = grep(parseJSON(`{"pattern":"token","path":` ~ JSONValue(buildPath(root, ".env")).toString ~ `}`), d);
     assert(e == "(no matches)", e);
     assert(!glob(parseJSON(`{"pattern":"*","path":` ~ JSONValue(root).toString ~ `}`), d).canFind(".env"));
+}
+
+// rust: search.rs::grep_content_is_sorted_with_line_numbers_and_no_ignored_files
+// rust: search.rs::grep_files_and_count_modes, search.rs::grep_on_a_single_explicit_file
+// rust: search.rs::grep_rejects_bad_arguments, search.rs::grep_reports_limit_truncation_and_no_matches
+// rust: search.rs::nested_gitignore_and_negation, search.rs::symlinks_are_not_followed_so_walks_cannot_loop
+// rust: search.rs::glob_matches_by_name_and_by_path_sorted, search.rs::grep_glob_filter_limits_by_file_name_and_path
+unittest
+{
+    import std.file : symlink;
+    auto root = buildPath(tempDir, "nano-d-search-more");
+    if (root.exists) rmdirRecurse(root);
+    scope (exit) rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "b/sub"));
+    mkdirRecurse(buildPath(root, "a"));
+    write(buildPath(root, "b/.gitignore"), "*.tmp\n!keep.tmp\n");
+    write(buildPath(root, "b/x.tmp"), "hit\n");
+    write(buildPath(root, "b/keep.tmp"), "hit\n");
+    write(buildPath(root, "b/sub/z.txt"), "one\nhit two\n");
+    write(buildPath(root, "a/y.txt"), "hit\n");
+    symlink(root, buildPath(root, "a/loop"));
+    import std.array : replace;
+    string rel(string s) { import std.string : stripRight; return s.replace(root ~ "/", "").stripRight; }
+    JSONValue j(string extra) { return parseJSON(`{"pattern":"hit","path":` ~ JSONValue(root).toString ~ extra ~ `}`); }
+    // Content mode: path:line:text, sorted; nested .gitignore with negation.
+    assert(rel(grep(j(``))) == "a/y.txt:1:hit\nb/keep.tmp:1:hit\nb/sub/z.txt:2:hit two", rel(grep(j(``))));
+    assert(rel(grep(j(`,"output_mode":"files"`))) == "a/y.txt\nb/keep.tmp\nb/sub/z.txt");
+    assert(grep(j(`,"output_mode":"count"`)).canFind("b/sub/z.txt:1"));
+    assert(rel(grep(j(`,"glob":"*.txt"`))) == "a/y.txt:1:hit\nb/sub/z.txt:2:hit two");
+    assert(rel(grep(j(`,"glob":"b/**/*.txt"`))) == "b/sub/z.txt:2:hit two");
+    assert(grep(parseJSON(`{"pattern":"nope","path":` ~ JSONValue(root).toString ~ `}`)) == "(no matches)");
+    // A single explicit file.
+    auto one = grep(parseJSON(`{"pattern":"two","path":` ~ JSONValue(buildPath(root, "b/sub/z.txt")).toString ~ `}`));
+    assert(one.canFind(":2:hit two"), one);
+    // Bad arguments are errors.
+    bool threw;
+    try grep(parseJSON(`{"pattern":"(","path":` ~ JSONValue(root).toString ~ `}`)); catch (ToolError) threw = true;
+    assert(threw);
+    threw = false;
+    try grep(parseJSON(`{"pattern":"x","output_mode":"weird"}`)); catch (ToolError) threw = true;
+    assert(threw);
+    // Globs match by name at any depth, by path with a slash; symlinks aren't walked.
+    assert(rel(glob(parseJSON(`{"pattern":"*.txt","path":` ~ JSONValue(root).toString ~ `}`))) == "a/y.txt\nb/sub/z.txt");
+    assert(rel(glob(parseJSON(`{"pattern":"b/*/*.txt","path":` ~ JSONValue(root).toString ~ `}`))) == "b/sub/z.txt");
 }

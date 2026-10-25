@@ -496,6 +496,11 @@ void printList(string dir, string cwd, bool all, bool json)
     foreach (ref s; shown) stdOut.writeln(idRow(s, now));
 }
 
+// rust: resume.rs::scroll_top_keeps_selection_in_the_window
+// rust: resume.rs::item_window_never_pushes_the_frame_past_the_terminal
+// rust: resume.rs::physical_rows_counts_terminal_wrapping
+// rust: resume.rs::truncate_never_exceeds_width_even_zero
+// rust: resume.rs::truncate_counts_variation_selector_width_as_a_string
 unittest
 {
     assert(cells("abc") == 3 && cells("日本") == 4 && cells("e\u0301") == 1 && cells("#\uFE0F") == 2);
@@ -509,6 +514,8 @@ unittest
     assert(scrollTop(5, 2, 3) == 2 && scrollTop(0, 7, 3) == 5 && scrollTop(4, 5, 3) == 4);
 }
 
+// rust: resume.rs::rank_matches_full_row_text_and_drops_non_matches
+// rust: resume.rs::rank_keeps_recency_order_when_search_is_empty
 unittest
 {
     size_t[] pos;
@@ -524,6 +531,7 @@ unittest
     assert(rank(["5m ago  w8  2 prompts  first thing then the keyword zebra", "other"], "zebra") == [0]);
 }
 
+// rust: resume.rs::row_fits_narrow_and_wide_text
 unittest
 {
     import nano.lineedit : script;
@@ -556,6 +564,10 @@ unittest
     assert(g.length == 2 && cells(g[1]) <= 22);
 }
 
+// rust: resume.rs::title_leads_the_topic
+// rust: resume.rs::ago_is_brief
+// rust: resume.rs::list_rows_skips_the_session_in_use
+// rust: resume.rs::last_requires_a_session_from_this_directory
 unittest
 {
     import std.file : tempDir, exists, rmdirRecurse, mkdirRecurse, readText;
@@ -585,4 +597,31 @@ unittest
     s.title = null;
     assert(topic(s) == "do it  ← older telling prompt");
     assert(project(s) == "?");
+}
+
+// rust: resume.rs::title_drops_control_characters, resume.rs::project_and_topic_drop_control_characters
+// rust: resume.rs::errors_and_plain_ids_drop_control_characters, resume.rs::rank_returns_distinct_indices_for_identical_rows
+// rust: resume.rs::directory_view_includes_unknown_cwd
+unittest
+{
+    import std.algorithm : canFind, map;
+    import std.array : array;
+    import std.exception : collectExceptionMsg;
+    import std.file : tempDir, mkdirRecurse;
+    import std.path : buildPath;
+    Summary s;
+    s.lastPrompt = "do it";
+    s.title = "evil\x1b[2J\ntitle";
+    assert(topic(s) == "evil[2J title · do it", topic(s));
+    Summary e;
+    e.cwd = "/work/evil\x1b[2J";
+    e.lastPrompt = "hi\x1b]8;;x\x07";
+    assert(project(e) == "evil[2J" && topic(e) == "hi]8;;x", project(e) ~ "|" ~ topic(e));
+    auto dir = buildPath(tempDir, "nano-d-resume-empty");
+    mkdirRecurse(dir);
+    auto msg = collectExceptionMsg(last(dir, "/work/evil\x1b[2J"));
+    assert(msg.canFind("no saved session for /work/evil[2J") && !msg.canFind("\x1b"), msg);
+    assert(rank(["same row", "same row"], "same") == [0, 1]);
+    Summary here = {id: "here", cwd: "/a"}, there = {id: "there", cwd: "/b"}, old = {id: "old"};
+    assert(inDir([here, there, old], "/a").map!(x => x.id).array == ["here", "old"]);
 }
