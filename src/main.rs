@@ -52,6 +52,7 @@ mod temperature;
 mod thinking;
 mod tools;
 mod trajectory;
+mod trust;
 mod turn_commands;
 mod ui;
 mod vision;
@@ -1892,6 +1893,7 @@ struct Args {
     allow: Vec<String>,
     deny: Vec<String>,
     no_hooks: bool,
+    yolo: bool,
     trajectory: Option<String>,
     json: bool,
     markdown: bool,
@@ -1907,11 +1909,15 @@ fn print_help() {
     );
     println!("                  [--verbosity quiet|normal|verbose|debug]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
+    println!("                  [--yolo]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot|muse");
     println!("       nano-coder --list-models PROVIDER[/model]");
     println!("       nano-coder --version");
+    println!();
+    println!("On an interactive start in a repository that ships skills or `.claude` hooks, nano-coder asks");
+    println!("\"Trust this repo?\" before loading them (default no). --yolo trusts without asking.");
 }
 
 fn parse_args() -> Result<Args> {
@@ -1950,6 +1956,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         allow: Vec::new(),
         deny: Vec::new(),
         no_hooks: false,
+        yolo: false,
         trajectory: None,
         json: false,
         markdown: false,
@@ -1982,6 +1989,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
             "--no-hooks" => args.no_hooks = true,
+            "--yolo" => args.yolo = true,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -2154,6 +2162,24 @@ async fn main() -> Result<()> {
     if args.no_hooks {
         config.disable_hooks = true;
     }
+
+    // Trust gate: before building the agent (which loads skills and project
+    // hooks), decide whether this repository's gated resources may run. An
+    // untrusted repo keeps its workspace skills and `.claude` project hooks out
+    // of the agent; user-level skills/hooks and nano's own `[hooks]` are
+    // unaffected. `--acp` defers to the client; `--yolo` trusts without asking.
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let trusted = trust::decide(
+        std::path::Path::new(&cwd),
+        &config.skills,
+        &trust::Options { yolo: args.yolo, acp: args.acp, interactive },
+    );
+    if !trusted {
+        config.skills.dirs.clear();
+        config.skills.ai_lock = false;
+        config.disable_project_hooks = true;
+    }
+
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
