@@ -536,7 +536,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
 
 // rust: agent.rs::temperature_resolves_against_the_live_client
 // rust: providers/mod.rs::copilot_reasoning_models_default_to_reasoning_replay
- unittest
+unittest
 {
     import nano.toml : parseToml;
     // replay_reasoning defaults on only for Copilot reasoning models.
@@ -554,7 +554,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
 
 // rust: providers/mod.rs::qwen_and_kimi_presets
 // rust: settings.rs::editing_qwen_to_the_token_plan_stores_the_endpoint_and_key_variable
- unittest
+unittest
 {
     import std.algorithm : canFind;
     import std.exception : collectExceptionMsg;
@@ -579,7 +579,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
     assert(parseKind("muse-code") == ProviderKind.muse && parseKind("openai-compatible") == ProviderKind.openai);
 }
 
- unittest
+unittest
 {
     import std.algorithm : canFind;
     import std.exception : collectExceptionMsg;
@@ -597,7 +597,7 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
     assert(collectExceptionMsg(resolve(c, "local/m")).canFind("has no base_url"));
 }
 
- unittest
+unittest
 {
     import std.file : tempDir, write, remove;
     import std.path : buildPath;

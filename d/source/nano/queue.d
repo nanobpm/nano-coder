@@ -314,7 +314,7 @@ unittest // pop is FIFO and edit rewrites in place
 
 // rust: queue.rs::add_queues_a_message
 // rust: queue.rs::parse_covers_the_subcommands
- unittest // parse covers the subcommands
+unittest // parse covers the subcommands
 {
     import std.exception : assertThrown;
     foreach (l; ["", "  ", "list", "ls"]) assert(parse(l) == QueueOp(ListOp()));

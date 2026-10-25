@@ -245,7 +245,7 @@ ToolDefinition definition()
 }
 
 // rust: question.rs::parses_questions_and_requires_text
- unittest // parses_questions_and_requires_text
+unittest // parses_questions_and_requires_text
 {
     import std.exception : assertThrown, assertNotThrown;
     auto qs = parse(parseJSON(`{ "questions": [ { "question": "Which DB?", "options": [ {"label": "Postgres"}, {"label": "SQLite"} ] } ] }`));
@@ -281,7 +281,7 @@ unittest // ask_blocks_until_resolved, and sequential questions each register
 // rust: question.rs::away_and_dismissed_have_stable_wording
 // rust: question.rs::result_text_strips_control_sequences_from_model_and_user_text
 // rust: question.rs::result_text_strips_newlines_from_quoted_question_and_answer
- unittest // wording, and control sequences/newlines stripped
+unittest // wording, and control sequences/newlines stripped
 {
     auto qs = [Question("Q")];
     assert(resultText(qs, Answer(Away())).canFind("away from the keyboard"));

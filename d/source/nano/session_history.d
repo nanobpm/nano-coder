@@ -296,7 +296,7 @@ string read(string path, JSONValue args)
 
 // rust: history.rs::read_returns_one_message_whole_or_bounded
 // rust: session.rs::standard_replace_does_not_offer_history_tools
- unittest
+unittest
 {
     import std.file : tempDir, mkdirRecurse, rmdirRecurse;
     import std.path : buildPath;

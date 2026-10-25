@@ -329,7 +329,7 @@ version (unittest)
     }
 }
 
- unittest // suggests a plan once per session; memory once unless saved
+unittest // suggests a plan once per session; memory once unless saved
 {
     Plan plan;
     Reminders r;
@@ -354,7 +354,7 @@ version (unittest)
 }
 
 // rust: reminders.rs::nudges_a_stale_plan_until_it_changes
- unittest // nudges a stale plan until it changes
+unittest // nudges a stale plan until it changes
 {
     Plan plan;
     plan.apply("plan_add", parseJSON(`{"items": ["read", "fix"]}`));
@@ -457,7 +457,7 @@ unittest // changing execution arguments is not a repeat; the same ones are
 }
 
 // rust: reminders.rs::disabled_plan_tool_repeats_are_still_detected
- unittest // distinct malformed payloads, exempt tools, reset, images
+unittest // distinct malformed payloads, exempt tools, reset, images
 {
     Reminders r;
     auto empty = parseJSON(`{}`);

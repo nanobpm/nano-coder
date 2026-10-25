@@ -507,7 +507,7 @@ version (unittest)
     }
 }
 
- unittest
+unittest
 {
     // Terse and telling prompts, and the context shown for a terse last one.
     Summary s;
@@ -529,7 +529,7 @@ version (unittest)
     assert(big.firstPrompt.length == 600);
 }
 
- unittest
+unittest
 {
     assert(cleanTitle("\"Fixing the deploy test.\"\nmore") == "Fixing the deploy test");
     assert(cleanTitle("Title: **Port nano-coder to D**") == "Port nano-coder to D");
@@ -541,7 +541,7 @@ version (unittest)
     assert(long_.walkLength == 60 && long_[$ - 3 .. $] == "…");
 }
 
- unittest
+unittest
 {
     auto dir = testDir("list");
     writeLog(dir, "s1", ["first prompt that is telling enough here", "go"]);
@@ -578,7 +578,7 @@ version (unittest)
     assert(list(dir)[0].title == "Deploy fix");
 }
 
- unittest
+unittest
 {
     // A stale cache (log grew behind the index) falls back to a full scan.
     auto dir = testDir("stale");
@@ -598,7 +598,7 @@ version (unittest)
     assert(update(path, from, null).prompts == 5);
 }
 
- unittest
+unittest
 {
     // The index compacts once it grows well past one line per session.
     auto dir = testDir("compact");

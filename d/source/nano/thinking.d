@@ -741,6 +741,7 @@ version (unittest)
     }
 }
 
+// rust: thinking.rs::parses_and_round_trips
 unittest
 {
     assert(Thinking.parse("default").isDefault);
@@ -776,6 +777,7 @@ unittest
     assert(builtin("gpt-4.1").isNull && builtin("llama3.3").isNull && builtin("omni-moderation").isNull);
 }
 
+// rust: thinking.rs::most_specific_setting_wins
 unittest
 {
     alias O = ProviderKind.openai;
@@ -818,6 +820,7 @@ unittest
 }
 
 // rust: thinking.rs::config_levels_override_the_table
+// rust: thinking.rs::invalid_configured_level_names_are_dropped_with_a_warning
 unittest
 {
     import std.algorithm : canFind;
@@ -840,6 +843,14 @@ unittest
 
 // rust: acp.rs::thinking_value_reports_nothing_for_a_dropped_level
 // rust: thinking.rs::extra_body_override_is_reported_as_overriding_not_sent
+// rust: thinking.rs::warns_when_extra_body_sets_the_same_field
+// rust: thinking.rs::extra_body_thinking_override_locks_only_when_it_enables_thinking
+// rust: thinking.rs::dropped_or_overridden_field_still_locks_an_always_thinking_model
+// rust: thinking.rs::adaptive_output_config_effort_override_keeps_the_thinking_control
+// rust: thinking.rs::format_only_output_config_does_not_override_a_requested_level
+// rust: thinking.rs::a_dropped_extra_body_control_is_not_an_override
+// rust: thinking.rs::drop_params_suppresses_the_generated_field
+// rust: thinking.rs::extra_body_override_suppresses_the_generated_field
 unittest
 {
     import std.algorithm : canFind;
@@ -878,6 +889,8 @@ unittest
 }
 
 // rust: providers/openai.rs::encodes_thinking_levels_and_lets_extra_body_win
+// rust: thinking.rs::budget_tokens_maps_custom_names_to_a_conservative_ceiling
+// rust: thinking.rs::caps_budgets_below_max_tokens
 unittest
 {
     assert(budgetTokens("custom") == 16384);
@@ -898,7 +911,9 @@ unittest
     assert(b["chat_template_kwargs"]["enable_thinking"].boolean == false);
 }
 
- unittest
+// rust: thinking.rs::reads_levels_from_ollama_and_llama_cpp
+// rust: thinking.rs::reads_levels_from_a_model_list_entry
+unittest
 {
     auto e = parseJSON(`{"id":"x","capabilities":{"supports":{"reasoning_effort":["none","Low","high"],"adaptive_thinking":true}}}`);
     auto r = Reported.fromModelEntry(e);

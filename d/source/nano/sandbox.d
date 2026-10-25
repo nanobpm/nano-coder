@@ -372,7 +372,7 @@ version (unittest)
 }
 
 // rust: sandbox.rs::parses_modes
- unittest
+unittest
 {
     assert(parseMode("workspace") == SandboxMode.workspace);
     assert(parseMode("read-only") == SandboxMode.readOnly);
@@ -436,7 +436,7 @@ version (HasOsSandbox) unittest // extra writable paths
     }
 }
 
- unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
+unittest // device directories only in workspace mode, never /dev/shm or /dev/pts
 {
     import std.file : exists;
     auto ws = outsideDir();
@@ -453,7 +453,7 @@ version (HasOsSandbox) unittest // extra writable paths
     assert(!w.allowsWrite("/dev/shm/x", ws));
 }
 
- unittest // a poisoned .git pointer to an external repo isn't granted
+unittest // a poisoned .git pointer to an external repo isn't granted
 {
     import std.file : write, mkdirRecurse;
     auto ws = outsideDir(), outsider = outsideDir();
@@ -466,7 +466,7 @@ version (HasOsSandbox) unittest // extra writable paths
 }
 
 // rust: sandbox.rs::linked_worktree_git_dirs_are_granted
- unittest // a linked worktree's git dirs are granted
+unittest // a linked worktree's git dirs are granted
 {
     import std.file : write, mkdirRecurse;
     import std.process : execute, Config;

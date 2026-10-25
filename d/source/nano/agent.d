@@ -152,9 +152,9 @@ class Agent
     size_t learnedWindow;
     /// Compactions this session.
     uint compactions;
-    /// Session token totals.
     /// Longest tool result kept whole (characters); longer ones are cut and spilled.
     size_t toolOutputLimit = 40_000;
+    /// Session token totals.
     ulong sessionInputTokens, sessionOutputTokens;
     /// AI Credits used this session; `hasSessionAic` once a provider reported any.
     bool hasSessionAic;
@@ -1674,7 +1674,7 @@ unittest
 
 // Each turn updates the session index; with session_titles on, a telling
 // prompt gets one background title request, stored cleaned in the index.
- unittest
+unittest
 {
     import std.file : tempDir, exists, rmdirRecurse;
     import std.path : buildPath;

@@ -600,6 +600,13 @@ string stampBlock(string stamp, string text)
     return stamp ~ body.replace("\n", "\n" ~ pad) ~ (body.length < text.length ? "\n" : "");
 }
 
+// rust: ui.rs::stamps_the_first_line_and_aligns_the_rest
+unittest
+{
+    assert(stampBlock("12:00:00 ", "● Plan\n  ☐ one\n") == "12:00:00 ● Plan\n           ☐ one\n");
+    assert(stampBlock("", "x\n") == "x\n");
+}
+
 private string spaces(size_t n) { import std.array : replicate; return " ".replicate(n); }
 Verbosity verbosity() { return atomicLoad(gVerbosity); }
 void setVerbosity(Verbosity v) { atomicStore(gVerbosity, v); }

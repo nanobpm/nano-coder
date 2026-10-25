@@ -6,15 +6,15 @@ acp.rs::only_unabsorbed_steers_are_requeued	todo
 acp.rs::requeued_escaped_steers_are_re_escaped	todo
 acp.rs::slash_prompts_never_reach_the_model_over_acp	todo
 acp.rs::thinking_value_reports_nothing_for_a_dropped_level	test
-agent.rs::a_background_probe_refines_a_default_window_source	todo
+agent.rs::a_background_probe_refines_a_default_window_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_chat_output_cap_fallback_halves_the_sent_budget	todo
 agent.rs::a_compaction_summary_cap_fallback_halves_the_sent_budget	todo
 agent.rs::a_compaction_summary_is_retried_after_learning_the_output_cap	todo
 agent.rs::a_compaction_summary_retry_honours_a_pending_model_switch	todo
-agent.rs::a_configured_window_preserves_the_probed_output_limit	todo
-agent.rs::a_configured_window_probes_only_the_thinking_levels	todo
+agent.rs::a_configured_window_preserves_the_probed_output_limit	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::a_configured_window_probes_only_the_thinking_levels	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_direct_model_switch_supersedes_a_stale_queued_request	todo
-agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	todo
+agent.rs::a_direct_model_switch_with_a_slow_key_command_does_not_stall_the_runtime	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_failed_direct_model_switch_still_clears_a_stale_queued_request	todo
 agent.rs::a_failed_new_session_keeps_the_thinking_override	todo
 agent.rs::a_failed_repair_on_resume_leaves_the_live_session_untouched	todo
@@ -23,10 +23,10 @@ agent.rs::a_hard_stop_skips_the_rest_of_the_batch	test
 agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap	test
 agent.rs::a_learned_window_is_the_combined_cap_when_no_total_is_advertised	todo
 agent.rs::a_learned_window_tightens_the_effective_combined_window	todo
-agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	todo
+agent.rs::a_looser_probe_does_not_replace_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_lower_learned_window_restores_the_output_reservation	todo
 agent.rs::a_mid_turn_thinking_change_applies_from_the_next_step_and_drops_the_temperature	todo
-agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	todo
+agent.rs::a_newer_model_request_during_a_slow_build_supersedes_the_stale_one	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::a_prompt_only_window_is_capped_to_the_combined_window	todo
 agent.rs::a_prompt_only_window_keeps_the_estimation_margin	todo
 agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings	test
@@ -36,9 +36,9 @@ agent.rs::a_same_agent_retry_after_a_provider_error_does_not_replay_the_snapshot
 agent.rs::a_second_overflow_is_returned	test
 agent.rs::a_small_max_tokens_caps_the_thinking_budget_with_a_warning	todo
 agent.rs::a_spoofed_summary_prefix_does_not_unlock_history_tools	todo
-agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	todo
+agent.rs::a_stale_background_probe_is_discarded_after_a_later_switch	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_steer_between_continuations_drops_the_cut_off_prefix	todo
-agent.rs::a_stricter_probe_replaces_a_learned_window_stat	todo
+agent.rs::a_stricter_probe_replaces_a_learned_window_stat	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::a_summary_cut_off_at_the_output_limit_is_flagged	todo
 agent.rs::a_thinking_level_set_mid_turn_applies_from_the_next_step	todo
 agent.rs::a_title_is_requested_at_most_once_per_session_across_switches	todo
@@ -47,7 +47,7 @@ agent.rs::a_truncated_final_assistant_is_not_replayed_as_a_clean_finish	gap	D co
 agent.rs::a_truncated_turns_stop_reason_survives_a_reload	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::adds_project_instructions_to_the_system_prompt_and_nested_ones_to_file_results	todo
 agent.rs::an_empty_summary_at_the_output_limit_names_the_cause	todo
-agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	todo
+agent.rs::an_equal_probe_replaces_a_learned_window_stat_source	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::an_interactive_session_keeps_an_unbounded_zero_cap	todo
 agent.rs::an_output_limit_rejection_is_learned_and_retried	test
 agent.rs::an_output_limit_rejection_is_retried_against_the_sent_budget	todo
@@ -58,10 +58,10 @@ agent.rs::auto_compaction_mid_turn_keeps_the_turn_going	test
 agent.rs::auto_mode_disables_the_turn_cap	todo
 agent.rs::auto_mode_does_not_disable_the_cap_in_a_headless_turn	todo
 agent.rs::calibrated_estimate_recomputes_when_a_suffix_image_displaces_a_prefix_image	todo
-agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset	todo
+agent.rs::cancel_during_key_command_build_kills_the_child_despite_a_turn_flag_reset	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancel_during_model_call_stops_the_turn	todo
 agent.rs::cancel_kills_running_bash_and_skips_remaining_calls	test
-agent.rs::cancelled_apply_model_request_signals_the_caller_and_keeps_the_request	todo
+agent.rs::cancelled_apply_model_request_signals_the_caller_and_keeps_the_request	na	Tokio runtime races while a client builds asynchronously; D builds the client synchronously on the agent thread
 agent.rs::cancelled_compaction_does_not_issue_the_summary_call	todo
 agent.rs::compaction_keeps_the_temperature_when_turns_think_on_anthropic	todo
 agent.rs::compaction_sends_no_temperature_to_an_always_thinking_model	todo
@@ -87,8 +87,8 @@ agent.rs::max_tokens_is_sent_unchanged_when_the_window_has_room	todo
 agent.rs::max_tokens_shrinks_so_prompt_and_output_fit_the_window	todo
 agent.rs::memory_save_persists_and_surfaces_in_the_prompt	todo
 agent.rs::memory_tools_track_the_configured_mode	todo
-agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	todo
-agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	todo
+agent.rs::mid_turn_model_switch_with_a_configured_window_skips_the_probe	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
+agent.rs::mid_turn_model_switch_without_a_configured_window_probes_in_the_background	gap	D probes capabilities synchronously when a client is built; Rust refines the window in a background probe and tracks each stat's source (config / probe / learned)
 agent.rs::model_switch_during_tool_call_applies_at_the_next_model_call	todo
 agent.rs::model_switch_queued_before_manual_compaction_applies_to_the_summary	todo
 agent.rs::model_switch_queued_during_a_call_applies_before_threshold_compaction	todo
@@ -133,7 +133,7 @@ agent.rs::redelivering_a_truncated_turn_replays_its_stop_reason	gap	D continues 
 agent.rs::refreshing_stats_tracks_a_max_tokens_driven_thinking_change	todo
 agent.rs::repairs_interrupted_turns_on_resume	test
 agent.rs::repeated_output_limit_cut_offs_end_with_a_distinct_stop_reason	test
-agent.rs::replay_after_a_crash_rebuilds_the_whole_answer	todo
+agent.rs::replay_after_a_crash_rebuilds_the_whole_answer	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::replay_after_mid_turn_compaction_shows_the_folded_input_once	todo
 agent.rs::replay_after_repeated_compaction_preserves_the_original_turns	todo
 agent.rs::replay_history_after_compaction_restores_real_turns_not_summary	todo
@@ -142,22 +142,22 @@ agent.rs::replay_shows_the_image_marker_on_persisted_tool_results	todo
 agent.rs::reporting_an_outcome_ends_the_turn_and_is_recorded	test
 agent.rs::request_settings_derives_temperature_from_the_snapshot_not_a_reread	todo
 agent.rs::resume_after_a_logged_continuation_reminder_stitches_the_prefix	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_replays_a_logged_clean_final_answer	todo
-agent.rs::resume_after_compaction_replays_chunks_logged_after_the_summary	todo
-agent.rs::resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run	todo
+agent.rs::resume_after_compaction_replays_a_logged_clean_final_answer	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_after_compaction_replays_chunks_logged_after_the_summary	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_after_compaction_resets_the_prefix_on_a_post_summary_tool_run	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_after_compaction_restores_the_persisted_continuation	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_after_compaction_with_a_spent_budget_ends_max_tokens	todo
+agent.rs::resume_after_compaction_with_a_spent_budget_ends_max_tokens	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_after_the_third_cutoff_still_issues_the_last_continuation	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_before_a_logged_continuation_reminder_re_prompts_and_stitches	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
-agent.rs::resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix	todo
+agent.rs::resume_before_a_stop_hook_reply_does_not_restore_the_discarded_prefix	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_finishes_a_recorded_answer_without_calling_the_model	todo
 agent.rs::resume_finishes_a_reported_outcome_without_calling_the_model	todo
 agent.rs::resume_restores_a_lost_user_message	todo
 agent.rs::resume_restores_continuation_state_before_session_start_context	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_restores_the_continuation_budget_before_a_tool_run	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resume_runs_session_start_hooks_for_the_continued_turn	todo
-agent.rs::resume_stops_reconstruction_at_a_stop_hook_reprompt	todo
-agent.rs::resume_with_a_spent_budget_before_turn_end_ends_max_tokens	todo
+agent.rs::resume_stops_reconstruction_at_a_stop_hook_reprompt	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
+agent.rs::resume_with_a_spent_budget_before_turn_end_ends_max_tokens	gap	D continues cut-off replies within a turn but does not persist the pending continuation, so resume/redelivery cannot stitch it
 agent.rs::resumed_pending_input_is_not_folded_into_the_index_twice	todo
 agent.rs::resumes_sessions_and_deduplicates_inputs	todo
 agent.rs::session_start_context_survives_a_rejected_first_prompt	todo
@@ -291,55 +291,55 @@ context.rs::summary_budget_leaves_room_for_reasoning	todo
 context.rs::transcript_keeps_the_newest_messages	test
 context.rs::transcript_labels_log_lines_when_asked	todo
 files.rs::a_failed_read_does_not_authorize_edits	todo
-files.rs::a_miss_shows_the_closest_lines	todo
-files.rs::a_misspelled_single_line_still_gets_a_closest_hint	todo
-files.rs::absent_target_write_refuses_to_clobber_a_concurrent_create	todo
-files.rs::bare_blank_line_in_numbered_old_is_not_stripped	todo
-files.rs::consecutive_tsv_numbers_do_not_retarget_an_unrelated_block	todo
-files.rs::crossing_crlf_and_lf_ranges_are_ambiguous_not_collapsed	todo
-files.rs::dedent_across_multibyte_whitespace_does_not_panic	todo
-files.rs::edit_fails_when_file_changes_mid_call	todo
-files.rs::edit_in_crlf_region_of_mixed_file_converts_replacement_to_crlf	todo
-files.rs::edit_in_lf_region_of_mixed_file_keeps_lf_replacement	todo
-files.rs::edit_matches_crlf_files_as_read	todo
-files.rs::edit_result_shows_the_changed_lines_in_context	todo
-files.rs::edits_and_overwrites_require_a_current_read	todo
-files.rs::failed_pre_rename_validation_removes_the_temp_file	todo
+files.rs::a_miss_shows_the_closest_lines	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
+files.rs::a_misspelled_single_line_still_gets_a_closest_hint	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
+files.rs::absent_target_write_refuses_to_clobber_a_concurrent_create	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
+files.rs::bare_blank_line_in_numbered_old_is_not_stripped	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::consecutive_tsv_numbers_do_not_retarget_an_unrelated_block	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::crossing_crlf_and_lf_ranges_are_ambiguous_not_collapsed	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::dedent_across_multibyte_whitespace_does_not_panic	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::edit_fails_when_file_changes_mid_call	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
+files.rs::edit_in_crlf_region_of_mixed_file_converts_replacement_to_crlf	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::edit_in_lf_region_of_mixed_file_keeps_lf_replacement	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::edit_matches_crlf_files_as_read	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::edit_result_shows_the_changed_lines_in_context	test
+files.rs::edits_and_overwrites_require_a_current_read	test
+files.rs::failed_pre_rename_validation_removes_the_temp_file	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
 files.rs::image_reads_authorize_writes_only_once_dispatched_to_the_model	todo
-files.rs::incompatible_indentation_rejects_the_relaxed_match	todo
-files.rs::line_number_prefix_at_u64_max_does_not_overflow	todo
-files.rs::line_number_prefix_requires_exact_six_wide_rendering	todo
-files.rs::literal_prefix_shaped_row_is_edited_in_place_not_rejected	todo
-files.rs::mixed_whitespace_deepen_appends_delta_after_existing_indentation	todo
-files.rs::mixed_whitespace_shift_preserves_the_common_prefix	todo
-files.rs::near_miss_qualifies_a_truncated_scan	todo
-files.rs::new_string_tsv_row_is_not_stripped_as_a_line_prefix	todo
-files.rs::nonconsecutive_numeric_prefixes_are_not_line_numbers	todo
-files.rs::nonuniform_indentation_rejects_the_relaxed_match	todo
-files.rs::numbered_old_with_prefixed_blank_line_strips_and_edits	todo
-files.rs::old_matching_both_ending_styles_is_not_treated_as_unique	todo
-files.rs::overlapping_crlf_and_lf_ranges_are_one_occurrence	todo
-files.rs::overwrite_propagates_read_errors_instead_of_skipping_freshness	todo
-files.rs::prefix_shaped_new_string_in_copied_range_is_rejected	todo
+files.rs::incompatible_indentation_rejects_the_relaxed_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::line_number_prefix_at_u64_max_does_not_overflow	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::line_number_prefix_requires_exact_six_wide_rendering	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::literal_prefix_shaped_row_is_edited_in_place_not_rejected	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::mixed_whitespace_deepen_appends_delta_after_existing_indentation	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::mixed_whitespace_shift_preserves_the_common_prefix	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::near_miss_qualifies_a_truncated_scan	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
+files.rs::new_string_tsv_row_is_not_stripped_as_a_line_prefix	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::nonconsecutive_numeric_prefixes_are_not_line_numbers	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::nonuniform_indentation_rejects_the_relaxed_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::numbered_old_with_prefixed_blank_line_strips_and_edits	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::old_matching_both_ending_styles_is_not_treated_as_unique	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::overlapping_crlf_and_lf_ranges_are_one_occurrence	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::overwrite_propagates_read_errors_instead_of_skipping_freshness	gap	write_file/edit_file: D writes in place (std.file.write) after a freshness check; Rust writes a temp file, re-validates and renames atomically
+files.rs::prefix_shaped_new_string_in_copied_range_is_rejected	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
 files.rs::read_detects_image_despite_text_extension	todo
 files.rs::read_image_stores_absolute_source_path	todo
 files.rs::read_pages_with_line_numbers	test
-files.rs::read_rejects_binary	todo
+files.rs::read_rejects_binary	test
 files.rs::read_returns_images_by_magic_bytes	todo
-files.rs::reindent_shifts_lines_shallower_than_the_match	todo
-files.rs::relaxed_matches_ignore_whitespace_and_line_numbers	todo
-files.rs::relaxed_matches_must_be_unique	todo
-files.rs::relaxed_matching_rejects_ambiguity_across_attempts	todo
-files.rs::replace_all_does_not_apply_to_a_stripped_relaxed_match	todo
-files.rs::replace_all_normalizes_each_occurrence_to_its_own_region	todo
-files.rs::replace_all_result_shows_every_changed_region	todo
-files.rs::single_line_match_normalizes_multiline_replacement_endings	todo
-files.rs::snippet_output_is_globally_capped	todo
+files.rs::reindent_shifts_lines_shallower_than_the_match	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::relaxed_matches_ignore_whitespace_and_line_numbers	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::relaxed_matches_must_be_unique	test
+files.rs::relaxed_matching_rejects_ambiguity_across_attempts	gap	edit_file: D's indentation-insensitive match inserts new_string verbatim; Rust re-indents it to the matched block and rejects incompatible indentation
+files.rs::replace_all_does_not_apply_to_a_stripped_relaxed_match	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::replace_all_normalizes_each_occurrence_to_its_own_region	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::replace_all_result_shows_every_changed_region	gap	edit_file: D's result shows only the first changed region
+files.rs::single_line_match_normalizes_multiline_replacement_endings	gap	edit_file: D has no CRLF-aware matching or line-ending normalisation of the replacement
+files.rs::snippet_output_is_globally_capped	gap	edit_file: on a miss D says "not found" without Rust's closest-lines hint
 files.rs::string_arg_distinguishes_missing_null_and_wrong_type	todo
-files.rs::stripped_line_number_match_must_begin_at_line_boundary	todo
-files.rs::unpadded_tsv_number_is_not_treated_as_a_line_prefix	todo
-files.rs::write_creates_parents_and_edit_requires_unique_match	todo
-files.rs::writes_through_symlinks	todo
+files.rs::stripped_line_number_match_must_begin_at_line_boundary	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::unpadded_tsv_number_is_not_treated_as_a_line_prefix	gap	edit_file: D doesn't strip read_file line-number prefixes copied into old_string
+files.rs::write_creates_parents_and_edit_requires_unique_match	test
+files.rs::writes_through_symlinks	test
 frame.rs::a_differential_render_after_a_wrapping_raw_line_addresses_real_rows	todo
 frame.rs::a_resize_drag_ends_on_a_stable_correct_frame	todo
 frame.rs::a_width_change_reflows_history	todo
@@ -395,7 +395,7 @@ instructions.rs::a_dormant_scoped_rules_import_does_not_suppress_a_rendered_file
 instructions.rs::a_fence_looking_line_inside_an_open_span_does_not_open_a_fence	todo
 instructions.rs::a_rules_root_that_is_itself_an_out_of_root_symlink_is_not_walked	todo
 instructions.rs::a_scoped_rule_already_imported_is_not_re_emitted	todo
-instructions.rs::a_symlink_cycle_in_rules_does_not_loop_forever	todo
+instructions.rs::a_symlink_cycle_in_rules_does_not_loop_forever	test
 instructions.rs::agents_md_mentions_are_not_imports	test
 instructions.rs::an_indented_continuation_line_can_close_an_open_span	todo
 instructions.rs::an_out_of_root_directory_symlink_in_rules_is_not_walked	todo
@@ -405,9 +405,9 @@ instructions.rs::fence_close_requires_a_bare_marker_and_small_indent	test
 instructions.rs::front_matter_forms	test
 instructions.rs::front_matter_imports_are_not_expanded_when_front_matter_is_dropped	todo
 instructions.rs::html_comments_are_stripped_outside_code_blocks	test
-instructions.rs::imports_expand_in_claude_files_once_and_stay_inside_the_repository	todo
+instructions.rs::imports_expand_in_claude_files_once_and_stay_inside_the_repository	test
 instructions.rs::imports_inside_blockquote_containers_are_skipped_like_top_level	test
-instructions.rs::imports_stop_after_four_levels	todo
+instructions.rs::imports_stop_after_four_levels	test
 instructions.rs::indented_code_blocks_preserve_comments_and_imports	todo
 instructions.rs::inline_paths_keep_brace_groups	test
 instructions.rs::inline_paths_with_braces_match	test
@@ -425,9 +425,9 @@ instructions.rs::overflow_directory_stays_pending_for_a_later_call	todo
 instructions.rs::overflow_imported_file_in_subdir_stays_pending_for_a_later_call	todo
 instructions.rs::overflow_scoped_rule_stays_pending_for_a_later_call	todo
 instructions.rs::oversized_group_commits_what_fits_and_defers_the_first_unrendered_file	todo
-instructions.rs::per_file_truncation_marker_mentions_read_file	todo
+instructions.rs::per_file_truncation_marker_mentions_read_file	test
 instructions.rs::rejected_fence_candidate_does_not_break_an_open_span	todo
-instructions.rs::render_cap_bounds_total_with_header_and_single_marker	todo
+instructions.rs::render_cap_bounds_total_with_header_and_single_marker	test
 instructions.rs::repeated_blocked_outside_import_warns_only_once	todo
 instructions.rs::rule_with_explicit_empty_paths_is_skipped_not_loaded_globally	todo
 instructions.rs::rules_nested_deeper_than_eight_directories_are_still_loaded	todo
@@ -440,13 +440,13 @@ lineedit.rs::a_new_read_starts_a_fresh_escape_pair	todo
 lineedit.rs::an_arm_does_not_survive_an_intervening_turn	todo
 lineedit.rs::clear_input_if_any_empties_a_non_empty_line	todo
 lineedit.rs::clear_input_if_any_is_an_inert_no_op_on_an_empty_line	todo
-lineedit.rs::double_escape_clears_a_command_menu_line_in_two_presses	todo
-lineedit.rs::double_escape_press_clears_a_non_empty_idle_input	todo
-lineedit.rs::editing_a_recalled_line_restarts_browsing_from_the_newest	todo
-lineedit.rs::enter_on_an_unknown_command_keeps_the_line_unsent	todo
+lineedit.rs::double_escape_clears_a_command_menu_line_in_two_presses	test
+lineedit.rs::double_escape_press_clears_a_non_empty_idle_input	test
+lineedit.rs::editing_a_recalled_line_restarts_browsing_from_the_newest	test
+lineedit.rs::enter_on_an_unknown_command_keeps_the_line_unsent	test
 lineedit.rs::enter_steers_and_ctrl_enter_queues_during_a_turn	test
-lineedit.rs::erase_word_from_the_middle_keeps_the_tail	todo
-lineedit.rs::erase_word_handles_multibyte_spaces	todo
+lineedit.rs::erase_word_from_the_middle_keeps_the_tail	test
+lineedit.rs::erase_word_handles_multibyte_spaces	test
 lineedit.rs::escape_clears_through_the_reader_and_only_when_there_is_text	todo
 lineedit.rs::escape_does_not_clear_the_input_during_a_turn	todo
 lineedit.rs::escape_during_a_turn_does_not_arm_the_prompt_clear	todo
@@ -456,23 +456,23 @@ lineedit.rs::frame_hook_receives_the_command_menu_at_the_prompt	todo
 lineedit.rs::frame_menu_marks_menu_visible_so_esc_can_hide_it	todo
 lineedit.rs::frame_mode_submission_records_history	todo
 lineedit.rs::frame_mutation_invokes_the_draw_hook_once	todo
-lineedit.rs::ignores_sgr_mouse_reports	todo
-lineedit.rs::inserts_and_deletes_at_the_cursor	todo
-lineedit.rs::kitty_encoded_control_keys_act_like_legacy_bytes	todo
-lineedit.rs::kitty_lock_state_bits_are_ignored	todo
-lineedit.rs::movement_clamps_at_the_ends	todo
+lineedit.rs::ignores_sgr_mouse_reports	test
+lineedit.rs::inserts_and_deletes_at_the_cursor	test
+lineedit.rs::kitty_encoded_control_keys_act_like_legacy_bytes	test
+lineedit.rs::kitty_lock_state_bits_are_ignored	test
+lineedit.rs::movement_clamps_at_the_ends	test
 lineedit.rs::non_idle_phase_marks_turn_and_restores_prompt_on_drop	todo
-lineedit.rs::parses_ctrl_and_cmd_enter_as_a_newline	todo
-lineedit.rs::parses_cursor_and_function_keys	todo
-lineedit.rs::parses_kitty_and_modify_other_keys_control_keys	todo
-lineedit.rs::parses_modified_cursor_keys	todo
-lineedit.rs::paste_normalizes_line_endings	todo
-lineedit.rs::tab_completes_commands_and_is_a_space_elsewhere	todo
+lineedit.rs::parses_ctrl_and_cmd_enter_as_a_newline	test
+lineedit.rs::parses_cursor_and_function_keys	test
+lineedit.rs::parses_kitty_and_modify_other_keys_control_keys	test
+lineedit.rs::parses_modified_cursor_keys	test
+lineedit.rs::paste_normalizes_line_endings	test
+lineedit.rs::tab_completes_commands_and_is_a_space_elsewhere	test
 lineedit.rs::tab_completes_model_arguments_from_context	todo
-lineedit.rs::take_returns_the_multiline_input	todo
-lineedit.rs::take_skips_repeats_but_history_up_still_works	todo
-lineedit.rs::up_down_recalls_submitted_lines_and_the_draft	todo
-lineedit.rs::word_jumps_skip_whitespace	todo
+lineedit.rs::take_returns_the_multiline_input	test
+lineedit.rs::take_skips_repeats_but_history_up_still_works	test
+lineedit.rs::up_down_recalls_submitted_lines_and_the_draft	test
+lineedit.rs::word_jumps_skip_whitespace	test
 llm.rs::attachments_round_trip_and_stay_off_plain_messages	todo
 llm.rs::available_image_beyond_quota_says_sent_earlier	todo
 llm.rs::decodes_valid_arguments_and_marks_invalid_ones	todo
@@ -1006,38 +1006,38 @@ temperature.rs::muse_reasoning_models_ignore_a_configured_temperature	todo
 temperature.rs::parses_numbers_and_default	todo
 temperature.rs::rejects_non_finite_values	todo
 temperature.rs::user_model_settings_merge_over_presets	todo
-thinking.rs::a_dropped_extra_body_control_is_not_an_override	todo
+thinking.rs::a_dropped_extra_body_control_is_not_an_override	test
 thinking.rs::a_preserved_disable_control_unlocks_the_temperature	todo
 thinking.rs::adaptive_off_request_keeps_its_disable_control_under_an_effort_override	todo
-thinking.rs::adaptive_output_config_effort_override_keeps_the_thinking_control	todo
+thinking.rs::adaptive_output_config_effort_override_keeps_the_thinking_control	test
 thinking.rs::an_extra_body_control_overrides_a_setting_fitted_to_default	todo
-thinking.rs::budget_tokens_maps_custom_names_to_a_conservative_ceiling	todo
-thinking.rs::caps_budgets_below_max_tokens	todo
+thinking.rs::budget_tokens_maps_custom_names_to_a_conservative_ceiling	test
+thinking.rs::caps_budgets_below_max_tokens	test
 thinking.rs::config_levels_override_the_table	test
 thinking.rs::default_aliases_in_configured_levels_are_rejected	todo
 thinking.rs::default_on_an_always_thinking_model_still_locks_the_temperature	todo
 thinking.rs::drop_params_strips_the_preserved_half_of_an_output_config_override	todo
-thinking.rs::drop_params_suppresses_the_generated_field	todo
-thinking.rs::dropped_or_overridden_field_still_locks_an_always_thinking_model	todo
+thinking.rs::drop_params_suppresses_the_generated_field	test
+thinking.rs::dropped_or_overridden_field_still_locks_an_always_thinking_model	test
 thinking.rs::effort_only_override_with_default_effective_is_no_complete_control	todo
 thinking.rs::extra_body_override_is_reported_as_overriding_not_sent	test
-thinking.rs::extra_body_override_suppresses_the_generated_field	todo
-thinking.rs::extra_body_thinking_override_locks_only_when_it_enables_thinking	todo
+thinking.rs::extra_body_override_suppresses_the_generated_field	test
+thinking.rs::extra_body_thinking_override_locks_only_when_it_enables_thinking	test
 thinking.rs::fits_the_level_to_the_model	test
-thinking.rs::format_only_output_config_does_not_override_a_requested_level	todo
+thinking.rs::format_only_output_config_does_not_override_a_requested_level	test
 thinking.rs::gpt_5_family_reasoning_levels_split_by_variant	test
-thinking.rs::invalid_configured_level_names_are_dropped_with_a_warning	todo
+thinking.rs::invalid_configured_level_names_are_dropped_with_a_warning	test
 thinking.rs::knows_model_families	test
-thinking.rs::most_specific_setting_wins	todo
+thinking.rs::most_specific_setting_wins	test
 thinking.rs::muse_is_analysed_as_a_responses_wire	todo
 thinking.rs::off_aliases_in_configured_levels_are_rejected	todo
-thinking.rs::parses_and_round_trips	todo
+thinking.rs::parses_and_round_trips	test
 thinking.rs::picks_the_request_form_for_the_api	todo
-thinking.rs::reads_levels_from_a_model_list_entry	todo
-thinking.rs::reads_levels_from_ollama_and_llama_cpp	todo
+thinking.rs::reads_levels_from_a_model_list_entry	test
+thinking.rs::reads_levels_from_ollama_and_llama_cpp	test
 thinking.rs::unrelated_nested_extra_body_options_do_not_suppress_the_generated_control	todo
 thinking.rs::unrelated_output_config_fields_do_not_enable_thinking	todo
-thinking.rs::warns_when_extra_body_sets_the_same_field	todo
+thinking.rs::warns_when_extra_body_sets_the_same_field	test
 trajectory.rs::a_pager_that_could_not_start_falls_back	todo
 trajectory.rs::compaction_becomes_a_row	todo
 trajectory.rs::crashed_input_materializes_opening_user_row	todo
@@ -1083,14 +1083,14 @@ ui.rs::frame_quiet_preserves_a_model_switch_failure	todo
 ui.rs::fully_quiet_final_answer_closed_by_a_louder_message_is_not_reprinted	todo
 ui.rs::non_streamed_final_message_clears_an_earlier_suppressed_segments_guard	todo
 ui.rs::non_streamed_thinking_event_still_emits_summary	todo
-ui.rs::parses_and_orders_verbosity	todo
-ui.rs::pausing_and_resuming_the_work_clock_is_idempotent	todo
-ui.rs::plan_checklist_sanitizes_model_controlled_titles	todo
+ui.rs::parses_and_orders_verbosity	test
+ui.rs::pausing_and_resuming_the_work_clock_is_idempotent	test
+ui.rs::plan_checklist_sanitizes_model_controlled_titles	test
 ui.rs::prompt_glyph_and_hint_say_whose_turn_it_is	todo
 ui.rs::quiet_assistant_message_closes_the_plain_stream	todo
 ui.rs::raw_export_is_kept_in_the_frame_transcript	todo
 ui.rs::raw_export_mid_stream_does_not_duplicate_the_answer	todo
-ui.rs::stamps_the_first_line_and_aligns_the_rest	todo
+ui.rs::stamps_the_first_line_and_aligns_the_rest	test
 ui.rs::streamed_reasoning_then_text_emits_one_thinking_summary	todo
 ui.rs::summarizes_tool_calls	todo
 ui.rs::the_prompt_spins_during_a_turn_and_shows_ready_after	todo

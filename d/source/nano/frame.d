@@ -649,3 +649,16 @@ unittest // decorate fills the placeholders and keeps the row within the width
     assert(rows[1] == "more");
     assert(visibleWidth(decorate([glyphMark ~ " " ~ hintMark], false, 0, 10)[0]) <= 10);
 }
+
+// rust: ui.rs::pausing_and_resuming_the_work_clock_is_idempotent
+unittest
+{
+    auto c = WorkClock.started(0);
+    c.pause(2000);
+    c.pause(9000);
+    assert(c.banked == 2000, "a second pause banks nothing");
+    c.resume(9000);
+    c.resume(30_000);
+    assert(c.since == 9000, "a second resume doesn't restart the clock");
+    assert(c.elapsed(31_000) == 24_000);
+}

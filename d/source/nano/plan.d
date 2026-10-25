@@ -519,7 +519,7 @@ ToolDefinition[] definitions()
 }
 
 // rust: plan.rs::adds_updates_and_tracks_what_is_next
- unittest // adds_updates_and_tracks_what_is_next
+unittest // adds_updates_and_tracks_what_is_next
 {
     Plan plan;
     auto o = plan.apply("plan_add",
@@ -544,7 +544,7 @@ ToolDefinition[] definitions()
 }
 
 // rust: plan.rs::rejects_bad_calls_without_changing_the_plan
- unittest // rejects_bad_calls_without_changing_the_plan
+unittest // rejects_bad_calls_without_changing_the_plan
 {
     import std.exception : collectExceptionMsg, assertThrown;
     Plan plan;
@@ -568,7 +568,7 @@ ToolDefinition[] definitions()
 }
 
 // rust: plan.rs::context_note_drops_finished_notes_first_and_round_trips_through_acp
- unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
+unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
 {
     import std.array : replicate;
     Plan plan;
@@ -640,11 +640,21 @@ private string fitWidth(string s, size_t width)
     return out_ ~ "…";
 }
 
- unittest // checklist
+unittest // checklist
 {
     Plan plan;
     plan.apply("plan_add", parseJSON(`{"items": ["one", "two\u001b[2J", "three"]}`));
     plan.apply("plan_update", parseJSON(`{"updates": [{"id": 1, "status": "done"}, {"id": 2, "status": "in_progress"}]}`));
     auto text = checklist(plan, 80, false);
     assert(text == "● Plan 1/3 done\n  ✔ one\n  ◼ two[2J\n  ☐ three\n", text);
+}
+
+// rust: ui.rs::plan_checklist_sanitizes_model_controlled_titles
+unittest
+{
+    import std.algorithm : canFind;
+    Plan plan;
+    plan.items ~= PlanItem(1, "\x1b[2Jwipe\x1b[H", Status.pending);
+    auto r = checklist(plan, 80, true);
+    assert(!r.canFind("\x1b[2J") && !r.canFind("\x1b[H") && r.canFind("wipe"), r);
 }

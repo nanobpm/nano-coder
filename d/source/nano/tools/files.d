@@ -288,6 +288,8 @@ unittest
     assert(threw);
 }
 
+// rust: files.rs::write_creates_parents_and_edit_requires_unique_match
+// rust: files.rs::edits_and_overwrites_require_a_current_read
 unittest
 {
     auto st = new ReadState;
@@ -323,4 +325,54 @@ unittest
     assert(threw);
     editFile(j("path", q, "old_string", "a", "new_string", "b", "replace_all", true), st);
     assert(readText(q) == "b\nb\n");
+}
+
+// rust: files.rs::relaxed_matches_must_be_unique
+unittest
+{
+    auto st = new ReadState;
+    auto p = tmpFile("twice.txt", "  x = 1; \n\tx = 1; \n");
+    readFile(j("path", p), st);
+    bool threw;
+    try editFile(j("path", p, "old_string", "x = 1;\n", "new_string", "y\n"), st);
+    catch (ToolError e) threw = e.msg.indexOf("matches 2 places") > 0;
+    assert(threw);
+}
+
+// rust: files.rs::writes_through_symlinks
+unittest
+{
+    import std.file : symlink;
+    auto st = new ReadState;
+    auto target = tmpFile("real.txt", "old\n");
+    auto link = target ~ ".link";
+    if (link.exists) remove(link);
+    symlink(target, link);
+    scope (exit) remove(link);
+    readFile(j("path", link), st);
+    writeFile(j("path", link, "content", "new\n"), st);
+    assert(readText(target) == "new\n");
+    import std.file : isSymlink;
+    assert(link.isSymlink);
+}
+
+// rust: files.rs::edit_result_shows_the_changed_lines_in_context
+unittest
+{
+    auto st = new ReadState;
+    auto p = tmpFile("ctx.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\n");
+    readFile(j("path", p), st);
+    auto r = editFile(j("path", p, "old_string", "e\n", "new_string", "E\n"), st);
+    assert(r.indexOf("     5\tE\n") > 0 && r.indexOf("     2\tb\n") > 0 && r.indexOf("     8\th\n") > 0, r);
+    assert(r.indexOf("     1\ta\n") < 0, r);
+}
+
+// rust: files.rs::read_rejects_binary
+unittest
+{
+    auto st = new ReadState;
+    auto p = tmpFile("bin.dat", "ab\0cd");
+    bool threw;
+    try readFile(j("path", p), st); catch (ToolError e) threw = e.msg.indexOf("binary") > 0;
+    assert(threw);
 }

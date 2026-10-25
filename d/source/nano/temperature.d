@@ -131,7 +131,7 @@ Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig prov
     return r;
 }
 
- unittest
+unittest
 {
     import std.algorithm : canFind;
     import nano.toml : parseToml;
@@ -163,7 +163,7 @@ Resolved resolve(double global, ProviderKind kind, const ref ProviderConfig prov
     assert(isNaN(r.effective) && r.warning.canFind("from the provider's extra_body"));
 }
 
- unittest
+unittest
 {
     ProviderConfig none;
     // Copilot reasoning models take no temperature; Copilot Claude is clamped.

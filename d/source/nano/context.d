@@ -339,7 +339,7 @@ unittest
 }
 
 // rust: context.rs::transcript_keeps_the_newest_messages
- unittest // transcripts: roles, tool calls, ids, newest kept
+unittest // transcripts: roles, tool calls, ids, newest kept
 {
     import std.json : parseJSON;
     import nano.llm : ToolCall;

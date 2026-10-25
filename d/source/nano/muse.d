@@ -513,7 +513,7 @@ unittest
     assert("User-Agent" !in h && h["x-client-id"] == "tbh:exec");
 }
 
- unittest
+unittest
 {
     auto refused = mintRefusal(403, parseJSON(`{"api_key":"sk-secret","require_payment":true,"action_url":"https://pay"}`));
     assert(!refused.canFind("sk-secret") && refused.canFind("subscription is required") && refused.canFind("https://pay"));
@@ -521,7 +521,7 @@ unittest
     assert(mintRefusal(500, JSONValue.init).canFind("no usable API key"));
 }
 
- unittest
+unittest
 {
     OauthGrant g = OauthGrant("a", "r", Nullable!long(100));
     assert(g.needsRefresh(50) && !g.needsRefresh(39));
@@ -530,7 +530,7 @@ unittest
     assert(isFresher(OauthGrant("b", "r"), g) && !isFresher(OauthGrant("b", "r"), OauthGrant("a", "r")));
 }
 
- unittest
+unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, getAttributes;
     import std.path : buildPath;
@@ -565,7 +565,7 @@ unittest
 // rust: providers/muse.rs::lists_models_hiding_image_generation
 // rust: providers/muse.rs::muse_vision_treats_chat_rows_as_image_capable
 // rust: providers/muse.rs::reads_effort_variants_in_both_shapes
- unittest
+unittest
 {
     auto cat = parseJSON(`{"data":[
         {"id":"muse-spark-1.3","context_limit":200000,"output_limit":32000,

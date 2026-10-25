@@ -556,7 +556,7 @@ unittest
     assert(g.length == 2 && cells(g[1]) <= 22);
 }
 
- unittest
+unittest
 {
     import std.file : tempDir, exists, rmdirRecurse, mkdirRecurse, readText;
     import std.path : buildPath;

@@ -138,7 +138,7 @@ ToolDefinition definition()
 }
 
 // rust: goal.rs::parses_arguments_leniently
- unittest // parses arguments leniently
+unittest // parses arguments leniently
 {
     import std.exception : assertThrown;
     auto o = Outcome.fromArgs(parseJSON(`{"status": "Done", "summary": " opened #12 "}`));
@@ -151,7 +151,7 @@ ToolDefinition definition()
 }
 
 // rust: goal.rs::finds_the_last_successful_report
- unittest // finds the last successful report
+unittest // finds the last successful report
 {
     import nano.llm : ToolCall;
     ToolCall call(string id, string status)

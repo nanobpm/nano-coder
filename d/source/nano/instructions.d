@@ -924,6 +924,7 @@ unittest // root to leaf, fallbacks, nested files once
 }
 
 // rust: instructions.rs::outside_a_repository_only_the_working_directory_counts
+// rust: instructions.rs::per_file_truncation_marker_mentions_read_file
 unittest // outside a repository only the working directory counts; per-file cap
 {
     import std.file : rmdirRecurse, mkdirRecurse;
@@ -938,7 +939,6 @@ unittest // outside a repository only the working directory counts; per-file cap
     assert(p.loaded.length == 1 && p.loaded[0].text.canFind("[... truncated") && p.loaded[0].text.canFind("read_file"));
 }
 
-// rust: instructions.rs::a_committed_instruction_file_symlinked_outside_the_repo_is_skipped
 // rust: instructions.rs::loaded_paths_keeps_a_scoped_rule_after_it_attaches
 // rust: instructions.rs::user_files_come_first_and_local_files_follow_the_main_file
 unittest // user files first; local files follow the main file
@@ -1028,6 +1028,8 @@ unittest // front matter and brace groups
 }
 
 // rust: instructions.rs::agents_md_mentions_are_not_imports
+// rust: instructions.rs::imports_expand_in_claude_files_once_and_stay_inside_the_repository
+// rust: instructions.rs::imports_stop_after_four_levels
 unittest // imports: Claude files only, once, inside the repository, four levels
 {
     import std.file : rmdirRecurse;
@@ -1056,6 +1058,7 @@ unittest // imports: Claude files only, once, inside the repository, four levels
     assert(find(r2).loaded.length == 1 + maxImportDepth);
 }
 
+// rust: instructions.rs::a_committed_instruction_file_symlinked_outside_the_repo_is_skipped
 unittest // a committed file symlinked outside the repository is skipped
 {
     import std.file : rmdirRecurse, symlink;
@@ -1096,6 +1099,7 @@ unittest // scoped rules attach once per compaction; imports resolve on attach
     assert(p.nestedFor(buildPath(root, "src/api/y.ts"), root) !is null);
 }
 
+// rust: instructions.rs::render_cap_bounds_total_with_header_and_single_marker
 unittest // the render cap bounds the total with one marker
 {
     import std.file : rmdirRecurse;
@@ -1114,6 +1118,7 @@ unittest // the render cap bounds the total with one marker
     assert(r.length <= maxTotalBytes && r.count("[omitted: instruction size limit reached") == 1);
 }
 
+// rust: instructions.rs::a_symlink_cycle_in_rules_does_not_loop_forever
 unittest // a symlink cycle in the rules directory terminates
 {
     import std.file : rmdirRecurse, symlink;

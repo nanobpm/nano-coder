@@ -535,7 +535,7 @@ unittest
     assert(ago(now - 5.minutes, now) == "5m ago" && ago(now - 3.hours, now) == "3h ago");
 }
 
- unittest
+unittest
 {
     // Malformed arguments and Responses item ids round-trip in Rust's shape.
     auto m = Message.assistant("", [ToolCall.fromRaw("c1", "bash", "{oops")]);

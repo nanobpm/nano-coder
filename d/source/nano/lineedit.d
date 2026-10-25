@@ -426,9 +426,16 @@ struct EditState
     /// Tab: complete a `/command` typed so far, or its first argument.
     void tab()
     {
+        import std.algorithm : canFind;
+        import std.ascii : isWhite;
         auto t = text;
-        if (cursor != buf.length || !t.startsWith("/")) return;
+        // Tab is a space outside a command, and past a command name with
+        // nothing to complete (a bare ambiguous `/s` and the argument menus
+        // stay put).
+        if (!t.startsWith("/")) return insert(" ");
+        if (cursor != buf.length) return;
         if (auto c = commands.completeLine(t)) set(c);
+        else if (t.canFind!isWhite && !commands.hasArgumentMenu(t)) return insert(" ");
         changed();
     }
 
@@ -875,6 +882,9 @@ version (unittest)
     }
 }
 
+// rust: lineedit.rs::erase_word_from_the_middle_keeps_the_tail
+// rust: lineedit.rs::word_jumps_skip_whitespace
+// rust: lineedit.rs::inserts_and_deletes_at_the_cursor
 unittest // editing keys
 {
     auto screen = new Screen;
@@ -890,6 +900,12 @@ unittest // editing keys
     assert(e.readLine("> ", "> ").text == "XfooY bar");
     e = editor("x\x15y\r", screen); // Ctrl-U
     assert(e.readLine("> ", "> ").text == "y");
+    e = editor("foo bar baz\x1b[D\x1b[D\x1b[D\x17\r", screen); // Ctrl-W mid-line keeps the tail
+    assert(e.readLine("> ", "> ").text == "foo baz");
+    e = editor("fix it\t\r", screen); // Tab outside a command is a space
+    assert(e.readLine("> ", "> ").text == "fix it ");
+    e = editor("/compact focus\tx\r", screen);
+    assert(e.readLine("> ", "> ").text == "/compact focus x");
 }
 
 unittest // Shift-Tab runs the action with the input erased, keeping the text; Ctrl-O does nothing
@@ -918,6 +934,9 @@ unittest // UTF-8, wide characters and combining marks
     assert(charWidth('世') == 2 && charWidth('\u0301') == 0 && textWidth("a世") == 3);
 }
 
+// rust: lineedit.rs::parses_ctrl_and_cmd_enter_as_a_newline
+// rust: lineedit.rs::take_returns_the_multiline_input
+// rust: lineedit.rs::paste_normalizes_line_endings
 unittest // multi-line input: Ctrl-J, Alt-Enter, kitty/modifyOtherKeys Ctrl-Enter, paste
 {
     auto screen = new Screen;
@@ -930,6 +949,7 @@ unittest // multi-line input: Ctrl-J, Alt-Enter, kitty/modifyOtherKeys Ctrl-Ente
     assert(e.readLine("> ", "> ").text == "abXc\ndef");
 }
 
+// rust: lineedit.rs::up_down_recalls_submitted_lines_and_the_draft
 unittest // history recall; Ctrl-D; Ctrl-C
 {
     auto screen = new Screen;
@@ -948,6 +968,10 @@ unittest // history recall; Ctrl-D; Ctrl-C
     assert(e.readLine("", "", true).outcome == Outcome.cancel);
 }
 
+// rust: lineedit.rs::double_escape_clears_a_command_menu_line_in_two_presses
+// rust: lineedit.rs::double_escape_press_clears_a_non_empty_idle_input
+// rust: lineedit.rs::enter_on_an_unknown_command_keeps_the_line_unsent
+// rust: lineedit.rs::tab_completes_commands_and_is_a_space_elsewhere
 unittest // slash commands: Tab, menu, rejection, Esc
 {
     auto screen = new Screen;
@@ -1010,10 +1034,51 @@ unittest // stop keeps the typed text
     assert(e.state.text == "dra");
 }
 
+// rust: lineedit.rs::kitty_encoded_control_keys_act_like_legacy_bytes
+// rust: lineedit.rs::parses_kitty_and_modify_other_keys_control_keys
+// rust: lineedit.rs::ignores_sgr_mouse_reports
+// rust: lineedit.rs::parses_modified_cursor_keys
 unittest // escape parsing
 {
     assert(parseEscape("\x1b[1;3D").kind == K.wordLeft && parseEscape("\x1bOH").kind == K.home);
     assert(parseEscape("\x1b[<0;1;1M").kind == K.ignored && parseEscape("\x1b[Z").kind == K.ignored);
     assert(parseEscape("\x1b[119;5u").kind == K.eraseWord); // kitty Ctrl-W
     assert(parseEscape("\x1b[27;6;87~").kind == K.eraseWord); // Ctrl-Shift-W
+}
+
+// rust: lineedit.rs::parses_cursor_and_function_keys, lineedit.rs::kitty_lock_state_bits_are_ignored
+unittest
+{
+    K k(string s) { return parseEscape(s).kind; }
+    assert(k("\x1b[D") == K.left && k("\x1b[C") == K.right && k("\x1b[H") == K.home && k("\x1b[F") == K.end);
+    assert(k("\x1bOD") == K.left && k("\x1bOC") == K.right && k("\x1bOH") == K.home && k("\x1bOF") == K.end);
+    assert(k("\x1b[3~") == K.delete_ && k("\x1b[1~") == K.home && k("\x1b[4~") == K.end);
+    assert(k("\x1b[A") == K.up && k("\x1b[B") == K.down && k("\x1bOA") == K.up && k("\x1bOB") == K.down);
+    // Caps Lock (64) and Num Lock (128) bits don't defeat the modifiers.
+    assert(k("\x1b[27;65u") == K.escape && k("\x1b[27;129u") == K.escape);
+    assert(k("\x1b[13;65u") == K.submit && k("\x1b[13;193u") == K.submit);
+    assert(k("\x1b[99;69u") == K.interrupt && k("\x1b[99;197u") == K.interrupt);
+    assert(k("\x1b[13;69u") == K.newline && k("\x1b[98;131u") == K.wordLeft);
+}
+
+// rust: lineedit.rs::movement_clamps_at_the_ends, lineedit.rs::erase_word_handles_multibyte_spaces
+// rust: lineedit.rs::take_skips_repeats_but_history_up_still_works
+// rust: lineedit.rs::editing_a_recalled_line_restarts_browsing_from_the_newest
+unittest
+{
+    auto screen = new Screen;
+    auto e = editor("ab\x1b[D\x1b[D\x1b[DX\x1b[C\x1b[C\x1b[CY\r", screen);
+    assert(e.readLine("> ", "> ").text == "XabY");
+    e = editor("run a\u00a0b\u00e9  \x17\r", screen);
+    assert(e.readLine("> ", "> ").text == "run a\u00a0");
+    e = editor("run a\u00a0b\u00e9  \x17\x17\r", screen);
+    assert(e.readLine("> ", "> ").text == "run ");
+    e = editor("same\rsame\r\x1b[A\x1b[A\r", screen);
+    e.readLine("> ", "> ");
+    e.readLine("> ", "> ");
+    assert(e.readLine("> ", "> ").text == "same");
+    e = editor("first\rsecond\r\x1b[A!\x1b[A\x1b[B\r", screen);
+    e.readLine("> ", "> ");
+    e.readLine("> ", "> ");
+    assert(e.readLine("> ", "> ").text == "second!");
 }

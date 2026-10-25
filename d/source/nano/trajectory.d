@@ -878,7 +878,7 @@ size_t wrappedRows(string line, size_t cols)
     return rows;
 }
 
- unittest
+unittest
 {
     import std.algorithm : canFind;
     string[] lines = [
@@ -923,7 +923,7 @@ size_t wrappedRows(string line, size_t cols)
     assert(t.toJson.canFind(`"kind": "tool",` ~ "\n" ~ `          "name": "bash",`));
 }
 
- unittest
+unittest
 {
     // Synthetic final answer after report_outcome isn't a model call.
     Turn t = Turn(1, "go");

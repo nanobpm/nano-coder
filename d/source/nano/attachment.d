@@ -533,7 +533,7 @@ unittest
 }
 
 // rust: attachment.rs::prepare_errors_when_minimum_size_still_exceeds_byte_cap
- unittest
+unittest
 {
     // Passthrough keeps the bytes; a quarter-turn EXIF reports display size.
     ImageLimits lim;
@@ -574,7 +574,7 @@ unittest
     assert(threw);
 }
 
- unittest
+unittest
 {
     import std.file : tempDir, rmdirRecurse, write, exists_ = exists;
     import std.path : buildPath;

@@ -352,7 +352,7 @@ unittest
     assert(e.deviceCode == "https://acme.ghe.com/login/device/code");
 }
 
- unittest
+unittest
 {
     import std.file : tempDir, rmdirRecurse, getAttributes, exists;
     import std.path : buildPath;
