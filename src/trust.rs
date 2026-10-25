@@ -291,6 +291,16 @@ fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
 /// path the line-based format cannot represent losslessly is **not** persisted
 /// (see [`trust_key`]); it remains trusted only for the current process.
 ///
+/// The whole read → dedupe-check → append runs under an exclusive advisory
+/// lock on the trust file itself (`flock` / `LockFileEx`), so concurrent
+/// approvals in *separate processes* are serialised: without the lock two
+/// processes can both observe the file as well-formed and then interleave
+/// their writes, concatenating two approved roots into one line that
+/// authorizes neither (and would authorize a directory at the concatenated
+/// path). The key and its newline are emitted as **one** `write_all` while the
+/// lock is held, so even a writer that ignores the lock cannot splice its
+/// bytes between a key and its terminator.
+///
 /// The append must never splice the new key onto an existing entry: a file
 /// whose final entry lacks a trailing newline would otherwise concatenate the
 /// two absolute paths into one line, so *neither* approved root matches
@@ -302,6 +312,15 @@ fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
 fn remember(root: &Path, trust_file: Option<&Path>) {
     let Some(file) = trust_file else { return };
     let Some(key) = trust_key(root) else { return };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) else { return };
+    // Held until `f` is dropped at the end of the function, so the read, the
+    // checks, and the append are one critical section across processes.
+    if f.lock().is_err() {
+        return;
+    }
     let existing = std::fs::read_to_string(file).unwrap_or_default();
     // Exact, untrimmed line comparison (see `is_remembered`).
     if existing.lines().any(|line| line == key) {
@@ -310,12 +329,7 @@ fn remember(root: &Path, trust_file: Option<&Path>) {
     if !existing.is_empty() && !existing.ends_with('\n') {
         return;
     }
-    if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
-        let _ = writeln!(f, "{key}");
-    }
+    let _ = f.write_all(format!("{key}\n").as_bytes());
 }
 
 #[cfg(test)]
@@ -559,6 +573,54 @@ mod tests {
         assert!(is_remembered(&first, Some(&trust)));
         assert!(is_remembered(&second, Some(&trust)), "appended as its own line");
         assert!(!is_remembered(&concatenated, Some(&trust)));
+    }
+
+    #[test]
+    fn concurrent_remembers_never_splice_or_lose_an_entry() {
+        // Concurrent approvals run in *separate processes* (two terminals), so
+        // the regression test must too: threads share one advisory lock. Each
+        // child re-runs this test binary in a hidden worker mode that performs
+        // one `remember` of its own distinct root. Without serialisation the
+        // children can interleave their writes and splice two roots into one
+        // concatenated line, or overwrite each other and lose an approval.
+        if let (Ok(file), Ok(root)) = (std::env::var("TRUST_CHILD_FILE"), std::env::var("TRUST_CHILD_ROOT")) {
+            remember(Path::new(&root), Some(Path::new(&file)));
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let roots: Vec<PathBuf> = (0..8).map(|i| dir.path().join(format!("repo-{i}"))).collect();
+        let exe = std::env::current_exe().unwrap();
+        let children: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                std::process::Command::new(&exe)
+                    .arg("--exact")
+                    .arg("trust::tests::concurrent_remembers_never_splice_or_lose_an_entry")
+                    .arg("--include-ignored")
+                    .env("TRUST_CHILD_FILE", &trust)
+                    .env("TRUST_CHILD_ROOT", root)
+                    .env("RUST_BACKTRACE", "0")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success(), "a child approval failed");
+        }
+
+        let recorded =
+            std::fs::read_to_string(&trust).unwrap_or_else(|e| panic!("trust file missing after approvals: {e}"));
+        // Every line is exactly one approved root: no two roots were spliced
+        // into one entry, and no stray partial write survives.
+        for line in recorded.lines() {
+            assert!(roots.iter().any(|r| r.as_os_str() == line), "unexpected or spliced entry: {line:?}");
+        }
+        for root in &roots {
+            assert!(is_remembered(root, Some(&trust)), "no approval was lost: {root:?}");
+        }
+        assert_eq!(recorded.lines().count(), roots.len(), "one line per approved root");
     }
 
     #[test]
