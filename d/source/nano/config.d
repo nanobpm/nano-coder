@@ -485,9 +485,8 @@ ResolvedProvider resolve(const ref Config c, string spec)
     if (!r.apiKey.length && pc.apiKeyEnv.length) r.apiKey = environment.get(pc.apiKeyEnv, "");
     if (!r.apiKey.length && pc.apiKeyCommand.length)
     {
-        auto res = executeShell(pc.apiKeyCommand);
-        if (res.status != 0) throw new Exception(format("provider %s: api_key_command failed: %s", name, res.output.strip));
-        r.apiKey = res.output.strip;
+        import nano.keycmd : runKeyCommand;
+        r.apiKey = runKeyCommand(name, pc.apiKeyCommand);
     }
     return r;
 }
@@ -613,3 +612,47 @@ unittest
     c = Config.load(path);
     assert(c.providers["groq"].apiKey == "sk-own" && c.providers["openai"].apiKey is null);
 }
+
+// rust: providers/mod.rs::finish_body_deep_merges_nested_extra_body_objects
+// rust: providers/mod.rs::finish_body_keeps_resolved_temperature
+// rust: providers/mod.rs::copilot_endpoint_override_is_validated_when_present
+// rust: providers/mod.rs::muse_endpoint_override_is_validated_when_present
+// rust: providers/mod.rs::muse_defaults_to_reasoning_replay
+// rust: providers/mod.rs::validate_spec_rejects_a_provider_without_a_model
+// rust: providers/mod.rs::user_config_overrides_and_extends_presets
+unittest
+{
+    import std.algorithm : canFind;
+    import std.exception : collectExceptionMsg;
+    import std.file : write, tempDir, remove;
+    ProviderConfig x;
+    x.extraBody = parseJSON(`{"output_config":{"format":"json"},"temperature":2}`);
+    auto b = parseJSON(`{"output_config":{"effort":"high"},"temperature":0.3}`);
+    x.finishBody(b);
+    assert(b["output_config"]["effort"].str == "high" && b["output_config"]["format"].str == "json");
+    assert(b["temperature"].toString == parseJSON(`0.3`).toString, b.toString);
+
+    auto path = buildPath(tempDir, "nano-coder-d-config-test2.toml");
+    scope (exit) remove(path);
+    string cfg(string body_) { write(path, body_); return path; }
+    foreach (url; ["not a url", "ftp://host/v1", "https://host/v1?token=x", " https://host/v1", "   "])
+        foreach (kind; ["github-copilot", "muse"])
+        {
+            auto c = Config.load(cfg(format("[providers.p]\nkind = %s\nbase_url = %s\n", tomlQuote(kind), tomlQuote(url))));
+            assert(collectExceptionMsg(resolve(c, "p/m")).canFind("base_url"), kind ~ " " ~ url);
+        }
+    auto c = Config.load(cfg("[providers.muse]\nkind = \"muse\"\n"));
+    assert(resolve(c, "muse/muse-spark-1.3").replayReasoning);
+    c = Config.load(cfg("[providers.muse]\nkind = \"muse\"\nreplay_reasoning = false\n"));
+    assert(!resolve(c, "muse/muse-spark-1.3").replayReasoning);
+    c = Config.load(cfg("[providers.bare]\nkind = \"openai\"\nbase_url = \"http://localhost:9/v1\"\n"));
+    assert(collectExceptionMsg(resolve(c, "bare")).canFind("no model"));
+    c = Config.load(cfg("[providers.ollama]\nbase_url = \"http://merlin.local:11434/v1/\"\ndefault_model = \"qwen3:8b\"\n"
+        ~ "[providers.ds4]\nkind = \"openai\"\nbase_url = \"http://localhost:8100/v1\"\ndefault_model = \"m\"\n"));
+    auto o = resolve(c, "ollama");
+    assert(o.config.baseUrl == "http://merlin.local:11434/v1" && o.model == "qwen3:8b");
+    assert(resolve(c, "ds4").config.baseUrl == "http://localhost:8100/v1");
+    assert(resolve(c, "anthropic/claude").config.baseUrl == "https://api.anthropic.com/v1", "presets remain");
+}
+
+version (unittest) private string tomlQuote(string s) { return `"` ~ s ~ `"`; }

@@ -329,6 +329,8 @@ version (unittest)
     }
 }
 
+// rust: reminders.rs::suggests_saving_a_memory_once_unless_one_was_saved
+// rust: reminders.rs::suggests_a_plan_once_per_session
 unittest // suggests a plan once per session; memory once unless saved
 {
     Plan plan;
@@ -372,6 +374,8 @@ unittest // nudges a stale plan until it changes
     foreach (_; 0 .. planStaleAfter * 2) assert(!r.afterToolCall(plan, false).length);
 }
 
+// rust: reminders.rs::caps_the_warning_then_hard_stops
+// rust: reminders.rs::warns_on_the_third_identical_call_not_before
 unittest // warns on the third identical call, caps warnings, then hard-stops
 {
     Reminders r;
@@ -396,6 +400,7 @@ unittest // the warning names report_outcome only when it is offered
     assert(!b.canFind("report_outcome") && b.canFind("try something different"));
 }
 
+// rust: reminders.rs::a_one_time_hint_on_the_first_failure_keeps_it_out_of_the_identical_streak
 unittest // a hint on the first failure keeps it out of the identical streak
 {
     Reminders r;
@@ -405,6 +410,7 @@ unittest // a hint on the first failure keeps it out of the identical streak
     assert(v[repeatWarnAfter].warning);
 }
 
+// rust: reminders.rs::different_arguments_or_results_do_not_repeat
 unittest // different arguments or results do not repeat
 {
     Reminders r, s;
@@ -415,6 +421,7 @@ unittest // different arguments or results do not repeat
     }
 }
 
+// rust: reminders.rs::a_fresh_streak_does_not_hard_stop_before_its_own_warnings
 unittest // a fresh streak does not hard-stop before its own warnings
 {
     Reminders r;
@@ -427,6 +434,9 @@ unittest // a fresh streak does not hard-stop before its own warnings
     assert(call(r, "cmd c", false, "exit 1").hardStop);
 }
 
+// rust: reminders.rs::a_bash_loop_that_appends_pipeline_stages_still_counts
+// rust: reminders.rs::changing_a_diagnostic_stages_query_is_not_a_repeat
+// rust: reminders.rs::an_appended_diagnostic_suffix_loop_is_detected
 unittest // appended diagnostic stages still count; changed queries do not
 {
     Reminders r;
@@ -443,6 +453,7 @@ unittest // appended diagnostic stages still count; changed queries do not
         assert(call(s, "cat log | grep " ~ q, true, "").none, q);
 }
 
+// rust: reminders.rs::changing_execution_arguments_is_not_a_repeat
 unittest // changing execution arguments is not a repeat; the same ones are
 {
     Reminders r, s, t;
@@ -457,6 +468,11 @@ unittest // changing execution arguments is not a repeat; the same ones are
 }
 
 // rust: reminders.rs::disabled_plan_tool_repeats_are_still_detected
+// rust: reminders.rs::reset_repeat_breaks_a_building_streak
+// rust: reminders.rs::changing_image_attachment_does_not_repeat
+// rust: reminders.rs::an_interleaved_exempt_call_breaks_the_streak
+// rust: reminders.rs::exempt_tools_and_start_turn_reset_the_detector
+// rust: reminders.rs::distinct_malformed_payloads_sharing_a_prefix_are_not_a_repeat
 unittest // distinct malformed payloads, exempt tools, reset, images
 {
     Reminders r;
@@ -492,6 +508,9 @@ unittest // distinct malformed payloads, exempt tools, reset, images
 }
 
 // rust: reminders.rs::identical_large_output_with_per_call_spill_paths_still_counts
+// rust: reminders.rs::spill_normalisation_only_touches_the_marker_not_arbitrary_output
+// rust: reminders.rs::spill_normalisation_handles_paths_with_spaces
+// rust: reminders.rs::spill_path_normalisation_collapses_per_call_names
 unittest // identical large output with per-call spill paths still counts
 {
     Reminders r;
@@ -503,6 +522,10 @@ unittest // identical large output with per-call spill paths still counts
     assert(normaliseSpillPaths("saved to a.txt") == "saved to a.txt");
 }
 
+// rust: reminders.rs::less_logfile_option_is_not_diagnostic
+// rust: reminders.rs::pipeline_key_only_collapses_read_only_diagnostic_stages
+// rust: reminders.rs::pipeline_key_keeps_stages_that_write_through_options_or_shell_control
+// rust: reminders.rs::a_quoted_pipe_is_not_a_pipeline_boundary
 unittest // pipeline parsing
 {
     assert(splitPipeline(`echo "a|b" | wc -l`).length == 2);
@@ -525,6 +548,7 @@ unittest // pipeline parsing
     assert(!isDiagnosticExtension("make", "make | tee x"));
 }
 
+// rust: reminders.rs::distinct_side_effecting_pipelines_do_not_hard_stop
 unittest // distinct side-effecting pipelines do not hard-stop
 {
     Reminders r;

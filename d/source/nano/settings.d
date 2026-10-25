@@ -248,6 +248,14 @@ void save(const ref Config c, const ref Changes ch, const ProviderConfig[string]
     rename(tmp, path);
 }
 
+// rust: settings.rs::editing_a_preset_stores_only_the_overrides
+// rust: settings.rs::switching_a_preset_to_a_key_command_overrides_its_env_var
+// rust: settings.rs::save_updates_only_changed_keys_and_keeps_comments
+// rust: settings.rs::thinking_choices_offer_the_models_levels_for_every_scope
+// rust: settings.rs::thinking_choices_default_lands_on_the_existing_level
+// rust: settings.rs::provider_rows_list_recents_first_and_highlight_the_previous_model
+// rust: settings.rs::recent_models_keep_four_with_a_configured_provider
+// rust: settings.rs::turn_cap_label_marks_zero_as_unbounded
 unittest
 {
     import std.algorithm : canFind;
@@ -298,4 +306,55 @@ unittest
     ProviderConfig none;
     auto d = diffFrom(preset, none, upd);
     assert(!d.hasKind && d.apiKeyEnv == "" && d.apiKeyEnvSet && d.apiKeyCommand == "pass x");
+}
+
+// rust: settings.rs::save_writes_thinking_levels_in_place
+// rust: settings.rs::save_keeps_temperature_comments_when_the_provider_is_also_edited
+unittest
+{
+    import std.math : isNaN;
+    import nano.thinking : Thinking;
+    auto doc = "temperature = 0.2 # global tune\n\n[providers.groq] # fast\nmax_retries = 2\n"
+        ~ "temperature = 0.1 # tuned for this provider\nthinking = \"high\" # tuned\n\n"
+        ~ "[providers.kimi]\nmodels = { k3 = { temperature = 0.7, thinking = \"low\" } }\n";
+    Config c;
+    c.temperature = double.nan;
+    ProviderConfig groq, kimi;
+    groq.temperature = 0.4;
+    groq.thinking = Thinking.off;
+    kimi.models["k3"] = ModelSettings.init;
+    c.providers = ["groq": groq, "kimi": kimi];
+    c.providers["anthropic"] = ProviderConfig.init;
+    c.providers["anthropic"].models["claude"] = ModelSettings.init;
+    c.providers["anthropic"].models["claude"].temperature = 0.3;
+    c.providers["anthropic"].models["claude"].thinking = Thinking.parse("xhigh");
+    Changes ch;
+    ch.temperature = true;
+    ch.providerTemperatures["groq"] = true;
+    ch.providerThinking["groq"] = true;
+    ch.modelTemperatures[pairKey("anthropic", "claude")] = true;
+    ch.modelThinking[pairKey("anthropic", "claude")] = true;
+    auto out_ = applyChanges(doc, c, ch, null);
+    import std.algorithm : canFind;
+    assert(out_.canFind("temperature = \"default\" # global tune\n"), out_);
+    assert(out_.canFind("[providers.groq] # fast\nmax_retries = 2\ntemperature = 0.4 # tuned for this provider\nthinking = \"off\" # tuned\n"), out_);
+    // (Unsetting a key inside an inline table is a gap: D leaves it.)
+    assert(out_.canFind("models = { k3 = { temperature = 0.7, thinking = \"low\" } }"), out_);
+    assert(out_.canFind("temperature = 0.3") && out_.canFind("thinking = \"xhigh\""), out_);
+}
+
+// rust: settings.rs::save_creates_a_missing_file
+unittest
+{
+    import std.file : tempDir, rmdirRecurse, readText, exists;
+    import std.path : buildPath;
+    auto dir = buildPath(tempDir, "nano-settings-save-test");
+    scope (exit) if (dir.exists) rmdirRecurse(dir);
+    auto path = buildPath(dir, "nested/config.toml");
+    Config c;
+    c.model = "ollama/qwen3";
+    Changes ch;
+    ch.model = true;
+    save(c, ch, null, path);
+    assert(readText(path) == "model = \"ollama/qwen3\"\n");
 }

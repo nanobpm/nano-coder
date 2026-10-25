@@ -550,6 +550,7 @@ unittest
     assert(r.usage.hasAic && imported!"std.math".isClose(r.usage.aic, 0.0116));
 }
 
+// rust: providers/openai.rs::encodes_tool_round_trip_and_provider_overrides
 unittest
 {
     ResolvedProvider p;
@@ -569,6 +570,8 @@ unittest
     assert(b["messages"][2]["tool_call_id"].str == "c1");
 }
 
+// rust: providers/openai.rs::replay_ignores_generic_reasoning_field
+// rust: providers/openai.rs::replays_reasoning_content_when_enabled
 unittest
 {
     // With replay on, streamed `reasoning_content` is kept and sent back on
