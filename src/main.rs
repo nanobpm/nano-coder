@@ -2179,10 +2179,15 @@ async fn main() -> Result<()> {
     // repo's `.claude` hooks are inert, so they must not drive the trust prompt
     // or the non-interactive warning.
     let hooks_enabled = !config.disable_hooks && !config.disable_project_hooks;
+    // Workspace skills are gated only when they could actually load: the
+    // `NANO_CODER_NO_SKILLS` override (honoured by skill discovery) and a
+    // disabled skills config both mean a repo's skill dirs and `ai.lock` are
+    // inert, so they must not drive the trust prompt or the warning.
+    let skills_enabled = config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
     let trusted = trust::decide(
         &cwd_path,
         &config.skills,
-        &trust::Options { yolo: args.yolo, acp: args.acp, interactive, hooks_enabled },
+        &trust::Options { yolo: args.yolo, acp: args.acp, interactive, hooks_enabled, skills_enabled },
     );
     if !trusted {
         config.skills.dirs.clear();

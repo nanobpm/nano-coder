@@ -66,6 +66,11 @@ pub struct Options {
     /// `disable_project_hooks`). When false, a repo's `.claude` hooks are not a
     /// gated resource — nothing would load — so they do not trigger the prompt.
     pub hooks_enabled: bool,
+    /// Whether workspace skills can actually load (`skills.enabled` and the
+    /// `NANO_CODER_NO_SKILLS` override is unset). When false, a repo's skill
+    /// directories and `ai.lock` are not gated — discovery skips them, so they
+    /// must not drive the trust prompt or the non-interactive warning.
+    pub skills_enabled: bool,
 }
 
 /// Which gated resources a repository carries.
@@ -78,12 +83,12 @@ pub struct Gated {
 }
 
 impl Gated {
-    /// Detect the gated resources under `root`. `hooks_enabled` reflects whether
-    /// project hooks could actually load; when false, a repo's `.claude` hooks
-    /// are not counted as gated (nothing would load), mirroring how a disabled
-    /// skills config suppresses skill detection.
-    pub fn detect(root: &Path, skills: &SkillsConfig, hooks_enabled: bool) -> Self {
-        let skills_present = skills.enabled
+    /// Detect the gated resources under `root`. `skills_enabled` and
+    /// `hooks_enabled` reflect whether each resource could actually load; when
+    /// either is false, that resource is not counted as gated (nothing would
+    /// load), so a repo carrying only disabled resources is treated as empty.
+    pub fn detect(root: &Path, skills: &SkillsConfig, skills_enabled: bool, hooks_enabled: bool) -> Self {
+        let skills_present = skills_enabled
             && ((skills.ai_lock && root.join(LOCK_FILE).is_file())
                 || skills.dirs.iter().any(|dir| dir_has_skill(&root.join(dir))));
         let hooks_present = hooks_enabled
@@ -151,7 +156,7 @@ fn decide_root(
     if is_remembered(root, trust_file) {
         return true;
     }
-    let gated = Gated::detect(root, skills, opts.hooks_enabled);
+    let gated = Gated::detect(root, skills, opts.skills_enabled, opts.hooks_enabled);
     // Nothing to gate right now: there is no question worth asking, but an
     // unapproved root stays untrusted rather than being granted trust. A later
     // `/restart` or hook reload re-detects, so a skill or hook that appears
@@ -228,14 +233,33 @@ fn is_yes(answer: &str) -> bool {
 /// with discovery: a repository cannot hide a skill behind a symlink chain that
 /// a prefix-retaining walk would fail to descend (e.g. by exceeding the OS
 /// symlink limit) while discovery later resolves and loads it.
+///
+/// Canonicalizing is not on its own enough to bound the walk: a symlink cycle
+/// (e.g. several links back to `.`) resolves to the same canonical directory
+/// over and over, and a naive recursion re-expands it at every entry, so the
+/// work grows exponentially in the number of links — an untrusted repo could
+/// stall startup before the user can even decline. Each canonical directory is
+/// therefore recorded with the *shallowest* depth at which it was scanned, and
+/// re-scanned only when reached again by a shorter path (strictly more
+/// remaining depth budget), which could uncover a skill the deeper visit was
+/// cut off from. A revisit at equal-or-greater depth already explored
+/// everything this one could, so it is skipped — collapsing cycles and aliases
+/// without ever missing a skill reachable through a shorter path.
 fn dir_has_skill(dir: &Path) -> bool {
-    fn scan(dir: &Path, depth: usize) -> bool {
+    fn scan(dir: &Path, depth: usize, visited: &mut HashMap<PathBuf, usize>) -> bool {
         // Resolve this directory to its canonical target before inspecting it,
         // so detection follows the same symlinks discovery does.
         let dir = match dir.canonicalize() {
             Ok(real) => real,
             Err(_) => return false,
         };
+        // Already scanned this canonical directory with at least as much depth
+        // budget: that visit saw everything this one would, so skip it and stop
+        // a cycle/alias from re-expanding.
+        if visited.get(&dir).is_some_and(|&seen| seen <= depth) {
+            return false;
+        }
+        visited.insert(dir.clone(), depth);
         if dir.join(SKILL_FILE).is_file() {
             return true;
         }
@@ -243,9 +267,10 @@ fn dir_has_skill(dir: &Path) -> bool {
             return false;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { return false };
-        entries.filter_map(|e| e.ok()).any(|e| e.path().is_dir() && scan(&e.path(), depth + 1))
+        entries.filter_map(|e| e.ok()).any(|e| e.path().is_dir() && scan(&e.path(), depth + 1, visited))
     }
-    dir.is_dir() && scan(dir, 0)
+    let mut visited = HashMap::new();
+    dir.is_dir() && scan(dir, 0, &mut visited)
 }
 
 /// The trusted-projects file: `NANO_CODER_TRUST_FILE` if set, else
@@ -395,7 +420,7 @@ mod tests {
     }
 
     fn opts(interactive: bool, yolo: bool, acp: bool) -> Options {
-        Options { yolo, acp, interactive, hooks_enabled: true }
+        Options { yolo, acp, interactive, hooks_enabled: true, skills_enabled: true }
     }
 
     #[test]
@@ -483,7 +508,7 @@ mod tests {
         // `.claude/skills` is a symlink to the directory holding the skill.
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         symlink(root.join("real"), root.join(".claude/skills")).unwrap();
-        let gated = Gated::detect(&root, &skills_cfg(), true);
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(gated.skills, "a skill behind a symlinked skills dir is still gated");
     }
 
@@ -724,9 +749,9 @@ mod tests {
         // project hooks cannot load (`--no-hooks` or `disable_project_hooks`),
         // otherwise it prompts for consent that would gate nothing.
         let (_dir, root, _trust) = repo_with_hook();
-        let enabled = Gated::detect(&root, &skills_cfg(), true);
+        let enabled = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(enabled.hooks, "an enabled project hook is gated");
-        let disabled = Gated::detect(&root, &skills_cfg(), false);
+        let disabled = Gated::detect(&root, &skills_cfg(), true, false);
         assert!(!disabled.hooks, "a disabled project hook is not gated");
         assert!(disabled.is_empty(), "nothing is left to gate");
     }
@@ -737,7 +762,7 @@ mod tests {
         // question and is not trusted (nothing gated), rather than prompting.
         let (_dir, root, trust) = repo_with_hook();
         let mut asker = ScriptedAsker::yes();
-        let opts = Options { yolo: false, acp: false, interactive: true, hooks_enabled: false };
+        let opts = Options { yolo: false, acp: false, interactive: true, hooks_enabled: false, skills_enabled: true };
         let trusted = decide_root(&root, &skills_cfg(), &opts, Some(&trust), &mut asker);
         assert!(!trusted, "a hook-only repo with hooks disabled is not granted trust");
         assert!(!asker.asked, "no trust question is asked when nothing can load");
@@ -750,7 +775,7 @@ mod tests {
         let skill = root.join(".claude/skills/x");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "# x\n").unwrap();
-        let gated = Gated::detect(&root, &skills_cfg(), true);
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(gated.skills);
         assert!(!gated.hooks);
         assert_eq!(gated.describe(), "skills");
@@ -761,7 +786,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
-        let gated = Gated::detect(&root, &skills_cfg(), true);
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(!gated.skills, "an empty skills dir carries no skill");
         assert!(gated.is_empty());
     }
@@ -771,8 +796,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join(LOCK_FILE), "{}").unwrap();
-        let gated = Gated::detect(&root, &skills_cfg(), true);
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(gated.skills, "ai.lock is a gated skill source");
+    }
+
+    #[test]
+    fn disabled_skills_are_not_gated() {
+        // When skills cannot load (`skills.enabled` is false or
+        // `NANO_CODER_NO_SKILLS` is set, both collapsed into `skills_enabled`),
+        // a repo's skill dirs and `ai.lock` must not be gated: discovery skips
+        // them, so prompting for consent would gate nothing and a `yes` would
+        // persist a useless trust grant.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skill = root.join(".claude/skills/x");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# x\n").unwrap();
+        std::fs::write(root.join(LOCK_FILE), "{}").unwrap();
+        let enabled = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(enabled.skills, "a skill is gated when skills can load");
+        let disabled = Gated::detect(&root, &skills_cfg(), false, true);
+        assert!(!disabled.skills, "skills are not gated when they cannot load");
+        assert!(disabled.is_empty(), "a skills-only repo is empty when skills are off");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_terminates_on_symlink_cycles() {
+        // A symlink cycle (here: many links back to the skills dir itself)
+        // resolves to the same canonical directory over and over. Without
+        // per-canonical-directory memoisation the walk re-expands the cycle at
+        // every entry and the work grows exponentially, letting an untrusted
+        // repo stall startup before the user can decline. The scan must collapse
+        // the cycle and return promptly.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        // Eight self-links: a naive walk would perform thousands of scans.
+        for i in 0..8 {
+            symlink(&skills, skills.join(format!("loop{i}"))).unwrap();
+        }
+        let start = std::time::Instant::now();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a cycle with no SKILL.md carries no skill");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "the cycle must not blow up the scan");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_finds_skill_through_shorter_path_despite_cycle() {
+        // Memoising visited directories must not hide a skill reachable through a
+        // shorter path than a cycle first exposed it at: a canonical directory
+        // re-reached with more remaining depth budget is re-scanned.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        // A self-link cycle plus a genuine skill one level down.
+        symlink(&skills, skills.join("loop")).unwrap();
+        let skill = skills.join("real");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# x\n").unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(gated.skills, "a real skill is found even alongside a cycle");
     }
 
     #[test]
