@@ -326,6 +326,7 @@ string midTurnCommand(string text, MidTurn ctx)
             switch (name)
             {
                 case "/help": return helpText().stripRight;
+                case "/version": return versionString;
                 case "/mode": return modeListing(control.mode);
                 case "/verbosity": return verbosityListing(verbosity);
                 case "/providers": return providersListing(ctx.cfg[0].providers, ctx.cfg[0].defaultProvider);
@@ -1958,6 +1959,9 @@ int runMain(string[] args)
                         writefln("Mode set to %s (%s)", m.name, m.describe);
                     }
                     catch (Exception e) writeln(e.msg);
+                    continue;
+                case "/version":
+                    writeln(versionString);
                     continue;
                 case "/tools":
                     writeln(toolsListing(agent));

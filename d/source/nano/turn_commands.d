@@ -38,7 +38,7 @@ Timing timing(string cmd) nothrow
 {
     auto p = splitCmd(cmd);
     auto name = p[0], arg = p[1];
-    if (["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context"].canFind(name) && !arg.length)
+    if (["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context", "/version"].canFind(name) && !arg.length)
         return Timing.immediate;
     if (name == "/trajectory" && ["", "--json", "--markdown", "--md"].canFind(arg)) return Timing.immediate;
     if (name == "/mode" || name == "/verbosity") return arg.length ? Timing.nextStep : Timing.immediate;
@@ -91,6 +91,7 @@ unittest
     assert(splitCmd("/mode   auto ") == ["/mode", "auto"]);
     with (Timing)
     {
+        assert(timing("/version") == immediate && timing("/version x") != immediate);
         assert(timing("/help") == immediate && timing("/context") == immediate);
         assert(timing("/plan") == immediate && timing("/plan x") == afterTurn);
         assert(timing("/trajectory") == immediate && timing("/trajectory\t--md") == immediate);
