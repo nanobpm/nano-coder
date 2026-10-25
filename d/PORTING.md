@@ -96,7 +96,9 @@ directory works; it's kept separate by default so the port can't damage real ses
 
 - **Network loss (D first).** A request that can't connect (DNS, refused, reset, timeout)
   waits for the network with backoff (1s up to 30s), doesn't use up `max_retries`, and
-  continues until Ctrl-C. A reply whose stream drops mid-way is asked for again (up to 10
+  continues until Ctrl-C. The wait is reported on one line: on a terminal or in the
+  frame UI it is rewritten in place with the time spent waiting; elsewhere there is one
+  line when the wait starts and one when the network is back. A reply whose stream drops mid-way is asked for again (up to 10
   times per step), and the partial text isn't kept. The Copilot token refresh waits the same
   way. Rust: nanobpm/nano-coder#148.
 

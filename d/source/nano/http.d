@@ -124,10 +124,8 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     if (onEvent !is null) req.headers["Accept"] = "text/event-stream";
     req.body_ = body_.toString;
     req.idleTimeout = timeoutSecs.seconds;
-    import core.time : MonoTime;
-    // Consecutive transport failures (no HTTP response) and when they began.
-    long offline;
-    MonoTime offlineSince;
+    auto offline = OfflineWait(what, policy);
+    scope (failure) offline.abandon();
     for (long attempt = 0;; attempt++)
     {
         bool received;
@@ -141,6 +139,7 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         try
         {
             status = perform(req, text, meta, onEvent is null ? null : (const(char)[] chunk) {
+                offline.end();
                 // Only an event-stream 2xx is parsed as events.
                 if (meta.contentType.indexOf("event-stream") < 0) return;
                 received = true;
@@ -155,17 +154,11 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
             if (received) throw new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
             // Connection refused/reset, DNS, timeouts: the network is down or
             // flaky. Wait for it (backing off) without using up the retry budget.
-            if (offline == 0) offlineSince = MonoTime.currTime;
-            if (MonoTime.currTime - offlineSince >= policy.offlineBudget)
-                throw new Exception(format("%s: %s", what, e.msg));
-            auto wait = policy.backoff(offline++);
-            stdErr.writefln("[%s] network unavailable (%s); retrying in %.0fs (Ctrl-C to stop)", what, curlReason(e.msg),
-                wait.total!"msecs" / 1000.0);
-            pause(wait);
+            offline.wait(e);
             attempt--;
             continue;
         }
-        offline = 0;
+        offline.end();
         if (failure is null)
         {
             bool ok = status >= 200 && status < 300;
@@ -222,21 +215,110 @@ unittest
 /// request on a turn's path, such as refreshing a session token.
 int performOnline(const ref Request req, out string body_, string what, RetryPolicy policy = RetryPolicy.init)
 {
-    import core.time : MonoTime;
-    auto since = MonoTime.currTime;
-    for (long offline = 0;; offline++)
+    auto offline = OfflineWait(what, policy);
+    scope (failure) offline.abandon();
+    for (;;)
     {
-        try return perform(req, body_);
+        try
+        {
+            auto status = perform(req, body_);
+            offline.end();
+            return status;
+        }
         catch (CurlException e)
         {
             if (cancelRequested()) throw new Cancelled;
-            if (MonoTime.currTime - since >= policy.offlineBudget) throw new Exception(format("%s: %s", what, e.msg));
-            auto wait = policy.backoff(offline);
-            stdErr.writefln("[%s] network unavailable (%s); retrying in %.0fs (Ctrl-C to stop)", what, curlReason(e.msg),
-                wait.total!"msecs" / 1000.0);
-            pause(wait);
+            offline.wait(e);
         }
     }
+}
+
+/// Waiting out an unreachable network: backs off between attempts (without
+/// using up `maxRetries`) and reports it on one line. On a terminal (or in
+/// the frame UI) the line is rewritten in place with the time spent waiting;
+/// otherwise it is printed when the wait starts and when it ends.
+private struct OfflineWait
+{
+    import core.time : MonoTime;
+    string what;
+    RetryPolicy policy;
+    long failures;
+    MonoTime since, shown;
+    bool live;
+    string reason;
+
+    this(string what, RetryPolicy policy) { this.what = what; this.policy = policy; }
+
+    /// One failed attempt: throws once the offline budget is spent, else
+    /// sleeps the next backoff (Ctrl-C throws Cancelled).
+    void wait(CurlException e)
+    {
+        auto now = MonoTime.currTime;
+        reason = curlReason(e.msg);
+        if (failures == 0)
+        {
+            since = now;
+            live = liveStderr();
+            if (!live) stdErr.writefln("[%s] network unavailable (%s); waiting to reconnect (Ctrl-C to stop)", what, reason);
+        }
+        if (now - since >= policy.offlineBudget) throw new Exception(format("%s: %s", what, e.msg));
+        auto until = now + policy.backoff(failures++);
+        while (MonoTime.currTime < until)
+        {
+            if (cancelRequested()) throw new Cancelled;
+            if (live && MonoTime.currTime - shown >= 1.seconds) draw();
+            Thread.sleep(50.msecs);
+        }
+    }
+
+    private void draw()
+    {
+        shown = MonoTime.currTime;
+        stdErr.writef("\r\x1b[K[%s] network unavailable (%s); waiting to reconnect, %s (Ctrl-C to stop)", what, reason,
+            formatElapsed(shown - since));
+        stdErr.flush();
+    }
+
+    /// Cancelled or out of budget: end the live line without claiming recovery.
+    void abandon()
+    {
+        if (failures && live) stdErr.writeln();
+        failures = 0;
+    }
+
+    /// The network answered: close the line.
+    void end()
+    {
+        if (failures == 0) return;
+        auto took = formatElapsed(MonoTime.currTime - since);
+        if (live) stdErr.writef("\r\x1b[K");
+        stdErr.writefln("[%s] network back after %s", what, took);
+        failures = 0;
+    }
+}
+
+/// Whether stderr shows an in-place line: a terminal, or the frame UI's transcript.
+private bool liveStderr()
+{
+    import core.sys.posix.unistd : isatty;
+    import nano.lineedit : ttyOut;
+    return isatty(2) != 0 || ttyOut != 1;
+}
+
+/// `45s`, `3m05s`, `1h02m`.
+string formatElapsed(Duration d) pure
+{
+    auto s = d.total!"seconds";
+    if (s < 60) return format("%ss", s);
+    if (s < 3600) return format("%sm%02ss", s / 60, s % 60);
+    return format("%sh%02sm", s / 3600, s % 3600 / 60);
+}
+
+unittest
+{
+    assert(formatElapsed(45.seconds) == "45s");
+    assert(formatElapsed(185.seconds) == "3m05s");
+    assert(formatElapsed(3720.seconds) == "1h02m");
 }
 
 /// `postJson` with a provider's retry policy, retryable statuses and timeout.
