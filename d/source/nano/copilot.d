@@ -238,7 +238,7 @@ struct SessionToken
 /// Exchange a GitHub OAuth token for a Copilot session token.
 SessionToken exchange(const Endpoints e, string oauth)
 {
-    import nano.http : Request, perform;
+    import nano.http : Request, performOnline;
     import std.datetime.systime : Clock;
     Request req;
     req.method = "GET";
@@ -247,7 +247,7 @@ SessionToken exchange(const Endpoints e, string oauth)
     req.headers["Accept"] = "application/json";
     req.headers["Authorization"] = "Bearer " ~ oauth;
     string text;
-    auto status = perform(req, text);
+    auto status = performOnline(req, text, "copilot token");
     if (status < 200 || status >= 300)
         throw new Exception(format("Copilot token exchange failed (HTTP %s): %s. Run `nano-coder --login github-copilot` "
             ~ "or set GITHUB_COPILOT_OAUTH_TOKEN; the account must have an active Copilot subscription.",

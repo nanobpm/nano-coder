@@ -12,6 +12,7 @@ import std.string : strip, stripLeft;
 import std.array : join;
 import std.conv : to;
 import nano.llm;
+import nano.http : StreamInterrupted;
 import core.thread : Thread;
 import core.time : Duration;
 static import nano.session_index;
@@ -415,6 +416,7 @@ class Agent
             import std.datetime.stopwatch : StopWatch, AutoStart;
             auto sw = StopWatch(AutoStart.yes);
             bool overflowRetried, capRetried;
+            size_t dropped;
             for (;;)
             {
                 ChatRequest req;
@@ -432,6 +434,16 @@ class Agent
                     break;
                 }
                 catch (Cancelled) return cancelled(ev);
+                catch (StreamInterrupted e)
+                {
+                    // The connection dropped mid-reply. Nothing of it was kept, so
+                    // ask again (the request itself waits for the network).
+                    if (control.isCancelled) return cancelled(ev);
+                    if (++dropped > maxStreamRestarts) throw e;
+                    stdErr.writefln("[agent] %s; asking again (%s/%s)", e.msg, dropped, maxStreamRestarts);
+                    ev.text(false, "\n");
+                    continue;
+                }
                 catch (Exception e)
                 {
                     if (control.isCancelled) return cancelled(ev);
@@ -1808,6 +1820,8 @@ unittest
 
 /// Continuations asked for after replies cut off at the output-token limit, per turn.
 enum maxTruncatedContinuations = 3;
+/// Replies re-requested in one step after the connection dropped mid-stream.
+enum maxStreamRestarts = 10;
 
 /// The nudge after a reply cut off at the output-token limit (Rust's wording).
 string truncatedContinuationNote(long completionTokens)
@@ -1871,4 +1885,24 @@ unittest
         LLMResponse("fresh")]);
     auto agent = new Agent(mock, reg, Policy.init, "sys");
     assert(agent.run("go", new NullEvents) == "fresh");
+}
+
+// A reply whose stream drops mid-way is asked for again; the partial text
+// isn't kept in the conversation.
+unittest
+{
+    import nano.providers.mock;
+    auto mock = new MockClient([LLMResponse("!drop:Hal"), LLMResponse("!drop:Half a"), LLMResponse("whole answer")]);
+    auto agent = new Agent(mock, new ToolRegistry, Policy.init, "sys");
+    assert(agent.run("go", new NullEvents) == "whole answer");
+    assert(mock.seen.length == 3);
+    assert(agent.messages[$ - 1].content == "whole answer" && agent.messages[$ - 2].content == "go");
+    // Past the restart limit the error ends the turn.
+    LLMResponse[] drops;
+    foreach (i; 0 .. maxStreamRestarts + 1) drops ~= LLMResponse("!drop:x");
+    mock.script = drops ~ LLMResponse("never");
+    bool threw;
+    try agent.run("again", new NullEvents);
+    catch (StreamInterrupted) threw = true;
+    assert(threw);
 }

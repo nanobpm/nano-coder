@@ -15,6 +15,13 @@ import core.time : seconds, msecs, Duration;
 import core.thread : Thread;
 import nano.retry : ErrorInfo, RetryPolicy, retryDelay, retryableError = retryable;
 
+/// A streamed reply that broke after some events arrived. The request can't
+/// be resumed, but the caller can discard the partial reply and ask again.
+class StreamInterrupted : Exception
+{
+    this(string msg) { super(msg); }
+}
+
 class ApiError : Exception
 {
     int status;
@@ -117,6 +124,10 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
     if (onEvent !is null) req.headers["Accept"] = "text/event-stream";
     req.body_ = body_.toString;
     req.idleTimeout = timeoutSecs.seconds;
+    import core.time : MonoTime;
+    // Consecutive transport failures (no HTTP response) and when they began.
+    long offline;
+    MonoTime offlineSince;
     for (long attempt = 0;; attempt++)
     {
         bool received;
@@ -139,11 +150,22 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         catch (CurlException e)
         {
             if (cancelRequested()) throw new Cancelled;
-            // Connection resets, timeouts, DNS: transient, unless the stream
-            // already delivered events (a restart would duplicate them).
-            if (received || attempt >= policy.maxRetries) throw new Exception(format("%s: %s", what, e.msg));
-            failure = e;
+            // A stream cut after events arrived can't be restarted here (the
+            // events were already shown); the agent asks again.
+            if (received) throw new StreamInterrupted(format("%s: connection lost mid-reply (%s)", what, curlReason(e.msg)));
+            // Connection refused/reset, DNS, timeouts: the network is down or
+            // flaky. Wait for it (backing off) without using up the retry budget.
+            if (offline == 0) offlineSince = MonoTime.currTime;
+            if (MonoTime.currTime - offlineSince >= policy.offlineBudget)
+                throw new Exception(format("%s: %s", what, e.msg));
+            auto wait = policy.backoff(offline++);
+            stdErr.writefln("[%s] network unavailable (%s); retrying in %.0fs (Ctrl-C to stop)", what, curlReason(e.msg),
+                wait.total!"msecs" / 1000.0);
+            pause(wait);
+            attempt--;
+            continue;
         }
+        offline = 0;
         if (failure is null)
         {
             bool ok = status >= 200 && status < 300;
@@ -180,6 +202,40 @@ string postJson(string url, string[string] headers, JSONValue body_, string what
         stdErr.writefln("[%s] attempt %s failed: %s; retrying in %.1fs", what, attempt + 1, failure.msg,
             delay.total!"msecs" / 1000.0);
         pause(delay);
+    }
+}
+
+/// A curl error without libcurl's " on handle XXXX" suffix.
+string curlReason(string msg) pure
+{
+    auto i = msg.indexOf(" on handle ");
+    return i < 0 ? msg : msg[0 .. i];
+}
+
+unittest
+{
+    assert(curlReason("Couldn't connect to server on handle B45438000") == "Couldn't connect to server");
+    assert(curlReason("Timeout was reached") == "Timeout was reached");
+}
+
+/// `perform`, waiting out an unreachable network (as `postJson` does) for a
+/// request on a turn's path, such as refreshing a session token.
+int performOnline(const ref Request req, out string body_, string what, RetryPolicy policy = RetryPolicy.init)
+{
+    import core.time : MonoTime;
+    auto since = MonoTime.currTime;
+    for (long offline = 0;; offline++)
+    {
+        try return perform(req, body_);
+        catch (CurlException e)
+        {
+            if (cancelRequested()) throw new Cancelled;
+            if (MonoTime.currTime - since >= policy.offlineBudget) throw new Exception(format("%s: %s", what, e.msg));
+            auto wait = policy.backoff(offline);
+            stdErr.writefln("[%s] network unavailable (%s); retrying in %.0fs (Ctrl-C to stop)", what, curlReason(e.msg),
+                wait.total!"msecs" / 1000.0);
+            pause(wait);
+        }
     }
 }
 
@@ -279,4 +335,24 @@ unittest
     p.feed(":1}\r\n\r\ndata: one\ndata: two\n\ndata: [DONE]", &emit);
     p.finish(&emit);
     assert(got == [`{"a":1}`, "one\ntwo", "[DONE]"]);
+}
+
+// Unreachable network: transport failures keep retrying past maxRetries until
+// the offline budget runs out (unbounded in use; Ctrl-C cancels).
+unittest
+{
+    import core.time : msecs, MonoTime;
+    RetryPolicy p;
+    p.maxRetries = 0;
+    p.initialBackoff = 20.msecs;
+    p.maxBackoff = 40.msecs;
+    p.offlineBudget = 300.msecs;
+    auto start = MonoTime.currTime;
+    string msg;
+    try postJson("http://127.0.0.1:9/x", null, JSONValue(1), "probe", p, [], 5);
+    catch (StreamInterrupted) assert(0);
+    catch (Exception e) msg = e.msg;
+    assert(msg.length && msg[0 .. 6] == "probe:", msg);
+    // Retried well past maxRetries = 0 before giving up.
+    assert(MonoTime.currTime - start >= 300.msecs);
 }

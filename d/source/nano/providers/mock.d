@@ -29,6 +29,13 @@ class MockClient : LLMClient
         script = script[1 .. $];
         // A scripted provider error.
         if (r.content.length > 7 && r.content[0 .. 7] == "!error:") throw new Exception(r.content[7 .. $]);
+        // A scripted stream that breaks mid-reply after showing some text.
+        if (r.content.length > 6 && r.content[0 .. 6] == "!drop:")
+        {
+            import nano.http : StreamInterrupted;
+            if (sink !is null) sink(false, r.content[6 .. $]);
+            throw new StreamInterrupted("mock: connection lost mid-reply");
+        }
         if (sink !is null && r.content.length) sink(false, r.content);
         return r;
     }

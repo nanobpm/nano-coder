@@ -76,6 +76,11 @@ struct RetryPolicy
     long maxRetries = 5;
     Duration initialBackoff = 1.seconds;
     Duration maxBackoff = 30.seconds;
+    /// How long to keep waiting for the network while requests can't connect
+    /// (DNS, refused, reset, timeout). These failures don't use up `maxRetries`:
+    /// a laptop that goes offline mid-turn carries on once it reconnects.
+    /// Unbounded by default; Ctrl-C cancels the wait.
+    Duration offlineBudget = Duration.max;
 
     /// Exponential backoff for a zero-based attempt.
     Duration backoff(long attempt) const
