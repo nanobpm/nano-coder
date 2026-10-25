@@ -61,6 +61,7 @@ public import nano.safeio : realPath;
 
 void rmrf(string p) nothrow { try rmdirRecurse(p); catch (Exception) {} }
 
+// rust: permissions.rs::static_guard_is_advisory_and_fails_closed_on_uninspectable_input
 unittest // static_guard_is_advisory_and_fails_closed_on_uninspectable_input
 {
     // Defect-CLASS invariant (see SECURITY.md): the static guard is a
@@ -75,6 +76,7 @@ unittest // static_guard_is_advisory_and_fails_closed_on_uninspectable_input
     assert(blocked("sh -c \"$(cat payload)\"").canFind("computed at run time"));
 }
 
+// rust: permissions.rs::readonly_loop_bodies_are_allowed_by_effect
 unittest // readonly_loop_bodies_are_allowed_by_effect
 {
     // Regression from #119: counting tests per file is a read-only
@@ -115,6 +117,7 @@ unittest // readonly_loop_bodies_are_allowed_by_effect
     assert(blocked("for f in *; do PATH=/tmp/evil grep x \"$f\"; done").canFind("assigns `PATH`"));
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round2_safety_gaps
 unittest // readonly_loop_closes_review_round2_safety_gaps
 {
     // #1 A command substitution in a loop header or condition runs on the
@@ -167,6 +170,7 @@ unittest // readonly_loop_closes_review_round2_safety_gaps
     allowed("for f in input; do sort -- *; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round3_safety_gaps
 unittest // readonly_loop_closes_review_round3_safety_gaps
 {
     // #1 A `for`/`select` header rebinds its variable, and a loop body can
@@ -225,6 +229,7 @@ unittest // readonly_loop_closes_review_round3_safety_gaps
     allowed("while read line < \"$(echo input)\"; do cat input; break; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round4_safety_gaps
 unittest // readonly_loop_closes_review_round4_safety_gaps
 {
     // #1 A header substitution is itself a command sequence, so a read-only
@@ -281,6 +286,7 @@ unittest // readonly_loop_closes_review_round4_safety_gaps
     allowed("for f in input; do sort -t : -- input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round5_safety_gaps
 unittest // readonly_loop_closes_review_round5_safety_gaps
 {
     // #1 A header substitution is reclassified from its cloned records (flags
@@ -335,6 +341,7 @@ unittest // readonly_loop_closes_review_round5_safety_gaps
             .canFind("loop variable"));
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round6_safety_gaps
 unittest // readonly_loop_closes_review_round6_safety_gaps
 {
     // #1 Inside `[[ ... ]]`, `>` and `<` are string-comparison operators, not
@@ -365,6 +372,7 @@ unittest // readonly_loop_closes_review_round6_safety_gaps
     allowed("for p in x; do read -p \"$p\"; cat input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round7_safety_gaps
 unittest // readonly_loop_closes_review_round7_safety_gaps
 {
     // #1 `[[` is conditional syntax only in command position. As an operand
@@ -428,6 +436,7 @@ unittest // readonly_loop_closes_review_round7_safety_gaps
     assert(blocked("for f in x; do read -p \"${@}\"; cat input; done").canFind("cannot be inspected"));
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round8_safety_gaps
 unittest // readonly_loop_closes_review_round8_safety_gaps
 {
     // #1 `[[` numeric comparisons (`-eq`, `-lt`, …) evaluate their operands
@@ -479,6 +488,7 @@ unittest // readonly_loop_closes_review_round8_safety_gaps
     allowed("until [[ z > m ]]; do echo z; break; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round9_safety_gaps
 unittest // readonly_loop_closes_review_round9_safety_gaps
 {
     // #1 An unquoted brace expansion yields one argument per alternative,
@@ -508,6 +518,7 @@ unittest // readonly_loop_closes_review_round9_safety_gaps
     allowed("until [[ -f a || -f b ]]; do cat a; break; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round10_safety_gaps
 unittest // readonly_loop_closes_review_round10_safety_gaps
 {
     // #1 (new thread) The brace scanner must parse quotes, command
@@ -538,6 +549,7 @@ unittest // readonly_loop_closes_review_round10_safety_gaps
     allowed("for f in x; do echo \"${text:0:3}\"; cat input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round11_safety_gaps
 unittest // readonly_loop_closes_review_round11_safety_gaps
 {
     // #1 (new thread) An expanding here-document body is an assignment
@@ -566,6 +578,7 @@ unittest // readonly_loop_closes_review_round11_safety_gaps
     allowed("for f in x; do echo {1..9}; cat input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round12_safety_gaps
 unittest // readonly_loop_closes_review_round12_safety_gaps
 {
     // #1 (previously missed) An indirect parameter expansion `${!ref:=/etc}`
@@ -590,6 +603,7 @@ unittest // readonly_loop_closes_review_round12_safety_gaps
     allowed("for f in x; do echo {{a}}; cat input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round13_safety_gaps
 unittest // readonly_loop_closes_review_round13_safety_gaps
 {
     // #1 (previously missed) A positional/array-list expansion nested in a
@@ -616,6 +630,7 @@ unittest // readonly_loop_closes_review_round13_safety_gaps
     allowed("for f in x; do echo -o{ab}; cat input; done");
 }
 
+// rust: permissions.rs::readonly_loop_closes_review_round14_safety_gaps
 unittest // readonly_loop_closes_review_round14_safety_gaps
 {
     // (previously missed) A positional/array list can hide behind *several*
@@ -638,6 +653,7 @@ unittest // readonly_loop_closes_review_round14_safety_gaps
     allowed("for f in x; do sort -T \"${outer:-${#arr[@]}}\" input; done");
 }
 
+// rust: permissions.rs::blocks_catastrophic_deletes
 unittest // blocks_catastrophic_deletes
 {
     foreach (command; [
@@ -682,6 +698,7 @@ unittest // blocks_catastrophic_deletes
     assert(blocked("rm -rf *").canFind("working directory"));
 }
 
+// rust: permissions.rs::follows_cd_and_assignments_in_the_command
 unittest // follows_cd_and_assignments_in_the_command
 {
     foreach (command; [
@@ -712,6 +729,7 @@ unittest // follows_cd_and_assignments_in_the_command
     }
 }
 
+// rust: permissions.rs::workspace_under_a_system_directory
 unittest // workspace_under_a_system_directory
 {
     auto cwd = ("/var/lib/jenkins/workspace/job");
@@ -723,6 +741,7 @@ unittest // workspace_under_a_system_directory
     assert(run("rm -rf /var/lib/dpkg").isErr);
 }
 
+// rust: permissions.rs::allows_ordinary_deletes
 unittest // allows_ordinary_deletes
 {
     foreach (command; [
@@ -745,6 +764,7 @@ unittest // allows_ordinary_deletes
     }
 }
 
+// rust: permissions.rs::blocks_disk_and_device_writes
 unittest // blocks_disk_and_device_writes
 {
     foreach (command; [
@@ -763,6 +783,7 @@ unittest // blocks_disk_and_device_writes
     allowed("diskutil list");
 }
 
+// rust: permissions.rs::blocks_destructive_database_commands
 unittest // blocks_destructive_database_commands
 {
     foreach (command; [
@@ -800,6 +821,7 @@ unittest // blocks_destructive_database_commands
     allowed("terraform plan");
 }
 
+// rust: permissions.rs::guards_protected_branches
 unittest // guards_protected_branches
 {
     foreach (command; [
@@ -825,6 +847,7 @@ unittest // guards_protected_branches
     allowed("git push origin --delete old-feature");
 }
 
+// rust: permissions.rs::fails_closed_on_uninspectable_commands
 unittest // fails_closed_on_uninspectable_commands
 {
     assert(blocked("echo 'unterminated").canFind("could not inspect"));
@@ -834,6 +857,7 @@ unittest // fails_closed_on_uninspectable_commands
     allowed("bash scripts/build.sh");
 }
 
+// rust: permissions.rs::computed_program_words_do_not_bypass_guards
 unittest // computed_program_words_do_not_bypass_guards
 {
     // A program word computed at run time is not the literal executable the shell runs,
@@ -850,6 +874,7 @@ unittest // computed_program_words_do_not_bypass_guards
     assert(blocked("RM=rm; $RM -rf /").canFind("would affect"));
 }
 
+// rust: permissions.rs::user_rules_deny_and_allow
 unittest // user_rules_deny_and_allow
 {
     auto p = policy(["Bash(sqlite3 test.db *)", "Bash(rm -rf /tmp/*)"], ["Bash(git push:*)", "Bash(curl *)"]);
@@ -868,6 +893,7 @@ unittest // user_rules_deny_and_allow
     check(p, "rm -rf /").unwrapOk;
 }
 
+// rust: permissions.rs::allow_list_still_guards_redirection_only_commands
 unittest // allow_list_still_guards_redirection_only_commands
 {
     // A redirection-only command (empty words) must not be auto-approved by an
@@ -877,6 +903,7 @@ unittest // allow_list_still_guards_redirection_only_commands
     assert(check(p, "echo hi > /dev/null").isOk);
 }
 
+// rust: permissions.rs::guards_wrapper_long_options_and_qualified_targets
 unittest // guards_wrapper_long_options_and_qualified_targets
 {
     // Long wrapper options that take a value must not be mistaken for the
@@ -915,6 +942,7 @@ unittest // guards_wrapper_long_options_and_qualified_targets
     allowed("find ./build -path '*/tmp/*' -delete");
 }
 
+// rust: permissions.rs::round5_guard_hardening
 unittest // round5_guard_hardening
 {
     // #1 A broad allow rule matches on words only; the device-write guard must
@@ -939,6 +967,7 @@ unittest // round5_guard_hardening
     assert(blocked("chmod \"-R\" 777 /").canFind("filesystem root"));
 }
 
+// rust: permissions.rs::round6_guard_hardening
 unittest // round6_guard_hardening
 {
     // #1 A device reached through `..` or an unnormalized path must still be
@@ -971,6 +1000,7 @@ unittest // round6_guard_hardening
     allowed("find -P . -name '*.log' -delete");
 }
 
+// rust: permissions.rs::round7_guard_hardening
 unittest // round7_guard_hardening
 {
     // #1 A device write reached through a proven command-local assignment must
@@ -989,6 +1019,7 @@ unittest // round7_guard_hardening
     assert(p.checkIn("bash", cmdArgs("find / -name x -delete"), root).isErr);
 }
 
+// rust: permissions.rs::round8_guard_hardening
 unittest // round8_guard_hardening
 {
     // #2 `>&` is combined output redirection, so it must run the device guard.
@@ -1029,6 +1060,7 @@ unittest // round8_guard_hardening
     assert(check(Policy.init, "find .git -name '*' -delete").isErr);
 }
 
+// rust: permissions.rs::round10_guard_hardening
 unittest // round10_guard_hardening
 {
     // #2 A command substitution in an *unquoted* here-document body is run by
@@ -1069,6 +1101,7 @@ unittest // round10_guard_hardening
     assert(blocked("echo x > $NANO_UNSET_TARGET").canFind("computed at run time"));
 }
 
+// rust: permissions.rs::round11_guard_hardening
 unittest // round11_guard_hardening
 {
     // #1 A shell nested under a container wrapper (`docker exec c sh -c '...'`)
@@ -1124,6 +1157,7 @@ unittest // round11_guard_hardening
     rmrf(base);
 }
 
+// rust: permissions.rs::round12_guard_hardening
 unittest // round12_guard_hardening
 {
     // #2 Loops may now run when their bodies are provably read-only, but a
@@ -1141,6 +1175,7 @@ unittest // round12_guard_hardening
 
 }
 
+// rust: permissions.rs::round13_guard_hardening
 unittest // round13_guard_hardening
 {
     // #1 A container invocation is a separate, unsandboxed process: host bind
@@ -1170,6 +1205,7 @@ unittest // round13_guard_hardening
     assert(blocked("bash <<< 'rm -rf /'").canFind("filesystem root"));
 }
 
+// rust: permissions.rs::resolve_collapses_parent_after_symlink
 unittest // resolve_collapses_parent_after_symlink
 {
     // #1 A `..` that follows a symlink must be resolved through the link's real
@@ -1189,6 +1225,7 @@ unittest // resolve_collapses_parent_after_symlink
     assert(denied);
 }
 
+// rust: permissions.rs::cd_into_symlink_tracks_physical_base
 unittest // cd_into_symlink_tracks_physical_base
 {
     // #6 `cd link` (with `link -> /etc`) physically moves into the target, so a
@@ -1207,6 +1244,7 @@ unittest // cd_into_symlink_tracks_physical_base
     assert(find_blocked);
 }
 
+// rust: permissions.rs::find_follow_and_mv_symlink_dest_are_resolved
 unittest // find_follow_and_mv_symlink_dest_are_resolved
 {
     // #6/#7 `find -L link ... -delete` and `mv x link` (with `link -> /etc`)
@@ -1226,6 +1264,7 @@ unittest // find_follow_and_mv_symlink_dest_are_resolved
     assert(find_default_ok);
 }
 
+// rust: permissions.rs::shred_normalizes_device_paths
 unittest // shred_normalizes_device_paths
 {
     // #9 `shred`/`blkdiscard` operands go through the resolving device guard,
@@ -1236,6 +1275,7 @@ unittest // shred_normalizes_device_paths
     allowed("shred -n 3 -u scratch.txt");
 }
 
+// rust: permissions.rs::path_rules_follow_symlink_targets
 unittest // path_rules_follow_symlink_targets
 {
     // #1 File tools dereference symlinks, so a link to a protected file must be
@@ -1296,6 +1336,7 @@ unittest // trailing_slash_follows_symlink_out_of_workspace
     assert(isAllowed);
 }
 
+// rust: permissions.rs::path_rules_and_tool_names
 unittest // path_rules_and_tool_names
 {
     auto p = policy([], ["Edit(**/.env)", "Read(~/.ssh/**)", "web_fetch"]);
@@ -1309,6 +1350,7 @@ unittest // path_rules_and_tool_names
     assert(validateRule("Bash(rm") !is null);
 }
 
+// rust: permissions.rs::read_rules_cover_grep_and_glob
 unittest // read_rules_cover_grep_and_glob
 {
     auto cwd = ("/work/project");
@@ -1332,6 +1374,7 @@ unittest // read_rules_cover_grep_and_glob
     assert(p.checkIn("glob", parseJSON(`{"pattern": "*"}`), cwd).isOk);
 }
 
+// rust: permissions.rs::read_denied_is_false_without_read_deny_rules
 unittest // read_denied_is_false_without_read_deny_rules
 {
     // With no Read-deny path rule, every discovered entry short-circuits to
@@ -1352,6 +1395,7 @@ unittest // builtin_rules_can_be_disabled
     assert(check(p, "rm -rf /").isOk);
 }
 
+// rust: permissions.rs::sandbox_confines_file_tools
 unittest // sandbox_confines_file_tools (+ round12 #1: a symlink escaping lexically-inside paths)
 {
     import nano.sandbox : SandboxConfig, SandboxMode;

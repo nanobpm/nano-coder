@@ -338,6 +338,7 @@ unittest
     assert(c == "abcd\n…[4 characters omitted]…\nij", c);
 }
 
+// rust: context.rs::transcript_keeps_the_newest_messages
  unittest // transcripts: roles, tool calls, ids, newest kept
 {
     import std.json : parseJSON;

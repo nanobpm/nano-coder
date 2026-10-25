@@ -274,6 +274,7 @@ version (unittest)
     }
 }
 
+// rust: files.rs::read_pages_with_line_numbers
 unittest
 {
     auto st = new ReadState;

@@ -287,6 +287,7 @@ string preview(string text, size_t max)
     return cut ~ "…";
 }
 
+// rust: queue.rs::push_assigns_monotonic_ids_that_survive_removal_and_clear
 unittest // push assigns monotonic ids that survive removal and clear
 {
     auto q = MessageQueue.make;
@@ -298,6 +299,7 @@ unittest // push assigns monotonic ids that survive removal and clear
     assert(q.push("fourth") == 3);
 }
 
+// rust: queue.rs::pop_is_fifo_and_edit_rewrites_in_place
 unittest // pop is FIFO and edit rewrites in place
 {
     auto q = MessageQueue.make;
@@ -310,6 +312,8 @@ unittest // pop is FIFO and edit rewrites in place
     assert(!q.pop(m));
 }
 
+// rust: queue.rs::add_queues_a_message
+// rust: queue.rs::parse_covers_the_subcommands
  unittest // parse covers the subcommands
 {
     import std.exception : assertThrown;
@@ -324,6 +328,7 @@ unittest // pop is FIFO and edit rewrites in place
     assert(parse("add fix the build") == QueueOp(AddOp("fix the build")));
 }
 
+// rust: queue.rs::apply_reports_what_happened
 unittest // apply reports what happened
 {
     import std.algorithm : canFind, startsWith;
@@ -345,6 +350,7 @@ unittest // apply reports what happened
     assert(note.startsWith("↧ queued #") && note.canFind("/queue remove") && q.length == 1, note);
 }
 
+// rust: queue.rs::edits_reach_unread_steers_and_share_ids_with_the_queue
 unittest // edits reach unread steers and share ids with the queue (Rust edits_reach_unread_steers_and_share_ids_with_the_queue)
 {
     import std.algorithm : canFind, startsWith;
@@ -389,6 +395,7 @@ unittest // edits reach unread steers and share ids with the queue (Rust edits_r
     assert(q.list == [QueuedMessage(3, "kept")] && q.push("next") == 4);
 }
 
+// rust: queue.rs::preview_flattens_and_truncates
 unittest // preview flattens and truncates
 {
     import std.utf : count;

@@ -87,6 +87,13 @@ bool isModelStudioUrl(string url)
     return false;
 }
 
+// rust: providers/qwen.rs::every_plan_has_its_own_api_key_variable
+// rust: providers/qwen.rs::the_default_endpoint_matches_the_historical_preset
+// rust: providers/qwen.rs::urls_round_trip_to_the_same_endpoint
+// rust: settings.rs::applying_an_endpoint_before_the_key_prompt_keeps_no_key_authoritative
+// rust: settings.rs::applying_an_endpoint_retargets_a_stale_plan_variable_behind_another_key_source
+// rust: providers/qwen.rs::every_plan_and_region_is_named
+// rust: providers/qwen.rs::endpoints_are_unique_and_well_formed
 unittest
 {
     import std.algorithm : count, canFind, uniq, sort, map;
@@ -109,6 +116,7 @@ unittest
     assert(endpointForUrl("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/extra") is null);
 }
 
+// rust: providers/qwen.rs::model_studio_hosts_are_recognised_beyond_the_exact_matrix
 unittest
 {
     assert(isModelStudioUrl("https://abc123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"));

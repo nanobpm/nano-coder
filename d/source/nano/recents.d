@@ -124,6 +124,9 @@ void save(string path, const Recents r) nothrow
     catch (Exception) {}
 }
 
+// rust: providers/mod.rs::parses_model_specs
+// rust: recents.rs::canonical_prefixes_the_real_provider
+// rust: recents.rs::canonicalize_migrates_a_legacy_raw_list
  unittest
 {
     ProviderConfig[string] all;

@@ -1074,6 +1074,8 @@ version (unittest)
     }
 }
 
+// rust: claude_hooks.rs::matcher_matches_claude_and_nano_names
+// rust: claude_hooks.rs::source_matcher_alternation_and_wildcard
 unittest // matcher_matches_claude_and_nano_names, source_matcher_alternation_and_wildcard
 {
     assert(matcherSelects("Edit|Write", "Edit", "edit_file"));
@@ -1102,6 +1104,7 @@ unittest // translates_tool_input_both_ways
     assert(claudeToolName("grep") == "Grep" && claudeToolName("glob") == "Glob");
 }
 
+// rust: claude_hooks.rs::reads_tool_input_command_like_a_claude_script
 unittest // grep_and_glob_hooks_match_claude_names, reads_tool_input_command_like_a_claude_script
 {
     auto dir = tdir("grep");
@@ -1117,6 +1120,7 @@ unittest // grep_and_glob_hooks_match_claude_names, reads_tool_input_command_lik
     assert(!m2.runPreToolUse("bash", j(`{"command": "ls"}`), "t2").denies);
 }
 
+// rust: claude_hooks.rs::pre_tool_use_json_permission_decision
 unittest // pre_tool_use_json_permission_decision, fails closed on crash; post crash non-blocking
 {
     auto dir = tdir("json");
@@ -1127,6 +1131,8 @@ unittest // pre_tool_use_json_permission_decision, fails closed on crash; post c
     assert(!with_([cmd(Event.postToolUse, "exit 7")], dir).runPostToolUse("bash", j(`{"command": "ls"}`), "ok", "t1").blocked);
 }
 
+// rust: claude_hooks.rs::session_start_matcher_selects_on_source_trigger
+// rust: claude_hooks.rs::session_start_plain_text_becomes_context
 unittest // session_start_matcher_selects_on_source_trigger, plain text becomes context
 {
     auto dir = tdir("start");
@@ -1142,6 +1148,7 @@ unittest // session_start_matcher_selects_on_source_trigger, plain text becomes 
     assert(with_([cmd(Event.sessionStart, "echo hello world")], dir).runSessionStart("startup").contextBlock == "hello world");
 }
 
+// rust: claude_hooks.rs::user_prompt_submit_exit_2_blocks_with_stderr
 unittest // hook_that_ignores_large_stdin_does_not_deadlock; user_prompt_submit_exit_2_blocks_with_stderr
 {
     auto dir = tdir("stdin");
@@ -1151,6 +1158,7 @@ unittest // hook_that_ignores_large_stdin_does_not_deadlock; user_prompt_submit_
     assert(o.blocked && o.blockReason == "secret-detected");
 }
 
+// rust: claude_hooks.rs::hook_receives_env_and_updated_input
 unittest // hook_receives_env_and_updated_input; input JSON reaches the hook
 {
     auto dir = tdir("env");
@@ -1174,6 +1182,8 @@ unittest // exec form expands ${CLAUDE_PROJECT_DIR} and passes args verbatim
     assert(with_([h], dir).runSessionStart("startup").contextBlock == dir ~ "/x a b $HOME");
 }
 
+// rust: claude_hooks.rs::if_rule_narrows_tool_hooks
+// rust: claude_hooks.rs::stop_block_keeps_going
 unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_pre_tool_use_only
 {
     auto dir = tdir("if");
@@ -1194,6 +1204,8 @@ unittest // if_rule_narrows_tool_hooks; stop_block_keeps_going; timeout_blocks_p
     assert(!with_([tp], dir).runPostToolUse("bash", j(`{"command": "ls"}`), "ok", "t1").blocked);
 }
 
+// rust: claude_hooks.rs::disable_all_hooks_in_a_file_is_honored
+// rust: claude_hooks.rs::disable_flags_turn_hooks_off
 unittest // loads_and_dedups_from_settings_files; disable flags; disableAllHooks
 {
     auto dir = tdir("load");
@@ -1234,6 +1246,7 @@ unittest // nano [hooks] and ~/.claude/settings.json load alongside the project;
     assert(m.hooks[1].source == Source.userClaude);
 }
 
+// rust: claude_hooks.rs::unreadable_settings_file_is_reported_not_silently_skipped
 unittest // unreadable_settings_file_is_reported_not_silently_skipped
 {
     import core.sys.posix.unistd : geteuid;
@@ -1250,6 +1263,7 @@ unittest // unreadable_settings_file_is_reported_not_silently_skipped
     assert(m.skipped[0].reason.canFind("could not read settings file"), m.skipped[0].reason);
 }
 
+// rust: claude_hooks.rs::dedup_keeps_entries_with_distinct_if_rules
 unittest // dedup_keeps_entries_with_distinct_if_rules, shell vs exec, empty-argument boundaries
 {
     auto dir = tdir("dedup");
@@ -1317,6 +1331,7 @@ unittest // unrepresentable_timeout_fails_closed_instead_of_panicking; new sessi
     assert(parts.length >= 3 && parts[0] == parts[2], "the hook leads its own process group: " ~ run.stdout_);
 }
 
+// rust: claude_hooks.rs::herdr_integration_hooks_are_skipped
 unittest // herdr_integration_hooks_are_skipped
 {
     import std.file : write;
@@ -1334,6 +1349,7 @@ unittest // herdr_integration_hooks_are_skipped
     foreach (sk; m.skipped) assert(sk.reason.canFind("Herdr"));
 }
 
+// rust: claude_hooks.rs::malformed_if_filter_is_reported_as_skipped
 unittest // malformed_if_filter_is_reported_as_skipped; blank_if_filter_is_normalized_to_none
 {
     auto m = loadProject(tdir("badif"), `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
@@ -1346,6 +1362,7 @@ unittest // malformed_if_filter_is_reported_as_skipped; blank_if_filter_is_norma
     assert(b.selected(Event.preToolUse, "Bash", "bash", j(`{"command":"ls"}`), null).length == 1);
 }
 
+// rust: claude_hooks.rs::listing_neutralises_line_breaks_in_config_fields
 unittest // listing_neutralises_line_breaks_in_config_fields
 {
     import std.string : lineSplitter;
@@ -1376,6 +1393,7 @@ unittest // cap_counts_characters_not_bytes
 
 import std.algorithm : endsWith;
 
+// rust: claude_hooks.rs::read_error_on_stdout_fails_pre_tool_use_closed
 unittest // read errors fail PreToolUse closed; content hash matches Rust's DefaultHasher
 {
     ProcessRun run;

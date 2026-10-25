@@ -251,16 +251,20 @@ string render(const ref Stats stats, size_t cols)
 /// delta, once deltas span 250 ms, at most every 250 ms (Rust's RateMeter).
 struct RateMeter
 {
-    private long firstMs = -1, lastEmitMs = -1;
+    private long startMs = -1, firstMs = -1, lastMs = -1, lastEmitMs = -1;
     private size_t bytes;
 
-    void reset() { this = RateMeter.init; }
+    /// Start metering a new generation (one model call) begun at `nowMs`.
+    void reset(long nowMs = -1) { this = RateMeter.init; startMs = nowMs; }
 
     /// Record `n` bytes at `nowMs`; the rate when one is due, else 0.
     double record(size_t n, long nowMs)
     {
+        // An empty delta doesn't start the clock: the idle gap before real
+        // output would depress the rate.
         if (n == 0) return 0;
         if (firstMs < 0) firstMs = nowMs;
+        lastMs = nowMs;
         bytes += n;
         auto elapsed = nowMs - firstMs;
         if (elapsed < 250) return 0;
@@ -268,6 +272,71 @@ struct RateMeter
         lastEmitMs = nowMs;
         return ((bytes + 3) / 4) / (elapsed / 1000.0);
     }
+
+    /// The rate at `nowMs` with no new delta: it falls while output pauses.
+    double sample(long nowMs) const
+    {
+        if (firstMs < 0 || nowMs <= firstMs) return 0;
+        return ((bytes + 3) / 4) / ((nowMs - firstMs) / 1000.0);
+    }
+
+    /// The generation's final rate: `tokens` (the reported output, or the
+    /// byte estimate when <= 0) over the time since the first delta for a real
+    /// stream, or since the generation began for a one-shot reply. 0 when no
+    /// output streamed.
+    double finish(long tokens, long nowMs) const
+    {
+        if (firstMs < 0) return 0;
+        auto from = lastMs - firstMs >= 250 || startMs < 0 ? firstMs : startMs;
+        if (nowMs <= from) return 0;
+        double t = tokens > 0 ? tokens : (bytes + 3) / 4;
+        return t / ((nowMs - from) / 1000.0);
+    }
+}
+
+// rust: agent.rs::rate_meter_tracks_scripted_stream, agent.rs::rate_meter_throttles_updates
+// rust: agent.rs::rate_meter_ignores_empty_deltas, agent.rs::rate_meter_sample_decays_during_pause
+// rust: agent.rs::rate_meter_finish_falls_back_to_usage_over_elapsed_for_one_shot
+// rust: agent.rs::rate_meter_finish_uses_first_token_denominator_for_multi_delta_stream
+unittest
+{
+    import std.math : isClose, abs;
+    RateMeter m;
+    m.reset(0);
+    assert(m.record(8, 0) == 0);
+    assert(isClose(m.record(8, 1000), 4.0));
+    double last;
+    foreach (sec; 2 .. 9) if (auto r = m.record(8, sec * 1000)) last = r;
+    assert(abs(last - 2.25) < 0.01, "settles toward 2 tok/s");
+
+    m.reset(0);
+    assert(m.record(100, 0) == 0 && m.record(100, 300) > 0 && m.record(100, 350) == 0 && m.record(100, 600) > 0);
+
+    m.reset(0);
+    assert(m.record(0, 0) == 0 && m.record(4, 1000) == 0);
+    assert(isClose(m.record(4, 1500), 4.0));
+
+    m.reset(0);
+    m.record(400, 0);
+    assert(m.sample(2000) < m.sample(1000) && m.sample(5000) < m.sample(2000));
+
+    // One-shot: usage (else the estimate) over the whole call.
+    m.reset(0);
+    assert(m.record(400, 0) == 0);
+    assert(isClose(m.finish(200, 2000), 100.0) && isClose(m.finish(0, 2000), 50.0));
+    RateMeter none;
+    none.reset(0);
+    assert(none.finish(10, 1000) == 0);
+    m.reset(0);
+    m.record(200, 0);
+    m.record(200, 1);
+    assert(isClose(m.finish(200, 2000), 100.0), "two back-to-back callbacks are one shot");
+
+    // A real stream: from the first token, not the slow time to first token.
+    m.reset(0);
+    m.record(400, 2000);
+    assert(m.record(400, 3000) > 0);
+    assert(abs(m.finish(200, 5000) - 66.67) < 0.01);
 }
 
 unittest

@@ -560,6 +560,11 @@ unittest
     assert(reloadRenewedGrant(OauthGrant("old", "other", Nullable!long(1)), dir).isNull);
 }
 
+// rust: providers/muse.rs::lists_models_excludes_contributor_rows
+// rust: providers/muse.rs::lists_models_excludes_hidden_rows
+// rust: providers/muse.rs::lists_models_hiding_image_generation
+// rust: providers/muse.rs::muse_vision_treats_chat_rows_as_image_capable
+// rust: providers/muse.rs::reads_effort_variants_in_both_shapes
  unittest
 {
     auto cat = parseJSON(`{"data":[

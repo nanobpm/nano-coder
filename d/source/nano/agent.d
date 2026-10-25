@@ -1272,6 +1272,7 @@ version (unittest)
     }
 }
 
+// rust: agent.rs::malformed_tool_call_skips_handler_and_reports_actionable_error
 unittest
 {
     auto reg = new ToolRegistry;
@@ -1293,6 +1294,7 @@ unittest
     assert(second[$ - 1].content.indexOf("Invalid arguments") == 0);
 }
 
+// rust: agent.rs::steer_during_tool_call_joins_next_model_call
 unittest
 {
     auto reg = new ToolRegistry;
@@ -1311,6 +1313,8 @@ unittest
 }
 
 // A steer sent while a tool runs joins the next model call.
+// rust: agent.rs::steer_during_tool_call_joins_next_model_call
+// rust: agent.rs::steer_during_final_answer_extends_the_turn
 unittest
 {
     auto reg = new ToolRegistry;
@@ -1328,6 +1332,8 @@ unittest
 }
 
 // A steer that lands during the final answer extends the turn.
+// rust: agent.rs::steer_during_final_answer_extends_the_turn
+// rust: agent.rs::cancel_kills_running_bash_and_skips_remaining_calls
 unittest
 {
     auto reg = new ToolRegistry;
@@ -1368,6 +1374,7 @@ unittest
 
 // Claude hooks in the loop: prompt context and blocking, PreToolUse deny and
 // rewrite (re-checked against the policy), PostToolUse context, Stop blocks.
+// rust: agent.rs::reporting_an_outcome_ends_the_turn_and_is_recorded
 unittest
 {
     import nano.claude_hooks : Hook, Event;
@@ -1429,6 +1436,10 @@ unittest
 }
 
 // report_outcome ends the turn with its summary as the answer.
+// rust: agent.rs::plan_mode_keeps_read_only_tools
+// rust: agent.rs::plan_mode_gates_mutating_tools
+// rust: agent.rs::normal_mode_cap_stops_headless
+// rust: agent.rs::a_headless_turn_with_no_cap_stops_at_the_safety_cap
 unittest
 {
     import nano.providers.mock;
@@ -1452,6 +1463,9 @@ unittest
 }
 
 // A headless turn stops at the cap with Rust's note; plan mode hides mutating tools.
+// rust: agent.rs::a_hard_stop_skips_the_rest_of_the_batch
+// rust: agent.rs::a_repeat_loop_ends_the_turn_blocked_after_the_warnings
+// rust: agent.rs::identical_tool_calls_draw_a_loop_warning_on_the_third
 unittest
 {
     import nano.providers.mock;
@@ -1480,6 +1494,15 @@ unittest
 
 // The loop detector warns on repeated identical calls, then ends the turn as
 // blocked and skips the rest of the batch.
+// rust: agent.rs::prompt_only_window_does_not_shrink_max_tokens
+// rust: agent.rs::an_unset_max_tokens_uses_a_known_model_cap_before_the_large_fallback
+// rust: agent.rs::an_unset_max_tokens_falls_back_to_a_large_default_when_unpublished
+// rust: agent.rs::an_unset_max_tokens_defaults_to_the_models_published_output_limit
+// rust: agent.rs::an_output_limit_rejection_is_learned_and_retried
+// rust: agent.rs::auto_compaction_mid_turn_keeps_the_turn_going
+// rust: agent.rs::a_second_overflow_is_returned
+// rust: agent.rs::context_overflow_compacts_and_retries_once
+// rust: agent.rs::manual_compaction_summarizes_older_messages
 unittest
 {
     import std.algorithm : startsWith, canFind;
@@ -1590,7 +1613,11 @@ unittest
     assert(f.requestMaxTokens < 2_000);
 }
 
- unittest
+// rust: agent.rs::no_titles_unless_enabled
+// rust: agent.rs::titles_sessions_once_a_prompt_says_something
+// rust: agent.rs::read_file_image_errors_with_a_hint_when_the_model_cannot_see
+// rust: agent.rs::read_file_attaches_an_image_for_a_vision_model
+unittest
 {
     // read_file on an image: attached for a vision model, an error otherwise.
     import nano.providers.mock : MockClient;

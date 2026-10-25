@@ -268,6 +268,7 @@ private void run(string bin, string[] args)
     catch (Exception) return;
 }
 
+// rust: herdr.rs::pane_needs_all_herdr_variables
 unittest // the pane needs all of Herdr's variables
 {
     string delegate(string) @safe env(string[string] vars)
@@ -287,12 +288,14 @@ unittest // the pane needs all of Herdr's variables
     assert(!found);
 }
 
+// rust: herdr.rs::state_report_args
 unittest // state report arguments
 {
     assert(reportArgs("p1", State.working, 7, null) == ["pane", "report-agent", "p1", "--source", "nano-coder", "--agent",
         "nano-coder", "--state", "working", "--seq", "7"]);
 }
 
+// rust: herdr.rs::blocked_report_carries_a_clean_message
 unittest // a blocked report carries a clean message
 {
     import std.algorithm : countUntil;
@@ -304,6 +307,7 @@ unittest // a blocked report carries a clean message
     assert(args[$ - 1] == "é".replicate(200));
 }
 
+// rust: herdr.rs::session_report_puts_resume_argv_after_double_dash
 unittest // the session report puts the resume argv after `--`
 {
     import std.algorithm : countUntil;
@@ -315,6 +319,7 @@ unittest // the session report puts the resume argv after `--`
     assert(args[dash + 1 .. $] == ["nano-coder-d", "--resume", "s1", "--model", "openai/gpt-5"]);
 }
 
+// rust: herdr.rs::resume_argv_respects_herdr_rules
 unittest // the resume argv follows Herdr's rules
 {
     import std.array : replicate;
@@ -328,6 +333,7 @@ unittest // the resume argv follows Herdr's rules
     assert(resumeArgv("s1", null, ["y".replicate(9000)]) is null);
 }
 
+// rust: herdr.rs::release_args_shape
 unittest // release arguments
 {
     assert(releaseArgs("p1", 3) == ["pane", "release-agent", "p1", "--source", "nano-coder", "--agent", "nano-coder",

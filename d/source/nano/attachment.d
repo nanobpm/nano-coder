@@ -532,6 +532,7 @@ unittest
     assert(scaledDimensions(3000, 1500, 1568) == [1568, 784]);
 }
 
+// rust: attachment.rs::prepare_errors_when_minimum_size_still_exceeds_byte_cap
  unittest
 {
     // Passthrough keeps the bytes; a quarter-turn EXIF reports display size.

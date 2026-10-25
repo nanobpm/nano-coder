@@ -46,6 +46,7 @@ private Entry backdate(Entry e, long d)
     return e;
 }
 
+// rust: memory.rs::saves_searches_and_forgets_across_scopes
 unittest // saves_searches_and_forgets_across_scopes
 {
     auto s = store(tmp("basic"));
@@ -61,6 +62,9 @@ unittest // saves_searches_and_forgets_across_scopes
     assert(fails(s.forget(user.id)));
 }
 
+// rust: memory.rs::rejects_a_credential_split_across_text_and_evidence
+// rust: memory.rs::rejects_multiline_evidence
+// rust: memory.rs::rejects_secrets_and_overlong_text
 unittest // rejects_secrets_and_overlong_text, rejects_a_credential_split_across_text_and_evidence
 {
     auto s = store(tmp("secrets"));
@@ -191,6 +195,7 @@ unittest // rejects_multiline_evidence
     assert(s.save(Scope.user, "a fact", "Cargo.toml", null).evidence == "Cargo.toml");
 }
 
+// rust: memory.rs::expires_unused_entries_on_load
 unittest // expires_unused_entries_on_load
 {
     auto s = new Store(buildPath(tmp("expire"), "memory"), null, 30);
@@ -203,6 +208,7 @@ unittest // expires_unused_entries_on_load
     assert(readText(path).length == 0, "locked writer prunes");
 }
 
+// rust: memory.rs::search_returns_previous_mru_order
 unittest // search_bumps_last_used, search_returns_previous_mru_order
 {
     auto s = new Store(buildPath(tmp("bump"), "memory"), null, 0);
@@ -221,6 +227,7 @@ unittest // search_bumps_last_used, search_returns_previous_mru_order
     assert(out_.indexOf("alpha") < out_.indexOf("beta"), out_);
 }
 
+// rust: memory.rs::search_sanitises_escaped_line_breaks_in_evidence
 unittest // search sanitises evidence and control chars
 {
     auto s = new Store(buildPath(tmp("sanitise"), "memory"), null, 0);
@@ -236,6 +243,9 @@ unittest // search sanitises evidence and control chars
     assert(!out_.canFind('\x1b') && !out_.canFind('\x07') && out_.canFind("builds"), out_);
 }
 
+// rust: memory.rs::memory_directories_created_owner_only
+// rust: memory.rs::memory_directories_lock_path_owner_only
+// rust: memory.rs::preexisting_memory_directory_permissions_preserved
 unittest // file and directory permissions; stale lock file
 {
     import nano.safeio : chmodPath, statMode;
@@ -261,6 +271,7 @@ unittest // file and directory permissions; stale lock file
     { auto l = FileLock(path); }
 }
 
+// rust: memory.rs::index_is_dated_framed_and_capped
 unittest // index_is_dated_framed_and_capped, read-only guidance
 {
     auto s = store(tmp("index"));
@@ -289,6 +300,7 @@ unittest // index_on_read_failure_is_empty
     assert(s.index(true) == "" && s.index(false) == "");
 }
 
+// rust: memory.rs::index_sanitises_control_chars_in_label_and_tag
 unittest // index and forget sanitise control chars and unicode separators
 {
     auto s = store(tmp("scrub"));
@@ -312,6 +324,8 @@ unittest // index and forget sanitise control chars and unicode separators
     catch (Exception x) assert(!x.msg.canFind('\x1b'));
 }
 
+// rust: memory.rs::preserves_malformed_utf8_records_byte_for_byte
+// rust: memory.rs::preserves_unknown_records_across_rewrites
 unittest // preserves unknown, malformed UTF-8 and extra-field records
 {
     auto s = new Store(buildPath(tmp("unknown"), "memory"), null, 0);
@@ -333,6 +347,7 @@ unittest // preserves unknown, malformed UTF-8 and extra-field records
     assert(ids.canFind(keep.id) && !ids.canFind("fut1"));
 }
 
+// rust: memory.rs::project_scope_needs_a_repo_key
 unittest // absurd_expiry_days_errors, project_scope_needs_a_repo_key
 {
     auto s = new Store(buildPath(tmp("absurd"), "memory"), null, ulong.max);
@@ -348,6 +363,7 @@ unittest // absurd_expiry_days_errors, project_scope_needs_a_repo_key
     assert(s2.search("user fact", null).canFind("a user fact"));
 }
 
+// rust: memory.rs::normalizes_remotes_to_a_stable_key
 unittest // normalizes_remotes_to_a_stable_key
 {
     assert(normalizeRemote("git@github.com:nanobpm/nano-coder.git") == "git@github.com/nanobpm/nano-coder.git", "git@github.com:nanobpm/nano-coder.git");
@@ -426,6 +442,9 @@ unittest // normalizes_remotes_to_a_stable_key
     assert(normalizeRemote("/srv/repo@home.git") == "/srv/repo@home.git", "/srv/repo@home.git");
 }
 
+// rust: memory.rs::relative_local_origin_resolves_against_git_root
+// rust: memory.rs::run_dispatches_and_reports_saves
+// rust: memory.rs::sanitize_key_is_collision_resistant
 unittest // sanitize_key, project keys, tool set, run
 {
     assert(sanitizeKey("github.com/acme/a-b/c") != sanitizeKey("github.com/acme/a/b-c"));

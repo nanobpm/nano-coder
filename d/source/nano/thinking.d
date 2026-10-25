@@ -751,6 +751,8 @@ unittest
     assertThrown(Thinking.parse("very high!"));
 }
 
+// rust: thinking.rs::gpt_5_family_reasoning_levels_split_by_variant
+// rust: thinking.rs::knows_model_families
 unittest
 {
     assert(levelsOf("claude-fable-5-1") == "low,medium,high,xhigh,max");
@@ -789,6 +791,7 @@ unittest
     assert(r.effective.isDefault && r.source == Source.session && r.request().kind == Request.Kind.none);
 }
 
+// rust: thinking.rs::fits_the_level_to_the_model
 unittest
 {
     import std.algorithm : canFind;
@@ -814,6 +817,7 @@ unittest
     assert(sess(lv("high"), A, none, "claude-sonnet-4-5").request() == Request(Request.Kind.budget, null, 16384));
 }
 
+// rust: thinking.rs::config_levels_override_the_table
 unittest
 {
     import std.algorithm : canFind;
@@ -834,6 +838,8 @@ unittest
         && r.warning.canFind(`thinking_levels "none"`) && r.warning.canFind(`thinking_levels "auto"`));
 }
 
+// rust: acp.rs::thinking_value_reports_nothing_for_a_dropped_level
+// rust: thinking.rs::extra_body_override_is_reported_as_overriding_not_sent
 unittest
 {
     import std.algorithm : canFind;
@@ -871,6 +877,7 @@ unittest
     assert(r.anthropicThinkingOn && r.alwaysAnthropicThinking);
 }
 
+// rust: providers/openai.rs::encodes_thinking_levels_and_lets_extra_body_win
 unittest
 {
     assert(budgetTokens("custom") == 16384);

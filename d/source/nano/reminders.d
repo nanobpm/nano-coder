@@ -353,6 +353,7 @@ version (unittest)
     assert(memoryNotes(c, true) == 0);
 }
 
+// rust: reminders.rs::nudges_a_stale_plan_until_it_changes
  unittest // nudges a stale plan until it changes
 {
     Plan plan;
@@ -386,6 +387,7 @@ unittest // warns on the third identical call, caps warnings, then hard-stops
     assert(v[$ - 1].hardStop && repeats(s, 1)[0].hardStop);
 }
 
+// rust: reminders.rs::repeat_warning_only_names_report_outcome_when_it_is_offered
 unittest // the warning names report_outcome only when it is offered
 {
     auto on = Reminders(true), off = Reminders(false);
@@ -454,6 +456,7 @@ unittest // changing execution arguments is not a repeat; the same ones are
     assert(last.warning);
 }
 
+// rust: reminders.rs::disabled_plan_tool_repeats_are_still_detected
  unittest // distinct malformed payloads, exempt tools, reset, images
 {
     Reminders r;

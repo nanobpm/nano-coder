@@ -261,6 +261,10 @@ struct ResponsesStream
     }
 }
 
+// rust: providers/openai_responses.rs::builds_input_instructions_tools_and_calls
+// rust: providers/openai_responses.rs::copilot_reasoning_model_replays_reasoning_by_default
+// rust: providers/openai_responses.rs::preserves_function_call_item_id_across_replay
+// rust: providers/openai_responses.rs::replays_reasoning_items_before_tool_call
  unittest
 {
     import nano.config : ProviderKind;
@@ -300,6 +304,7 @@ struct ResponsesStream
 }
 
 // rust: providers/openai_responses.rs::parses_copilot_aic_from_response_and_stream
+// rust: providers/openai_responses.rs::parses_output_reasoning_text_and_calls
  unittest
 {
     auto r = parseResponses(parseJSON(`{"status":"completed","output":[

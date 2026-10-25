@@ -244,6 +244,7 @@ ToolDefinition definition()
         parseJSON(`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"question":{"type":"string","description":"The complete question to ask"},"header":{"type":"string","description":"Very short label (max 30 chars)"},"options":{"type":"array","items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"]}},"custom":{"type":"boolean","description":"Allow a custom typed answer (default true)"}},"required":["question"]}}},"required":["questions"]}`));
 }
 
+// rust: question.rs::parses_questions_and_requires_text
  unittest // parses_questions_and_requires_text
 {
     import std.exception : assertThrown, assertNotThrown;
@@ -256,6 +257,7 @@ ToolDefinition definition()
     assert(parse(JSONValue(`{"questions":[{"question":"s"}]}`))[0].question == "s");
 }
 
+// rust: question.rs::ask_blocks_until_resolved
 unittest // ask_blocks_until_resolved, and sequential questions each register
 {
     import core.thread : Thread;
@@ -275,6 +277,10 @@ unittest // ask_blocks_until_resolved, and sequential questions each register
     }
 }
 
+// rust: main.rs::sanitize_terminal_line_drops_line_feeds
+// rust: question.rs::away_and_dismissed_have_stable_wording
+// rust: question.rs::result_text_strips_control_sequences_from_model_and_user_text
+// rust: question.rs::result_text_strips_newlines_from_quoted_question_and_answer
  unittest // wording, and control sequences/newlines stripped
 {
     auto qs = [Question("Q")];

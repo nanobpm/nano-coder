@@ -341,6 +341,7 @@ string login(scope void delegate(string) @safe note, scope void delegate(long se
     }
 }
 
+// rust: providers/github_copilot.rs::derives_api_base_from_proxy_endpoint
 unittest
 {
     assert(baseUrlFromToken("tid=1;exp=2;proxy-ep=proxy.individual.githubcopilot.com;x=y") == "https://api.individual.githubcopilot.com");

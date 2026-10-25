@@ -982,6 +982,7 @@ unittest // select
     assert(e.select("Pick", ["a"]) == -1);
 }
 
+// rust: lineedit.rs::enter_steers_and_ctrl_enter_queues_during_a_turn
 unittest // Enter steers and Ctrl-Enter queues during a turn (Rust enter_steers_and_ctrl_enter_queues_during_a_turn)
 {
     auto screen = new Screen;

@@ -294,6 +294,8 @@ string read(string path, JSONValue args)
     return truncateOutput(text, limit, format("history-%s", id));
 }
 
+// rust: history.rs::read_returns_one_message_whole_or_bounded
+// rust: session.rs::standard_replace_does_not_offer_history_tools
  unittest
 {
     import std.file : tempDir, mkdirRecurse, rmdirRecurse;

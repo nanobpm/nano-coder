@@ -782,6 +782,7 @@ JSONValue[] requeueSteers(JSONValue[] deferred, Steer[] leftover, const(size_t)[
     return deferred;
 }
 
+// rust: acp.rs::leftover_steers_keep_their_arrival_position
 unittest
 {
     // Leftover steers keep their arrival position among deferred messages.
@@ -818,6 +819,7 @@ unittest
 }
 
 // End to end: a prompt runs a tool, streams updates and returns its stop reason.
+// rust: agent.rs::emits_acp_updates_for_messages_and_tools
 unittest
 {
     import nano.providers.mock;

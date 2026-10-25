@@ -137,6 +137,8 @@ string execute(JSONValue args, long defaultTimeout = defaultTimeoutSecs, const S
     return text;
 }
 
+// rust: bash.rs::formats_stdout_stderr_and_exit_code
+// rust: bash.rs::kills_on_timeout_without_waiting_for_background_children
 unittest
 {
     auto r = run("echo out; echo err >&2; exit 3", 5.seconds);
@@ -146,4 +148,29 @@ unittest
     import std.string : indexOf;
     auto text = execute(parseJSON(`{"command":"printf hi; false"}`));
     assert(text.indexOf("hi") == 0 && text.indexOf("Exit code: 1") > 0);
+}
+
+// rust: bash.rs::validates_arguments, output.rs::validates_limits
+unittest
+{
+    import std.exception : collectExceptionMsg;
+    import std.algorithm.searching : startsWith;
+    assert(collectExceptionMsg(execute(parseJSON(`{}`))) == `bash argument "command" must be set`);
+    assert(collectExceptionMsg(execute(parseJSON(`"{bad"`))).startsWith("bash arguments must be a JSON object"));
+    foreach (bad; [`0`, `-1`, `1000001`])
+        assert(collectExceptionMsg(execute(parseJSON(`{"command":"ls","max_output_length":` ~ bad ~ `}`))).length);
+    assert(collectExceptionMsg(execute(parseJSON(`{"command":"true","max_output_length":10}`))) is null);
+}
+
+// rust: bash.rs::truncates_and_keeps_full_capture
+unittest
+{
+    import std.algorithm.searching : startsWith, endsWith, findSplitAfter, findSplitBefore;
+    import std.file : readText;
+    import std.string : lineSplitter;
+    import std.range : walkLength;
+    auto result = execute(parseJSON(`{"command":"seq 1 100000","max_output_length":20}`));
+    assert(result.startsWith("1\n2\n3\n4\n5\n") && result.endsWith("100000\n"), result);
+    auto path = result.findSplitAfter("full output saved to ")[1].findSplitBefore(" ...]")[0];
+    assert(readText(path).lineSplitter.walkLength == 100000);
 }

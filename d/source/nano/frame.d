@@ -454,6 +454,7 @@ struct Transcript
     }
 }
 
+// rust: frame.rs::wraps_words_at_the_width
 unittest
 {
     import std.algorithm : canFind;

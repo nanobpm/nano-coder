@@ -174,7 +174,7 @@ private string spillFile(string text, string label)
     return path;
 }
 
-// (spill directory selection; the never-overwrite loop is not under test)
+// Spills go to the session directory when one is set.
 unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, readText;
@@ -193,6 +193,8 @@ unittest
 }
 
 // rust: output.rs::spills_long_output_to_a_file
+// rust: output.rs::leaves_short_output_alone
+// rust: output.rs::keeps_head_and_tail
 unittest
 {
     auto big = new char[1000];
@@ -210,4 +212,21 @@ unittest
     bool threw;
     try requireString(args, "missing", "t"); catch (ToolError) threw = true;
     assert(threw);
+}
+
+// rust: output.rs::spill_never_overwrites_an_existing_file
+unittest
+{
+    import std.file : tempDir, rmdirRecurse, exists, dirEntries, SpanMode, readText;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.array : array;
+    import std.algorithm : map, sort;
+    auto dir = buildPath(tempDir, format("nano-d-spill-twice-%s", thisProcessID));
+    scope (exit) { setSpillDir(null); if (dir.exists) rmdirRecurse(dir); }
+    setSpillDir(dir);
+    truncateOutput("abcdefghij", 4, "tool-x");
+    truncateOutput("klmnopqrst", 4, "tool-x");
+    auto texts = dirEntries(dir, SpanMode.shallow).array.map!(e => readText(e.name)).array.sort.array;
+    assert(texts == ["abcdefghij", "klmnopqrst"]);
 }

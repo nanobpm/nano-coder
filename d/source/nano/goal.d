@@ -137,6 +137,7 @@ ToolDefinition definition()
         }`));
 }
 
+// rust: goal.rs::parses_arguments_leniently
  unittest // parses arguments leniently
 {
     import std.exception : assertThrown;
@@ -149,6 +150,7 @@ ToolDefinition definition()
     assertThrown(Outcome.fromArgs(parseJSON(`{}`)));
 }
 
+// rust: goal.rs::finds_the_last_successful_report
  unittest // finds the last successful report
 {
     import nano.llm : ToolCall;

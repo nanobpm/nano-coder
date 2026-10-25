@@ -517,6 +517,7 @@ version (unittest)
     private enum DOC = "# Title\n\nSee:\n| k | v |\n|---|---|\n| x | y |\n\nIntro with **bold** and a [link](https://x.dev).\nSecond line.\n\n- one\n- two\n  - nested\n- three\n\n1. first\n2. second\n\n> quoted\n\n```sh\necho hi\n\n| not | table |\n```\n\n| Name | Size |\n|---|--:|\n| alpha | 1 |\n\n---\n\nThe end.";
 }
 
+// rust: markdown.rs::inline_markup_is_styled_and_markers_removed
 unittest // inline markup is styled and markers removed
 {
     import std.algorithm : canFind;
@@ -527,6 +528,7 @@ unittest // inline markup is styled and markers removed
     assert(render("***both***", 80).canFind("\x1b[1;3mboth"));
 }
 
+// rust: markdown.rs::headings_paragraphs_and_rules
 unittest // headings, paragraphs and rules
 {
     import std.algorithm : canFind;
@@ -535,6 +537,7 @@ unittest // headings, paragraphs and rules
     assert(render("### T", 80).canFind("\x1b[1mT"));
 }
 
+// rust: markdown.rs::paragraphs_wrap_and_soft_breaks_reflow
 unittest // paragraphs wrap and soft breaks reflow
 {
     assert(show("one two three\nfour five six seven", 12) == ["one two", "three four", "five six", "seven"]);
@@ -543,6 +546,7 @@ unittest // paragraphs wrap and soft breaks reflow
     foreach (l; show("supercalifragilisticexpialidocious ".replicate(3), 10)) assert(w(l) <= 10, l);
 }
 
+// rust: markdown.rs::links_show_their_url_unless_it_is_the_text
 unittest // links show their URL unless it is the text
 {
     assert(show("see [docs](https://x.dev/d) now", 80) == ["see docs (https://x.dev/d) now"]);
@@ -550,6 +554,9 @@ unittest // links show their URL unless it is the text
     assert(show("![logo](a.png)", 80) == ["[image: logo]"]);
 }
 
+// rust: markdown.rs::list_items_wrap_with_a_hanging_indent
+// rust: markdown.rs::lists_nest_with_bullets_numbers_and_tasks
+// rust: markdown.rs::loose_lists_keep_blank_lines
 unittest // lists nest with bullets, numbers and tasks; hanging indent; loose lists
 {
     auto text = "- one\n- two\n  - inner\n    - deep\n- three\n\n3. c\n4. d\n\n- [ ] todo\n- [x] done";
@@ -559,6 +566,7 @@ unittest // lists nest with bullets, numbers and tasks; hanging indent; loose li
     assert(show("- a\n\n- b\n\n  more", 80) == ["• a", "", "• b", "", "  more"]);
 }
 
+// rust: markdown.rs::code_blocks_are_verbatim_between_dim_fences
 unittest // code blocks are verbatim between dim fences
 {
     assert(show("```rust\nfn main() {\n    **not bold**\n}\n```\nafter", 80) == ["```rust", "fn main() {", "    **not bold**", "}", "```", "", "after"]);
@@ -566,6 +574,8 @@ unittest // code blocks are verbatim between dim fences
     assert(show("```\n" ~ "x".replicate(25) ~ "\n```", 10)[1 .. 4] == ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
 }
 
+// rust: markdown.rs::block_quotes_get_a_bar
+// rust: markdown.rs::controls_in_model_text_are_dropped
 unittest // block quotes get a bar; controls are dropped
 {
     import std.algorithm : canFind;
@@ -575,6 +585,12 @@ unittest // block quotes get a bar; controls are dropped
     assert(!render("```\n\x1b]0;title\x07\n```", 80).canFind("\x1b]"));
 }
 
+// rust: markdown.rs::a_table_may_follow_a_paragraph_line_directly
+// rust: markdown.rs::ragged_table_rows_are_padded_and_trimmed
+// rust: markdown.rs::table_cells_handle_escapes_code_markup_and_wide_chars
+// rust: markdown.rs::tables_in_code_and_lists
+// rust: markdown.rs::tables_render_as_grids_with_alignment
+// rust: markdown.rs::wide_tables_wrap_then_stack
 unittest // tables
 {
     import std.algorithm : canFind, all;

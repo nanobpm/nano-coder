@@ -518,6 +518,7 @@ ToolDefinition[] definitions()
     ];
 }
 
+// rust: plan.rs::adds_updates_and_tracks_what_is_next
  unittest // adds_updates_and_tracks_what_is_next
 {
     Plan plan;
@@ -542,6 +543,7 @@ ToolDefinition[] definitions()
     assert(plan.render(false, size_t.max).endsWith("All items are done.\n"));
 }
 
+// rust: plan.rs::rejects_bad_calls_without_changing_the_plan
  unittest // rejects_bad_calls_without_changing_the_plan
 {
     import std.exception : collectExceptionMsg, assertThrown;
@@ -565,6 +567,7 @@ ToolDefinition[] definitions()
     assertThrown(Plan.fromJSON(parseJSON(`{"items": [{"id": 1, "title": "x", "status": "pending", "after": [3]}]}`)));
 }
 
+// rust: plan.rs::context_note_drops_finished_notes_first_and_round_trips_through_acp
  unittest // context_note_drops_finished_notes_first_and_round_trips_through_acp
 {
     import std.array : replicate;

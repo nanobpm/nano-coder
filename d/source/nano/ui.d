@@ -128,6 +128,8 @@ string providersListing(const ProviderConfig[string] providers, string defaultPr
     return out_;
 }
 
+// rust: settings.rs::derived_endpoint_source_distinguishes_muse_credential_lanes
+// rust: vision.rs::built_in_openai_assumption_is_scoped_to_the_first_party_api
 unittest
 {
     import std.exception : collectExceptionMsg;

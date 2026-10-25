@@ -750,6 +750,7 @@ unittest // cap_keeps_truncated_body_within_max
     assert(out_.length <= 256 && out_.canFind("truncated"));
 }
 
+// rust: skills.rs::parses_front_matter_blocks_and_quotes
 unittest // parses_front_matter_blocks_and_quotes
 {
     string[2][] f;
@@ -760,6 +761,7 @@ unittest // parses_front_matter_blocks_and_quotes
     assert(!f.length && body_ == "# No front matter\n");
 }
 
+// rust: skills.rs::discovers_repository_and_user_skills_with_precedence
 unittest // discovers_repository_and_user_skills_with_precedence
 {
     auto dir = tmpRoot("discover");
@@ -797,6 +799,7 @@ unittest // no_skills_means_no_index
     assert(s.empty && s.renderIndex == "");
 }
 
+// rust: skills.rs::loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
 unittest // loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
 {
     auto dir = tmpRoot("lock");
@@ -831,6 +834,7 @@ unittest // loads_ai_lock_skills_and_plugin_skills_by_fetching_into_the_cache
     assert(Skills.discoverIn(repo, c, locs(dir)).names == ["lint", "triage"]);
 }
 
+// rust: skills.rs::prefers_the_spm_store_and_guards_untrusted_lock_entries
 unittest // prefers_the_spm_store_and_guards_untrusted_lock_entries
 {
     import std.array : replicate;
@@ -872,6 +876,7 @@ unittest // prefers_the_spm_store_and_guards_untrusted_lock_entries
     assert(w.canFind("`other`: host \"evil.example\" is not in skills.allowed_hosts"), w);
 }
 
+// rust: skills.rs::warns_about_ai_json_without_a_lock
 unittest // warns_about_ai_json_without_a_lock
 {
     auto dir = tmpRoot("manifest");
@@ -881,6 +886,8 @@ unittest // warns_about_ai_json_without_a_lock
     assert(Skills.discoverIn(dir, c, locs(dir)).warnings[0].canFind("ai.json has no ai.lock"));
 }
 
+// rust: skills.rs::parses_git_hosts
+// rust: skills.rs::store_key_matches_spm
 unittest // parses_git_hosts, store_key_matches_spm
 {
     import std.array : replicate;

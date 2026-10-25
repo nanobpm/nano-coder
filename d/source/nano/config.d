@@ -518,6 +518,7 @@ unittest
     assert(a.model == "c9" && a.config.baseUrl == "https://api.anthropic.com/v1");
 }
 
+// rust: config.rs::a_retired_legacy_renderer_setting_still_loads_with_a_notice
 unittest // a retired `renderer = "legacy"` still loads, with a notice
 {
     import std.algorithm : canFind;
@@ -533,6 +534,8 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
         == `Note: renderer = "legacy" is no longer available; using the frame renderer (remove the setting)`);
 }
 
+// rust: agent.rs::temperature_resolves_against_the_live_client
+// rust: providers/mod.rs::copilot_reasoning_models_default_to_reasoning_replay
  unittest
 {
     import nano.toml : parseToml;
@@ -549,6 +552,8 @@ unittest // a retired `renderer = "legacy"` still loads, with a notice
     assert(resolve(c, "deepseek/deepseek-reasoner").replayReasoning);
 }
 
+// rust: providers/mod.rs::qwen_and_kimi_presets
+// rust: settings.rs::editing_qwen_to_the_token_plan_stores_the_endpoint_and_key_variable
  unittest
 {
     import std.algorithm : canFind;

@@ -85,6 +85,9 @@ enum planPromptNote = "\n\nYou are in PLAN MODE: read-only. Do not create, modif
     ~ "anything, and do not run mutating commands. Analyse, read files, and produce a plan or answer. "
     ~ "Mutating tools are disabled; report_outcome and the plan tools remain available.";
 
+// rust: mode.rs::shift_tab_cycles_normal_plan_auto
+// rust: mode.rs::plan_allows_read_only_search_but_not_writes
+// rust: mode.rs::parses_mode_names
 unittest
 {
     assert(planAllows("grep") && planAllows("glob") && planAllows("read_file"));

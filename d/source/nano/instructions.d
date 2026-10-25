@@ -897,6 +897,7 @@ version (unittest)
     }
 }
 
+// rust: instructions.rs::loads_root_to_leaf_with_fallbacks_and_nested_files_once
 unittest // root to leaf, fallbacks, nested files once
 {
     import std.file : rmdirRecurse, mkdirRecurse;
@@ -922,6 +923,7 @@ unittest // root to leaf, fallbacks, nested files once
     assert(p.nestedFor("/elsewhere/file", root) is null);
 }
 
+// rust: instructions.rs::outside_a_repository_only_the_working_directory_counts
 unittest // outside a repository only the working directory counts; per-file cap
 {
     import std.file : rmdirRecurse, mkdirRecurse;
@@ -936,6 +938,9 @@ unittest // outside a repository only the working directory counts; per-file cap
     assert(p.loaded.length == 1 && p.loaded[0].text.canFind("[... truncated") && p.loaded[0].text.canFind("read_file"));
 }
 
+// rust: instructions.rs::a_committed_instruction_file_symlinked_outside_the_repo_is_skipped
+// rust: instructions.rs::loaded_paths_keeps_a_scoped_rule_after_it_attaches
+// rust: instructions.rs::user_files_come_first_and_local_files_follow_the_main_file
 unittest // user files first; local files follow the main file
 {
     import std.file : rmdirRecurse;
@@ -961,6 +966,13 @@ unittest // user files first; local files follow the main file
     assert(r.canFind("## CLAUDE.local.md (personal, not committed)") && r.canFind("style.md (rule)"));
 }
 
+// rust: instructions.rs::a_closing_fence_must_match_the_openers_blockquote_container
+// rust: instructions.rs::code_span_state_is_preserved_across_line_breaks
+// rust: instructions.rs::fence_close_requires_a_bare_marker_and_small_indent
+// rust: instructions.rs::html_comments_are_stripped_outside_code_blocks
+// rust: instructions.rs::imports_inside_blockquote_containers_are_skipped_like_top_level
+// rust: instructions.rs::longer_fences_are_not_closed_by_shorter_inner_runs
+// rust: instructions.rs::multi_backtick_code_spans_skip_their_contents
 unittest // import scanning: code spans, fences, blockquotes
 {
     assert(importRefs("See `` @a.md `` and @b.md") == ["b.md"]);
@@ -986,6 +998,10 @@ unittest // import scanning: code spans, fences, blockquotes
 
 private string strip_(string s) { return stripHtmlComments(s); }
 
+// rust: instructions.rs::front_matter_forms
+// rust: instructions.rs::inline_paths_keep_brace_groups
+// rust: instructions.rs::inline_paths_with_braces_match
+// rust: instructions.rs::split_top_level_adversarial
 unittest // front matter and brace groups
 {
     bool has;
@@ -1011,6 +1027,7 @@ unittest // front matter and brace groups
     foreach (v; ["}", "{", "a}", "{a", "\"a,b", "a,\"b", "'x,y',z", "{a,{b,c}},d", "a,,b", "", ","]) splitTopLevel(v);
 }
 
+// rust: instructions.rs::agents_md_mentions_are_not_imports
 unittest // imports: Claude files only, once, inside the repository, four levels
 {
     import std.file : rmdirRecurse;
@@ -1051,6 +1068,8 @@ unittest // a committed file symlinked outside the repository is skipped
     assert(!p.loaded.length && p.warnings.length && p.warnings[0].canFind("links outside the repository"));
 }
 
+// rust: instructions.rs::scoped_rule_imports_are_expanded_and_deduplicated
+// rust: instructions.rs::scoped_rules_attach_to_matching_files_once_per_compaction
 unittest // scoped rules attach once per compaction; imports resolve on attach
 {
     import std.file : rmdirRecurse;

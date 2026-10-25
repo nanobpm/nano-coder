@@ -919,7 +919,7 @@ class Console : AgentEvents
             if (name == "history_search") s.historySearches++;
             if (name == "history_read") s.historyReads++;
         });
-        meter.reset();
+        meter.reset(nowMs);
         if (quiet || quietTool(call)) return;
         endLine();
         writeln(stamp(), color ? "\x1b[38;5;114m●\x1b[0m " : "● ", bold(call.name), " ", dim(summary(call)));
@@ -942,6 +942,14 @@ class Console : AgentEvents
 
     void usage(TokenUsage u)
     {
+        // The call's final rate (reported output over the generation), then a
+        // fresh meter for the next call so its rate isn't diluted by this one.
+        if (gFrame)
+        {
+            auto rate = meter.finish(u.outputTokens, nowMs);
+            if (rate > 0) updateStatus((ref Stats s) { s.tokensPerSec = rate; });
+        }
+        meter.reset(nowMs);
         if (afterStep !is null) afterStep();
     }
     void userMessage(string text)

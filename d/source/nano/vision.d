@@ -166,6 +166,8 @@ bool assumesOpenaiVision(string model)
     return false;
 }
 
+// rust: vision.rs::built_in_anthropic_assumption_is_scoped_to_the_first_party_api
+// rust: vision.rs::override_wins_over_detection
 unittest
 {
     import std.json : parseJSON;

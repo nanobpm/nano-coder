@@ -370,6 +370,7 @@ string fit(string plain, size_t cols, const Style[] styles)
     return out_ ~ "\x1b[0m";
 }
 
+// rust: commands.rs::closest_skips_the_matrix_for_oversized_input
 unittest // rejection with did-you-mean, path hint and // escape
 {
     assert(rejection("/help") is null && rejection("hello") is null && rejection("//etc/hosts") is null);

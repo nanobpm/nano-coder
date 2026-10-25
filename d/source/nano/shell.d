@@ -984,12 +984,14 @@ version (unittest)
     }
 }
 
+// rust: shell.rs::splits_on_operators
 unittest // splits_on_operators
 {
     assert(words("ls -la && rm -rf / ; echo 'a b' | wc -l || true & sleep 1\ngit status") ==
         [["ls", "-la"], ["rm", "-rf", "/"], ["echo", "a b"], ["wc", "-l"], ["true"], ["sleep", "1"], ["git", "status"]]);
 }
 
+// rust: shell.rs::unquotes_and_marks_dynamic_and_glob
 unittest // unquotes_and_marks_dynamic_and_glob
 {
     auto w = parse(`rm -rf "$HOME"/x \* '*' * ${D:?}/y`)[0].words;
@@ -1001,6 +1003,7 @@ unittest // unquotes_and_marks_dynamic_and_glob
     assert(w[6].text == "${D:?}/y");
 }
 
+// rust: shell.rs::parses_substitutions_as_commands
 unittest // parses_substitutions_as_commands
 {
     assert(words(`echo "$(rm -rf / )" ` ~ "`mkfs /dev/sda`" ~ ` $(( 1 + 2 )) <(dd of=/dev/sda)`) ==
@@ -1008,6 +1011,7 @@ unittest // parses_substitutions_as_commands
          ["echo", "$(...)", "$(...)", "$(( 1 + 2 ))", "/dev/fd/63"]]);
 }
 
+// rust: shell.rs::nested_command_substitutions_are_inspected
 unittest // nested_command_substitutions_are_inspected
 {
     assert(words(`echo $(( $(rm -rf /) ))`) == [["rm", "-rf", "/"], ["echo", "$(( $(rm -rf /) ))"]]);
@@ -1015,6 +1019,7 @@ unittest // nested_command_substitutions_are_inspected
     assert(words("echo \"${X:-`mkfs /dev/sda`}\"") == [["mkfs", "/dev/sda"], ["echo", "${X:-`mkfs /dev/sda`}"]]);
 }
 
+// rust: shell.rs::records_redirects_and_heredocs
 unittest // records_redirects_and_heredocs
 {
     auto p = parse("cat > /dev/sda 2>&1 <<EOF\nDROP DATABASE x;\nEOF\necho done");
@@ -1028,6 +1033,7 @@ unittest // records_redirects_and_heredocs
     assert(p[1].words[0].text == "echo");
 }
 
+// rust: shell.rs::handles_subshells_groups_and_case
 unittest // handles_subshells_groups_and_case
 {
     assert(words("(cd x && rm -rf y)") == [["cd", "x"], ["rm", "-rf", "y"]]);
@@ -1035,6 +1041,7 @@ unittest // handles_subshells_groups_and_case
     assert(words("case $x in a|b) rm a ;; *) echo no ;; esac") == [["rm", "a"], ["echo", "no"], ["esac"]]);
 }
 
+// rust: shell.rs::fails_closed_on_malformed_input
 unittest // fails_closed_on_malformed_input
 {
     import std.array : replicate;
@@ -1043,6 +1050,7 @@ unittest // fails_closed_on_malformed_input
     assert(fails("echo " ~ "$(".replicate(40) ~ ")".replicate(40)));
 }
 
+// rust: shell.rs::unquoted_brace_expansion_splits
 unittest // unquoted_brace_expansion_splits
 {
     auto brace = wordAt("sort -T {/tmp,-oout} input", 0, 2);
@@ -1052,6 +1060,7 @@ unittest // unquoted_brace_expansion_splits
     assert(!wordAt("echo '{a,b}'", 0, 1).splits);
 }
 
+// rust: shell.rs::nested_and_substring_expansions_assign
 unittest // nested_and_substring_expansions_assign
 {
     assert(wordAt(`echo "${x:-$((PATH=0))}"`, 0, 1).assigns);
@@ -1061,6 +1070,7 @@ unittest // nested_and_substring_expansions_assign
     assert(!wordAt(`echo "${text:0:1}"`, 0, 1).assigns);
 }
 
+// rust: shell.rs::logical_operators_stay_inside_conditional
 unittest // logical_operators_stay_inside_conditional
 {
     import std.algorithm : any;
@@ -1071,6 +1081,7 @@ unittest // logical_operators_stay_inside_conditional
     assert(cmds.any!(s => s.words.any!(w => w.text == "||")));
 }
 
+// rust: shell.rs::brace_expansion_preserves_inner_parsing
 unittest // brace_expansion_preserves_inner_parsing
 {
     import std.algorithm : any;
@@ -1080,6 +1091,7 @@ unittest // brace_expansion_preserves_inner_parsing
     assert(wordAt(`echo {a,"b,c"}`, 0, 1).splits);
 }
 
+// rust: shell.rs::brace_expansion_marks_dynamic
 unittest // brace_expansion_marks_dynamic
 {
     auto b = wordAt("sort {input,-oresult} input", 0, 1);
@@ -1087,6 +1099,7 @@ unittest // brace_expansion_marks_dynamic
     assert(!wordAt("sort {input} input", 0, 1).dynamic);
 }
 
+// rust: shell.rs::substring_length_arithmetic_assigns
 unittest // substring_length_arithmetic_assigns
 {
     assert(wordAt(`echo "${text:0:PATH=0}"`, 0, 1).assigns);
@@ -1094,6 +1107,7 @@ unittest // substring_length_arithmetic_assigns
     assert(!wordAt(`echo "${text:0:1}"`, 0, 1).assigns);
 }
 
+// rust: shell.rs::backtick_inside_brace_splits
 unittest // backtick_inside_brace_splits
 {
     import std.algorithm : find;
@@ -1103,6 +1117,7 @@ unittest // backtick_inside_brace_splits
     assert(outer[0].words[2].splits && outer[0].words[2].dynamic);
 }
 
+// rust: shell.rs::brace_range_marks_dynamic
 unittest // brace_range_marks_dynamic
 {
     auto a = wordAt("printf -v{c..d} '%s' /etc", 0, 1);
@@ -1112,6 +1127,7 @@ unittest // brace_range_marks_dynamic
     assert(!wordAt("sort {input} input", 0, 1).dynamic);
 }
 
+// rust: shell.rs::heredoc_body_assigns_detects_expansions
 unittest // heredoc_body_assigns_detects_expansions
 {
     assert(heredocBodyAssigns("${text:PATH=0:1}\n"));
@@ -1123,6 +1139,7 @@ unittest // heredoc_body_assigns_detects_expansions
     assert(!heredocBodyAssigns("\\${d:=/etc}\n"));
 }
 
+// rust: shell.rs::indirect_expansion_assigns
 unittest // indirect_expansion_assigns
 {
     assert(wordAt(`echo "${!ref:=/etc}"`, 0, 1).assigns);
@@ -1133,6 +1150,7 @@ unittest // indirect_expansion_assigns
     assert(!heredocBodyAssigns("${!ref}\n"));
 }
 
+// rust: shell.rs::nested_brace_expansion_marks_dynamic
 unittest // nested_brace_expansion_marks_dynamic
 {
     auto c = wordAt("sort -T -o{{a,b}} input", 0, 2);
@@ -1142,6 +1160,7 @@ unittest // nested_brace_expansion_marks_dynamic
     assert(!wordAt("sort {{a}} input", 0, 1).dynamic);
 }
 
+// rust: shell.rs::quoted_default_nested_list_splits
 unittest // quoted_default_nested_list_splits
 {
     assert(wordAt(`sort -T "${missing:-"$@"}" input`, 0, 2).splits);
@@ -1160,6 +1179,7 @@ unittest // quoted_default_nested_list_splits
     assert(!wordAt(`sort -T "${outer:-${#arr[@]}}" input`, 0, 2).splits);
 }
 
+// rust: shell.rs::brace_wildcard_keeps_glob_metadata
 unittest // brace_wildcard_keeps_glob_metadata
 {
     auto s = wordAt("sort -T -o{*} input", 0, 2);

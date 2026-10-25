@@ -269,6 +269,7 @@ struct SseParser
     }
 }
 
+// rust: providers/mod.rs::parses_events_split_across_chunks
 unittest
 {
     string[] got;

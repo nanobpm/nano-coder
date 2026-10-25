@@ -473,6 +473,7 @@ string listRow(const ref Summary s, SysTime now)
     return oneLine(s.id) ~ "  " ~ line;
 }
 
+// rust: providers/openai.rs::parses_tool_calls_and_bad_arguments
 unittest
 {
     auto dir = buildPath(tempDir, "nano-coder-d-session-test");
@@ -524,6 +525,8 @@ unittest
     assertThrown(restore(buildPath(dir, "v9.jsonl")));
 }
 
+// rust: session_index.rs::set_title_does_not_replace_an_existing_title
+// rust: session_index.rs::title_source_skips_terse_prompts
 unittest
 {
     assert(isTerse("do it") && isTerse("/model x") && !isTerse("Fix the flaky deploy test"));

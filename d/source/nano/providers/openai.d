@@ -715,6 +715,9 @@ void ollamaWindow(JSONValue ps, JSONValue show, string model, ref Capabilities c
     }
 }
 
+// rust: providers/openai.rs::detects_window_from_models_listing
+// rust: providers/openai.rs::ollama_ps_window_survives_a_failed_show_probe
+// rust: providers/openai.rs::uses_ollama_num_ctx_not_the_model_maximum
 unittest
 {
     Capabilities c;

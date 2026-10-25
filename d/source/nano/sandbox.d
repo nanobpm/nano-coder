@@ -371,6 +371,7 @@ version (unittest)
     }
 }
 
+// rust: sandbox.rs::parses_modes
  unittest
 {
     assert(parseMode("workspace") == SandboxMode.workspace);
@@ -464,6 +465,7 @@ version (HasOsSandbox) unittest // extra writable paths
     foreach (r; c.writableRoots(ws)) assert(!within(r, canonicalize(fake)), r);
 }
 
+// rust: sandbox.rs::linked_worktree_git_dirs_are_granted
  unittest // a linked worktree's git dirs are granted
 {
     import std.file : write, mkdirRecurse;

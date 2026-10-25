@@ -154,6 +154,7 @@ Duration parseRetryAfterMessage(string message)
     return m[2].toLower[0] == 'm' ? usecsOf(amount * 1e3) : usecsOf(amount * 1e6);
 }
 
+// rust: providers/retry.rs::classifies_retryable_errors
 unittest
 {
     alias E = ErrorInfo;
@@ -166,6 +167,7 @@ unittest
     assert(retryable(E(200, "server_error"), s));
 }
 
+// rust: providers/retry.rs::parses_error_bodies
 unittest
 {
     auto openai = ErrorInfo.fromBody(429,
@@ -177,6 +179,8 @@ unittest
     assert(ErrorInfo.fromBody(400, `{"error":"plain"}`).message == "plain");
 }
 
+// rust: providers/retry.rs::honours_retry_after_hints
+// rust: providers/retry.rs::backs_off_exponentially_with_jitter
  unittest
 {
     // 2026-01-01T00:00:00Z
