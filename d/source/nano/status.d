@@ -339,6 +339,11 @@ unittest
     assert(abs(m.finish(200, 5000) - 66.67) < 0.01);
 }
 
+// rust: status.rs::shows_output_rate_only_while_generating
+// rust: status.rs::a_long_cwd_is_elided_before_other_segments_are_dropped
+// rust: status.rs::elide_path_drops_middle_directories_first
+// rust: status.rs::drops_low_priority_segments_when_narrow
+// rust: status.rs::renders_all_segments_when_wide
 unittest
 {
     import std.algorithm : canFind;

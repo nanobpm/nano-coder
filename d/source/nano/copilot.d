@@ -66,6 +66,7 @@ bool isReasoningModel(string model) pure
     return true;
 }
 
+// rust: providers/github_copilot.rs::catalogs_model_endpoints
 unittest
 {
     assert(apiForModel("claude-sonnet-4.5") == CopilotApi.messages);

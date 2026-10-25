@@ -62,6 +62,7 @@ bool parseCompactArgs(string args, out CompactionMode mode, out string focus)
     return has;
 }
 
+// rust: commands.rs::compact_args_take_an_optional_mode_then_focus
 unittest
 {
     CompactionMode m;
@@ -371,6 +372,9 @@ string fit(string plain, size_t cols, const Style[] styles)
 }
 
 // rust: commands.rs::closest_skips_the_matrix_for_oversized_input
+// rust: commands.rs::oversized_words_skip_edit_distance_and_suggest_nothing
+// rust: commands.rs::slash_slash_escapes_a_prompt
+// rust: commands.rs::unknown_commands_are_rejected_with_a_suggestion
 unittest // rejection with did-you-mean, path hint and // escape
 {
     assert(rejection("/help") is null && rejection("hello") is null && rejection("//etc/hosts") is null);
@@ -384,6 +388,7 @@ unittest // rejection with did-you-mean, path hint and // escape
     assert(rejection("/" ~ "x".replicateStr(5000)).canFind("Unknown"));
 }
 
+// rust: commands.rs::tab_completes_unique_commands_and_common_prefixes
 unittest // Tab completion
 {
     assert(complete("/he") == "/help");
@@ -395,6 +400,10 @@ unittest // Tab completion
     assert(complete("/") is null);
 }
 
+// rust: commands.rs::help_lists_every_command
+// rust: commands.rs::suggestion_rows_fit_and_highlight_the_typed_part
+// rust: commands.rs::rows_fit_the_terminal
+// rust: commands.rs::slash_lists_everything_and_typing_narrows_it
 unittest // menu rows
 {
     auto rows = menu("/m", 80, 10);
@@ -409,6 +418,8 @@ unittest // menu rows
 
 string replicateStr(string s, size_t n) pure nothrow { string r; foreach (_; 0 .. n) r ~= s; return r; }
 
+// rust: commands.rs::suggestions_narrow_on_the_argument_prefix
+// rust: commands.rs::complete_line_handles_arguments
 unittest // argument type-ahead (Rust suggestions / complete_line / suggestion_menu)
 {
     import std.algorithm : map, equal;

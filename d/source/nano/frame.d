@@ -662,3 +662,40 @@ unittest
     assert(c.since == 9000, "a second resume doesn't restart the clock");
     assert(c.elapsed(31_000) == 24_000);
 }
+
+// rust: frame.rs::sanitize_rejects_malformed_sgr_parameters, frame.rs::unsafe_terminal_controls_are_stripped_from_layout
+// rust: frame.rs::width_counts_terminal_cells_not_scalars, frame.rs::wrapping_preserves_ansi_but_not_its_width
+// rust: frame.rs::tabs_are_expanded_so_rows_never_overflow_the_width
+// rust: frame.rs::physical_row_helpers_count_native_wraps
+// rust: frame.rs::line_physical_rows_counts_wide_glyphs_that_cannot_start_in_the_last_column
+// rust: frame.rs::diffs_frames_line_by_line, frame.rs::debouncer_waits_for_quiet
+unittest
+{
+    import std.algorithm : all, canFind;
+    import std.array : replicate;
+    assert(sanitize("prefix\x1b[\r31mOVERWRITE") == "prefixOVERWRITE");
+    assert(sanitize("a\x1b[31\x08mb") == "ab" && sanitize("a\x1b[31 mb") == "ab");
+    assert(sanitize("\x1b[1;38:5:200mhi\x1b[0m") == "\x1b[1;38:5:200mhi\x1b[0m");
+    foreach (s; ["a\x1b[2Jb", "a\x1b[Hb", "a\rb", "a\x08b", "a\x07b"]) assert(sanitize(s) == "ab", s);
+    assert(wrapAnsi(sanitize("evil\x1b[2K\x1b[1;1Hclear"), 40).all!(l => !l.canFind("\x1b") && !l.canFind("\r")));
+    assert(visibleWidth("你好") == 4 && visibleWidth("e\u0301") == 1);
+    assert(wrapAnsi("你好世界你好世界", 5).all!(l => visibleWidth(l) <= 5));
+    assert(visibleWidth(fit("你好世界", 5)) <= 5);
+    auto w = wrapAnsi("\x1b[32mhello world again\x1b[0m", 11);
+    assert(w.length == 2 && w[0].canFind("\x1b[32m") && visibleWidth(w[0]) == 11);
+    assert(visibleWidth(sanitize("\tx\ty")) == 17);
+    assert(linePhysicalRows("", 10) == 1 && linePhysicalRows("1234567890", 10) == 1);
+    assert(linePhysicalRows("12345678901", 10) == 2 && linePhysicalRows("x".replicate(25), 10) == 3);
+    assert(linePhysicalRows("\x1b[2m12345\x1b[0m", 10) == 1);
+    assert(physicalRows(["abc", "x".replicate(21), ""], 10) == 5);
+    auto line = "1\u4e16\u4e16\u4e16\u4e16\u4e162\u4e16\u4e16\u4e16\u4e16";
+    assert(visibleWidth(line) == 20 && linePhysicalRows(line, 10) == 3);
+    assert(linePhysicalRows("\x1b[2m" ~ line ~ "\x1b[0m", 10) == 3 && linePhysicalRows("\u4e16", 1) == 1);
+    assert(firstDiff(["one", "two", "three"], ["one", "TWO", "three"]) == 1);
+    assert(firstDiff(["one", "two"], ["one", "two"]) < 0);
+    assert(firstDiff(["one", "two"], ["one", "two", "three"]) == 2);
+    auto d = Debouncer(40);
+    assert(d.ready(0));
+    d.record(0);
+    assert(!d.ready(10) && d.ready(40));
+}

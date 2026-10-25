@@ -1073,6 +1073,8 @@ unittest // a committed file symlinked outside the repository is skipped
 
 // rust: instructions.rs::scoped_rule_imports_are_expanded_and_deduplicated
 // rust: instructions.rs::scoped_rules_attach_to_matching_files_once_per_compaction
+// rust: instructions.rs::on_demand_paths_excludes_already_attached_rules
+// rust: instructions.rs::rule_with_explicit_empty_paths_is_skipped_not_loaded_globally
 unittest // scoped rules attach once per compaction; imports resolve on attach
 {
     import std.file : rmdirRecurse;

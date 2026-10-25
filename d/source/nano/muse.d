@@ -504,6 +504,7 @@ string[] listableModels(const JSONValue catalog)
     return ids.sort.uniq.array;
 }
 
+// rust: providers/muse.rs::slow_down_never_reduces_the_poll_interval
 unittest
 {
     auto e = Endpoints.forBases("https://auth.example", "https://mint.example");
@@ -513,6 +514,9 @@ unittest
     assert("User-Agent" !in h && h["x-client-id"] == "tbh:exec");
 }
 
+// rust: providers/muse.rs::mint_refusal_surfaces_the_subscription_gate
+// rust: providers/muse.rs::mint_refusal_relays_the_payment_remediation_url
+// rust: providers/muse.rs::mint_refusal_never_leaks_the_api_key
 unittest
 {
     auto refused = mintRefusal(403, parseJSON(`{"api_key":"sk-secret","require_payment":true,"action_url":"https://pay"}`));
@@ -521,6 +525,7 @@ unittest
     assert(mintRefusal(500, JSONValue.init).canFind("no usable API key"));
 }
 
+// rust: providers/muse.rs::freshness_tracks_renewal
 unittest
 {
     OauthGrant g = OauthGrant("a", "r", Nullable!long(100));
@@ -530,6 +535,9 @@ unittest
     assert(isFresher(OauthGrant("b", "r"), g) && !isFresher(OauthGrant("b", "r"), OauthGrant("a", "r")));
 }
 
+// rust: providers/muse.rs::parses_stored_credentials
+// rust: providers/muse.rs::stale_client_adopts_a_peers_renewed_grant
+// rust: providers/muse.rs::persist_rotated_only_writes_for_the_same_login
 unittest
 {
     import std.file : tempDir, rmdirRecurse, exists, getAttributes;
