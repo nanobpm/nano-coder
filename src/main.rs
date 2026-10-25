@@ -2110,6 +2110,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    // The working directory as a real path: the trust decision and project-hook
+    // loading must resolve the actual directory, not a display-string
+    // round-trip that rewrites non-UTF-8 bytes to replacement characters and so
+    // points resource detection at a different (empty) path.
+    let cwd_path = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
     if args.list_sessions {
         resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
         return Ok(());
@@ -2169,11 +2174,8 @@ async fn main() -> Result<()> {
     // of the agent; user-level skills/hooks and nano's own `[hooks]` are
     // unaffected. `--acp` defers to the client; `--yolo` trusts without asking.
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    let trusted = trust::decide(
-        std::path::Path::new(&cwd),
-        &config.skills,
-        &trust::Options { yolo: args.yolo, acp: args.acp, interactive },
-    );
+    let trusted =
+        trust::decide(&cwd_path, &config.skills, &trust::Options { yolo: args.yolo, acp: args.acp, interactive });
     if !trusted {
         config.skills.dirs.clear();
         config.skills.ai_lock = false;
@@ -2191,7 +2193,7 @@ async fn main() -> Result<()> {
     // Register tools and hooks
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
-    agent.load_claude_hooks(std::path::Path::new(&cwd));
+    agent.load_claude_hooks(&cwd_path);
 
     if args.acp {
         // ACP headless mode; sessions start with session/new or session/load.

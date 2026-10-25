@@ -15,10 +15,14 @@
 //! own `[hooks]`, and instruction files are never gated.
 //!
 //! The decision:
+//! - `--yolo` and `--acp` trust without asking (unconditionally, even for an
+//!   empty repository);
 //! - a root already recorded in the trusted-projects file is trusted (even
 //!   non-interactively, with no question);
-//! - a root with nothing to gate is trusted (loading is a no-op);
-//! - `--yolo` and `--acp` trust without asking;
+//! - a root with nothing to gate is left untrusted but is *not* asked about —
+//!   there is no question worth asking, yet no trust is granted either, so a
+//!   skill or hook that appears later (a checkout, a tool-created file) is
+//!   gated on the next `/restart` or hook reload;
 //! - an interactive start asks, defaulting to no; a `yes` is remembered once;
 //! - a non-interactive start (piped stdio, `-p`) leaves an untrusted root
 //!   unloaded and prints one stderr note.
@@ -123,18 +127,24 @@ fn decide_root(
     trust_file: Option<&Path>,
     asker: &mut dyn Asker,
 ) -> bool {
+    // `--yolo` / `--acp` trust without asking (and without remembering). These
+    // bypasses are unconditional: they hold even for an empty repository, so a
+    // caller that explicitly opted out of the gate is never gated.
+    if opts.yolo || opts.acp {
+        return true;
+    }
     // A remembered root is trusted with no question, even non-interactively.
     if is_remembered(root, trust_file) {
         return true;
     }
     let gated = Gated::detect(root, skills);
-    // Nothing to gate: loading is a no-op, so never ask.
+    // Nothing to gate right now: there is no question worth asking, but an
+    // unapproved root stays untrusted rather than being granted trust. A later
+    // `/restart` or hook reload re-detects, so a skill or hook that appears
+    // after this decision (a checkout, a tool-created file) is gated then
+    // instead of riding on a blanket "empty means trusted" grant.
     if gated.is_empty() {
-        return true;
-    }
-    // `--yolo` / `--acp` trust without asking (and without remembering).
-    if opts.yolo || opts.acp {
-        return true;
+        return false;
     }
     // Non-interactive: do not load, and say so once on stderr.
     if !opts.interactive {
@@ -197,15 +207,28 @@ fn is_yes(answer: &str) -> bool {
 
 /// Whether `dir` contains a `SKILL.md` within [`MAX_SCAN_DEPTH`], i.e. carries
 /// at least one workspace skill.
+///
+/// Each directory is canonicalized before it is scanned, matching how skill
+/// *discovery* resolves paths (`skills::Skills::add_dir`). Scanning the
+/// canonical target rather than the symlink prefix keeps detection in lockstep
+/// with discovery: a repository cannot hide a skill behind a symlink chain that
+/// a prefix-retaining walk would fail to descend (e.g. by exceeding the OS
+/// symlink limit) while discovery later resolves and loads it.
 fn dir_has_skill(dir: &Path) -> bool {
     fn scan(dir: &Path, depth: usize) -> bool {
+        // Resolve this directory to its canonical target before inspecting it,
+        // so detection follows the same symlinks discovery does.
+        let dir = match dir.canonicalize() {
+            Ok(real) => real,
+            Err(_) => return false,
+        };
         if dir.join(SKILL_FILE).is_file() {
             return true;
         }
         if depth >= MAX_SCAN_DEPTH {
             return false;
         }
-        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        let Ok(entries) = std::fs::read_dir(&dir) else { return false };
         entries.filter_map(|e| e.ok()).any(|e| e.path().is_dir() && scan(&e.path(), depth + 1))
     }
     dir.is_dir() && scan(dir, 0)
@@ -301,14 +324,64 @@ mod tests {
     }
 
     #[test]
-    fn no_gated_resources_means_no_question() {
+    fn no_gated_resources_stays_gated_without_a_question() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let trust = dir.path().join("trusted-projects");
         let mut asker = ScriptedAsker::yes();
         let trusted = decide_root(&root, &skills_cfg(), &opts(true, false, false), Some(&trust), &mut asker);
-        assert!(trusted, "nothing to gate → trusted");
+        assert!(!trusted, "an empty, unapproved root is not granted trust");
         assert!(!asker.asked, "no question when there is nothing to gate");
+        assert!(!trust.exists(), "nothing is remembered for an empty root");
+    }
+
+    #[test]
+    fn yolo_and_acp_trust_even_an_empty_root() {
+        // The explicit bypasses are unconditional: they hold even when there is
+        // currently nothing to gate.
+        for opts in [opts(true, true, false), opts(false, false, true), opts(false, true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let trust = dir.path().join("trusted-projects");
+            let mut asker = ScriptedAsker::with(None);
+            let trusted = decide_root(&root, &skills_cfg(), &opts, Some(&trust), &mut asker);
+            assert!(trusted, "yolo/acp bypass the gate even for an empty root");
+            assert!(!asker.asked);
+        }
+    }
+
+    #[test]
+    fn remembered_empty_root_is_trusted() {
+        // Explicit consent recorded earlier wins over the empty-root default.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        std::fs::write(&trust, format!("{}\n", root.display())).unwrap();
+        let mut asker = ScriptedAsker::with(None);
+        let trusted = decide_root(&root, &skills_cfg(), &opts(false, false, false), Some(&trust), &mut asker);
+        assert!(trusted, "a remembered root is trusted even when empty");
+        assert!(!asker.asked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_follows_symlinked_skill_dirs() {
+        // A skill reachable only through a symlinked directory must still be
+        // detected: discovery canonicalizes the directory before descending, so
+        // detection must too, or a symlink chain could hide a skill from the
+        // gate that discovery later loads.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // The real skill lives outside the configured `.claude/skills` prefix.
+        let real = root.join("real/x");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("SKILL.md"), "# x\n").unwrap();
+        // `.claude/skills` is a symlink to the directory holding the skill.
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        symlink(root.join("real"), root.join(".claude/skills")).unwrap();
+        let gated = Gated::detect(&root, &skills_cfg());
+        assert!(gated.skills, "a skill behind a symlinked skills dir is still gated");
     }
 
     #[test]
