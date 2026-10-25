@@ -223,34 +223,80 @@ mod interactive {
         let mut reader = pty.master.try_clone_reader().expect("pty reader");
         let mut writer = pty.master.take_writer().expect("pty writer");
         let mut screen = String::new();
-        let mut buf = [0u8; 8192];
 
-        // Read until `needle` appears on screen (or the deadline passes). The
-        // read is capped at 8 KiB so a quiet child cannot leave it parked
-        // mid-buffer past the deadline.
-        let mut read_until = |needle: &str, screen: &mut String| -> bool {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline {
-                if screen.contains(needle) {
-                    return true;
-                }
+        // Pump the PTY on a background thread into a channel, so the main loop
+        // never issues a *blocking* read itself: a child that is alive but
+        // silent (a regression that stalls before the question or banner) can
+        // otherwise park `reader.read` forever, and the deadline — only checked
+        // between reads — would never be reached. With a reader thread the main
+        // loop does timed receives, so the deadline is always honored.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => screen.push_str(&String::from_utf8_lossy(&buf[..n])),
-                    Err(_) => break,
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Read until `needle` appears on screen, or the deadline passes. The
+        // receive is timed, so a silent-but-alive child cannot hang the test:
+        // this returns within the 30s budget whether or not a byte ever
+        // arrives. On timeout the caller terminates and reaps the child.
+        let read_until = |needle: &str, screen: &mut String| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !screen.contains(needle) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match rx.recv_timeout(deadline - now) {
+                    Ok(chunk) => screen.push_str(&String::from_utf8_lossy(&chunk)),
+                    Err(_) => break, // timeout or the reader thread ended (EOF)
                 }
             }
             screen.contains(needle)
         };
 
-        // The trust question gates startup; answer it, then run a prompt.
+        // Kill and reap the child, never blocking the test on a stuck process.
+        let reap = |child: &mut Box<dyn portable_pty::Child + Send + Sync>| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        };
+
+        // The trust question gates startup; answer it, then run a prompt. If a
+        // milestone never appears, terminate the child before asserting so a
+        // regression fails the test instead of leaking a live process.
         let saw_question = read_until("Load its skills and hooks?", &mut screen);
+        if !saw_question {
+            reap(&mut child);
+        }
         assert!(saw_question, "trust question appeared:\n{screen}");
         write!(writer, "{answer}\r").unwrap();
         writer.flush().unwrap();
         // Wait for the prompt to be ready, then send a real prompt (fires the
         // project hook if trusted) and exit.
         let saw_ready = read_until("Type /help for commands", &mut screen);
+        if !saw_ready {
+            reap(&mut child);
+        }
         assert!(saw_ready, "startup completed:\n{screen}");
         write!(writer, "hi\r").unwrap();
         writer.flush().unwrap();
@@ -259,20 +305,12 @@ mod interactive {
         write!(writer, "/exit\r").unwrap();
         writer.flush().unwrap();
         let _ = read_until("nano-coder", &mut screen);
-        // Reap the child, but never block the test on a stuck process.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
+        reap(&mut child);
+        // Close the PTY and drain the reader thread so it cannot outlive the
+        // test holding the master fd.
+        drop(writer);
+        drop(pty.master);
+        let _ = reader_thread.join();
         screen
     }
 

@@ -29,6 +29,13 @@
 //!
 //! The decision is made once per root per process, so `/restart` and hook
 //! reloads do not re-ask.
+//!
+//! Persistence is a line-based `trusted-projects` file keyed on the exact root
+//! path. Because matching an entry authorizes loading that repository's skills
+//! and hooks, the key must be lossless: a path that is not valid UTF-8 or that
+//! contains a line break has no representable key, so it is never remembered
+//! and never matched (it stays gated and is asked about again) rather than
+//! sharing a lossy key with a different directory.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -248,17 +255,44 @@ fn trust_file() -> Option<PathBuf> {
     Some(base.join(crate::config::APP_NAME).join(TRUST_FILE_NAME))
 }
 
+/// The exact text line used to persist and match `root` in the line-based
+/// trusted-projects file, or `None` when the path cannot be represented
+/// losslessly on a single line.
+///
+/// Matching the persisted key is a trust-authorization decision, so it must be
+/// lossless: a *lossy* key (e.g. `root.display()` / `to_string_lossy`, which
+/// replace every non-UTF-8 byte with U+FFFD) collapses distinct directories —
+/// `repo\xFF` and `repo\xFE` share one key — so trusting one would authorize
+/// the other to load skills and hooks without consent. A path is representable
+/// only when it is valid UTF-8 and contains no line break (a `\n`/`\r` would
+/// split one entry across lines, letting a crafted path smuggle in or shadow a
+/// different one). An unrepresentable root **fails closed**: it is never
+/// matched and never remembered, so it simply stays gated and is asked about
+/// again rather than ever sharing a key with another directory.
+fn trust_key(root: &Path) -> Option<String> {
+    let key = root.to_str()?;
+    if key.is_empty() || key.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(key.to_string())
+}
+
 /// Whether `root` is recorded in the trusted-projects file.
 fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
     let Some(file) = trust_file else { return false };
+    let Some(key) = trust_key(root) else { return false };
     let Ok(text) = std::fs::read_to_string(file) else { return false };
-    let root = root.to_string_lossy();
-    text.lines().map(str::trim).any(|line| !line.is_empty() && line == root)
+    // Exact, untrimmed line comparison: trimming would let `/tmp/repo ` in the
+    // file authorize `/tmp/repo`, a different directory.
+    text.lines().any(|line| line == key)
 }
 
-/// Append `root` to the trusted-projects file (idempotently).
+/// Append `root` to the trusted-projects file (idempotently). A root whose
+/// path the line-based format cannot represent losslessly is **not** persisted
+/// (see [`trust_key`]); it remains trusted only for the current process.
 fn remember(root: &Path, trust_file: Option<&Path>) {
     let Some(file) = trust_file else { return };
+    let Some(key) = trust_key(root) else { return };
     if is_remembered(root, Some(file)) {
         return;
     }
@@ -266,7 +300,7 @@ fn remember(root: &Path, trust_file: Option<&Path>) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
-        let _ = writeln!(f, "{}", root.display());
+        let _ = writeln!(f, "{key}");
     }
 }
 
@@ -459,6 +493,61 @@ mod tests {
         let trusted = decide_root(&root, &skills_cfg(), &opts(false, false, false), Some(&trust), &mut asker);
         assert!(trusted, "a remembered root is trusted even with piped stdio");
         assert!(asker.noted.is_none(), "no note for a remembered root");
+    }
+
+    #[test]
+    fn trailing_whitespace_entry_does_not_authorize_trimmed_root() {
+        // A stored entry with trailing whitespace is a *different* directory
+        // from the trimmed path; a trimming match would authorize the wrong
+        // one. Matching is exact, so it must not match.
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let root = dir.path().join("repo");
+        std::fs::write(&trust, format!("{} \n", root.display())).unwrap();
+        assert!(!is_remembered(&root, Some(&trust)), "a padded entry must not authorize the trimmed root");
+    }
+
+    #[test]
+    fn remember_round_trips_an_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let root = dir.path().join("repo");
+        remember(&root, Some(&trust));
+        assert!(is_remembered(&root, Some(&trust)), "a remembered root matches itself exactly");
+        remember(&root, Some(&trust));
+        let recorded = std::fs::read_to_string(&trust).unwrap();
+        assert_eq!(recorded.lines().filter(|l| !l.is_empty()).count(), 1, "remembered once");
+    }
+
+    #[test]
+    fn newline_bearing_path_is_not_representable() {
+        // A path containing a line break cannot be a single line entry; it
+        // fails closed rather than smuggling in or shadowing another entry.
+        let root = Path::new("/tmp/re\npo");
+        assert!(trust_key(root).is_none(), "a newline path has no trust key");
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        remember(root, Some(&trust));
+        assert!(!trust.exists() || std::fs::read_to_string(&trust).unwrap().is_empty(), "it is not persisted");
+        assert!(!is_remembered(root, Some(&trust)), "and never matches");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_not_conflated() {
+        // Two distinct non-UTF-8 directories must never share a (lossy) key: a
+        // lossy key would let trusting one authorize the other. They fail
+        // closed — no key, never persisted, never matched.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let a = PathBuf::from(OsStr::from_bytes(b"/tmp/repo\xFF"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/tmp/repo\xFE"));
+        assert!(trust_key(&a).is_none() && trust_key(&b).is_none(), "non-UTF-8 paths have no key");
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        remember(&a, Some(&trust));
+        assert!(!is_remembered(&a, Some(&trust)), "a is not persisted");
+        assert!(!is_remembered(&b, Some(&trust)), "and cannot authorize the sibling b");
     }
 
     #[test]
