@@ -90,7 +90,7 @@ impl Gated {
     pub fn detect(root: &Path, skills: &SkillsConfig, skills_enabled: bool, hooks_enabled: bool) -> Self {
         let skills_present = skills_enabled
             && ((skills.ai_lock && root.join(LOCK_FILE).is_file())
-                || skills.dirs.iter().any(|dir| dir_has_skill(&root.join(dir))));
+                || skills.dirs.iter().any(|dir| dir_has_skill(root, &root.join(dir))));
         let hooks_present = hooks_enabled
             && (root.join(".claude/settings.json").is_file() || root.join(".claude/settings.local.json").is_file());
         Self { skills: skills_present, hooks: hooks_present }
@@ -245,14 +245,35 @@ fn is_yes(answer: &str) -> bool {
 /// cut off from. A revisit at equal-or-greater depth already explored
 /// everything this one could, so it is skipped — collapsing cycles and aliases
 /// without ever missing a skill reachable through a shorter path.
-fn dir_has_skill(dir: &Path) -> bool {
-    fn scan(dir: &Path, depth: usize, visited: &mut HashMap<PathBuf, usize>) -> bool {
+///
+/// The walk is also **confined**, exactly as discovery confines its own scan,
+/// at two levels:
+///
+/// 1. **Repository root** (`skills::add_dir`'s `confine` check): a configured
+///    skills directory whose canonical target escapes the repository root is a
+///    source discovery rejects outright — e.g. an otherwise empty repo whose
+///    `.claude/skills` is a symlink to an external skill tree. Detection must
+///    not scan it at all, or the repo prompts for (and traverses) skills it
+///    cannot load.
+/// 2. **Configured directory** (`skills::scan`/`within`): within an accepted
+///    skills root, any subdirectory whose canonical target escapes that root is
+///    dropped, so a child symlink cannot pull in an out-of-tree skill.
+///
+/// As in discovery, a `.git` component and dotfile entries are skipped.
+fn dir_has_skill(repo_root: &Path, dir: &Path) -> bool {
+    fn scan(dir: &Path, boundary: &Path, depth: usize, visited: &mut HashMap<PathBuf, usize>) -> bool {
         // Resolve this directory to its canonical target before inspecting it,
         // so detection follows the same symlinks discovery does.
         let dir = match dir.canonicalize() {
             Ok(real) => real,
             Err(_) => return false,
         };
+        // Confine to the configured skills root: a directory whose canonical
+        // target escapes it (or sits under a `.git`) is a source discovery
+        // rejects, so it is not scanned here either.
+        if !dir.starts_with(boundary) || dir.components().any(|c| c.as_os_str() == ".git") {
+            return false;
+        }
         // Already scanned this canonical directory with at least as much depth
         // budget: that visit saw everything this one would, so skip it and stop
         // a cycle/alias from re-expanding.
@@ -267,10 +288,24 @@ fn dir_has_skill(dir: &Path) -> bool {
             return false;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else { return false };
-        entries.filter_map(|e| e.ok()).any(|e| e.path().is_dir() && scan(&e.path(), depth + 1, visited))
+        entries
+            .filter_map(|e| e.ok())
+            // Skip dotfile entries, matching discovery's scan.
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .any(|e| scan(&e.path(), boundary, depth + 1, visited))
+    }
+    // The canonical configured directory is the inner confinement boundary: it,
+    // and only directories beneath it, are scanned. But first apply discovery's
+    // repository-root confinement — reject a configured skills directory whose
+    // canonical target escapes the repository, exactly as `skills::add_dir`
+    // does, so an external-symlinked skills root is never followed.
+    let Ok(repo) = repo_root.canonicalize() else { return false };
+    let Ok(boundary) = dir.canonicalize() else { return false };
+    if !boundary.starts_with(&repo) {
+        return false;
     }
     let mut visited = HashMap::new();
-    dir.is_dir() && scan(dir, 0, &mut visited)
+    scan(dir, &boundary, 0, &mut visited)
 }
 
 /// The trusted-projects file: `NANO_CODER_TRUST_FILE` if set, else
@@ -310,10 +345,22 @@ fn trust_key(root: &Path) -> Option<String> {
 }
 
 /// Whether `root` is recorded in the trusted-projects file.
+///
+/// Only **complete**, newline-terminated records authorize: a failed or
+/// interrupted append (or a file-size limit) can leave a partial path as the
+/// last line — `/parent/repo\n` cut after `/parent` — and accepting that
+/// unterminated remnant would trust a directory the user never approved. Any
+/// trailing bytes after the final newline therefore invalidate lookup entirely
+/// (fail closed): the root is re-asked rather than matched against a fragment.
 fn is_remembered(root: &Path, trust_file: Option<&Path>) -> bool {
     let Some(file) = trust_file else { return false };
     let Some(key) = trust_key(root) else { return false };
     let Ok(text) = std::fs::read_to_string(file) else { return false };
+    // Reject a partial trailing record: only newline-terminated entries are
+    // complete authorizations. An empty file has no partial record.
+    if !text.is_empty() && !text.ends_with('\n') {
+        return false;
+    }
     // Exact, untrimmed line comparison: trimming would let `/tmp/repo ` in the
     // file authorize `/tmp/repo`, a different directory.
     text.lines().any(|line| line == key)
@@ -651,7 +698,12 @@ mod tests {
         remember(&second, Some(&trust));
         let recorded = std::fs::read_to_string(&trust).unwrap();
         assert_eq!(recorded, format!("{}", first.display()), "the unterminated entry is left untouched");
-        assert!(is_remembered(&first, Some(&trust)), "the original root still matches");
+        // The unterminated remnant is a partial record, so lookup fails closed:
+        // it authorizes nothing (see is_remembered_rejects_an_unterminated_record).
+        assert!(
+            !is_remembered(&first, Some(&trust)),
+            "an unterminated entry is a partial record, not an authorization"
+        );
         assert!(!is_remembered(&second, Some(&trust)), "the new root is not spliced on");
         let concatenated = PathBuf::from(format!("{}{}", first.display(), second.display()));
         assert!(!is_remembered(&concatenated, Some(&trust)), "no concatenated path is authorized");
@@ -662,6 +714,37 @@ mod tests {
         assert!(is_remembered(&first, Some(&trust)));
         assert!(is_remembered(&second, Some(&trust)), "appended as its own line");
         assert!(!is_remembered(&concatenated, Some(&trust)));
+    }
+
+    #[test]
+    fn is_remembered_rejects_an_unterminated_record() {
+        // A failed or interrupted append (or a file-size limit) can cut a record
+        // mid-path, leaving a partial path as the last line. Accepting that
+        // unterminated remnant would trust a directory the user never approved
+        // — e.g. `/parent/repo\n` cut after `/parent` would authorize
+        // `/parent`. Lookup must require newline-terminated records and fail
+        // closed on any partial trailing record.
+        let dir = tempfile::tempdir().unwrap();
+        let trust = dir.path().join("trusted-projects");
+        let parent = dir.path().join("parent");
+        let repo = parent.join("repo");
+        // Simulate the truncated append: the full record was `parent/repo\n`
+        // but only `parent` (no newline) survived.
+        std::fs::write(&trust, format!("{}", parent.display())).unwrap();
+        assert!(!is_remembered(&parent, Some(&trust)), "a truncated record does not authorize its prefix");
+        assert!(!is_remembered(&repo, Some(&trust)), "the intended root is not authorized either");
+
+        // Even a complete earlier record is not matched once a partial record
+        // follows it: the file is corrupt, so nothing in it is trusted.
+        let other = dir.path().join("other");
+        std::fs::write(&trust, format!("{}\n{}", other.display(), parent.display())).unwrap();
+        assert!(!is_remembered(&other, Some(&trust)), "a partial trailing record invalidates lookup");
+        assert!(!is_remembered(&parent, Some(&trust)));
+
+        // A complete, newline-terminated record still matches.
+        std::fs::write(&trust, format!("{}\n", repo.display())).unwrap();
+        assert!(is_remembered(&repo, Some(&trust)), "a complete record is honored");
+        assert!(!is_remembered(&parent, Some(&trust)));
     }
 
     #[test]
@@ -862,6 +945,66 @@ mod tests {
         std::fs::write(skill.join("SKILL.md"), "# x\n").unwrap();
         let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(gated.skills, "a real skill is found even alongside a cycle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_rejects_a_skills_dir_symlinked_outside_the_repo() {
+        // The reviewer's case: an otherwise empty repo whose `.claude/skills`
+        // is a symlink to an external skill tree. Discovery rejects that source
+        // (the canonical target escapes the repository confinement boundary),
+        // so detection must not follow it either — otherwise the repo prompts
+        // for, and traverses, skills it cannot load.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // The skill tree lives entirely outside the repository.
+        let external = tempfile::tempdir().unwrap();
+        let ext_skill = external.path().join("x");
+        std::fs::create_dir_all(&ext_skill).unwrap();
+        std::fs::write(ext_skill.join("SKILL.md"), "# x\n").unwrap();
+        // `.claude/skills` symlinks to the external tree.
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        symlink(external.path(), root.join(".claude/skills")).unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a skills dir symlinked outside the repo is not gated");
+        assert!(gated.is_empty(), "nothing loadable remains to gate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_rejects_a_subdirectory_symlinked_outside_the_skills_root() {
+        // The recursive case: the configured skills dir is real and in-repo,
+        // but a *subdirectory* of it symlinks to an external skill tree.
+        // Discovery's `within` check drops that entry, so detection must too.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let ext_skill = external.path().join("x");
+        std::fs::create_dir_all(&ext_skill).unwrap();
+        std::fs::write(ext_skill.join("SKILL.md"), "# x\n").unwrap();
+        // A child of the skills dir escapes to the external tree.
+        symlink(external.path(), skills.join("ext")).unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a skill reachable only by escaping the skills root is not gated");
+    }
+
+    #[test]
+    fn detection_skips_a_dot_git_entry_inside_the_skills_root() {
+        // Discovery never descends into a `.git` component (its scan filters
+        // dotfile entries and `within` rejects any `.git` component); a SKILL.md
+        // planted under a `.git` directory that is physically inside the real,
+        // in-repo skills root must not be detected either.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let git_skill = root.join(".claude/skills/.git/x");
+        std::fs::create_dir_all(&git_skill).unwrap();
+        std::fs::write(git_skill.join("SKILL.md"), "# x\n").unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a SKILL.md under a .git component is not gated");
     }
 
     #[test]
