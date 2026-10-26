@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use serde_json::{Value, json};
 
 use crate::claude_hooks;
@@ -25,6 +25,7 @@ use crate::providers;
 use crate::reminders::{self, Reminders};
 use crate::session::{self, PendingInput, Record, SessionLog};
 use crate::skills::{self, Skills};
+use crate::timers::{self, Timers};
 use crate::tools::ToolRegistry;
 
 const INTERRUPTED_TOOL_RESULT: &str =
@@ -303,6 +304,10 @@ struct ControlInner {
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
+    /// The timers as last published by the agent (every change and
+    /// `Agent::refresh_stats`), so `/timers` can list them while a turn holds
+    /// the agent.
+    timers: Mutex<crate::timers::Timers>,
     /// `/thinking LEVEL` for this session; wins over the config. Shared so a
     /// level set mid-turn applies from the agent's next model call.
     thinking: Mutex<Option<crate::thinking::Thinking>>,
@@ -327,6 +332,7 @@ impl Default for TurnControl {
                 model: Mutex::new(None),
                 model_tx: tokio::sync::watch::channel(0u64).0,
                 plan: Mutex::new(crate::plan::Plan::default()),
+                timers: Mutex::new(crate::timers::Timers::default()),
                 thinking: Mutex::new(None),
             }),
         }
@@ -463,6 +469,15 @@ impl TurnControl {
         *self.inner.plan.lock().unwrap() = plan.clone();
     }
 
+    /// The timers as the agent last published them.
+    pub fn timers(&self) -> crate::timers::Timers {
+        self.inner.timers.lock().unwrap().clone()
+    }
+
+    pub fn publish_timers(&self, timers: &crate::timers::Timers) {
+        *self.inner.timers.lock().unwrap() = timers.clone();
+    }
+
     /// Flag for synchronous tools (e.g. bash) to poll.
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.inner.cancelled.clone()
@@ -503,6 +518,14 @@ pub enum AgentEvent<'a> {
     /// mid-turn.
     UserMessage {
         text: &'a str,
+    },
+    /// A timer fired mid-turn: its `⏰ timer N: <note>` notification. A
+    /// dedicated variant (not `UserMessage`) so a plain/redirected renderer
+    /// shows it — `UserMessage` is steer/replay chatter that plain output
+    /// intentionally suppresses, and a timer firing is not either (issue #150).
+    TimerFired {
+        id: u32,
+        note: &'a str,
     },
     AssistantMessage {
         message_id: &'a str,
@@ -729,6 +752,29 @@ pub struct Agent {
     skills: Skills,
     /// The agent's task plan (see `plan.rs`).
     plan: Plan,
+    /// The session's timers (see `timers.rs`); the harness owns the clock.
+    timers: Timers,
+    /// Test hook: a shared "now" for the timers, replacing the wall clock, so
+    /// a test (or a tool it registers) can advance time mid-turn.
+    #[cfg(test)]
+    timers_clock: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>,
+    /// Test hook: forces the next timers/plan persist (`timers_changed` /
+    /// `record_plan`) to fail, so a test can exercise the apply-then-persist
+    /// rollback without a real I/O failure. Consumed (reset) on the first
+    /// failed persist.
+    #[cfg(test)]
+    fail_next_persist: bool,
+    /// Whether the `timer_*` tools are offered. Off in ACP, which has no idle
+    /// loop to fire them.
+    timers_enabled: bool,
+    /// Steps since the last timer fired or the pending set emptied, driving the
+    /// `PENDING_NUDGE_EVERY` reminder for fired timers not yet marked done.
+    pending_timer_steps: usize,
+    /// Set by the REPL before an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so the user message `run_turn` pushes is
+    /// marked `auto_initiated` — billed as agent-initiated, not a premium
+    /// user request with no new user input. Consumed once per `run_turn`.
+    auto_turn: bool,
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
@@ -912,6 +958,14 @@ impl Agent {
             instructions: None,
             skills: Skills::default(),
             plan: Plan::default(),
+            timers: Timers::default(),
+            #[cfg(test)]
+            timers_clock: None,
+            #[cfg(test)]
+            fail_next_persist: false,
+            timers_enabled: true,
+            pending_timer_steps: 0,
+            auto_turn: false,
             reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
@@ -2022,6 +2076,15 @@ impl Agent {
         for msg in tail {
             match msg.role {
                 Role::User if msg.continuation => count += 1,
+                // A fired timer or pending-timer nudge is a harness-injected
+                // user message delivered mid-turn, NOT a new answer segment:
+                // the truncated answer it interrupts is still the one being
+                // continued, so keep its prefix and do not count the message as
+                // a continuation attempt (issue #150). A genuine steer or a
+                // Stop-hook re-prompt (`auto_initiated` but not `timer`) stays a
+                // segment reset via the arm below, since those discard the
+                // cut-off prefix.
+                Role::User if msg.timer => {}
                 Role::User => answer.clear(),
                 Role::Assistant
                     if msg.tool_calls.is_empty() && crate::llm::stop_reason_is_length(msg.stop_reason.as_deref()) =>
@@ -2223,6 +2286,7 @@ impl Agent {
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
             stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
+            stats.timers = (!self.timers.is_empty()).then(|| self.timers.status_segment());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
             stats.thinking = status_thinking(&self.thinking());
@@ -2334,6 +2398,34 @@ impl Agent {
             self.emit(AgentEvent::UserMessage { text: &steer.text });
             self.control.inner.absorbed.lock().unwrap().push(steer);
             absorbed = true;
+        }
+        // Timers fire at the start of a step, after the steers: their notes
+        // land as a user message the next model call sees. A fired timer is
+        // not a steer, so it does not reset the continuation accumulator.
+        //
+        // Skip the whole timer step when timers are disabled (an ACP-resumed
+        // CLI session has no idle loop and `disable_timers()` has hidden
+        // `timer_done`/`timer_cancel`): firing a restored timer or nudging here
+        // would ask the agent to acknowledge a timer it has no tool to clear,
+        // and would consume the restored state a later CLI resume still needs.
+        if !self.timers_enabled {
+            return Ok(absorbed);
+        }
+        let fired = self.fire_due_timers()?;
+        // Fired timers stay `pending` until the agent calls `timer_done`.
+        // Nudge about them every few steps so a note ignored mid-work is not
+        // forgotten; the counter resets when a timer fires or nothing pends.
+        if fired {
+            self.pending_timer_steps = 0;
+        } else if self.timers.has_pending() {
+            self.pending_timer_steps += 1;
+            if self.pending_timer_steps.is_multiple_of(timers::PENDING_NUDGE_EVERY)
+                && let Some(note) = self.timers.pending_nudge(self.timers_now())
+            {
+                self.push(Message::user(&reminders::wrap(&note)).timer())?;
+            }
+        } else {
+            self.pending_timer_steps = 0;
         }
         Ok(absorbed)
     }
@@ -2563,6 +2655,10 @@ impl Agent {
         self.completed_stop_reasons.clear();
         self.pending_input = None;
         self.plan = Plan::default();
+        // A fresh session starts with no timers (`/restart` clears them).
+        self.timers = Timers::default();
+        self.control.publish_timers(&self.timers);
+        self.pending_timer_steps = 0;
         self.reminders = Reminders::new(self.config.outcome_tool);
         self.session = session;
         self.session_id = Some(id.clone());
@@ -2644,6 +2740,11 @@ impl Agent {
         self.completed_stop_reasons = restored.stop_reasons;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
+        // Restore the session's timers; one that came due while nano-coder was
+        // closed fires as overdue at the next step (or the idle prompt).
+        self.timers = restored.timers.unwrap_or_default();
+        self.control.publish_timers(&self.timers);
+        self.pending_timer_steps = 0;
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
         // `/thinking` is session-scoped, so the previous session's override
@@ -2963,6 +3064,10 @@ impl Agent {
     }
 
     fn record_plan(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced plan persist failure (test)"));
+        }
         if let Some(log) = &mut self.session {
             log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: session::now() })?;
         }
@@ -2970,8 +3075,11 @@ impl Agent {
     }
 
     fn plan_changed(&mut self) -> Result<()> {
-        self.reminders.plan_changed();
+        // Persist first: a failed append must leave no observable side effect
+        // (reminder reset, UI event) so `run_plan_tool` can cleanly roll the
+        // live plan back.
         self.record_plan()?;
+        self.reminders.plan_changed();
         self.emit(AgentEvent::Plan { plan: &self.plan });
         self.refresh_stats();
         Ok(())
@@ -2991,6 +3099,9 @@ impl Agent {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
+        }
+        if self.timers_enabled {
+            tools.extend(timers::definitions());
         }
         if self.config.outcome_tool {
             tools.push(goal::definition());
@@ -3086,6 +3197,11 @@ impl Agent {
         }
         self.control.start_turn();
         self.reminders.start_turn();
+        // Consume the automatic-turn origin for this turn (an automatic timer
+        // wakeup/nudge): the main user message pushed below is marked
+        // `auto_initiated` so it bills as agent-initiated. Taken once here so it
+        // never leaks into the next, genuinely user-initiated turn.
+        let auto_turn = std::mem::take(&mut self.auto_turn);
         self.claude_stop_blocks = 0;
         self.sync_claude_hook_session();
         self.apply_mode_to_system_prompt();
@@ -3245,7 +3361,9 @@ impl Agent {
                     Some(extra) => format!("{user_input}\n\n{}", reminders::wrap(extra)),
                     None => user_input.to_string(),
                 };
-                self.push(Message::user(&message))?;
+                let message = Message::user(&message);
+                let message = if auto_turn { message.auto_initiated() } else { message };
+                self.push(message)?;
             }
         }
 
@@ -3951,6 +4069,7 @@ impl Agent {
                 let effective_call: &ToolCall = rewritten_call.as_ref().unwrap_or(tool_call);
 
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
+                let is_timer_tool = self.timers_enabled && timers::is_timer_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
@@ -3997,6 +4116,9 @@ impl Agent {
                 } else if is_plan_tool {
                     dispatched = true;
                     self.run_plan_tool(effective_call)
+                } else if is_timer_tool {
+                    dispatched = true;
+                    self.run_timer_tool(effective_call)
                 } else if is_skill_tool {
                     dispatched = true;
                     self.skills.load(&effective_call.arguments).map(Value::String)
@@ -4130,10 +4252,10 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
-                if self.config.reminders && (is_plan_tool || is_outcome_tool) {
-                    // Plan and outcome calls are never counted by the loop
+                if self.config.reminders && (is_plan_tool || is_outcome_tool || is_timer_tool) {
+                    // Plan, timer and outcome calls are never counted by the loop
                     // detector, but they must still break a repeat streak so an
-                    // interleaved plan/outcome call cannot mask otherwise
+                    // interleaved plan/timer/outcome call cannot mask otherwise
                     // consecutive repeats (issue #65).
                     self.reminders.reset_repeat();
                 } else if self.config.reminders {
@@ -4756,11 +4878,166 @@ impl Agent {
     }
 
     fn run_plan_tool(&mut self, call: &ToolCall) -> Result<Value> {
-        let outcome = self.plan.apply(&call.name, &call.arguments)?;
-        if outcome.changed {
-            self.plan_changed()?;
+        // Same apply-then-persist atomicity as `run_timer_tool`: `apply`
+        // mutates the live plan in place, so snapshot first and roll back on an
+        // apply or persist failure rather than leaving the live plan changed
+        // while reporting an error (issue #150 review).
+        let snapshot = self.plan.clone();
+        let outcome = match self.plan.apply(&call.name, &call.arguments) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.plan = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.plan_changed()
+        {
+            self.plan = snapshot;
+            self.control.publish_plan(&self.plan);
+            self.refresh_stats();
+            return Err(err);
         }
         Ok(Value::String(outcome.text))
+    }
+
+    /// "Now" for the timers: the wall clock, or the time a test set.
+    fn timers_now(&self) -> DateTime<Local> {
+        #[cfg(test)]
+        if let Some(fixed) = &self.timers_clock {
+            return *fixed.lock().unwrap();
+        }
+        Local::now()
+    }
+
+    /// Give the timers a shared clock for a test (`None` returns to the wall
+    /// clock); advancing the cell moves time, even mid-turn.
+    #[cfg(test)]
+    pub fn set_timers_now(&mut self, now: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>) {
+        self.timers_clock = now;
+    }
+
+    /// Test hook: force the next timers/plan persist to fail, so a test can
+    /// drive the apply-then-persist rollback without a real I/O failure.
+    #[cfg(test)]
+    pub fn fail_next_persist(&mut self) {
+        self.fail_next_persist = true;
+    }
+
+    /// The session's timers.
+    pub fn timers(&self) -> &Timers {
+        &self.timers
+    }
+
+    /// Turn the timer tools off (ACP: no idle loop to fire them). Existing
+    /// timers keep their state but cannot fire without the tools loop.
+    pub fn disable_timers(&mut self) {
+        self.timers_enabled = false;
+    }
+
+    fn run_timer_tool(&mut self, call: &ToolCall) -> Result<Value> {
+        if !self.timers_enabled {
+            return Err(anyhow::anyhow!(
+                "{} is not available here: timers need the interactive harness's idle loop to fire",
+                call.name
+            ));
+        }
+        // `apply` mutates the live timers in place, and persisting them
+        // afterwards can still fail. Snapshot first so an apply *or* persist
+        // failure rolls the live timers back to their prior state — otherwise a
+        // failed cancel/acknowledge would drop the timer in memory while
+        // returning an error, leaving the published/persisted timers stale and
+        // the live state silently diverged (issue #150 review).
+        let snapshot = self.timers.clone();
+        let outcome = match self.timers.apply(&call.name, &call.arguments, self.timers_now()) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.timers = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.timers_changed()
+        {
+            self.timers = snapshot;
+            self.control.publish_timers(&self.timers);
+            self.refresh_stats();
+            return Err(err);
+        }
+        Ok(Value::String(outcome.text))
+    }
+
+    /// Persist and publish the timers after a change (like `plan_changed`).
+    fn timers_changed(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced timers persist failure (test)"));
+        }
+        if let Some(log) = &mut self.session {
+            log.append(&Record::Timers { timers: self.timers.clone(), recorded_at: session::now() })?;
+        }
+        self.control.publish_timers(&self.timers);
+        self.refresh_stats();
+        Ok(())
+    }
+
+    /// Timers due right now (they fire once), soonest first.
+    pub fn take_fired_timers(&mut self) -> Result<Vec<timers::Timer>> {
+        // `take_due` moves the due timers out of `items` and into `pending`
+        // in place. If the subsequent persist fails we must roll the live
+        // timers back: the caller (`fire_due_timers`) aborts on the error
+        // before delivering their messages, so without a rollback the firing is
+        // consumed in memory (gone from `items`, now `pending`) while never
+        // delivered — a retry then finds nothing due, silently losing the
+        // reminders and leaving the live state diverged from the
+        // published/persisted snapshot (issue #150 review). Snapshot first and
+        // reset the nudge counter only after persistence succeeds, so a failed
+        // firing is fully atomic (deliver + persist, or leave state untouched).
+        let snapshot = self.timers.clone();
+        let fired = self.timers.take_due(self.timers_now());
+        if !fired.is_empty() {
+            if let Err(err) = self.timers_changed() {
+                self.timers = snapshot;
+                self.control.publish_timers(&self.timers);
+                self.refresh_stats();
+                return Err(err);
+            }
+            // Restart the pending-nudge interval whenever a timer fires, so a
+            // counter left near the `PENDING_NUDGE_EVERY` threshold by an
+            // earlier pending timer does not make the first model step after an
+            // idle firing immediately re-nudge. `absorb_steers` resets it too;
+            // doing it here makes both delivery paths (mid-turn and the idle
+            // REPL loop, which calls this directly) share the reset. Only after
+            // a successful persist, so a rolled-back firing keeps its counter.
+            self.pending_timer_steps = 0;
+        }
+        Ok(fired)
+    }
+
+    /// Mark the next `run_turn` as an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so its user message is billed as
+    /// agent-initiated rather than a premium user request (issue #150).
+    pub fn mark_auto_turn(&mut self) {
+        self.auto_turn = true;
+    }
+
+    /// Push the timers due at this step into the conversation as a user
+    /// message, after the steers. Returns whether any fired.
+    fn fire_due_timers(&mut self) -> Result<bool> {
+        let fired = self.take_fired_timers()?;
+        if fired.is_empty() {
+            return Ok(false);
+        }
+        let now = self.timers_now();
+        // The UI shows `⏰ timer N: <note>` per timer. A dedicated event (not
+        // `UserMessage`): plain/redirected output suppresses `UserMessage` as
+        // steer/replay chatter, but a mid-turn timer firing must be visible
+        // there too — including headless `--wait-timers` runs (issue #150).
+        for timer in &fired {
+            self.emit(AgentEvent::TimerFired { id: timer.id, note: &timer.note });
+        }
+        self.push(Message::user(&Timers::fired_batch_message(&fired, now)).timer())?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -6185,6 +6462,40 @@ mod tests {
         let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "one done", "the replay shortcut folds the persisted prefix into the answer");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_preserves_the_prefix_across_an_interleaved_timer_message() {
+        // A timer fired mid-turn, between a truncated chunk and its final
+        // chunk, and the crash landed before `TurnEnd`. The fired-timer user
+        // message is a harness injection, not a new answer segment, so the
+        // replay must keep the interrupted answer's prefix across it instead of
+        // clearing it (issue #150).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "timer-prefix").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        // The in-flight turn: a truncated chunk, its continuation reminder, then
+        // a fired timer's user message lands before the clean final chunk.
+        log.append(&Record::Message(Box::new(truncated_assistant("one ")))).unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+        )))
+        .unwrap();
+        log.append(&Record::Message(Box::new(Message::user(&Timers::fired_batch_message(&[], Local::now())).timer())))
+            .unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("two")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("timer-prefix").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            outcome.response, "one two",
+            "the fired-timer message does not clear the interrupted answer's prefix"
+        );
         assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
     }
 
@@ -9528,6 +9839,348 @@ mod tests {
         (agent, seen)
     }
 
+    /// 12:00 local today, for the timer tests' injected clock.
+    fn timer_noon() -> DateTime<Local> {
+        let date = Local::now().date_naive();
+        date.and_hms_opt(12, 0, 0).unwrap().and_local_timezone(Local).single().unwrap()
+    }
+
+    /// A shared clock at noon, so a tool the test registers can advance time
+    /// mid-turn.
+    fn timer_clock() -> std::sync::Arc<std::sync::Mutex<DateTime<Local>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(timer_noon()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            // Advances the injected clock past the timer, so it fires at the
+            // start of the next step — a deploy finishing while the turn runs.
+            call("e1", "advance_clock", json!({})),
+            text("done"),
+        ];
+        let (mut agent, seen) = agent(responses, dir.path());
+        let events = record_events(&mut agent);
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // The timer fired into the conversation as a user message the last
+        // model call saw.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let fired =
+            last.iter().find(|m| m.role == Role::User && m.content.contains("fired:")).expect("a fired timer message");
+        assert!(
+            fired.content.contains("Timer 1, set at 12:00, fired: check CI")
+                && fired.content.starts_with("<system-reminder>")
+                && fired.content.contains("call timer_done with its id"),
+            "{}",
+            fired.content
+        );
+        // The UI event shows `⏰ timer N: <note>` through the userMessage event.
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e["content"]["text"].as_str() == Some("⏰ timer 1: check CI")
+                    && e["sessionUpdate"].as_str() == Some("user_message_chunk")
+            }),
+            "{events:?}"
+        );
+        // It fired once: no active timers left, and it is now pending (waiting
+        // to be marked done).
+        assert!(agent.timers().is_empty());
+        assert!(agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_timers_neither_fire_nor_nudge_on_a_turn() {
+        // An ACP-resumed CLI session has no idle loop to fire timers, so
+        // `disable_timers()` hides the timer tools. A due restored timer must
+        // then stay put: firing or nudging here would ask the agent to
+        // acknowledge a timer with a `timer_done` tool it no longer has, and
+        // would consume state a later CLI resume still needs.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // A restored timer that is already due by the time the turn runs.
+        let now = *clock.lock().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), now).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        agent.disable_timers();
+        agent.run_turn(Some("msg-1"), "look").await.unwrap();
+
+        // No fired-timer message or nudge reached the model, and the timer is
+        // untouched (still active, not fired/pending).
+        {
+            let turns = seen.lock().unwrap();
+            assert!(
+                turns.iter().all(|t| t.iter().all(|m| {
+                    !m.content.contains("fired:") && !m.content.contains("Fired timers you haven't marked done:")
+                })),
+                "a disabled timer must not fire or nudge: {turns:?}"
+            );
+        }
+        assert_eq!(agent.timers().len(), 1);
+        assert!(!agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_timer_nudges_every_few_steps_until_marked_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        // timer_set, advance the clock so it fires at the next step, then run
+        // enough no-op steps to cross `PENDING_NUDGE_EVERY`, mark it done, and
+        // run more steps to confirm the nudges stop. Distinct `echo` arguments
+        // keep the repeat-loop detector from ending the turn.
+        let mut responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            call("adv", "advance_clock", json!({})),
+        ];
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("e{i}"), "echo", json!({"text": format!("step {i}")})));
+        }
+        responses.push(call("done", "timer_done", json!({"id": 1})));
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("f{i}"), "echo", json!({"text": format!("after {i}")})));
+        }
+        responses.push(text("ok"));
+
+        let (mut agent, seen) = agent(responses, dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // Exactly one nudge was pushed before `timer_done`, and none after.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let nudges = last
+            .iter()
+            .filter(|m| m.role == Role::User && m.content.contains("Fired timers you haven't marked done:"))
+            .count();
+        assert_eq!(nudges, 1, "one nudge total: {last:#?}");
+        // The timer was marked done, so nothing is pending anymore.
+        assert!(!agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_take_fired_timers_returns_due_timers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        // Not yet due.
+        assert!(agent.take_fired_timers().unwrap().is_empty());
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].note, "check CI");
+        assert!(agent.take_fired_timers().unwrap().is_empty(), "a timer fires once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_firing_resets_the_pending_nudge_counter() {
+        // Regression (PR #151): idle delivery calls `take_fired_timers`
+        // directly. If an earlier pending timer left the nudge counter near its
+        // threshold, a fresh idle firing must restart the interval so the next
+        // model step does not immediately re-nudge.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // Simulate a counter advanced to the nudge threshold by an earlier
+        // pending timer.
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the timer fired via idle delivery");
+        assert_eq!(agent.pending_timer_steps, 0, "a fresh firing restarts the nudge interval");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_automatic_timer_turn_marks_its_message_auto_initiated() {
+        // Regression (PR #151): a timer wakeup carries no new user input, so
+        // its user message must bill as agent-initiated.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("ok")], dir.path());
+        agent.new_session().unwrap();
+        agent.mark_auto_turn();
+        agent.run_turn(None, "⏰ timer 1: check CI").await.unwrap();
+        let auto = agent
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("timer 1"))
+            .expect("the timer user message");
+        assert!(auto.auto_initiated, "an automatic timer turn is agent-initiated");
+
+        // A following genuine user turn is NOT auto-initiated (the flag is
+        // consumed once).
+        let (mut agent2, _) = self::agent(vec![text("ok")], dir.path());
+        agent2.new_session().unwrap();
+        agent2.run_turn(None, "hello").await.unwrap();
+        let user = agent2
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("hello"))
+            .expect("the user message");
+        assert!(!user.auto_initiated, "a user-typed turn stays user-initiated");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timers_survive_resume_and_restart_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let noon = timer_noon();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let id = agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "1h", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+
+        let (mut resumed, _) = self::agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        assert_eq!(resumed.timers().len(), 1);
+        assert_eq!(resumed.timers().items[0].note, "check CI");
+
+        // `/restart` (a new session) clears them.
+        resumed.new_session().unwrap();
+        assert!(resumed.timers().is_empty());
+    }
+
+    #[test]
+    fn timer_tools_are_hidden_when_timers_are_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut on, _) = agent(Vec::new(), dir.path());
+        assert!(on.tool_definitions().iter().any(|d| d.name == "timer_set"));
+        on.disable_timers();
+        assert!(!on.tool_definitions().iter().any(|d| d.name.starts_with("timer_")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_tool_persistence_failure_rolls_the_live_timers_back() {
+        // A cancel/ack that fails to persist must not drop the timer in memory
+        // while reporting an error: live and persisted/published state would
+        // diverge. The tool must roll the live timers back (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+
+        let set = ToolCall {
+            id: "s1".into(),
+            name: "timer_set".into(),
+            arguments: json!({"after": "30m", "note": "check CI"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        agent.run_timer_tool(&set).unwrap();
+        assert_eq!(agent.timers().len(), 1);
+
+        // A cancel whose persist fails leaves the timer live (rolled back) and
+        // surfaces the error.
+        agent.fail_next_persist();
+        let cancel = ToolCall {
+            id: "c1".into(),
+            name: "timer_cancel".into(),
+            arguments: json!({"id": 1}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_timer_tool(&cancel).is_err());
+        assert_eq!(agent.timers().len(), 1, "a failed persist must not drop the live timer");
+
+        // With persistence working, the same cancel succeeds and clears it.
+        agent.run_timer_tool(&cancel).unwrap();
+        assert!(agent.timers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_tool_persistence_failure_rolls_the_live_plan_back() {
+        // Same apply-then-persist atomicity for the plan tool (sibling class).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.new_session().unwrap();
+
+        agent.fail_next_persist();
+        let add = ToolCall {
+            id: "p1".into(),
+            name: "plan_add".into(),
+            arguments: json!({"items": ["write the fix"]}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_plan_tool(&add).is_err());
+        assert!(agent.plan.is_empty(), "a failed persist must not leave the live plan changed");
+
+        // With persistence working, the add lands.
+        agent.run_plan_tool(&add).unwrap();
+        assert!(!agent.plan.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_firing_persistence_failure_rolls_the_due_timers_back() {
+        // Same apply-then-persist atomicity for the idle firing path
+        // (`take_fired_timers`, sibling class). `take_due` moves the due timer
+        // out of `items`; if the persist fails, the timer must be restored so a
+        // retry re-fires it and delivers the reminder, and the nudge counter
+        // must not be reset (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+
+        // The firing's persist fails: the due timer is rolled back (still an
+        // active item, not consumed into `pending`) and the nudge counter is
+        // untouched, so a later retry re-fires it.
+        agent.fail_next_persist();
+        assert!(agent.take_fired_timers().is_err());
+        assert_eq!(agent.timers().items.len(), 1, "a failed firing persist must not consume the due timer");
+        assert!(!agent.timers().has_pending(), "the rolled-back timer must not linger in pending");
+        assert_eq!(
+            agent.pending_timer_steps,
+            timers::PENDING_NUDGE_EVERY - 1,
+            "a rolled-back firing must not reset the nudge counter"
+        );
+
+        // With persistence working, the same firing delivers once.
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the retry re-fires the previously-rolled-back timer");
+        assert_eq!(fired[0].note, "check CI");
+        assert_eq!(agent.pending_timer_steps, 0, "a successful firing resets the nudge counter");
+    }
+
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -11064,7 +11717,7 @@ mod tests {
         // then list the mutating tool the Plan-time capture would have dropped.
         let normal = crate::context::ContextStats { mode: crate::mode::AgentMode::Normal, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &normal, &crate::plan::Plan::default())
+            snapshot.output("/tools", &normal, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11073,7 +11726,7 @@ mod tests {
         // And under a live Plan mode it is still filtered out.
         let plan = crate::context::ContextStats { mode: crate::mode::AgentMode::Plan, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(filtered)) =
-            snapshot.output("/tools", &plan, &crate::plan::Plan::default())
+            snapshot.output("/tools", &plan, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11097,7 +11750,7 @@ mod tests {
         // capture-time availability would have dropped.
         let available = crate::context::ContextStats { history_available: true, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &available, &crate::plan::Plan::default())
+            snapshot.output("/tools", &available, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11109,7 +11762,7 @@ mod tests {
         // And while history is unavailable they are still filtered out.
         let unavailable = crate::context::ContextStats { history_available: false, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(hidden)) =
-            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default())
+            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };

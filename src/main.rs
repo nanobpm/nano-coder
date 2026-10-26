@@ -8,6 +8,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthChar;
 
 mod acp;
 mod agent;
@@ -50,6 +51,7 @@ mod skills;
 mod status;
 mod temperature;
 mod thinking;
+mod timers;
 mod tools;
 mod trajectory;
 mod turn_commands;
@@ -770,6 +772,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
                                     let plan = control.plan();
+                                    let timers = control.timers();
                                     // Some immediate commands do synchronous disk
                                     // I/O while rendering — `/trajectory` reads and
                                     // decodes the whole session log, and `/providers`
@@ -784,7 +787,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     let snap = snapshot.clone();
                                     let cmd = text.to_string();
                                     let label = cmd.clone();
-                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan, &timers))
                                         .await
                                         .unwrap_or_else(|_| {
                                             Some(turn_commands::Output::Block(format!(
@@ -917,8 +920,16 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
+///
+/// Horizontal tabs (`\t`) are the one control that is *expanded* rather than
+/// dropped: a tab is legitimate column layout (e.g. numbered `read_file` output
+/// `   1\tcode`), so deleting it would merge adjacent columns into one unreadable
+/// run. Each tab is replaced by the spaces needed to reach the next 8-column tab
+/// stop — exactly what a terminal renders — which keeps the columns separated
+/// while still removing the raw control byte, preserving the terminal-safety
+/// protection (a space can neither move the cursor nor begin an escape).
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, true)
 }
 
 /// Like [`sanitize_terminal_text`], but for single-line fields: drops every
@@ -927,9 +938,113 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
 /// model-controlled text rendered on one row — picker prompts, option
 /// labels/descriptions and plan titles — where a line feed is not multi-line
 /// content to keep but injected layout that would spill an unprefixed extra row
-/// or move an interactive selector's cursor.
+/// or move an interactive selector's cursor. Horizontal tabs are expanded to
+/// spaces (next 8-column tab stop) just as in [`sanitize_terminal_text`], so
+/// tab-separated columns stay separated instead of merging.
 pub(crate) fn sanitize_terminal_line(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, false)
+}
+
+/// Shared core of [`sanitize_terminal_text`]/[`sanitize_terminal_line`]: strip
+/// control characters and the U+2028/U+2029 line separators, but expand each
+/// horizontal tab to spaces (next 8-column tab stop) so tab-separated columns
+/// survive the filter. `keep_newlines` keeps `\n` (and resets the tab-stop
+/// column) for multi-line text; a single-line field drops `\n` with the other
+/// controls. Tab stops are measured in terminal **cell** widths (via
+/// `UnicodeWidthChar::width`, as the frame sanitizer does), not character
+/// counts, so a wide CJK glyph advances two columns and a zero-width combining
+/// mark advances none — otherwise `界\tX` would misplace `X` and tab-aligned
+/// Unicode columns would drift.
+fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
+    const TAB_WIDTH: usize = 8;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Consume a *complete* ANSI escape sequence rather than dropping
+            // only the ESC byte and leaving its body (e.g. `[31m`) as visible
+            // text. A bare drop turns `\x1b[31mred\x1b[0m` into `[31mred[0m`,
+            // whose stray `[31m…[0m` eats preview width and can truncate real
+            // tool output; stripping the whole sequence keeps the text clean
+            // while still letting nothing drive the terminal (issue #150).
+            '\u{1b}' => match chars.peek() {
+                // CSI: `\x1b[` … final byte in `@`..=`~`.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `\x1b]` … terminated by BEL (`\x07`) or ST (`\x1b\`).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // A lone/unrecognized ESC drops just the ESC byte, as before;
+                // any following printable stays and control bytes are filtered.
+                _ => {}
+            },
+            '\t' => {
+                let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                for _ in 0..spaces {
+                    out.push(' ');
+                }
+                col += spaces;
+            }
+            '\n' if keep_newlines => {
+                out.push('\n');
+                col = 0;
+            }
+            '\u{2028}' | '\u{2029}' => {}
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                // Advance by the glyph's terminal cell width so tab stops stay
+                // aligned with what the terminal actually renders (wide glyph =
+                // 2 cells, zero-width mark = 0); unknown/non-printing falls back
+                // to 0, matching the frame sanitizer's `cell_width`.
+                col += UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a due idle timer may start its turn now, or must yield. The two idle
+/// paths (the preliminary `--wait-timers` wait and the prompt-read loop) both
+/// use this so the rule stays identical across them: a queued Ctrl-C always
+/// wins — the interrupt must route through the exit/double-press handler instead
+/// of starting a timer turn, which reads only new channel events and would run
+/// its tools despite the stop request — a half-typed draft holds the timer
+/// back until the line is sent or cleared, and an **armed Ctrl-C exit window**
+/// (a first press waiting for its pair) holds the timer back too: otherwise a
+/// timer coming due inside the two-press window would start an automatic turn,
+/// and the user's confirming second Ctrl-C would merely cancel that surprise
+/// turn instead of exiting as promised (issue #150).
+pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
+    due && !draft && !interrupt_queued && !exit_armed
+}
+
+/// Whether an end-of-input (Ctrl-D / closed pipe) seen during the idle timer
+/// wait should be *suppressed* (remembered, and the wait resumed) rather than
+/// ending the session. Only a headless `--wait-timers` run suppresses it: its
+/// driver may hold stdin open while the timers — the whole point of the run —
+/// are still pending. On an interactive terminal Ctrl-D must always exit
+/// normally, so a steerable session never suppresses EOF even under
+/// `--wait-timers` (issue #150).
+pub(crate) fn suppress_eof_for_timers(wait_timers: bool, steerable: bool) -> bool {
+    wait_timers && !steerable
 }
 
 /// The current session as Herdr should resume it, if it is saved to disk
@@ -1524,7 +1639,7 @@ fn live_stats(agent: &Agent) -> context::ContextStats {
     context::ContextStats { mode: agent.mode(), ..stats }
 }
 
-async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
+async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal, wait_timers: bool) -> Result<bool> {
     // Split name from argument on ANY whitespace, the same rule `timing` and
     // `Snapshot::output` use, so a tab/newline-separated form (e.g.
     // `/trajectory\t--json`) dispatches identically to its space-separated twin
@@ -1569,7 +1684,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ if name == "/trajectory" => {
             let stats = live_stats(agent);
             match turn_commands::Snapshot::capture(agent)
-                .output(cmd, &stats, agent.plan())
+                .output(cmd, &stats, agent.plan(), agent.timers())
                 .expect("/trajectory always produces an output")
             {
                 turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
@@ -1589,6 +1704,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 // which locks it again and deadlocks.
                 &live_stats(agent),
                 agent.plan(),
+                agent.timers(),
             ) =>
         {
             match output {
@@ -1806,6 +1922,14 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // `//…` is a prompt that starts with `/`.
             let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
+            // Issue #150: in a headless `--wait-timers` run a Ctrl-C that lands
+            // *during* the turn cancels it (the outcome is `Cancelled`). With no
+            // interactive session to steer, that interrupt means exit — propagate
+            // it to the outer loop rather than resuming the wait on the remaining
+            // timers.
+            if !terminal.steerable && wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                return Ok(false);
+            }
             print_turn_outcome(&outcome, &terminal.renderer);
             Ok(true)
         }
@@ -1884,6 +2008,9 @@ struct Args {
     model: Option<String>,
     /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    /// Headless: after the last prompt's turn, sleep until each timer is due
+    /// and run its fired message as the next turn, until no timers are left.
+    wait_timers: bool,
     list_sessions: bool,
     all: bool,
     config: Option<std::path::PathBuf>,
@@ -1905,7 +2032,7 @@ fn print_help() {
     println!(
         "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
     );
-    println!("                  [--verbosity quiet|normal|verbose|debug]");
+    println!("                  [--verbosity quiet|normal|verbose|debug] [--wait-timers]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
@@ -1942,6 +2069,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         list_models: None,
         model: None,
         resume: None,
+        wait_timers: false,
         list_sessions: false,
         all: false,
         config: None,
@@ -1969,6 +2097,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             // be rejected as an unknown argument.
             "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
             _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
+            "--wait-timers" => args.wait_timers = true,
             "--list-sessions" => args.list_sessions = true,
             "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
@@ -2172,6 +2301,9 @@ async fn main() -> Result<()> {
         // No human vets a memory save live here, so full memory is downgraded
         // to read-only (the model can still consult earlier notes).
         agent.restrict_memory_to_read_only();
+        // ACP has no idle loop to fire timers, so the timer tools are not
+        // offered at all.
+        agent.disable_timers();
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
@@ -2207,6 +2339,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        // A resumed session's timers survive in its log; say so, and note that
+        // one that came due while nano-coder was closed fires as overdue.
+        let timers_notice = (!agent.timers().is_empty())
+            .then(|| format!("{} timer(s) still set (/timers lists them)", agent.timers().len()));
 
         // Interactive CLI mode: build the startup banner. In frame mode the
         // renderer owns the screen and its first full redraw clears the
@@ -2220,6 +2356,9 @@ async fn main() -> Result<()> {
         ];
         if let Some(id) = agent.session_id() {
             banner.push(format!("Session: {id} (resume with --resume {id})"));
+        }
+        if let Some(notice) = &timers_notice {
+            banner.push(notice.clone());
         }
         for file in agent.project_instruction_files() {
             banner.push(format!("Instructions: {file}"));
@@ -2394,6 +2533,13 @@ async fn main() -> Result<()> {
         // `DoublePress`). The note stays visible until the window lapses.
         let mut exit_press = DoublePress::new(DOUBLE_INTERRUPT_WINDOW);
         let mut separate = false;
+        // Piped stdin emits its end-of-input exactly once. Under
+        // `--wait-timers` the timer wait below swallows that EOF to keep
+        // sleeping for timers, so remember it here: once the queued input and
+        // scheduled timers are both exhausted, the normal prompt read would
+        // otherwise block forever on a reader that never emits EOF again
+        // (the signal task holds the event channel open).
+        let mut stdin_closed = false;
         while running {
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
@@ -2418,19 +2564,242 @@ async fn main() -> Result<()> {
             // each time so `/resume` and `/restart` are picked up).
             herdr::report(herdr::State::Idle, None, herdr_session(&agent, &herdr_extra));
 
+            // The harness owns the timers' clock. With the prompt idle, a due
+            // timer ends the read and runs as a new turn — but a half-typed
+            // line holds it back. In a headless run (piped stdin), stdin stays
+            // open while a driver composes its next prompt, so the read would
+            // never end on its own: `--wait-timers` instead sleeps until the
+            // next timer is due and runs it, repeating until none are left.
+            let wait_timers = args.wait_timers;
+            let fired = if agent.timers().is_empty() {
+                // No timers to wait for: skip the wait entirely so piped input
+                // flows straight to the normal read below.
+                Vec::new()
+            } else {
+                loop {
+                    let now = Local::now();
+                    // A Ctrl-C requeued out of the wait below (it is pushed to
+                    // `terminal.queued` so the prompt read can apply the
+                    // double-press gesture) must still win over a timer that
+                    // came due at the same moment: the running timer turn reads
+                    // new channel events, not `terminal.queued`, so starting the
+                    // turn here would run its tools instead of honouring the
+                    // interrupt. Abandon the wait *without consuming the
+                    // interrupt* and let the prompt loop's interrupt handler act
+                    // on it — headless `--wait-timers` exits, a steerable session
+                    // arms the double-press gesture. Deleting it here (even in
+                    // the headless case) would strand the still-due timer, which
+                    // the prompt loop would then fire despite the stop request
+                    // (issue #150).
+                    if terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt)) {
+                        break Vec::new();
+                    }
+                    // Peek whether a timer is due *before* consuming it: a
+                    // half-typed draft holds delivery back, and taking the
+                    // timer here would persist its removal and drop the note
+                    // undelivered. Only consume once delivery is allowed.
+                    let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
+                    let draft = terminal.view.lock().unwrap().has_draft();
+                    // No interrupt is queued here (it would have broken the wait
+                    // above), so pass `false`; the armed Ctrl-C exit window,
+                    // however, must hold a due timer back exactly as in the
+                    // prompt loop below (a timer firing mid-window would steal
+                    // the user's confirming second press).
+                    if deliver_due_timer(due_now, draft, false, exit_press.deadline().is_some()) {
+                        break agent.take_fired_timers()?;
+                    }
+                    // Nothing deliverable right now. Without `--wait-timers` a
+                    // headless run is done once its input is; an interactive one
+                    // waits on the terminal instead.
+                    let steerable = terminal.steerable;
+                    if !steerable && !wait_timers {
+                        break Vec::new();
+                    }
+                    let Some(next_due) = agent.timers().next_due() else {
+                        // No timers left: a `--wait-timers` run ends here.
+                        break Vec::new();
+                    };
+                    // A timer already due but held back by a draft must not
+                    // busy-spin on its elapsed deadline: recheck on a short
+                    // bounded interval so clearing the draft still delivers
+                    // promptly, while a not-yet-due timer waits exactly until it
+                    // comes due.
+                    let timer_deadline = std::time::Instant::now()
+                        + if due_now {
+                            std::time::Duration::from_millis(200)
+                        } else {
+                            (next_due - now).to_std().unwrap_or(std::time::Duration::ZERO)
+                        };
+                    // Bound the wait on the soonest of the timer recheck and the
+                    // Ctrl-C exit window, exactly as the prompt loop below does:
+                    // after a first Ctrl-C with an active timer, control returns
+                    // here, so an armed exit hint that is never confirmed must
+                    // clear here too rather than linger on the status bar for the
+                    // (possibly hours-away) timer's whole wait.
+                    let deadline = [exit_press.deadline(), Some(timer_deadline)]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .expect("timer_deadline is always present");
+                    // Wait for terminal input or the deadline, whichever comes
+                    // first. The wait is scoped so the future's borrows end
+                    // before the agent/terminal are touched again.
+                    let event = {
+                        let next = terminal.next(&agent);
+                        tokio::pin!(next);
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next).await.ok()
+                    };
+                    match event {
+                        Some(event) => {
+                            // Real input arrived first; handle it below. Under
+                            // a *headless* `--wait-timers` run an end-of-input
+                            // is not the end: the driver may hold stdin open,
+                            // and the timers are the point, so the wait resumes.
+                            // On an interactive terminal Ctrl-D (EOF) must still
+                            // exit normally, so only suppress it when the session
+                            // is non-steerable — otherwise `--wait-timers` would
+                            // trap an interactive user, unable to quit while it
+                            // waits out and runs the timer (issue #150).
+                            if suppress_eof_for_timers(wait_timers, terminal.steerable)
+                                && matches!(event, TermInput::Eof)
+                            {
+                                // Remember the EOF rather than discard it: the
+                                // reader won't emit another, so without this the
+                                // post-timer prompt read would hang. Keep
+                                // waiting for the remaining timers.
+                                stdin_closed = true;
+                                continue;
+                            }
+                            terminal.queued.push_front(event);
+                            break Vec::new();
+                        }
+                        None => {
+                            // A deadline elapsed. If it was the Ctrl-C exit
+                            // window, clear the stale "(Ctrl-C again to exit)"
+                            // hint and disarm (a later press re-arms rather than
+                            // exits), mirroring the prompt loop below. Otherwise
+                            // it was the timer interval/deadline and the loop top
+                            // re-evaluates due/draft and consumes the timer when
+                            // delivery is allowed.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
+                        }
+                    }
+                }
+            };
+            if !fired.is_empty() {
+                // Show the fired timers and run their message as a new turn.
+                // Sanitize the model-controlled note: it can carry control or
+                // escape bytes that a terminal would otherwise interpret
+                // (issue #150). The stored note is left intact.
+                for timer in &fired {
+                    terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
+                }
+                let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                // An API/network error during this idle timer turn must not
+                // tear down the REPL: show it and return to the prompt, exactly
+                // as `run_command`'s error arm below does for a user turn.
+                agent.mark_auto_turn();
+                match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                    Ok(outcome) => {
+                        // Issue #150: in a headless `--wait-timers` run a Ctrl-C
+                        // that lands *during* the turn cancels it (the outcome is
+                        // `Cancelled`). With no interactive session to steer, that
+                        // interrupt means exit — break rather than resume the
+                        // outer loop and keep waiting on the remaining timers.
+                        if !terminal.steerable
+                            && args.wait_timers
+                            && outcome.stop_reason == agent::StopReason::Cancelled
+                        {
+                            break;
+                        }
+                        print_turn_outcome(&outcome, &terminal.renderer)
+                    }
+                    Err(e) => {
+                        if terminal.renderer.is_frame() {
+                            terminal.renderer.note(&format!("Error: {:#}", e));
+                        } else {
+                            eprintln!("Error: {:#}", e);
+                        }
+                    }
+                }
+                separate = true;
+                continue;
+            }
+
+            // What ended the prompt read: terminal input, or a due timer.
+            enum Prompt {
+                Input(TermInput),
+                TimerDue,
+            }
+
             let input = loop {
+                // An idle timer that is due ends the prompt read, unless the
+                // editor holds a half-typed draft — that keeps the timer back
+                // until the draft is sent or cleared. Checked before borrowing
+                // the terminal for the read.
+                let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
+                let draft = terminal.view.lock().unwrap().has_draft();
+                // A queued Ctrl-C (requeued out of the timer wait above, or
+                // arriving just as the timer comes due) must beat timer
+                // delivery here too: the timer turn reads only new channel
+                // events, so firing it would run its tools despite the stop
+                // request. Leave the interrupt for `terminal.next()` to surface
+                // so it routes through the exit/double-press handler below
+                // rather than starting a turn (issue #150).
+                let interrupt_queued = terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt));
+                // An armed Ctrl-C exit window also holds the timer back: after a
+                // first Ctrl-C arms the double-press gesture, a timer coming due
+                // before the window lapses must not start an automatic turn that
+                // the confirming second press would then cancel instead of
+                // exiting (issue #150).
+                if deliver_due_timer(timer_due, draft, interrupt_queued, exit_press.deadline().is_some()) {
+                    break Prompt::TimerDue;
+                }
+                // Piped stdin already closed during the timer wait and no timers
+                // remain to fire: with nothing queued, no further input will
+                // arrive, so end the session rather than block on a read that
+                // can never complete. (A not-yet-due timer still bounds the wait
+                // below and fires; a real Interrupt still breaks this loop.)
+                if stdin_closed
+                    && terminal.queued.is_empty()
+                    && terminal.messages.is_empty()
+                    && agent.timers().next_due().is_none()
+                {
+                    break Prompt::Input(TermInput::Eof);
+                }
                 let next = terminal.next(&agent);
-                // While the Ctrl-C exit hint is armed, bound the wait on the
-                // exit window: if the second press never comes, clear the stale
-                // "(Ctrl-C again to exit)" hint and disarm the detector so the
-                // visible instruction stays in sync with the armed state (a
-                // press after the window re-arms rather than exits).
-                let event = if let Some(deadline) = exit_press.deadline() {
+                // Bound this wait on the soonest of two deadlines, recomputed
+                // each wakeup, so an event that doesn't break the loop (a
+                // consumed Esc/CycleMode/Rejected) can't strand us waiting
+                // without a deadline:
+                //   * the next timer's due time, so a timer coming due while we
+                //     idle still ends the read and fires (the idle reminder);
+                //   * the Ctrl-C exit window, so a second press that never comes
+                //     clears the stale "(Ctrl-C again to exit)" hint and disarms
+                //     the detector (a later press re-arms rather than exits).
+                let timer_deadline = agent.timers().next_due().map(|due| {
+                    let wait = (due - Local::now()).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // Floor the recheck: a timer that is already due but held
+                    // back by a draft (the loop top only breaks when there is
+                    // no draft) would otherwise elapse instantly and busy-spin,
+                    // so recheck on a short interval instead.
+                    std::time::Instant::now() + wait.max(std::time::Duration::from_millis(200))
+                });
+                let deadline = [exit_press.deadline(), timer_deadline].into_iter().flatten().min();
+                let event = if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
                         Ok(event) => event,
                         Err(_) => {
-                            exit_press.disarm();
-                            terminal.renderer.clear_transient();
+                            // A deadline elapsed. If it was the Ctrl-C window,
+                            // clear the hint and disarm; otherwise it was the
+                            // timer deadline and the loop top fires it.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
                             continue;
                         }
                     }
@@ -2458,12 +2827,74 @@ async fn main() -> Result<()> {
                         // no-op contract. Staying in the inner loop keeps the
                         // empty-buffer Esc a true zero-redraw no-op.
                     }
-                    other => break other,
+                    other => break Prompt::Input(other),
                 }
             };
+            // A due timer fires as a new turn carrying its message; loop back
+            // to the prompt afterwards.
+            if matches!(input, Prompt::TimerDue) {
+                let fired = agent.take_fired_timers()?;
+                if !fired.is_empty() {
+                    // As above: sanitize the model-controlled note before it
+                    // reaches the terminal (issue #150).
+                    for timer in &fired {
+                        terminal.renderer.note(&format!(
+                            "⏰ timer {}: {}",
+                            timer.id,
+                            sanitize_terminal_line(&timer.note)
+                        ));
+                    }
+                    let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                    // As above: an idle timer turn's error returns to the
+                    // prompt rather than terminating the REPL.
+                    agent.mark_auto_turn();
+                    match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                        Ok(outcome) => {
+                            // Issue #150: as above — a Ctrl-C that cancels this
+                            // timer turn in a headless `--wait-timers` run exits
+                            // rather than resuming the wait on remaining timers.
+                            if !terminal.steerable
+                                && args.wait_timers
+                                && outcome.stop_reason == agent::StopReason::Cancelled
+                            {
+                                break;
+                            }
+                            print_turn_outcome(&outcome, &terminal.renderer)
+                        }
+                        Err(e) => {
+                            if terminal.renderer.is_frame() {
+                                terminal.renderer.note(&format!("Error: {:#}", e));
+                            } else {
+                                eprintln!("Error: {:#}", e);
+                            }
+                        }
+                    }
+                    separate = true;
+                }
+                continue;
+            }
+            let Prompt::Input(input) = input else { unreachable!("a timer due breaks TimerDue") };
             let input = match input {
-                TermInput::Eof => break,
+                TermInput::Eof => {
+                    // Confirmed end of input. A headless run that still has
+                    // timers set reports the ones that never fired (empty input
+                    // queues alone are not EOF, so this is the only place it is
+                    // safe to say so).
+                    let left = agent.timers().len();
+                    if left > 0 && !args.wait_timers {
+                        eprintln!("[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]");
+                    }
+                    break;
+                }
                 TermInput::Interrupt => {
+                    // Issue #150: a headless `--wait-timers` run has no
+                    // interactive session to steer, so the first Ctrl-C exits
+                    // (the interrupt is requeued out of the timer wait and
+                    // lands here). The interactive double-press-to-exit gesture
+                    // below is kept for steerable sessions.
+                    if !terminal.steerable && args.wait_timers {
+                        break;
+                    }
                     if exit_press.press(std::time::Instant::now()) {
                         break;
                     }
@@ -2495,7 +2926,7 @@ async fn main() -> Result<()> {
                 terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
-            match run_command(&mut agent, &input, &mut terminal).await {
+            match run_command(&mut agent, &input, &mut terminal, args.wait_timers).await {
                 Ok(continue_running) => {
                     running = continue_running;
                 }
@@ -2604,10 +3035,46 @@ mod tests {
 
     #[test]
     fn sanitize_terminal_text_strips_control_and_escape_sequences() {
-        // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
-        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
-        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
+        // A prompt-injected ANSI/OSC payload is stripped whole, printable text kept.
+        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hithere");
+        // Tabs are expanded to spaces (not dropped), so columns stay separated;
+        // other C0 controls are still removed.
+        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "ab      c");
         assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn sanitize_terminal_expands_tabs_to_spaces() {
+        // A tab is legitimate column layout, so it is expanded to the next
+        // 8-column tab stop rather than deleted — otherwise numbered `read_file`
+        // output like `   1\tcode` would merge into `   1code` (Copilot finding,
+        // src/frame.rs:175 / src/ui.rs:1351). Both renderers sanitize via these
+        // helpers, so the fix covers both.
+        assert_eq!(sanitize_terminal_text("     1\tleft\tright"), "     1  left    right");
+        assert_eq!(sanitize_terminal_line("     1\tleft\tright"), "     1  left    right");
+        // Tab stops are absolute 8-column stops, resetting after a kept `\n`.
+        assert_eq!(sanitize_terminal_text("a\tb"), "a       b");
+        assert_eq!(sanitize_terminal_text("ab\tc\nx\ty"), "ab      c\nx       y");
+        // A tab surviving an escape strip still can't move the cursor (it became
+        // spaces), so the terminal-safety protection is preserved. The CSI
+        // sequence itself is stripped whole, so the tab aligns to `hi`'s width.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\tthere"), "hi      there");
+    }
+
+    #[test]
+    fn sanitize_terminal_tab_stops_track_unicode_cell_width() {
+        // Tab stops are measured in terminal cells, not characters (Copilot
+        // finding, src/main.rs): a wide CJK glyph is two cells, so after `界`
+        // (col 2) the tab fills to the next 8-column stop — counting it as one
+        // character would misplace the next column by a cell.
+        for sanitize in [sanitize_terminal_line, sanitize_terminal_text] {
+            // `界` = 2 cells → tab fills 6 spaces to reach column 8.
+            assert_eq!(sanitize("界\tX"), format!("界{}X", " ".repeat(6)));
+            // `界界` = 4 cells → tab fills 4 spaces to reach column 8.
+            assert_eq!(sanitize("界界\tX"), format!("界界{}X", " ".repeat(4)));
+            // `e` + U+0301 (zero-width combining mark) = 1 cell → tab fills 7.
+            assert_eq!(sanitize("e\u{0301}\tX"), format!("e\u{0301}{}X", " ".repeat(7)));
+        }
     }
 
     #[test]
@@ -2707,7 +3174,23 @@ mod tests {
         // replay re-prints it as the lines the frame showed, so stripping `\n`
         // would concatenate the lines. Other controls are still dropped.
         assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
-        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
+        // A complete CSI sequence is stripped whole (not left as a visible
+        // `[2J` body), while the surrounding text and line feed survive.
+        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one\ntwo");
+    }
+
+    #[test]
+    fn sanitize_strips_whole_ansi_sequences() {
+        // The ESC byte and the entire sequence body are removed, so a colored
+        // tool note renders as clean text rather than a width-eating `[31m…[0m`.
+        assert_eq!(sanitize_terminal_line("\x1b[31mred\x1b[0m"), "red");
+        // OSC (here a clipboard-set) is consumed whole on both terminators:
+        // BEL (`\x07`) and ST (`\x1b\`).
+        assert_eq!(sanitize_terminal_line("a\x1b]52;c;Zm8=\x07b"), "ab");
+        assert_eq!(sanitize_terminal_line("a\x1b]0;title\x1b\\b"), "ab");
+        // A lone/unterminated ESC still drops only the ESC byte; trailing
+        // printable text is preserved.
+        assert_eq!(sanitize_terminal_line("a\x1bZb"), "aZb");
     }
 
     #[test]
@@ -2717,8 +3200,44 @@ mod tests {
         // spill an unprefixed extra row or move a selector's cursor, not
         // multi-line content to keep. Other controls are dropped as well.
         assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
-        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
+        // The whole CSI sequence is stripped; `\n` is dropped on this path.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hithere");
         assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn deliver_due_timer_yields_to_interrupt_and_draft() {
+        // The core of the issue #150 guard, deterministically: a due timer may
+        // start its turn only when nothing else must win first. A queued Ctrl-C
+        // (the race the harness test can't reliably reproduce), a half-typed
+        // draft, and an armed Ctrl-C exit window each hold the timer back; with
+        // none of them, a due timer fires.
+        assert!(deliver_due_timer(true, false, false, false), "due, nothing else → fire");
+        assert!(!deliver_due_timer(true, false, true, false), "queued interrupt must beat a due timer");
+        assert!(!deliver_due_timer(true, true, false, false), "a draft holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, false), "interrupt wins even with a draft");
+        // An armed exit window (first Ctrl-C awaiting its pair) defers the timer
+        // so the confirming second press exits instead of cancelling a surprise
+        // timer turn.
+        assert!(!deliver_due_timer(true, false, false, true), "armed exit window holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, true), "exit window wins alongside draft/interrupt");
+        // Not-yet-due timers never fire regardless of the other inputs.
+        assert!(!deliver_due_timer(false, false, false, false), "a not-due timer never fires");
+        assert!(!deliver_due_timer(false, false, true, false));
+        assert!(!deliver_due_timer(false, false, false, true));
+    }
+
+    #[test]
+    fn eof_suppression_is_headless_wait_timers_only() {
+        // Only a headless `--wait-timers` run holds a closed pipe's EOF back to
+        // keep waiting for its timers.
+        assert!(suppress_eof_for_timers(true, false), "headless --wait-timers suppresses EOF");
+        // An interactive `--wait-timers` session must let Ctrl-D exit (issue
+        // #150): suppressing it would trap the user while a timer runs.
+        assert!(!suppress_eof_for_timers(true, true), "interactive EOF still exits under --wait-timers");
+        // Without `--wait-timers`, EOF is never suppressed either way.
+        assert!(!suppress_eof_for_timers(false, false), "headless without --wait-timers exits on EOF");
+        assert!(!suppress_eof_for_timers(false, true), "interactive without --wait-timers exits on EOF");
     }
 
     #[test]

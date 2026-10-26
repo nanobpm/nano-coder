@@ -678,6 +678,14 @@ impl Renderer {
                 fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
                 fs.touch_transcript();
             }
+            // A mid-turn timer firing is a note, not a user turn. Sanitize the
+            // model-controlled note: it can carry control/escape bytes that a
+            // terminal would otherwise interpret (issue #150).
+            AgentEvent::TimerFired { id, note } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Note(format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)))));
+                fs.touch_transcript();
+            }
             // The mid-turn `/model <spec>` note is printed when the command is
             // typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
@@ -1090,7 +1098,12 @@ impl Renderer {
             if verbosity() == Verbosity::Quiet
                 && !matches!(
                     event,
-                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context | AgentEvent::ModelSwitchFailed { .. }
+                    AgentEvent::AssistantMessage { .. }
+                        | AgentEvent::Context
+                        | AgentEvent::ModelSwitchFailed { .. }
+                        // A timer firing is a harness notification, not model
+                        // chatter: show it even in quiet mode.
+                        | AgentEvent::TimerFired { .. }
                 )
                 && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
@@ -1106,6 +1119,14 @@ impl Renderer {
                 let mut state = self.state.lock().unwrap();
                 self.newline(&mut state);
                 self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+                return;
+            }
+            // A timer firing mid-turn is a harness notification, not model
+            // chatter: show it even in quiet mode (the user asked for the
+            // timer). Sanitize the model-controlled note (issue #150).
+            if let AgentEvent::TimerFired { id, note } = event {
+                let mut state = self.state.lock().unwrap();
+                self.note_now(&mut state, &format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)));
                 return;
             }
             // Mark the truncation guard only when a non-empty answer delta is
@@ -1296,6 +1317,14 @@ impl Renderer {
                 self.out(&mut state, &format!("{}{DIM}⟳ context compacted{RESET}\n", stamp()));
             }
             AgentEvent::UserMessage { .. } | AgentEvent::Context | AgentEvent::Compacted => {}
+            // A timer firing mid-turn is a harness notification, not the
+            // steer/replay chatter `UserMessage` carries: plain output shows it
+            // (the user asked for the timer), including a redirected/headless
+            // `--wait-timers` run. Sanitize the model-controlled note so its
+            // control/escape bytes never reach the terminal (issue #150).
+            AgentEvent::TimerFired { id, note } => {
+                self.note_now(&mut state, &format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)));
+            }
             // The mid-turn `/model <spec>` note is printed when the command
             // is typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } => {}
@@ -1310,7 +1339,12 @@ impl Renderer {
 
     fn tool_result(&self, ok: bool, output: &str, verbose: bool) -> String {
         let width = self.width().saturating_sub(8 + strip_ansi(&stamp()).chars().count());
-        let lines: Vec<&str> = output.trim_end().lines().collect();
+        // Tool output is model-/tool-controlled (e.g. `timer_list` and
+        // `timer_cancel` echo back model-authored notes): strip control and
+        // escape bytes so a result preview can never drive the terminal (clear
+        // the screen, set the title/clipboard, …). Only the displayed preview is
+        // sanitized — the model-facing `output` is handed on untouched (#150).
+        let lines: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
         let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
         if lines.is_empty() {
             return format!("  {color}{mark} (no output){RESET}\n");
@@ -1327,7 +1361,7 @@ impl Renderer {
             return text;
         }
         let more = if lines.len() > 1 { format!(" (+{} lines)", lines.len() - 1) } else { String::new() };
-        format!("  {color}{mark} {}{more}{RESET}\n", fit(lines[0], width.saturating_sub(more.len())))
+        format!("  {color}{mark} {}{more}{RESET}\n", fit(&lines[0], width.saturating_sub(more.len())))
     }
 
     /// Accumulate streamed reasoning. Plain output shows only the one-line
@@ -1839,6 +1873,23 @@ pub(crate) mod tests {
         r.event(&AgentEvent::TextDelta { text: "hello" });
         assert!(r.answer_may_be_truncated(), "a suppressed non-empty delta must flag truncation");
         set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn plain_tool_result_strips_terminal_escapes() {
+        // A model/tool-controlled result (e.g. a `timer_list`/`timer_cancel`
+        // note) rendered through the plain `ToolResult` branch must not carry
+        // live escape/control bytes to the terminal, while keeping its text
+        // (#150). Verbose shows every line; the one-line form shows the first.
+        let _lock = verbosity_lock();
+        let r = Renderer::plain_for_test();
+        let hostile = "note \x1b]0;pwned\x07\nsecond \x1b[2J line";
+        for verbose in [true, false] {
+            let content = strip_ansi(&r.tool_result(true, hostile, verbose));
+            assert!(!content.contains('\x1b'), "ESC survived (verbose={verbose}): {content:?}");
+            assert!(!content.contains('\x07'), "BEL survived (verbose={verbose}): {content:?}");
+            assert!(content.contains("note"), "visible text dropped (verbose={verbose}): {content:?}");
+        }
     }
 
     #[test]

@@ -169,7 +169,10 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
 }
 
 fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec<String> {
-    let lines: Vec<&str> = output.trim_end().lines().collect();
+    // Tool output is model-/tool-controlled; strip control and escape bytes so a
+    // result preview can't drive the terminal. Only the displayed preview is
+    // sanitized — the model-facing output is kept intact elsewhere (#150).
+    let lines: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
     let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
     // The prefix is two leading spaces, the marker, and one space; reserve its
     // real width so the longer `⎿ error:` marker can't overflow `width` and
@@ -190,7 +193,7 @@ fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec
         return out;
     }
     let more = if lines.len() > 1 { format!(" (+{} lines)", lines.len() - 1) } else { String::new() };
-    vec![fit(&format!("  {color}{mark} {}{more}{RESET}", fit(lines[0], body.saturating_sub(more.len()))), width)]
+    vec![fit(&format!("  {color}{mark} {}{more}{RESET}", fit(&lines[0], body.saturating_sub(more.len()))), width)]
 }
 
 /// Plans longer than this show finished items as one summary line.
@@ -1045,6 +1048,22 @@ mod tests {
         let result = render_item(&Item::ToolResult { ok: true, output: "a\nb\nc".into(), verbose: false }, 40);
         assert_eq!(result.len(), 1);
         assert!(strip(&result[0]).contains("(+2 lines)"));
+    }
+
+    #[test]
+    fn tool_result_preview_strips_terminal_escapes() {
+        // A model/tool-controlled result (e.g. a `timer_list` note) must not
+        // reach the terminal with live escape/control bytes: the frame preview
+        // strips them while still showing the surviving text (#150). Strip the
+        // renderer's own styling first, then assert the content carries no raw
+        // ESC/BEL of its own.
+        let hostile = "note \x1b]0;pwned\x07 \x1b[2J done";
+        let out = render_item(&Item::ToolResult { ok: true, output: hostile.into(), verbose: true }, 120);
+        let content = strip(&out.join("\n"));
+        assert!(!content.contains('\x1b'), "ESC survived the preview: {content:?}");
+        assert!(!content.contains('\x07'), "BEL survived the preview: {content:?}");
+        assert!(content.contains("note"), "visible text was dropped: {content:?}");
+        assert!(content.contains("done"), "visible text was dropped: {content:?}");
     }
 
     #[test]

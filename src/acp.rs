@@ -129,6 +129,7 @@ fn tool_kind(name: &str) -> &'static str {
         "grep" | "glob" => "search",
         "write_file" | "edit_file" => "edit",
         name if crate::plan::is_plan_tool(name) || name == crate::goal::TOOL_NAME => "think",
+        name if crate::timers::is_timer_tool(name) => "think",
         _ => "other",
     }
 }
@@ -141,6 +142,11 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
     Some(match event {
         AgentEvent::UserMessage { text: body } => {
             json!({ "sessionUpdate": "user_message_chunk", "content": text(body) })
+        }
+        // A mid-turn timer firing is shown to the client as the same
+        // `⏰ timer N: <note>` user-message chunk the CLI renders.
+        AgentEvent::TimerFired { id, note } => {
+            json!({ "sessionUpdate": "user_message_chunk", "content": text(&format!("⏰ timer {id}: {note}")) })
         }
         AgentEvent::AssistantMessage { message_id, text: body } => json!({
             "sessionUpdate": "agent_message_chunk",

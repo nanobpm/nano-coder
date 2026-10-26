@@ -413,6 +413,7 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/tools` - List registered tools
 - `/skills` - List the skills the agent can load, where each lives, and any loading warnings
 - `/plan` - Show the agent's task plan with all notes
+- `/timers` - List the session's timers (the agent schedules them with `timer_set` to come back to you later); shows each timer's id, due time and note (see [Timers](#timers))
 - `/memory [forget ID]` - List cross-session memories with their ids, or delete one by id (see [Memory](#memory))
 - `/hooks` - List the loaded external user hooks (from `.claude/settings.json` and friends), the files they came from, and any skipped entries (see [Lifecycle Hooks](#lifecycle-hooks))
 - `/queue [list|add text|remove N...|edit N text|clear]` - Show or edit the queued messages and unread steers. Works while a turn runs, so a queued message or steer can be removed or rewritten before it is sent.
@@ -470,7 +471,12 @@ asks again on the session's next turn.
 
 Flags: `--login github-copilot|muse`, `--list-models PROVIDER`, `--trajectory SESSION_ID [--json|--markdown]`, `--acp`, `--model provider/model` (or `AGENTIC_HARNESS_MODEL`), `--resume [SESSION_ID|last]`, `--list-sessions [--all] [--json]`,
 `--config PATH`, `--verbosity LEVEL` (`-v`), `--sandbox off|workspace|read-only` (or `NANO_CODER_SANDBOX`),
-`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--version` (`-V`).
+`--allow RULE` and `--deny RULE` (repeatable; added to the config's rules), `--wait-timers`, `--version` (`-V`).
+
+`--wait-timers` keeps the session alive for scheduled timers (see [Timers](#timers)) after input ends.
+In an interactive session the agent already waits at the prompt, but a piped or redirected run exits
+once stdin closes — so a run that reads its prompt from a pipe needs `--wait-timers` to keep waiting
+for timers set during the turn to come due, fire, and be delivered. Ctrl-C exits the wait.
 
 Before opening a PR, run `cargo fmt` (style in `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings`
 and `cargo test`; CI checks all three. To keep `git blame` past the one-time reformat, run
@@ -1139,6 +1145,30 @@ the result:
   *disabled* a repeated hallucinated `plan_*` call is itself detected rather than exempted.
 
 Plan and outcome calls don't count. Set `reminders = false` to turn them off.
+
+## Timers
+
+The `timer_*` tools let the agent schedule a note to itself to come back to you later — for
+example to check on a long build, or to follow up after a delay. A timer lives only for the
+session (it is written to the session log, so `--resume` restores pending ones).
+
+- `timer_set` - schedule a timer. Give exactly one of `after` (a delay like `30m`, `1h30m`,
+  `90s`, `2 hours`, `1.5h`) or `at` (a time like `HH:MM` for the next occurrence, or an ISO
+  date-time such as `2026-10-25T14:30`, local unless you append an offset like `+02:00` or `Z`),
+  plus a `note` describing what to do when it fires. Up to 10 timers can be active at once.
+- `timer_list` - the session's timers with their ids, due times and notes.
+- `timer_cancel` - drop a timer by `id`.
+- `timer_done` - acknowledge a fired timer by `id` once it is handled.
+
+When a timer comes due it is delivered to the model as an automatic turn. If one fires while a
+turn is already running it is delivered mid-turn; otherwise it starts a fresh automatic turn
+when the session is idle. `/timers` shows the current timers in the terminal.
+
+In an interactive session the agent waits at the prompt, so due timers fire naturally. A piped
+or redirected (non-interactive) run, however, exits as soon as stdin closes — pass
+`--wait-timers` to keep such a run alive after input ends so timers set during the turn can come
+due, fire and be delivered; Ctrl-C exits the wait. The timer tools are available in interactive
+CLI sessions; ACP headless mode has no idle loop to fire them, so they are not offered there.
 
 ## Outcomes
 

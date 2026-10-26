@@ -507,7 +507,7 @@ mod tests {
         // corrupt one must be sanitized and collapsed at the render boundary.
         let mut s = summary("s", None, "do it", None);
         s.title = Some("evil\u{1b}[2J\ntitle".into());
-        assert_eq!(topic(&s), "evil[2J title · do it");
+        assert_eq!(topic(&s), "evil title · do it");
     }
 
     #[test]
@@ -640,8 +640,8 @@ mod tests {
     #[test]
     fn project_and_topic_drop_control_characters() {
         let s = summary("s", Some("/work/evil\u{1b}[2J"), "hi\u{1b}]8;;x\u{7}", None);
-        assert_eq!(project(&s), "evil[2J");
-        assert_eq!(topic(&s), "hi]8;;x");
+        assert_eq!(project(&s), "evil");
+        assert_eq!(topic(&s), "hi");
     }
 
     #[test]
@@ -649,10 +649,10 @@ mod tests {
         // `--resume last` from a crafted directory name cannot inject escapes.
         let dir = tempfile::tempdir().unwrap();
         let err = last(dir.path(), "/work/evil\u{1b}[2J", None).unwrap_err().to_string();
-        assert!(err.contains("no saved session for /work/evil[2J"), "{err}");
+        assert!(err.contains("no saved session for /work/evil"), "{err}");
         assert!(!err.contains('\u{1b}'), "{err}");
         // A crafted session id is sanitized by the same helper for plain output.
-        assert_eq!(crate::sanitize_terminal_text("s\u{1b}[2J"), "s[2J");
+        assert_eq!(crate::sanitize_terminal_text("s\u{1b}[2J"), "s");
     }
 
     #[test]

@@ -352,6 +352,9 @@ impl Trajectory {
                 }
                 // The plan is surfaced by `/plan`; it is not a ledger row.
                 Record::Plan { .. } => {}
+                // Timers are surfaced by `/timers` and the status line; not a
+                // ledger row.
+                Record::Timers { .. } => {}
                 // Audit metadata, not a conversation row.
                 Record::Hooks { .. } => {}
             }

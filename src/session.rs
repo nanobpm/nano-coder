@@ -97,6 +97,11 @@ pub enum Record {
         plan: crate::plan::Plan,
         recorded_at: DateTime<FixedOffset>,
     },
+    /// The session's timers after a change; the latest one wins.
+    Timers {
+        timers: crate::timers::Timers,
+        recorded_at: DateTime<FixedOffset>,
+    },
     /// The external hook configuration files loaded for this session (audit
     /// trail: issue #92). Observational only — ignored when rebuilding state.
     Hooks {
@@ -163,6 +168,9 @@ pub struct Restored {
     /// An input accepted but not completed before the log ended.
     pub pending_input: Option<PendingInput>,
     pub plan: Option<crate::plan::Plan>,
+    /// The session's timers as of the latest timers record (absent when the
+    /// session never set one).
+    pub timers: Option<crate::timers::Timers>,
     /// Whether the last replacement was a smart compaction, so the resumed
     /// session should offer the history tools without re-sniffing message text.
     pub history_available: bool,
@@ -523,6 +531,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 restored.history_hint_consumed = false;
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
+            Record::Timers { timers, .. } => restored.timers = Some(timers),
             // Audit-only: records the loaded hook config, not conversation state.
             Record::Hooks { .. } => {}
         }

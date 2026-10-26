@@ -97,6 +97,14 @@ pub struct Message {
     /// fresh reply (issue #114). Log only; not sent to providers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continuation: bool,
+    /// Marks a fired-timer or pending-timer-nudge user message (implies
+    /// `auto_initiated`), so recovery's continuation replay can tell it apart
+    /// from a Stop-hook re-prompt: a timer message is delivered mid-turn but
+    /// does NOT begin a new answer segment, so the replay keeps the interrupted
+    /// answer's prefix across it rather than clearing it (issue #150). Log
+    /// only; not sent to providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timer: bool,
     /// Provider-specific reasoning blocks that must be replayed with this
     /// assistant message (Anthropic `thinking` blocks with signatures).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -152,6 +160,7 @@ impl Message {
             is_error: false,
             auto_initiated: false,
             continuation: false,
+            timer: false,
             thinking_blocks: vec![],
             tool_call_id: None,
             name: None,
@@ -215,6 +224,16 @@ impl Message {
     pub fn continuation(mut self) -> Self {
         self.auto_initiated = true;
         self.continuation = true;
+        self
+    }
+
+    /// Mark this (user-role) message as a fired-timer or pending-timer-nudge
+    /// injection (implies `auto_initiated`), so recovery's continuation replay
+    /// keeps the interrupted answer's prefix across it instead of treating it
+    /// as a new answer segment (issue #150).
+    pub fn timer(mut self) -> Self {
+        self.auto_initiated = true;
+        self.timer = true;
         self
     }
 }
