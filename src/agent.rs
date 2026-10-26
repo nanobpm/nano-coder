@@ -756,6 +756,11 @@ pub struct Agent {
     /// Steps since the last timer fired or the pending set emptied, driving the
     /// `PENDING_NUDGE_EVERY` reminder for fired timers not yet marked done.
     pending_timer_steps: usize,
+    /// Set by the REPL before an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so the user message `run_turn` pushes is
+    /// marked `auto_initiated` — billed as agent-initiated, not a premium
+    /// user request with no new user input. Consumed once per `run_turn`.
+    auto_turn: bool,
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
@@ -944,6 +949,7 @@ impl Agent {
             timers_clock: None,
             timers_enabled: true,
             pending_timer_steps: 0,
+            auto_turn: false,
             reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
@@ -2391,7 +2397,7 @@ impl Agent {
             if self.pending_timer_steps.is_multiple_of(timers::PENDING_NUDGE_EVERY)
                 && let Some(note) = self.timers.pending_nudge(self.timers_now())
             {
-                self.push(Message::user(&reminders::wrap(&note)))?;
+                self.push(Message::user(&reminders::wrap(&note)).auto_initiated())?;
             }
         } else {
             self.pending_timer_steps = 0;
@@ -3159,6 +3165,11 @@ impl Agent {
         }
         self.control.start_turn();
         self.reminders.start_turn();
+        // Consume the automatic-turn origin for this turn (an automatic timer
+        // wakeup/nudge): the main user message pushed below is marked
+        // `auto_initiated` so it bills as agent-initiated. Taken once here so it
+        // never leaks into the next, genuinely user-initiated turn.
+        let auto_turn = std::mem::take(&mut self.auto_turn);
         self.claude_stop_blocks = 0;
         self.sync_claude_hook_session();
         self.apply_mode_to_system_prompt();
@@ -3318,7 +3329,9 @@ impl Agent {
                     Some(extra) => format!("{user_input}\n\n{}", reminders::wrap(extra)),
                     None => user_input.to_string(),
                 };
-                self.push(Message::user(&message))?;
+                let message = Message::user(&message);
+                let message = if auto_turn { message.auto_initiated() } else { message };
+                self.push(message)?;
             }
         }
 
@@ -4895,9 +4908,23 @@ impl Agent {
     pub fn take_fired_timers(&mut self) -> Result<Vec<timers::Timer>> {
         let fired = self.timers.take_due(self.timers_now());
         if !fired.is_empty() {
+            // Restart the pending-nudge interval whenever a timer fires, so a
+            // counter left near the `PENDING_NUDGE_EVERY` threshold by an
+            // earlier pending timer does not make the first model step after an
+            // idle firing immediately re-nudge. `absorb_steers` resets it too;
+            // doing it here makes both delivery paths (mid-turn and the idle
+            // REPL loop, which calls this directly) share the reset.
+            self.pending_timer_steps = 0;
             self.timers_changed()?;
         }
         Ok(fired)
+    }
+
+    /// Mark the next `run_turn` as an automatic timer turn (a wakeup, mid-turn
+    /// firing, or pending nudge) so its user message is billed as
+    /// agent-initiated rather than a premium user request (issue #150).
+    pub fn mark_auto_turn(&mut self) {
+        self.auto_turn = true;
     }
 
     /// Push the timers due at this step into the conversation as a user
@@ -4913,7 +4940,7 @@ impl Agent {
         for timer in &fired {
             self.emit(AgentEvent::UserMessage { text: &format!("⏰ timer {}: {}", timer.id, timer.note) });
         }
-        self.push(Message::user(&Timers::fired_batch_message(&fired, now)))?;
+        self.push(Message::user(&Timers::fired_batch_message(&fired, now)).auto_initiated())?;
         Ok(true)
     }
 
@@ -9843,6 +9870,57 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].note, "check CI");
         assert!(agent.take_fired_timers().unwrap().is_empty(), "a timer fires once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_firing_resets_the_pending_nudge_counter() {
+        // Regression (PR #151): idle delivery calls `take_fired_timers`
+        // directly. If an earlier pending timer left the nudge counter near its
+        // threshold, a fresh idle firing must restart the interval so the next
+        // model step does not immediately re-nudge.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // Simulate a counter advanced to the nudge threshold by an earlier
+        // pending timer.
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the timer fired via idle delivery");
+        assert_eq!(agent.pending_timer_steps, 0, "a fresh firing restarts the nudge interval");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_automatic_timer_turn_marks_its_message_auto_initiated() {
+        // Regression (PR #151): a timer wakeup carries no new user input, so
+        // its user message must bill as agent-initiated.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(vec![text("ok")], dir.path());
+        agent.new_session().unwrap();
+        agent.mark_auto_turn();
+        agent.run_turn(None, "⏰ timer 1: check CI").await.unwrap();
+        let auto = agent
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("timer 1"))
+            .expect("the timer user message");
+        assert!(auto.auto_initiated, "an automatic timer turn is agent-initiated");
+
+        // A following genuine user turn is NOT auto-initiated (the flag is
+        // consumed once).
+        let (mut agent2, _) = self::agent(vec![text("ok")], dir.path());
+        agent2.new_session().unwrap();
+        agent2.run_turn(None, "hello").await.unwrap();
+        let user = agent2
+            .conversation
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("hello"))
+            .expect("the user message");
+        assert!(!user.auto_initiated, "a user-typed turn stays user-initiated");
     }
 
     #[tokio::test(flavor = "multi_thread")]

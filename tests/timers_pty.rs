@@ -164,3 +164,63 @@ fn a_timer_appears_in_timers_and_the_status_line_and_fires_mid_turn() {
     let screen = pty.wait_for("⏰ timer 1: check CI", Duration::from_secs(75));
     assert!(screen.contains("fired: check CI") || screen.contains("⏰ timer 1: check CI"), "{screen}");
 }
+
+/// Concatenated contents of every persisted session log under `dir/sessions`.
+fn session_logs(dir: &std::path::Path) -> String {
+    let sessions = dir.join("sessions");
+    let mut all = String::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "jsonl")
+                && let Ok(body) = std::fs::read_to_string(entry.path())
+            {
+                all.push_str(&body);
+            }
+        }
+    }
+    all
+}
+
+#[test]
+fn a_half_typed_draft_holds_an_idle_timer_back_until_it_is_cleared() {
+    // Draft protection (issue #150): unlike the mid-turn scenario above, this
+    // leaves the prompt idle with a half-typed draft across the deadline, so a
+    // regression that fired into a half-typed line — or skipped idle delivery
+    // entirely — would be caught here.
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let pty = Pty::spawn(&["--model", "mock/test", "--config", config.to_str().unwrap()]);
+
+    pty.wait_for("mock/test", Duration::from_secs(15));
+
+    // Set a one-minute timer WITHOUT the mock's wait, so the turn ends and the
+    // prompt goes idle well before the deadline.
+    pty.send("set a timer\n");
+    let screen = pty.wait_for("Timer 1 set for", Duration::from_secs(20));
+    assert!(screen.contains("Timer 1 set for"), "{screen}");
+
+    // Leave a half-typed draft (no Enter). An idle timer coming due must be
+    // held back while a draft is in the editor, never firing into it.
+    pty.send("a half-typed note");
+    // Wait past the one-minute deadline; the timer must NOT fire while held.
+    std::thread::sleep(Duration::from_secs(70));
+    let screen = pty.screen();
+    assert!(
+        !screen.contains("⏰ timer 1") && !screen.contains("fired: check CI"),
+        "a held draft must hold the timer back: {screen}"
+    );
+    assert!(
+        !session_logs(dir.path()).contains("fired: check CI"),
+        "no firing was persisted while the draft was held"
+    );
+
+    // Clear the draft (Ctrl-U, 0x15). The now-overdue timer fires.
+    pty.send("\u{15}");
+    let screen = pty.wait_for("⏰ timer 1: check CI", Duration::from_secs(15));
+    assert!(screen.contains("fired: check CI") || screen.contains("⏰ timer 1: check CI"), "{screen}");
+
+    // Exactly once: the persisted session records a single firing, so clearing
+    // the draft neither double-delivers nor re-arms the timer.
+    let fires = session_logs(dir.path()).matches("fired: check CI").count();
+    assert_eq!(fires, 1, "the held timer fires exactly once after the draft clears");
+}

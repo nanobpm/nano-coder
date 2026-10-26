@@ -2529,6 +2529,7 @@ async fn main() -> Result<()> {
                 // An API/network error during this idle timer turn must not
                 // tear down the REPL: show it and return to the prompt, exactly
                 // as `run_command`'s error arm below does for a user turn.
+                agent.mark_auto_turn();
                 match run_interactive_turn(&mut agent, &text, &mut terminal).await {
                     Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
                     Err(e) => {
@@ -2642,6 +2643,7 @@ async fn main() -> Result<()> {
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
                     // As above: an idle timer turn's error returns to the
                     // prompt rather than terminating the REPL.
+                    agent.mark_auto_turn();
                     match run_interactive_turn(&mut agent, &text, &mut terminal).await {
                         Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
                         Err(e) => {
@@ -2672,6 +2674,14 @@ async fn main() -> Result<()> {
                     break;
                 }
                 TermInput::Interrupt => {
+                    // Issue #150: a headless `--wait-timers` run has no
+                    // interactive session to steer, so the first Ctrl-C exits
+                    // (the interrupt is requeued out of the timer wait and
+                    // lands here). The interactive double-press-to-exit gesture
+                    // below is kept for steerable sessions.
+                    if !terminal.steerable && args.wait_timers {
+                        break;
+                    }
                     if exit_press.press(std::time::Instant::now()) {
                         break;
                     }
