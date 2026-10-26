@@ -148,12 +148,7 @@ impl Timers {
                 changed: true,
             });
         }
-        let ids: Vec<String> = self
-            .items
-            .iter()
-            .chain(self.pending.iter())
-            .map(|t| t.id.to_string())
-            .collect();
+        let ids: Vec<String> = self.items.iter().chain(self.pending.iter()).map(|t| t.id.to_string()).collect();
         if ids.is_empty() {
             bail!("no timer {id}: no timers are set");
         }

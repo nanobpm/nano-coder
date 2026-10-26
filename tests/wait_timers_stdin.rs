@@ -85,10 +85,7 @@ fn piped_wait_timers_run_exits_after_stdin_closes_and_the_timer_fires() {
             // recorded the timer *firing* so this test fails if `--wait-timers`
             // stops actually waiting for and delivering the timer.
             let logs = session_logs(dir.path());
-            assert!(
-                logs.contains("fired: check CI"),
-                "session must record timer 1 firing before exit; logs:\n{logs}"
-            );
+            assert!(logs.contains("fired: check CI"), "session must record timer 1 firing before exit; logs:\n{logs}");
             return;
         }
         if Instant::now() > deadline {
@@ -289,8 +286,5 @@ fn headless_wait_timers_run_exits_on_an_interrupt_during_the_idle_timer_wait() {
     // The interrupt won, so the timer's turn never started: its fired note must
     // be absent. (The status bar's "⏰ HH:MM" uses a different format and is not
     // emitted on this non-TTY stdout; only a fired turn prints "⏰ timer".)
-    assert!(
-        !out.contains("⏰ timer"),
-        "timer turn started despite the interrupt during the idle wait\nstdout:\n{out}"
-    );
+    assert!(!out.contains("⏰ timer"), "timer turn started despite the interrupt during the idle wait\nstdout:\n{out}");
 }

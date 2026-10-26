@@ -2647,9 +2647,7 @@ async fn main() -> Result<()> {
                     let event = {
                         let next = terminal.next(&agent);
                         tokio::pin!(next);
-                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next)
-                            .await
-                            .ok()
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next).await.ok()
                     };
                     match event {
                         Some(event) => {
@@ -2697,9 +2695,7 @@ async fn main() -> Result<()> {
                 // escape bytes that a terminal would otherwise interpret
                 // (issue #150). The stored note is left intact.
                 for timer in &fired {
-                    terminal
-                        .renderer
-                        .note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
+                    terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
                 }
                 let text = timers::Timers::fired_batch_message(&fired, Local::now());
                 // An API/network error during this idle timer turn must not
@@ -2713,7 +2709,10 @@ async fn main() -> Result<()> {
                         // `Cancelled`). With no interactive session to steer, that
                         // interrupt means exit — break rather than resume the
                         // outer loop and keep waiting on the remaining timers.
-                        if !terminal.steerable && args.wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                        if !terminal.steerable
+                            && args.wait_timers
+                            && outcome.stop_reason == agent::StopReason::Cancelled
+                        {
                             break;
                         }
                         print_turn_outcome(&outcome, &terminal.renderer)
@@ -2839,9 +2838,11 @@ async fn main() -> Result<()> {
                     // As above: sanitize the model-controlled note before it
                     // reaches the terminal (issue #150).
                     for timer in &fired {
-                        terminal
-                            .renderer
-                            .note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
+                        terminal.renderer.note(&format!(
+                            "⏰ timer {}: {}",
+                            timer.id,
+                            sanitize_terminal_line(&timer.note)
+                        ));
                     }
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
                     // As above: an idle timer turn's error returns to the
@@ -2852,7 +2853,10 @@ async fn main() -> Result<()> {
                             // Issue #150: as above — a Ctrl-C that cancels this
                             // timer turn in a headless `--wait-timers` run exits
                             // rather than resuming the wait on remaining timers.
-                            if !terminal.steerable && args.wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                            if !terminal.steerable
+                                && args.wait_timers
+                                && outcome.stop_reason == agent::StopReason::Cancelled
+                            {
                                 break;
                             }
                             print_turn_outcome(&outcome, &terminal.renderer)
@@ -2878,9 +2882,7 @@ async fn main() -> Result<()> {
                     // safe to say so).
                     let left = agent.timers().len();
                     if left > 0 && !args.wait_timers {
-                        eprintln!(
-                            "[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]"
-                        );
+                        eprintln!("[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]");
                     }
                     break;
                 }

@@ -6484,10 +6484,8 @@ mod tests {
             Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
         )))
         .unwrap();
-        log.append(&Record::Message(Box::new(
-            Message::user(&Timers::fired_batch_message(&[], Local::now())).timer(),
-        )))
-        .unwrap();
+        log.append(&Record::Message(Box::new(Message::user(&Timers::fired_batch_message(&[], Local::now())).timer())))
+            .unwrap();
         log.append(&Record::Message(Box::new(Message::assistant("two")))).unwrap();
         drop(log);
         let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());

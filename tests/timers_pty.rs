@@ -39,7 +39,11 @@ impl Pty {
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
         size.ws_row = 24;
         size.ws_col = 100;
-        if unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), &termios, &size) } != 0 {
+        // openpty's termios/winsize params are *const on Linux but *mut on
+        // macOS; cast through a raw pointer so both compile without warnings.
+        let termios_ptr = &termios as *const libc::termios as *mut libc::termios;
+        let size_ptr = &size as *const libc::winsize as *mut libc::winsize;
+        if unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), termios_ptr, size_ptr) } != 0 {
             panic!("openpty failed");
         }
         let master_fd = unsafe { OwnedFd::from_raw_fd(master) };
@@ -183,10 +187,7 @@ fn session_logs(dir: &std::path::Path) -> String {
 
 /// Every persisted session record (one parsed JSONL line) under `dir/sessions`.
 fn session_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    session_logs(dir)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect()
+    session_logs(dir).lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).collect()
 }
 
 /// How many *user-message* records carry `needle` — the authoritative
@@ -207,9 +208,10 @@ fn user_message_firings(records: &[serde_json::Value], needle: &str) -> usize {
 /// user `Message`, then `TurnEnd`, so this guarantees every record of that turn
 /// is on disk before the count is read (the UI note races ahead of all three).
 fn fired_turn_complete(records: &[serde_json::Value], needle: &str) -> bool {
-    let Some(fired_at) = records.iter().position(|r| {
-        r["type"] == "message" && r["data"]["role"] == "user" && r["data"].to_string().contains(needle)
-    }) else {
+    let Some(fired_at) = records
+        .iter()
+        .position(|r| r["type"] == "message" && r["data"]["role"] == "user" && r["data"].to_string().contains(needle))
+    else {
         return false;
     };
     records[fired_at + 1..].iter().any(|r| r["type"] == "turn_end")
@@ -243,10 +245,7 @@ fn a_half_typed_draft_holds_an_idle_timer_back_until_it_is_cleared() {
         !screen.contains("⏰ timer 1") && !screen.contains("fired: check CI"),
         "a held draft must hold the timer back: {screen}"
     );
-    assert!(
-        !session_logs(dir.path()).contains("fired: check CI"),
-        "no firing was persisted while the draft was held"
-    );
+    assert!(!session_logs(dir.path()).contains("fired: check CI"), "no firing was persisted while the draft was held");
 
     // Clear the draft (Ctrl-U, 0x15). The now-overdue timer fires.
     pty.send("\u{15}");

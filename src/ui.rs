@@ -683,11 +683,7 @@ impl Renderer {
             // terminal would otherwise interpret (issue #150).
             AgentEvent::TimerFired { id, note } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(stamped(Item::Note(format!(
-                    "⏰ timer {}: {}",
-                    id,
-                    crate::sanitize_terminal_line(note)
-                ))));
+                fs.items.push(stamped(Item::Note(format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)))));
                 fs.touch_transcript();
             }
             // The mid-turn `/model <spec>` note is printed when the command is
