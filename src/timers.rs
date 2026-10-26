@@ -353,7 +353,12 @@ fn delay_from(amount: f64, unit: &str, text: &str) -> Result<Duration> {
         "h" | "hr" | "hrs" | "hour" | "hours" => amount * 3_600.0,
         _ => return Err(bad_delay(text)),
     };
-    if !seconds.is_finite() || seconds <= 0.0 || seconds > i64::MAX as f64 / 1_000.0 {
+    // Accept a zero component (e.g. the `00m` in `1h00m`, the exact form
+    // `format_delay` emits for one hour): only a negative, non-finite, or
+    // out-of-range value is unparsable. The minimum is enforced by `set` on
+    // the *total*, so an all-zero delay still gets the actionable too-soon
+    // error rather than a confusing "could not parse" one.
+    if !seconds.is_finite() || seconds < 0.0 || seconds > i64::MAX as f64 / 1_000.0 {
         return Err(bad_delay(text));
     }
     Ok(Duration::milliseconds((seconds * 1_000.0).round() as i64))
@@ -397,12 +402,29 @@ pub fn parse_at(text: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
     if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M") {
         return local_naive(naive, text);
     }
+    // ISO date-times carrying an explicit offset. `parse_from_rfc3339` below
+    // requires *seconds* and a colon in the offset, so valid forms like
+    // `2026-10-26T14:30+02:00` (minute precision), `...+0200` (compact
+    // offset), or `2026-10-26T14:30:00+0200` (seconds, compact offset) would
+    // otherwise be rejected. A trailing `Z`/`z` is UTC; normalize it to a
+    // numeric zero offset so the minute-precision `...Z` form parses too (the
+    // original text, including a fractional-second `Z`, still falls through to
+    // the RFC3339 fallback below).
+    let offset_text = match text.strip_suffix(['Z', 'z']) {
+        Some(head) => format!("{head}+0000"),
+        None => text.to_string(),
+    };
+    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"] {
+        if let Ok(fixed) = DateTime::parse_from_str(&offset_text, fmt) {
+            return Ok(fixed.with_timezone(&Local));
+        }
+    }
     if let Ok(fixed) = DateTime::parse_from_rfc3339(text) {
         return Ok(fixed.with_timezone(&Local));
     }
     Err(anyhow::anyhow!(
         "could not parse {text:?} as a time; use \"HH:MM\" (the next occurrence, local time) or an ISO date-time \
-         like \"2026-10-25T14:30\" (local time without an offset)"
+         like \"2026-10-25T14:30\" (local time; append an offset such as \"+02:00\" or \"Z\" to pin the zone)"
     ))
 }
 
@@ -470,7 +492,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "at": {
                         "type": "string",
-                        "description": "Fire time: \"HH:MM\" (next occurrence, local time) or an ISO date-time like \"2026-10-25T14:30\" (local without an offset). Exactly one of `after`/`at`."
+                        "description": "Fire time: \"HH:MM\" (next occurrence, local time) or an ISO date-time like \"2026-10-25T14:30\" (local; append an offset such as \"+02:00\" or \"Z\" to pin the zone). Exactly one of `after`/`at`."
                     },
                     "note": {
                         "type": "string",
@@ -534,6 +556,15 @@ mod tests {
         assert_eq!(parse_delay("120").unwrap(), Duration::hours(2));
         assert_eq!(parse_delay("2 hours").unwrap(), Duration::hours(2));
         assert_eq!(parse_delay(" 1h 30m ").unwrap(), Duration::minutes(90));
+        // Zero-valued components are accepted; the minimum is enforced by
+        // `set` on the total, not here. `1h00m` is the exact form
+        // `format_delay` emits for one hour, so it must round-trip.
+        assert_eq!(parse_delay("1h00m").unwrap(), Duration::hours(1));
+        assert_eq!(parse_delay("0h30m").unwrap(), Duration::minutes(30));
+        assert_eq!(parse_delay("1h30m0s").unwrap(), Duration::minutes(90));
+        // An all-zero delay parses to zero; `set` then rejects it as too soon.
+        assert_eq!(parse_delay("0h0m0s").unwrap(), Duration::zero());
+        assert_eq!(parse_delay("0").unwrap(), Duration::zero());
     }
 
     #[test]
@@ -567,6 +598,20 @@ mod tests {
         assert_eq!(due.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-10-25T14:30:45");
         let due = parse_at("2026-10-25 14:30:00", at(12, 0)).unwrap();
         assert_eq!(due.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-10-25T14:30:00");
+        // Offset-bearing ISO date-times (RFC3339 requires seconds and a colon
+        // in the offset, so these would otherwise be rejected). The instant is
+        // taken as given, so compare in UTC.
+        let utc = |t| parse_at(t, at(12, 0)).unwrap().with_timezone(&chrono::Utc);
+        // Minute precision, colon offset.
+        assert_eq!(utc("2026-10-26T14:30+02:00").format("%Y-%m-%dT%H:%MZ").to_string(), "2026-10-26T12:30Z");
+        // Minute precision, compact offset.
+        assert_eq!(utc("2026-10-26T14:30+0200").format("%Y-%m-%dT%H:%MZ").to_string(), "2026-10-26T12:30Z");
+        // Seconds precision, compact offset.
+        assert_eq!(utc("2026-10-26T14:30:00+0200").format("%Y-%m-%dT%H:%M:%SZ").to_string(), "2026-10-26T12:30:00Z");
+        // Minute precision with a `Z` (UTC) suffix.
+        assert_eq!(utc("2026-10-26T14:30Z").format("%Y-%m-%dT%H:%MZ").to_string(), "2026-10-26T14:30Z");
+        // A seconds-and-colon-offset RFC3339 value still works.
+        assert_eq!(utc("2026-10-26T14:30:00+02:00").format("%Y-%m-%dT%H:%M:%SZ").to_string(), "2026-10-26T12:30:00Z");
         assert!(parse_at("noon", at(12, 0)).is_err());
     }
 
@@ -599,6 +644,10 @@ mod tests {
         let before = timers.clone();
 
         let err = set(&mut timers, json!({"after": "20s", "note": "x"})).unwrap_err().to_string();
+        assert!(err.contains("at least a minute") && err.contains("bash"), "{err}");
+        // An all-zero compound delay parses, then fails the minimum with the
+        // same actionable too-soon error (not a "could not parse" one).
+        let err = set(&mut timers, json!({"after": "0h0m0s", "note": "x"})).unwrap_err().to_string();
         assert!(err.contains("at least a minute") && err.contains("bash"), "{err}");
         let err = set(&mut timers, json!({"after": "25h", "note": "x"})).unwrap_err().to_string();
         assert!(err.contains("at most 24 hours") && err.contains("cron"), "{err}");
