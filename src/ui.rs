@@ -678,6 +678,18 @@ impl Renderer {
                 fs.items.push(stamped(Item::Message { role: Role::User, text: (*text).to_string() }));
                 fs.touch_transcript();
             }
+            // A mid-turn timer firing is a note, not a user turn. Sanitize the
+            // model-controlled note: it can carry control/escape bytes that a
+            // terminal would otherwise interpret (issue #150).
+            AgentEvent::TimerFired { id, note } => {
+                self.frame_finish_stream(fs);
+                fs.items.push(stamped(Item::Note(format!(
+                    "⏰ timer {}: {}",
+                    id,
+                    crate::sanitize_terminal_line(note)
+                ))));
+                fs.touch_transcript();
+            }
             // The mid-turn `/model <spec>` note is printed when the command is
             // typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
@@ -1090,7 +1102,12 @@ impl Renderer {
             if verbosity() == Verbosity::Quiet
                 && !matches!(
                     event,
-                    AgentEvent::AssistantMessage { .. } | AgentEvent::Context | AgentEvent::ModelSwitchFailed { .. }
+                    AgentEvent::AssistantMessage { .. }
+                        | AgentEvent::Context
+                        | AgentEvent::ModelSwitchFailed { .. }
+                        // A timer firing is a harness notification, not model
+                        // chatter: show it even in quiet mode.
+                        | AgentEvent::TimerFired { .. }
                 )
                 && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
@@ -1106,6 +1123,14 @@ impl Renderer {
                 let mut state = self.state.lock().unwrap();
                 self.newline(&mut state);
                 self.out(&mut state, &format!("{}{RED}⚠ model switch to {spec} failed: {error}{RESET}\n", stamp()));
+                return;
+            }
+            // A timer firing mid-turn is a harness notification, not model
+            // chatter: show it even in quiet mode (the user asked for the
+            // timer). Sanitize the model-controlled note (issue #150).
+            if let AgentEvent::TimerFired { id, note } = event {
+                let mut state = self.state.lock().unwrap();
+                self.note_now(&mut state, &format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)));
                 return;
             }
             // Mark the truncation guard only when a non-empty answer delta is
@@ -1296,6 +1321,14 @@ impl Renderer {
                 self.out(&mut state, &format!("{}{DIM}⟳ context compacted{RESET}\n", stamp()));
             }
             AgentEvent::UserMessage { .. } | AgentEvent::Context | AgentEvent::Compacted => {}
+            // A timer firing mid-turn is a harness notification, not the
+            // steer/replay chatter `UserMessage` carries: plain output shows it
+            // (the user asked for the timer), including a redirected/headless
+            // `--wait-timers` run. Sanitize the model-controlled note so its
+            // control/escape bytes never reach the terminal (issue #150).
+            AgentEvent::TimerFired { id, note } => {
+                self.note_now(&mut state, &format!("⏰ timer {}: {}", id, crate::sanitize_terminal_line(note)));
+            }
             // The mid-turn `/model <spec>` note is printed when the command
             // is typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } => {}

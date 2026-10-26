@@ -2465,6 +2465,23 @@ async fn main() -> Result<()> {
             } else {
                 loop {
                     let now = Local::now();
+                    // A Ctrl-C requeued out of the wait below (it is pushed to
+                    // `terminal.queued` so the prompt read can apply the
+                    // double-press gesture) must still win over a timer that
+                    // came due at the same moment: the running timer turn reads
+                    // new channel events, not `terminal.queued`, so starting the
+                    // turn here would run its tools instead of honouring the
+                    // interrupt. In a headless `--wait-timers` run the first
+                    // Ctrl-C means exit, so consume it and abandon the wait; in
+                    // a steerable session leave it queued for the prompt loop's
+                    // double-press handling (issue #150).
+                    if terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt)) {
+                        if !terminal.steerable && wait_timers {
+                            terminal.queued.retain(|i| !matches!(i, TermInput::Interrupt));
+                            break Vec::new();
+                        }
+                        break Vec::new();
+                    }
                     // Peek whether a timer is due *before* consuming it: a
                     // half-typed draft holds delivery back, and taking the
                     // timer here would persist its removal and drop the note
@@ -2552,8 +2569,13 @@ async fn main() -> Result<()> {
             };
             if !fired.is_empty() {
                 // Show the fired timers and run their message as a new turn.
+                // Sanitize the model-controlled note: it can carry control or
+                // escape bytes that a terminal would otherwise interpret
+                // (issue #150). The stored note is left intact.
                 for timer in &fired {
-                    terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
+                    terminal
+                        .renderer
+                        .note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
                 }
                 let text = timers::Timers::fired_batch_message(&fired, Local::now());
                 // An API/network error during this idle timer turn must not
@@ -2677,8 +2699,12 @@ async fn main() -> Result<()> {
             if matches!(input, Prompt::TimerDue) {
                 let fired = agent.take_fired_timers()?;
                 if !fired.is_empty() {
+                    // As above: sanitize the model-controlled note before it
+                    // reaches the terminal (issue #150).
                     for timer in &fired {
-                        terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
+                        terminal
+                            .renderer
+                            .note(&format!("⏰ timer {}: {}", timer.id, sanitize_terminal_line(&timer.note)));
                     }
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
                     // As above: an idle timer turn's error returns to the

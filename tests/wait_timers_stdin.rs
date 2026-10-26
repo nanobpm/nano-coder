@@ -205,3 +205,63 @@ fn headless_wait_timers_run_exits_on_an_interrupt_during_a_turn() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Issue #150: a Ctrl-C that reaches the preliminary timer wait *as a timer
+/// becomes due* must exit the headless `--wait-timers` run, not start the timer
+/// turn. The wait requeues the interrupt into `terminal.queued` for the prompt
+/// loop; the bug was that the loop top then selected the due timer and started
+/// its turn without consuming the queued interrupt — and a running turn reads
+/// new channel events, not `terminal.queued`, so the Ctrl-C was never honoured.
+///
+/// Timing: the mock's "set a timer and wait" sets a one-minute timer and then
+/// runs `sleep 75`, so at ~62s the timer is due while a turn is still in
+/// flight. The SIGINT lands in the preliminary wait right at that deadline.
+#[cfg(unix)]
+#[test]
+fn headless_wait_timers_run_exits_on_an_interrupt_as_a_timer_comes_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nano-coder"))
+        .args(["--model", "mock/test", "--config", config.to_str().unwrap(), "--wait-timers"])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nano-coder");
+
+    // Keep stdin open so there is no EOF to end the run; the only way out is
+    // the interrupt. "and wait" makes the mock set a one-minute timer and then
+    // run `sleep 75`, so the turn is still in flight when the timer comes due.
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"set a timer and wait\n").expect("write prompt");
+    stdin.flush().expect("flush prompt");
+
+    // Send SIGINT just after the one-minute timer comes due (the turn is still
+    // inside `sleep 75`). The interrupt reaches the preliminary timer wait at
+    // the deadline boundary: it must be honoured (exit) rather than left queued
+    // while the due timer's turn starts.
+    std::thread::sleep(Duration::from_secs(62));
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0, "deliver SIGINT");
+
+    // Without the fix the interrupt is requeued but the due timer's turn starts
+    // anyway, so the run outlives this deadline instead of exiting.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            drop(stdin);
+            // Require a *successful* shutdown: a startup failure or an
+            // unhandled SIGINT (exit 130 / killed by a signal) also terminates
+            // the child but is not the clean exit this test asserts.
+            assert!(status.success(), "run exited unsuccessfully: {status}");
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("headless --wait-timers run did not exit on a Ctrl-C as a timer came due");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

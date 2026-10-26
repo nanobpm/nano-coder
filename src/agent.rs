@@ -519,6 +519,14 @@ pub enum AgentEvent<'a> {
     UserMessage {
         text: &'a str,
     },
+    /// A timer fired mid-turn: its `⏰ timer N: <note>` notification. A
+    /// dedicated variant (not `UserMessage`) so a plain/redirected renderer
+    /// shows it — `UserMessage` is steer/replay chatter that plain output
+    /// intentionally suppresses, and a timer firing is not either (issue #150).
+    TimerFired {
+        id: u32,
+        note: &'a str,
+    },
     AssistantMessage {
         message_id: &'a str,
         text: &'a str,
@@ -4944,10 +4952,12 @@ impl Agent {
             return Ok(false);
         }
         let now = self.timers_now();
-        // The UI shows `⏰ timer N: <note>` per timer through the same
-        // steer/userMessage event the message itself emits.
+        // The UI shows `⏰ timer N: <note>` per timer. A dedicated event (not
+        // `UserMessage`): plain/redirected output suppresses `UserMessage` as
+        // steer/replay chatter, but a mid-turn timer firing must be visible
+        // there too — including headless `--wait-timers` runs (issue #150).
         for timer in &fired {
-            self.emit(AgentEvent::UserMessage { text: &format!("⏰ timer {}: {}", timer.id, timer.note) });
+            self.emit(AgentEvent::TimerFired { id: timer.id, note: &timer.note });
         }
         self.push(Message::user(&Timers::fired_batch_message(&fired, now)).timer())?;
         Ok(true)
