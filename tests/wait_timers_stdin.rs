@@ -134,8 +134,12 @@ fn headless_wait_timers_run_exits_on_the_first_interrupt() {
     // and keeps waiting, so this deadline trips.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if child.try_wait().expect("poll child").is_some() {
+        if let Some(status) = child.try_wait().expect("poll child") {
             drop(stdin);
+            // Require a *successful* shutdown: a startup failure or an
+            // unhandled SIGINT (exit 130 / killed by a signal) also terminates
+            // the child but is not the clean exit this test asserts.
+            assert!(status.success(), "run exited unsuccessfully: {status}");
             return;
         }
         if Instant::now() > deadline {
@@ -185,8 +189,12 @@ fn headless_wait_timers_run_exits_on_an_interrupt_during_a_turn() {
     // waiting on the timer, so the run outlives this deadline.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if child.try_wait().expect("poll child").is_some() {
+        if let Some(status) = child.try_wait().expect("poll child") {
             drop(stdin);
+            // Require a *successful* shutdown: a startup failure or an
+            // unhandled SIGINT (exit 130 / killed by a signal) also terminates
+            // the child but is not the clean exit this test asserts.
+            assert!(status.success(), "run exited unsuccessfully: {status}");
             return;
         }
         if Instant::now() > deadline {
