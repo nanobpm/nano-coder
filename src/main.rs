@@ -8,6 +8,7 @@ use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthChar;
 
 mod acp;
 mod agent;
@@ -949,7 +950,11 @@ pub(crate) fn sanitize_terminal_line(s: &str) -> String {
 /// horizontal tab to spaces (next 8-column tab stop) so tab-separated columns
 /// survive the filter. `keep_newlines` keeps `\n` (and resets the tab-stop
 /// column) for multi-line text; a single-line field drops `\n` with the other
-/// controls.
+/// controls. Tab stops are measured in terminal **cell** widths (via
+/// `UnicodeWidthChar::width`, as the frame sanitizer does), not character
+/// counts, so a wide CJK glyph advances two columns and a zero-width combining
+/// mark advances none — otherwise `界\tX` would misplace `X` and tab-aligned
+/// Unicode columns would drift.
 fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
     const TAB_WIDTH: usize = 8;
     let mut out = String::with_capacity(s.len());
@@ -971,7 +976,11 @@ fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
             c if c.is_control() => {}
             c => {
                 out.push(c);
-                col += 1;
+                // Advance by the glyph's terminal cell width so tab stops stay
+                // aligned with what the terminal actually renders (wide glyph =
+                // 2 cells, zero-width mark = 0); unknown/non-printing falls back
+                // to 0, matching the frame sanitizer's `cell_width`.
+                col += UnicodeWidthChar::width(c).unwrap_or(0);
             }
         }
     }
@@ -983,10 +992,14 @@ fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
 /// use this so the rule stays identical across them: a queued Ctrl-C always
 /// wins — the interrupt must route through the exit/double-press handler instead
 /// of starting a timer turn, which reads only new channel events and would run
-/// its tools despite the stop request — and a half-typed draft holds the timer
-/// back until the line is sent or cleared (issue #150).
-pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool) -> bool {
-    due && !draft && !interrupt_queued
+/// its tools despite the stop request — a half-typed draft holds the timer
+/// back until the line is sent or cleared, and an **armed Ctrl-C exit window**
+/// (a first press waiting for its pair) holds the timer back too: otherwise a
+/// timer coming due inside the two-press window would start an automatic turn,
+/// and the user's confirming second Ctrl-C would merely cancel that surprise
+/// turn instead of exiting as promised (issue #150).
+pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
+    due && !draft && !interrupt_queued && !exit_armed
 }
 
 /// The current session as Herdr should resume it, if it is saved to disk
@@ -2543,9 +2556,11 @@ async fn main() -> Result<()> {
                     let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
                     let draft = terminal.view.lock().unwrap().has_draft();
                     // No interrupt is queued here (it would have broken the wait
-                    // above), so pass `false`: this is the same delivery rule the
-                    // prompt loop below applies.
-                    if deliver_due_timer(due_now, draft, false) {
+                    // above), so pass `false`; the armed Ctrl-C exit window,
+                    // however, must hold a due timer back exactly as in the
+                    // prompt loop below (a timer firing mid-window would steal
+                    // the user's confirming second press).
+                    if deliver_due_timer(due_now, draft, false, exit_press.deadline().is_some()) {
                         break agent.take_fired_timers()?;
                     }
                     // Nothing deliverable right now. Without `--wait-timers` a
@@ -2684,7 +2699,12 @@ async fn main() -> Result<()> {
                 // so it routes through the exit/double-press handler below
                 // rather than starting a turn (issue #150).
                 let interrupt_queued = terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt));
-                if deliver_due_timer(timer_due, draft, interrupt_queued) {
+                // An armed Ctrl-C exit window also holds the timer back: after a
+                // first Ctrl-C arms the double-press gesture, a timer coming due
+                // before the window lapses must not start an automatic turn that
+                // the confirming second press would then cancel instead of
+                // exiting (issue #150).
+                if deliver_due_timer(timer_due, draft, interrupt_queued, exit_press.deadline().is_some()) {
                     break Prompt::TimerDue;
                 }
                 // Piped stdin already closed during the timer wait and no timers
@@ -2987,6 +3007,22 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_terminal_tab_stops_track_unicode_cell_width() {
+        // Tab stops are measured in terminal cells, not characters (Copilot
+        // finding, src/main.rs): a wide CJK glyph is two cells, so after `界`
+        // (col 2) the tab fills to the next 8-column stop — counting it as one
+        // character would misplace the next column by a cell.
+        for sanitize in [sanitize_terminal_line, sanitize_terminal_text] {
+            // `界` = 2 cells → tab fills 6 spaces to reach column 8.
+            assert_eq!(sanitize("界\tX"), format!("界{}X", " ".repeat(6)));
+            // `界界` = 4 cells → tab fills 4 spaces to reach column 8.
+            assert_eq!(sanitize("界界\tX"), format!("界界{}X", " ".repeat(4)));
+            // `e` + U+0301 (zero-width combining mark) = 1 cell → tab fills 7.
+            assert_eq!(sanitize("e\u{0301}\tX"), format!("e\u{0301}{}X", " ".repeat(7)));
+        }
+    }
+
+    #[test]
     fn sanitize_terminal_text_strips_unicode_line_separators() {
         // U+2028/U+2029 are not `char::is_control`, but a terminal folds them as
         // line breaks, so a hand-edited `/memory` id/text/evidence value could
@@ -3101,15 +3137,22 @@ mod tests {
     fn deliver_due_timer_yields_to_interrupt_and_draft() {
         // The core of the issue #150 guard, deterministically: a due timer may
         // start its turn only when nothing else must win first. A queued Ctrl-C
-        // (the race the harness test can't reliably reproduce) and a half-typed
-        // draft each hold the timer back; with neither, a due timer fires.
-        assert!(deliver_due_timer(true, false, false), "due, no draft, no interrupt → fire");
-        assert!(!deliver_due_timer(true, false, true), "queued interrupt must beat a due timer");
-        assert!(!deliver_due_timer(true, true, false), "a draft holds the timer back");
-        assert!(!deliver_due_timer(true, true, true), "interrupt wins even with a draft");
+        // (the race the harness test can't reliably reproduce), a half-typed
+        // draft, and an armed Ctrl-C exit window each hold the timer back; with
+        // none of them, a due timer fires.
+        assert!(deliver_due_timer(true, false, false, false), "due, nothing else → fire");
+        assert!(!deliver_due_timer(true, false, true, false), "queued interrupt must beat a due timer");
+        assert!(!deliver_due_timer(true, true, false, false), "a draft holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, false), "interrupt wins even with a draft");
+        // An armed exit window (first Ctrl-C awaiting its pair) defers the timer
+        // so the confirming second press exits instead of cancelling a surprise
+        // timer turn.
+        assert!(!deliver_due_timer(true, false, false, true), "armed exit window holds the timer back");
+        assert!(!deliver_due_timer(true, true, true, true), "exit window wins alongside draft/interrupt");
         // Not-yet-due timers never fire regardless of the other inputs.
-        assert!(!deliver_due_timer(false, false, false), "a not-due timer never fires");
-        assert!(!deliver_due_timer(false, false, true));
+        assert!(!deliver_due_timer(false, false, false, false), "a not-due timer never fires");
+        assert!(!deliver_due_timer(false, false, true, false));
+        assert!(!deliver_due_timer(false, false, false, true));
     }
 
     #[test]

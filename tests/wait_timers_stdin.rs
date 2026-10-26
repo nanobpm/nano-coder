@@ -206,62 +206,91 @@ fn headless_wait_timers_run_exits_on_an_interrupt_during_a_turn() {
     }
 }
 
-/// Issue #150: a Ctrl-C that reaches the preliminary timer wait *as a timer
-/// becomes due* must exit the headless `--wait-timers` run, not start the timer
-/// turn. The wait requeues the interrupt into `terminal.queued` for the prompt
-/// loop; the bug was that the loop top then selected the due timer and started
-/// its turn without consuming the queued interrupt — and a running turn reads
-/// new channel events, not `terminal.queued`, so the Ctrl-C was never honoured.
+/// Issue #150: a Ctrl-C that reaches the preliminary timer wait while the run
+/// is **idle** (its turn finished) with a timer still pending must exit the
+/// headless `--wait-timers` run without ever starting the timer's turn. The
+/// wait requeues the interrupt into `terminal.queued` for the prompt loop,
+/// which must honour it rather than fire the due timer (a running turn reads new
+/// channel events, not `terminal.queued`, so the Ctrl-C would be lost).
 ///
-/// Timing: the mock's "set a timer and wait" sets a one-minute timer and then
-/// runs `sleep 75`, so at ~62s the timer is due while a turn is still in
-/// flight. The SIGINT lands in the preliminary wait right at that deadline.
+/// The earlier version of this test prompted "set a timer **and wait**", so the
+/// mock ran `sleep 75` and the SIGINT at ~62s cancelled an *in-flight* turn —
+/// the in-flight cancellation path, never the idle timer wait — so it passed
+/// even with the requeue guard removed. Here the prompt is plain "set a timer":
+/// the mock sets a one-minute timer and the turn completes in well under a
+/// second, so the run spends the rest of the minute idle in the preliminary
+/// timer wait. The SIGINT lands squarely in that idle wait, before the timer is
+/// due, and must exit without the timer ever firing. We assert that by
+/// capturing stdout and requiring the "⏰ timer" fired note never appears: if
+/// the interrupt were dropped by the idle wait, the timer would fire at ~60s and
+/// print that note (and the run would not exit on time).
 #[cfg(unix)]
 #[test]
-fn headless_wait_timers_run_exits_on_an_interrupt_as_a_timer_comes_due() {
+fn headless_wait_timers_run_exits_on_an_interrupt_during_the_idle_timer_wait() {
+    use std::io::Read;
+
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_nano-coder"))
         .args(["--model", "mock/test", "--config", config.to_str().unwrap(), "--wait-timers"])
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn nano-coder");
 
-    // Keep stdin open so there is no EOF to end the run; the only way out is
-    // the interrupt. "and wait" makes the mock set a one-minute timer and then
-    // run `sleep 75`, so the turn is still in flight when the timer comes due.
+    // Drain stdout on a thread so the pipe can't fill and wedge the child, and
+    // so we can inspect it after exit for the fired-timer note.
+    let mut stdout = child.stdout.take().expect("stdout");
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
+    // Keep stdin open so there is no EOF to end the run; the only way out is the
+    // interrupt. Plain "set a timer" (no "wait") sets a one-minute timer and the
+    // turn finishes immediately, so the run goes idle into the preliminary timer
+    // wait with the timer still pending.
     let mut stdin = child.stdin.take().expect("stdin");
-    stdin.write_all(b"set a timer and wait\n").expect("write prompt");
+    stdin.write_all(b"set a timer\n").expect("write prompt");
     stdin.flush().expect("flush prompt");
 
-    // Send SIGINT just after the one-minute timer comes due (the turn is still
-    // inside `sleep 75`). The interrupt reaches the preliminary timer wait at
-    // the deadline boundary: it must be honoured (exit) rather than left queued
-    // while the due timer's turn starts.
-    std::thread::sleep(Duration::from_secs(62));
+    // Send SIGINT while the run is idle in the preliminary timer wait, safely
+    // before the one-minute timer is due. It must be honoured (exit) rather than
+    // swallowed by the idle wait — and the timer must never fire.
+    std::thread::sleep(Duration::from_secs(45));
     let pid = child.id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0, "deliver SIGINT");
 
-    // Without the fix the interrupt is requeued but the due timer's turn starts
-    // anyway, so the run outlives this deadline instead of exiting.
+    // Without the requeue guard the interrupt is lost in the idle wait; the
+    // timer then fires at ~60s (printing its note) and the run outlives this
+    // deadline instead of exiting.
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait().expect("poll child") {
-            drop(stdin);
-            // Require a *successful* shutdown: a startup failure or an
-            // unhandled SIGINT (exit 130 / killed by a signal) also terminates
-            // the child but is not the clean exit this test asserts.
-            assert!(status.success(), "run exited unsuccessfully: {status}");
-            return;
+            break status;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("headless --wait-timers run did not exit on a Ctrl-C as a timer came due");
+            drop(stdin);
+            panic!("headless --wait-timers run did not exit on a Ctrl-C during the idle timer wait");
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
+    drop(stdin);
+    let out = reader.join().expect("join stdout reader");
+    // Require a *successful* shutdown: a startup failure or an unhandled SIGINT
+    // (exit 130 / killed by a signal) also terminates the child but is not the
+    // clean exit this test asserts.
+    assert!(status.success(), "run exited unsuccessfully: {status}\nstdout:\n{out}");
+    // The interrupt won, so the timer's turn never started: its fired note must
+    // be absent. (The status bar's "⏰ HH:MM" uses a different format and is not
+    // emitted on this non-TTY stdout; only a fired turn prints "⏰ timer".)
+    assert!(
+        !out.contains("⏰ timer"),
+        "timer turn started despite the interrupt during the idle wait\nstdout:\n{out}"
+    );
 }
