@@ -4983,16 +4983,33 @@ impl Agent {
 
     /// Timers due right now (they fire once), soonest first.
     pub fn take_fired_timers(&mut self) -> Result<Vec<timers::Timer>> {
+        // `take_due` moves the due timers out of `items` and into `pending`
+        // in place. If the subsequent persist fails we must roll the live
+        // timers back: the caller (`fire_due_timers`) aborts on the error
+        // before delivering their messages, so without a rollback the firing is
+        // consumed in memory (gone from `items`, now `pending`) while never
+        // delivered — a retry then finds nothing due, silently losing the
+        // reminders and leaving the live state diverged from the
+        // published/persisted snapshot (issue #150 review). Snapshot first and
+        // reset the nudge counter only after persistence succeeds, so a failed
+        // firing is fully atomic (deliver + persist, or leave state untouched).
+        let snapshot = self.timers.clone();
         let fired = self.timers.take_due(self.timers_now());
         if !fired.is_empty() {
+            if let Err(err) = self.timers_changed() {
+                self.timers = snapshot;
+                self.control.publish_timers(&self.timers);
+                self.refresh_stats();
+                return Err(err);
+            }
             // Restart the pending-nudge interval whenever a timer fires, so a
             // counter left near the `PENDING_NUDGE_EVERY` threshold by an
             // earlier pending timer does not make the first model step after an
             // idle firing immediately re-nudge. `absorb_steers` resets it too;
             // doing it here makes both delivery paths (mid-turn and the idle
-            // REPL loop, which calls this directly) share the reset.
+            // REPL loop, which calls this directly) share the reset. Only after
+            // a successful persist, so a rolled-back firing keeps its counter.
             self.pending_timer_steps = 0;
-            self.timers_changed()?;
         }
         Ok(fired)
     }
@@ -10126,6 +10143,44 @@ mod tests {
         // With persistence working, the add lands.
         agent.run_plan_tool(&add).unwrap();
         assert!(!agent.plan.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_firing_persistence_failure_rolls_the_due_timers_back() {
+        // Same apply-then-persist atomicity for the idle firing path
+        // (`take_fired_timers`, sibling class). `take_due` moves the due timer
+        // out of `items`; if the persist fails, the timer must be restored so a
+        // retry re-fires it and delivers the reminder, and the nudge counter
+        // must not be reset (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.pending_timer_steps = timers::PENDING_NUDGE_EVERY - 1;
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+
+        // The firing's persist fails: the due timer is rolled back (still an
+        // active item, not consumed into `pending`) and the nudge counter is
+        // untouched, so a later retry re-fires it.
+        agent.fail_next_persist();
+        assert!(agent.take_fired_timers().is_err());
+        assert_eq!(agent.timers().items.len(), 1, "a failed firing persist must not consume the due timer");
+        assert!(!agent.timers().has_pending(), "the rolled-back timer must not linger in pending");
+        assert_eq!(
+            agent.pending_timer_steps,
+            timers::PENDING_NUDGE_EVERY - 1,
+            "a rolled-back firing must not reset the nudge counter"
+        );
+
+        // With persistence working, the same firing delivers once.
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1, "the retry re-fires the previously-rolled-back timer");
+        assert_eq!(fired[0].note, "check CI");
+        assert_eq!(agent.pending_timer_steps, 0, "a successful firing resets the nudge counter");
     }
 
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
