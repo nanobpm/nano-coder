@@ -681,8 +681,11 @@ mod tests {
         assert!(!shown.contains('\u{1b}'), "escape leaked into /timers: {shown:?}");
         assert!(!shown.contains('\u{7}'), "BEL leaked into /timers: {shown:?}");
         assert_eq!(shown.lines().count(), 2, "forged newline added a row: {shown:?}");
-        assert!(shown.contains("evil[2Jlineinjected"), "{shown:?}");
-        assert!(shown.contains("done?]0;title"), "{shown:?}");
+        // The CSI/OSC sequences are stripped whole, leaving clean note text with
+        // no visible `[2J` / `]0;title` bodies eating listing width.
+        assert!(shown.contains("evillineinjected"), "{shown:?}");
+        assert!(!shown.contains("[2J"), "CSI body left visible: {shown:?}");
+        assert!(!shown.contains("]0;title"), "OSC body left visible: {shown:?}");
 
         // Model-facing tool result keeps the note exactly as the model set it.
         let raw = timers.render(at(12, 20));

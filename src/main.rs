@@ -959,8 +959,42 @@ fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
     const TAB_WIDTH: usize = 8;
     let mut out = String::with_capacity(s.len());
     let mut col = 0usize;
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            // Consume a *complete* ANSI escape sequence rather than dropping
+            // only the ESC byte and leaving its body (e.g. `[31m`) as visible
+            // text. A bare drop turns `\x1b[31mred\x1b[0m` into `[31mred[0m`,
+            // whose stray `[31m…[0m` eats preview width and can truncate real
+            // tool output; stripping the whole sequence keeps the text clean
+            // while still letting nothing drive the terminal (issue #150).
+            '\u{1b}' => match chars.peek() {
+                // CSI: `\x1b[` … final byte in `@`..=`~`.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `\x1b]` … terminated by BEL (`\x07`) or ST (`\x1b\`).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // A lone/unrecognized ESC drops just the ESC byte, as before;
+                // any following printable stays and control bytes are filtered.
+                _ => {}
+            },
             '\t' => {
                 let spaces = TAB_WIDTH - (col % TAB_WIDTH);
                 for _ in 0..spaces {
@@ -1000,6 +1034,17 @@ fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
 /// turn instead of exiting as promised (issue #150).
 pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool, exit_armed: bool) -> bool {
     due && !draft && !interrupt_queued && !exit_armed
+}
+
+/// Whether an end-of-input (Ctrl-D / closed pipe) seen during the idle timer
+/// wait should be *suppressed* (remembered, and the wait resumed) rather than
+/// ending the session. Only a headless `--wait-timers` run suppresses it: its
+/// driver may hold stdin open while the timers — the whole point of the run —
+/// are still pending. On an interactive terminal Ctrl-D must always exit
+/// normally, so a steerable session never suppresses EOF even under
+/// `--wait-timers` (issue #150).
+pub(crate) fn suppress_eof_for_timers(wait_timers: bool, steerable: bool) -> bool {
+    wait_timers && !steerable
 }
 
 /// The current session as Herdr should resume it, if it is saved to disk
@@ -2609,10 +2654,17 @@ async fn main() -> Result<()> {
                     match event {
                         Some(event) => {
                             // Real input arrived first; handle it below. Under
-                            // `--wait-timers` an end-of-input is not the end:
-                            // the driver may hold stdin open, and the timers
-                            // are the point, so the wait resumes.
-                            if wait_timers && matches!(event, TermInput::Eof) {
+                            // a *headless* `--wait-timers` run an end-of-input
+                            // is not the end: the driver may hold stdin open,
+                            // and the timers are the point, so the wait resumes.
+                            // On an interactive terminal Ctrl-D (EOF) must still
+                            // exit normally, so only suppress it when the session
+                            // is non-steerable — otherwise `--wait-timers` would
+                            // trap an interactive user, unable to quit while it
+                            // waits out and runs the timer (issue #150).
+                            if suppress_eof_for_timers(wait_timers, terminal.steerable)
+                                && matches!(event, TermInput::Eof)
+                            {
                                 // Remember the EOF rather than discard it: the
                                 // reader won't emit another, so without this the
                                 // post-timer prompt read would hang. Keep
@@ -2981,8 +3033,8 @@ mod tests {
 
     #[test]
     fn sanitize_terminal_text_strips_control_and_escape_sequences() {
-        // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
-        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
+        // A prompt-injected ANSI/OSC payload is stripped whole, printable text kept.
+        assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hithere");
         // Tabs are expanded to spaces (not dropped), so columns stay separated;
         // other C0 controls are still removed.
         assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "ab      c");
@@ -3002,8 +3054,9 @@ mod tests {
         assert_eq!(sanitize_terminal_text("a\tb"), "a       b");
         assert_eq!(sanitize_terminal_text("ab\tc\nx\ty"), "ab      c\nx       y");
         // A tab surviving an escape strip still can't move the cursor (it became
-        // spaces), so the terminal-safety protection is preserved.
-        assert_eq!(sanitize_terminal_line("hi\x1b[2J\tthere"), "hi[2J   there");
+        // spaces), so the terminal-safety protection is preserved. The CSI
+        // sequence itself is stripped whole, so the tab aligns to `hi`'s width.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\tthere"), "hi      there");
     }
 
     #[test]
@@ -3119,7 +3172,23 @@ mod tests {
         // replay re-prints it as the lines the frame showed, so stripping `\n`
         // would concatenate the lines. Other controls are still dropped.
         assert_eq!(sanitize_terminal_text("one\ntwo\nthree"), "one\ntwo\nthree");
-        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one[2J\ntwo");
+        // A complete CSI sequence is stripped whole (not left as a visible
+        // `[2J` body), while the surrounding text and line feed survive.
+        assert_eq!(sanitize_terminal_text("one\x1b[2J\ntwo"), "one\ntwo");
+    }
+
+    #[test]
+    fn sanitize_strips_whole_ansi_sequences() {
+        // The ESC byte and the entire sequence body are removed, so a colored
+        // tool note renders as clean text rather than a width-eating `[31m…[0m`.
+        assert_eq!(sanitize_terminal_line("\x1b[31mred\x1b[0m"), "red");
+        // OSC (here a clipboard-set) is consumed whole on both terminators:
+        // BEL (`\x07`) and ST (`\x1b\`).
+        assert_eq!(sanitize_terminal_line("a\x1b]52;c;Zm8=\x07b"), "ab");
+        assert_eq!(sanitize_terminal_line("a\x1b]0;title\x1b\\b"), "ab");
+        // A lone/unterminated ESC still drops only the ESC byte; trailing
+        // printable text is preserved.
+        assert_eq!(sanitize_terminal_line("a\x1bZb"), "aZb");
     }
 
     #[test]
@@ -3129,7 +3198,8 @@ mod tests {
         // spill an unprefixed extra row or move a selector's cursor, not
         // multi-line content to keep. Other controls are dropped as well.
         assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
-        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
+        // The whole CSI sequence is stripped; `\n` is dropped on this path.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hithere");
         assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
     }
 
@@ -3153,6 +3223,19 @@ mod tests {
         assert!(!deliver_due_timer(false, false, false, false), "a not-due timer never fires");
         assert!(!deliver_due_timer(false, false, true, false));
         assert!(!deliver_due_timer(false, false, false, true));
+    }
+
+    #[test]
+    fn eof_suppression_is_headless_wait_timers_only() {
+        // Only a headless `--wait-timers` run holds a closed pipe's EOF back to
+        // keep waiting for its timers.
+        assert!(suppress_eof_for_timers(true, false), "headless --wait-timers suppresses EOF");
+        // An interactive `--wait-timers` session must let Ctrl-D exit (issue
+        // #150): suppressing it would trap the user while a timer runs.
+        assert!(!suppress_eof_for_timers(true, true), "interactive EOF still exits under --wait-timers");
+        // Without `--wait-timers`, EOF is never suppressed either way.
+        assert!(!suppress_eof_for_timers(false, false), "headless without --wait-timers exits on EOF");
+        assert!(!suppress_eof_for_timers(false, true), "interactive without --wait-timers exits on EOF");
     }
 
     #[test]
