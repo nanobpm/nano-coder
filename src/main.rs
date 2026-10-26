@@ -2412,6 +2412,13 @@ async fn main() -> Result<()> {
         // `DoublePress`). The note stays visible until the window lapses.
         let mut exit_press = DoublePress::new(DOUBLE_INTERRUPT_WINDOW);
         let mut separate = false;
+        // Piped stdin emits its end-of-input exactly once. Under
+        // `--wait-timers` the timer wait below swallows that EOF to keep
+        // sleeping for timers, so remember it here: once the queued input and
+        // scheduled timers are both exhausted, the normal prompt read would
+        // otherwise block forever on a reader that never emits EOF again
+        // (the signal task holds the event channel open).
+        let mut stdin_closed = false;
         while running {
             let prompt = |terminal: &Terminal, separate: bool| {
                 if terminal.queued.is_empty() && terminal.messages.is_empty() {
@@ -2495,6 +2502,11 @@ async fn main() -> Result<()> {
                             // the driver may hold stdin open, and the timers
                             // are the point, so the wait resumes.
                             if wait_timers && matches!(event, TermInput::Eof) {
+                                // Remember the EOF rather than discard it: the
+                                // reader won't emit another, so without this the
+                                // post-timer prompt read would hang. Keep
+                                // waiting for the remaining timers.
+                                stdin_closed = true;
                                 continue;
                             }
                             terminal.queued.push_front(event);
@@ -2514,8 +2526,19 @@ async fn main() -> Result<()> {
                     terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
                 }
                 let text = timers::Timers::fired_batch_message(&fired, Local::now());
-                let outcome = run_interactive_turn(&mut agent, &text, &mut terminal).await?;
-                print_turn_outcome(&outcome, &terminal.renderer);
+                // An API/network error during this idle timer turn must not
+                // tear down the REPL: show it and return to the prompt, exactly
+                // as `run_command`'s error arm below does for a user turn.
+                match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                    Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
+                    Err(e) => {
+                        if terminal.renderer.is_frame() {
+                            terminal.renderer.note(&format!("Error: {:#}", e));
+                        } else {
+                            eprintln!("Error: {:#}", e);
+                        }
+                    }
+                }
                 separate = true;
                 continue;
             }
@@ -2535,6 +2558,18 @@ async fn main() -> Result<()> {
                 let draft = terminal.view.lock().unwrap().has_draft();
                 if timer_due && !draft {
                     break Prompt::TimerDue;
+                }
+                // Piped stdin already closed during the timer wait and no timers
+                // remain to fire: with nothing queued, no further input will
+                // arrive, so end the session rather than block on a read that
+                // can never complete. (A not-yet-due timer still bounds the wait
+                // below and fires; a real Interrupt still breaks this loop.)
+                if stdin_closed
+                    && terminal.queued.is_empty()
+                    && terminal.messages.is_empty()
+                    && agent.timers().next_due().is_none()
+                {
+                    break Prompt::Input(TermInput::Eof);
                 }
                 let next = terminal.next(&agent);
                 // Bound this wait on the soonest of two deadlines, recomputed
@@ -2605,8 +2640,18 @@ async fn main() -> Result<()> {
                         terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
                     }
                     let text = timers::Timers::fired_batch_message(&fired, Local::now());
-                    let outcome = run_interactive_turn(&mut agent, &text, &mut terminal).await?;
-                    print_turn_outcome(&outcome, &terminal.renderer);
+                    // As above: an idle timer turn's error returns to the
+                    // prompt rather than terminating the REPL.
+                    match run_interactive_turn(&mut agent, &text, &mut terminal).await {
+                        Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
+                        Err(e) => {
+                            if terminal.renderer.is_frame() {
+                                terminal.renderer.note(&format!("Error: {:#}", e));
+                            } else {
+                                eprintln!("Error: {:#}", e);
+                            }
+                        }
+                    }
                     separate = true;
                 }
                 continue;

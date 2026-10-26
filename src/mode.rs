@@ -83,6 +83,7 @@ const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "timer_set",
     "timer_list",
     "timer_cancel",
+    "timer_done",
     "load_skill",
     "report_outcome",
     "question",
@@ -124,6 +125,17 @@ mod tests {
         assert!(!plan_allows("bash"));
         assert!(!plan_allows("write_file"));
         assert!(!plan_allows("edit_file"));
+    }
+
+    #[test]
+    fn plan_allows_every_timer_tool() {
+        // Plan mode can set and receive timers, so the whole timer lifecycle —
+        // including acknowledging a fired one — must stay reachable. Leaving
+        // `timer_done` out strands the agent: it is nudged to acknowledge a
+        // timer it has no tool to acknowledge.
+        for name in crate::timers::TOOL_NAMES {
+            assert!(plan_allows(name), "plan mode must allow timer tool {name}");
+        }
     }
 
     #[test]

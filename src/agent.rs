@@ -2371,6 +2371,15 @@ impl Agent {
         // Timers fire at the start of a step, after the steers: their notes
         // land as a user message the next model call sees. A fired timer is
         // not a steer, so it does not reset the continuation accumulator.
+        //
+        // Skip the whole timer step when timers are disabled (an ACP-resumed
+        // CLI session has no idle loop and `disable_timers()` has hidden
+        // `timer_done`/`timer_cancel`): firing a restored timer or nudging here
+        // would ask the agent to acknowledge a timer it has no tool to clear,
+        // and would consume the restored state a later CLI resume still needs.
+        if !self.timers_enabled {
+            return Ok(absorbed);
+        }
         let fired = self.fire_due_timers()?;
         // Fired timers stay `pending` until the agent calls `timer_done`.
         // Nudge about them every few steps so a note ignored mid-work is not
@@ -9736,6 +9745,40 @@ mod tests {
         // to be marked done).
         assert!(agent.timers().is_empty());
         assert!(agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_timers_neither_fire_nor_nudge_on_a_turn() {
+        // An ACP-resumed CLI session has no idle loop to fire timers, so
+        // `disable_timers()` hides the timer tools. A due restored timer must
+        // then stay put: firing or nudging here would ask the agent to
+        // acknowledge a timer with a `timer_done` tool it no longer has, and
+        // would consume state a later CLI resume still needs.
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, seen) = agent(vec![text("done")], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        // A restored timer that is already due by the time the turn runs.
+        let now = *clock.lock().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), now).unwrap();
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        agent.disable_timers();
+        agent.run_turn(Some("msg-1"), "look").await.unwrap();
+
+        // No fired-timer message or nudge reached the model, and the timer is
+        // untouched (still active, not fired/pending).
+        {
+            let turns = seen.lock().unwrap();
+            assert!(
+                turns.iter().all(|t| t.iter().all(|m| {
+                    !m.content.contains("fired:") && !m.content.contains("Fired timers you haven't marked done:")
+                })),
+                "a disabled timer must not fire or nudge: {turns:?}"
+            );
+        }
+        assert_eq!(agent.timers().len(), 1);
+        assert!(!agent.timers().has_pending());
     }
 
     #[tokio::test(flavor = "multi_thread")]
