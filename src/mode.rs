@@ -78,6 +78,11 @@ const PLAN_ALLOWED_TOOLS: &[&str] = &[
     "plan_add",
     "plan_update",
     "plan_show",
+    // Timers are session state, not workspace mutations: setting one to come
+    // back later is how a plan survives its own waiting.
+    "timer_set",
+    "timer_list",
+    "timer_cancel",
     "load_skill",
     "report_outcome",
     "question",

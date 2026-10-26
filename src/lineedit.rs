@@ -151,6 +151,12 @@ impl EditView {
         self.on_edit = Some(hook);
     }
 
+    /// Whether the editor holds a half-typed line. An idle timer waits for the
+    /// draft to be sent or cleared rather than firing into it.
+    pub fn has_draft(&self) -> bool {
+        !self.line.is_empty()
+    }
+
     /// Hand the editor (and its command menu) to the frame hook.
     fn draw_edit(&mut self) {
         let Some(hook) = self.on_edit.clone() else { return };

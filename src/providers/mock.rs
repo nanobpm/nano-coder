@@ -46,6 +46,24 @@ impl MockLLMClient {
                 }),
             ));
         }
+        // A fired timer's message gets a plain text answer: acting on the note
+        // is the model's business, and the mock has nothing to check.
+        if content.contains("fired:") {
+            return None;
+        }
+        // "set a timer … and wait" also runs a short sleep, so a PTY test can
+        // watch the timer fire mid-turn while the turn is still working.
+        if content.contains("set a timer") && content.contains("wait") {
+            return Some(("timer_set", json!({ "after": "1m", "note": "check CI" })));
+        }
+        // "set a timer" drives `timer_set` with a one-minute timer (the
+        // minimum), so the timer flow can be exercised without a model. The
+        // explicit "set a" keeps a fired timer's own message ("Timer 1 …
+        // fired: …") from re-arming it forever. Checked before "time":
+        // "timer" contains it as a prefix.
+        if content.contains("set a timer") {
+            return Some(("timer_set", json!({ "after": "1m", "note": "check CI" })));
+        }
         if content.contains("time") || content.contains("clock") {
             return Some(("get_time", json!({})));
         }
@@ -117,6 +135,27 @@ impl LLMClient for MockLLMClient {
 
         if let Some(tool_msg) = last.filter(|m| m.role == Role::Tool) {
             let name = tool_msg.name.as_deref().unwrap_or("unknown");
+            // After setting a timer for a prompt that said "wait", sleep so
+            // the turn is still running when the timer comes due (a PTY test
+            // watches it fire mid-turn).
+            let waiting = request.messages.iter().rev().find(|m| m.role == Role::User).is_some_and(|m| {
+                let c = m.content.to_lowercase();
+                c.contains("set a timer") && c.contains("wait")
+            });
+            if name == "timer_set" && waiting {
+                return Ok(LLMResponse {
+                    tool_calls: vec![ToolCall {
+                        id: format!("call_{call_id}_wait"),
+                        name: "bash".to_string(),
+                        arguments: json!({ "command": "sleep 75" }),
+                        item_id: None,
+                        malformed_arguments: None,
+                    }],
+                    usage: Self::usage(20),
+                    stop_reason: Some("tool_calls".into()),
+                    ..Default::default()
+                });
+            }
             return Ok(LLMResponse {
                 content: format!("Based on the {} tool result: {}", name, tool_msg.content),
                 usage: Self::usage(30),

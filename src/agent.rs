@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use serde_json::{Value, json};
 
 use crate::claude_hooks;
@@ -25,6 +25,7 @@ use crate::providers;
 use crate::reminders::{self, Reminders};
 use crate::session::{self, PendingInput, Record, SessionLog};
 use crate::skills::{self, Skills};
+use crate::timers::{self, Timers};
 use crate::tools::ToolRegistry;
 
 const INTERRUPTED_TOOL_RESULT: &str =
@@ -303,6 +304,10 @@ struct ControlInner {
     /// The plan as last published by the agent (every `AgentEvent::Plan`),
     /// so `/plan` can show it while a turn holds the agent.
     plan: Mutex<crate::plan::Plan>,
+    /// The timers as last published by the agent (every change and
+    /// `Agent::refresh_stats`), so `/timers` can list them while a turn holds
+    /// the agent.
+    timers: Mutex<crate::timers::Timers>,
     /// `/thinking LEVEL` for this session; wins over the config. Shared so a
     /// level set mid-turn applies from the agent's next model call.
     thinking: Mutex<Option<crate::thinking::Thinking>>,
@@ -327,6 +332,7 @@ impl Default for TurnControl {
                 model: Mutex::new(None),
                 model_tx: tokio::sync::watch::channel(0u64).0,
                 plan: Mutex::new(crate::plan::Plan::default()),
+                timers: Mutex::new(crate::timers::Timers::default()),
                 thinking: Mutex::new(None),
             }),
         }
@@ -461,6 +467,15 @@ impl TurnControl {
 
     pub fn publish_plan(&self, plan: &crate::plan::Plan) {
         *self.inner.plan.lock().unwrap() = plan.clone();
+    }
+
+    /// The timers as the agent last published them.
+    pub fn timers(&self) -> crate::timers::Timers {
+        self.inner.timers.lock().unwrap().clone()
+    }
+
+    pub fn publish_timers(&self, timers: &crate::timers::Timers) {
+        *self.inner.timers.lock().unwrap() = timers.clone();
     }
 
     /// Flag for synchronous tools (e.g. bash) to poll.
@@ -729,6 +744,15 @@ pub struct Agent {
     skills: Skills,
     /// The agent's task plan (see `plan.rs`).
     plan: Plan,
+    /// The session's timers (see `timers.rs`); the harness owns the clock.
+    timers: Timers,
+    /// Test hook: a shared "now" for the timers, replacing the wall clock, so
+    /// a test (or a tool it registers) can advance time mid-turn.
+    #[cfg(test)]
+    timers_clock: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>,
+    /// Whether the `timer_*` tools are offered. Off in ACP, which has no idle
+    /// loop to fire them.
+    timers_enabled: bool,
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
@@ -912,6 +936,10 @@ impl Agent {
             instructions: None,
             skills: Skills::default(),
             plan: Plan::default(),
+            timers: Timers::default(),
+            #[cfg(test)]
+            timers_clock: None,
+            timers_enabled: true,
             reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
@@ -2223,6 +2251,7 @@ impl Agent {
             stats.smart_compact = self.config.compaction_mode == CompactionMode::Smart && self.session.is_some();
             stats.history_available = self.history_tools_enabled();
             stats.plan = (!self.plan.items.is_empty()).then(|| self.plan.progress());
+            stats.timers = (!self.timers.is_empty()).then(|| self.timers.status_segment());
             stats.cwd = cwd;
             stats.mode = self.control.mode();
             stats.thinking = status_thinking(&self.thinking());
@@ -2335,6 +2364,10 @@ impl Agent {
             self.control.inner.absorbed.lock().unwrap().push(steer);
             absorbed = true;
         }
+        // Timers fire at the start of a step, after the steers: their notes
+        // land as a user message the next model call sees. A fired timer is
+        // not a steer, so it does not reset the continuation accumulator.
+        self.fire_due_timers()?;
         Ok(absorbed)
     }
 
@@ -2563,6 +2596,9 @@ impl Agent {
         self.completed_stop_reasons.clear();
         self.pending_input = None;
         self.plan = Plan::default();
+        // A fresh session starts with no timers (`/restart` clears them).
+        self.timers = Timers::default();
+        self.control.publish_timers(&self.timers);
         self.reminders = Reminders::new(self.config.outcome_tool);
         self.session = session;
         self.session_id = Some(id.clone());
@@ -2644,6 +2680,10 @@ impl Agent {
         self.completed_stop_reasons = restored.stop_reasons;
         self.pending_input = restored.pending_input;
         self.plan = restored.plan.unwrap_or_default();
+        // Restore the session's timers; one that came due while nano-coder was
+        // closed fires as overdue at the next step (or the idle prompt).
+        self.timers = restored.timers.unwrap_or_default();
+        self.control.publish_timers(&self.timers);
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
         // `/thinking` is session-scoped, so the previous session's override
@@ -2991,6 +3031,9 @@ impl Agent {
         let mut tools = self.tools.definitions();
         if self.config.plan_tools {
             tools.extend(plan::definitions());
+        }
+        if self.timers_enabled {
+            tools.extend(timers::definitions());
         }
         if self.config.outcome_tool {
             tools.push(goal::definition());
@@ -3951,6 +3994,7 @@ impl Agent {
                 let effective_call: &ToolCall = rewritten_call.as_ref().unwrap_or(tool_call);
 
                 let is_plan_tool = self.config.plan_tools && plan::is_plan_tool(&tool_call.name);
+                let is_timer_tool = self.timers_enabled && timers::is_timer_tool(&tool_call.name);
                 let is_outcome_tool = self.config.outcome_tool && tool_call.name == goal::TOOL_NAME;
                 let is_skill_tool = tool_call.name == skills::TOOL_NAME && !self.skills.is_empty();
                 let is_history_tool = history::is_history_tool(&tool_call.name) && self.history_tools_enabled();
@@ -3997,6 +4041,9 @@ impl Agent {
                 } else if is_plan_tool {
                     dispatched = true;
                     self.run_plan_tool(effective_call)
+                } else if is_timer_tool {
+                    dispatched = true;
+                    self.run_timer_tool(effective_call)
                 } else if is_skill_tool {
                     dispatched = true;
                     self.skills.load(&effective_call.arguments).map(Value::String)
@@ -4130,10 +4177,10 @@ impl Agent {
                     result_text.push_str("\n\n");
                     result_text.push_str(history::FAILED_TOOL_HINT);
                 }
-                if self.config.reminders && (is_plan_tool || is_outcome_tool) {
-                    // Plan and outcome calls are never counted by the loop
+                if self.config.reminders && (is_plan_tool || is_outcome_tool || is_timer_tool) {
+                    // Plan, timer and outcome calls are never counted by the loop
                     // detector, but they must still break a repeat streak so an
-                    // interleaved plan/outcome call cannot mask otherwise
+                    // interleaved plan/timer/outcome call cannot mask otherwise
                     // consecutive repeats (issue #65).
                     self.reminders.reset_repeat();
                 } else if self.config.reminders {
@@ -4761,6 +4808,83 @@ impl Agent {
             self.plan_changed()?;
         }
         Ok(Value::String(outcome.text))
+    }
+
+    /// "Now" for the timers: the wall clock, or the time a test set.
+    fn timers_now(&self) -> DateTime<Local> {
+        #[cfg(test)]
+        if let Some(fixed) = &self.timers_clock {
+            return *fixed.lock().unwrap();
+        }
+        Local::now()
+    }
+
+    /// Give the timers a shared clock for a test (`None` returns to the wall
+    /// clock); advancing the cell moves time, even mid-turn.
+    #[cfg(test)]
+    pub fn set_timers_now(&mut self, now: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>) {
+        self.timers_clock = now;
+    }
+
+    /// The session's timers.
+    pub fn timers(&self) -> &Timers {
+        &self.timers
+    }
+
+    /// Turn the timer tools off (ACP: no idle loop to fire them). Existing
+    /// timers keep their state but cannot fire without the tools loop.
+    pub fn disable_timers(&mut self) {
+        self.timers_enabled = false;
+    }
+
+    fn run_timer_tool(&mut self, call: &ToolCall) -> Result<Value> {
+        if !self.timers_enabled {
+            return Err(anyhow::anyhow!(
+                "{} is not available here: timers need the interactive harness's idle loop to fire",
+                call.name
+            ));
+        }
+        let outcome = self.timers.apply(&call.name, &call.arguments, self.timers_now())?;
+        if outcome.changed {
+            self.timers_changed()?;
+        }
+        Ok(Value::String(outcome.text))
+    }
+
+    /// Persist and publish the timers after a change (like `plan_changed`).
+    fn timers_changed(&mut self) -> Result<()> {
+        if let Some(log) = &mut self.session {
+            log.append(&Record::Timers { timers: self.timers.clone(), recorded_at: session::now() })?;
+        }
+        self.control.publish_timers(&self.timers);
+        self.refresh_stats();
+        Ok(())
+    }
+
+    /// Timers due right now (they fire once), soonest first.
+    pub fn take_fired_timers(&mut self) -> Result<Vec<timers::Timer>> {
+        let fired = self.timers.take_due(self.timers_now());
+        if !fired.is_empty() {
+            self.timers_changed()?;
+        }
+        Ok(fired)
+    }
+
+    /// Push the timers due at this step into the conversation as a user
+    /// message, after the steers. Returns whether any fired.
+    fn fire_due_timers(&mut self) -> Result<bool> {
+        let fired = self.take_fired_timers()?;
+        if fired.is_empty() {
+            return Ok(false);
+        }
+        let now = self.timers_now();
+        // The UI shows `⏰ timer N: <note>` per timer through the same
+        // steer/userMessage event the message itself emits.
+        for timer in &fired {
+            self.emit(AgentEvent::UserMessage { text: &format!("⏰ timer {}: {}", timer.id, timer.note) });
+        }
+        self.push(Message::user(&Timers::fired_batch_message(&fired, now)))?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -9528,6 +9652,115 @@ mod tests {
         (agent, seen)
     }
 
+    /// 12:00 local today, for the timer tests' injected clock.
+    fn timer_noon() -> DateTime<Local> {
+        let date = Local::now().date_naive();
+        date.and_hms_opt(12, 0, 0).unwrap().and_local_timezone(Local).single().unwrap()
+    }
+
+    /// A shared clock at noon, so a tool the test registers can advance time
+    /// mid-turn.
+    fn timer_clock() -> std::sync::Arc<std::sync::Mutex<DateTime<Local>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(timer_noon()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_set_in_a_turn_fires_mid_turn_when_the_clock_passes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            // Advances the injected clock past the timer, so it fires at the
+            // start of the next step — a deploy finishing while the turn runs.
+            call("e1", "advance_clock", json!({})),
+            text("done"),
+        ];
+        let (mut agent, seen) = agent(responses, dir.path());
+        let events = record_events(&mut agent);
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // The timer fired into the conversation as a user message the last
+        // model call saw.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let fired =
+            last.iter().find(|m| m.role == Role::User && m.content.contains("fired:")).expect("a fired timer message");
+        assert!(
+            fired.content.contains("Timer 1, set at 12:00, fired: check CI")
+                && fired.content.starts_with("<system-reminder>")
+                && fired.content.contains("Act on it now, as the note says."),
+            "{}",
+            fired.content
+        );
+        // The UI event shows `⏰ timer N: <note>` through the userMessage event.
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e["content"]["text"].as_str() == Some("⏰ timer 1: check CI")
+                    && e["sessionUpdate"].as_str() == Some("user_message_chunk")
+            }),
+            "{events:?}"
+        );
+        // It fired once: the timers are empty now.
+        assert!(agent.timers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_take_fired_timers_returns_due_timers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let noon = *clock.lock().unwrap();
+        let (mut agent, _) = agent(vec![], dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "30m", "note": "check CI"}), noon).unwrap();
+        // Not yet due.
+        assert!(agent.take_fired_timers().unwrap().is_empty());
+        *clock.lock().unwrap() += chrono::Duration::minutes(31);
+        let fired = agent.take_fired_timers().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].note, "check CI");
+        assert!(agent.take_fired_timers().unwrap().is_empty(), "a timer fires once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timers_survive_resume_and_restart_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let noon = timer_noon();
+        let (mut agent, _) = agent(vec![], dir.path());
+        let id = agent.new_session().unwrap();
+        agent.timers.apply("timer_set", &json!({"after": "1h", "note": "check CI"}), noon).unwrap();
+        agent.timers_changed().unwrap();
+
+        let (mut resumed, _) = self::agent(vec![], dir.path());
+        resumed.load_session(&id).unwrap();
+        assert_eq!(resumed.timers().len(), 1);
+        assert_eq!(resumed.timers().items[0].note, "check CI");
+
+        // `/restart` (a new session) clears them.
+        resumed.new_session().unwrap();
+        assert!(resumed.timers().is_empty());
+    }
+
+    #[test]
+    fn timer_tools_are_hidden_when_timers_are_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut on, _) = agent(Vec::new(), dir.path());
+        assert!(on.tool_definitions().iter().any(|d| d.name == "timer_set"));
+        on.disable_timers();
+        assert!(!on.tool_definitions().iter().any(|d| d.name.starts_with("timer_")));
+    }
+
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -11064,7 +11297,7 @@ mod tests {
         // then list the mutating tool the Plan-time capture would have dropped.
         let normal = crate::context::ContextStats { mode: crate::mode::AgentMode::Normal, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &normal, &crate::plan::Plan::default())
+            snapshot.output("/tools", &normal, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11073,7 +11306,7 @@ mod tests {
         // And under a live Plan mode it is still filtered out.
         let plan = crate::context::ContextStats { mode: crate::mode::AgentMode::Plan, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(filtered)) =
-            snapshot.output("/tools", &plan, &crate::plan::Plan::default())
+            snapshot.output("/tools", &plan, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11097,7 +11330,7 @@ mod tests {
         // capture-time availability would have dropped.
         let available = crate::context::ContextStats { history_available: true, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(listing)) =
-            snapshot.output("/tools", &available, &crate::plan::Plan::default())
+            snapshot.output("/tools", &available, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };
@@ -11109,7 +11342,7 @@ mod tests {
         // And while history is unavailable they are still filtered out.
         let unavailable = crate::context::ContextStats { history_available: false, ..Default::default() };
         let Some(crate::turn_commands::Output::Block(hidden)) =
-            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default())
+            snapshot.output("/tools", &unavailable, &crate::plan::Plan::default(), &crate::timers::Timers::default())
         else {
             panic!("/tools produced no block");
         };

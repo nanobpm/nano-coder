@@ -50,6 +50,7 @@ mod skills;
 mod status;
 mod temperature;
 mod thinking;
+mod timers;
 mod tools;
 mod trajectory;
 mod turn_commands;
@@ -770,6 +771,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                 turn_commands::Timing::Immediate => {
                                     let stats = stats.lock().unwrap().clone();
                                     let plan = control.plan();
+                                    let timers = control.timers();
                                     // Some immediate commands do synchronous disk
                                     // I/O while rendering — `/trajectory` reads and
                                     // decodes the whole session log, and `/providers`
@@ -784,7 +786,7 @@ async fn run_interactive_turn(agent: &mut Agent, text: &str, terminal: &mut Term
                                     let snap = snapshot.clone();
                                     let cmd = text.to_string();
                                     let label = cmd.clone();
-                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan))
+                                    let out = tokio::task::spawn_blocking(move || snap.output(&cmd, &stats, &plan, &timers))
                                         .await
                                         .unwrap_or_else(|_| {
                                             Some(turn_commands::Output::Block(format!(
@@ -1569,7 +1571,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
         _ if name == "/trajectory" => {
             let stats = live_stats(agent);
             match turn_commands::Snapshot::capture(agent)
-                .output(cmd, &stats, agent.plan())
+                .output(cmd, &stats, agent.plan(), agent.timers())
                 .expect("/trajectory always produces an output")
             {
                 turn_commands::Output::Block(text) => terminal.renderer.print_block(&text),
@@ -1589,6 +1591,7 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
                 // which locks it again and deadlocks.
                 &live_stats(agent),
                 agent.plan(),
+                agent.timers(),
             ) =>
         {
             match output {
@@ -1884,6 +1887,9 @@ struct Args {
     model: Option<String>,
     /// `Some("")`: `--resume` without an ID (pick one).
     resume: Option<String>,
+    /// Headless: after the last prompt's turn, sleep until each timer is due
+    /// and run its fired message as the next turn, until no timers are left.
+    wait_timers: bool,
     list_sessions: bool,
     all: bool,
     config: Option<std::path::PathBuf>,
@@ -1905,7 +1911,7 @@ fn print_help() {
     println!(
         "Usage: nano-coder [--acp] [--model provider/model] [--resume [SESSION_ID|last] | --resume=SESSION_ID] [--config PATH]"
     );
-    println!("                  [--verbosity quiet|normal|verbose|debug]");
+    println!("                  [--verbosity quiet|normal|verbose|debug] [--wait-timers]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
@@ -1942,6 +1948,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         list_models: None,
         model: None,
         resume: None,
+        wait_timers: false,
         list_sessions: false,
         all: false,
         config: None,
@@ -1969,6 +1976,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             // be rejected as an unknown argument.
             "--resume" => args.resume = Some(iter.next_if(|next| !next.starts_with('-')).unwrap_or_default()),
             _ if let Some(id) = arg.strip_prefix("--resume=") => args.resume = Some(id.to_string()),
+            "--wait-timers" => args.wait_timers = true,
             "--list-sessions" => args.list_sessions = true,
             "--all" => args.all = true,
             "--config" => args.config = Some(value("--config")?.into()),
@@ -2172,6 +2180,9 @@ async fn main() -> Result<()> {
         // No human vets a memory save live here, so full memory is downgraded
         // to read-only (the model can still consult earlier notes).
         agent.restrict_memory_to_read_only();
+        // ACP has no idle loop to fire timers, so the timer tools are not
+        // offered at all.
+        agent.disable_timers();
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
@@ -2207,6 +2218,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        // A resumed session's timers survive in its log; say so, and note that
+        // one that came due while nano-coder was closed fires as overdue.
+        let timers_notice = (!agent.timers().is_empty())
+            .then(|| format!("{} timer(s) still set (/timers lists them)", agent.timers().len()));
 
         // Interactive CLI mode: build the startup banner. In frame mode the
         // renderer owns the screen and its first full redraw clears the
@@ -2220,6 +2235,9 @@ async fn main() -> Result<()> {
         ];
         if let Some(id) = agent.session_id() {
             banner.push(format!("Session: {id} (resume with --resume {id})"));
+        }
+        if let Some(notice) = &timers_notice {
+            banner.push(notice.clone());
         }
         for file in agent.project_instruction_files() {
             banner.push(format!("Instructions: {file}"));
@@ -2418,7 +2436,107 @@ async fn main() -> Result<()> {
             // each time so `/resume` and `/restart` are picked up).
             herdr::report(herdr::State::Idle, None, herdr_session(&agent, &herdr_extra));
 
+            // The harness owns the timers' clock. With the prompt idle, a due
+            // timer ends the read and runs as a new turn — but a half-typed
+            // line holds it back. In a headless run (piped stdin), stdin stays
+            // open while a driver composes its next prompt, so the read would
+            // never end on its own: `--wait-timers` instead sleeps until the
+            // next timer is due and runs it, repeating until none are left.
+            let wait_timers = args.wait_timers;
+            let fired = if agent.timers().is_empty() {
+                // No timers to wait for: skip the wait entirely so piped input
+                // flows straight to the normal read below.
+                Vec::new()
+            } else {
+                loop {
+                    let fired = agent.take_fired_timers()?;
+                    let draft = terminal.view.lock().unwrap().has_draft();
+                    if !fired.is_empty() && !draft {
+                        break fired;
+                    }
+                    // Nothing fireable right now. Without `--wait-timers` a
+                    // headless run is done once its input is; an interactive one
+                    // waits on the terminal instead.
+                    let steerable = terminal.steerable;
+                    if !steerable && !wait_timers {
+                        break Vec::new();
+                    }
+                    let Some(due) = agent.timers().next_due() else {
+                        // No timers left: a `--wait-timers` run ends here.
+                        break Vec::new();
+                    };
+                    let sleep = (due - Local::now()).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // Wait for terminal input or the timer's due time, whichever
+                    // comes first. The wait is scoped so the future's borrows end
+                    // before the agent/terminal are touched again.
+                    let event = {
+                        let next = terminal.next(&agent);
+                        tokio::pin!(next);
+                        tokio::time::timeout(sleep, &mut next).await.ok()
+                    };
+                    match event {
+                        Some(event) => {
+                            // Real input arrived first; handle it below. Under
+                            // `--wait-timers` an end-of-input is not the end:
+                            // the driver may hold stdin open, and the timers
+                            // are the point, so the wait resumes.
+                            if wait_timers && matches!(event, TermInput::Eof) {
+                                continue;
+                            }
+                            terminal.queued.push_front(event);
+                            break Vec::new();
+                        }
+                        None => {
+                            // The timer came due. A headless run fires it
+                            // unconditionally (no editor to hold a draft); an
+                            // interactive run re-checks the draft above.
+                            if !steerable {
+                                let fired = agent.take_fired_timers()?;
+                                if !fired.is_empty() {
+                                    break fired;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if !fired.is_empty() {
+                // Show the fired timers and run their message as a new turn.
+                for timer in &fired {
+                    terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
+                }
+                let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                let outcome = run_interactive_turn(&mut agent, &text, &mut terminal).await?;
+                print_turn_outcome(&outcome, &terminal.renderer);
+                separate = true;
+                continue;
+            }
+            if !terminal.steerable && terminal.queued.is_empty() && terminal.messages.is_empty() {
+                // Headless: the input is exhausted. Report timers that never
+                // fired, then exit.
+                let left = agent.timers().len();
+                if left > 0 && !wait_timers {
+                    eprintln!("[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]");
+                }
+                break;
+            }
+
+            // What ended the prompt read: terminal input, or a due timer.
+            enum Prompt {
+                Input(TermInput),
+                TimerDue,
+            }
+
             let input = loop {
+                // An idle timer that is due ends the prompt read, unless the
+                // editor holds a half-typed draft — that keeps the timer back
+                // until the draft is sent or cleared. Checked before borrowing
+                // the terminal for the read.
+                let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
+                let draft = terminal.view.lock().unwrap().has_draft();
+                if timer_due && !draft {
+                    break Prompt::TimerDue;
+                }
                 let next = terminal.next(&agent);
                 // While the Ctrl-C exit hint is armed, bound the wait on the
                 // exit window: if the second press never comes, clear the stale
@@ -2458,9 +2576,25 @@ async fn main() -> Result<()> {
                         // no-op contract. Staying in the inner loop keeps the
                         // empty-buffer Esc a true zero-redraw no-op.
                     }
-                    other => break other,
+                    other => break Prompt::Input(other),
                 }
             };
+            // A due timer fires as a new turn carrying its message; loop back
+            // to the prompt afterwards.
+            if matches!(input, Prompt::TimerDue) {
+                let fired = agent.take_fired_timers()?;
+                if !fired.is_empty() {
+                    for timer in &fired {
+                        terminal.renderer.note(&format!("⏰ timer {}: {}", timer.id, timer.note));
+                    }
+                    let text = timers::Timers::fired_batch_message(&fired, Local::now());
+                    let outcome = run_interactive_turn(&mut agent, &text, &mut terminal).await?;
+                    print_turn_outcome(&outcome, &terminal.renderer);
+                    separate = true;
+                }
+                continue;
+            }
+            let Prompt::Input(input) = input else { unreachable!("a timer due breaks TimerDue") };
             let input = match input {
                 TermInput::Eof => break,
                 TermInput::Interrupt => {

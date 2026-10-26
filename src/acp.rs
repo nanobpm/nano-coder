@@ -129,6 +129,7 @@ fn tool_kind(name: &str) -> &'static str {
         "grep" | "glob" => "search",
         "write_file" | "edit_file" => "edit",
         name if crate::plan::is_plan_tool(name) || name == crate::goal::TOOL_NAME => "think",
+        name if crate::timers::is_timer_tool(name) => "think",
         _ => "other",
     }
 }

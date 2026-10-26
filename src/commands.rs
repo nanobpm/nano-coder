@@ -25,6 +25,11 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "/settings", args: "", description: "View/edit settings" },
     Command { name: "/verbosity", args: "[quiet|normal|verbose|debug]", description: "Show or set output detail" },
     Command { name: "/plan", args: "", description: "Show the agent's task plan with notes" },
+    Command {
+        name: "/timers",
+        args: "",
+        description: "List the session's timers (the agent sets them with timer_set)",
+    },
     Command { name: "/memory", args: "[forget ID]", description: "List cross-session memories (or forget one by id)" },
     Command { name: "/hooks", args: "", description: "List loaded user hooks (.claude/settings.json and friends)" },
     Command {

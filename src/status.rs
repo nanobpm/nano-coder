@@ -174,6 +174,10 @@ fn render(stats: &ContextStats, cols: usize) -> String {
     if let Some((done, total)) = stats.plan {
         segments.push(Segment { text: format!(" plan {done}/{total} "), color: None, priority: 4 });
     }
+    // Active timers: ` ⏰ HH:MM ` for one, ` ⏰ N next HH:MM ` for several.
+    if let Some(timers) = &stats.timers {
+        segments.push(Segment { text: format!(" {timers} "), color: None, priority: 4 });
+    }
     // The mode is only worth a segment when it is not the default; normal is
     // the expected state and the space is better spent on context stats.
     let mode_segment = match stats.mode {
@@ -335,6 +339,7 @@ mod tests {
             smart_compact: false,
             activity: Activity::Tool("bash".into()),
             plan: Some((2, 5)),
+            timers: None,
             cwd: "/tmp/project".into(),
             tokens_per_sec: None,
             mode: crate::mode::AgentMode::Normal,
@@ -387,6 +392,17 @@ mod tests {
         assert!(line.contains("work/llama-b"), "{line:?}");
         assert!(line.contains("ctx 96.5k/128k"), "{line:?}");
         assert!(!line.contains("auto-compact"), "{line:?}");
+    }
+
+    #[test]
+    fn shows_timers_only_when_set() {
+        // No timer segment by default.
+        assert!(!visible(&render(&stats(), 200)).contains("⏰"));
+        // One timer: the fire time; several: the count and the next one.
+        let one = ContextStats { timers: Some("⏰ 12:30".into()), ..stats() };
+        assert!(visible(&render(&one, 200)).contains("⏰ 12:30"));
+        let several = ContextStats { timers: Some("⏰ 2 next 12:30".into()), ..stats() };
+        assert!(visible(&render(&several, 200)).contains("⏰ 2 next 12:30"));
     }
 
     #[test]

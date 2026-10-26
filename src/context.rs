@@ -136,6 +136,9 @@ pub struct ContextStats {
     pub activity: Activity,
     /// Plan progress as (done, total), when there is a plan.
     pub plan: Option<(usize, usize)>,
+    /// The timers status segment (`⏰ HH:MM`, `⏰ N next HH:MM`), when timers
+    /// are set.
+    pub timers: Option<String>,
     /// Working directory shown on the status line.
     pub cwd: String,
     /// Live output rate while generating (completion tokens per second),
