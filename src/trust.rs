@@ -224,6 +224,17 @@ fn is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Whether `path`'s canonical target is a *file* confined within `boundary` and
+/// clear of any `.git` component, mirroring discovery's `skills::within`. A bare
+/// `is_file()` follows a symlink out of the tree; this rejects such a target so
+/// detection never counts a `SKILL.md` discovery would refuse to load.
+fn within(path: &Path, boundary: &Path) -> bool {
+    match path.canonicalize() {
+        Ok(real) => real.starts_with(boundary) && !real.components().any(|c| c.as_os_str() == ".git") && real.is_file(),
+        Err(_) => false,
+    }
+}
+
 /// Whether `dir` contains a `SKILL.md` within [`MAX_SCAN_DEPTH`], i.e. carries
 /// at least one workspace skill.
 ///
@@ -281,7 +292,13 @@ fn dir_has_skill(repo_root: &Path, dir: &Path) -> bool {
             return false;
         }
         visited.insert(dir.clone(), depth);
-        if dir.join(SKILL_FILE).is_file() {
+        // Confine the `SKILL.md` *target* itself, not just its parent: a
+        // symlinked `SKILL.md` whose canonical target escapes the boundary (or
+        // resolves under a `.git`) still satisfies a bare `is_file()`, yet
+        // discovery's `within` (`skills::scan`) rejects it, so it cannot load.
+        // Detection must apply the same canonical-target check or the repo
+        // prompts for (persistent) trust over a source that never loads.
+        if within(&dir.join(SKILL_FILE), boundary) {
             return true;
         }
         if depth >= MAX_SCAN_DEPTH {
@@ -990,6 +1007,51 @@ mod tests {
         symlink(external.path(), skills.join("ext")).unwrap();
         let gated = Gated::detect(&root, &skills_cfg(), true, true);
         assert!(!gated.skills, "a skill reachable only by escaping the skills root is not gated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_rejects_a_skill_file_symlinked_outside_the_skills_root() {
+        // The file-level case: the configured skills dir (and the candidate
+        // skill subdirectory) are real and in-repo, but the `SKILL.md` itself
+        // is a symlink whose target lives outside the skills root. A bare
+        // `is_file()` follows that link and would gate it, yet discovery's
+        // `within` rejects the file, so it can never load — detection must not
+        // prompt for persistent trust over it.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skill_dir = root.join(".claude/skills/x");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let ext_file = external.path().join("SKILL.md");
+        std::fs::write(&ext_file, "# x\n").unwrap();
+        // The SKILL.md in an in-repo skill dir points to an external file.
+        symlink(&ext_file, skill_dir.join("SKILL.md")).unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a SKILL.md symlinked outside the skills root is not gated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_skips_a_skill_file_symlinked_through_a_dot_git() {
+        // A `SKILL.md` whose canonical target resolves under a `.git` component
+        // *inside* the skills root is rejected by discovery's `within` (its
+        // `.git` clause, not the boundary clause), so detection must drop it too
+        // even though a bare `is_file()` would follow the link.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let skill_dir = root.join(".claude/skills/x");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // A real SKILL.md physically sits under a `.git` directory that is
+        // itself within the skills root, so only the `.git` clause excludes it.
+        let git_file = root.join(".claude/skills/.git/SKILL.md");
+        std::fs::create_dir_all(git_file.parent().unwrap()).unwrap();
+        std::fs::write(&git_file, "# x\n").unwrap();
+        symlink(&git_file, skill_dir.join("SKILL.md")).unwrap();
+        let gated = Gated::detect(&root, &skills_cfg(), true, true);
+        assert!(!gated.skills, "a SKILL.md resolving under a .git component is not gated");
     }
 
     #[test]
