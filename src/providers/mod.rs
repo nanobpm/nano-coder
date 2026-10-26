@@ -16,7 +16,7 @@ pub mod qwen;
 pub mod retry;
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -910,18 +910,107 @@ fn human_secs(d: Duration) -> String {
     if (s - s.round()).abs() < 0.05 { format!("{}", s.round() as u64) } else { format!("{s:.1}") }
 }
 
+/// Reports a network outage during [`send_online`] without growing logs
+/// without bound. On a terminal it keeps **one** live line, redrawn in place as
+/// the backoff changes; on a pipe/file it announces the outage **once** and then
+/// stays silent until it resolves. On recovery (a response arrives after an
+/// outage) it reports reconnection exactly once. On cancellation or budget
+/// exhaustion the live line is closed via `Drop`/`give_up` **without** claiming
+/// recovery.
+struct OutageReporter<'a> {
+    what: &'a str,
+    tty: bool,
+    /// Non-terminal: whether the one-time outage notice has been printed.
+    announced: bool,
+    /// Terminal: whether a live (carriage-return) line is currently open.
+    live: bool,
+}
+
+impl<'a> OutageReporter<'a> {
+    fn new(what: &'a str) -> Self {
+        Self { what, tty: std::io::stderr().is_terminal(), announced: false, live: false }
+    }
+
+    /// Still offline; will retry after `delay`.
+    fn waiting(&mut self, reason: &str, delay: Duration) {
+        if self.tty {
+            // One live line, redrawn in place (`\r` + clear-to-end-of-line) so
+            // repeated backoffs never scroll the terminal.
+            let mut err = std::io::stderr();
+            let _ = write!(
+                err,
+                "\r[{}] network unavailable ({}); retrying in {}s (Ctrl-C to stop)\x1b[K",
+                self.what,
+                reason,
+                human_secs(delay),
+            );
+            let _ = err.flush();
+            self.live = true;
+        } else if !self.announced {
+            // Non-terminal: announce once, then stay silent — a per-retry line
+            // would grow the log unbounded for a long outage.
+            eprintln!("[{}] network unavailable ({reason}); waiting for reconnection (Ctrl-C to stop)", self.what);
+            self.announced = true;
+        }
+    }
+
+    /// A response arrived after an outage: report reconnection once.
+    fn recovered(&mut self) {
+        if self.tty {
+            if self.live {
+                // Close the live line, then confirm on its own line.
+                let mut err = std::io::stderr();
+                let _ = write!(err, "\r\x1b[K");
+                let _ = err.flush();
+                self.live = false;
+                eprintln!("[{}] network recovered; continuing", self.what);
+            }
+        } else if self.announced {
+            eprintln!("[{}] network recovered; continuing", self.what);
+        }
+    }
+
+    /// Cancellation or budget exhaustion ends the wait: close the live line
+    /// without claiming recovery (nothing reconnected).
+    fn give_up(&mut self) {
+        if self.tty && self.live {
+            // End the open live line so a later prompt is not appended to it.
+            eprintln!();
+            self.live = false;
+        }
+    }
+}
+
+impl Drop for OutageReporter<'_> {
+    fn drop(&mut self) {
+        // Cancellation (Ctrl-C / a cancelled turn) drops this future — and so
+        // this reporter — mid-wait. Close any open live line without claiming
+        // recovery; the explicit recovery/give-up paths already cleared `live`,
+        // so this only fires on the cancellation path.
+        self.give_up();
+    }
+}
+
 /// Send a request, waiting out *transport* failures that produced no HTTP
 /// response (DNS, connection refused/reset, connect/idle timeout) instead of
 /// spending the caller's `max_retries` budget. Each attempt rebuilds the
 /// request via `build`. Backs off (`initial_backoff` doubling to `max_backoff`)
-/// for as long as `offline_budget` allows, printing a "network unavailable"
-/// notice; a builder error (an unusable request) fails at once. Any HTTP
+/// for as long as `offline_budget` allows, reporting the outage on one live
+/// line (or once, on a pipe) and announcing recovery when a response finally
+/// arrives. A builder error (an unusable request) or a redirect-policy error (a
+/// redirect loop or a disallowed redirect) fails at once — the network is up, so
+/// retrying as offline would spin forever on a misconfigured endpoint. Any HTTP
 /// response — whatever its status — returns immediately for the caller to
 /// classify, which also resets the offline wait for the next call.
 ///
+/// The `offline_budget` bounds the **whole** wait, backoff sleeps included: each
+/// backoff is clamped to the remaining budget and, once that budget is spent, the
+/// loop stops **before** issuing another request (a fresh send could extend the
+/// wait by its own timeout or land after the budget).
+///
 /// Cancellation (Ctrl-C / a cancelled turn) stops the wait by dropping this
 /// future at the caller's `select!`, so the backoff sleep needs no explicit
-/// cancel plumbing.
+/// cancel plumbing; the reporter's `Drop` closes the live line.
 pub(crate) async fn send_online(
     what: &str,
     policy: &RetryPolicy,
@@ -929,25 +1018,46 @@ pub(crate) async fn send_online(
 ) -> Result<reqwest::Response> {
     let mut attempt: u32 = 0;
     let mut offline_since: Option<Instant> = None;
+    let mut reporter = OutageReporter::new(what);
     loop {
         match build().send().await {
-            Ok(response) => return Ok(response),
-            // A malformed request can never succeed on retry.
-            Err(e) if e.is_builder() => return Err(anyhow!(e)),
+            Ok(response) => {
+                // A response arrived (any status): if we had been waiting out an
+                // outage, announce the reconnection before handing back.
+                if offline_since.is_some() {
+                    reporter.recovered();
+                }
+                return Ok(response);
+            }
+            // A request that can never succeed on retry: a malformed request
+            // (builder error) or a redirect-policy failure — a redirect loop or
+            // a disallowed cross-host redirect reports `is_redirect()`, not
+            // `is_builder()`. Both mean HTTP was (or would be) exchanged, so the
+            // network is up: treating them as an outage would resend forever
+            // instead of surfacing the actionable error.
+            Err(e) if e.is_builder() || e.is_redirect() => return Err(anyhow!(e)),
             Err(e) => {
                 let since = *offline_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= policy.offline_budget {
+                // Bound the whole wait — backoff sleeps included — by the
+                // remaining budget, and stop before resending once it is spent.
+                let Some(remaining) = policy.offline_budget.checked_sub(since.elapsed()).filter(|r| !r.is_zero())
+                else {
+                    reporter.give_up();
                     return Err(anyhow!(e).context("network unavailable"));
-                }
+                };
                 let factor = 2u32.saturating_pow(attempt.min(20));
-                let delay = policy.initial_backoff.saturating_mul(factor).min(policy.max_backoff);
-                eprintln!(
-                    "[{what}] network unavailable ({}); retrying in {}s (Ctrl-C to stop)",
-                    clean_reason(&e.to_string()),
-                    human_secs(delay),
-                );
+                let backoff = policy.initial_backoff.saturating_mul(factor).min(policy.max_backoff);
+                let delay = backoff.min(remaining);
+                reporter.waiting(&clean_reason(&e.to_string()), delay);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
+                // The backoff consumed the rest of the budget: give up before
+                // resending rather than starting a request we have no budget for
+                // (which could extend the wait by its timeout or succeed late).
+                if since.elapsed() >= policy.offline_budget {
+                    reporter.give_up();
+                    return Err(anyhow!(e).context("network unavailable"));
+                }
             }
         }
     }
@@ -2093,5 +2203,97 @@ mod tests {
         assert!(elapsed < Duration::from_secs(5), "waited far past the offline budget: {elapsed:?}");
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("network unavailable"), "error should name the outage: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offline_budget_bounds_the_backoff_sleep() {
+        // A tiny budget with a large backoff: the budget must bound the *whole*
+        // wait, backoff sleeps included. Before the fix the first failed send
+        // slept the full one-second backoff (and then started another request)
+        // even though the budget was 100ms, so the call took ~1s. Now the
+        // backoff is clamped to the remaining budget and no further request is
+        // issued, so the call returns in roughly the budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let user = HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("http://{addr}")),
+                max_retries: Some(0),
+                retry_initial_backoff_ms: Some(1_000),
+                retry_max_backoff_ms: Some(1_000),
+                offline_budget_ms: Some(100),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let start = Instant::now();
+        let result = transport.post_json_to(&url, &serde_json::json!({ "hello": "world" }), |r| r).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "an always-offline endpoint must fail once the budget is spent");
+        assert!(elapsed >= Duration::from_millis(80), "gave up before the budget: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(600), "slept the full backoff past the budget: {elapsed:?}");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("network unavailable"), "error should name the outage: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_does_not_wait_out_a_redirect_loop() {
+        // A redirect loop is NOT a transport outage: HTTP responses are flowing,
+        // the network is up. reqwest's default policy follows a bounded number of
+        // redirects and then fails with `is_redirect()` (not `is_builder()`), so
+        // the offline loop must surface that actionable error immediately instead
+        // of resending forever against a misconfigured endpoint.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A server that answers every request with `301 -> /`, forever.
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                let resp =
+                                    b"HTTP/1.1 301 Moved Permanently\r\nLocation: /\r\nContent-Length: 0\r\n\r\n";
+                                if stream.write_all(resp).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let user = HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("http://{addr}")),
+                max_retries: Some(0),
+                retry_initial_backoff_ms: Some(50),
+                retry_max_backoff_ms: Some(50),
+                // A generous budget: if a redirect loop were (wrongly) treated as
+                // an outage, the call would spin until this elapsed. It must
+                // instead return at once, well under the budget.
+                offline_budget_ms: Some(10_000),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let start = Instant::now();
+        let result = transport.post_json_to(&url, &serde_json::json!({ "hello": "world" }), |r| r).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "a redirect loop is a hard error, not a recoverable outage");
+        assert!(elapsed < Duration::from_secs(5), "redirect loop was wrongly treated as an outage: {elapsed:?}");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(!err.contains("network unavailable"), "a redirect loop must not be reported as an outage: {err}");
     }
 }

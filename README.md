@@ -764,13 +764,19 @@ which is the `openai` default), `retry_initial_backoff_ms`, `retry_max_backoff_m
 A transport failure with no HTTP response (DNS, connection refused or reset, connect or
 idle timeout) is treated as the network being down rather than a failed attempt: nano-coder
 backs off (`retry_initial_backoff_ms` doubling to `retry_max_backoff_ms`) and keeps waiting,
-printing `network unavailable (…); retrying in Ns (Ctrl-C to stop)`, so a turn survives a
-laptop sleep, a Wi-Fi change or a VPN reconnect instead of failing after about a minute.
-These waits do not consume `max_retries` (which still bounds HTTP-status retries like 429 or
-5xx), and the Copilot session-token refresh waits the same way. If a stream drops after it
-started replying, the partial reply is discarded (nothing reaches history) and the request
-is re-sent, up to ten times per model call. The wait is unbounded by default; set
-`offline_budget_ms` to give up after that many milliseconds offline.
+reporting the outage on a single live line (`network unavailable (…); retrying in Ns
+(Ctrl-C to stop)`) when stderr is a terminal, or announcing it once when output is piped, so
+a long outage never floods the log. When a response finally arrives it announces the
+recovery, so a turn survives a laptop sleep, a Wi-Fi change or a VPN reconnect instead of
+failing after about a minute. A redirect-policy error (a redirect loop or a disallowed
+redirect) is *not* an outage — HTTP is flowing — so it surfaces its actionable error at once
+instead of being retried. These waits do not consume `max_retries` (which still bounds
+HTTP-status retries like 429 or 5xx), and the Copilot session-token refresh waits the same
+way. If a stream drops after it started replying, the partial reply is discarded (nothing
+reaches history) and the request is re-sent, up to ten times per model call. The wait is
+unbounded by default; set `offline_budget_ms` to give up after that many milliseconds
+offline — the budget bounds the whole wait, backoff sleeps included, and no further request
+is issued once it is spent.
 
 The old top-level `api_key` / `base_url` still work. They apply to `default_provider`,
 which becomes `openai` if it was `mock`.

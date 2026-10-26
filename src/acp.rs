@@ -185,7 +185,11 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
         // Interactive-only (a `/model` typed mid-turn); an ACP client switches
         // models between turns, so these never fire here.
         | AgentEvent::ModelSwitched { .. }
-        | AgentEvent::ModelSwitchFailed { .. } => {
+        | AgentEvent::ModelSwitchFailed { .. }
+        // A stream restart affects only the live delta renderers; ACP reports a
+        // completed message at `AssistantMessage`, not per-delta, so there is no
+        // partial to discard here.
+        | AgentEvent::ResponseRestarted => {
             return None;
         }
     })

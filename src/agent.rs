@@ -582,6 +582,14 @@ pub enum AgentEvent<'a> {
         spec: &'a str,
         error: &'a str,
     },
+    /// A streamed reply broke after some output had already been shown
+    /// (`StreamInterrupted`) and the whole request is being re-sent from
+    /// scratch. The partial reply was displayed but never recorded in history,
+    /// so renderers must discard the abandoned text and reset any pending
+    /// thinking before accepting the restarted stream's deltas — otherwise the
+    /// replacement answer is appended to the stale prefix and the final
+    /// `AssistantMessage` is suppressed.
+    ResponseRestarted,
 }
 
 /// Result of a compaction.
@@ -3790,6 +3798,14 @@ impl Agent {
                                 eprintln!(
                                     "[agent] {what}: {interrupted}; asking again ({stream_restarts}/{MAX_STREAM_RESTARTS})"
                                 );
+                                // Tell the renderers to discard the abandoned
+                                // partial reply (and reset pending thinking)
+                                // before the re-sent stream's deltas arrive, so
+                                // the replacement answer starts fresh instead of
+                                // being appended to the stale prefix.
+                                if let Some(sink) = event_sink {
+                                    sink(session_id, &AgentEvent::ResponseRestarted);
+                                }
                                 continue;
                             }
                             self.set_activity(Activity::Idle);
@@ -9762,6 +9778,36 @@ mod tests {
             !agent.conversation().iter().any(|m| m.content.contains("partial reply")),
             "no partial, mid-reply text reaches history"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_restart_emits_a_reset_event_before_resending() {
+        // On each mid-reply break the agent emits `ResponseRestarted` so the
+        // renderers discard the abandoned partial (and reset pending thinking)
+        // before the re-sent stream's deltas arrive. Without it the replacement
+        // answer is appended to the stale prefix and the final message is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+            let name = match event {
+                AgentEvent::TextDelta { text } => format!("text-delta:{text}"),
+                AgentEvent::ResponseRestarted => "restart".to_string(),
+                AgentEvent::AssistantMessage { text, .. } => format!("message:{text}"),
+                _ => return,
+            };
+            sink.lock().unwrap().push(name);
+        }));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        let seen = events.lock().unwrap().clone();
+        // Two breaks -> two resets, each emitted after a shown partial and
+        // before the request is re-sent.
+        assert_eq!(seen.iter().filter(|e| *e == "restart").count(), 2, "one reset per mid-reply break: {seen:?}");
+        assert_eq!(seen[0], "text-delta:partial reply ", "a partial is shown first: {seen:?}");
+        assert_eq!(seen[1], "restart", "the reset follows the abandoned partial: {seen:?}");
+        assert_eq!(seen.last().unwrap(), "message:the full answer", "the turn still completes whole: {seen:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
