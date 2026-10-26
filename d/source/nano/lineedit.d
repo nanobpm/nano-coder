@@ -552,6 +552,9 @@ final class LineEditor
 
     private static dstring replicateD(dchar c, size_t n) pure { dstring r; foreach (_; 0 .. n) r ~= c; return r; }
 
+    /// Text is typed but not yet sent (an idle timer waits for it).
+    bool hasDraft() const { return state.buf.length > 0; }
+
     private Result read(string prompt, string styledPrompt, bool turn, bool delegate() @safe stop)
     {
         this.prompt = prompt;

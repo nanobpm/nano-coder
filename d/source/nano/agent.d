@@ -39,6 +39,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments)
 import nano.config : ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
+import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice;
 import nano.permissions;
 import nano.session;
 import nano.control;
@@ -397,6 +398,7 @@ class Agent
                 ev.userMessage(s.text);
                 control.absorbed(s);
             }
+            fireDueTimers(ev);
             if (overThreshold())
             {
                 CompactReport rep;
@@ -638,7 +640,8 @@ class Agent
     /// loop detector, whose hard stop sets `loopStop`. Returns text to append.
     private string remind(const ref ToolCall call, bool ok, string result, ref string loopStop)
     {
-        if ((planTools && isPlanTool(call.name)) || (outcomeTool && call.name == outcomeToolName))
+        if ((planTools && isPlanTool(call.name)) || (outcomeTool && call.name == outcomeToolName)
+            || (timerTools && isTimerTool(call.name)))
         {
             // Never counted, but they break a repeat streak.
             reminders.resetRepeat();
@@ -1066,7 +1069,8 @@ class Agent
         bool isPlan = planTools && isPlanTool(call.name);
         bool isOutcome = outcomeTool && call.name == outcomeToolName;
         bool isHistory = historyEnabled && hist.isHistoryTool(call.name);
-        if (!isPlan && !isOutcome && !isHistory && !tools.has(call.name))
+        bool isTimer = timerTools && isTimerTool(call.name);
+        if (!isPlan && !isOutcome && !isHistory && !isTimer && !tools.has(call.name))
             return format("Tool '%s' not found. Available: %s", call.name, toolNames());
         // Backstop for a call already in flight when plan mode was switched on.
         if (control.mode == AgentMode.plan && !planAllows(call.name))
@@ -1106,11 +1110,13 @@ class Agent
             }
             else if (isHistory)
                 out_ = call.name == hist.searchTool ? hist.search(log.path, args) : hist.read(log.path, args);
+            else if (isTimer) out_ = runTimerTool(call.name, args);
             else out_ = isPlan ? runPlanTool(call.name, args) : tools.execute(call.name, args);
             isError = false;
         }
         catch (ToolError e) out_ = e.msg;
         catch (PlanError e) out_ = e.msg;
+        catch (TimerError e) out_ = e.msg;
         catch (hist.HistoryError e) out_ = e.msg;
         catch (OutcomeError e) out_ = e.msg;
         catch (QuestionError e) out_ = e.msg;
@@ -1134,7 +1140,7 @@ class Agent
 
     /// Start a fresh session in place (Rust `new_session`, for `/restart`):
     /// the conversation is just `system`, logged to `newLog` (null: not
-    /// persisted); mode, session thinking, plan, reminders, hook session,
+    /// persisted); mode, session thinking, plan, timers, reminders, hook session,
     /// calibration, history tools and counters are reset. The old log stays.
     void restart(string system, SessionLog newLog)
     {
@@ -1145,6 +1151,7 @@ class Agent
         control.mode = AgentMode.normal;
         sessionThinking.nullify();
         plan = Plan.init;
+        setTimers(Timers.init);
         reminders = Reminders.init;
         sessionStarted = false;
         pendingStartContext = null;
@@ -1176,7 +1183,8 @@ class Agent
     ToolDefinition[] offeredTools()
     {
         auto all = tools.definitions ~ (planTools ? planDefinitions() : null)
-            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null);
+            ~ (outcomeTool ? [outcomeDefinition()] : null) ~ (historyEnabled ? hist.definitions() : null)
+            ~ (timerTools ? timerDefinitions() : null);
         if (control.mode != AgentMode.plan) return all;
         ToolDefinition[] kept;
         foreach (t; all) if (planAllows(t.name)) kept ~= t;
@@ -1206,6 +1214,63 @@ class Agent
     void delegate() onPlanChanged;
     /// A `/model SPEC` queued mid-turn, applied (on the agent thread) before the next model call.
     void delegate(string) onModelRequest;
+
+    /// Timers the agent set for itself (`timer_*` tools).
+    Timers timers;
+    /// Offer the timer tools (off for ACP, which has no idle loop to fire them).
+    bool timerTools = true;
+    /// Called after the timers change (the UI updates the status bar).
+    void delegate() onTimersChanged;
+    /// The clock timers run on (unix seconds); tests replace it.
+    long delegate() now;
+
+    long timerNow()
+    {
+        import std.datetime.systime : Clock;
+        return now !is null ? now() : Clock.currTime.toUnixTime;
+    }
+
+    private string runTimerTool(string name, JSONValue args)
+    {
+        auto o = timers.apply(name, args, timerNow());
+        if (o.changed) timersChanged();
+        return o.text;
+    }
+
+    private void timersChanged()
+    {
+        if (log !is null) log.timers(timers.toJSON);
+        if (onTimersChanged !is null) onTimersChanged();
+    }
+
+    /// Take the due timers and return the message they send, or null.
+    /// The caller runs it as a turn (an idle prompt or `--wait-timers`).
+    string takeFiredTimers(out string notice)
+    {
+        auto t = timerNow();
+        auto due = timers.takeDue(t);
+        if (!due.length) return null;
+        timersChanged();
+        notice = firedNotice(due);
+        return firedMessage(due, t);
+    }
+
+    /// Mid-turn: due timers join the conversation before the next model call.
+    private void fireDueTimers(AgentEvents ev)
+    {
+        if (!timerTools || !timers.anyDue(timerNow())) return;
+        string notice;
+        auto text = takeFiredTimers(notice);
+        push(Message.user(wrapReminder(text)));
+        ev.userMessage(notice);
+    }
+
+    /// Replace the timers with ones restored from the session log.
+    void setTimers(Timers t)
+    {
+        timers = t;
+        if (onTimersChanged !is null) onTimersChanged();
+    }
 
     private string runPlanTool(string name, JSONValue args)
     {
@@ -1905,4 +1970,42 @@ unittest
     try agent.run("again", new NullEvents);
     catch (StreamInterrupted) threw = true;
     assert(threw);
+}
+
+// Timers: a timer set by the model fires mid-turn as a system note before
+// the next model call, and an idle one is handed to the caller as a prompt.
+unittest
+{
+    import nano.providers.mock;
+    import std.algorithm : canFind, any;
+    long clock = 1_000_000;
+    auto mock = new MockClient([
+        LLMResponse("", "", [ToolCall.fromRaw("t", "timer_set", `{"after": "5m", "note": "check CI"}`)]),
+        LLMResponse("", "", [ToolCall.fromRaw("w", "wait", `{}`)]),
+        LLMResponse("done"),
+    ]);
+    auto reg = new ToolRegistry;
+    reg.register(ToolDefinition("wait", "", parseJSON(`{"type":"object"}`)), (JSONValue a) { clock += 600; return "waited"; });
+    auto agent = new Agent(mock, reg, Policy.init, "sys");
+    agent.now = () => clock;
+    assert(agent.run("go", new NullEvents) == "done");
+    assert(mock.toolsSeen[0].canFind("timer_set"));
+    assert(mock.seen[1][$ - 1].content.canFind("Timer 1 set for"));
+    assert(mock.seen[2].any!(m => m.content.canFind("Timer 1, set at") && m.content.canFind("check CI")));
+    assert(agent.timers.empty);
+
+    // Idle: nothing due yet, then the fired message.
+    mock.script = [LLMResponse("", "", [ToolCall.fromRaw("t", "timer_set", `{"after": "2m", "note": "look again"}`)]),
+        LLMResponse("ok")];
+    agent.run("again", new NullEvents);
+    string notice;
+    assert(agent.takeFiredTimers(notice) is null);
+    clock += 120;
+    auto msg = agent.takeFiredTimers(notice);
+    assert(msg.canFind("look again") && notice.canFind("⏰ timer 2"), notice);
+
+    agent.timerTools = false;
+    mock.script = [LLMResponse("x")];
+    agent.run("off", new NullEvents);
+    assert(!mock.toolsSeen[$ - 1].canFind("timer_set"));
 }

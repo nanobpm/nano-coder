@@ -102,6 +102,20 @@ directory works; it's kept separate by default so the port can't damage real ses
   times per step), and the partial text isn't kept. The Copilot token refresh waits the same
   way. Rust: nanobpm/nano-coder#148.
 
+- **Timers (D first).** `timer_set` (`after: "30m"` or `at: "14:30"`, plus a `note` for
+  the agent's future self), `timer_list` and `timer_cancel` let the agent come back to
+  something later in the session, such as a CI run, a deploy or a review (`nano/timers.d`).
+  The harness owns the clock. A due timer joins a running turn as a system note before the
+  next model call. At an idle prompt it starts a new turn, but only while nothing is typed.
+  With `-p` it fires only with `--wait-timers`, which sleeps until each timer is due and
+  runs it; without the flag, timers left unfired are named in a note when the run ends.
+  Limits: delays of 1 minute to 24 hours, and at most 10 timers at once. Timers don't
+  repeat. A timer only reminds the agent; anything it does next goes through the normal
+  permission checks. Timers are a `timers` record in the session log, so `--resume` restores
+  them, and one that came due while nano-coder was closed fires as overdue. `/timers` lists
+  them and the status line shows `⏰ HH:MM`. Timers are off under `--acp`, which has no idle
+  loop to fire them. Rust: issue to follow.
+
 ## Parity tracking
 
 The Rust test suite is the feature specification. `parity/manifest.tsv` lists every Rust

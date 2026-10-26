@@ -29,6 +29,7 @@ immutable Command[] commands = [
     Command("/settings", "", "View/edit settings"),
     Command("/verbosity", "[quiet|normal|verbose|debug]", "Show or set output detail"),
     Command("/plan", "", "Show the agent's task plan with notes"),
+    Command("/timers", "", "List the timers the agent set for itself"),
     Command("/memory", "[forget ID]", "List cross-session memories (or forget one by id)"),
     Command("/hooks", "", "List loaded user hooks (.claude/settings.json and friends)"),
     Command("/queue", "[list|add text|remove N...|edit N text|clear]", "Show or edit the queued messages"),

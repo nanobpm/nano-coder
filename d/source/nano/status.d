@@ -21,6 +21,9 @@ struct Stats
     bool calibrated;
     bool hasPlan;
     size_t planDone, planTotal;
+    /// Active timers and when the next one fires (local `HH:MM`).
+    size_t timers;
+    string nextTimer;
     AgentMode mode;
     string thinking; /// the level sent (null: the model decides)
     ulong sessionInputTokens, sessionOutputTokens;
@@ -181,6 +184,8 @@ string render(const ref Stats stats, size_t cols)
         Segment(format("  %s msgs ", stats.messages), null, 3),
     ];
     if (stats.hasPlan) segments ~= Segment(format(" plan %s/%s ", stats.planDone, stats.planTotal), null, 4);
+    if (stats.timers) segments ~= Segment(stats.timers == 1 ? format(" ⏰ %s ", stats.nextTimer)
+        : format(" ⏰ %s next %s ", stats.timers, stats.nextTimer), null, 4);
     // The mode only gets a segment when it is not the default.
     if (stats.mode == AgentMode.plan) segments ~= Segment(" plan ", "\x1b[1;38;5;221m", 10);
     else if (stats.mode == AgentMode.auto_) segments ~= Segment(" auto ", "\x1b[1;38;5;114m", 10);

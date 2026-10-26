@@ -54,7 +54,7 @@ enum string versionString = "nano-coder-d " ~ packageVersion ~ " (D port of nano
 enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH] [-p PROMPT]
                     [--resume [SESSION_ID|last]] [--plan] [--sandbox off|workspace|read-only]
                     [--allow RULE]... [--deny RULE]...
-                    [--no-session] [--no-hooks] [--yolo] [--verbosity quiet|normal|verbose|debug] [--acp]
+                    [--no-session] [--no-hooks] [--yolo] [--wait-timers] [--verbosity quiet|normal|verbose|debug] [--acp]
        nano-coder-d --list-sessions [--all] [--json]
        nano-coder-d --trajectory SESSION_ID [--json|--markdown]
        nano-coder-d --list-models PROVIDER[/model]
@@ -62,7 +62,8 @@ enum string usage = `Usage: nano-coder-d [--model provider/model] [--config PATH
        nano-coder-d --version
 
 Reads the Rust nano-coder's config (~/.config/nano-coder/config.toml).
--p runs one prompt and exits; with no -p, prompts are read from stdin (a REPL on a terminal).
+-p runs one prompt and exits (--wait-timers: first wait for the timers the agent set,
+running each as it fires); with no -p, prompts are read from stdin (a REPL on a terminal).
 --acp serves the Agent Client Protocol (JSON-RPC 2.0, one message per line) on stdin/stdOut.
 REPL commands: /help lists them (/model, /mode, /verbosity, /providers, /restart, /resume, ...)
 Ctrl-C cancels a running turn; a line typed during a turn steers it.
@@ -73,7 +74,7 @@ interactive start asks "Trust this repo?" and remembers a yes; -p and piped runs
 struct Options
 {
     string model, configPath, prompt, resume, listModels, sandbox, login, trajectory, verbosity;
-    bool yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
+    bool waitTimers, yolo, markdown, plan, noSession, noHooks, verbose, hasResume, acp, listSessions, all, json;
     string[] allow, deny;
 }
 
@@ -109,6 +110,7 @@ Options parseArgs(string[] args)
             case "--markdown": o.markdown = true; break;
             case "--trajectory": o.trajectory = value(); break;
             case "--no-session": o.noSession = true; break;
+            case "--wait-timers": o.waitTimers = true; break;
             case "--no-hooks": o.noHooks = true; break;
             case "--yolo": o.yolo = true; break;
             case "--verbose", "-v": o.verbosity = "verbose"; break;
@@ -667,6 +669,8 @@ void statusFromAgent(ref Stats s, Agent agent, string cwdShown)
     s.hasPlan = progress[1] > 0;
     s.planDone = progress[0];
     s.planTotal = progress[1];
+    s.timers = agent.timers.items.length;
+    s.nextTimer = s.timers ? imported!"nano.timers".clock(agent.timers.nextDue) : null;
     s.mode = agent.control.mode;
     auto th = agent.thinking();
     auto w = wireValue(th);
@@ -1136,6 +1140,13 @@ string sessionText(Agent agent)
     return agent.log is null ? "not recording (--no-session)" : format("session %s\nlog: %s", agent.log.id, agent.log.path);
 }
 
+/// `/timers`: the agent's active timers.
+string timersText(Agent agent)
+{
+    return agent.timers.empty ? "No timers set. The agent sets one with the timer_set tool."
+        : agent.timers.list(agent.timerNow()).stripRight;
+}
+
 string planText(Agent agent)
 {
     return agent.plan.empty ? "No plan yet. The agent makes one with the plan_add tool."
@@ -1378,6 +1389,7 @@ int runMain(string[] args)
     agent.titleModel = cfg.titleModel;
     agent.titleClient = (string spec) => makeClient(resolve(cfg, spec));
     agent.planTools = cfg.planTools;
+    agent.timerTools = !o.acp; // ACP has no idle loop to fire them
     agent.outcomeTool = cfg.outcomeTool;
     agent.remindersEnabled = cfg.reminders;
     agent.questions = questions;
@@ -1478,6 +1490,14 @@ int runMain(string[] args)
         {
             try agent.plan = Plan.fromJSON(restored.plan);
             catch (Exception e) stdErr.writeln("nano-coder-d: ignoring the saved plan: ", e.msg);
+        }
+        {
+            import nano.timers : Timers;
+            Timers t;
+            try t = Timers.fromJSON(restored.timers);
+            catch (Exception e) stdErr.writeln("nano-coder-d: ignoring the saved timers: ", e.msg);
+            agent.setTimers(t);
+            if (!t.empty) stdErr.writefln("%s timer%s still set (/timers lists them)", t.items.length, t.items.length == 1 ? "" : "s");
         }
         stdErr.writefln("resumed %s (%s messages)", restored.id, agent.messages.length - 1);
         if (restored.pendingInput.length)
@@ -1606,6 +1626,7 @@ int runMain(string[] args)
         view.set("/skills", skillsListing(skills));
         view.set("/session", sessionText(agent));
         view.set("/plan", planText(agent));
+        view.set("/timers", timersText(agent));
         view.set("/context", contextReport(agent));
         view.set("log", agent.log is null ? null : agent.log.path);
         refreshStatus();
@@ -1730,7 +1751,38 @@ int runMain(string[] args)
         return ok;
     }
 
-    if (o.prompt.length) return turn(o.prompt) ? 0 : 1;
+    if (o.prompt.length)
+    {
+        bool ok = turn(o.prompt);
+        // --wait-timers: sleep until each timer the agent set fires and run
+        // it as the next prompt, until none are left (Ctrl-C stops waiting).
+        while (ok && o.waitTimers && !agent.timers.empty && !atomicLoad(agent.control).isCancelled)
+        {
+            import core.thread : Thread;
+            import core.time : msecs;
+            stdOut.flush(); // the answer before the notes
+            auto wait = agent.timers.nextDue - agent.timerNow();
+            if (wait > 0)
+            {
+                stdErr.writeln(console.dim(format("[waiting %s for timer %s]", imported!"nano.timers".describe(wait),
+                    agent.timers.items[0].id)));
+                // Idle Ctrl-C exits (130) via the SIGINT handler.
+                while (agent.timers.nextDue > agent.timerNow()) Thread.sleep(500.msecs);
+            }
+            string notice;
+            auto fired = agent.takeFiredTimers(notice);
+            if (fired is null) continue;
+            stdErr.writeln(console.dim(notice));
+            ok = turn(fired);
+        }
+        if (ok && !o.waitTimers && !agent.timers.empty)
+        {
+            stdOut.flush();
+            stdErr.writeln(console.dim(format("[%s timer%s didn't fire: the run ended first (--wait-timers waits for them)]",
+                agent.timers.items.length, agent.timers.items.length == 1 ? "" : "s")));
+        }
+        return ok ? 0 : 1;
+    }
 
     bool interactive = isTerminal(0);
     if (interactive && isTerminal(1) && environment.get("TERM", "") != "dumb"
@@ -1835,13 +1887,21 @@ int runMain(string[] args)
             // While the Ctrl-C exit hint is armed, end the read when the window
             // lapses so the stale hint is cleared (Rust's DoublePress deadline).
             bool delegate() @safe lapse = null;
-            if (exitArmedAt != MonoTime.zero)
-                lapse = () @safe => MonoTime.currTime - exitArmedAt > exitWindow;
+            // A due timer ends the read too, once nothing is typed.
+            lapse = () @safe => (exitArmedAt != MonoTime.zero && MonoTime.currTime - exitArmedAt > exitWindow)
+                || (!editor.hasDraft && agent.timers.anyDue(agent.timerNow()));
             auto r = editor.readLine(.stamp(false) ~ "› ", console.stamp() ~ glyphMark ~ " ", false, lapse);
             editor.restyle = null;
             syncMode(); // Shift-Tab at the prompt switched the mode
             if (r.outcome == Outcome.eof) break;
-            if (r.outcome == Outcome.stopped)
+            if (r.outcome == Outcome.stopped && !editor.hasDraft && agent.timers.anyDue(agent.timerNow()))
+            {
+                string notice;
+                line = agent.takeFiredTimers(notice);
+                writeln(console.dim(notice));
+                line = "\x00" ~ line;
+            }
+            else if (r.outcome == Outcome.stopped)
             {
                 exitArmedAt = MonoTime.zero; // window lapsed: drop the hint, re-arm on the next press
                 quietPrompt = true;
@@ -1856,9 +1916,12 @@ int runMain(string[] args)
                 quietPrompt = true;
                 continue;
             }
-            if (r.outcome != Outcome.line) continue;
-            line = r.text;
-            if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
+            if (line is null) // not a fired timer
+            {
+                if (r.outcome != Outcome.line) continue;
+                line = r.text;
+                if (auto lit = unescapePrompt(line)) line = "\x00" ~ lit; // `//…`: a prompt starting with /
+            }
         }
         else
         {
@@ -1974,6 +2037,9 @@ int runMain(string[] args)
                     continue;
                 case "/plan":
                     writeln(planText(agent));
+                    continue;
+                case "/timers":
+                    writeln(timersText(agent));
                     continue;
                 case "/mode":
                     if (!arg.length)

@@ -272,6 +272,14 @@ class SessionLog
         write_(record("plan", d));
     }
 
+    /// The timers after a change; the latest record wins.
+    void timers(JSONValue timers)
+    {
+        JSONValue d = ["recorded_at": nowStamp()];
+        d["timers"] = timers;
+        write_(record("timers", d));
+    }
+
     /// The turn for `inputId` finished. `stopReason` is omitted for `end_turn`.
     void turnEnd(string inputId, string response, string stopReason, JSONValue outcome = JSONValue.init)
     {
@@ -313,6 +321,8 @@ struct Restored
     JSONValue[string] completedOutcomes;
     /// The latest plan record (`{goal, items}`), or null.
     JSONValue plan;
+    /// The latest timers record (`{last_id, items}`), or null.
+    JSONValue timers;
     /// The latest compaction was smart: the history tools are offered.
     bool historyAvailable;
     /// The one-time history hint was already shown after that compaction.
@@ -399,6 +409,9 @@ Restored restore(string path)
             break;
         case "plan":
             r.plan = data["plan"];
+            break;
+        case "timers":
+            r.timers = data["timers"];
             break;
         default: // hooks: audit only
             break;

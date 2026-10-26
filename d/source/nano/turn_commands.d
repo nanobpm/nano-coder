@@ -38,7 +38,7 @@ Timing timing(string cmd) nothrow
 {
     auto p = splitCmd(cmd);
     auto name = p[0], arg = p[1];
-    if (["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context", "/version"].canFind(name) && !arg.length)
+    if (["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/timers", "/context", "/version"].canFind(name) && !arg.length)
         return Timing.immediate;
     if (name == "/trajectory" && ["", "--json", "--markdown", "--md"].canFind(arg)) return Timing.immediate;
     if (name == "/mode" || name == "/verbosity") return arg.length ? Timing.nextStep : Timing.immediate;
