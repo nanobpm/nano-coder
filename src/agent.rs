@@ -2060,6 +2060,15 @@ impl Agent {
         for msg in tail {
             match msg.role {
                 Role::User if msg.continuation => count += 1,
+                // A fired timer or pending-timer nudge is a harness-injected
+                // user message delivered mid-turn, NOT a new answer segment:
+                // the truncated answer it interrupts is still the one being
+                // continued, so keep its prefix and do not count the message as
+                // a continuation attempt (issue #150). A genuine steer or a
+                // Stop-hook re-prompt (`auto_initiated` but not `timer`) stays a
+                // segment reset via the arm below, since those discard the
+                // cut-off prefix.
+                Role::User if msg.timer => {}
                 Role::User => answer.clear(),
                 Role::Assistant
                     if msg.tool_calls.is_empty() && crate::llm::stop_reason_is_length(msg.stop_reason.as_deref()) =>
@@ -2397,7 +2406,7 @@ impl Agent {
             if self.pending_timer_steps.is_multiple_of(timers::PENDING_NUDGE_EVERY)
                 && let Some(note) = self.timers.pending_nudge(self.timers_now())
             {
-                self.push(Message::user(&reminders::wrap(&note)).auto_initiated())?;
+                self.push(Message::user(&reminders::wrap(&note)).timer())?;
             }
         } else {
             self.pending_timer_steps = 0;
@@ -4940,7 +4949,7 @@ impl Agent {
         for timer in &fired {
             self.emit(AgentEvent::UserMessage { text: &format!("⏰ timer {}: {}", timer.id, timer.note) });
         }
-        self.push(Message::user(&Timers::fired_batch_message(&fired, now)).auto_initiated())?;
+        self.push(Message::user(&Timers::fired_batch_message(&fired, now)).timer())?;
         Ok(true)
     }
 
@@ -6366,6 +6375,42 @@ mod tests {
         let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(outcome.response, "one done", "the replay shortcut folds the persisted prefix into the answer");
+        assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_preserves_the_prefix_across_an_interleaved_timer_message() {
+        // A timer fired mid-turn, between a truncated chunk and its final
+        // chunk, and the crash landed before `TurnEnd`. The fired-timer user
+        // message is a harness injection, not a new answer segment, so the
+        // replay must keep the interrupted answer's prefix across it instead of
+        // clearing it (issue #150).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "timer-prefix").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "run it".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("run it")))).unwrap();
+        // The in-flight turn: a truncated chunk, its continuation reminder, then
+        // a fired timer's user message lands before the clean final chunk.
+        log.append(&Record::Message(Box::new(truncated_assistant("one ")))).unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&reminders::wrap(&truncated_continuation_note(50))).continuation(),
+        )))
+        .unwrap();
+        log.append(&Record::Message(Box::new(
+            Message::user(&Timers::fired_batch_message(&[], Local::now())).timer(),
+        )))
+        .unwrap();
+        log.append(&Record::Message(Box::new(Message::assistant("two")))).unwrap();
+        drop(log);
+        let (mut agent, seen) = agent(vec![text("should not be called")], dir.path());
+        agent.load_session("timer-prefix").unwrap();
+        let outcome = agent.run_turn(Some("msg-1"), "run it").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            outcome.response, "one two",
+            "the fired-timer message does not clear the interrupted answer's prefix"
+        );
         assert!(seen.lock().unwrap().is_empty(), "a recorded answer is replayed, not re-run");
     }
 

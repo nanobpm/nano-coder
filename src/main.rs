@@ -1526,7 +1526,7 @@ fn live_stats(agent: &Agent) -> context::ContextStats {
     context::ContextStats { mode: agent.mode(), ..stats }
 }
 
-async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> Result<bool> {
+async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal, wait_timers: bool) -> Result<bool> {
     // Split name from argument on ANY whitespace, the same rule `timing` and
     // `Snapshot::output` use, so a tab/newline-separated form (e.g.
     // `/trajectory\t--json`) dispatches identically to its space-separated twin
@@ -1809,6 +1809,14 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal) -> R
             // `//…` is a prompt that starts with `/`.
             let cmd = commands::unescape_prompt(cmd).unwrap_or(cmd);
             let outcome = run_interactive_turn(agent, cmd, terminal).await?;
+            // Issue #150: in a headless `--wait-timers` run a Ctrl-C that lands
+            // *during* the turn cancels it (the outcome is `Cancelled`). With no
+            // interactive session to steer, that interrupt means exit — propagate
+            // it to the outer loop rather than resuming the wait on the remaining
+            // timers.
+            if !terminal.steerable && wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                return Ok(false);
+            }
             print_turn_outcome(&outcome, &terminal.renderer);
             Ok(true)
         }
@@ -2553,7 +2561,17 @@ async fn main() -> Result<()> {
                 // as `run_command`'s error arm below does for a user turn.
                 agent.mark_auto_turn();
                 match run_interactive_turn(&mut agent, &text, &mut terminal).await {
-                    Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
+                    Ok(outcome) => {
+                        // Issue #150: in a headless `--wait-timers` run a Ctrl-C
+                        // that lands *during* the turn cancels it (the outcome is
+                        // `Cancelled`). With no interactive session to steer, that
+                        // interrupt means exit — break rather than resume the
+                        // outer loop and keep waiting on the remaining timers.
+                        if !terminal.steerable && args.wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                            break;
+                        }
+                        print_turn_outcome(&outcome, &terminal.renderer)
+                    }
                     Err(e) => {
                         if terminal.renderer.is_frame() {
                             terminal.renderer.note(&format!("Error: {:#}", e));
@@ -2667,7 +2685,15 @@ async fn main() -> Result<()> {
                     // prompt rather than terminating the REPL.
                     agent.mark_auto_turn();
                     match run_interactive_turn(&mut agent, &text, &mut terminal).await {
-                        Ok(outcome) => print_turn_outcome(&outcome, &terminal.renderer),
+                        Ok(outcome) => {
+                            // Issue #150: as above — a Ctrl-C that cancels this
+                            // timer turn in a headless `--wait-timers` run exits
+                            // rather than resuming the wait on remaining timers.
+                            if !terminal.steerable && args.wait_timers && outcome.stop_reason == agent::StopReason::Cancelled {
+                                break;
+                            }
+                            print_turn_outcome(&outcome, &terminal.renderer)
+                        }
                         Err(e) => {
                             if terminal.renderer.is_frame() {
                                 terminal.renderer.note(&format!("Error: {:#}", e));
@@ -2735,7 +2761,7 @@ async fn main() -> Result<()> {
                 terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
-            match run_command(&mut agent, &input, &mut terminal).await {
+            match run_command(&mut agent, &input, &mut terminal, args.wait_timers).await {
                 Ok(continue_running) => {
                     running = continue_running;
                 }

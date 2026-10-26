@@ -550,9 +550,15 @@ mod tests {
         // 14:30 later today when it is still ahead.
         let due = parse_at("14:30", at(12, 0)).unwrap();
         assert_eq!(due, at(14, 30));
-        // 09:00 is already past at noon, so it means tomorrow.
-        let due = parse_at("09:00", at(12, 0)).unwrap();
-        assert_eq!(due, at(9, 0) + Duration::days(1));
+        // 09:00 is already past at noon, so it means tomorrow. Compare the
+        // naive local calendar values (tomorrow's date at 09:00), NOT
+        // `at(9, 0) + Duration::days(1)`: that is 24 *elapsed* hours, which a
+        // daylight-saving transition shifts off the wall-clock 09:00 the parser
+        // correctly returns (e.g. over the Europe/Berlin October fold).
+        let now = at(12, 0);
+        let due = parse_at("09:00", now).unwrap();
+        assert_eq!(due.date_naive(), now.date_naive() + Duration::days(1));
+        assert_eq!(due.time(), NaiveTime::from_hms_opt(9, 0, 0).unwrap());
         // An ISO date-time without an offset is local time.
         let due = parse_at("2026-10-25T14:30", at(12, 0)).unwrap();
         assert_eq!(due.format("%Y-%m-%dT%H:%M").to_string(), "2026-10-25T14:30");

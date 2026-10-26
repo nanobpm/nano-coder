@@ -288,13 +288,17 @@ fn a_stale_ctrl_c_exit_hint_clears_itself_while_a_timer_is_pending() {
     pty.wait_for("mock/test", Duration::from_secs(15));
 
     // Set a one-minute timer WITHOUT the mock's wait, so the turn ends and the
-    // prompt idles in the pre-prompt timer wait with a pending timer.
+    // prompt idles in the pre-prompt timer wait with a pending timer. Wait for
+    // the turn to FINISH — the idle prompt only re-renders once the turn is
+    // over — before the Ctrl-C below, otherwise the interrupt lands mid-turn
+    // and cancels it instead of arming the exit hint.
     pty.send("set a timer\n");
     let screen = pty.wait_for("Timer 1 set for", Duration::from_secs(20));
     assert!(screen.contains("Timer 1 set for"), "{screen}");
+    pty.wait_for("ready · type a message", Duration::from_secs(20));
 
-    // One Ctrl-C (0x03) on the empty prompt arms the exit hint rather than
-    // exiting (the double-press-to-exit gesture).
+    // One Ctrl-C (0x03) on the now-idle empty prompt arms the exit hint rather
+    // than exiting (the double-press-to-exit gesture).
     pty.send("\u{3}");
     pty.wait_for("Ctrl-C again to exit", Duration::from_secs(10));
 

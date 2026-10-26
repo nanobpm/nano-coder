@@ -146,3 +146,54 @@ fn headless_wait_timers_run_exits_on_the_first_interrupt() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Issue #150: a Ctrl-C that lands *during* a headless `--wait-timers` turn
+/// exits the run, rather than cancelling only that turn and resuming the wait
+/// on the remaining timer. The "set a timer … and wait" prompt makes the mock
+/// set a one-minute timer and then run `sleep 75`, so the turn is still in
+/// flight (in the tool call) when the SIGINT arrives.
+#[cfg(unix)]
+#[test]
+fn headless_wait_timers_run_exits_on_an_interrupt_during_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nano-coder"))
+        .args(["--model", "mock/test", "--config", config.to_str().unwrap(), "--wait-timers"])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nano-coder");
+
+    // Keep stdin open so there is no EOF to end the run; the only way out is
+    // the interrupt. "and wait" makes the mock follow `timer_set` with a
+    // 75-second `sleep`, so the turn is mid-tool-call when SIGINT lands.
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(b"set a timer and wait\n").expect("write prompt");
+    stdin.flush().expect("flush prompt");
+
+    // Let the turn reach the long `sleep`, then interrupt it. The one-minute
+    // timer is nowhere near due, so only propagating the in-flight interrupt
+    // lets the run exit promptly. Five seconds gives a slow CI box time to set
+    // the timer and enter the `sleep 75` tool call.
+    std::thread::sleep(Duration::from_secs(5));
+    let pid = child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0, "deliver SIGINT");
+
+    // Without the fix the interrupt cancels the turn but the outer loop resumes
+    // waiting on the timer, so the run outlives this deadline.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            drop(stdin);
+            return;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("headless --wait-timers run did not exit on a Ctrl-C during a turn");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
