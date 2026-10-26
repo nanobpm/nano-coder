@@ -919,8 +919,16 @@ const AUTO_AWAY_SECS: u64 = 15;
 /// (`memory::is_line_break`) fold them as line breaks, so a hand-edited value
 /// could otherwise smuggle a forged extra line (e.g. a fake `/memory` row) past
 /// the filter.
+///
+/// Horizontal tabs (`\t`) are the one control that is *expanded* rather than
+/// dropped: a tab is legitimate column layout (e.g. numbered `read_file` output
+/// `   1\tcode`), so deleting it would merge adjacent columns into one unreadable
+/// run. Each tab is replaced by the spaces needed to reach the next 8-column tab
+/// stop — exactly what a terminal renders — which keeps the columns separated
+/// while still removing the raw control byte, preserving the terminal-safety
+/// protection (a space can neither move the cursor nor begin an escape).
 pub(crate) fn sanitize_terminal_text(s: &str) -> String {
-    s.chars().filter(|c| (!c.is_control() || *c == '\n') && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, true)
 }
 
 /// Like [`sanitize_terminal_text`], but for single-line fields: drops every
@@ -929,9 +937,45 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
 /// model-controlled text rendered on one row — picker prompts, option
 /// labels/descriptions and plan titles — where a line feed is not multi-line
 /// content to keep but injected layout that would spill an unprefixed extra row
-/// or move an interactive selector's cursor.
+/// or move an interactive selector's cursor. Horizontal tabs are expanded to
+/// spaces (next 8-column tab stop) just as in [`sanitize_terminal_text`], so
+/// tab-separated columns stay separated instead of merging.
 pub(crate) fn sanitize_terminal_line(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
+    sanitize_terminal_chars(s, false)
+}
+
+/// Shared core of [`sanitize_terminal_text`]/[`sanitize_terminal_line`]: strip
+/// control characters and the U+2028/U+2029 line separators, but expand each
+/// horizontal tab to spaces (next 8-column tab stop) so tab-separated columns
+/// survive the filter. `keep_newlines` keeps `\n` (and resets the tab-stop
+/// column) for multi-line text; a single-line field drops `\n` with the other
+/// controls.
+fn sanitize_terminal_chars(s: &str, keep_newlines: bool) -> String {
+    const TAB_WIDTH: usize = 8;
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                let spaces = TAB_WIDTH - (col % TAB_WIDTH);
+                for _ in 0..spaces {
+                    out.push(' ');
+                }
+                col += spaces;
+            }
+            '\n' if keep_newlines => {
+                out.push('\n');
+                col = 0;
+            }
+            '\u{2028}' | '\u{2029}' => {}
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Whether a due idle timer may start its turn now, or must yield. The two idle
@@ -2919,8 +2963,27 @@ mod tests {
     fn sanitize_terminal_text_strips_control_and_escape_sequences() {
         // A prompt-injected ANSI/OSC payload is neutralised, printable text kept.
         assert_eq!(sanitize_terminal_text("hi\x1b[2Jthere"), "hi[2Jthere");
-        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "abc");
+        // Tabs are expanded to spaces (not dropped), so columns stay separated;
+        // other C0 controls are still removed.
+        assert_eq!(sanitize_terminal_text("a\x07\x00b\tc"), "ab      c");
         assert_eq!(sanitize_terminal_text("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn sanitize_terminal_expands_tabs_to_spaces() {
+        // A tab is legitimate column layout, so it is expanded to the next
+        // 8-column tab stop rather than deleted — otherwise numbered `read_file`
+        // output like `   1\tcode` would merge into `   1code` (Copilot finding,
+        // src/frame.rs:175 / src/ui.rs:1351). Both renderers sanitize via these
+        // helpers, so the fix covers both.
+        assert_eq!(sanitize_terminal_text("     1\tleft\tright"), "     1  left    right");
+        assert_eq!(sanitize_terminal_line("     1\tleft\tright"), "     1  left    right");
+        // Tab stops are absolute 8-column stops, resetting after a kept `\n`.
+        assert_eq!(sanitize_terminal_text("a\tb"), "a       b");
+        assert_eq!(sanitize_terminal_text("ab\tc\nx\ty"), "ab      c\nx       y");
+        // A tab surviving an escape strip still can't move the cursor (it became
+        // spaces), so the terminal-safety protection is preserved.
+        assert_eq!(sanitize_terminal_line("hi\x1b[2J\tthere"), "hi[2J   there");
     }
 
     #[test]
