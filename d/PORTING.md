@@ -114,7 +114,7 @@ directory works; it's kept separate by default so the port can't damage real ses
   permission checks. Timers are a `timers` record in the session log, so `--resume` restores
   them, and one that came due while nano-coder was closed fires as overdue. `/timers` lists
   them and the status line shows `⏰ HH:MM`. Timers are off under `--acp`, which has no idle
-  loop to fire them. Rust: issue to follow.
+  loop to fire them. Rust: nanobpm/nano-coder#150.
 
 ## Parity tracking
 
