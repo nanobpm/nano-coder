@@ -2471,15 +2471,14 @@ async fn main() -> Result<()> {
                     // came due at the same moment: the running timer turn reads
                     // new channel events, not `terminal.queued`, so starting the
                     // turn here would run its tools instead of honouring the
-                    // interrupt. In a headless `--wait-timers` run the first
-                    // Ctrl-C means exit, so consume it and abandon the wait; in
-                    // a steerable session leave it queued for the prompt loop's
-                    // double-press handling (issue #150).
+                    // interrupt. Abandon the wait *without consuming the
+                    // interrupt* and let the prompt loop's interrupt handler act
+                    // on it — headless `--wait-timers` exits, a steerable session
+                    // arms the double-press gesture. Deleting it here (even in
+                    // the headless case) would strand the still-due timer, which
+                    // the prompt loop would then fire despite the stop request
+                    // (issue #150).
                     if terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt)) {
-                        if !terminal.steerable && wait_timers {
-                            terminal.queued.retain(|i| !matches!(i, TermInput::Interrupt));
-                            break Vec::new();
-                        }
                         break Vec::new();
                     }
                     // Peek whether a timer is due *before* consuming it: a
@@ -2619,7 +2618,15 @@ async fn main() -> Result<()> {
                 // the terminal for the read.
                 let timer_due = agent.timers().next_due().is_some_and(|due| due <= Local::now());
                 let draft = terminal.view.lock().unwrap().has_draft();
-                if timer_due && !draft {
+                // A queued Ctrl-C (requeued out of the timer wait above, or
+                // arriving just as the timer comes due) must beat timer
+                // delivery here too: the timer turn reads only new channel
+                // events, so firing it would run its tools despite the stop
+                // request. Leave the interrupt for `terminal.next()` to surface
+                // so it routes through the exit/double-press handler below
+                // rather than starting a turn (issue #150).
+                let interrupt_queued = terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt));
+                if timer_due && !draft && !interrupt_queued {
                     break Prompt::TimerDue;
                 }
                 // Piped stdin already closed during the timer wait and no timers

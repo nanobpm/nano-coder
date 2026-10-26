@@ -203,8 +203,19 @@ impl Timers {
     }
 
     /// One line per timer, pending (fired, not done) first then active, or
-    /// `No timers set.`.
+    /// `No timers set.`. Notes are rendered verbatim: this feeds the
+    /// `timer_list` tool result back to the model, so the model must see the
+    /// note exactly as it set it (a sanitizing pass could drop a legitimate
+    /// newline). The terminal-facing `/timers` listing sanitizes instead — see
+    /// [`render_command`](Self::render_command).
     pub fn render(&self, now: DateTime<Local>) -> String {
+        self.render_with(now, |note| note.to_string())
+    }
+
+    /// One line per timer with each model-controlled `note` passed through
+    /// `note_fmt`. Callers choose the policy: the model-facing [`render`] keeps
+    /// notes verbatim; the terminal-facing [`render_command`] sanitizes them.
+    fn render_with(&self, now: DateTime<Local>, note_fmt: impl Fn(&str) -> String) -> String {
         if self.items.is_empty() && self.pending.is_empty() {
             return "No timers set.".to_string();
         }
@@ -212,7 +223,12 @@ impl Timers {
         let mut pending: Vec<&Timer> = self.pending.iter().collect();
         pending.sort_by_key(|t| t.due_at);
         for t in pending {
-            lines.push(format!("{}. fired at {}, not done yet: {}", t.id, due_local(t).format("%H:%M"), t.note));
+            lines.push(format!(
+                "{}. fired at {}, not done yet: {}",
+                t.id,
+                due_local(t).format("%H:%M"),
+                note_fmt(&t.note)
+            ));
         }
         let mut timers: Vec<&Timer> = self.items.iter().collect();
         timers.sort_by_key(|t| t.due_at);
@@ -222,18 +238,25 @@ impl Timers {
                 t.id,
                 due_local(t).format("%H:%M"),
                 format_delay(due_local(t) - now),
-                t.note
+                note_fmt(&t.note)
             ));
         }
         lines.join("\n")
     }
 
     /// The `/timers` listing: the timers, or how they get set.
+    ///
+    /// This output reaches the terminal verbatim (`Renderer::print_block` →
+    /// `println!` on the plain path), and each `note` is model-controlled, so
+    /// sanitize every displayed note — dropping ANSI/OSC control and escape
+    /// bytes a terminal would otherwise interpret — exactly as the firing
+    /// notification does. The stored note is left intact; only this displayed
+    /// copy is sanitized (issue #150).
     pub fn render_command(&self, now: DateTime<Local>) -> String {
         if self.items.is_empty() && self.pending.is_empty() {
             "No timers set. The agent sets one with the timer_set tool.".to_string()
         } else {
-            self.render(now)
+            self.render_with(now, crate::sanitize_terminal_line)
         }
     }
 
@@ -635,6 +658,36 @@ mod tests {
         // Ids keep counting across cancels.
         set(&mut timers, json!({"after": "1h", "note": "third"})).unwrap();
         assert_eq!(timers.items.last().unwrap().id, 3);
+    }
+
+    #[test]
+    fn timers_listing_sanitizes_model_controlled_notes() {
+        // A model-controlled note can carry ANSI/OSC escapes (e.g. from
+        // prompt-injected content). The `/timers` terminal listing must drop
+        // them so they never reach the terminal, while the model-facing
+        // `timer_list` tool result keeps the note verbatim (issue #150).
+        let mut timers = Timers::default();
+        // An active timer whose note embeds ESC + a CSI clear-screen and a
+        // newline that would forge an extra listing row.
+        set(&mut timers, json!({"after": "30m", "note": "evil\u{1b}[2Jline\ninjected"})).unwrap();
+        // Fire a second timer into `pending` so the pending branch is covered
+        // too; give it an escape as well.
+        set(&mut timers, json!({"at": "12:10", "note": "done?\u{1b}]0;title\u{7}"})).unwrap();
+        timers.take_due(at(12, 15));
+
+        // Terminal listing (`/timers`): no control bytes survive, and the
+        // forged newline is gone, so each timer stays on exactly one row.
+        let shown = timers.render_command(at(12, 20));
+        assert!(!shown.contains('\u{1b}'), "escape leaked into /timers: {shown:?}");
+        assert!(!shown.contains('\u{7}'), "BEL leaked into /timers: {shown:?}");
+        assert_eq!(shown.lines().count(), 2, "forged newline added a row: {shown:?}");
+        assert!(shown.contains("evil[2Jlineinjected"), "{shown:?}");
+        assert!(shown.contains("done?]0;title"), "{shown:?}");
+
+        // Model-facing tool result keeps the note exactly as the model set it.
+        let raw = timers.render(at(12, 20));
+        assert!(raw.contains("evil\u{1b}[2Jline\ninjected"), "model note was altered: {raw:?}");
+        assert!(raw.contains("done?\u{1b}]0;title\u{7}"), "model note was altered: {raw:?}");
     }
 
     #[test]
