@@ -181,6 +181,40 @@ fn session_logs(dir: &std::path::Path) -> String {
     all
 }
 
+/// Every persisted session record (one parsed JSONL line) under `dir/sessions`.
+fn session_records(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    session_logs(dir)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect()
+}
+
+/// How many *user-message* records carry `needle` — the authoritative
+/// per-delivery firing count. A single idle delivery also writes the firing
+/// into the `Record::Input` echo (and the UI note prints it before either),
+/// so a raw substring count over-counts; only the parsed user `Record::Message`
+/// is one-per-delivery.
+fn user_message_firings(records: &[serde_json::Value], needle: &str) -> usize {
+    records
+        .iter()
+        .filter(|r| r["type"] == "message" && r["data"]["role"] == "user")
+        .filter(|r| r["data"].to_string().contains(needle))
+        .count()
+}
+
+/// Whether the firing's automatic turn has fully ended: a `turn_end` record
+/// appears *after* the user-message firing. Delivery writes `Input`, then the
+/// user `Message`, then `TurnEnd`, so this guarantees every record of that turn
+/// is on disk before the count is read (the UI note races ahead of all three).
+fn fired_turn_complete(records: &[serde_json::Value], needle: &str) -> bool {
+    let Some(fired_at) = records.iter().position(|r| {
+        r["type"] == "message" && r["data"]["role"] == "user" && r["data"].to_string().contains(needle)
+    }) else {
+        return false;
+    };
+    records[fired_at + 1..].iter().any(|r| r["type"] == "turn_end")
+}
+
 #[test]
 fn a_half_typed_draft_holds_an_idle_timer_back_until_it_is_cleared() {
     // Draft protection (issue #150): unlike the mid-turn scenario above, this
@@ -219,8 +253,63 @@ fn a_half_typed_draft_holds_an_idle_timer_back_until_it_is_cleared() {
     let screen = pty.wait_for("⏰ timer 1: check CI", Duration::from_secs(15));
     assert!(screen.contains("fired: check CI") || screen.contains("⏰ timer 1: check CI"), "{screen}");
 
-    // Exactly once: the persisted session records a single firing, so clearing
-    // the draft neither double-delivers nor re-arms the timer.
-    let fires = session_logs(dir.path()).matches("fired: check CI").count();
+    // The UI note above is printed *before* the delivery's records are written,
+    // so counting immediately races. Wait for the automatic turn to fully end —
+    // its `TurnEnd` persisted after the firing — before reading the count.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fired_turn_complete(&session_records(dir.path()), "fired: check CI") {
+        assert!(
+            Instant::now() < deadline,
+            "the timer firing's automatic turn never completed in the session log:\n{}",
+            session_logs(dir.path())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Exactly once: a single *user-message* firing is persisted, so clearing the
+    // draft neither double-delivers nor re-arms the timer. (The firing text also
+    // lands in the `Input` echo and the UI note, so only the parsed user message
+    // is a sound per-delivery count.)
+    let fires = user_message_firings(&session_records(dir.path()), "fired: check CI");
     assert_eq!(fires, 1, "the held timer fires exactly once after the draft clears");
+}
+
+#[test]
+fn a_stale_ctrl_c_exit_hint_clears_itself_while_a_timer_is_pending() {
+    // Regression (issue #150): after the first Ctrl-C with an active timer,
+    // control returns to the pre-prompt timer wait. That wait must bound itself
+    // by the Ctrl-C exit window and clear the hint when it lapses — not sleep
+    // until the (up to a minute away) timer, leaving "(Ctrl-C again to exit)"
+    // stranded on the status bar long after a second press would only re-arm.
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let pty = Pty::spawn(&["--model", "mock/test", "--config", config.to_str().unwrap()]);
+
+    pty.wait_for("mock/test", Duration::from_secs(15));
+
+    // Set a one-minute timer WITHOUT the mock's wait, so the turn ends and the
+    // prompt idles in the pre-prompt timer wait with a pending timer.
+    pty.send("set a timer\n");
+    let screen = pty.wait_for("Timer 1 set for", Duration::from_secs(20));
+    assert!(screen.contains("Timer 1 set for"), "{screen}");
+
+    // One Ctrl-C (0x03) on the empty prompt arms the exit hint rather than
+    // exiting (the double-press-to-exit gesture).
+    pty.send("\u{3}");
+    pty.wait_for("Ctrl-C again to exit", Duration::from_secs(10));
+
+    // The exit window is 2s; well past it (and well short of the timer) the hint
+    // must be gone. Without the bound the pre-prompt wait would sleep ~a minute
+    // and the hint would linger here.
+    std::thread::sleep(Duration::from_secs(5));
+    let screen = pty.screen();
+    assert!(
+        !screen.contains("Ctrl-C again to exit"),
+        "the stale exit hint must clear once the window lapses, not linger until the timer: {screen}"
+    );
+    // The timer is still pending and never fired — only the hint cleared.
+    assert!(
+        !session_logs(dir.path()).contains("fired: check CI"),
+        "the pending timer must not have fired while we only waited out the exit window"
+    );
 }

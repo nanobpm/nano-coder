@@ -2482,18 +2482,32 @@ async fn main() -> Result<()> {
                     // bounded interval so clearing the draft still delivers
                     // promptly, while a not-yet-due timer waits exactly until it
                     // comes due.
-                    let sleep = if due_now {
-                        std::time::Duration::from_millis(200)
-                    } else {
-                        (next_due - now).to_std().unwrap_or(std::time::Duration::ZERO)
-                    };
-                    // Wait for terminal input or the timer's due time, whichever
-                    // comes first. The wait is scoped so the future's borrows end
+                    let timer_deadline = std::time::Instant::now()
+                        + if due_now {
+                            std::time::Duration::from_millis(200)
+                        } else {
+                            (next_due - now).to_std().unwrap_or(std::time::Duration::ZERO)
+                        };
+                    // Bound the wait on the soonest of the timer recheck and the
+                    // Ctrl-C exit window, exactly as the prompt loop below does:
+                    // after a first Ctrl-C with an active timer, control returns
+                    // here, so an armed exit hint that is never confirmed must
+                    // clear here too rather than linger on the status bar for the
+                    // (possibly hours-away) timer's whole wait.
+                    let deadline = [exit_press.deadline(), Some(timer_deadline)]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        .expect("timer_deadline is always present");
+                    // Wait for terminal input or the deadline, whichever comes
+                    // first. The wait is scoped so the future's borrows end
                     // before the agent/terminal are touched again.
                     let event = {
                         let next = terminal.next(&agent);
                         tokio::pin!(next);
-                        tokio::time::timeout(sleep, &mut next).await.ok()
+                        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next)
+                            .await
+                            .ok()
                     };
                     match event {
                         Some(event) => {
@@ -2513,9 +2527,17 @@ async fn main() -> Result<()> {
                             break Vec::new();
                         }
                         None => {
-                            // The interval/deadline elapsed; the loop top
+                            // A deadline elapsed. If it was the Ctrl-C exit
+                            // window, clear the stale "(Ctrl-C again to exit)"
+                            // hint and disarm (a later press re-arms rather than
+                            // exits), mirroring the prompt loop below. Otherwise
+                            // it was the timer interval/deadline and the loop top
                             // re-evaluates due/draft and consumes the timer when
                             // delivery is allowed.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
                         }
                     }
                 }
