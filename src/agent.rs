@@ -758,6 +758,12 @@ pub struct Agent {
     /// a test (or a tool it registers) can advance time mid-turn.
     #[cfg(test)]
     timers_clock: Option<std::sync::Arc<std::sync::Mutex<DateTime<Local>>>>,
+    /// Test hook: forces the next timers/plan persist (`timers_changed` /
+    /// `record_plan`) to fail, so a test can exercise the apply-then-persist
+    /// rollback without a real I/O failure. Consumed (reset) on the first
+    /// failed persist.
+    #[cfg(test)]
+    fail_next_persist: bool,
     /// Whether the `timer_*` tools are offered. Off in ACP, which has no idle
     /// loop to fire them.
     timers_enabled: bool,
@@ -955,6 +961,8 @@ impl Agent {
             timers: Timers::default(),
             #[cfg(test)]
             timers_clock: None,
+            #[cfg(test)]
+            fail_next_persist: false,
             timers_enabled: true,
             pending_timer_steps: 0,
             auto_turn: false,
@@ -3056,6 +3064,10 @@ impl Agent {
     }
 
     fn record_plan(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced plan persist failure (test)"));
+        }
         if let Some(log) = &mut self.session {
             log.append(&Record::Plan { plan: self.plan.clone(), recorded_at: session::now() })?;
         }
@@ -3063,8 +3075,11 @@ impl Agent {
     }
 
     fn plan_changed(&mut self) -> Result<()> {
-        self.reminders.plan_changed();
+        // Persist first: a failed append must leave no observable side effect
+        // (reminder reset, UI event) so `run_plan_tool` can cleanly roll the
+        // live plan back.
         self.record_plan()?;
+        self.reminders.plan_changed();
         self.emit(AgentEvent::Plan { plan: &self.plan });
         self.refresh_stats();
         Ok(())
@@ -4863,9 +4878,25 @@ impl Agent {
     }
 
     fn run_plan_tool(&mut self, call: &ToolCall) -> Result<Value> {
-        let outcome = self.plan.apply(&call.name, &call.arguments)?;
-        if outcome.changed {
-            self.plan_changed()?;
+        // Same apply-then-persist atomicity as `run_timer_tool`: `apply`
+        // mutates the live plan in place, so snapshot first and roll back on an
+        // apply or persist failure rather than leaving the live plan changed
+        // while reporting an error (issue #150 review).
+        let snapshot = self.plan.clone();
+        let outcome = match self.plan.apply(&call.name, &call.arguments) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.plan = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.plan_changed()
+        {
+            self.plan = snapshot;
+            self.control.publish_plan(&self.plan);
+            self.refresh_stats();
+            return Err(err);
         }
         Ok(Value::String(outcome.text))
     }
@@ -4886,6 +4917,13 @@ impl Agent {
         self.timers_clock = now;
     }
 
+    /// Test hook: force the next timers/plan persist to fail, so a test can
+    /// drive the apply-then-persist rollback without a real I/O failure.
+    #[cfg(test)]
+    pub fn fail_next_persist(&mut self) {
+        self.fail_next_persist = true;
+    }
+
     /// The session's timers.
     pub fn timers(&self) -> &Timers {
         &self.timers
@@ -4904,15 +4942,37 @@ impl Agent {
                 call.name
             ));
         }
-        let outcome = self.timers.apply(&call.name, &call.arguments, self.timers_now())?;
-        if outcome.changed {
-            self.timers_changed()?;
+        // `apply` mutates the live timers in place, and persisting them
+        // afterwards can still fail. Snapshot first so an apply *or* persist
+        // failure rolls the live timers back to their prior state — otherwise a
+        // failed cancel/acknowledge would drop the timer in memory while
+        // returning an error, leaving the published/persisted timers stale and
+        // the live state silently diverged (issue #150 review).
+        let snapshot = self.timers.clone();
+        let outcome = match self.timers.apply(&call.name, &call.arguments, self.timers_now()) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.timers = snapshot;
+                return Err(err);
+            }
+        };
+        if outcome.changed
+            && let Err(err) = self.timers_changed()
+        {
+            self.timers = snapshot;
+            self.control.publish_timers(&self.timers);
+            self.refresh_stats();
+            return Err(err);
         }
         Ok(Value::String(outcome.text))
     }
 
     /// Persist and publish the timers after a change (like `plan_changed`).
     fn timers_changed(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_persist) {
+            return Err(anyhow::anyhow!("forced timers persist failure (test)"));
+        }
         if let Some(log) = &mut self.session {
             log.append(&Record::Timers { timers: self.timers.clone(), recorded_at: session::now() })?;
         }
@@ -10004,6 +10064,68 @@ mod tests {
         assert!(on.tool_definitions().iter().any(|d| d.name == "timer_set"));
         on.disable_timers();
         assert!(!on.tool_definitions().iter().any(|d| d.name.starts_with("timer_")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timer_tool_persistence_failure_rolls_the_live_timers_back() {
+        // A cancel/ack that fails to persist must not drop the timer in memory
+        // while reporting an error: live and persisted/published state would
+        // diverge. The tool must roll the live timers back (issue #150 review).
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        agent.new_session().unwrap();
+
+        let set = ToolCall {
+            id: "s1".into(),
+            name: "timer_set".into(),
+            arguments: json!({"after": "30m", "note": "check CI"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        agent.run_timer_tool(&set).unwrap();
+        assert_eq!(agent.timers().len(), 1);
+
+        // A cancel whose persist fails leaves the timer live (rolled back) and
+        // surfaces the error.
+        agent.fail_next_persist();
+        let cancel = ToolCall {
+            id: "c1".into(),
+            name: "timer_cancel".into(),
+            arguments: json!({"id": 1}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_timer_tool(&cancel).is_err());
+        assert_eq!(agent.timers().len(), 1, "a failed persist must not drop the live timer");
+
+        // With persistence working, the same cancel succeeds and clears it.
+        agent.run_timer_tool(&cancel).unwrap();
+        assert!(agent.timers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_tool_persistence_failure_rolls_the_live_plan_back() {
+        // Same apply-then-persist atomicity for the plan tool (sibling class).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _) = agent(Vec::new(), dir.path());
+        agent.new_session().unwrap();
+
+        agent.fail_next_persist();
+        let add = ToolCall {
+            id: "p1".into(),
+            name: "plan_add".into(),
+            arguments: json!({"items": ["write the fix"]}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert!(agent.run_plan_tool(&add).is_err());
+        assert!(agent.plan.is_empty(), "a failed persist must not leave the live plan changed");
+
+        // With persistence working, the add lands.
+        agent.run_plan_tool(&add).unwrap();
+        assert!(!agent.plan.is_empty());
     }
 
     fn report(id: &str, status: &str, summary: &str) -> ToolCall {
