@@ -1343,7 +1343,12 @@ impl Renderer {
 
     fn tool_result(&self, ok: bool, output: &str, verbose: bool) -> String {
         let width = self.width().saturating_sub(8 + strip_ansi(&stamp()).chars().count());
-        let lines: Vec<&str> = output.trim_end().lines().collect();
+        // Tool output is model-/tool-controlled (e.g. `timer_list` and
+        // `timer_cancel` echo back model-authored notes): strip control and
+        // escape bytes so a result preview can never drive the terminal (clear
+        // the screen, set the title/clipboard, …). Only the displayed preview is
+        // sanitized — the model-facing `output` is handed on untouched (#150).
+        let lines: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
         let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
         if lines.is_empty() {
             return format!("  {color}{mark} (no output){RESET}\n");
@@ -1360,7 +1365,7 @@ impl Renderer {
             return text;
         }
         let more = if lines.len() > 1 { format!(" (+{} lines)", lines.len() - 1) } else { String::new() };
-        format!("  {color}{mark} {}{more}{RESET}\n", fit(lines[0], width.saturating_sub(more.len())))
+        format!("  {color}{mark} {}{more}{RESET}\n", fit(&lines[0], width.saturating_sub(more.len())))
     }
 
     /// Accumulate streamed reasoning. Plain output shows only the one-line
@@ -1872,6 +1877,23 @@ pub(crate) mod tests {
         r.event(&AgentEvent::TextDelta { text: "hello" });
         assert!(r.answer_may_be_truncated(), "a suppressed non-empty delta must flag truncation");
         set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn plain_tool_result_strips_terminal_escapes() {
+        // A model/tool-controlled result (e.g. a `timer_list`/`timer_cancel`
+        // note) rendered through the plain `ToolResult` branch must not carry
+        // live escape/control bytes to the terminal, while keeping its text
+        // (#150). Verbose shows every line; the one-line form shows the first.
+        let _lock = verbosity_lock();
+        let r = Renderer::plain_for_test();
+        let hostile = "note \x1b]0;pwned\x07\nsecond \x1b[2J line";
+        for verbose in [true, false] {
+            let content = strip_ansi(&r.tool_result(true, hostile, verbose));
+            assert!(!content.contains('\x1b'), "ESC survived (verbose={verbose}): {content:?}");
+            assert!(!content.contains('\x07'), "BEL survived (verbose={verbose}): {content:?}");
+            assert!(content.contains("note"), "visible text dropped (verbose={verbose}): {content:?}");
+        }
     }
 
     #[test]

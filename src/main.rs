@@ -934,6 +934,17 @@ pub(crate) fn sanitize_terminal_line(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}').collect()
 }
 
+/// Whether a due idle timer may start its turn now, or must yield. The two idle
+/// paths (the preliminary `--wait-timers` wait and the prompt-read loop) both
+/// use this so the rule stays identical across them: a queued Ctrl-C always
+/// wins — the interrupt must route through the exit/double-press handler instead
+/// of starting a timer turn, which reads only new channel events and would run
+/// its tools despite the stop request — and a half-typed draft holds the timer
+/// back until the line is sent or cleared (issue #150).
+pub(crate) fn deliver_due_timer(due: bool, draft: bool, interrupt_queued: bool) -> bool {
+    due && !draft && !interrupt_queued
+}
+
 /// The current session as Herdr should resume it, if it is saved to disk
 /// (an unsaved session cannot be resumed).
 fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
@@ -2487,7 +2498,10 @@ async fn main() -> Result<()> {
                     // undelivered. Only consume once delivery is allowed.
                     let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
                     let draft = terminal.view.lock().unwrap().has_draft();
-                    if due_now && !draft {
+                    // No interrupt is queued here (it would have broken the wait
+                    // above), so pass `false`: this is the same delivery rule the
+                    // prompt loop below applies.
+                    if deliver_due_timer(due_now, draft, false) {
                         break agent.take_fired_timers()?;
                     }
                     // Nothing deliverable right now. Without `--wait-timers` a
@@ -2626,7 +2640,7 @@ async fn main() -> Result<()> {
                 // so it routes through the exit/double-press handler below
                 // rather than starting a turn (issue #150).
                 let interrupt_queued = terminal.queued.iter().any(|i| matches!(i, TermInput::Interrupt));
-                if timer_due && !draft && !interrupt_queued {
+                if deliver_due_timer(timer_due, draft, interrupt_queued) {
                     break Prompt::TimerDue;
                 }
                 // Piped stdin already closed during the timer wait and no timers
@@ -3018,6 +3032,21 @@ mod tests {
         assert_eq!(sanitize_terminal_line("first\nsecond"), "firstsecond");
         assert_eq!(sanitize_terminal_line("hi\x1b[2J\nthere"), "hi[2Jthere");
         assert_eq!(sanitize_terminal_line("plain — label"), "plain — label");
+    }
+
+    #[test]
+    fn deliver_due_timer_yields_to_interrupt_and_draft() {
+        // The core of the issue #150 guard, deterministically: a due timer may
+        // start its turn only when nothing else must win first. A queued Ctrl-C
+        // (the race the harness test can't reliably reproduce) and a half-typed
+        // draft each hold the timer back; with neither, a due timer fires.
+        assert!(deliver_due_timer(true, false, false), "due, no draft, no interrupt → fire");
+        assert!(!deliver_due_timer(true, false, true), "queued interrupt must beat a due timer");
+        assert!(!deliver_due_timer(true, true, false), "a draft holds the timer back");
+        assert!(!deliver_due_timer(true, true, true), "interrupt wins even with a draft");
+        // Not-yet-due timers never fire regardless of the other inputs.
+        assert!(!deliver_due_timer(false, false, false), "a not-due timer never fires");
+        assert!(!deliver_due_timer(false, false, true));
     }
 
     #[test]
