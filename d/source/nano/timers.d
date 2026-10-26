@@ -26,7 +26,9 @@ enum long minDelaySecs = 60;
 enum long maxDelaySecs = 24 * 3600;
 enum maxNoteChars = 1_000;
 
-immutable string[] toolNames = ["timer_set", "timer_list", "timer_cancel"];
+immutable string[] toolNames = ["timer_set", "timer_list", "timer_cancel", "timer_done"];
+/// Steps between reminders about a fired timer the agent hasn't marked done.
+enum pendingNudgeEvery = 5;
 
 bool isTimerTool(string name) { return toolNames.canFind(name); }
 
@@ -53,6 +55,9 @@ struct Outcome
 struct Timers
 {
     Timer[] items; /// active, in due order
+    /// Fired but not yet marked done with `timer_done`: the agent is reminded
+    /// until it does (or cancels them).
+    Timer[] pending;
     uint lastId;
 
     bool empty() const { return items.length == 0; }
@@ -69,6 +74,7 @@ struct Timers
         while (n < items.length && items[n].dueAt <= now) n++;
         auto due = items[0 .. n].dup;
         items = items[n .. $].dup;
+        pending ~= due;
         return due;
     }
 
@@ -79,6 +85,7 @@ struct Timers
             case "timer_set": return set(args, now);
             case "timer_list": return Outcome(list(now), false);
             case "timer_cancel": return cancel(args, now);
+            case "timer_done": return done(args);
             default: throw new TimerError("unknown timer tool " ~ tool);
         }
     }
@@ -110,13 +117,39 @@ struct Timers
             t.id, clock(due), describe(delay)), true);
     }
 
+    private static long idArg(JSONValue args, string tool)
+    {
+        if (args.type != JSONType.object || "id" !in args.objectNoRef) throw new TimerError(tool ~ " takes {id}");
+        auto v = args["id"];
+        try return v.type == JSONType.string ? v.str.strip.to!long : v.integer;
+        catch (Exception) throw new TimerError(tool ~ ": `id` must be a timer number");
+    }
+
+    /// Mark a fired timer handled, ending its reminders.
+    private Outcome done(JSONValue args)
+    {
+        auto id = idArg(args, "timer_done");
+        foreach (i, t; pending)
+            if (t.id == id)
+            {
+                pending = pending[0 .. i] ~ pending[i + 1 .. $];
+                return Outcome(format("Timer %s marked done.", id), true);
+            }
+        if (items.canFind!(t => t.id == id))
+            throw new TimerError(format("timer %s hasn't fired yet; to drop it, use timer_cancel", id));
+        throw new TimerError(format("no fired timer %s%s", id,
+            pending.length ? "; waiting to be done: " ~ pending.map!(t => t.id.to!string).join(", ") : ""));
+    }
+
     private Outcome cancel(JSONValue args, long now)
     {
-        if (args.type != JSONType.object || "id" !in args.objectNoRef) throw new TimerError("timer_cancel takes {id}");
-        auto v = args["id"];
-        long id;
-        try id = v.type == JSONType.string ? v.str.strip.to!long : v.integer;
-        catch (Exception) throw new TimerError("timer_cancel: `id` must be a timer number");
+        auto id = idArg(args, "timer_cancel");
+        foreach (i, t; pending)
+            if (t.id == id)
+            {
+                pending = pending[0 .. i] ~ pending[i + 1 .. $];
+                return Outcome(format("Cancelled timer %s (%s); it had already fired.", id, t.note.oneLine(60)), true);
+            }
         foreach (i, t; items)
             if (t.id == id)
             {
@@ -130,8 +163,10 @@ struct Timers
     /// The active timers, one per line.
     string list(long now) const
     {
-        if (!items.length) return "No timers set.";
+        if (!items.length && !pending.length) return "No timers set.";
         string s;
+        foreach (t; pending)
+            s ~= format("%s. fired at %s, not done yet: %s\n", t.id, clock(t.dueAt), t.note.oneLine(200));
         foreach (t; items)
             s ~= format("%s. %s (in %s): %s\n", t.id, clock(t.dueAt), describe(t.dueAt > now ? t.dueAt - now : 0),
                 t.note.oneLine(200));
@@ -140,11 +175,16 @@ struct Timers
 
     JSONValue toJSON() const
     {
-        JSONValue[] list;
-        foreach (t; items)
-            list ~= JSONValue(["id": JSONValue(t.id), "set_at": JSONValue(t.setAt), "due_at": JSONValue(t.dueAt),
-                "note": JSONValue(t.note)]);
-        return JSONValue(["last_id": JSONValue(lastId), "items": JSONValue(list)]);
+        static JSONValue[] list(const Timer[] ts)
+        {
+            JSONValue[] l;
+            foreach (t; ts)
+                l ~= JSONValue(["id": JSONValue(t.id), "set_at": JSONValue(t.setAt), "due_at": JSONValue(t.dueAt),
+                    "note": JSONValue(t.note)]);
+            return l;
+        }
+        return JSONValue(["last_id": JSONValue(lastId), "items": JSONValue(list(items)),
+            "pending": JSONValue(list(pending))]);
     }
 
     static Timers fromJSON(const JSONValue v)
@@ -152,13 +192,15 @@ struct Timers
         Timers r;
         if (v.type != JSONType.object) return r;
         if (auto l = "last_id" in v.objectNoRef) r.lastId = cast(uint) l.integer;
-        if (auto list = "items" in v.objectNoRef)
-            foreach (j; list.arrayNoRef)
-            {
-                auto t = Timer(cast(uint) j["id"].integer, j["set_at"].integer, j["due_at"].integer, j["note"].str);
-                if (t.id > r.lastId) r.lastId = t.id;
-                r.items ~= t;
-            }
+        foreach (key; ["items", "pending"])
+            if (auto list = key in v.objectNoRef)
+                foreach (j; list.arrayNoRef)
+                {
+                    auto t = Timer(cast(uint) j["id"].integer, j["set_at"].integer, j["due_at"].integer, j["note"].str);
+                    if (t.id > r.lastId) r.lastId = t.id;
+                    if (key == "items") r.items ~= t;
+                    else r.pending ~= t;
+                }
         r.items.sort!((a, b) => a.dueAt < b.dueAt);
         return r;
     }
@@ -175,7 +217,17 @@ string firedMessage(const Timer[] due, long now)
             late >= 120 ? format(" (overdue by %s: nano-coder wasn't running when it came due)", describe(late)) : "",
             t.note);
     }
-    return s ~ "Act on it now, as the note says.";
+    return s ~ "Act on it now, as the note says, then call timer_done with its id. Until you do, you'll be "
+        ~ "reminded every few steps.";
+}
+
+/// The reminder about fired timers not yet marked done.
+string pendingNudge(const Timer[] pending, long now)
+{
+    string s = "Fired timers you haven't marked done:\n";
+    foreach (t; pending)
+        s ~= format("- %s (fired %s ago): %s\n", t.id, describe(now > t.dueAt ? now - t.dueAt : 0), t.note.oneLine(300));
+    return s ~ "Handle them (now, or once the current step is finished) and call timer_done; timer_cancel drops one.";
 }
 
 /// A one-line notice for the user.
@@ -296,7 +348,9 @@ ToolDefinition[] definitions()
             ~ " timers at once. Don't use it to wait during a turn: run a command that waits instead.",
             parseJSON(`{"type":"object","properties":{"after":{"type":"string","description":"Delay, e.g. \"10m\", \"1h30m\""},"at":{"type":"string","description":"Local time \"14:30\" (the next one) or \"2026-10-25T14:30\""},"note":{"type":"string","description":"What to do when it fires"}},"required":["note"]}`)),
         ToolDefinition("timer_list", "List the active timers.", parseJSON(`{"type":"object","properties":{}}`)),
-        ToolDefinition("timer_cancel", "Cancel a timer by its id.",
+        ToolDefinition("timer_done", "Mark a fired timer as handled, which stops its reminders.",
+            parseJSON(`{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}`)),
+        ToolDefinition("timer_cancel", "Cancel a timer by its id (one not yet fired, or a fired one you won't handle).",
             parseJSON(`{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}`)),
     ];
 }
@@ -338,6 +392,13 @@ unittest
     assert(due.length == 2 && due[0].id == 2 && due[1].id == 1);
     assert(firedMessage(due, now + 1800).canFind("Timer 1, set at"));
     assert(firedMessage(due, now + 1800).canFind("overdue by 20m"));
+    // Fired timers wait for timer_done.
+    assert(t.pending.length == 2);
+    assert(t.list(now + 1800).canFind("not done yet"));
+    assert(collectExceptionMsg(t.apply("timer_done", parseJSON(`{"id": 4}`), now)).canFind("hasn't fired"));
+    assert(t.apply("timer_done", parseJSON(`{"id": 2}`), now).text == "Timer 2 marked done.");
+    assert(collectExceptionMsg(t.apply("timer_done", parseJSON(`{"id": 2}`), now)).canFind("no fired timer 2; waiting to be done: 1"));
+    assert(pendingNudge(t.pending, now + 1900).canFind("- 1 (fired 1m40s ago): check CI"));
     // Round trip; ids keep counting.
     auto back = Timers.fromJSON(parseJSON(t.toJSON.toString));
     assert(back == t);

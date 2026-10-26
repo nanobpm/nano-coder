@@ -39,7 +39,7 @@ string toolResultDisplay(string text, const(Attachment)[] attachments)
 import nano.config : ProviderConfig, ProviderKind;
 import std.typecons : Nullable;
 import nano.plan : Plan, PlanError, isPlanTool, planDefinitions = definitions;
-import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice;
+import nano.timers : Timers, TimerError, isTimerTool, timerDefinitions = definitions, firedMessage, firedNotice, pendingNudge, pendingNudgeEvery;
 import nano.permissions;
 import nano.session;
 import nano.control;
@@ -1255,15 +1255,26 @@ class Agent
         return firedMessage(due, t);
     }
 
-    /// Mid-turn: due timers join the conversation before the next model call.
+    /// Mid-turn: due timers join the conversation before the next model call,
+    /// and fired ones not yet marked done are restated every few steps.
     private void fireDueTimers(AgentEvents ev)
     {
-        if (!timerTools || !timers.anyDue(timerNow())) return;
-        string notice;
-        auto text = takeFiredTimers(notice);
-        push(Message.user(wrapReminder(text)));
-        ev.userMessage(notice);
+        if (!timerTools) return;
+        if (timers.anyDue(timerNow()))
+        {
+            string notice;
+            auto text = takeFiredTimers(notice);
+            push(Message.user(wrapReminder(text)));
+            ev.userMessage(notice);
+            stepsSinceTimerNote = 0;
+            return;
+        }
+        if (!timers.pending.length) { stepsSinceTimerNote = 0; return; }
+        if (++stepsSinceTimerNote < pendingNudgeEvery) return;
+        stepsSinceTimerNote = 0;
+        push(Message.user(wrapReminder(pendingNudge(timers.pending, timerNow()))));
     }
+    private size_t stepsSinceTimerNote;
 
     /// Replace the timers with ones restored from the session log.
     void setTimers(Timers t)
@@ -1992,7 +2003,21 @@ unittest
     assert(mock.toolsSeen[0].canFind("timer_set"));
     assert(mock.seen[1][$ - 1].content.canFind("Timer 1 set for"));
     assert(mock.seen[2].any!(m => m.content.canFind("Timer 1, set at") && m.content.canFind("check CI")));
-    assert(agent.timers.empty);
+    assert(agent.timers.empty && agent.timers.pending.length == 1);
+
+    // Not marked done: restated every few steps, until timer_done.
+    reg.register(ToolDefinition("noop", "", parseJSON(`{"type":"object"}`)), (JSONValue a) => "ok");
+    LLMResponse noop(int i) { return LLMResponse("", "", [ToolCall.fromRaw("n", "noop", format(`{"i": %s}`, i))]); }
+    mock.script = [noop(1), noop(2), noop(3), noop(4), noop(5),
+        LLMResponse("", "", [ToolCall.fromRaw("d", "timer_done", `{"id": 1}`)]), noop(6), noop(7), noop(8), noop(9),
+        noop(10), noop(11), LLMResponse("ok")];
+    auto before = mock.seen.length;
+    agent.run("keep working", new NullEvents);
+    size_t nudges;
+    foreach (req; mock.seen[before .. $])
+        if (req[$ - 1].content.canFind("haven't marked done")) nudges++;
+    assert(nudges == 1, nudges.to!string);
+    assert(agent.timers.pending.length == 0, agent.timers.toJSON.toString ~ mock.seen[$ - 1][$ - 1].content);
 
     // Idle: nothing due yet, then the fired message.
     mock.script = [LLMResponse("", "", [ToolCall.fromRaw("t", "timer_set", `{"after": "2m", "note": "look again"}`)]),

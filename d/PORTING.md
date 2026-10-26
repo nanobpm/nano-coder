@@ -110,7 +110,9 @@ directory works; it's kept separate by default so the port can't damage real ses
   With `-p` it fires only with `--wait-timers`, which sleeps until each timer is due and
   runs it; without the flag, timers left unfired are named in a note when the run ends.
   Limits: delays of 1 minute to 24 hours, and at most 10 timers at once. Timers don't
-  repeat. A timer only reminds the agent; anything it does next goes through the normal
+  repeat. A fired timer stays pending until the agent calls `timer_done` (or
+  `timer_cancel`): while it is pending, a reminder listing it is added every 5 steps of a
+  turn, so a timer that fires during focused work isn't lost. A timer only reminds the agent; anything it does next goes through the normal
   permission checks. Timers are a `timers` record in the session log, so `--resume` restores
   them, and one that came due while nano-coder was closed fires as overdue. `/timers` lists
   them and the status line shows `⏰ HH:MM`. Timers are off under `--acp`, which has no idle
