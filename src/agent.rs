@@ -753,6 +753,9 @@ pub struct Agent {
     /// Whether the `timer_*` tools are offered. Off in ACP, which has no idle
     /// loop to fire them.
     timers_enabled: bool,
+    /// Steps since the last timer fired or the pending set emptied, driving the
+    /// `PENDING_NUDGE_EVERY` reminder for fired timers not yet marked done.
+    pending_timer_steps: usize,
     reminders: Reminders,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
@@ -940,6 +943,7 @@ impl Agent {
             #[cfg(test)]
             timers_clock: None,
             timers_enabled: true,
+            pending_timer_steps: 0,
             reminders: Reminders::new(outcome_tool),
             tool_output_limit: output::DEFAULT_MAX_OUTPUT_LENGTH,
             questions: crate::question::QuestionBroker::new(),
@@ -2367,7 +2371,22 @@ impl Agent {
         // Timers fire at the start of a step, after the steers: their notes
         // land as a user message the next model call sees. A fired timer is
         // not a steer, so it does not reset the continuation accumulator.
-        self.fire_due_timers()?;
+        let fired = self.fire_due_timers()?;
+        // Fired timers stay `pending` until the agent calls `timer_done`.
+        // Nudge about them every few steps so a note ignored mid-work is not
+        // forgotten; the counter resets when a timer fires or nothing pends.
+        if fired {
+            self.pending_timer_steps = 0;
+        } else if self.timers.has_pending() {
+            self.pending_timer_steps += 1;
+            if self.pending_timer_steps.is_multiple_of(timers::PENDING_NUDGE_EVERY)
+                && let Some(note) = self.timers.pending_nudge(self.timers_now())
+            {
+                self.push(Message::user(&reminders::wrap(&note)))?;
+            }
+        } else {
+            self.pending_timer_steps = 0;
+        }
         Ok(absorbed)
     }
 
@@ -2599,6 +2618,7 @@ impl Agent {
         // A fresh session starts with no timers (`/restart` clears them).
         self.timers = Timers::default();
         self.control.publish_timers(&self.timers);
+        self.pending_timer_steps = 0;
         self.reminders = Reminders::new(self.config.outcome_tool);
         self.session = session;
         self.session_id = Some(id.clone());
@@ -2684,6 +2704,7 @@ impl Agent {
         // closed fires as overdue at the next step (or the idle prompt).
         self.timers = restored.timers.unwrap_or_default();
         self.control.publish_timers(&self.timers);
+        self.pending_timer_steps = 0;
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
         // `/thinking` is session-scoped, so the previous session's override
@@ -9698,7 +9719,7 @@ mod tests {
         assert!(
             fired.content.contains("Timer 1, set at 12:00, fired: check CI")
                 && fired.content.starts_with("<system-reminder>")
-                && fired.content.contains("Act on it now, as the note says."),
+                && fired.content.contains("call timer_done with its id"),
             "{}",
             fired.content
         );
@@ -9711,8 +9732,56 @@ mod tests {
             }),
             "{events:?}"
         );
-        // It fired once: the timers are empty now.
+        // It fired once: no active timers left, and it is now pending (waiting
+        // to be marked done).
         assert!(agent.timers().is_empty());
+        assert!(agent.timers().has_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_timer_nudges_every_few_steps_until_marked_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = timer_clock();
+        // timer_set, advance the clock so it fires at the next step, then run
+        // enough no-op steps to cross `PENDING_NUDGE_EVERY`, mark it done, and
+        // run more steps to confirm the nudges stop. Distinct `echo` arguments
+        // keep the repeat-loop detector from ending the turn.
+        let mut responses = vec![
+            call("t1", "timer_set", json!({"after": "30m", "note": "check CI"})),
+            call("adv", "advance_clock", json!({})),
+        ];
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("e{i}"), "echo", json!({"text": format!("step {i}")})));
+        }
+        responses.push(call("done", "timer_done", json!({"id": 1})));
+        for i in 0..crate::timers::PENDING_NUDGE_EVERY {
+            responses.push(call(&format!("f{i}"), "echo", json!({"text": format!("after {i}")})));
+        }
+        responses.push(text("ok"));
+
+        let (mut agent, seen) = agent(responses, dir.path());
+        agent.set_timers_now(Some(clock.clone()));
+        let clock2 = clock.clone();
+        agent.tools().register(
+            ToolDefinition::new("advance_clock", "advance the clock", json!({"type": "object"})),
+            Box::new(move |_| {
+                *clock2.lock().unwrap() += chrono::Duration::minutes(31);
+                Ok(json!("advanced"))
+            }),
+        );
+        agent.new_session().unwrap();
+        agent.run_turn(Some("msg-1"), "watch the build").await.unwrap();
+
+        // Exactly one nudge was pushed before `timer_done`, and none after.
+        let turns = seen.lock().unwrap();
+        let last = turns.last().unwrap();
+        let nudges = last
+            .iter()
+            .filter(|m| m.role == Role::User && m.content.contains("Fired timers you haven't marked done:"))
+            .count();
+        assert_eq!(nudges, 1, "one nudge total: {last:#?}");
+        // The timer was marked done, so nothing is pending anymore.
+        assert!(!agent.timers().has_pending());
     }
 
     #[tokio::test(flavor = "multi_thread")]

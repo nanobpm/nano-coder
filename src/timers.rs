@@ -23,8 +23,11 @@ pub const MAX_TIMERS: usize = 10;
 pub const OVERDUE_AFTER: Duration = Duration::minutes(2);
 /// A `note` is clipped to this many characters.
 const MAX_NOTE_CHARS: usize = 1_000;
+/// A fired timer that has not been marked done nudges the agent every this
+/// many steps.
+pub const PENDING_NUDGE_EVERY: usize = 5;
 
-pub const TOOL_NAMES: [&str; 3] = ["timer_set", "timer_list", "timer_cancel"];
+pub const TOOL_NAMES: [&str; 4] = ["timer_set", "timer_list", "timer_cancel", "timer_done"];
 
 /// One active timer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +47,11 @@ pub struct Timers {
     pub last_id: u32,
     #[serde(default)]
     pub items: Vec<Timer>,
+    /// Timers that have fired but the agent has not yet marked done; they keep
+    /// reminding so a note ignored mid-work is not lost. `due_at` is when the
+    /// timer fired.
+    #[serde(default)]
+    pub pending: Vec<Timer>,
 }
 
 /// What a timer tool call did.
@@ -73,6 +81,7 @@ impl Timers {
             "timer_set" => self.set(args, now),
             "timer_list" => Ok(Outcome { text: self.render(now), changed: false }),
             "timer_cancel" => self.cancel(args),
+            "timer_done" => self.done(args),
             other => bail!("unknown timer tool {other}"),
         }
     }
@@ -100,10 +109,7 @@ impl Timers {
             );
         }
         if delay > MAX_DELAY {
-            bail!(
-                "a timer can be at most 24 hours out; for something further ahead, hand the work to something \
-                 durable, such as a workflow engine or cron"
-            );
+            return Err(too_far_ahead());
         }
         if self.items.len() >= MAX_TIMERS {
             bail!("at most {MAX_TIMERS} timers can be active; cancel one with timer_cancel first");
@@ -130,54 +136,115 @@ impl Timers {
         let Some(id) = args.get("id").and_then(id_of) else {
             bail!("timer_cancel needs the timer `id`");
         };
-        let Some(index) = self.items.iter().position(|t| t.id == id) else {
-            let ids: Vec<String> = self.items.iter().map(|t| t.id.to_string()).collect();
-            if ids.is_empty() {
-                bail!("no timer {id}: no timers are set");
-            }
-            bail!("no timer {id}; active timers are {}", ids.join(", "));
-        };
-        let timer = self.items.remove(index);
-        Ok(Outcome { text: format!("Cancelled timer {} ({}).", timer.id, timer.note), changed: true })
+        if let Some(index) = self.items.iter().position(|t| t.id == id) {
+            let timer = self.items.remove(index);
+            return Ok(Outcome { text: format!("Cancelled timer {} ({}).", timer.id, timer.note), changed: true });
+        }
+        // A fired-but-pending timer can also be dropped (the agent won't handle it).
+        if let Some(index) = self.pending.iter().position(|t| t.id == id) {
+            let timer = self.pending.remove(index);
+            return Ok(Outcome {
+                text: format!("Cancelled timer {} ({}); it had already fired.", timer.id, timer.note),
+                changed: true,
+            });
+        }
+        let ids: Vec<String> = self
+            .items
+            .iter()
+            .chain(self.pending.iter())
+            .map(|t| t.id.to_string())
+            .collect();
+        if ids.is_empty() {
+            bail!("no timer {id}: no timers are set");
+        }
+        bail!("no timer {id}; active timers are {}", ids.join(", "));
     }
 
-    /// One line per timer, soonest first, or `No timers set.`.
+    /// Mark a fired (pending) timer as handled, stopping its reminders.
+    fn done(&mut self, args: &Value) -> Result<Outcome> {
+        let Some(id) = args.get("id").and_then(id_of) else {
+            bail!("timer_done needs the timer `id`");
+        };
+        if let Some(index) = self.pending.iter().position(|t| t.id == id) {
+            let timer = self.pending.remove(index);
+            return Ok(Outcome { text: format!("Timer {} marked done.", timer.id), changed: true });
+        }
+        // Not pending: it may still be ticking (not fired yet) or unknown.
+        if self.items.iter().any(|t| t.id == id) {
+            bail!("timer {id} hasn't fired yet; to drop it, use timer_cancel");
+        }
+        let ids: Vec<String> = self.pending.iter().map(|t| t.id.to_string()).collect();
+        if ids.is_empty() {
+            bail!("no fired timer {id}; none are waiting to be done");
+        }
+        bail!("no fired timer {id}; waiting to be done: {}", ids.join(", "));
+    }
+
+    /// Whether any fired timer is waiting to be marked done.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The mid-turn nudge listing fired timers not yet marked done, or `None`.
+    pub fn pending_nudge(&self, now: DateTime<Local>) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let mut pending: Vec<&Timer> = self.pending.iter().collect();
+        pending.sort_by_key(|t| t.due_at);
+        let mut text = String::from("Fired timers you haven't marked done:");
+        for t in pending {
+            text.push_str(&format!("\n- {} (fired {} ago): {}", t.id, format_delay(now - due_local(t)), t.note));
+        }
+        text.push_str(
+            "\nHandle them (now, or once the current step is finished) and call timer_done; timer_cancel drops one.",
+        );
+        Some(text)
+    }
+
+    /// One line per timer, pending (fired, not done) first then active, or
+    /// `No timers set.`.
     pub fn render(&self, now: DateTime<Local>) -> String {
-        if self.items.is_empty() {
+        if self.items.is_empty() && self.pending.is_empty() {
             return "No timers set.".to_string();
+        }
+        let mut lines = Vec::new();
+        let mut pending: Vec<&Timer> = self.pending.iter().collect();
+        pending.sort_by_key(|t| t.due_at);
+        for t in pending {
+            lines.push(format!("{}. fired at {}, not done yet: {}", t.id, due_local(t).format("%H:%M"), t.note));
         }
         let mut timers: Vec<&Timer> = self.items.iter().collect();
         timers.sort_by_key(|t| t.due_at);
-        timers
-            .iter()
-            .map(|t| {
-                format!(
-                    "{}. {} (in {}): {}",
-                    t.id,
-                    due_local(t).format("%H:%M"),
-                    format_delay(due_local(t) - now),
-                    t.note
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        for t in timers {
+            lines.push(format!(
+                "{}. {} (in {}): {}",
+                t.id,
+                due_local(t).format("%H:%M"),
+                format_delay(due_local(t) - now),
+                t.note
+            ));
+        }
+        lines.join("\n")
     }
 
     /// The `/timers` listing: the timers, or how they get set.
     pub fn render_command(&self, now: DateTime<Local>) -> String {
-        if self.items.is_empty() {
+        if self.items.is_empty() && self.pending.is_empty() {
             "No timers set. The agent sets one with the timer_set tool.".to_string()
         } else {
             self.render(now)
         }
     }
 
-    /// Take the timers due at `now` (they fire once), soonest first.
+    /// Take the timers due at `now` (they fire once), soonest first. Each fired
+    /// timer moves into `pending` so it keeps reminding until marked done.
     pub fn take_due(&mut self, now: DateTime<Local>) -> Vec<Timer> {
         let (due, keep): (Vec<Timer>, Vec<Timer>) = self.items.drain(..).partition(|t| t.due_at <= now.timestamp());
         self.items = keep;
         let mut due = due;
         due.sort_by_key(|t| t.due_at);
+        self.pending.extend(due.iter().cloned());
         due
     }
 
@@ -199,7 +266,10 @@ impl Timers {
     /// The user message carrying every timer that fired at one step.
     pub fn fired_batch_message(fired: &[Timer], now: DateTime<Local>) -> String {
         let mut text = fired.iter().map(|t| Self::fired_message(t, now)).collect::<Vec<_>>().join("\n");
-        text.push_str("\nAct on it now, as the note says.");
+        text.push_str(
+            "\nAct on it now, as the note says, then call timer_done with its id. Until you do, you'll be reminded \
+             every few steps.",
+        );
         text
     }
 
@@ -241,27 +311,37 @@ pub fn parse_delay(text: &str) -> Result<Duration> {
         return Err(bad_delay(&text));
     }
     // A bare number is minutes ("120").
-    if let Ok(minutes) = text.parse::<f64>() {
-        return delay_from(minutes, "m", &text);
-    }
-    let mut total = Duration::zero();
-    let mut rest = text.as_str();
-    let mut parts = 0;
-    while !rest.is_empty() {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-        if digits.is_empty() {
+    let total = if let Ok(minutes) = text.parse::<f64>() {
+        delay_from(minutes, "m", &text)?
+    } else {
+        let mut total = Duration::zero();
+        let mut rest = text.as_str();
+        let mut parts = 0;
+        while !rest.is_empty() {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            if digits.is_empty() {
+                return Err(bad_delay(&text));
+            }
+            let amount: f64 = digits.parse().map_err(|_| bad_delay(&text))?;
+            rest = &rest[digits.len()..];
+            let unit_len = rest.find(char::is_numeric).unwrap_or(rest.len());
+            let unit = rest[..unit_len].trim();
+            rest = &rest[unit_len..];
+            // Accumulate with a checked add so a compound delay far past
+            // chrono's range returns the too-far error instead of panicking.
+            total = total.checked_add(&delay_from(amount, unit, &text)?).ok_or_else(too_far_ahead)?;
+            parts += 1;
+        }
+        if parts == 0 {
             return Err(bad_delay(&text));
         }
-        let amount: f64 = digits.parse().map_err(|_| bad_delay(&text))?;
-        rest = &rest[digits.len()..];
-        let unit_len = rest.find(char::is_numeric).unwrap_or(rest.len());
-        let unit = rest[..unit_len].trim();
-        rest = &rest[unit_len..];
-        total += delay_from(amount, unit, &text)?;
-        parts += 1;
-    }
-    if parts == 0 {
-        return Err(bad_delay(&text));
+        total
+    };
+    // Bound the result to 24 hours here, before `now + delay` can overflow
+    // chrono's date range (a value like "1000000000000h" would otherwise
+    // panic rather than return a tool error).
+    if total > MAX_DELAY {
+        return Err(too_far_ahead());
     }
     Ok(total)
 }
@@ -285,6 +365,14 @@ fn bad_delay(text: &str) -> anyhow::Error {
     )
 }
 
+/// The "too far ahead" error, shared by delay parsing and the `set` bound.
+fn too_far_ahead() -> anyhow::Error {
+    anyhow::anyhow!(
+        "a timer can be at most 24 hours out; for something further ahead, hand the work to something \
+         durable, such as a workflow engine or cron"
+    )
+}
+
 /// A fire time: `HH:MM` (the next occurrence in local time — tomorrow when
 /// already past today) or an ISO date-time; one without an offset is local.
 pub fn parse_at(text: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
@@ -296,8 +384,14 @@ pub fn parse_at(text: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
         return local_naive(day, text);
     }
     // An ISO date-time without an offset is local time; one with an offset
-    // (or `Z`) is taken as given.
+    // (or `Z`) is taken as given. Accept both minute- and second-precision.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S") {
+        return local_naive(naive, text);
+    }
     if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M") {
+        return local_naive(naive, text);
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
         return local_naive(naive, text);
     }
     if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M") {
@@ -393,7 +487,18 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "timer_cancel",
-            "Cancel one of this session's timers by id.",
+            "Cancel a timer by its id (one not yet fired, or a fired one you won't handle).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "The timer id (a string like \"3\" works too)" }
+                },
+                "required": ["id"]
+            }),
+        ),
+        ToolDefinition::new(
+            "timer_done",
+            "Mark a fired timer as handled, which stops its reminders.",
             json!({
                 "type": "object",
                 "properties": {
@@ -451,6 +556,11 @@ mod tests {
         // An ISO date-time without an offset is local time.
         let due = parse_at("2026-10-25T14:30", at(12, 0)).unwrap();
         assert_eq!(due.format("%Y-%m-%dT%H:%M").to_string(), "2026-10-25T14:30");
+        // Seconds-bearing ISO values (with `T` or a space) are accepted too.
+        let due = parse_at("2026-10-25T14:30:45", at(12, 0)).unwrap();
+        assert_eq!(due.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-10-25T14:30:45");
+        let due = parse_at("2026-10-25 14:30:00", at(12, 0)).unwrap();
+        assert_eq!(due.format("%Y-%m-%dT%H:%M:%S").to_string(), "2026-10-25T14:30:00");
         assert!(parse_at("noon", at(12, 0)).is_err());
     }
 
@@ -542,7 +652,85 @@ mod tests {
             "{late}"
         );
         let batch = Timers::fired_batch_message(std::slice::from_ref(&timer), at(9, 46));
-        assert!(batch.ends_with("Act on it now, as the note says."), "{batch}");
+        assert!(batch.ends_with("Until you do, you'll be reminded every few steps."), "{batch}");
+        assert!(batch.contains("call timer_done with its id"), "{batch}");
+    }
+
+    #[test]
+    fn fired_timers_stay_pending_until_done() {
+        let mut timers = Timers::default();
+        set(&mut timers, json!({"after": "30m", "note": "check CI"})).unwrap();
+        set(&mut timers, json!({"after": "1h", "note": "deploy"})).unwrap();
+        // The first fires and becomes pending (not dropped).
+        let fired = timers.take_due(at(12, 31));
+        assert_eq!(fired.len(), 1);
+        assert!(timers.has_pending());
+        assert_eq!(timers.pending.len(), 1);
+        // It shows in listings, pending first.
+        let list = timers.render(at(12, 40));
+        assert!(list.starts_with("1. fired at 12:30, not done yet: check CI"), "{list}");
+        assert!(list.contains("2. 13:00 (in 20m): deploy"), "{list}");
+        // A nudge lists it.
+        let nudge = timers.pending_nudge(at(12, 40)).unwrap();
+        assert!(nudge.contains("Fired timers you haven't marked done:"), "{nudge}");
+        assert!(nudge.contains("- 1 (fired 10m ago): check CI"), "{nudge}");
+        assert!(nudge.contains("call timer_done"), "{nudge}");
+        // timer_done stops the reminders.
+        let out = timers.apply("timer_done", &json!({"id": 1}), at(12, 40)).unwrap();
+        assert!(out.changed);
+        assert_eq!(out.text, "Timer 1 marked done.");
+        assert!(!timers.has_pending());
+        assert!(timers.pending_nudge(at(12, 40)).is_none());
+    }
+
+    #[test]
+    fn timer_done_and_cancel_handle_pending_and_errors() {
+        let mut timers = Timers::default();
+        set(&mut timers, json!({"after": "30m", "note": "a"})).unwrap();
+        set(&mut timers, json!({"after": "45m", "note": "b"})).unwrap();
+        // timer_done on a not-yet-fired timer points to timer_cancel.
+        let err = timers.apply("timer_done", &json!({"id": 1}), at(12, 0)).unwrap_err().to_string();
+        assert!(err.contains("hasn't fired yet") && err.contains("timer_cancel"), "{err}");
+        // Nothing pending yet.
+        let err = timers.apply("timer_done", &json!({"id": 9}), at(12, 0)).unwrap_err().to_string();
+        assert!(err.contains("none are waiting to be done"), "{err}");
+        // Fire both; now they are pending.
+        timers.take_due(at(13, 0));
+        assert_eq!(timers.pending.len(), 2);
+        let err = timers.apply("timer_done", &json!({"id": 7}), at(13, 0)).unwrap_err().to_string();
+        assert!(err.contains("waiting to be done: 1, 2"), "{err}");
+        // timer_cancel drops a pending timer with the fired wording.
+        let out = timers.apply("timer_cancel", &json!({"id": 1}), at(13, 0)).unwrap();
+        assert_eq!(out.text, "Cancelled timer 1 (a); it had already fired.");
+        assert_eq!(timers.pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_survives_a_json_round_trip() {
+        let mut timers = Timers::default();
+        set(&mut timers, json!({"after": "30m", "note": "one"})).unwrap();
+        timers.take_due(at(12, 31));
+        assert!(timers.has_pending());
+        let json = serde_json::to_value(&timers).unwrap();
+        let restored: Timers = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, timers);
+        assert!(restored.has_pending());
+    }
+
+    #[test]
+    fn rejects_oversized_delays_without_overflowing() {
+        // A delay far past chrono's date range is a tool error, not a panic.
+        assert!(parse_delay("1000000000000h").unwrap_err().to_string().contains("24 hours"));
+        assert!(parse_delay("25h").unwrap_err().to_string().contains("24 hours"));
+        // Compound accumulation is bounded too.
+        assert!(parse_delay("13h13h").unwrap_err().to_string().contains("24 hours"));
+        // The 24-hour boundary itself is still accepted.
+        assert!(parse_delay("24h").is_ok());
+        assert!(parse_delay("23h59m59s").is_ok());
+        // Setting such a timer returns the tool error instead of panicking.
+        let mut timers = Timers::default();
+        let err = set(&mut timers, json!({"after": "1000000000000h", "note": "x"})).unwrap_err().to_string();
+        assert!(err.contains("24 hours"), "{err}");
     }
 
     #[test]

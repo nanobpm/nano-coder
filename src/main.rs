@@ -2449,23 +2449,37 @@ async fn main() -> Result<()> {
                 Vec::new()
             } else {
                 loop {
-                    let fired = agent.take_fired_timers()?;
+                    let now = Local::now();
+                    // Peek whether a timer is due *before* consuming it: a
+                    // half-typed draft holds delivery back, and taking the
+                    // timer here would persist its removal and drop the note
+                    // undelivered. Only consume once delivery is allowed.
+                    let due_now = agent.timers().next_due().is_some_and(|d| d <= now);
                     let draft = terminal.view.lock().unwrap().has_draft();
-                    if !fired.is_empty() && !draft {
-                        break fired;
+                    if due_now && !draft {
+                        break agent.take_fired_timers()?;
                     }
-                    // Nothing fireable right now. Without `--wait-timers` a
+                    // Nothing deliverable right now. Without `--wait-timers` a
                     // headless run is done once its input is; an interactive one
                     // waits on the terminal instead.
                     let steerable = terminal.steerable;
                     if !steerable && !wait_timers {
                         break Vec::new();
                     }
-                    let Some(due) = agent.timers().next_due() else {
+                    let Some(next_due) = agent.timers().next_due() else {
                         // No timers left: a `--wait-timers` run ends here.
                         break Vec::new();
                     };
-                    let sleep = (due - Local::now()).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // A timer already due but held back by a draft must not
+                    // busy-spin on its elapsed deadline: recheck on a short
+                    // bounded interval so clearing the draft still delivers
+                    // promptly, while a not-yet-due timer waits exactly until it
+                    // comes due.
+                    let sleep = if due_now {
+                        std::time::Duration::from_millis(200)
+                    } else {
+                        (next_due - now).to_std().unwrap_or(std::time::Duration::ZERO)
+                    };
                     // Wait for terminal input or the timer's due time, whichever
                     // comes first. The wait is scoped so the future's borrows end
                     // before the agent/terminal are touched again.
@@ -2487,15 +2501,9 @@ async fn main() -> Result<()> {
                             break Vec::new();
                         }
                         None => {
-                            // The timer came due. A headless run fires it
-                            // unconditionally (no editor to hold a draft); an
-                            // interactive run re-checks the draft above.
-                            if !steerable {
-                                let fired = agent.take_fired_timers()?;
-                                if !fired.is_empty() {
-                                    break fired;
-                                }
-                            }
+                            // The interval/deadline elapsed; the loop top
+                            // re-evaluates due/draft and consumes the timer when
+                            // delivery is allowed.
                         }
                     }
                 }
@@ -2510,15 +2518,6 @@ async fn main() -> Result<()> {
                 print_turn_outcome(&outcome, &terminal.renderer);
                 separate = true;
                 continue;
-            }
-            if !terminal.steerable && terminal.queued.is_empty() && terminal.messages.is_empty() {
-                // Headless: the input is exhausted. Report timers that never
-                // fired, then exit.
-                let left = agent.timers().len();
-                if left > 0 && !wait_timers {
-                    eprintln!("[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]");
-                }
-                break;
             }
 
             // What ended the prompt read: terminal input, or a due timer.
@@ -2538,17 +2537,35 @@ async fn main() -> Result<()> {
                     break Prompt::TimerDue;
                 }
                 let next = terminal.next(&agent);
-                // While the Ctrl-C exit hint is armed, bound the wait on the
-                // exit window: if the second press never comes, clear the stale
-                // "(Ctrl-C again to exit)" hint and disarm the detector so the
-                // visible instruction stays in sync with the armed state (a
-                // press after the window re-arms rather than exits).
-                let event = if let Some(deadline) = exit_press.deadline() {
+                // Bound this wait on the soonest of two deadlines, recomputed
+                // each wakeup, so an event that doesn't break the loop (a
+                // consumed Esc/CycleMode/Rejected) can't strand us waiting
+                // without a deadline:
+                //   * the next timer's due time, so a timer coming due while we
+                //     idle still ends the read and fires (the idle reminder);
+                //   * the Ctrl-C exit window, so a second press that never comes
+                //     clears the stale "(Ctrl-C again to exit)" hint and disarms
+                //     the detector (a later press re-arms rather than exits).
+                let timer_deadline = agent.timers().next_due().map(|due| {
+                    let wait = (due - Local::now()).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // Floor the recheck: a timer that is already due but held
+                    // back by a draft (the loop top only breaks when there is
+                    // no draft) would otherwise elapse instantly and busy-spin,
+                    // so recheck on a short interval instead.
+                    std::time::Instant::now() + wait.max(std::time::Duration::from_millis(200))
+                });
+                let deadline = [exit_press.deadline(), timer_deadline].into_iter().flatten().min();
+                let event = if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
                         Ok(event) => event,
                         Err(_) => {
-                            exit_press.disarm();
-                            terminal.renderer.clear_transient();
+                            // A deadline elapsed. If it was the Ctrl-C window,
+                            // clear the hint and disarm; otherwise it was the
+                            // timer deadline and the loop top fires it.
+                            if exit_press.deadline().is_some_and(|d| d <= std::time::Instant::now()) {
+                                exit_press.disarm();
+                                terminal.renderer.clear_transient();
+                            }
                             continue;
                         }
                     }
@@ -2596,7 +2613,19 @@ async fn main() -> Result<()> {
             }
             let Prompt::Input(input) = input else { unreachable!("a timer due breaks TimerDue") };
             let input = match input {
-                TermInput::Eof => break,
+                TermInput::Eof => {
+                    // Confirmed end of input. A headless run that still has
+                    // timers set reports the ones that never fired (empty input
+                    // queues alone are not EOF, so this is the only place it is
+                    // safe to say so).
+                    let left = agent.timers().len();
+                    if left > 0 && !args.wait_timers {
+                        eprintln!(
+                            "[{left} timer(s) didn't fire: the run ended first (--wait-timers waits for them)]"
+                        );
+                    }
+                    break;
+                }
                 TermInput::Interrupt => {
                     if exit_press.press(std::time::Instant::now()) {
                         break;
