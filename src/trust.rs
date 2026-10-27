@@ -38,7 +38,7 @@
 //! sharing a lossy key with a different directory.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -413,7 +413,15 @@ fn remember(root: &Path, trust_file: Option<&Path>) {
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) else { return };
+    // Open for both read and append. `File::lock` on Windows (`LockFileEx`)
+    // needs the handle to carry read or write *data* access; an append-only
+    // handle lacks it, so an append-only open would make every accepted trust
+    // decision fail to lock here and never persist — re-asking the user on
+    // every launch and leaving non-interactive launches gated. Requesting read
+    // access makes the lock portable, and it lets the existing contents be read
+    // back through this same locked handle (below) instead of reopening the
+    // path, keeping read → dedupe → append one critical section.
+    let Ok(mut f) = std::fs::OpenOptions::new().read(true).append(true).create(true).open(file) else { return };
     // Held until `f` is dropped at the end of the function, so the read, the
     // checks, and the append are one critical section across processes.
     if f.lock().is_err() {
@@ -423,7 +431,12 @@ fn remember(root: &Path, trust_file: Option<&Path>) {
     // that is writable but unreadable (and may lack a trailing newline) would
     // otherwise bypass the terminator guard below and concatenate the new key
     // onto the previous entry. Leave it untouched and trust only this process.
-    let Ok(existing) = std::fs::read_to_string(file) else { return };
+    // Reading through the locked handle (append mode leaves the read cursor at
+    // the start; writes still go to the end) keeps the whole sequence atomic.
+    let mut existing = String::new();
+    if f.read_to_string(&mut existing).is_err() {
+        return;
+    }
     // Exact, untrimmed line comparison (see `is_remembered`).
     if existing.lines().any(|line| line == key) {
         return;
@@ -690,7 +703,9 @@ mod tests {
         let existing = dir.path().join("existing");
         let fresh = dir.path().join("fresh");
         std::fs::write(&trust, format!("{}\n", existing.display())).unwrap();
-        // Write-only: open-for-append still succeeds, but the read fails.
+        // Read-less open: requesting read access (needed for a portable lock)
+        // makes the open itself fail on a write-only file, so `remember` returns
+        // before touching it. Either way the file must be left untouched.
         std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o200)).unwrap();
         remember(&fresh, Some(&trust));
         // Restore read access to inspect the result.
