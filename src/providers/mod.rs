@@ -990,7 +990,7 @@ impl<'a> OutageReporter<'a> {
                 reason,
                 human_secs(delay),
             );
-            let width = crate::status::stderr_terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20);
+            let width = live_notice_width();
             let mut err = std::io::stderr();
             let _ = write!(err, "\r{}\x1b[K", crate::frame::fit_line(&notice, width));
             let _ = err.flush();
@@ -1042,6 +1042,24 @@ impl Drop for OutageReporter<'_> {
         // so this only fires on the cancellation path.
         self.give_up();
     }
+}
+
+/// Width for the live outage notice. Preserve the measured stderr width and
+/// clamp only to one column — never up to a floor: forcing a minimum width
+/// (e.g. 20) on a terminal narrower than that makes the fitted notice wider
+/// than the physical row, so it wraps and `\r` + clear-to-end-of-line rewrite
+/// only the last row, leaving stale rows and growing scrollback on every retry.
+/// Clamping to one column keeps the single-line reporter bounded in narrow
+/// terminal panes.
+fn live_notice_width() -> usize {
+    clamp_notice_width(crate::status::stderr_terminal_size().map(|(_, cols)| cols as usize))
+}
+
+/// The pure clamp behind [`live_notice_width`]: fall back to 80 when the size
+/// is unreadable, otherwise keep the measured width, bounded below by one
+/// column so `fit_line` always has room for its truncation ellipsis.
+fn clamp_notice_width(cols: Option<usize>) -> usize {
+    cols.unwrap_or(80).max(1)
 }
 
 /// Send a request, waiting out *transport* failures that produced no HTTP
@@ -2435,5 +2453,32 @@ mod tests {
         assert!(elapsed < Duration::from_secs(5), "redirect loop was wrongly treated as an outage: {elapsed:?}");
         let err = format!("{:#}", result.unwrap_err());
         assert!(!err.contains("network unavailable"), "a redirect loop must not be reported as an outage: {err}");
+    }
+
+    #[test]
+    fn live_notice_width_preserves_narrow_terminals() {
+        // Regression: the width floor must be one column, not 20. On a terminal
+        // narrower than 20 columns a `.max(20)` floor makes the fitted notice
+        // wider than the physical row, so it wraps and `\r` + clear-to-end-of-line
+        // rewrite only the last row — leaving stale rows and growing scrollback
+        // on every retry. Preserve the measured width, clamped only to ≥ 1.
+        assert_eq!(clamp_notice_width(Some(10)), 10, "narrow measured width must be preserved");
+        assert_eq!(clamp_notice_width(Some(19)), 19);
+        assert_eq!(clamp_notice_width(Some(1)), 1);
+        assert_eq!(clamp_notice_width(Some(0)), 1, "zero columns clamp up to one");
+        assert_eq!(clamp_notice_width(Some(80)), 80);
+        assert_eq!(clamp_notice_width(Some(200)), 200, "wide terminals are untouched");
+        assert_eq!(clamp_notice_width(None), 80, "unreadable size falls back to 80");
+
+        // The fitted notice must never exceed the measured width on a narrow
+        // terminal, so the single-line reporter stays on one physical row.
+        let notice = "[agent] network unavailable (connection refused); retrying in 3s (Ctrl-C to stop)";
+        for cols in [1usize, 5, 10, 19, 20, 80] {
+            let fitted = crate::frame::fit_line(notice, clamp_notice_width(Some(cols)));
+            assert!(
+                crate::ui::visible_width(&fitted) <= cols.max(1),
+                "fitted notice wraps on a {cols}-column terminal: {fitted:?}"
+            );
+        }
     }
 }
