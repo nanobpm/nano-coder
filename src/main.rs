@@ -54,6 +54,7 @@ mod thinking;
 mod timers;
 mod tools;
 mod trajectory;
+mod trust;
 mod turn_commands;
 mod ui;
 mod vision;
@@ -2019,6 +2020,7 @@ struct Args {
     allow: Vec<String>,
     deny: Vec<String>,
     no_hooks: bool,
+    yolo: bool,
     trajectory: Option<String>,
     json: bool,
     markdown: bool,
@@ -2034,11 +2036,15 @@ fn print_help() {
     );
     println!("                  [--verbosity quiet|normal|verbose|debug] [--wait-timers]");
     println!("                  [--sandbox off|workspace|read-only] [--allow RULE]... [--deny RULE]... [--no-hooks]");
+    println!("                  [--yolo]");
     println!("       nano-coder --list-sessions [--all] [--json]");
     println!("       nano-coder --trajectory SESSION_ID [--json|--markdown]");
     println!("       nano-coder --login github-copilot|muse");
     println!("       nano-coder --list-models PROVIDER[/model]");
     println!("       nano-coder --version");
+    println!();
+    println!("On an interactive start in a repository that ships skills or `.claude` hooks, nano-coder asks");
+    println!("\"Trust this repo?\" before loading them (default no). --yolo trusts without asking.");
 }
 
 fn parse_args() -> Result<Args> {
@@ -2078,6 +2084,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
         allow: Vec::new(),
         deny: Vec::new(),
         no_hooks: false,
+        yolo: false,
         trajectory: None,
         json: false,
         markdown: false,
@@ -2111,6 +2118,7 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
             "--allow" => args.allow.push(value("--allow")?),
             "--deny" => args.deny.push(value("--deny")?),
             "--no-hooks" => args.no_hooks = true,
+            "--yolo" => args.yolo = true,
             "-V" | "--version" => {
                 print_version();
                 std::process::exit(0);
@@ -2231,6 +2239,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let cwd = env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    // The working directory as a real path: the trust decision and project-hook
+    // loading must resolve the actual directory, not a display-string
+    // round-trip that rewrites non-UTF-8 bytes to replacement characters and so
+    // points resource detection at a different (empty) path.
+    let cwd_path = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(&cwd));
     if args.list_sessions {
         resume::print_list(&config.session_dir(), &cwd, args.all, args.json)?;
         return Ok(());
@@ -2283,6 +2296,34 @@ async fn main() -> Result<()> {
     if args.no_hooks {
         config.disable_hooks = true;
     }
+
+    // Trust gate: before building the agent (which loads skills and project
+    // hooks), decide whether this repository's gated resources may run. An
+    // untrusted repo keeps its workspace skills and `.claude` project hooks out
+    // of the agent; user-level skills/hooks and nano's own `[hooks]` are
+    // unaffected. `--acp` defers to the client; `--yolo` trusts without asking.
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    // Project hooks are gated only when they could actually load: `--no-hooks`
+    // (`disable_hooks`) and a configured `disable_project_hooks` both mean a
+    // repo's `.claude` hooks are inert, so they must not drive the trust prompt
+    // or the non-interactive warning.
+    let hooks_enabled = !config.disable_hooks && !config.disable_project_hooks;
+    // Workspace skills are gated only when they could actually load: the
+    // `NANO_CODER_NO_SKILLS` override (honoured by skill discovery) and a
+    // disabled skills config both mean a repo's skill dirs and `ai.lock` are
+    // inert, so they must not drive the trust prompt or the warning.
+    let skills_enabled = config.skills.enabled && std::env::var_os("NANO_CODER_NO_SKILLS").is_none();
+    let trusted = trust::decide(
+        &cwd_path,
+        &config.skills,
+        &trust::Options { yolo: args.yolo, acp: args.acp, interactive, hooks_enabled, skills_enabled },
+    );
+    if !trusted {
+        config.skills.dirs.clear();
+        config.skills.ai_lock = false;
+        config.disable_project_hooks = true;
+    }
+
     ui::set_verbosity(config.verbosity);
     ui::set_timestamps(config.timestamps);
 
@@ -2294,7 +2335,7 @@ async fn main() -> Result<()> {
     // Register tools and hooks
     register_builtin_tools(&mut agent);
     register_hooks(&mut agent);
-    agent.load_claude_hooks(std::path::Path::new(&cwd));
+    agent.load_claude_hooks(&cwd_path);
 
     if args.acp {
         // ACP headless mode; sessions start with session/new or session/load.
