@@ -911,14 +911,20 @@ fn human_secs(d: Duration) -> String {
 }
 
 /// Reports a network outage during [`send_online`] without growing logs
-/// without bound. On a terminal it keeps **one** live line, redrawn in place as
-/// the backoff changes; on a pipe/file it announces the outage **once** and then
-/// stays silent until it resolves. On recovery (a response arrives after an
-/// outage) it reports reconnection exactly once. On cancellation or budget
-/// exhaustion the live line is closed via `Drop`/`give_up` **without** claiming
-/// recovery.
+/// without bound. In frame mode the app renderer owns the screen, so the
+/// notice is routed through it **once** (direct stderr writes would fight the
+/// frame's status row and spinner). On a plain terminal it keeps **one** live
+/// line, redrawn in place as the backoff changes and fitted to the terminal
+/// width so it never wraps onto stale extra rows; on a pipe/file it announces
+/// the outage **once** and then stays silent until it resolves. On recovery (a
+/// response arrives after an outage) it reports reconnection exactly once. On
+/// cancellation or budget exhaustion the live line is closed via
+/// `Drop`/`give_up` **without** claiming recovery.
 struct OutageReporter<'a> {
     what: &'a str,
+    /// The app-owned frame renderer owns the screen: route notices through it
+    /// rather than writing to stderr directly.
+    frame: bool,
     tty: bool,
     /// Non-terminal: whether the one-time outage notice has been printed.
     announced: bool,
@@ -928,22 +934,47 @@ struct OutageReporter<'a> {
 
 impl<'a> OutageReporter<'a> {
     fn new(what: &'a str) -> Self {
-        Self { what, tty: std::io::stderr().is_terminal(), announced: false, live: false }
+        Self {
+            what,
+            frame: crate::ui::frame_active(),
+            tty: std::io::stderr().is_terminal(),
+            announced: false,
+            live: false,
+        }
     }
 
     /// Still offline; will retry after `delay`.
     fn waiting(&mut self, reason: &str, delay: Duration) {
-        if self.tty {
+        if self.frame {
+            // The frame renderer owns the whole screen (including the bottom
+            // status row and a 100 ms spinner redraw); a direct `\r` stderr
+            // write would be overwritten by the spinner and could scroll the
+            // screen without updating the renderer's cached layout. Route a
+            // single bounded notice through the renderer instead — repeating it
+            // per retry would grow the transcript, so announce only once.
+            if !self.announced {
+                crate::ui::log(&format!(
+                    "[{}] network unavailable ({reason}); waiting for reconnection (Ctrl-C to stop)",
+                    self.what
+                ));
+                self.announced = true;
+            }
+        } else if self.tty {
             // One live line, redrawn in place (`\r` + clear-to-end-of-line) so
-            // repeated backoffs never scroll the terminal.
-            let mut err = std::io::stderr();
-            let _ = write!(
-                err,
-                "\r[{}] network unavailable ({}); retrying in {}s (Ctrl-C to stop)\x1b[K",
+            // repeated backoffs never scroll the terminal. Fit the notice to
+            // the stderr terminal width first: an over-long line wraps onto
+            // multiple physical rows, but `\r` and clear-to-end-of-line only
+            // rewrite the last one, leaving stale rows behind and growing
+            // scrollback on every retry during a long outage.
+            let notice = format!(
+                "[{}] network unavailable ({}); retrying in {}s (Ctrl-C to stop)",
                 self.what,
                 reason,
                 human_secs(delay),
             );
+            let width = crate::status::stderr_terminal_size().map(|(_, cols)| cols as usize).unwrap_or(80).max(20);
+            let mut err = std::io::stderr();
+            let _ = write!(err, "\r{}\x1b[K", crate::frame::fit_line(&notice, width));
             let _ = err.flush();
             self.live = true;
         } else if !self.announced {
@@ -956,7 +987,11 @@ impl<'a> OutageReporter<'a> {
 
     /// A response arrived after an outage: report reconnection once.
     fn recovered(&mut self) {
-        if self.tty {
+        if self.frame {
+            if self.announced {
+                crate::ui::log(&format!("[{}] network recovered; continuing", self.what));
+            }
+        } else if self.tty {
             if self.live {
                 // Close the live line, then confirm on its own line.
                 let mut err = std::io::stderr();

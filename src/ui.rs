@@ -164,6 +164,14 @@ pub fn log(text: &str) {
     }
 }
 
+/// Whether the app-owned frame renderer currently owns the screen. Lets
+/// lower layers (e.g. the provider outage reporter) route their notices
+/// through [`log`] in frame mode instead of fighting the frame for the
+/// terminal with direct `\r` stderr writes.
+pub fn frame_active() -> bool {
+    RENDERER.get().is_some_and(|renderer| renderer.is_frame())
+}
+
 static LEVEL: AtomicU8 = AtomicU8::new(Verbosity::Normal as u8);
 
 pub fn verbosity() -> Verbosity {
@@ -1133,6 +1141,7 @@ impl Renderer {
                         // A timer firing is a harness notification, not model
                         // chatter: show it even in quiet mode.
                         | AgentEvent::TimerFired { .. }
+                        | AgentEvent::ResponseRestarted
                 )
                 && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
@@ -2143,6 +2152,39 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(texts, ["the full answer"], "only the re-sent full answer remains, not the concatenation");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn response_restart_resets_frame_stream_even_when_quiet() {
+        // The frame-mode quiet filter in `event` must whitelist
+        // `ResponseRestarted`: if an answer starts at normal verbosity and the
+        // user switches to quiet before the disconnect, the restart must still
+        // reach the handler and reset stream state — otherwise the abandoned
+        // partial survives and the re-sent reply concatenates onto it once
+        // verbosity returns to normal.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::TextDelta { text: "partial reply " });
+        assert_eq!(r.frame_items().len(), 1, "the streamed partial created one item");
+
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::ResponseRestarted);
+        assert!(r.frame_items().is_empty(), "the restart resets stream state even while quiet");
+
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "the full answer" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "the full answer" });
+        let texts: Vec<String> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["the full answer"], "no concatenation onto the stale quiet-era partial");
         set_verbosity(Verbosity::Normal);
     }
 
