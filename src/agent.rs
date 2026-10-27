@@ -3200,7 +3200,7 @@ impl Agent {
         if let Some(id) = input_id
             && let Some(response) = self.completed_inputs.get(id)
         {
-            eprintln!("[agent] input {id:?} already processed; returning recorded response");
+            crate::ui::log(&format!("[agent] input {id:?} already processed; returning recorded response"));
             let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
             return Ok(TurnOutcome {
                 response: response.clone(),
@@ -3795,9 +3795,16 @@ impl Agent {
                             if stream_restarts < MAX_STREAM_RESTARTS {
                                 stream_restarts += 1;
                                 let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
-                                eprintln!(
+                                // Route through `ui::log` (not a raw stderr
+                                // write): in frame mode the renderer owns the
+                                // screen, and the `ResponseRestarted` redraw
+                                // below would erase a stderr line that was never
+                                // added to the transcript. `ui::log` adds it to
+                                // the frame so the notice survives; off-frame it
+                                // falls back to stderr unchanged.
+                                crate::ui::log(&format!(
                                     "[agent] {what}: {interrupted}; asking again ({stream_restarts}/{MAX_STREAM_RESTARTS})"
-                                );
+                                ));
                                 // Tell the renderers to discard the abandoned
                                 // partial reply (and reset pending thinking)
                                 // before the re-sent stream's deltas arrive, so
@@ -3850,9 +3857,9 @@ impl Agent {
                             if learned < request_max_tokens {
                                 self.learned_max_output = Some(learned as usize);
                                 self.refresh_stats();
-                                eprintln!(
+                                crate::ui::log(&format!(
                                     "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
-                                );
+                                ));
                                 continue;
                             }
                         }
@@ -3872,7 +3879,7 @@ impl Agent {
                         // without this refresh it keeps showing the old window
                         // and source for the whole client build and compaction.
                         self.refresh_stats();
-                        eprintln!("[agent] context overflow ({message}); compacting and retrying");
+                        crate::ui::log(&format!("[agent] context overflow ({message}); compacting and retrying"));
                         // The overflow compaction is a model call too;
                         // `compact_logged` applies a `/model` queued while the
                         // overflowing request was in flight before the summary
@@ -4581,7 +4588,7 @@ impl Agent {
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
             if trigger != CompactTrigger::Manual {
-                eprintln!("[agent] auto-{report}");
+                crate::ui::log(&format!("[agent] auto-{report}"));
             }
             self.stats.lock().unwrap().compactions += 1;
             self.emit(AgentEvent::Compacted);
@@ -4812,9 +4819,9 @@ impl Agent {
                         if learned < budget {
                             self.learned_max_output = Some(learned as usize);
                             self.refresh_stats();
-                            eprintln!(
+                            crate::ui::log(&format!(
                                 "[agent] summary output-limit rejection ({message}); retrying with max_tokens={learned}"
-                            );
+                            ));
                             continue;
                         }
                     }

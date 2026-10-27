@@ -903,6 +903,24 @@ pub(crate) fn clean_reason(reason: &str) -> String {
     HANDLE.replace_all(reason.trim(), "").trim().to_string()
 }
 
+/// Format an error with its **full source chain** (`top: cause: root`), the way
+/// anyhow's alternate (`{:#}`) formatting does. `reqwest::Error::to_string()`
+/// renders only the outermost layer — e.g. the generic
+/// `error sending request for url (…)` — dropping the transport reason (a DNS
+/// failure, a refused connection) that lives in its source. Walking the chain
+/// surfaces that reason so the outage notice (and, with an indefinite wait, the
+/// only signal the user ever sees) names the real cause.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Human backoff duration: whole seconds when it is (near-)integral, else one
 /// decimal place. Used for the "retrying in Ns" notices.
 fn human_secs(d: Duration) -> String {
@@ -1038,10 +1056,12 @@ impl Drop for OutageReporter<'_> {
 /// response — whatever its status — returns immediately for the caller to
 /// classify, which also resets the offline wait for the next call.
 ///
-/// The `offline_budget` bounds the **whole** wait, backoff sleeps included: each
-/// backoff is clamped to the remaining budget and, once that budget is spent, the
-/// loop stops **before** issuing another request (a fresh send could extend the
-/// wait by its own timeout or land after the budget).
+/// The `offline_budget` bounds the **whole** wait, backoff sleeps *and* in-flight
+/// resends included: each backoff is clamped to the remaining budget, each resend
+/// after the first failure is capped by `tokio::time::timeout` at the remaining
+/// budget, and once the budget is spent the loop stops **before** issuing another
+/// request (a fresh send could extend the wait by its own timeout or land after
+/// the budget).
 ///
 /// Cancellation (Ctrl-C / a cancelled turn) stops the wait by dropping this
 /// future at the caller's `select!`, so the backoff sleep needs no explicit
@@ -1053,9 +1073,33 @@ pub(crate) async fn send_online(
 ) -> Result<reqwest::Response> {
     let mut attempt: u32 = 0;
     let mut offline_since: Option<Instant> = None;
+    let mut last_err: Option<anyhow::Error> = None;
     let mut reporter = OutageReporter::new(what);
     loop {
-        match build().send().await {
+        let send = build().send();
+        let outcome = match offline_since {
+            Some(since) => {
+                let Some(remaining) = policy.offline_budget.checked_sub(since.elapsed()).filter(|r| !r.is_zero())
+                else {
+                    reporter.give_up();
+                    return Err(last_err.unwrap_or_else(|| anyhow!("network unavailable")));
+                };
+                match tokio::time::timeout(remaining, send).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        // The resend outlived the remaining budget without a
+                        // response: stop waiting instead of blocking on the
+                        // client's own (far longer) timeout.
+                        reporter.give_up();
+                        return Err(last_err
+                            .map(|e| e.context("network unavailable: resend exceeded offline budget"))
+                            .unwrap_or_else(|| anyhow!("network unavailable: resend exceeded offline budget")));
+                    }
+                }
+            }
+            None => send.await,
+        };
+        match outcome {
             Ok(response) => {
                 // A response arrived (any status): if we had been waiting out an
                 // outage, announce the reconnection before handing back.
@@ -1073,26 +1117,25 @@ pub(crate) async fn send_online(
             Err(e) if e.is_builder() || e.is_redirect() => return Err(anyhow!(e)),
             Err(e) => {
                 let since = *offline_since.get_or_insert_with(Instant::now);
-                // Bound the whole wait — backoff sleeps included — by the
-                // remaining budget, and stop before resending once it is spent.
+                // Preserve the full transport error chain for the notice *and*
+                // the eventual give-up error: `reqwest::Error::to_string()`
+                // hides the DNS/connection cause behind a generic message.
+                let reason = clean_reason(&error_chain(&e));
+                last_err = Some(anyhow!(e).context("network unavailable"));
+                // Bound the backoff sleep by the remaining budget, and stop
+                // before resending once it is spent (the next iteration's
+                // budget check gives up rather than issuing another request).
                 let Some(remaining) = policy.offline_budget.checked_sub(since.elapsed()).filter(|r| !r.is_zero())
                 else {
                     reporter.give_up();
-                    return Err(anyhow!(e).context("network unavailable"));
+                    return Err(last_err.unwrap());
                 };
                 let factor = 2u32.saturating_pow(attempt.min(20));
                 let backoff = policy.initial_backoff.saturating_mul(factor).min(policy.max_backoff);
                 let delay = backoff.min(remaining);
-                reporter.waiting(&clean_reason(&e.to_string()), delay);
+                reporter.waiting(&reason, delay);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
-                // The backoff consumed the rest of the budget: give up before
-                // resending rather than starting a request we have no budget for
-                // (which could extend the wait by its timeout or succeed late).
-                if since.elapsed() >= policy.offline_budget {
-                    reporter.give_up();
-                    return Err(anyhow!(e).context("network unavailable"));
-                }
             }
         }
     }
@@ -2271,6 +2314,68 @@ mod tests {
         assert!(result.is_err(), "an always-offline endpoint must fail once the budget is spent");
         assert!(elapsed >= Duration::from_millis(80), "gave up before the budget: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(600), "slept the full backoff past the budget: {elapsed:?}");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("network unavailable"), "error should name the outage: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offline_budget_bounds_an_in_flight_resend() {
+        // The budget bounds the *whole* wait — not only the backoff sleeps. Once
+        // an outage is being waited out (`offline_since` set by a first, fast
+        // failure), a *resend* that connects but then stalls (the server accepts
+        // the socket and never answers) must be cut off at the remaining budget,
+        // not block for the client's far longer read timeout. Before the fix the
+        // in-flight resend was unbounded, so this call would hang for `timeout`
+        // (here 30s); now it returns in roughly the budget.
+        //
+        // The first connection is refused (nothing is listening yet), which fails
+        // fast and starts the offline wait; the listener is then installed so the
+        // *next* attempt connects and stalls.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Drop the listener so the first attempt's connect is refused (a fast
+        // transport failure that sets `offline_since`), then re-bind below.
+        let port = addr.port();
+        drop(listener);
+        let user = HashMap::from([(
+            "x".to_string(),
+            ProviderConfig {
+                kind: Some(ProviderKind::Openai),
+                base_url: Some(format!("http://127.0.0.1:{port}")),
+                max_retries: Some(0),
+                retry_initial_backoff_ms: Some(20),
+                retry_max_backoff_ms: Some(20),
+                offline_budget_ms: Some(150),
+                // A client idle timeout far larger than the budget: only the
+                // budget cap on the resend brings this back quickly.
+                timeout_secs: Some(30),
+                ..Default::default()
+            },
+        )]);
+        let transport = HttpTransport::new(resolve("x/model", &user, "mock").unwrap()).unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        // Install the stalling server after a short delay: the first attempt
+        // (t=0) is refused, the first backoff (20ms) elapses, and by the time the
+        // resend is issued the listener accepts and holds the socket open.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let Ok(listener) = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await else { return };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                // Keep the socket open without ever responding (dropping it
+                // would reset the connection — a fast error, not a stall).
+                tokio::spawn(async move {
+                    let _hold = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let start = Instant::now();
+        let result = transport.post_json_to(&url, &serde_json::json!({ "hello": "world" }), |r| r).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "a stalled resend must fail once the offline budget is spent");
+        assert!(elapsed >= Duration::from_millis(120), "gave up before the budget: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "an in-flight resend outlived the offline budget: {elapsed:?}");
         let err = format!("{:#}", result.unwrap_err());
         assert!(err.contains("network unavailable"), "error should name the outage: {err}");
     }
