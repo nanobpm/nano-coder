@@ -301,7 +301,7 @@ pub async fn login() -> Result<PathBuf> {
             let credentials =
                 StoredCredentials { oauth_token: token.to_string(), domain: domain.clone(), created_at: Utc::now() };
             // Prove the account actually has Copilot before reporting success.
-            let session = exchange(&http, &endpoints, token).await?;
+            let session = exchange(&http, &endpoints, token, &super::RetryPolicy::default()).await?;
             let path = save_credentials(&credentials)?;
             eprintln!("Logged in; Copilot API endpoint {}", session.base_url);
             return Ok(path);
@@ -334,14 +334,24 @@ pub fn base_url_from_token(token: &str) -> Option<String> {
     Some(format!("https://{}", host.as_deref().unwrap_or(endpoint)))
 }
 
-/// Exchange a GitHub OAuth token for a Copilot session token.
-pub async fn exchange(http: &reqwest::Client, endpoints: &Endpoints, oauth: &str) -> Result<SessionToken> {
-    let response = with_editor_headers(http.get(&endpoints.copilot_token), &Default::default())
-        .header("Accept", "application/json")
-        .bearer_auth(oauth)
-        .send()
-        .await
-        .context("Copilot token exchange")?;
+/// Exchange a GitHub OAuth token for a Copilot session token. Transport
+/// failures with no HTTP response wait for the network (`send_online`, bounded
+/// by `policy.offline_budget`) just like a model request, so a refresh that
+/// lands while the laptop is briefly offline survives instead of failing the
+/// turn at once.
+pub async fn exchange(
+    http: &reqwest::Client,
+    endpoints: &Endpoints,
+    oauth: &str,
+    policy: &super::RetryPolicy,
+) -> Result<SessionToken> {
+    let response = super::send_online("copilot token", policy, || {
+        with_editor_headers(http.get(&endpoints.copilot_token), &Default::default())
+            .header("Accept", "application/json")
+            .bearer_auth(oauth)
+    })
+    .await
+    .context("Copilot token exchange")?;
     let status = response.status().as_u16();
     let text = response.text().await?;
     if !(200..300).contains(&status) {
@@ -461,7 +471,8 @@ impl GithubCopilotClient {
         {
             return Ok(current.clone());
         }
-        let fresh = exchange(self.transport.http(), &self.endpoints, &self.oauth).await?;
+        let fresh =
+            exchange(self.transport.http(), &self.endpoints, &self.oauth, &self.transport.provider().retry).await?;
         *session = Some(fresh.clone());
         Ok(fresh)
     }

@@ -35,6 +35,11 @@ const LOOP_STOPPED_TOOL_RESULT: &str =
     "Error: the turn is ending as blocked (repeated-call loop detected); this tool call was not run.";
 pub const CANCELLED_RESPONSE: &str = "[turn cancelled]";
 
+/// Most times a single model call will be re-sent after the connection drops
+/// mid-reply (a `StreamInterrupted`) before the turn gives up. Bounds the
+/// "network came back but the stream keeps breaking" case.
+const MAX_STREAM_RESTARTS: u32 = 10;
+
 /// Turn cap for a headless (non-interactive) session whose configured cap is
 /// unbounded — `max_iterations = 0`, or Auto mode, which disables the cap.
 /// With no human present nothing else stops a runaway turn, so the cap is a
@@ -577,6 +582,14 @@ pub enum AgentEvent<'a> {
         spec: &'a str,
         error: &'a str,
     },
+    /// A streamed reply broke after some output had already been shown
+    /// (`StreamInterrupted`) and the whole request is being re-sent from
+    /// scratch. The partial reply was displayed but never recorded in history,
+    /// so renderers must discard the abandoned text and reset any pending
+    /// thinking before accepting the restarted stream's deltas — otherwise the
+    /// replacement answer is appended to the stale prefix and the final
+    /// `AssistantMessage` is suppressed.
+    ResponseRestarted,
 }
 
 /// Result of a compaction.
@@ -3187,7 +3200,7 @@ impl Agent {
         if let Some(id) = input_id
             && let Some(response) = self.completed_inputs.get(id)
         {
-            eprintln!("[agent] input {id:?} already processed; returning recorded response");
+            crate::ui::log(&format!("[agent] input {id:?} already processed; returning recorded response"));
             let stop_reason = self.completed_stop_reasons.get(id).copied().unwrap_or(StopReason::EndTurn);
             return Ok(TurnOutcome {
                 response: response.clone(),
@@ -3586,6 +3599,10 @@ impl Agent {
             // actually sent, not a stale pre-compaction resolution.
             let mut sent_temperature = None;
             let mut sent_thinking = None;
+            // Re-sends after a mid-reply connection drop (`StreamInterrupted`),
+            // capped per model call so a persistently broken connection still
+            // ends the turn instead of asking forever.
+            let mut stream_restarts: u32 = 0;
             let response = loop {
                 self.set_activity(Activity::Thinking);
                 // Every attempt is a model call (and the overflow branch below
@@ -3769,6 +3786,38 @@ impl Agent {
                         break Some(response);
                     }
                     Some(Err(e)) => {
+                        // A stream that broke *after* visible output arrived: the
+                        // partial reply was shown but never added to history, so
+                        // discard it and re-send the same request (which itself
+                        // waits out any network outage). Capped per model call so
+                        // a persistently broken connection still ends the turn.
+                        if let Some(interrupted) = providers::stream_interrupted(&e) {
+                            if stream_restarts < MAX_STREAM_RESTARTS {
+                                stream_restarts += 1;
+                                let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                                // Route through `ui::log` (not a raw stderr
+                                // write): in frame mode the renderer owns the
+                                // screen, and the `ResponseRestarted` redraw
+                                // below would erase a stderr line that was never
+                                // added to the transcript. `ui::log` adds it to
+                                // the frame so the notice survives; off-frame it
+                                // falls back to stderr unchanged.
+                                crate::ui::log(&format!(
+                                    "[agent] {what}: {interrupted}; asking again ({stream_restarts}/{MAX_STREAM_RESTARTS})"
+                                ));
+                                // Tell the renderers to discard the abandoned
+                                // partial reply (and reset pending thinking)
+                                // before the re-sent stream's deltas arrive, so
+                                // the replacement answer starts fresh instead of
+                                // being appended to the stale prefix.
+                                if let Some(sink) = event_sink {
+                                    sink(session_id, &AgentEvent::ResponseRestarted);
+                                }
+                                continue;
+                            }
+                            self.set_activity(Activity::Idle);
+                            return Err(e);
+                        }
                         let message = format!("{e:#}");
                         // An output-token-limit rejection: the configured or
                         // fallback `max_tokens` exceeds the model's real output
@@ -3808,9 +3857,9 @@ impl Agent {
                             if learned < request_max_tokens {
                                 self.learned_max_output = Some(learned as usize);
                                 self.refresh_stats();
-                                eprintln!(
+                                crate::ui::log(&format!(
                                     "[agent] output-limit rejection ({message}); retrying with max_tokens={learned}"
-                                );
+                                ));
                                 continue;
                             }
                         }
@@ -3830,7 +3879,7 @@ impl Agent {
                         // without this refresh it keeps showing the old window
                         // and source for the whole client build and compaction.
                         self.refresh_stats();
-                        eprintln!("[agent] context overflow ({message}); compacting and retrying");
+                        crate::ui::log(&format!("[agent] context overflow ({message}); compacting and retrying"));
                         // The overflow compaction is a model call too;
                         // `compact_logged` applies a `/model` queued while the
                         // overflowing request was in flight before the summary
@@ -4539,7 +4588,7 @@ impl Agent {
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
             if trigger != CompactTrigger::Manual {
-                eprintln!("[agent] auto-{report}");
+                crate::ui::log(&format!("[agent] auto-{report}"));
             }
             self.stats.lock().unwrap().compactions += 1;
             self.emit(AgentEvent::Compacted);
@@ -4690,6 +4739,13 @@ impl Agent {
         // dropped-history fallback, which would lose the summarized context
         // (issue #114).
         let mut summary_output_retried = false;
+        // Re-sends after a mid-summary connection drop (`StreamInterrupted`),
+        // capped like a chat turn's so a persistently broken connection still
+        // falls back instead of asking forever. Without this a disconnect after
+        // summary content arrived raised `StreamInterrupted` even with the
+        // discard sink, and compaction fell through to `dropped_note`, removing
+        // the earlier messages from the active context with no summary.
+        let mut summary_stream_restarts: u32 = 0;
         let result = loop {
             // Honour a `/model` switch queued while a previous summary attempt
             // was in flight, before building this attempt's request — the chat
@@ -4748,6 +4804,25 @@ impl Agent {
                 result = self.client.chat_stream(&request, &discard) => result,
             };
             match attempt {
+                // A stream that broke *after* summary content arrived: the
+                // partial summary was discarded (the sink drops every delta) and
+                // never added to history, so re-send the same request (which
+                // itself waits out any network outage). Capped per summary call
+                // so a persistently broken connection still ends in the
+                // `dropped_note` fallback instead of asking forever. A
+                // non-`StreamInterrupted` error falls through to the output-cap
+                // handling below.
+                Err(e)
+                    if summary_stream_restarts < MAX_STREAM_RESTARTS && providers::stream_interrupted(&e).is_some() =>
+                {
+                    let interrupted = providers::stream_interrupted(&e).expect("checked by the guard");
+                    summary_stream_restarts += 1;
+                    let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                    crate::ui::log(&format!(
+                        "[agent] {what}: {interrupted}; asking again ({summary_stream_restarts}/{MAX_STREAM_RESTARTS})"
+                    ));
+                    continue;
+                }
                 Err(e) if !summary_output_retried => {
                     let message = format!("{e:#}");
                     if context::is_output_cap_error(&message) && !context::is_context_overflow(&message) {
@@ -4770,9 +4845,9 @@ impl Agent {
                         if learned < budget {
                             self.learned_max_output = Some(learned as usize);
                             self.refresh_stats();
-                            eprintln!(
+                            crate::ui::log(&format!(
                                 "[agent] summary output-limit rejection ({message}); retrying with max_tokens={learned}"
-                            );
+                            ));
                             continue;
                         }
                     }
@@ -9172,6 +9247,95 @@ mod tests {
         assert!(agent.conversation()[1].content.ends_with("SUMMARY: streamed"));
     }
 
+    /// A summary stream that breaks mid-summary (`StreamInterrupted`) for its
+    /// first `breaks` attempts, then completes. Mirrors a network that cuts out
+    /// while the summary is streaming and then recovers.
+    struct BreaksMidSummary {
+        breaks_left: Mutex<u32>,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidSummary {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            // Only the compaction summary call is scripted to break; the
+            // `send_message` turns that precede it are ordinary chat calls and
+            // answer immediately.
+            if !request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT) {
+                return Ok(text("ok"));
+            }
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some summary text, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial summary "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text("the summary"));
+            Ok(text("the summary"))
+        }
+        fn model_name(&self) -> &str {
+            "breaks-mid-summary"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_summary_agent(breaks: u32, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client = BreaksMidSummary { breaks_left: Mutex::new(breaks), attempts: attempts.clone() };
+        let config = Config { session_dir: Some(dir.to_path_buf()), ..Config::default() };
+        (Agent::new(Box::new(client), config), attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_retries_a_mid_summary_drop_instead_of_dropping_history() {
+        // The summary stream breaks twice, then completes: the agent re-sends
+        // the summary request rather than falling back to `dropped_note`, so
+        // compaction lands a real summary and no history is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(2, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "a mid-summary drop is retried, not a dropped-history fallback");
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful summary");
+        assert!(agent.conversation()[1].content.ends_with("the summary"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_falls_back_after_too_many_mid_summary_drops() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // compaction falls back to `dropped_note` instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(MAX_STREAM_RESTARTS + 1, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.fallback.is_some(), "a persistently broken summary stream falls back");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
+    }
+
     /// Replays scripted results, including errors.
     struct Fallible {
         results: Mutex<Vec<std::result::Result<LLMResponse, String>>>,
@@ -9652,6 +9816,138 @@ mod tests {
         let update = crate::acp::update_for(&AgentEvent::Thinking { text: "r" }).unwrap();
         assert_eq!(update["sessionUpdate"], "agent_thought_chunk");
         assert!(crate::acp::update_for(&AgentEvent::TextDelta { text: "r" }).is_none());
+    }
+
+    /// A client whose `chat_stream` emits a visible partial delta and then
+    /// drops the connection (`StreamInterrupted`) for its first `breaks`
+    /// attempts, answering in full afterwards. Mirrors a network that cuts out
+    /// mid-reply and then recovers.
+    struct BreaksMidReply {
+        breaks_left: Mutex<u32>,
+        answer: String,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidReply {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("tests never clone this client")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            // Non-streaming fallback mirrors the streaming path's break/answer.
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some visible output, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial reply "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text(&self.answer));
+            Ok(LLMResponse { content: self.answer.clone(), stop_reason: Some("stop".into()), ..Default::default() })
+        }
+        fn model_name(&self) -> &str {
+            "breaks"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_reply_agent(breaks: u32, answer: &str, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client =
+            BreaksMidReply { breaks_left: Mutex::new(breaks), answer: answer.to_string(), attempts: attempts.clone() };
+        let config = Config {
+            session_dir: Some(dir.to_path_buf()),
+            project_instructions: false,
+            skills: crate::skills::SkillsConfig { enabled: false, ..Default::default() },
+            ..Config::default()
+        };
+        let mut agent = Agent::new(Box::new(client), config);
+        agent.set_streaming(true);
+        // Streaming is only taken when an event sink is present.
+        agent.set_event_sink(std::sync::Arc::new(|_, _| {}));
+        (agent, attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_drops_are_retried_and_leave_no_partial_text_in_history() {
+        // The stream breaks mid-reply twice, then answers: the agent discards
+        // each partial reply and re-sends, so the turn completes with the full
+        // answer and history holds no partial text.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful answer");
+        let assistant: Vec<&str> =
+            agent.conversation().iter().filter(|m| m.role == Role::Assistant).map(|m| m.content.as_str()).collect();
+        assert_eq!(assistant, ["the full answer"], "only the full answer is recorded");
+        assert!(
+            !agent.conversation().iter().any(|m| m.content.contains("partial reply")),
+            "no partial, mid-reply text reaches history"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mid_reply_restart_emits_a_reset_event_before_resending() {
+        // On each mid-reply break the agent emits `ResponseRestarted` so the
+        // renderers discard the abandoned partial (and reset pending thinking)
+        // before the re-sent stream's deltas arrive. Without it the replacement
+        // answer is appended to the stale prefix and the final message is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, _attempts) = breaks_mid_reply_agent(2, "the full answer", dir.path());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        agent.set_event_sink(std::sync::Arc::new(move |_, event| {
+            let name = match event {
+                AgentEvent::TextDelta { text } => format!("text-delta:{text}"),
+                AgentEvent::ResponseRestarted => "restart".to_string(),
+                AgentEvent::AssistantMessage { text, .. } => format!("message:{text}"),
+                _ => return,
+            };
+            sink.lock().unwrap().push(name);
+        }));
+        agent.new_session().unwrap();
+        agent.run_turn(Some("in-1"), "hi").await.unwrap();
+        let seen = events.lock().unwrap().clone();
+        // Two breaks -> two resets, each emitted after a shown partial and
+        // before the request is re-sent.
+        assert_eq!(seen.iter().filter(|e| *e == "restart").count(), 2, "one reset per mid-reply break: {seen:?}");
+        assert_eq!(seen[0], "text-delta:partial reply ", "a partial is shown first: {seen:?}");
+        assert_eq!(seen[1], "restart", "the reset follows the abandoned partial: {seen:?}");
+        assert_eq!(seen.last().unwrap(), "message:the full answer", "the turn still completes whole: {seen:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn too_many_mid_reply_drops_end_the_turn() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // the turn ends with an error instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_reply_agent(MAX_STREAM_RESTARTS + 1, "never reached", dir.path());
+        agent.new_session().unwrap();
+        let error = agent.run_turn(Some("in-1"), "hi").await.unwrap_err();
+        assert!(format!("{error:#}").contains("connection lost mid-reply"), "{error:#}");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
+        assert!(
+            agent.conversation().iter().all(|m| m.role != Role::Assistant),
+            "a turn that never completed records no assistant message"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11060,10 +11356,13 @@ mod tests {
                         kind: Some(crate::providers::ProviderKind::Openai),
                         default_model: Some("x".to_string()),
                         base_url: Some("http://127.0.0.1:9/v1".to_string()),
-                        // Fail fast: no retries, a short timeout, so the test
-                        // does not wait out the default backoff schedule.
+                        // Fail fast: no retries, a short timeout, and no offline
+                        // wait (`offline_budget_ms: 0`) so the unreachable
+                        // endpoint surfaces its connect failure at once instead
+                        // of waiting for the network to come back.
                         max_retries: Some(0),
                         timeout_secs: Some(2),
+                        offline_budget_ms: Some(0),
                         ..Default::default()
                     },
                 );

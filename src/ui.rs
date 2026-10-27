@@ -164,6 +164,14 @@ pub fn log(text: &str) {
     }
 }
 
+/// Whether the app-owned frame renderer currently owns the screen. Lets
+/// lower layers (e.g. the provider outage reporter) route their notices
+/// through [`log`] in frame mode instead of fighting the frame for the
+/// terminal with direct `\r` stderr writes.
+pub fn frame_active() -> bool {
+    RENDERER.get().is_some_and(|renderer| renderer.is_frame())
+}
+
 static LEVEL: AtomicU8 = AtomicU8::new(Verbosity::Normal as u8);
 
 pub fn verbosity() -> Verbosity {
@@ -496,6 +504,27 @@ impl Renderer {
         }
     }
 
+    /// Discard an interrupted stream: drop the abandoned partial answer and any
+    /// pending reasoning deltas so a re-sent reply renders from scratch rather
+    /// than concatenating onto the stale prefix. Unlike `frame_finish_stream`,
+    /// this does **not** keep the partial as a transcript item — it never
+    /// reached history, so it must not linger on screen.
+    fn frame_reset_stream(&self, fs: &mut FrameState) {
+        if let Some(i) = fs.stream.take() {
+            // Remove the abandoned streamed-answer item outright. `fs.stream` is
+            // the only stored item index, so removing it (even from the middle,
+            // when reasoning interleaved after the answer pushed a later think
+            // item) shifts no index we rely on.
+            if fs.items.get(i).is_some_and(|it| matches!(it.item, Item::Message { .. })) {
+                fs.items.remove(i);
+            }
+        }
+        // Abandon reasoning deltas from the interrupted attempt; the re-sent
+        // reply streams its own.
+        fs.think = None;
+        fs.think_streamed = false;
+    }
+
     /// Map an agent event onto the transcript and re-render (frame mode).
     fn frame_event(&self, fs: &mut FrameState, event: &AgentEvent) {
         match event {
@@ -689,6 +718,14 @@ impl Renderer {
             // The mid-turn `/model <spec>` note is printed when the command is
             // typed; the event exists so the sink records the recents MRU.
             AgentEvent::ModelSwitched { .. } | AgentEvent::Context => {}
+            // A streamed reply was interrupted and is being re-sent: drop the
+            // abandoned partial answer and any pending reasoning deltas so the
+            // restart renders from scratch rather than concatenating onto the
+            // stale prefix.
+            AgentEvent::ResponseRestarted => {
+                self.frame_reset_stream(fs);
+                fs.touch_transcript();
+            }
             // A mid-turn `/model <spec>` that could not be applied: surface the
             // error in the transcript so the failed switch is never silent.
             AgentEvent::ModelSwitchFailed { spec, error } => {
@@ -1104,6 +1141,7 @@ impl Renderer {
                         // A timer firing is a harness notification, not model
                         // chatter: show it even in quiet mode.
                         | AgentEvent::TimerFired { .. }
+                        | AgentEvent::ResponseRestarted
                 )
                 && !(fs.batch && matches!(event, AgentEvent::UserMessage { .. }))
             {
@@ -1171,6 +1209,20 @@ impl Renderer {
                     state.streamed_text = false;
                     state.streamed_thinking = false;
                 }
+                // A streamed reply was interrupted and is being re-sent: close
+                // any open stream and reset pending thinking so the restart's
+                // (suppressed) deltas begin a fresh segment rather than
+                // extending the abandoned one.
+                AgentEvent::ResponseRestarted => {
+                    let mut state = self.state.lock().unwrap();
+                    self.finish_thinking(&mut state);
+                    if state.streamed_text {
+                        self.newline(&mut state);
+                    }
+                    state.streamed_text = false;
+                    state.streamed_thinking = false;
+                    self.answer_segment_closed.store(true, Ordering::Relaxed);
+                }
                 _ => {}
             }
             return;
@@ -1233,6 +1285,20 @@ impl Renderer {
                 state.streamed_thinking = false;
                 // This message is final; the next answer delta starts a fresh
                 // segment (see `answer_segment_closed`).
+                self.answer_segment_closed.store(true, Ordering::Relaxed);
+            }
+            // A streamed reply was interrupted and is being re-sent: finish the
+            // abandoned partial line and reset stream state so the restart's
+            // deltas begin a fresh segment — otherwise `streamed_text` stays set,
+            // the replacement answer is appended to the stale prefix, and the
+            // final `AssistantMessage` is suppressed (issue #148 follow-up).
+            AgentEvent::ResponseRestarted => {
+                self.finish_thinking(&mut state);
+                if state.streamed_text {
+                    self.newline(&mut state);
+                }
+                state.streamed_text = false;
+                state.streamed_thinking = false;
                 self.answer_segment_closed.store(true, Ordering::Relaxed);
             }
             // In normal mode a plan change is shown as the checklist (the
@@ -2030,6 +2096,95 @@ pub(crate) mod tests {
             r.state.lock().unwrap().streamed_text,
             "a new message after a quiet-closed segment streams on its own line"
         );
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn response_restart_resets_the_plain_stream() {
+        // A streamed answer breaks mid-reply (`StreamInterrupted`) and the agent
+        // emits `ResponseRestarted` before re-sending. Plain output must close
+        // the abandoned partial line and reset `streamed_text`, so the restart's
+        // deltas begin a fresh segment instead of being appended to — and the
+        // final `AssistantMessage` suppressed by — the stale prefix.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::plain_for_test();
+        r.begin_turn();
+        r.event(&AgentEvent::TextDelta { text: "partial reply " });
+        assert!(r.state.lock().unwrap().streamed_text, "the interrupted answer is streaming");
+
+        r.event(&AgentEvent::ResponseRestarted);
+        {
+            let state = r.state.lock().unwrap();
+            assert!(!state.streamed_text, "the restart must reset the plain stream");
+            assert!(state.at_line_start, "the abandoned partial line must be closed");
+        }
+
+        // The re-sent answer streams fresh on its own line.
+        r.event(&AgentEvent::TextDelta { text: "the full answer" });
+        assert!(r.state.lock().unwrap().streamed_text, "the re-sent answer streams on its own line");
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "the full answer" });
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn response_restart_discards_the_partial_in_frame_mode() {
+        // Frame mode must drop the abandoned partial answer on restart rather
+        // than concatenating the re-sent reply onto it; the transcript ends with
+        // only the full answer.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::TextDelta { text: "partial reply " });
+        assert_eq!(r.frame_items().len(), 1, "the streamed partial created one item");
+
+        r.event(&AgentEvent::ResponseRestarted);
+        assert!(r.frame_items().is_empty(), "the abandoned partial is discarded on restart");
+
+        r.event(&AgentEvent::TextDelta { text: "the full answer" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "the full answer" });
+        let texts: Vec<String> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["the full answer"], "only the re-sent full answer remains, not the concatenation");
+        set_verbosity(Verbosity::Normal);
+    }
+
+    #[test]
+    fn response_restart_resets_frame_stream_even_when_quiet() {
+        // The frame-mode quiet filter in `event` must whitelist
+        // `ResponseRestarted`: if an answer starts at normal verbosity and the
+        // user switches to quiet before the disconnect, the restart must still
+        // reach the handler and reset stream state — otherwise the abandoned
+        // partial survives and the re-sent reply concatenates onto it once
+        // verbosity returns to normal.
+        let _lock = verbosity_lock();
+        set_verbosity(Verbosity::Normal);
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::TextDelta { text: "partial reply " });
+        assert_eq!(r.frame_items().len(), 1, "the streamed partial created one item");
+
+        set_verbosity(Verbosity::Quiet);
+        r.event(&AgentEvent::ResponseRestarted);
+        assert!(r.frame_items().is_empty(), "the restart resets stream state even while quiet");
+
+        set_verbosity(Verbosity::Normal);
+        r.event(&AgentEvent::TextDelta { text: "the full answer" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "the full answer" });
+        let texts: Vec<String> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["the full answer"], "no concatenation onto the stale quiet-era partial");
         set_verbosity(Verbosity::Normal);
     }
 
