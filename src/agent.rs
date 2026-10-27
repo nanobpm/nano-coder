@@ -4739,6 +4739,13 @@ impl Agent {
         // dropped-history fallback, which would lose the summarized context
         // (issue #114).
         let mut summary_output_retried = false;
+        // Re-sends after a mid-summary connection drop (`StreamInterrupted`),
+        // capped like a chat turn's so a persistently broken connection still
+        // falls back instead of asking forever. Without this a disconnect after
+        // summary content arrived raised `StreamInterrupted` even with the
+        // discard sink, and compaction fell through to `dropped_note`, removing
+        // the earlier messages from the active context with no summary.
+        let mut summary_stream_restarts: u32 = 0;
         let result = loop {
             // Honour a `/model` switch queued while a previous summary attempt
             // was in flight, before building this attempt's request — the chat
@@ -4797,6 +4804,25 @@ impl Agent {
                 result = self.client.chat_stream(&request, &discard) => result,
             };
             match attempt {
+                // A stream that broke *after* summary content arrived: the
+                // partial summary was discarded (the sink drops every delta) and
+                // never added to history, so re-send the same request (which
+                // itself waits out any network outage). Capped per summary call
+                // so a persistently broken connection still ends in the
+                // `dropped_note` fallback instead of asking forever. A
+                // non-`StreamInterrupted` error falls through to the output-cap
+                // handling below.
+                Err(e)
+                    if summary_stream_restarts < MAX_STREAM_RESTARTS && providers::stream_interrupted(&e).is_some() =>
+                {
+                    let interrupted = providers::stream_interrupted(&e).expect("checked by the guard");
+                    summary_stream_restarts += 1;
+                    let what = format!("{}/{}", self.client.provider_name(), self.client.model_name());
+                    crate::ui::log(&format!(
+                        "[agent] {what}: {interrupted}; asking again ({summary_stream_restarts}/{MAX_STREAM_RESTARTS})"
+                    ));
+                    continue;
+                }
                 Err(e) if !summary_output_retried => {
                     let message = format!("{e:#}");
                     if context::is_output_cap_error(&message) && !context::is_context_overflow(&message) {
@@ -9219,6 +9245,95 @@ mod tests {
         assert_eq!(report.fallback, None, "summary must not fall back to dropping messages");
         assert_eq!(*streamed.lock().unwrap(), 1);
         assert!(agent.conversation()[1].content.ends_with("SUMMARY: streamed"));
+    }
+
+    /// A summary stream that breaks mid-summary (`StreamInterrupted`) for its
+    /// first `breaks` attempts, then completes. Mirrors a network that cuts out
+    /// while the summary is streaming and then recovers.
+    struct BreaksMidSummary {
+        breaks_left: Mutex<u32>,
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl LLMClient for BreaksMidSummary {
+        fn clone_boxed(&self) -> Box<dyn LLMClient> {
+            unimplemented!("test double is never cloned")
+        }
+        async fn chat(&self, request: &ChatRequest<'_>) -> Result<LLMResponse> {
+            self.chat_stream(request, &|_| {}).await
+        }
+        async fn chat_stream(
+            &self,
+            request: &ChatRequest<'_>,
+            sink: crate::llm::StreamSink<'_>,
+        ) -> Result<LLMResponse> {
+            // Only the compaction summary call is scripted to break; the
+            // `send_message` turns that precede it are ordinary chat calls and
+            // answer immediately.
+            if !request.messages[0].content.starts_with(context::SUMMARY_SYSTEM_PROMPT) {
+                return Ok(text("ok"));
+            }
+            *self.attempts.lock().unwrap() += 1;
+            // Deliver some summary text, as a real stream would before it breaks.
+            sink(StreamEvent::Text("partial summary "));
+            {
+                let mut left = self.breaks_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(anyhow::Error::new(providers::StreamInterrupted {
+                        reason: "connection reset by peer".into(),
+                    }));
+                }
+            }
+            sink(StreamEvent::Text("the summary"));
+            Ok(text("the summary"))
+        }
+        fn model_name(&self) -> &str {
+            "breaks-mid-summary"
+        }
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn breaks_mid_summary_agent(breaks: u32, dir: &std::path::Path) -> (Agent, Arc<Mutex<u32>>) {
+        let attempts = Arc::new(Mutex::new(0));
+        let client = BreaksMidSummary { breaks_left: Mutex::new(breaks), attempts: attempts.clone() };
+        let config = Config { session_dir: Some(dir.to_path_buf()), ..Config::default() };
+        (Agent::new(Box::new(client), config), attempts)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_retries_a_mid_summary_drop_instead_of_dropping_history() {
+        // The summary stream breaks twice, then completes: the agent re-sends
+        // the summary request rather than falling back to `dropped_note`, so
+        // compaction lands a real summary and no history is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(2, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert_eq!(report.fallback, None, "a mid-summary drop is retried, not a dropped-history fallback");
+        assert_eq!(*attempts.lock().unwrap(), 3, "two breaks then one successful summary");
+        assert!(agent.conversation()[1].content.ends_with("the summary"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_falls_back_after_too_many_mid_summary_drops() {
+        // One more break than the cap (`MAX_STREAM_RESTARTS`) is not recovered:
+        // compaction falls back to `dropped_note` instead of asking forever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, attempts) = breaks_mid_summary_agent(MAX_STREAM_RESTARTS + 1, dir.path());
+        agent.new_session().unwrap();
+        agent.send_message("one").await.unwrap();
+        agent.send_message("two").await.unwrap();
+        let report = agent.compact(None, None).await.unwrap().expect("compacted");
+        assert!(report.fallback.is_some(), "a persistently broken summary stream falls back");
+        // The cap bounds the re-sends: the initial send plus `MAX_STREAM_RESTARTS`
+        // retries, all of which broke.
+        assert_eq!(*attempts.lock().unwrap(), MAX_STREAM_RESTARTS + 1);
     }
 
     /// Replays scripted results, including errors.
