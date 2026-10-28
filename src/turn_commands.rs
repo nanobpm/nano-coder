@@ -45,9 +45,10 @@ pub enum Timing {
 pub fn timing(cmd: &str) -> Timing {
     let (name, arg) = split_cmd(cmd);
     match (name, arg) {
-        ("/help" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/timers" | "/context", "") => {
-            Timing::Immediate
-        }
+        (
+            "/help" | "/version" | "/tools" | "/skills" | "/providers" | "/session" | "/plan" | "/timers" | "/context",
+            "",
+        ) => Timing::Immediate,
         // Only the supported export forms run early; anything else defers so
         // the between-turns command reports the unknown option (as it does for
         // every other command given arguments it doesn't take).
@@ -174,6 +175,7 @@ impl Snapshot {
         let (name, arg) = split_cmd(cmd);
         match (name, arg) {
             ("/help", "") => block(crate::commands::help_text()),
+            ("/version", "") => block(crate::commands::version_string()),
             ("/tools", "") => block(self.tools(stats.mode, stats.history_available)),
             ("/skills", "") => block(self.skills.clone()),
             ("/providers", "") => block(self.providers()),
@@ -330,8 +332,18 @@ mod tests {
 
     #[test]
     fn timing_sorts_commands_by_what_they_touch() {
-        for cmd in ["/help", "/tools", "/skills", "/providers", "/session", "/plan", "/context", "/mode", "/verbosity"]
-        {
+        for cmd in [
+            "/help",
+            "/version",
+            "/tools",
+            "/skills",
+            "/providers",
+            "/session",
+            "/plan",
+            "/context",
+            "/mode",
+            "/verbosity",
+        ] {
             assert_eq!(timing(cmd), Timing::Immediate, "{cmd}");
         }
         for cmd in ["/trajectory", "/trajectory --json", "/trajectory --markdown", "/trajectory --md"] {
@@ -350,6 +362,7 @@ mod tests {
         }
         // A read-only command given arguments it doesn't take is not run early.
         assert_eq!(timing("/plan extra"), Timing::AfterTurn);
+        assert_eq!(timing("/version extra"), Timing::AfterTurn);
         // Only the supported `/trajectory` forms run early: an unknown option
         // defers to the between-turns command, which reports the bad option.
         for cmd in ["/trajectory --bogus", "/trajectory extra", "/trajectory --json extra"] {

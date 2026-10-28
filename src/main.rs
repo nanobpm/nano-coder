@@ -2027,7 +2027,7 @@ struct Args {
 }
 
 fn print_version() {
-    println!("nano-coder {}", env!("CARGO_PKG_VERSION"));
+    println!("{}", commands::version_string());
 }
 
 fn print_help() {

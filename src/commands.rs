@@ -16,6 +16,7 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command { name: "/help", args: "", description: "Show this help" },
+    Command { name: "/version", args: "", description: "Show the nano-coder version" },
     Command {
         name: "/compact",
         args: "[--smart|--standard] [focus]",
@@ -339,6 +340,11 @@ fn synopsis(c: &Command) -> String {
     if c.args.is_empty() { c.name.to_string() } else { format!("{} {}", c.name, c.args) }
 }
 
+/// The version string, the same one `nano-coder --version` prints.
+pub fn version_string() -> String {
+    format!("nano-coder {}", env!("CARGO_PKG_VERSION"))
+}
+
 pub fn help_text() -> String {
     let width = column_width();
     let mut out = String::from("Commands:");
@@ -523,6 +529,7 @@ mod tests {
     #[test]
     fn tab_completes_unique_commands_and_common_prefixes() {
         assert_eq!(complete("/he").as_deref(), Some("/help"));
+        assert_eq!(complete("/vers").as_deref(), Some("/version"));
         assert_eq!(complete("/comp").as_deref(), Some("/compact "));
         assert_eq!(complete("/c").as_deref(), Some("/co"));
         assert_eq!(complete("/co"), None, "already the common prefix");
@@ -642,5 +649,13 @@ mod tests {
     fn help_lists_every_command() {
         let help = help_text();
         assert!(COMMANDS.iter().all(|c| help.contains(c.name)));
+    }
+
+    #[test]
+    fn help_lists_version() {
+        let help = help_text();
+        assert!(help.contains("/version"), "{help}");
+        assert!(help.contains("Show the nano-coder version"), "{help}");
+        assert_eq!(version_string(), format!("nano-coder {}", env!("CARGO_PKG_VERSION")));
     }
 }
