@@ -169,6 +169,7 @@ src/
 │   ├── anthropic.rs # Anthropic Messages API
 │   ├── github_copilot.rs # UNOFFICIAL Copilot-subscription provider
 │   ├── muse.rs      # UNOFFICIAL Meta Muse Code provider
+│   ├── claude_code.rs # Claude plan via the local Claude Code CLI (`claude -p`)
 │   ├── retry.rs     # Retry classification and backoff
 │   └── mock.rs      # Offline scripted client
 ├── bash.rs      # bash tool: timeout, file capture, bounded output
@@ -564,6 +565,7 @@ Built-in presets:
 | `llamacpp` | openai | `http://localhost:8080/v1` | — |
 | `github-copilot` | github-copilot | from session token | `GITHUB_COPILOT_OAUTH_TOKEN` or `--login` (unofficial, see below) |
 | `muse` | muse | from minted key (`--login`); default Meta API endpoint (`META_API_KEY`) | `META_API_KEY` or `--login` (unofficial, see below) |
+| `claude-code` | claude-code | — (runs the local `claude` CLI) | — (Claude Code's own login, see below) |
 | `mock` | mock | — | — |
 
 `kind = "openai"` means OpenAI Chat Completions, which also covers vLLM, LM Studio,
@@ -860,6 +862,40 @@ carries no Muse Code plan, so it will not draw on a subscription (use `--login m
 that). `META_API_KEY` takes priority over a stored login; the minted key and OAuth token live
 in `<data dir>/nano-coder/muse.json`. `MUSE_AUTH_BASE_URL` and `MUSE_MINT_BASE_URL` point the
 login and mint at other hosts.
+
+### Claude Code (your Claude plan)
+
+The `claude-code` provider runs a Claude plan (Pro or Max) through the **Claude Code CLI you
+already have installed**, so no Anthropic API key is needed. nano-coder never reads or sends
+Claude Code's credentials: every model call starts `claude -p` (headless mode), which signs in
+the way it always does, so usage counts against your plan's limits like any other Claude Code
+session.
+
+```bash
+claude                                     # once: install Claude Code and sign in with /login
+nano-coder --list-models claude-code       # fable, opus, sonnet, haiku
+nano-coder --model claude-code/sonnet
+```
+
+How a call works:
+
+- Claude Code's built-in tools, settings files (hooks, plugins, `CLAUDE.md`, permission rules),
+  slash commands, MCP servers and session history are switched off, and nano-coder's system
+  prompt replaces Claude Code's. nano-coder's own tools, permissions and sandbox apply as usual.
+- nano-coder's tools reach the model through a small stub MCP server (the nano-coder binary
+  itself), so the model calls them natively. The stub never runs a tool: when the model's
+  message ends, nano-coder stops `claude` and runs the tools itself.
+- Headless mode can't replay earlier turns, so the conversation is sent as a transcript in one
+  user turn. A cache breakpoint on its last block lets each call reuse the previous call's
+  cached prompt.
+- Thinking levels map to `claude --effort` (`low`, `medium`, `high`, `xhigh`, `max`).
+  `temperature` and `max_tokens` are not passed on; Claude Code uses its own output limit.
+- The context window is assumed to be 200k tokens; set `context_window` to change it.
+
+Each call starts a new `claude` process, which adds about a second per model call. If
+`claude` is not on `PATH` (or in `~/.local/bin` or `~/.claude/local`), set
+`NANO_CODER_CLAUDE_PATH` to it. Claude Code honours its usual environment, so an
+`ANTHROPIC_API_KEY` in the environment makes it bill that key instead of your plan.
 
 ### Retries
 
