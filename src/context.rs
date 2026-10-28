@@ -424,9 +424,14 @@ const CLIP_ERROR_CONTEXT: usize = 1;
 /// matter in build/test output (`error[E0308]`, `panicked at`, `FAILED`,
 /// `Traceback`, …) usually sit in the middle, where head+tail clipping drops
 /// them. The list stays small and fixed — no per-language logic. `warning:`
-/// lines (e.g. `warning: unused`) are noise here and never pinned.
+/// lines (e.g. `warning: unused`) are noise here and never pinned — even when
+/// they name an error (`warning: unused import: std::error::Error`), so a
+/// warning-heavy log cannot exhaust the pin allowance ahead of a real error.
 fn is_error_line(line: &str) -> bool {
-    let lower = line.to_lowercase();
+    let lower = line.trim_start().to_lowercase();
+    if lower.starts_with("warning:") {
+        return false;
+    }
     lower.contains("error")
         || lower.contains("panic")
         || lower.contains("failed")
@@ -450,41 +455,80 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
     if error_lines.is_empty() {
         return clip(text, max_chars);
     }
-    // Merge the ±context windows of the first CLIP_ERROR_LINES error lines.
-    let mut merged: Vec<(usize, usize)> = Vec::new();
+    // Merge the ±context windows of the first CLIP_ERROR_LINES error lines,
+    // remembering which error lines each window pins so the last-resort clip
+    // below can never cut one.
+    let mut merged: Vec<(usize, usize, Vec<usize>)> = Vec::new();
     for &i in error_lines.iter().take(CLIP_ERROR_LINES) {
         let start = i.saturating_sub(CLIP_ERROR_CONTEXT);
         let end = (i + CLIP_ERROR_CONTEXT).min(lines.len() - 1);
         match merged.last_mut() {
-            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
+            Some(last) if start <= last.1 + 1 => {
+                last.1 = last.1.max(end);
+                last.2.push(i);
+            }
+            _ => merged.push((start, end, vec![i])),
         }
     }
-    let build_pinned = |ranges: &[(usize, usize)]| {
-        let mut s = String::new();
-        for (idx, &(start, end)) in ranges.iter().enumerate() {
-            if idx > 0 {
-                s.push_str("…\n");
-            }
-            for line in &lines[start..=end] {
-                s.push_str(line);
-                s.push('\n');
-            }
-        }
-        s
-    };
     // If the pins take over half the budget, drop whole windows from the end
     // — never cut a window mid-line, which could lose the very error line it
-    // pins. A single oversized window (one giant line) keeps only its own
-    // head and tail via `clip`.
-    let mut ranges = merged;
-    let mut pinned = build_pinned(&ranges);
-    while pinned.chars().count() > max_chars / 2 && ranges.len() > 1 {
-        ranges.pop();
-        pinned = build_pinned(&ranges);
-    }
-    if pinned.chars().count() > max_chars / 2 {
-        pinned = clip(&pinned, max_chars / 2);
+    // pins. The error lines of a surviving window are reserved first; only
+    // what is left of the window's budget goes to context, and a merged
+    // window that cannot afford its context keeps its bare error lines.
+    let mut windows = merged;
+    let pin_budget = max_chars / 2;
+    let pinned;
+    loop {
+        let mut attempt = String::new();
+        let mut fits = true;
+        for (idx, (start, end, errs)) in windows.iter().enumerate() {
+            if idx > 0 {
+                attempt.push_str("…\n");
+            }
+            let reserved: usize = errs.iter().map(|&i| lines[i].chars().count() + 1).sum();
+            if reserved > pin_budget {
+                // Even the bare error lines overflow: keep their heads.
+                for &i in errs {
+                    attempt.push_str(&lines[i].chars().take(pin_budget / errs.len()).collect::<String>());
+                    attempt.push('\n');
+                }
+                fits = false;
+                continue;
+            }
+            let context_budget = pin_budget - reserved;
+            let context: Vec<&str> = lines[*start..=*end].iter().filter(|l| !is_error_line(l)).copied().collect();
+            let context_chars: usize = context.iter().map(|l| l.chars().count() + 1).sum();
+            if context_chars <= context_budget {
+                for line in &lines[*start..=*end] {
+                    attempt.push_str(line);
+                    attempt.push('\n');
+                }
+            } else if context.len() <= 1 {
+                // One oversized context line around the error: clip the
+                // context, never the error line itself.
+                for line in &lines[*start..=*end] {
+                    if is_error_line(line) {
+                        attempt.push_str(line);
+                    } else {
+                        attempt.push_str(&clip(line, context_budget.saturating_sub(1)));
+                    }
+                    attempt.push('\n');
+                }
+            } else {
+                // A merged window whose context cannot fit keeps its error
+                // lines; the context is what the budget could not afford.
+                for &i in errs {
+                    attempt.push_str(lines[i]);
+                    attempt.push('\n');
+                }
+                fits = false;
+            }
+        }
+        if fits || windows.len() <= 1 {
+            pinned = attempt;
+            break;
+        }
+        windows.pop();
     }
     // Split what is left of the budget between head and tail as clip does,
     // charging the marker lines against it too so the budget holds.
@@ -817,8 +861,69 @@ mod tests {
         assert!(is_error_line("Traceback (most recent call last):"));
         assert!(is_error_line("java.lang.IllegalStateException: boom"));
         assert!(!is_error_line("warning: unused variable: `tmp`"));
+        assert!(!is_error_line("warning: unused import: std::error::Error"));
+        assert!(!is_error_line("  warning: previous error occurred here"));
+        assert!(!is_error_line("WARNING: the build failed to cache"));
         assert!(!is_error_line("   Compiling lease-0.1.0 (/work/lease)"));
         assert!(!is_error_line("test lease::tests::case_123 ... ok"));
+    }
+
+    #[test]
+    fn clipped_tool_result_ignores_warnings_that_name_errors() {
+        // A warning-heavy log must not exhaust the pin allowance: twenty
+        // warnings containing error keywords precede the real compiler error.
+        let mut content = String::new();
+        for i in 0..40 {
+            content.push_str(&format!("warning: unused import: std::error::Error (number {i})\n"));
+        }
+        content.push_str("error[E0308]: mismatched types: expected `Lease`, found `()`\n");
+        for _ in 0..400 {
+            content.push_str("ordinary build output line that nobody cares about\n");
+        }
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: mismatched types"), "{clipped}");
+        // The head still shows the log's opening warnings (that is plain
+        // head/tail clipping), but the pinned window around the error must
+        // hold no warning line.
+        let window = clipped
+            .lines()
+            .skip_while(|l| !l.contains("error[E0308]"))
+            .take(3)
+            .collect::<Vec<_>>();
+        assert!(
+            window.iter().all(|l| !l.contains("warning:")),
+            "warnings must not be pinned:\n{clipped}"
+        );
+    }
+
+    #[test]
+    fn clipped_tool_result_clips_context_before_the_error_line() {
+        // A 56-character error between two 1,200-character context lines: the
+        // window cannot fit the pin budget, so the context clips — the error
+        // line itself is reserved and must survive whole.
+        let pad = "x".repeat(1_200);
+        let mut content = "ordinary build output line\n".repeat(200);
+        content.push_str(&format!("{pad}\nerror[E0308]: mismatched types: expected `Lease`, found `()`\n{pad}\n"));
+        content.push_str(&"more ordinary output after the failure\n".repeat(200));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: mismatched types: expected `Lease`, found `()`"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_every_error_of_a_merged_window() {
+        // Two errors three lines apart merge into one window whose context
+        // cannot fit: both error lines survive even when the context drops.
+        let pad = "y".repeat(900);
+        let mut content = "ordinary build output line\n".repeat(200);
+        content.push_str(&format!(
+            "{pad}\nerror[E0308]: first failure here\n{pad}\nerror[E0599]: second failure here\n{pad}\n"
+        ));
+        content.push_str(&"more ordinary output after the failure\n".repeat(200));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.contains("error[E0308]: first failure here"), "{clipped}");
+        assert!(clipped.contains("error[E0599]: second failure here"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
     }
 
     #[test]
