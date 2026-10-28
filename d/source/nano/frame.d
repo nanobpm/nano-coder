@@ -19,8 +19,9 @@ import nano.lineedit : charWidth;
 enum syncStart = "\x1b[?2026h", syncEnd = "\x1b[?2026l";
 private enum DIM = "\x1b[2m", BOLD = "\x1b[1m", RESET = "\x1b[0m";
 
-/// The sentinel `editorLines` puts at the cursor (one cell wide), swapped
-/// for a reverse-video block after layout.
+/// The sentinel `editorLines` puts where the cursor has no character to
+/// overlay (end of the text, on a newline), swapped for a reverse-video
+/// blank after layout.
 enum dchar cursorMark = '\0';
 
 size_t cellWidth(dchar c) pure nothrow
@@ -213,7 +214,22 @@ string[] editorLines(string prompt, dstring text, size_t cursor, size_t width) p
     import std.conv : to;
     if (width < 1) width = 1;
     if (cursor > text.length) cursor = text.length;
-    auto marked = (text[0 .. cursor] ~ cursorMark ~ text[cursor .. $]).to!string;
+    // The block overlays the character after the insertion point in reverse
+    // video (as a terminal's own block cursor does); inserting a blank cell
+    // there instead shifted the rest of the line one cell right, reading as
+    // an off-by-one against Backspace/Delete ("any" cursor-1-back rendered
+    // "an y"). `sanitize` keeps well-formed SGR and `wrapAnsi` carries
+    // escapes at no cell cost, so the character keeps exactly its own width.
+    // The one-cell sentinel (a reverse-video blank) remains only where
+    // there is no printable character to overlay.
+    string marked;
+    if (cursor < text.length && text[cursor] != '\n'
+            && (text[cursor] == '\t' || !isControl(text[cursor])))
+        marked = text[0 .. cursor].to!string ~ "\x1b[7m"
+            ~ text[cursor .. cursor + 1].to!string ~ "\x1b[27m"
+            ~ text[cursor + 1 .. $].to!string;
+    else
+        marked = (text[0 .. cursor] ~ cursorMark ~ text[cursor .. $]).to!string;
     auto pw = visibleWidth(prompt);
     auto inner = width > pw ? width - pw : 1;
     string[] lines;
@@ -470,8 +486,16 @@ unittest
     assert(wrapBlock("a\nb", 5) == ["a", "b"]);
     auto ed = editorLines("› ", "hi"d, 2, 20);
     assert(ed == ["\x1b[1m› \x1b[0mhi\x1b[7m \x1b[27m"], ed[0]);
+    // Mid-line the block overlays the character under it, adding no cell:
+    // cursor one back over "any" must not render as "an y".
+    ed = editorLines("› ", "any"d, 2, 20);
+    assert(ed == ["\x1b[1m› \x1b[0man\x1b[7my\x1b[27m"], ed[0]);
+    assert(visibleWidth(ed[0]) == 5);
+    // On a newline the blank sits at the end of that row.
+    ed = editorLines("› ", "ab\ncd"d, 2, 20);
+    assert(ed.length == 2 && ed[0].canFind("ab\x1b[7m \x1b[27m"));
     ed = editorLines("› ", "abcdef"d, 0, 5);
-    assert(ed.length == 3 && ed[0].canFind("\x1b[7m \x1b[27m"));
+    assert(ed.length == 2 && ed[0].canFind("\x1b[7ma\x1b[27m"));
     assert(compose(["t"], ["e"], "s") == ["t", "e", "s"]);
     assert(queueIndicator(0, 40) is null && queueIndicator(2, 40).canFind("⏸2 queued"));
     assert(firstDiff(["a", "b"], ["a", "b"]) == -1 && firstDiff(["a", "b"], ["a", "c"]) == 1 && firstDiff(["a"], ["a", "b"]) == 1);
