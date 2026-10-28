@@ -640,10 +640,14 @@ fn option_spec(cmd: &str) -> Option<OptionSpec> {
             max_read_positionals: None,
         },
         // `uniq [INPUT [OUTPUT]]`: a second positional is an output file.
+        // `--all-repeated` and `--group` take *optional* values, accepted only
+        // in the `--opt=VALUE` form — they never consume the next word, so they
+        // must not be in `long_with_arg` (otherwise `uniq --group - /tmp/out`
+        // would skip `-` and miscount the output operand as an input).
         "uniq" => OptionSpec {
             short_with_arg: "fsw",
             short_writers: "",
-            long_with_arg: &["--skip-fields", "--skip-chars", "--check-chars", "--all-repeated", "--group"],
+            long_with_arg: &["--skip-fields", "--skip-chars", "--check-chars"],
             long_writers: &[],
             max_read_positionals: Some(1),
         },
@@ -707,7 +711,9 @@ fn stage_has_side_effect(cmd: &str, args: &[String]) -> bool {
     spec.max_read_positionals.is_some_and(|max| positionals > max)
 }
 
-/// Split one pipeline stage into shell words: whitespace-separated, with
+/// Split one pipeline stage into shell words: separated on shell whitespace
+/// (space, tab, newline, CR, form feed — *not* the wider Unicode whitespace
+/// set, which the shell treats as ordinary word characters), with
 /// single/double quotes removed and backslash escapes honoured. Returns `None`
 /// (fail closed) for shapes this helper does not model — an unterminated quote
 /// or trailing backslash, or any expansion/glob/grouping character outside
@@ -720,7 +726,13 @@ fn shell_words(stage: &str) -> Option<Vec<String>> {
     let mut chars = stage.chars();
     while let Some(c) = chars.next() {
         match c {
-            c if c.is_whitespace() => {
+            // Split only on characters the shell treats as word separators —
+            // not every `char::is_whitespace()`: a literal vertical tab (or
+            // NEL, NBSP, …) is *not* IFS whitespace, so the shell keeps it
+            // inside the word (`sort -t<VT>` passes the VT as `-t`'s value).
+            // Dropping it here would merge `-t<VT>` into `-t`, making the
+            // option parser consume the next word as the separator value.
+            ' ' | '\t' | '\n' | '\r' | '\x0c' => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));
                     in_word = false;
@@ -1970,6 +1982,18 @@ mod tests {
         assert_eq!(pipeline_key("cat f | uniq -f 2"), "cat f");
         assert_eq!(pipeline_key("cat f | uniq -f 2 - /tmp/out"), "cat f | uniq -f 2 - /tmp/out");
         assert_eq!(pipeline_key("cat f | uniq -- -in -out"), "cat f | uniq -- -in -out");
+        // `uniq --all-repeated` / `--group` take optional values only as
+        // `--opt=VALUE`; bare, they must NOT swallow the next word — otherwise
+        // `uniq --group - /tmp/out` would miscount the output operand.
+        assert_eq!(pipeline_key("cat f | uniq --group - /tmp/out"), "cat f | uniq --group - /tmp/out");
+        assert_eq!(pipeline_key("cat f | uniq --all-repeated - /tmp/out"), "cat f | uniq --all-repeated - /tmp/out");
+        // The `=`-joined optional-value forms are still pure filters.
+        assert_eq!(pipeline_key("cat f | uniq --group=prepend"), "cat f");
+        assert_eq!(pipeline_key("cat f | uniq --all-repeated=separate"), "cat f");
+        // A literal vertical tab is not shell whitespace: the shell keeps it
+        // inside `-t<VT>` as the separator value, so `-o` must still be seen
+        // as the writer option it is.
+        assert_eq!(pipeline_key("cat f | sort -t\u{b} -o /tmp/out"), "cat f | sort -t\u{b} -o /tmp/out");
         // Quoted writer flags are still writer flags.
         assert_eq!(pipeline_key("cat f | sort '-o' /tmp/a"), "cat f | sort '-o' /tmp/a");
         assert_eq!(pipeline_key("cat f | 'tee' /tmp/a"), "cat f | 'tee' /tmp/a");
