@@ -415,6 +415,98 @@ fn clip(text: &str, max_chars: usize) -> String {
     format!("{head}\n…[{} characters omitted]…\n{tail}", text.chars().count() - max_chars)
 }
 
+/// Maximum error lines pinned when clipping a tool result (issue #67).
+const CLIP_ERROR_LINES: usize = 20;
+/// Context lines kept around each pinned error line.
+const CLIP_ERROR_CONTEXT: usize = 1;
+
+/// A line worth pinning when a long tool result is clipped: the lines that
+/// matter in build/test output (`error[E0308]`, `panicked at`, `FAILED`,
+/// `Traceback`, …) usually sit in the middle, where head+tail clipping drops
+/// them. The list stays small and fixed — no per-language logic. `warning:`
+/// lines (e.g. `warning: unused`) are noise here and never pinned.
+fn is_error_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("error")
+        || lower.contains("panic")
+        || lower.contains("failed")
+        || lower.contains("traceback")
+        || lower.contains("exception")
+}
+
+/// Clip a tool result for the compaction transcript, keeping the head and tail
+/// as `clip` does but also pinning up to [`CLIP_ERROR_LINES`] error lines from
+/// the omitted middle, each with [`CLIP_ERROR_CONTEXT`] lines of context, in
+/// order and separated by `…`. Everything stays within the same `max_chars`
+/// budget: when the pins don't fit, the head shrinks to make room (the pins
+/// are the point), and as a last resort the pins themselves clip plain.
+fn clip_tool_result(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let error_lines: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| is_error_line(l)).map(|(i, _)| i).collect();
+    if error_lines.is_empty() {
+        return clip(text, max_chars);
+    }
+    // Merge the ±context windows of the first CLIP_ERROR_LINES error lines.
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &i in error_lines.iter().take(CLIP_ERROR_LINES) {
+        let start = i.saturating_sub(CLIP_ERROR_CONTEXT);
+        let end = (i + CLIP_ERROR_CONTEXT).min(lines.len() - 1);
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let build_pinned = |ranges: &[(usize, usize)]| {
+        let mut s = String::new();
+        for (idx, &(start, end)) in ranges.iter().enumerate() {
+            if idx > 0 {
+                s.push_str("…\n");
+            }
+            for line in &lines[start..=end] {
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+        s
+    };
+    // If the pins take over half the budget, drop whole windows from the end
+    // — never cut a window mid-line, which could lose the very error line it
+    // pins. A single oversized window (one giant line) keeps only its own
+    // head and tail via `clip`.
+    let mut ranges = merged;
+    let mut pinned = build_pinned(&ranges);
+    while pinned.chars().count() > max_chars / 2 && ranges.len() > 1 {
+        ranges.pop();
+        pinned = build_pinned(&ranges);
+    }
+    if pinned.chars().count() > max_chars / 2 {
+        pinned = clip(&pinned, max_chars / 2);
+    }
+    // Split what is left of the budget between head and tail as clip does,
+    // charging the marker lines against it too so the budget holds.
+    let marker = format!("…[{} characters omitted; error lines pinned]…\n", total - max_chars);
+    let rest = max_chars.saturating_sub(pinned.chars().count() + marker.chars().count() + 3);
+    let head: String = text.chars().take(rest * 2 / 3).collect();
+    let tail: String = {
+        let chars: Vec<char> = text.chars().collect();
+        chars[chars.len() - rest / 3..].iter().collect()
+    };
+    let mut out = String::with_capacity(max_chars + 16);
+    out.push_str(&head);
+    out.push('\n');
+    out.push_str(&marker);
+    out.push_str(&pinned);
+    out.push('…');
+    out.push('\n');
+    out.push_str(&tail);
+    // The budget is never exceeded, even for a pathological single-line pin.
+    if out.chars().count() > max_chars { clip(&out, max_chars) } else { out }
+}
+
 /// Shorten an oversized message in place (tool output kept head and tail).
 pub fn clip_message(message: &mut Message, max_tokens: usize) -> bool {
     if text_tokens(&message.content) <= max_tokens {
@@ -447,7 +539,7 @@ pub fn render_transcript(messages: &[Message], max_chars: usize, ids: bool) -> S
             Role::Tool => {
                 let name = message.name.as_deref().unwrap_or("tool");
                 let label = if message.is_error { "failed" } else { "result" };
-                let mut block = format!("TOOL {label} ({name}):\n{}", clip(&message.content, 2_000));
+                let mut block = format!("TOOL {label} ({name}):\n{}", clip_tool_result(&message.content, 2_000));
                 // The summary request never includes images; render each as a
                 // placeholder so the transcript still notes it was seen.
                 for attachment in &message.attachments {
@@ -634,6 +726,99 @@ mod tests {
         assert!(text.starts_with("…[earlier messages omitted]…"));
         assert!(text.contains("message 49"));
         assert!(!text.contains("message 0 "));
+    }
+
+    #[test]
+    fn clipped_tool_result_pins_an_error_line_from_the_middle() {
+        // Issue #67: a 50k-character tool result with one `error:` line in the
+        // middle — the clipped transcript must contain that line.
+        let mut content = String::new();
+        while content.len() < 30_000 {
+            content.push_str("   Compiling lease-0.1.0 (/work/lease)\n");
+        }
+        content.push_str("error[E0599]: no method named `refresh_lease_v42_fast` found for struct `TokenCache`\n");
+        while content.len() < 50_000 {
+            content.push_str("test lease::tests::case_123 ... ok\n");
+        }
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(&[message], 100_000, false);
+        assert!(
+            text.contains("error[E0599]: no method named `refresh_lease_v42_fast` found for struct `TokenCache`"),
+            "the middle error line must survive clipping:\n{text}"
+        );
+        assert!(text.contains("error lines pinned"), "{text}");
+    }
+
+    #[test]
+    fn clipped_tool_result_without_error_lines_clips_as_before() {
+        let content = "x".repeat(50_000);
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(&[message], 100_000, false);
+        assert!(text.contains("characters omitted"), "{text}");
+        assert!(!text.contains("error lines pinned"), "{text}");
+        assert_eq!(text, format!("TOOL result (bash):\n{}", clip(&content, 2_000)));
+    }
+
+    #[test]
+    fn clipped_tool_result_never_exceeds_the_budget() {
+        // Many error lines: pins are capped and the total stays within budget.
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!("error: failure number {i} in the middle of the log\n"));
+            content.push_str(&"padding line to spread the errors out across the log\n".repeat(20));
+        }
+        let message = Message::tool_result("call_1", "bash", &content);
+        let text = render_transcript(&[message.clone()], 1_000_000, false);
+        let body = text.strip_prefix("TOOL result (bash):\n").unwrap();
+        assert!(body.chars().count() <= 2_000, "budget exceeded: {} chars", body.chars().count());
+        // Pins are capped at CLIP_ERROR_LINES error lines (each with context).
+        assert!(body.matches("error: failure number").count() <= CLIP_ERROR_LINES);
+        // Directly: an error line in the omitted middle is pinned within budget.
+        let buried = format!(
+            "{}\ncompiling crate-a\nerror: boom\nnote: see above\n{}",
+            "ordinary build output line\n".repeat(200),
+            "test crate::case ... ok\n".repeat(200)
+        );
+        let clipped = clip_tool_result(&buried, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {} chars", clipped.chars().count());
+        assert!(clipped.contains("error: boom"), "{clipped}");
+        assert!(clipped.contains("note: see above"), "context line pinned too:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_context_and_tail() {
+        let mut content = String::new();
+        for _ in 0..400 {
+            content.push_str("ordinary build output line that nobody cares about\n");
+        }
+        content.push_str("  --> src/lease.rs:41:9\n");
+        content.push_str("error[E0308]: mismatched types: expected `Lease`, found `()`\n");
+        content.push_str("  = note: this error originates in the macro\n");
+        for _ in 0..400 {
+            content.push_str("more ordinary output after the failure\n");
+        }
+        content.push_str("error: could not compile `lease` due to 1 previous error\n");
+        content.push_str("exit status: 101\n");
+        let clipped = clip_tool_result(&content, 2_000);
+        // The error line and one line of context on each side are pinned.
+        assert!(clipped.contains("error[E0308]: mismatched types"), "{clipped}");
+        assert!(clipped.contains("--> src/lease.rs:41:9"), "{clipped}");
+        assert!(clipped.contains("= note: this error originates"), "{clipped}");
+        // The tail (exit status) survives.
+        assert!(clipped.contains("exit status: 101"), "{clipped}");
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn error_line_detection_is_small_and_fixed() {
+        assert!(is_error_line("error[E0308]: mismatched types"));
+        assert!(is_error_line("thread 'main' panicked at src/store.rs:10"));
+        assert!(is_error_line("test result: FAILED. 3 passed; 2 failed"));
+        assert!(is_error_line("Traceback (most recent call last):"));
+        assert!(is_error_line("java.lang.IllegalStateException: boom"));
+        assert!(!is_error_line("warning: unused variable: `tmp`"));
+        assert!(!is_error_line("   Compiling lease-0.1.0 (/work/lease)"));
+        assert!(!is_error_line("test lease::tests::case_123 ... ok"));
     }
 
     #[test]
