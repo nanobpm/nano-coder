@@ -511,13 +511,13 @@ impl Renderer {
         // Reasoning that is still streaming, expanded with Ctrl-O, is drawn
         // live under the transcript until it becomes an `Item::Thinking`.
         let transcript = match &fs.think {
-            Some((text, started)) if fs.think_expanded => {
+            Some((text, _)) if fs.think_expanded => {
                 let mut lines = transcript;
-                let header = format!(
-                    "{}∴ Thinking… {:.1}s{RESET}",
-                    "\x1b[38;5;245m",
-                    now.saturating_duration_since(*started).as_secs_f64()
-                );
+                // Keep this header static: once the expanded body outgrows the
+                // viewport it scrolls off-screen, and a ticking elapsed time
+                // would force a full scrollback repaint on every tick. The
+                // editor's working-time indicator already shows elapsed time.
+                let header = format!("{}∴ Thinking…{RESET}", "\x1b[38;5;245m");
                 lines.push(frame::fit_line(&header, width));
                 lines.extend(frame::expanded_body(text, width, "\x1b[38;5;245m"));
                 lines
@@ -609,7 +609,22 @@ impl Renderer {
                             fs.touch_transcript();
                         }
                     }
-                    None => {}
+                    // Deltas streamed and a `TextDelta` already finalized the
+                    // summary. Reconcile it with this authoritative full text
+                    // (a mid-reasoning `/verbosity` change can leave the stored
+                    // copy truncated), keeping its expansion state.
+                    None => {
+                        let full = text.trim();
+                        if !full.is_empty()
+                            && let Some(StampedItem { item: Item::Thinking { chars, text: stored, .. }, .. }) =
+                                fs.items.iter_mut().rev().find(|i| matches!(i.item, Item::Thinking { .. }))
+                            && stored.as_str() != full
+                        {
+                            *stored = full.to_string();
+                            *chars = full.chars().count();
+                            fs.touch_transcript();
+                        }
+                    }
                 }
                 fs.think_streamed = false;
                 // Do NOT reset `fs.stream` here: a streamed assistant message
@@ -2343,6 +2358,25 @@ pub(crate) mod tests {
         let messages = items.iter().filter(|i| matches!(i.item, Item::Message { role: Role::Assistant, .. })).count();
         assert_eq!(thinking, 1, "reasoning summary duplicated: {items:?}");
         assert_eq!(messages, 1, "streamed answer duplicated: {items:?}");
+    }
+
+    #[test]
+    fn trailing_thinking_reconciles_truncated_streamed_reasoning() {
+        let r = Renderer::frame_for_test();
+        // Simulate a verbosity change mid-reasoning: only part of the deltas
+        // arrived before the answer finalized the summary.
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
+        r.event(&AgentEvent::TextDelta { text: "Answer." });
+        r.event(&AgentEvent::Thinking { text: "pondering the whole plan" });
+        let items = r.frame_items();
+        let texts: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Thinking { text, chars, .. } => Some((text.clone(), *chars)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec![("pondering the whole plan".to_string(), 24)]);
     }
 
     #[test]
