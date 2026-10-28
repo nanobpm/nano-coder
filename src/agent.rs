@@ -3146,14 +3146,20 @@ impl Agent {
         self.sync_claude_hook_session();
         self.apply_mode_to_system_prompt();
         self.turn_history_calls = 0;
-        self.edits_since_check = false;
-        self.verify_reminder_fired = false;
         // Log size before this turn's records: the session-index update in
         // `finish_turn` folds the input records committed by this turn into
         // the cached summary (from the log's tail) instead of rescanning the
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // Verify-before-complete state (issue #68) is per *input*, not per
+        // `run_turn` call: a resumed input keeps its unchecked-edit flag and
+        // spent reminder, so a retry after a failure cannot forget an edit or
+        // re-fire the reminder. Only a new input starts clean.
+        if resuming.is_none() {
+            self.edits_since_check = false;
+            self.verify_reminder_fired = false;
+        }
         // Where a resumed turn's input sits, so after the replay shortcuts
         // below we can rebuild any in-flight output-limit continuation state
         // from the messages logged before the interrupt (issue #114).
@@ -4187,7 +4193,9 @@ impl Agent {
                 // successful edit counts — a failed write changed nothing.
                 if ok && matches!(tool_call.name.as_str(), "write_file" | "edit_file") {
                     self.edits_since_check = true;
-                } else if tool_call.name == "bash" {
+                } else if dispatched && tool_call.name == "bash" {
+                    // Only a bash call that actually ran counts as a check (even
+                    // one that failed); a denied/malformed one never ran.
                     self.edits_since_check = false;
                 }
                 // A non-image binary file takes read_file's generic "looks
@@ -10400,6 +10408,38 @@ mod tests {
         assert!(!text.contains(goal::VERIFY_REMINDER), "a bash check clears the edit: {text}");
         assert!(text.contains("Recorded outcome"), "accepted: {text}");
         assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_a_rejected_bash_is_still_reminded() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then a malformed (never-run) bash, then completed: still reminded.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall::from_raw_arguments("b1".into(), "bash".into(), r#"{"command":"cargo te"#, None),
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+        let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(text.contains(goal::VERIFY_REMINDER), "a bash call that never ran is no check: {text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
