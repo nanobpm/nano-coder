@@ -1180,19 +1180,38 @@ mod tests {
 
         // A *root-relative* rule keyed on the resolved tree
         // (`Read(real/secret.txt)`, matched against the path stripped of the
-        // working directory) must hold when the same tree is walked through
-        // the alias: the resolved view is also stripped of the resolved root.
+        // working directory) still holds when the same tree is walked through
+        // the alias: the resolved view is stripped of the (resolved) cwd, so
+        // the same `real/secret.txt` relative form is produced.
         let policy = policy_with_deny(&["Read(real/secret.txt)"]);
         let out = text_out(
             grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
         );
-        assert_eq!(out, "alias/open.txt", "root-relative resolved rule bypassed via alias: {out}");
+        assert_eq!(out, "alias/open.txt", "cwd-relative resolved rule bypassed via alias: {out}");
         // …and a relative rule keyed on the alias view still applies.
         let policy = policy_with_deny(&["Read(alias/secret.txt)"]);
         let out = text_out(
             grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
         );
         assert_eq!(out, "alias/open.txt", "root-relative alias rule not honoured: {out}");
+
+        // A cwd-relative rule must NOT be re-anchored to the resolved root.
+        // `Read(other/secret.txt)` denies nothing under `real/`; if the
+        // resolved view were also stripped of the resolved root, walking
+        // through `alias -> real` would produce the root-relative
+        // `secret.txt`, which no cwd-relative form of `real/secret.txt` ever
+        // yields — but the broader re-anchoring class (e.g. a `Read(**/…)` or
+        // root-relative strip) would let a rule keyed on one tree hide files
+        // in another reached through an alias. Assert the alias walk is
+        // unaffected by a rule that only names a sibling tree.
+        let policy = policy_with_deny(&["Read(other/secret.txt)"]);
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(
+            out, "alias/open.txt\nalias/secret.txt",
+            "unrelated cwd-relative rule leaked into the alias walk: {out}"
+        );
     }
 
     #[cfg(unix)]

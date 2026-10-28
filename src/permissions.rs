@@ -489,7 +489,11 @@ pub(crate) struct ReadDenyScan<'a> {
     /// only in the *alias* view: `alias/secret.txt` never textually contains
     /// the denied `/real/tree/secret.txt`, so a `Read(/real/tree/**)` rule
     /// would be bypassed. Checking each candidate in the resolved view too
-    /// preserves deny semantics without a per-entry canonicalize.
+    /// preserves deny semantics without a per-entry canonicalize. The resolved
+    /// view is matched against the rule pattern and the two cwd-relative
+    /// strips only — never re-anchored to the resolved root — so a
+    /// cwd-relative rule is not broadened to other directories that happen to
+    /// be reached through an alias.
     root_normalized: PathBuf,
     root_resolved: PathBuf,
 }
@@ -535,15 +539,6 @@ impl ReadDenyScan<'_> {
                 || (self.cwd_resolved != self.cwd_normalized
                     && candidate
                         .strip_prefix(&self.cwd_resolved)
-                        .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
-                // A rule keyed on the *resolved* root (`Read(/real/tree/**)`
-                // with the walk rooted at `alias -> /real/tree`) must match
-                // resolved candidates relative to that root too; the lexical
-                // strip-prefixes above can never produce `secret.txt` from
-                // `/real/tree/secret.txt` when cwd differs from the root.
-                || (self.root_resolved != self.root_normalized
-                    && candidate
-                        .strip_prefix(&self.root_resolved)
                         .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
         };
         self.patterns.iter().any(|pattern| match pattern {
