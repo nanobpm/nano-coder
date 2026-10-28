@@ -328,6 +328,11 @@ struct FrameState {
     /// preceding `TextDelta` already finalized, which would otherwise duplicate
     /// the reasoning line. Reset at each turn/message boundary.
     think_streamed: bool,
+    /// Indices of the `Item::Thinking` items finalized from streamed deltas in
+    /// the current response (reasoning may interleave with answer deltas, so
+    /// there can be several). The trailing authoritative `Thinking` event
+    /// reconciles exactly these — never a previous response's item.
+    think_items: Vec<usize>,
     /// Ctrl-O expanded the reasoning block that is still streaming (`think`):
     /// its text is drawn live under the transcript, and the finished
     /// [`Item::Thinking`] inherits the flag.
@@ -395,6 +400,7 @@ impl Renderer {
             stream: None,
             think: None,
             think_streamed: false,
+            think_items: Vec::new(),
             think_expanded: false,
             prompt_stamp: stamp(),
             busy: None,
@@ -533,6 +539,7 @@ impl Renderer {
     fn frame_finish_stream(&self, fs: &mut FrameState) {
         fs.stream = None;
         fs.think_streamed = false;
+        fs.think_items.clear();
         if let Some((text, started)) = fs.think.take() {
             let text = text.trim();
             if !text.is_empty() {
@@ -566,6 +573,7 @@ impl Renderer {
         // reply streams its own.
         fs.think = None;
         fs.think_streamed = false;
+        fs.think_items.clear();
         fs.think_expanded = false;
     }
 
@@ -577,52 +585,90 @@ impl Renderer {
                 fs.think.get_or_insert_with(|| (String::new(), Instant::now())).0.push_str(text);
             }
             AgentEvent::Thinking { text } => {
-                match fs.think.take() {
-                    // Reasoning streamed as deltas but was not yet finalized by
-                    // a `TextDelta` (e.g. reasoning-only, or the answer is not
-                    // streamed): emit its summary now.
-                    Some((_, started)) => {
-                        let chars = text.trim().chars().count();
-                        if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking {
-                                chars,
-                                seconds: started.elapsed().as_secs_f64(),
-                                text: text.trim().to_string(),
-                                expanded: std::mem::take(&mut fs.think_expanded),
-                            }));
+                let full = text.trim();
+                if !fs.think_streamed {
+                    // Non-streamed block delivered whole — emit it.
+                    fs.think = None;
+                    if !full.is_empty() {
+                        fs.items.push(stamped(Item::Thinking {
+                            chars: full.chars().count(),
+                            seconds: 0.0,
+                            text: full.to_string(),
+                            expanded: false,
+                        }));
+                        fs.touch_transcript();
+                    }
+                } else {
+                    // Deltas streamed this response. This event carries the
+                    // authoritative full reasoning (a mid-reasoning `/verbosity`
+                    // change can leave the streamed copy truncated, and
+                    // interleaved reasoning may have been split across several
+                    // items). Reconcile every item of *this* response into one.
+                    let pending = fs.think.take();
+                    let mut idx = std::mem::take(&mut fs.think_items);
+                    idx.sort_unstable();
+                    let mut expanded = std::mem::take(&mut fs.think_expanded);
+                    let mut seconds = pending.as_ref().map_or(0.0, |(_, s)| s.elapsed().as_secs_f64());
+                    // Drop all but the first item (highest index first so the
+                    // lower indices stay valid), shifting `fs.stream` down.
+                    for &i in idx.iter().skip(1).rev() {
+                        if fs.items.get(i).is_some_and(|it| matches!(it.item, Item::Thinking { .. })) {
+                            if let Item::Thinking { expanded: e, seconds: s, .. } = &fs.items[i].item {
+                                expanded |= *e;
+                                seconds += *s;
+                            }
+                            fs.items.remove(i);
+                            if let Some(st) = fs.stream.as_mut()
+                                && *st > i
+                            {
+                                *st -= 1;
+                            }
                             fs.touch_transcript();
                         }
                     }
-                    // No pending reasoning. If deltas streamed this turn, a
-                    // preceding `TextDelta` already finalized the summary, so
-                    // skip to avoid duplicating it. Otherwise this is a
-                    // non-streamed block delivered whole — emit it.
-                    None if !fs.think_streamed => {
-                        let chars = text.trim().chars().count();
-                        if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking {
-                                chars,
-                                seconds: 0.0,
-                                text: text.trim().to_string(),
-                                expanded: false,
-                            }));
+                    let first = idx
+                        .first()
+                        .copied()
+                        .filter(|&i| fs.items.get(i).is_some_and(|it| matches!(it.item, Item::Thinking { .. })));
+                    match first {
+                        Some(i) => {
+                            if let Item::Thinking { chars, text: stored, expanded: e, seconds: s } =
+                                &mut fs.items[i].item
+                            {
+                                if full.is_empty() {
+                                    // Keep what streamed rather than blanking it.
+                                } else if stored.as_str() != full {
+                                    *stored = full.to_string();
+                                    *chars = full.chars().count();
+                                }
+                                *e |= expanded;
+                                *s += seconds;
+                            }
                             fs.touch_transcript();
                         }
-                    }
-                    // Deltas streamed and a `TextDelta` already finalized the
-                    // summary. Reconcile it with this authoritative full text
-                    // (a mid-reasoning `/verbosity` change can leave the stored
-                    // copy truncated), keeping its expansion state.
-                    None => {
-                        let full = text.trim();
-                        if !full.is_empty()
-                            && let Some(StampedItem { item: Item::Thinking { chars, text: stored, .. }, .. }) =
-                                fs.items.iter_mut().rev().find(|i| matches!(i.item, Item::Thinking { .. }))
-                            && stored.as_str() != full
-                        {
-                            *stored = full.to_string();
-                            *chars = full.chars().count();
-                            fs.touch_transcript();
+                        None => {
+                            // Nothing finalized yet for this response (reasoning
+                            // only, or the streamed deltas were whitespace):
+                            // create the item rather than touching an older one.
+                            let fallback = pending.as_ref().map(|(t, _)| t.trim().to_string()).unwrap_or_default();
+                            let body = if full.is_empty() { fallback } else { full.to_string() };
+                            if !body.is_empty() {
+                                let item = stamped(Item::Thinking {
+                                    chars: body.chars().count(),
+                                    seconds,
+                                    text: body,
+                                    expanded,
+                                });
+                                // Order reasoning ahead of an in-flight answer.
+                                match fs.stream {
+                                    Some(st) if st < fs.items.len() => {
+                                        fs.items.insert(st, item);
+                                        fs.stream = Some(st + 1);
+                                    }
+                                    _ => fs.items.push(item),
+                                }
+                                fs.touch_transcript();
+                            }
                         }
                     }
                 }
@@ -650,6 +696,7 @@ impl Renderer {
                             text: think.to_string(),
                             expanded: std::mem::take(&mut fs.think_expanded),
                         }));
+                        fs.think_items.push(fs.items.len() - 1);
                         fs.touch_transcript();
                     }
                 }
@@ -2377,6 +2424,53 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(texts, vec![("pondering the whole plan".to_string(), 24)]);
+    }
+
+    fn thinking_texts(r: &Renderer) -> Vec<String> {
+        r.frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trailing_thinking_merges_interleaved_reasoning_fragments() {
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ThinkingDelta { text: "first " });
+        r.event(&AgentEvent::TextDelta { text: "A" });
+        r.event(&AgentEvent::ThinkingDelta { text: "second" });
+        r.event(&AgentEvent::TextDelta { text: "B" });
+        r.event(&AgentEvent::Thinking { text: "first second" });
+        assert_eq!(thinking_texts(&r), vec!["first second".to_string()]);
+        let items = r.frame_items();
+        let msgs: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs, vec!["AB".to_string()]);
+        r.event(&AgentEvent::TextDelta { text: "C" });
+        assert!(r.frame_items().iter().any(|i| matches!(&i.item, Item::Message { text, .. } if text == "ABC")));
+    }
+
+    #[test]
+    fn trailing_thinking_never_overwrites_previous_response_reasoning() {
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ThinkingDelta { text: "old" });
+        r.event(&AgentEvent::TextDelta { text: "One." });
+        r.event(&AgentEvent::Thinking { text: "old" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "One." });
+        // Next response: reasoning deltas are only whitespace, so no item is
+        // finalized before the answer starts.
+        r.event(&AgentEvent::ThinkingDelta { text: "  " });
+        r.event(&AgentEvent::TextDelta { text: "Two." });
+        r.event(&AgentEvent::Thinking { text: "new reasoning" });
+        assert_eq!(thinking_texts(&r), vec!["old".to_string(), "new reasoning".to_string()]);
     }
 
     #[test]

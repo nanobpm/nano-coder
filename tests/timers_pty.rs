@@ -329,9 +329,12 @@ fn ctrl_o_expands_the_latest_tool_result_in_place() {
     // The mock runs `ls -la` in the repo root: collapsed, only the first row
     // and a "+N lines" count are shown.
     pty.send("list files\n");
-    let screen = pty.wait_for("lines)", Duration::from_secs(20));
+    // Wait for the turn to finish (idle prompt), not a fixed sleep. The mock's
+    // follow-up reply echoes only the result's first line, so `Cargo.toml` can
+    // appear on screen only via the expanded tool-result block.
+    pty.wait_for("lines)", Duration::from_secs(20));
+    let screen = pty.wait_for("ready · type a message", Duration::from_secs(20));
     assert!(!screen.contains("Cargo.toml"), "collapsed result shows only its first line: {screen}");
-    std::thread::sleep(Duration::from_millis(500));
 
     pty.send("\x0f");
     let screen = pty.wait_for("Cargo.toml", Duration::from_secs(10));
