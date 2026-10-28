@@ -21,7 +21,7 @@ cargo install nano-coder             # or build from source
 - **Lifecycle Hooks**: 6 internal hook events for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
+- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
 - **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -59,7 +59,7 @@ show in the same list (marked `steer`, with the id from the `↪ steer #N` note)
 be withdrawn or rewritten before the agent's next step. A queued message is never injected while the agent is
 asking for input (the `question` tool's picker owns the terminal until you answer).
 Slash commands work mid-turn too, where it is safe:
-- **Right away:** read-only ones (`/help`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
+- **Right away:** read-only ones (`/help`, `/version`, `/tools`, `/skills`, `/providers`, `/session`, `/plan`,
   `/context`, `/trajectory` (`--json`/`--markdown`), and `/mode` or `/verbosity` without an
   argument) show the current state. `/plan` shows the plan as the agent updates it.
 - **From the agent's next step:** `/mode NAME` applies when the agent takes its next step.
@@ -391,6 +391,7 @@ argument set (`/model`, `/mode`, `/verbosity`, `/thinking`) get the same treatme
 argument: a type-ahead list narrows as you type and Tab completes it.
 
 - `/help` - Show available commands
+- `/version` - Show the nano-coder version (the same string `nano-coder --version` prints)
 - `/compact [--smart|--standard] [focus]` - Summarize older messages with the current model,
   keeping the latest message. `--smart` / `--standard` override `compaction_mode` for this
   compaction (see [Smart compaction](#smart-compaction-experimental)). Optional text tells the
