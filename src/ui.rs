@@ -698,8 +698,8 @@ impl Renderer {
             }
             AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
             AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
-                let _ = call;
                 fs.items.push(stamped(Item::ToolResult {
+                    call_id: call.id.clone(),
                     ok: false,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
@@ -738,6 +738,7 @@ impl Renderer {
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
                 fs.items.push(stamped(Item::ToolCall {
+                    call_id: call.id.clone(),
                     name: call.name.clone(),
                     summary: tool_summary_text(call),
                     args: tool_args_text(call),
@@ -745,12 +746,16 @@ impl Renderer {
                 }));
                 fs.touch_transcript();
             }
-            AgentEvent::ToolResult { ok, output, .. } => {
+            AgentEvent::ToolResult { call, ok, output } => {
+                // A result arriving after Ctrl-O expanded its call inherits the
+                // call's expansion state, so the pair stays in step.
+                let expanded = frame::expanded_state_of_call(&fs.items, &call.id).unwrap_or(false);
                 fs.items.push(stamped(Item::ToolResult {
+                    call_id: call.id.clone(),
                     ok: *ok,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
-                    expanded: false,
+                    expanded,
                 }));
                 fs.touch_transcript();
             }
@@ -1564,8 +1569,13 @@ fn tool_summary(call: &ToolCall, width: usize) -> String {
 /// The raw one-line argument summary for a tool call (no colour, no fitting),
 /// for the frame renderer's [`Item::ToolCall`](crate::frame::Item).
 /// The full tool arguments, pretty-printed, for an expanded
-/// [`Item::ToolCall`](crate::frame::Item).
+/// [`Item::ToolCall`](crate::frame::Item). Malformed or truncated argument
+/// text (kept verbatim in [`ToolCall::malformed_arguments`], with `arguments`
+/// left empty) is shown as-is so a failed call still displays its full input.
 pub fn tool_args_text(call: &ToolCall) -> String {
+    if let Some(raw) = call.invalid_arguments() {
+        return raw.to_string();
+    }
     match &call.arguments {
         Value::String(raw) => raw.clone(),
         Value::Object(args) if args.is_empty() => String::new(),
@@ -2487,6 +2497,67 @@ pub(crate) mod tests {
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");
+    }
+
+    #[test]
+    fn tool_args_text_keeps_malformed_arguments_verbatim() {
+        // A truncated/malformed argument stream leaves `arguments` empty and
+        // records the raw text in `malformed_arguments`; expanding the failed
+        // call must show that original input, not nothing.
+        let call = ToolCall::from_raw_arguments("c1".into(), "bash".into(), "{\"command\": \"ls\",", None);
+        assert!(call.invalid_arguments().is_some());
+        assert_eq!(tool_args_text(&call), "{\"command\": \"ls\",");
+        // Well-formed calls still pretty-print; an empty object stays empty.
+        let ok = ToolCall {
+            id: "c2".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert_eq!(tool_args_text(&ok), "{\n  \"command\": \"ls\"\n}");
+        let empty = ToolCall { arguments: json!({}), ..ok.clone() };
+        assert_eq!(tool_args_text(&empty), "");
+    }
+
+    #[test]
+    fn tool_result_inherits_expansion_from_its_call() {
+        // ToolCall → Ctrl-O → ToolResult → Ctrl-O: the result arrives expanded
+        // because its call is expanded, and the next Ctrl-O collapses the pair
+        // instead of re-expanding the result.
+        let _guard = verbosity_lock();
+        let r = Renderer::frame_for_test();
+        let call = ToolCall {
+            id: "call_9".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        r.event(&AgentEvent::ToolCall { call: &call });
+        r.toggle_latest();
+        r.event(&AgentEvent::ToolResult { call: &call, ok: true, output: "file-a\nfile-b" });
+        let items = r.frame_items();
+        let expanded: Vec<bool> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expanded, [true, true], "result inherits the call's expansion: {items:?}");
+        // The next Ctrl-O targets the result (the latest item) and collapses
+        // the whole pair.
+        r.toggle_latest();
+        let expanded: Vec<bool> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expanded, [false, false]);
     }
 
     #[test]
