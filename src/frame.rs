@@ -53,13 +53,15 @@ pub enum Role {
 pub enum Item {
     /// A user or assistant message (plain text, wrapped to width).
     Message { role: Role, text: String },
-    /// A finished reasoning block, shown collapsed as a one-line summary.
-    Thinking { chars: usize, seconds: f64 },
-    /// A tool invocation: the tool name and a one-line argument summary.
-    ToolCall { name: String, summary: String },
+    /// A finished reasoning block, shown collapsed as a one-line summary, or
+    /// with its full `text` when `expanded` (Ctrl-O).
+    Thinking { chars: usize, seconds: f64, text: String, expanded: bool },
+    /// A tool invocation: the tool name and a one-line argument summary, plus
+    /// the full (pretty-printed) arguments shown when `expanded` (Ctrl-O).
+    ToolCall { name: String, summary: String, args: String, expanded: bool },
     /// A tool result: its first line plus a "+N lines" count (or a preview
-    /// when `verbose`).
-    ToolResult { ok: bool, output: String, verbose: bool },
+    /// when `verbose`); every line when `expanded` (Ctrl-O).
+    ToolResult { ok: bool, output: String, verbose: bool, expanded: bool },
     /// The current plan checklist.
     Plan(Plan),
     /// A short diagnostic / lifecycle note.
@@ -147,15 +149,30 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
                 )
                 .collect()
         }
-        Item::Thinking { chars, seconds } => {
-            vec![fit(&format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"), width)]
+        Item::Thinking { chars, seconds, text, expanded } => {
+            let mut out =
+                vec![fit(&format!("{THINK}∴ Thought for {seconds:.1}s{RESET}{DIM} · {chars} chars{RESET}"), width)];
+            if *expanded {
+                out.extend(expanded_body(text, width, THINK));
+            }
+            out
         }
-        Item::ToolCall { name, summary } => {
+        Item::ToolCall { name, summary, args, expanded } => {
             let used = name.chars().count() + 4;
             let summary = fit(summary, width.saturating_sub(used));
-            vec![fit(&format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"), width)]
+            let mut out = vec![fit(&format!("{GREEN}●{RESET} {BOLD}{name}{RESET} {DIM}{summary}{RESET}"), width)];
+            if *expanded {
+                out.extend(expanded_body(args, width, DIM));
+            }
+            out
         }
-        Item::ToolResult { ok, output, verbose } => tool_result_lines(*ok, output, *verbose, width),
+        Item::ToolResult { ok, output, verbose, expanded } => {
+            if *expanded {
+                expanded_result_lines(*ok, output, width)
+            } else {
+                tool_result_lines(*ok, output, *verbose, width)
+            }
+        }
         Item::Plan(plan) => plan_lines(plan, width),
         Item::Note(text) | Item::OutcomeMark(text) => {
             wrap_block(text, width).into_iter().map(|line| format!("{DIM}{line}{RESET}")).collect()
@@ -166,6 +183,68 @@ pub fn render_item(item: &Item, width: usize) -> Vec<String> {
         // byte-exact too.
         Item::Raw(text) => text.split('\n').map(str::to_string).collect(),
     }
+}
+
+/// Render a sanitized, fully wrapped body (expanded thinking text or tool
+/// arguments) indented under its header row, in `color`. Folding happens here,
+/// at render time, so an expanded item reflows on resize like any other.
+pub(crate) fn expanded_body(text: &str, width: usize, color: &str) -> Vec<String> {
+    let inner = width.saturating_sub(4).max(1);
+    let clean: Vec<String> = text.trim().lines().map(crate::sanitize_terminal_line).collect();
+    if clean.is_empty() {
+        return Vec::new();
+    }
+    wrap_block(&clean.join("\n"), inner)
+        .into_iter()
+        .map(|line| fit(&format!("    {color}{line}{RESET}"), width))
+        .collect()
+}
+
+/// A tool result with every line shown (wrapped, never truncated).
+fn expanded_result_lines(ok: bool, output: &str, width: usize) -> Vec<String> {
+    let clean: Vec<String> = output.trim_end().lines().map(crate::sanitize_terminal_line).collect();
+    let (mark, color) = if ok { ("⎿", DIM) } else { ("⎿ error:", RED) };
+    if clean.is_empty() {
+        return vec![fit(&format!("  {color}{mark} (no output){RESET}"), width)];
+    }
+    let lead = mark.chars().count() + 3;
+    let body = width.saturating_sub(lead).max(1);
+    let pad = " ".repeat(lead);
+    wrap_block(&clean.join("\n"), body)
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let row =
+                if i == 0 { format!("  {color}{mark} {line}{RESET}") } else { format!("{pad}{color}{line}{RESET}") };
+            fit(&row, width)
+        })
+        .collect()
+}
+
+/// Toggle the expansion of the latest collapsible item in `items` (a tool
+/// call/result pair or a thinking block). Returns whether anything changed.
+pub fn toggle_latest(items: &mut [StampedItem]) -> bool {
+    let Some(i) = items
+        .iter()
+        .rposition(|si| matches!(si.item, Item::Thinking { .. } | Item::ToolCall { .. } | Item::ToolResult { .. }))
+    else {
+        return false;
+    };
+    match &mut items[i].item {
+        Item::Thinking { expanded, .. } | Item::ToolCall { expanded, .. } => *expanded = !*expanded,
+        Item::ToolResult { expanded, .. } => {
+            let next = !*expanded;
+            *expanded = next;
+            // Keep the call's arguments in step with its result.
+            if i > 0
+                && let Item::ToolCall { expanded, .. } = &mut items[i - 1].item
+            {
+                *expanded = next;
+            }
+        }
+        _ => unreachable!(),
+    }
+    true
 }
 
 fn tool_result_lines(ok: bool, output: &str, verbose: bool, width: usize) -> Vec<String> {
@@ -810,6 +889,79 @@ mod tests {
         out
     }
 
+    fn expandable_items() -> Vec<StampedItem> {
+        let s = |item| StampedItem { stamp: String::new(), item };
+        vec![
+            s(Item::Thinking { chars: 11, seconds: 1.5, text: "first idea\nsecond".into(), expanded: false }),
+            s(Item::ToolCall {
+                name: "bash".into(),
+                summary: "ls".into(),
+                args: "{\n  \"command\": \"ls\"\n}".into(),
+                expanded: false,
+            }),
+            s(Item::ToolResult {
+                ok: true,
+                output: (1..=15).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n"),
+                verbose: false,
+                expanded: false,
+            }),
+        ]
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_latest_tool_call_and_result_in_place() {
+        let mut items = expandable_items();
+        let collapsed: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert_eq!(collapsed.len(), 3, "{collapsed:?}");
+        assert!(collapsed[2].contains("row 1 (+14 lines)"), "{collapsed:?}");
+
+        assert!(toggle_latest(&mut items));
+        let expanded: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        // Thinking stays collapsed; the call shows its arguments, the result every row.
+        assert_eq!(expanded[0], collapsed[0]);
+        assert!(expanded.iter().any(|l| l.contains("\"command\": \"ls\"")), "{expanded:?}");
+        for i in 1..=15 {
+            assert!(expanded.iter().any(|l| l.trim_end().ends_with(&format!("row {i}"))), "row {i}: {expanded:?}");
+        }
+        assert!(!expanded.iter().any(|l| l.contains("+14 lines")));
+        // Expanded content is folded at render time, so it reflows at any width.
+        for w in [12, 20, 80] {
+            assert!(transcript_lines(&items, w).iter().all(|l| visible_width(l) <= w), "width {w}");
+        }
+
+        assert!(toggle_latest(&mut items));
+        let again: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert_eq!(again, collapsed);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_the_latest_thinking_block() {
+        let mut items = expandable_items();
+        items.truncate(1);
+        assert_eq!(transcript_lines(&items, 40).len(), 1);
+        assert!(toggle_latest(&mut items));
+        let lines: Vec<String> = transcript_lines(&items, 40).iter().map(|l| strip(l)).collect();
+        assert!(lines[0].contains("Thought for 1.5s"));
+        assert_eq!(lines[1].trim(), "first idea");
+        assert_eq!(lines[2].trim(), "second");
+        assert!(!toggle_latest(&mut Vec::new()));
+    }
+
+    #[test]
+    fn expanded_content_is_sanitized() {
+        let mut items = vec![StampedItem {
+            stamp: String::new(),
+            item: Item::ToolResult {
+                ok: true,
+                output: "a\nb\x1b]0;pwn\x07\x1b[2J".into(),
+                verbose: false,
+                expanded: false,
+            },
+        }];
+        toggle_latest(&mut items);
+        assert!(transcript_lines(&items, 40).iter().all(|l| !l.contains("\x1b]") && !l.contains("[2J")));
+    }
+
     #[test]
     fn sanitize_rejects_malformed_sgr_parameters() {
         // A CSI sequence that ends in `m` but hides a control byte in its
@@ -1030,11 +1182,18 @@ mod tests {
                 item: Item::ToolCall {
                     name: "bash".into(),
                     summary: "ls -la /some/very/long/path/that/overflows".into(),
+                    args: String::new(),
+                    expanded: false,
                 },
             },
             StampedItem {
                 stamp: format!("{DIM}12:34:56{RESET} "),
-                item: Item::ToolResult { ok: true, output: "line1\nline2\nline3".into(), verbose: false },
+                item: Item::ToolResult {
+                    ok: true,
+                    output: "line1\nline2\nline3".into(),
+                    verbose: false,
+                    expanded: false,
+                },
             },
             StampedItem {
                 stamp: String::new(),
@@ -1045,7 +1204,8 @@ mod tests {
             assert!(visible_width(&line) <= 20, "{line:?} ({} cols)", visible_width(&line));
         }
         // The single-line tool result summarises the extra lines.
-        let result = render_item(&Item::ToolResult { ok: true, output: "a\nb\nc".into(), verbose: false }, 40);
+        let result =
+            render_item(&Item::ToolResult { ok: true, output: "a\nb\nc".into(), verbose: false, expanded: false }, 40);
         assert_eq!(result.len(), 1);
         assert!(strip(&result[0]).contains("(+2 lines)"));
     }
@@ -1058,7 +1218,8 @@ mod tests {
         // renderer's own styling first, then assert the content carries no raw
         // ESC/BEL of its own.
         let hostile = "note \x1b]0;pwned\x07 \x1b[2J done";
-        let out = render_item(&Item::ToolResult { ok: true, output: hostile.into(), verbose: true }, 120);
+        let out =
+            render_item(&Item::ToolResult { ok: true, output: hostile.into(), verbose: true, expanded: false }, 120);
         let content = strip(&out.join("\n"));
         assert!(!content.contains('\x1b'), "ESC survived the preview: {content:?}");
         assert!(!content.contains('\x07'), "BEL survived the preview: {content:?}");

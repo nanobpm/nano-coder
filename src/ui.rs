@@ -328,6 +328,10 @@ struct FrameState {
     /// preceding `TextDelta` already finalized, which would otherwise duplicate
     /// the reasoning line. Reset at each turn/message boundary.
     think_streamed: bool,
+    /// Ctrl-O expanded the reasoning block that is still streaming (`think`):
+    /// its text is drawn live under the transcript, and the finished
+    /// [`Item::Thinking`] inherits the flag.
+    think_expanded: bool,
     /// The timestamp shown on the editor prompt, captured when a fresh prompt
     /// starts and held stable while the user types. Regenerating it on every
     /// render (keystroke, live status tick) would make the prompt stamp — and
@@ -391,6 +395,7 @@ impl Renderer {
             stream: None,
             think: None,
             think_streamed: false,
+            think_expanded: false,
             prompt_stamp: stamp(),
             busy: None,
             transient: None,
@@ -427,6 +432,26 @@ impl Renderer {
             fs.queued = queued;
             fs.menu = menu.to_vec();
             self.frame_render(fs);
+        }
+    }
+
+    /// Ctrl-O: expand or collapse the latest collapsible transcript item (a
+    /// tool call/result pair or a thinking block) in place and redraw. While
+    /// reasoning is streaming, it toggles that live block instead. A no-op
+    /// outside frame mode (piped output has nothing to expand).
+    pub fn toggle_latest(&self) {
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            Self::frame_toggle(fs);
+            self.frame_render(fs);
+        }
+    }
+
+    fn frame_toggle(fs: &mut FrameState) {
+        if fs.think.is_some() {
+            fs.think_expanded = !fs.think_expanded;
+        } else if frame::toggle_latest(&mut fs.items) {
+            fs.touch_transcript();
         }
     }
 
@@ -483,6 +508,22 @@ impl Renderer {
             Some(text) => frame::transient_status(text, width),
             None => self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default(),
         };
+        // Reasoning that is still streaming, expanded with Ctrl-O, is drawn
+        // live under the transcript until it becomes an `Item::Thinking`.
+        let transcript = match &fs.think {
+            Some((text, started)) if fs.think_expanded => {
+                let mut lines = transcript;
+                let header = format!(
+                    "{}∴ Thinking… {:.1}s{RESET}",
+                    "\x1b[38;5;245m",
+                    now.saturating_duration_since(*started).as_secs_f64()
+                );
+                lines.push(frame::fit_line(&header, width));
+                lines.extend(frame::expanded_body(text, width, "\x1b[38;5;245m"));
+                lines
+            }
+            _ => transcript,
+        };
         let composed = frame::compose(&transcript, &editor, &status);
         let _ = fs.out.render(&composed, width, height);
     }
@@ -498,6 +539,8 @@ impl Renderer {
                 fs.items.push(stamped(Item::Thinking {
                     chars: text.chars().count(),
                     seconds: started.elapsed().as_secs_f64(),
+                    text: text.to_string(),
+                    expanded: std::mem::take(&mut fs.think_expanded),
                 }));
                 fs.touch_transcript();
             }
@@ -523,6 +566,7 @@ impl Renderer {
         // reply streams its own.
         fs.think = None;
         fs.think_streamed = false;
+        fs.think_expanded = false;
     }
 
     /// Map an agent event onto the transcript and re-render (frame mode).
@@ -540,7 +584,12 @@ impl Renderer {
                     Some((_, started)) => {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() }));
+                            fs.items.push(stamped(Item::Thinking {
+                                chars,
+                                seconds: started.elapsed().as_secs_f64(),
+                                text: text.trim().to_string(),
+                                expanded: std::mem::take(&mut fs.think_expanded),
+                            }));
                             fs.touch_transcript();
                         }
                     }
@@ -551,7 +600,12 @@ impl Renderer {
                     None if !fs.think_streamed => {
                         let chars = text.trim().chars().count();
                         if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking { chars, seconds: 0.0 }));
+                            fs.items.push(stamped(Item::Thinking {
+                                chars,
+                                seconds: 0.0,
+                                text: text.trim().to_string(),
+                                expanded: false,
+                            }));
                             fs.touch_transcript();
                         }
                     }
@@ -578,6 +632,8 @@ impl Renderer {
                         fs.items.push(stamped(Item::Thinking {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
+                            text: think.to_string(),
+                            expanded: std::mem::take(&mut fs.think_expanded),
                         }));
                         fs.touch_transcript();
                     }
@@ -647,6 +703,7 @@ impl Renderer {
                     ok: false,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
+                    expanded: false,
                 }));
                 fs.touch_transcript();
             }
@@ -680,7 +737,12 @@ impl Renderer {
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(stamped(Item::ToolCall { name: call.name.clone(), summary: tool_summary_text(call) }));
+                fs.items.push(stamped(Item::ToolCall {
+                    name: call.name.clone(),
+                    summary: tool_summary_text(call),
+                    args: tool_args_text(call),
+                    expanded: false,
+                }));
                 fs.touch_transcript();
             }
             AgentEvent::ToolResult { ok, output, .. } => {
@@ -688,6 +750,7 @@ impl Renderer {
                     ok: *ok,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
+                    expanded: false,
                 }));
                 fs.touch_transcript();
             }
@@ -1500,6 +1563,16 @@ fn tool_summary(call: &ToolCall, width: usize) -> String {
 
 /// The raw one-line argument summary for a tool call (no colour, no fitting),
 /// for the frame renderer's [`Item::ToolCall`](crate::frame::Item).
+/// The full tool arguments, pretty-printed, for an expanded
+/// [`Item::ToolCall`](crate::frame::Item).
+pub fn tool_args_text(call: &ToolCall) -> String {
+    match &call.arguments {
+        Value::String(raw) => raw.clone(),
+        Value::Object(args) if args.is_empty() => String::new(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 pub fn tool_summary_text(call: &ToolCall) -> String {
     let text = match &call.arguments {
         Value::Object(args) => ["command", "path", "file_path", "pattern", "url", "text"]

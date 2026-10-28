@@ -316,3 +316,40 @@ fn a_stale_ctrl_c_exit_hint_clears_itself_while_a_timer_is_pending() {
         "the pending timer must not have fired while we only waited out the exit window"
     );
 }
+
+/// Ctrl-O (issue #136) expands the latest tool result in place at the idle
+/// prompt, on the real binary in a PTY.
+#[test]
+fn ctrl_o_expands_the_latest_tool_result_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let pty = Pty::spawn(&["--model", "mock/test", "--config", config.to_str().unwrap()]);
+    pty.wait_for("mock/test", Duration::from_secs(15));
+
+    // The mock runs `ls -la` in the repo root: collapsed, only the first row
+    // and a "+N lines" count are shown.
+    pty.send("list files\n");
+    let screen = pty.wait_for("lines)", Duration::from_secs(20));
+    assert!(!screen.contains("Cargo.toml"), "collapsed result shows only its first line: {screen}");
+    std::thread::sleep(Duration::from_millis(500));
+
+    pty.send("\x0f");
+    let screen = pty.wait_for("Cargo.toml", Duration::from_secs(10));
+    assert!(screen.contains("\"command\": \"ls -la\""), "expanded call shows its arguments: {screen}");
+    assert_eq!(screen.matches("Cargo.toml").count(), 1, "no reprint/duplication: {screen}");
+}
+
+/// Ctrl-O expands the latest thinking block to show the reasoning text.
+#[test]
+fn ctrl_o_expands_the_latest_thinking_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let pty = Pty::spawn(&["--model", "mock/test", "--config", config.to_str().unwrap()]);
+    pty.wait_for("mock/test", Duration::from_secs(15));
+
+    pty.send("think about it\n");
+    let screen = pty.wait_for("Thought for", Duration::from_secs(20));
+    assert!(!screen.contains("restate the problem"), "{screen}");
+    pty.send("\x0f");
+    pty.wait_for("restate the problem", Duration::from_secs(10));
+}
