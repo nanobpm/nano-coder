@@ -314,7 +314,15 @@ impl Policy {
         if patterns.is_empty() {
             return None;
         }
-        Some(ReadDenyScan { patterns, cwd_normalized: normalize(cwd), cwd_resolved: resolve_symlinks(cwd) })
+        Some(ReadDenyScan {
+            patterns,
+            cwd_normalized: normalize(cwd),
+            cwd_resolved: resolve_symlinks(cwd),
+            // Until `for_root` sets them, the root is the working directory
+            // itself (the search tools' default root).
+            root_normalized: normalize(cwd),
+            root_resolved: resolve_symlinks(cwd),
+        })
     }
 
     fn read_deny_rule(&self, path: &Path, cwd: &Path) -> Option<&Rule> {
@@ -474,15 +482,51 @@ pub(crate) struct ReadDenyScan<'a> {
     patterns: Vec<Option<&'a Regex>>,
     cwd_normalized: PathBuf,
     cwd_resolved: PathBuf,
+    /// The search root's lexical and symlink-resolved forms, set by
+    /// [`ReadDenyScan::for_root`]. The walker never follows symlinked
+    /// *entries*, but a root named explicitly by the caller may itself be a
+    /// symlink (`alias -> /real/tree`), and then every walked path is lexical
+    /// only in the *alias* view: `alias/secret.txt` never textually contains
+    /// the denied `/real/tree/secret.txt`, so a `Read(/real/tree/**)` rule
+    /// would be bypassed. Checking each candidate in the resolved view too
+    /// preserves deny semantics without a per-entry canonicalize.
+    root_normalized: PathBuf,
+    root_resolved: PathBuf,
 }
 
 impl ReadDenyScan<'_> {
+    /// Set the search root this scan filters. `root` is the filesystem path
+    /// the walk starts from (already joined against `cwd`); it is resolved
+    /// once here rather than per walked entry.
+    pub(crate) fn for_root(mut self, root: &Path) -> Self {
+        self.root_normalized = normalize(root);
+        self.root_resolved = resolve_symlinks(root);
+        self
+    }
+
     /// Whether a Read-deny rule covers `path` or any of its ancestors. The
     /// candidate is normalized lexically (no `canonicalize`), so this is
     /// valid only for paths that cannot contain a symlink component — the
-    /// search walker's guarantee, since it never follows symlinks.
+    /// search walker's guarantee for every entry *below* the root. The root
+    /// itself may be a symlink, so each candidate is also judged in the
+    /// root's resolved view (see the struct docs).
     pub(crate) fn denied(&self, path: &Path) -> bool {
         let absolute = normalize(&self.cwd_normalized.join(path));
+        // The same candidate with the search-root prefix resolved through
+        // symlinks (`alias/secret.txt` -> `/real/tree/secret.txt`), built from
+        // the precomputed resolved root — no filesystem access per call.
+        let resolved;
+        let mut candidates: Vec<&Path> = vec![&absolute];
+        if self.root_resolved != self.root_normalized
+            && let Ok(rest) = absolute.strip_prefix(&self.root_normalized)
+        {
+            // `normalize` collapses the trailing empty component a `join("")`
+            // leaves when `rest` is empty (the candidate *is* the root):
+            // `ancestors()` skips that component, so the root itself would
+            // otherwise go unchecked in the resolved view.
+            resolved = normalize(&self.root_resolved.join(rest));
+            candidates = vec![&absolute, &resolved];
+        }
         let matches = |pattern: &Regex, candidate: &Path| {
             pattern.is_match(&candidate.to_string_lossy())
                 || candidate
@@ -492,10 +536,21 @@ impl ReadDenyScan<'_> {
                     && candidate
                         .strip_prefix(&self.cwd_resolved)
                         .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
+                // A rule keyed on the *resolved* root (`Read(/real/tree/**)`
+                // with the walk rooted at `alias -> /real/tree`) must match
+                // resolved candidates relative to that root too; the lexical
+                // strip-prefixes above can never produce `secret.txt` from
+                // `/real/tree/secret.txt` when cwd differs from the root.
+                || (self.root_resolved != self.root_normalized
+                    && candidate
+                        .strip_prefix(&self.root_resolved)
+                        .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
         };
         self.patterns.iter().any(|pattern| match pattern {
             None => true,
-            Some(pattern) => absolute.ancestors().any(|candidate| matches(pattern, candidate)),
+            Some(pattern) => {
+                candidates.iter().any(|base| base.ancestors().any(|candidate| matches(pattern, candidate)))
+            }
         })
     }
 }

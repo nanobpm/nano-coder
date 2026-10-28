@@ -8,7 +8,9 @@
 //! size) unchanged. Behavior:
 //! * `.git` directories and symlinked entries are never followed, so a walk
 //!   cannot loop or escape the search root through a link. A search root
-//!   named explicitly is used as given.
+//!   named explicitly is used as given — and judged in both its lexical and
+//!   symlink-resolved views, so a symlinked root cannot smuggle denied files
+//!   past a `Read(...)` rule.
 //! * `.gitignore` files from the search root downward are honored with a
 //!   documented subset of gitignore syntax: comments, `!` negation,
 //!   trailing-`/` directory patterns, patterns with a `/` anchored to the
@@ -241,10 +243,9 @@ struct FileMatches {
 /// Unreadable, oversized and binary files yield no matches: one bad file
 /// should not fail a whole search.
 fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: bool) -> FileMatches {
-    let mut found = FileMatches::default();
-    let Ok(file) = File::open(path) else { return found };
+    let Ok(file) = File::open(path) else { return FileMatches::default() };
     if file.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
-        return found;
+        return FileMatches::default();
     }
     // The stat check above only covers the size at open time: a file that
     // keeps growing (an appended log) or one long unterminated line would
@@ -254,7 +255,24 @@ fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: boo
     // plain `read_until` loop below would buffer cap + line before the
     // discard decision. A file that ends exactly at the take boundary is
     // caught after the loop via the take's remaining `limit`.
-    let mut reader = BufReader::new(file.take(MAX_FILE_BYTES + 1));
+    search_reader(&mut BufReader::new(file.take(MAX_FILE_BYTES + 1)), regex, collect_up_to, first_only)
+}
+
+/// The per-line scan behind [`search_file`]. `reader` must already be
+/// byte-capped (a `BufReader<Take<…>>` at MAX_FILE_BYTES + 1): when the take
+/// adapter's limit is exhausted at that boundary without a newline crossing
+/// it (a single over-cap line, or content that grew to exactly cap + 1), the
+/// file is over budget and its matches are discarded, exactly as if the stat
+/// had already reported it oversized. Extracted from `search_file` so tests
+/// can drive the capped reader with an in-memory source whose size the
+/// metadata guard never sees.
+fn search_reader<R: Read>(
+    reader: &mut BufReader<std::io::Take<R>>,
+    regex: &Regex,
+    collect_up_to: usize,
+    first_only: bool,
+) -> FileMatches {
+    let mut found = FileMatches::default();
     let mut raw: Vec<u8> = Vec::new();
     let mut sniffed = 0usize;
     let mut line_no = 0usize;
@@ -305,9 +323,9 @@ fn search_file(path: &Path, regex: &Regex, collect_up_to: usize, first_only: boo
             }
         }
     }
-    // The take adapter stops the read at MAX_FILE_BYTES + 1. A file that
-    // reaches that boundary without a newline ever crossing it (a single
-    // over-cap line, or content that grew to exactly cap + 1) is over
+    // The take adapter stops the read at MAX_FILE_BYTES + 1. A reader whose
+    // limit is exhausted at that boundary without a newline crossing it (a
+    // single over-cap line, or content that grew to exactly cap + 1) is over
     // budget: discard its matches just like the in-loop crossing does.
     if reader.get_ref().limit() == 0 {
         return FileMatches::default();
@@ -418,10 +436,13 @@ fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFil
     if metadata.is_file() {
         // An explicitly named file is searched even if a .gitignore rule or
         // the include glob would skip it in a walk; deny rules still apply.
-        if let Some(scan) = policy.read_deny_scan(cwd)
-            && scan.denied(&fs_root)
-        {
-            return Ok(Vec::new());
+        // The file may be reached through a symlink (`alias/secret.txt`), so
+        // judge it in the root's resolved view too.
+        if let Some(scan) = policy.read_deny_scan(cwd) {
+            let scan = scan.for_root(&fs_root);
+            if scan.denied(&fs_root) {
+                return Ok(Vec::new());
+            }
         }
         let rel = root_path.file_name().map(PathBuf::from).unwrap_or_else(|| root_path.to_path_buf());
         return Ok(vec![FoundFile { fs_path: fs_root, display: root.to_string(), rel, explicit_file: true }]);
@@ -434,8 +455,12 @@ fn collect_files(root: &str, cwd: &Path, policy: &Policy) -> Result<Vec<FoundFil
     // the resolved working directory are fixed for the whole walk, so the
     // per-entry filter below is pure path manipulation and regex matching
     // instead of one `canonicalize` syscall per discovered entry. `None`
-    // means no Read-deny rule exists, so no permission work at all.
-    let scan = policy.read_deny_scan(cwd);
+    // means no Read-deny rule exists, so no permission work at all. The root
+    // itself may be a symlink named explicitly by the caller (the walker
+    // never follows symlinked *entries*, but the root is used as given), so
+    // the scan also judges each candidate in the root's resolved view —
+    // otherwise `alias/secret.txt` would bypass a `Read(/real/tree/**)` rule.
+    let scan = policy.read_deny_scan(cwd).map(|scan| scan.for_root(&fs_root));
     let mut budget = MAX_TOTAL_IGNORE_RULES;
     let mut out = Vec::new();
     walk_dir(&fs_root, &PathBuf::new(), root, scan.as_ref(), &[], &mut budget, &mut out, true)?;
@@ -973,6 +998,47 @@ mod tests {
     }
 
     #[test]
+    fn capped_reader_stops_at_cap_plus_one_for_over_cap_lines() {
+        // The fixture in `search_file_bounds_peak_memory_at_the_cap` exceeds
+        // MAX_FILE_BYTES on disk, so `search_file` returns at its metadata
+        // guard without ever constructing the capped reader — that test would
+        // also pass with the old unbounded reader. Drive the extracted reader
+        // loop with an in-memory source instead: the metadata guard never
+        // runs, so the take adapter and the cap-crossing checks are the only
+        // things that can discard the matches.
+        let regex = Regex::new("needle").unwrap();
+
+        // An over-cap *unterminated* line: the take adapter must stop the
+        // read at cap + 1 (peak memory at the cap, not cap + line) and the
+        // exhausted limit must discard the file's matches.
+        let mut content = String::from("needle ").into_bytes();
+        content.extend(std::iter::repeat_n(b'x', (MAX_FILE_BYTES as usize) * 2));
+        let mut reader = BufReader::new(content.as_slice().take(MAX_FILE_BYTES + 1));
+        let found = search_reader(&mut reader, &regex, 8, false);
+        assert_eq!(found.count, 0, "over-cap unterminated line leaked a match");
+        assert!(found.lines.is_empty());
+        assert_eq!(reader.get_ref().limit(), 0, "read did not stop at cap + 1");
+
+        // A match before the cap whose file crosses it later (an appended
+        // log): the in-loop crossing discards the matches gathered so far.
+        let mut content = String::from("needle\n").into_bytes();
+        content.extend(std::iter::repeat_n(b'x', (MAX_FILE_BYTES as usize) + 1024));
+        let mut reader = BufReader::new(content.as_slice().take(MAX_FILE_BYTES + 1));
+        let found = search_reader(&mut reader, &regex, 8, false);
+        assert_eq!(found.count, 0, "match before the cap crossing leaked");
+
+        // Content that fits the cap must not be discarded: exactly
+        // MAX_FILE_BYTES with a final newline never exhausts the take.
+        let mut content = String::from("needle\n").into_bytes();
+        content.extend(std::iter::repeat_n(b'x', MAX_FILE_BYTES as usize - content.len() - 1));
+        content.push(b'\n');
+        assert_eq!(content.len() as u64, MAX_FILE_BYTES);
+        let mut reader = BufReader::new(content.as_slice().take(MAX_FILE_BYTES + 1));
+        let found = search_reader(&mut reader, &regex, 8, false);
+        assert_eq!(found.count, 1, "at-cap content wrongly discarded");
+    }
+
+    #[test]
     fn search_file_accepts_content_just_under_the_cap() {
         // The streaming take reader must not reject a file that stays within
         // the budget: content ending exactly at MAX_FILE_BYTES with a final
@@ -1022,10 +1088,18 @@ mod tests {
         // A pathological single line (far past MAX_IGNORE_RULE_CHARS) must
         // not be compiled into an equally large regex: the rule is dropped,
         // so the file it tried to ignore stays visible, while well-formed
-        // rules around it still apply.
+        // rules around it still apply. Assert the rejection directly: the
+        // oversized rule below matches a basename of thousands of `a`s, so it
+        // could never hide either fixture file even if it were compiled —
+        // without this check the test would also pass with the length guard
+        // removed.
+        let long_rule = format!("**/{}", "a".repeat(MAX_IGNORE_RULE_CHARS * 4));
+        assert!(parse_ignore_line(&long_rule, Path::new("")).is_none(), "over-long rule was not rejected");
+        let at_cap = "a".repeat(MAX_IGNORE_RULE_CHARS);
+        assert!(parse_ignore_line(&at_cap, Path::new("")).is_some(), "at-cap rule wrongly rejected");
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let long_rule = format!("**/{}", "a".repeat(MAX_IGNORE_RULE_CHARS * 4));
         std::fs::write(root.join(".gitignore"), format!("{long_rule}\n*.log\n")).unwrap();
         std::fs::write(root.join("a.rs"), "needle\n").unwrap();
         std::fs::write(root.join("b.log"), "needle\n").unwrap();
@@ -1060,6 +1134,65 @@ mod tests {
         // No Read-deny rules → no scan, so the walker skips permission work
         // entirely (the pre-existing fast path).
         assert!(Policy::default().read_deny_scan(&root).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_search_root_cannot_bypass_read_deny() {
+        // The walker skips symlinked *entries*, but a search root named
+        // explicitly may itself be a symlink. With `alias -> real` and a
+        // `Read(.../real/secret.txt)` deny rule, the walked paths are lexical
+        // in the alias view only (`alias/secret.txt` never contains the denied
+        // text), so a lexical-only scan would expose the denied file's
+        // contents through grep and its name through glob. The scan must also
+        // judge each candidate in the root's resolved view.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let real = cwd.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("secret.txt"), "needle\n").unwrap();
+        std::fs::write(real.join("open.txt"), "needle\n").unwrap();
+        std::os::unix::fs::symlink(&real, cwd.join("alias")).unwrap();
+
+        let policy = policy_with_deny(&[&format!("Read({})", real.join("secret.txt").display())]);
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(out, "alias/open.txt", "denied file leaked through a symlinked root: {out}");
+        let listed = text_out(glob_in(&json!({"pattern": "**/*", "path": "alias"}), &policy, &cwd).unwrap());
+        assert_eq!(listed, "alias/open.txt", "glob leaked a denied name through a symlinked root: {listed}");
+
+        // An explicitly named *file* reached through a symlink is denied too.
+        let out = text_out(grep_in(&json!({"pattern": "needle", "path": "alias/secret.txt"}), &policy, &cwd).unwrap());
+        assert_eq!(out, NO_MATCHES, "symlinked explicit file leaked: {out}");
+
+        // A rule keyed on the *alias* path still applies, and a walk through
+        // the real directory is unaffected by the alias's existence.
+        let policy = policy_with_deny(&["Read(**/alias/secret.txt)"]);
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(out, "alias/open.txt", "alias-keyed rule not honoured: {out}");
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "real", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(out, "real/open.txt\nreal/secret.txt", "real walk wrongly filtered: {out}");
+
+        // A *root-relative* rule keyed on the resolved tree
+        // (`Read(real/secret.txt)`, matched against the path stripped of the
+        // working directory) must hold when the same tree is walked through
+        // the alias: the resolved view is also stripped of the resolved root.
+        let policy = policy_with_deny(&["Read(real/secret.txt)"]);
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(out, "alias/open.txt", "root-relative resolved rule bypassed via alias: {out}");
+        // …and a relative rule keyed on the alias view still applies.
+        let policy = policy_with_deny(&["Read(alias/secret.txt)"]);
+        let out = text_out(
+            grep_in(&json!({"pattern": "needle", "path": "alias", "output_mode": "files"}), &policy, &cwd).unwrap(),
+        );
+        assert_eq!(out, "alias/open.txt", "root-relative alias rule not honoured: {out}");
     }
 
     #[cfg(unix)]
