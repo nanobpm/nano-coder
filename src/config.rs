@@ -86,6 +86,11 @@ pub struct Config {
     pub plan_tools: bool,
     /// Offer the `report_outcome` tool (an explicit completed/blocked signal).
     pub outcome_tool: bool,
+    /// Before accepting `report_outcome(completed)`, ask once per turn for the
+    /// check's evidence when files were edited after the last `bash` call (see
+    /// `goal.rs`). On in the terminal; the ACP harness turns it off because the
+    /// orchestrator verifies there.
+    pub verify_before_complete: bool,
     /// Append `<system-reminder>` notes to tool results (e.g. a stale plan).
     pub reminders: bool,
     /// Agent skills (`SKILL.md` folders and `ai.lock` entries).
@@ -179,6 +184,7 @@ impl Default for Config {
             instruction_imports_outside_project: false,
             plan_tools: true,
             outcome_tool: true,
+            verify_before_complete: true,
             reminders: true,
             skills: crate::skills::SkillsConfig::default(),
             permissions: crate::permissions::PermissionsConfig::default(),

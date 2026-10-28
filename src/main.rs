@@ -2345,6 +2345,10 @@ async fn main() -> Result<()> {
         // ACP has no idle loop to fire timers, so the timer tools are not
         // offered at all.
         agent.disable_timers();
+        // The ACP orchestrator runs its own verification before accepting a
+        // completed report, so the harness's verify-before-complete reminder is
+        // off here (it stays on in the terminal, where nothing else checks).
+        agent.config_mut().verify_before_complete = false;
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }
