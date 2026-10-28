@@ -284,11 +284,37 @@ impl Policy {
 
     /// Whether a `Read(...)` deny rule covers `path` — the path itself or
     /// any ancestor directory, so `Read(secrets)` also withholds the files
-    /// inside `secrets/`. The search tools call this for every discovered
-    /// file, keeping denied contents and names out of their output even
-    /// when the search root itself is allowed.
+    /// inside `secrets/`. Kept for tests and one-off checks; the search
+    /// tools' per-entry filter goes through [`Policy::read_deny_scan`], which
+    /// avoids a `canonicalize` per candidate.
+    #[cfg(test)]
     pub(crate) fn read_denied(&self, path: &Path, cwd: &Path) -> bool {
         self.read_deny_rule(path, cwd).is_some()
+    }
+
+    /// Precompute a reusable Read-deny check for a batch of paths under one
+    /// `cwd` — the search tools' per-entry permission filter. `read_denied`
+    /// resolves symlinks through the filesystem for every candidate (one
+    /// `canonicalize` per path), which costs a syscall per walked entry; a
+    /// scan resolves `cwd` and collects the applicable rules once up front,
+    /// then judges each path lexically. Returns `None` when no Read-deny
+    /// path rule exists, so the caller can skip permission work entirely.
+    ///
+    /// The lexical check is equivalent for paths that cannot contain a
+    /// symlink component — exactly what the search walker produces, since it
+    /// never follows symlinks and `.`/`..` cannot appear in the relative
+    /// paths it builds from directory entries.
+    pub(crate) fn read_deny_scan(&self, cwd: &Path) -> Option<ReadDenyScan<'_>> {
+        let mut patterns = Vec::new();
+        for rule in &self.deny {
+            if rule.subject == Subject::Path && rule.applies_to("read_file") {
+                patterns.push(rule.pattern.as_ref());
+            }
+        }
+        if patterns.is_empty() {
+            return None;
+        }
+        Some(ReadDenyScan { patterns, cwd_normalized: normalize(cwd), cwd_resolved: resolve_symlinks(cwd) })
     }
 
     fn read_deny_rule(&self, path: &Path, cwd: &Path) -> Option<&Rule> {
@@ -437,6 +463,41 @@ fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {
         return true;
     }
     absolute.strip_prefix(cwd).is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy()))
+}
+
+/// A precomputed Read-deny check for many paths under one `cwd`; see
+/// [`Policy::read_deny_scan`]. Holds the applicable rules' compiled patterns
+/// (a rule without a pattern denies everything, represented as `None`) plus
+/// the two resolved views of `cwd`, so each check is pure path manipulation
+/// and regex matching — no filesystem access per candidate.
+pub(crate) struct ReadDenyScan<'a> {
+    patterns: Vec<Option<&'a Regex>>,
+    cwd_normalized: PathBuf,
+    cwd_resolved: PathBuf,
+}
+
+impl ReadDenyScan<'_> {
+    /// Whether a Read-deny rule covers `path` or any of its ancestors. The
+    /// candidate is normalized lexically (no `canonicalize`), so this is
+    /// valid only for paths that cannot contain a symlink component — the
+    /// search walker's guarantee, since it never follows symlinks.
+    pub(crate) fn denied(&self, path: &Path) -> bool {
+        let absolute = normalize(&self.cwd_normalized.join(path));
+        let matches = |pattern: &Regex, candidate: &Path| {
+            pattern.is_match(&candidate.to_string_lossy())
+                || candidate
+                    .strip_prefix(&self.cwd_normalized)
+                    .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy()))
+                || (self.cwd_resolved != self.cwd_normalized
+                    && candidate
+                        .strip_prefix(&self.cwd_resolved)
+                        .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
+        };
+        self.patterns.iter().any(|pattern| match pattern {
+            None => true,
+            Some(pattern) => absolute.ancestors().any(|candidate| matches(pattern, candidate)),
+        })
+    }
 }
 
 fn command_text(cmd: &Simple) -> String {
