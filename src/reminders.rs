@@ -712,7 +712,7 @@ fn stage_has_side_effect(cmd: &str, args: &[String]) -> bool {
 }
 
 /// Split one pipeline stage into shell words: separated on shell whitespace
-/// (space, tab, newline, CR, form feed — *not* the wider Unicode whitespace
+/// (space, tab, newline only — the default IFS; *not* CR, form feed or the wider Unicode whitespace
 /// set, which the shell treats as ordinary word characters), with
 /// single/double quotes removed and backslash escapes honoured. Returns `None`
 /// (fail closed) for shapes this helper does not model — an unterminated quote
@@ -727,12 +727,12 @@ fn shell_words(stage: &str) -> Option<Vec<String>> {
     while let Some(c) = chars.next() {
         match c {
             // Split only on characters the shell treats as word separators —
-            // not every `char::is_whitespace()`: a literal vertical tab (or
-            // NEL, NBSP, …) is *not* IFS whitespace, so the shell keeps it
+            // not every `char::is_whitespace()`: a literal CR, form feed,
+            // vertical tab (or NEL, NBSP, …) is *not* IFS whitespace, so the shell keeps it
             // inside the word (`sort -t<VT>` passes the VT as `-t`'s value).
             // Dropping it here would merge `-t<VT>` into `-t`, making the
             // option parser consume the next word as the separator value.
-            ' ' | '\t' | '\n' | '\r' | '\x0c' => {
+            ' ' | '\t' | '\n' => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));
                     in_word = false;
@@ -1994,6 +1994,9 @@ mod tests {
         // inside `-t<VT>` as the separator value, so `-o` must still be seen
         // as the writer option it is.
         assert_eq!(pipeline_key("cat f | sort -t\u{b} -o /tmp/out"), "cat f | sort -t\u{b} -o /tmp/out");
+        // Likewise CR and form feed are not default-IFS characters.
+        assert_eq!(pipeline_key("cat f | sort -t\r -o /tmp/out"), "cat f | sort -t\r -o /tmp/out");
+        assert_eq!(pipeline_key("cat f | sort -t\u{c} -o /tmp/out"), "cat f | sort -t\u{c} -o /tmp/out");
         // Quoted writer flags are still writer flags.
         assert_eq!(pipeline_key("cat f | sort '-o' /tmp/a"), "cat f | sort '-o' /tmp/a");
         assert_eq!(pipeline_key("cat f | 'tee' /tmp/a"), "cat f | 'tee' /tmp/a");
