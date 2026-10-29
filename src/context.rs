@@ -470,65 +470,65 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
             _ => merged.push((start, end, vec![i])),
         }
     }
-    // If the pins take over half the budget, drop whole windows from the end
-    // — never cut a window mid-line, which could lose the very error line it
-    // pins. The error lines of a surviving window are reserved first; only
-    // what is left of the window's budget goes to context, and a merged
-    // window that cannot afford its context keeps its bare error lines.
-    let mut windows = merged;
+    // Pins share one cumulative budget (half of `max_chars`, separators
+    // included). Windows are accepted in order while they fit; a window whose
+    // context would overflow shrinks to its error lines (or, with a single
+    // context line, clips that context) — a shrink is a success, not a reason
+    // to discard later windows. Error lines are never cut mid-line unless the
+    // very first window's bare error lines alone exceed the whole budget.
     let pin_budget = max_chars / 2;
-    let pinned;
-    loop {
-        let mut attempt = String::new();
-        let mut fits = true;
-        for (idx, (start, end, errs)) in windows.iter().enumerate() {
+    let mut pinned = String::new();
+    let mut used = 0usize;
+    for (idx, (start, end, errs)) in merged.iter().enumerate() {
+        let sep = if idx > 0 { 2 } else { 0 }; // "…\n"
+        let Some(remaining) = pin_budget.checked_sub(used + sep) else { break };
+        let reserved: usize = errs.iter().map(|&i| lines[i].chars().count() + 1).sum();
+        let mut rendered = String::new();
+        if reserved > remaining {
             if idx > 0 {
-                attempt.push_str("…\n");
+                break; // later windows that cannot fit whole error lines stop here
             }
-            let reserved: usize = errs.iter().map(|&i| lines[i].chars().count() + 1).sum();
-            if reserved > pin_budget {
-                // Even the bare error lines overflow: keep their heads.
-                for &i in errs {
-                    attempt.push_str(&lines[i].chars().take(pin_budget / errs.len()).collect::<String>());
-                    attempt.push('\n');
-                }
-                fits = false;
-                continue;
+            // Even the first window's bare error lines overflow: keep their heads.
+            let per = remaining / errs.len();
+            for &i in errs {
+                rendered.push_str(&lines[i].chars().take(per.saturating_sub(1)).collect::<String>());
+                rendered.push('\n');
             }
-            let context_budget = pin_budget - reserved;
+        } else {
+            let context_budget = remaining - reserved;
             let context: Vec<&str> = lines[*start..=*end].iter().filter(|l| !is_error_line(l)).copied().collect();
             let context_chars: usize = context.iter().map(|l| l.chars().count() + 1).sum();
             if context_chars <= context_budget {
                 for line in &lines[*start..=*end] {
-                    attempt.push_str(line);
-                    attempt.push('\n');
+                    rendered.push_str(line);
+                    rendered.push('\n');
                 }
-            } else if context.len() <= 1 {
-                // One oversized context line around the error: clip the
-                // context, never the error line itself.
+            } else if context.len() == 1 && context_budget > 1 {
+                // One oversized context line: clip the context, never the error.
+                let clipped = clip(context[0], context_budget - 1);
+                let clipped = if clipped.chars().count() < context_budget { Some(clipped) } else { None };
                 for line in &lines[*start..=*end] {
                     if is_error_line(line) {
-                        attempt.push_str(line);
-                    } else {
-                        attempt.push_str(&clip(line, context_budget.saturating_sub(1)));
+                        rendered.push_str(line);
+                        rendered.push('\n');
+                    } else if let Some(c) = &clipped {
+                        rendered.push_str(c);
+                        rendered.push('\n');
                     }
-                    attempt.push('\n');
                 }
             } else {
-                // A merged window whose context cannot fit keeps its error
-                // lines; the context is what the budget could not afford.
+                // Context cannot fit: keep the bare error lines.
                 for &i in errs {
-                    attempt.push_str(lines[i]);
-                    attempt.push('\n');
+                    rendered.push_str(lines[i]);
+                    rendered.push('\n');
                 }
-                fits = false;
             }
         }
-        if fits || windows.len() <= 1 {
-            pinned = attempt;
-            break;
+        if idx > 0 {
+            pinned.push_str("…\n");
         }
-        windows.pop();
+        used += sep + rendered.chars().count();
+        pinned.push_str(&rendered);
     }
     // Split what is left of the budget between head and tail as clip does,
     // charging the marker lines against it too so the budget holds.
@@ -809,10 +809,10 @@ mod tests {
         let mut content = String::new();
         for i in 0..200 {
             content.push_str(&format!("error: failure number {i} in the middle of the log\n"));
-            content.push_str(&"padding line to spread the errors out across the log\n".repeat(20));
+            content.push_str(&"padding line to spread the diagnostics out across the log\n".repeat(20));
         }
         let message = Message::tool_result("call_1", "bash", &content);
-        let text = render_transcript(&[message.clone()], 1_000_000, false);
+        let text = render_transcript(std::slice::from_ref(&message), 1_000_000, false);
         let body = text.strip_prefix("TOOL result (bash):\n").unwrap();
         assert!(body.chars().count() <= 2_000, "budget exceeded: {} chars", body.chars().count());
         // Pins are capped at CLIP_ERROR_LINES error lines (each with context).
@@ -827,6 +827,41 @@ mod tests {
         assert!(clipped.chars().count() <= 2_000, "budget exceeded: {} chars", clipped.chars().count());
         assert!(clipped.contains("error: boom"), "{clipped}");
         assert!(clipped.contains("note: see above"), "context line pinned too:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_pins_respect_cumulative_budget() {
+        // Many separated windows, each small: together they must stay within
+        // the pin budget, and the tail must survive (no plain-clip fallback).
+        let mut content = "head line\n".repeat(300);
+        for i in 0..20 {
+            content.push_str(&format!("ctx before {i}\nerror: separated failure {i} {}\nctx after {i}\n", "x".repeat(40)));
+            content.push_str(&"plain padding\n".repeat(30));
+        }
+        content.push_str("FINAL TAIL MARKER\n");
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error lines pinned"), "{clipped}");
+        assert!(clipped.contains("FINAL TAIL MARKER"), "tail lost:\n{clipped}");
+        assert!(clipped.contains("separated failure 0 "), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_shrunk_window_does_not_drop_later_windows() {
+        // First window has huge context and shrinks to its error line; the
+        // second, small window still fits and must be kept.
+        let content = format!(
+            "{}\n{}\nerror: first failure\n{}\n{}\nnote: a\nerror: second failure\nnote: b\n{}",
+            "head\n".repeat(400),
+            "c".repeat(1_200),
+            "d".repeat(1_200),
+            "pad\n".repeat(50),
+            "tail\n".repeat(400)
+        );
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: first failure"), "{clipped}");
+        assert!(clipped.contains("error: second failure"), "{clipped}");
     }
 
     #[test]
