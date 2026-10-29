@@ -284,11 +284,45 @@ impl Policy {
 
     /// Whether a `Read(...)` deny rule covers `path` — the path itself or
     /// any ancestor directory, so `Read(secrets)` also withholds the files
-    /// inside `secrets/`. The search tools call this for every discovered
-    /// file, keeping denied contents and names out of their output even
-    /// when the search root itself is allowed.
+    /// inside `secrets/`. Kept for tests and one-off checks; the search
+    /// tools' per-entry filter goes through [`Policy::read_deny_scan`], which
+    /// avoids a `canonicalize` per candidate.
+    #[cfg(test)]
     pub(crate) fn read_denied(&self, path: &Path, cwd: &Path) -> bool {
         self.read_deny_rule(path, cwd).is_some()
+    }
+
+    /// Precompute a reusable Read-deny check for a batch of paths under one
+    /// `cwd` — the search tools' per-entry permission filter. `read_denied`
+    /// resolves symlinks through the filesystem for every candidate (one
+    /// `canonicalize` per path), which costs a syscall per walked entry; a
+    /// scan resolves `cwd` and collects the applicable rules once up front,
+    /// then judges each path lexically. Returns `None` when no Read-deny
+    /// path rule exists, so the caller can skip permission work entirely.
+    ///
+    /// The lexical check is equivalent for paths that cannot contain a
+    /// symlink component — exactly what the search walker produces, since it
+    /// never follows symlinks and `.`/`..` cannot appear in the relative
+    /// paths it builds from directory entries.
+    pub(crate) fn read_deny_scan(&self, cwd: &Path) -> Option<ReadDenyScan<'_>> {
+        let mut patterns = Vec::new();
+        for rule in &self.deny {
+            if rule.subject == Subject::Path && rule.applies_to("read_file") {
+                patterns.push(rule.pattern.as_ref());
+            }
+        }
+        if patterns.is_empty() {
+            return None;
+        }
+        Some(ReadDenyScan {
+            patterns,
+            cwd_normalized: normalize(cwd),
+            cwd_resolved: resolve_symlinks(cwd),
+            // Until `for_root` sets them, the root is the working directory
+            // itself (the search tools' default root).
+            root_normalized: normalize(cwd),
+            root_resolved: resolve_symlinks(cwd),
+        })
     }
 
     fn read_deny_rule(&self, path: &Path, cwd: &Path) -> Option<&Rule> {
@@ -437,6 +471,83 @@ fn path_rule_matches(rule: &Rule, absolute: &Path, cwd: &Path) -> bool {
         return true;
     }
     absolute.strip_prefix(cwd).is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy()))
+}
+
+/// A precomputed Read-deny check for many paths under one `cwd`; see
+/// [`Policy::read_deny_scan`]. Holds the applicable rules' compiled patterns
+/// (a rule without a pattern denies everything, represented as `None`) plus
+/// the two resolved views of `cwd`, so each check is pure path manipulation
+/// and regex matching — no filesystem access per candidate.
+pub(crate) struct ReadDenyScan<'a> {
+    patterns: Vec<Option<&'a Regex>>,
+    cwd_normalized: PathBuf,
+    cwd_resolved: PathBuf,
+    /// The search root's lexical and symlink-resolved forms, set by
+    /// [`ReadDenyScan::for_root`]. The walker never follows symlinked
+    /// *entries*, but a root named explicitly by the caller may itself be a
+    /// symlink (`alias -> /real/tree`), and then every walked path is lexical
+    /// only in the *alias* view: `alias/secret.txt` never textually contains
+    /// the denied `/real/tree/secret.txt`, so a `Read(/real/tree/**)` rule
+    /// would be bypassed. Checking each candidate in the resolved view too
+    /// preserves deny semantics without a per-entry canonicalize. The resolved
+    /// view is matched against the rule pattern and the two cwd-relative
+    /// strips only — never re-anchored to the resolved root — so a
+    /// cwd-relative rule is not broadened to other directories that happen to
+    /// be reached through an alias.
+    root_normalized: PathBuf,
+    root_resolved: PathBuf,
+}
+
+impl ReadDenyScan<'_> {
+    /// Set the search root this scan filters. `root` is the filesystem path
+    /// the walk starts from (already joined against `cwd`); it is resolved
+    /// once here rather than per walked entry.
+    pub(crate) fn for_root(mut self, root: &Path) -> Self {
+        self.root_normalized = normalize(root);
+        self.root_resolved = resolve_symlinks(root);
+        self
+    }
+
+    /// Whether a Read-deny rule covers `path` or any of its ancestors. The
+    /// candidate is normalized lexically (no `canonicalize`), so this is
+    /// valid only for paths that cannot contain a symlink component — the
+    /// search walker's guarantee for every entry *below* the root. The root
+    /// itself may be a symlink, so each candidate is also judged in the
+    /// root's resolved view (see the struct docs).
+    pub(crate) fn denied(&self, path: &Path) -> bool {
+        let absolute = normalize(&self.cwd_normalized.join(path));
+        // The same candidate with the search-root prefix resolved through
+        // symlinks (`alias/secret.txt` -> `/real/tree/secret.txt`), built from
+        // the precomputed resolved root — no filesystem access per call.
+        let resolved;
+        let mut candidates: Vec<&Path> = vec![&absolute];
+        if self.root_resolved != self.root_normalized
+            && let Ok(rest) = absolute.strip_prefix(&self.root_normalized)
+        {
+            // `normalize` collapses the trailing empty component a `join("")`
+            // leaves when `rest` is empty (the candidate *is* the root):
+            // `ancestors()` skips that component, so the root itself would
+            // otherwise go unchecked in the resolved view.
+            resolved = normalize(&self.root_resolved.join(rest));
+            candidates = vec![&absolute, &resolved];
+        }
+        let matches = |pattern: &Regex, candidate: &Path| {
+            pattern.is_match(&candidate.to_string_lossy())
+                || candidate
+                    .strip_prefix(&self.cwd_normalized)
+                    .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy()))
+                || (self.cwd_resolved != self.cwd_normalized
+                    && candidate
+                        .strip_prefix(&self.cwd_resolved)
+                        .is_ok_and(|relative| pattern.is_match(&relative.to_string_lossy())))
+        };
+        self.patterns.iter().any(|pattern| match pattern {
+            None => true,
+            Some(pattern) => {
+                candidates.iter().any(|base| base.ancestors().any(|candidate| matches(pattern, candidate)))
+            }
+        })
+    }
 }
 
 fn command_text(cmd: &Simple) -> String {
