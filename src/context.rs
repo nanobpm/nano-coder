@@ -519,6 +519,49 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
     {
         tail_start -= 1;
     }
+    // 1b. An oversized boundary line would leave its end bare: keep a budgeted
+    //     excerpt instead (head: prefix; tail: suffix), so the opening command
+    //     and the closing exit status survive even when whole lines cannot fit.
+    let excerpt = |s: &str, keep: usize, from_end: bool| -> String {
+        let cs: Vec<char> = s.chars().collect();
+        let k = keep.min(cs.len());
+        if from_end {
+            format!("…{}", cs[cs.len() - k..].iter().collect::<String>())
+        } else {
+            format!("{}…", cs[..k].iter().collect::<String>())
+        }
+    };
+    let ends_nl = |i: usize| if lines[i].ends_with('\n') { 1 } else { 0 };
+    if head_end == 0 && n > 1 && floor > 8 && !is_error_line(bare(0)) {
+        let base = cost(&kept, 0, 0);
+        let room = floor.min((max_chars as isize - used as isize - base).max(0) as usize);
+        if room > 8 {
+            let s = format!("{}{}", excerpt(bare(0), room - 2, false), if ends_nl(0) == 1 { "\n" } else { "" });
+            let l = s.chars().count();
+            if (used as isize + base + l as isize) as usize <= max_chars {
+                used = (used as isize + base + l as isize) as usize;
+                kept[0] = true;
+                clipped[0] = Some(s);
+                head_end = 1;
+            }
+        }
+    }
+    if tail_start == n && n > head_end + 1 && floor > 8 && !is_error_line(bare(n - 1)) {
+        let i = n - 1;
+        let base = cost(&kept, i, 0);
+        let room = floor.min((max_chars as isize - used as isize - base).max(0) as usize);
+        if room > 8 {
+            let nl = ends_nl(i);
+            let s = format!("{}{}", excerpt(bare(i), room - 1 - nl, true), if nl == 1 { "\n" } else { "" });
+            let l = s.chars().count();
+            if (used as isize + base + l as isize) as usize <= max_chars {
+                used = (used as isize + base + l as isize) as usize;
+                kept[i] = true;
+                clipped[i] = Some(s);
+                tail_start = i;
+            }
+        }
+    }
     // 2. Pin error lines not already kept, whole while they fit; only the very
     //    first pin may be budget-clipped (keeping the line's head and end).
     let mut pinned: Vec<usize> = Vec::new();
@@ -1310,5 +1353,28 @@ mod tests {
         assert_eq!(output_limit_for_model("gpt-4.1"), None);
         assert_eq!(output_limit_for_model("claude-sonnet-4-5"), None);
         assert_eq!(output_limit_for_model("some-unlisted-model"), None);
+    }
+}
+
+#[cfg(test)]
+mod boundary_excerpt_tests {
+    use super::*;
+
+    #[test]
+    fn clipped_tool_result_keeps_excerpts_of_oversized_boundary_lines() {
+        let first = format!("$ cargo test {}", "a".repeat(2500));
+        let last = format!("{} exit status: 101", "b".repeat(2500));
+        let text = format!("{first}\nerror: boom\n{last}");
+        let out = clip_tool_result(&text, 2000);
+        assert!(out.chars().count() <= 2000);
+        assert!(out.starts_with("$ cargo test"), "{out}");
+        assert!(out.ends_with("exit status: 101"), "{out}");
+        assert_eq!(out.matches("error: boom").count(), 1);
+
+        let text = format!("{first}\nerror: boom\n{last}\n");
+        let out = clip_tool_result(&text, 2000);
+        assert!(out.chars().count() <= 2000);
+        assert!(out.starts_with("$ cargo test"));
+        assert!(out.ends_with("exit status: 101\n"));
     }
 }
