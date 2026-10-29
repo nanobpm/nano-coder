@@ -76,6 +76,13 @@ Slash commands work mid-turn too, where it is safe:
 the running turn, killing any running bash command; a second Ctrl-C at the prompt exits.
 At the idle prompt, **Esc Esc** instead clears the input, so a half-typed or pasted prompt
 can be discarded without deleting it character by character.
+
+Tool calls, their results and thinking blocks are shown collapsed (`● bash ls -la`,
+`⎿ first line (+N lines)`, `∴ Thought for 3.1s · 812 chars`). **Ctrl-O** expands the
+latest one in place — the call's full arguments with every line of its result, or the
+full reasoning text — and pressing it again collapses it. It works at the idle prompt
+and mid-turn (where it expands the thinking block that is still streaming), and the
+expanded view reflows on resize. Piped output is unchanged.
 With piped (non-terminal) stdin, lines read during a turn are queued as later prompts
 (never steer).
 

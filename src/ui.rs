@@ -328,6 +328,15 @@ struct FrameState {
     /// preceding `TextDelta` already finalized, which would otherwise duplicate
     /// the reasoning line. Reset at each turn/message boundary.
     think_streamed: bool,
+    /// Indices of the `Item::Thinking` items finalized from streamed deltas in
+    /// the current response (reasoning may interleave with answer deltas, so
+    /// there can be several). The trailing authoritative `Thinking` event
+    /// reconciles exactly these — never a previous response's item.
+    think_items: Vec<usize>,
+    /// Ctrl-O expanded the reasoning block that is still streaming (`think`):
+    /// its text is drawn live under the transcript, and the finished
+    /// [`Item::Thinking`] inherits the flag.
+    think_expanded: bool,
     /// The timestamp shown on the editor prompt, captured when a fresh prompt
     /// starts and held stable while the user types. Regenerating it on every
     /// render (keystroke, live status tick) would make the prompt stamp — and
@@ -391,6 +400,8 @@ impl Renderer {
             stream: None,
             think: None,
             think_streamed: false,
+            think_items: Vec::new(),
+            think_expanded: false,
             prompt_stamp: stamp(),
             busy: None,
             transient: None,
@@ -427,6 +438,26 @@ impl Renderer {
             fs.queued = queued;
             fs.menu = menu.to_vec();
             self.frame_render(fs);
+        }
+    }
+
+    /// Ctrl-O: expand or collapse the latest collapsible transcript item (a
+    /// tool call/result pair or a thinking block) in place and redraw. While
+    /// reasoning is streaming, it toggles that live block instead. A no-op
+    /// outside frame mode (piped output has nothing to expand).
+    pub fn toggle_latest(&self) {
+        let mut frame = self.frame.lock().unwrap();
+        if let Some(fs) = frame.as_mut() {
+            Self::frame_toggle(fs);
+            self.frame_render(fs);
+        }
+    }
+
+    fn frame_toggle(fs: &mut FrameState) {
+        if fs.think.is_some() {
+            fs.think_expanded = !fs.think_expanded;
+        } else if frame::toggle_latest(&mut fs.items) {
+            fs.touch_transcript();
         }
     }
 
@@ -483,6 +514,22 @@ impl Renderer {
             Some(text) => frame::transient_status(text, width),
             None => self.status.as_ref().map(|s| s.stats_line(width)).unwrap_or_default(),
         };
+        // Reasoning that is still streaming, expanded with Ctrl-O, is drawn
+        // live under the transcript until it becomes an `Item::Thinking`.
+        let transcript = match &fs.think {
+            Some((text, _)) if fs.think_expanded => {
+                let mut lines = transcript;
+                // Keep this header static: once the expanded body outgrows the
+                // viewport it scrolls off-screen, and a ticking elapsed time
+                // would force a full scrollback repaint on every tick. The
+                // editor's working-time indicator already shows elapsed time.
+                let header = format!("{}∴ Thinking…{RESET}", "\x1b[38;5;245m");
+                lines.push(frame::fit_line(&header, width));
+                lines.extend(frame::expanded_body(text, width, "\x1b[38;5;245m"));
+                lines
+            }
+            _ => transcript,
+        };
         let composed = frame::compose(&transcript, &editor, &status);
         let _ = fs.out.render(&composed, width, height);
     }
@@ -492,12 +539,15 @@ impl Renderer {
     fn frame_finish_stream(&self, fs: &mut FrameState) {
         fs.stream = None;
         fs.think_streamed = false;
+        fs.think_items.clear();
         if let Some((text, started)) = fs.think.take() {
             let text = text.trim();
             if !text.is_empty() {
                 fs.items.push(stamped(Item::Thinking {
                     chars: text.chars().count(),
                     seconds: started.elapsed().as_secs_f64(),
+                    text: text.to_string(),
+                    expanded: std::mem::take(&mut fs.think_expanded),
                 }));
                 fs.touch_transcript();
             }
@@ -523,6 +573,8 @@ impl Renderer {
         // reply streams its own.
         fs.think = None;
         fs.think_streamed = false;
+        fs.think_items.clear();
+        fs.think_expanded = false;
     }
 
     /// Map an agent event onto the transcript and re-render (frame mode).
@@ -533,29 +585,92 @@ impl Renderer {
                 fs.think.get_or_insert_with(|| (String::new(), Instant::now())).0.push_str(text);
             }
             AgentEvent::Thinking { text } => {
-                match fs.think.take() {
-                    // Reasoning streamed as deltas but was not yet finalized by
-                    // a `TextDelta` (e.g. reasoning-only, or the answer is not
-                    // streamed): emit its summary now.
-                    Some((_, started)) => {
-                        let chars = text.trim().chars().count();
-                        if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking { chars, seconds: started.elapsed().as_secs_f64() }));
+                let full = text.trim();
+                if !fs.think_streamed {
+                    // Non-streamed block delivered whole — emit it.
+                    fs.think = None;
+                    if !full.is_empty() {
+                        fs.items.push(stamped(Item::Thinking {
+                            chars: full.chars().count(),
+                            seconds: 0.0,
+                            text: full.to_string(),
+                            expanded: false,
+                        }));
+                        fs.touch_transcript();
+                    }
+                } else {
+                    // Deltas streamed this response. This event carries the
+                    // authoritative full reasoning (a mid-reasoning `/verbosity`
+                    // change can leave the streamed copy truncated, and
+                    // interleaved reasoning may have been split across several
+                    // items). Reconcile every item of *this* response into one.
+                    let pending = fs.think.take();
+                    let mut idx = std::mem::take(&mut fs.think_items);
+                    idx.sort_unstable();
+                    let mut expanded = std::mem::take(&mut fs.think_expanded);
+                    let mut seconds = pending.as_ref().map_or(0.0, |(_, s)| s.elapsed().as_secs_f64());
+                    // Drop all but the first item (highest index first so the
+                    // lower indices stay valid), shifting `fs.stream` down.
+                    for &i in idx.iter().skip(1).rev() {
+                        if fs.items.get(i).is_some_and(|it| matches!(it.item, Item::Thinking { .. })) {
+                            if let Item::Thinking { expanded: e, seconds: s, .. } = &fs.items[i].item {
+                                expanded |= *e;
+                                seconds += *s;
+                            }
+                            fs.items.remove(i);
+                            if let Some(st) = fs.stream.as_mut()
+                                && *st > i
+                            {
+                                *st -= 1;
+                            }
                             fs.touch_transcript();
                         }
                     }
-                    // No pending reasoning. If deltas streamed this turn, a
-                    // preceding `TextDelta` already finalized the summary, so
-                    // skip to avoid duplicating it. Otherwise this is a
-                    // non-streamed block delivered whole — emit it.
-                    None if !fs.think_streamed => {
-                        let chars = text.trim().chars().count();
-                        if chars > 0 {
-                            fs.items.push(stamped(Item::Thinking { chars, seconds: 0.0 }));
+                    let first = idx
+                        .first()
+                        .copied()
+                        .filter(|&i| fs.items.get(i).is_some_and(|it| matches!(it.item, Item::Thinking { .. })));
+                    match first {
+                        Some(i) => {
+                            if let Item::Thinking { chars, text: stored, expanded: e, seconds: s } =
+                                &mut fs.items[i].item
+                            {
+                                if full.is_empty() {
+                                    // Keep what streamed rather than blanking it.
+                                } else if stored.as_str() != full {
+                                    *stored = full.to_string();
+                                    *chars = full.chars().count();
+                                }
+                                *e |= expanded;
+                                *s += seconds;
+                            }
                             fs.touch_transcript();
                         }
+                        None => {
+                            // Nothing finalized yet for this response (reasoning
+                            // only, or the streamed deltas were whitespace):
+                            // create the item rather than touching an older one.
+                            let fallback = pending.as_ref().map(|(t, _)| t.trim().to_string()).unwrap_or_default();
+                            let body = if full.is_empty() { fallback } else { full.to_string() };
+                            if !body.is_empty() {
+                                let item = stamped(Item::Thinking {
+                                    chars: body.chars().count(),
+                                    seconds,
+                                    text: body,
+                                    expanded,
+                                });
+                                // Order reasoning ahead of an in-flight answer.
+                                match fs.stream {
+                                    Some(st) if st < fs.items.len() => {
+                                        fs.items.insert(st, item);
+                                        fs.stream = Some(st + 1);
+                                    }
+                                    _ => fs.items.push(item),
+                                }
+                                fs.touch_transcript();
+                            }
+                        }
                     }
-                    None => {}
                 }
                 fs.think_streamed = false;
                 // Do NOT reset `fs.stream` here: a streamed assistant message
@@ -578,7 +693,10 @@ impl Renderer {
                         fs.items.push(stamped(Item::Thinking {
                             chars: think.chars().count(),
                             seconds: started.elapsed().as_secs_f64(),
+                            text: think.to_string(),
+                            expanded: std::mem::take(&mut fs.think_expanded),
                         }));
+                        fs.think_items.push(fs.items.len() - 1);
                         fs.touch_transcript();
                     }
                 }
@@ -642,11 +760,12 @@ impl Renderer {
             }
             AgentEvent::ToolResult { call, ok: true, .. } if quiet_plan_tool(&call.name) => {}
             AgentEvent::ToolResult { call, ok: false, output } if quiet_plan_tool(&call.name) => {
-                let _ = call;
                 fs.items.push(stamped(Item::ToolResult {
+                    call_id: call.id.clone(),
                     ok: false,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
+                    expanded: false,
                 }));
                 fs.touch_transcript();
             }
@@ -680,14 +799,25 @@ impl Renderer {
                 if call.name == crate::goal::TOOL_NAME && verbosity() < Verbosity::Verbose => {}
             AgentEvent::ToolCall { call } => {
                 self.frame_finish_stream(fs);
-                fs.items.push(stamped(Item::ToolCall { name: call.name.clone(), summary: tool_summary_text(call) }));
+                fs.items.push(stamped(Item::ToolCall {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    summary: tool_summary_text(call),
+                    args: tool_args_text(call),
+                    expanded: false,
+                }));
                 fs.touch_transcript();
             }
-            AgentEvent::ToolResult { ok, output, .. } => {
+            AgentEvent::ToolResult { call, ok, output } => {
+                // A result arriving after Ctrl-O expanded its call inherits the
+                // call's expansion state, so the pair stays in step.
+                let expanded = frame::expanded_state_of_call(&fs.items, &call.id).unwrap_or(false);
                 fs.items.push(stamped(Item::ToolResult {
+                    call_id: call.id.clone(),
                     ok: *ok,
                     output: (*output).to_string(),
                     verbose: verbosity() >= Verbosity::Verbose,
+                    expanded,
                 }));
                 fs.touch_transcript();
             }
@@ -1500,6 +1630,21 @@ fn tool_summary(call: &ToolCall, width: usize) -> String {
 
 /// The raw one-line argument summary for a tool call (no colour, no fitting),
 /// for the frame renderer's [`Item::ToolCall`](crate::frame::Item).
+/// The full tool arguments, pretty-printed, for an expanded
+/// [`Item::ToolCall`](crate::frame::Item). Malformed or truncated argument
+/// text (kept verbatim in [`ToolCall::malformed_arguments`], with `arguments`
+/// left empty) is shown as-is so a failed call still displays its full input.
+pub fn tool_args_text(call: &ToolCall) -> String {
+    if let Some(raw) = call.invalid_arguments() {
+        return raw.to_string();
+    }
+    match &call.arguments {
+        Value::String(raw) => raw.clone(),
+        Value::Object(args) if args.is_empty() => String::new(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 pub fn tool_summary_text(call: &ToolCall) -> String {
     let text = match &call.arguments {
         Value::Object(args) => ["command", "path", "file_path", "pattern", "url", "text"]
@@ -2263,6 +2408,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn trailing_thinking_reconciles_truncated_streamed_reasoning() {
+        let r = Renderer::frame_for_test();
+        // Simulate a verbosity change mid-reasoning: only part of the deltas
+        // arrived before the answer finalized the summary.
+        r.event(&AgentEvent::ThinkingDelta { text: "pondering" });
+        r.event(&AgentEvent::TextDelta { text: "Answer." });
+        r.event(&AgentEvent::Thinking { text: "pondering the whole plan" });
+        let items = r.frame_items();
+        let texts: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Thinking { text, chars, .. } => Some((text.clone(), *chars)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec![("pondering the whole plan".to_string(), 24)]);
+    }
+
+    fn thinking_texts(r: &Renderer) -> Vec<String> {
+        r.frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trailing_thinking_merges_interleaved_reasoning_fragments() {
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ThinkingDelta { text: "first " });
+        r.event(&AgentEvent::TextDelta { text: "A" });
+        r.event(&AgentEvent::ThinkingDelta { text: "second" });
+        r.event(&AgentEvent::TextDelta { text: "B" });
+        r.event(&AgentEvent::Thinking { text: "first second" });
+        assert_eq!(thinking_texts(&r), vec!["first second".to_string()]);
+        let items = r.frame_items();
+        let msgs: Vec<_> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::Message { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(msgs, vec!["AB".to_string()]);
+        r.event(&AgentEvent::TextDelta { text: "C" });
+        assert!(r.frame_items().iter().any(|i| matches!(&i.item, Item::Message { text, .. } if text == "ABC")));
+    }
+
+    #[test]
+    fn trailing_thinking_never_overwrites_previous_response_reasoning() {
+        let r = Renderer::frame_for_test();
+        r.event(&AgentEvent::ThinkingDelta { text: "old" });
+        r.event(&AgentEvent::TextDelta { text: "One." });
+        r.event(&AgentEvent::Thinking { text: "old" });
+        r.event(&AgentEvent::AssistantMessage { message_id: "m1", text: "One." });
+        // Next response: reasoning deltas are only whitespace, so no item is
+        // finalized before the answer starts.
+        r.event(&AgentEvent::ThinkingDelta { text: "  " });
+        r.event(&AgentEvent::TextDelta { text: "Two." });
+        r.event(&AgentEvent::Thinking { text: "new reasoning" });
+        assert_eq!(thinking_texts(&r), vec!["old".to_string(), "new reasoning".to_string()]);
+    }
+
+    #[test]
     fn non_streamed_thinking_event_still_emits_summary() {
         let r = Renderer::frame_for_test();
         // No ThinkingDelta: a whole `Thinking` block must still show once.
@@ -2414,6 +2625,67 @@ pub(crate) mod tests {
         assert_eq!(strip_ansi(&tool_summary(&call, 40)), "");
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(strip_ansi("\x1b[2mhi\x1b[0m\r\n"), "hi\n");
+    }
+
+    #[test]
+    fn tool_args_text_keeps_malformed_arguments_verbatim() {
+        // A truncated/malformed argument stream leaves `arguments` empty and
+        // records the raw text in `malformed_arguments`; expanding the failed
+        // call must show that original input, not nothing.
+        let call = ToolCall::from_raw_arguments("c1".into(), "bash".into(), "{\"command\": \"ls\",", None);
+        assert!(call.invalid_arguments().is_some());
+        assert_eq!(tool_args_text(&call), "{\"command\": \"ls\",");
+        // Well-formed calls still pretty-print; an empty object stays empty.
+        let ok = ToolCall {
+            id: "c2".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        assert_eq!(tool_args_text(&ok), "{\n  \"command\": \"ls\"\n}");
+        let empty = ToolCall { arguments: json!({}), ..ok.clone() };
+        assert_eq!(tool_args_text(&empty), "");
+    }
+
+    #[test]
+    fn tool_result_inherits_expansion_from_its_call() {
+        // ToolCall → Ctrl-O → ToolResult → Ctrl-O: the result arrives expanded
+        // because its call is expanded, and the next Ctrl-O collapses the pair
+        // instead of re-expanding the result.
+        let _guard = verbosity_lock();
+        let r = Renderer::frame_for_test();
+        let call = ToolCall {
+            id: "call_9".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+            item_id: None,
+            malformed_arguments: None,
+        };
+        r.event(&AgentEvent::ToolCall { call: &call });
+        r.toggle_latest();
+        r.event(&AgentEvent::ToolResult { call: &call, ok: true, output: "file-a\nfile-b" });
+        let items = r.frame_items();
+        let expanded: Vec<bool> = items
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expanded, [true, true], "result inherits the call's expansion: {items:?}");
+        // The next Ctrl-O targets the result (the latest item) and collapses
+        // the whole pair.
+        r.toggle_latest();
+        let expanded: Vec<bool> = r
+            .frame_items()
+            .iter()
+            .filter_map(|i| match &i.item {
+                Item::ToolCall { expanded, .. } | Item::ToolResult { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expanded, [false, false]);
     }
 
     #[test]

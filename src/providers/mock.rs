@@ -157,7 +157,14 @@ impl LLMClient for MockLLMClient {
                 });
             }
             return Ok(LLMResponse {
-                content: format!("Based on the {} tool result: {}", name, tool_msg.content),
+                // Echo only the first line so multi-line output (e.g. `ls -la`)
+                // never leaks into the assistant message, where it would
+                // confound PTY tests that check a collapsed/expanded result.
+                content: format!(
+                    "Based on the {} tool result: {}",
+                    name,
+                    tool_msg.content.lines().next().unwrap_or_default()
+                ),
                 usage: Self::usage(30),
                 stop_reason: Some("stop".into()),
                 ..Default::default()

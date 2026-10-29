@@ -415,10 +415,17 @@ impl Terminal {
         let reader_view = view.clone();
         let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_suspend = suspend.clone();
+        let reader_renderer = renderer.clone();
         std::thread::spawn(move || {
             if key_mode {
                 let mut reader = lineedit::LineReader::with_suspend(reader_suspend);
                 let send = |key: lineedit::Key| {
+                    // Ctrl-O is display-only: toggle and redraw right here, at
+                    // the idle prompt and mid-turn alike.
+                    if matches!(key, lineedit::Key::ToggleExpand) {
+                        reader_renderer.toggle_latest();
+                        return;
+                    }
                     let _ = lines.send(match key {
                         lineedit::Key::Line(line) => TermInput::Line(line),
                         lineedit::Key::Queue(line) => TermInput::Queue(line),
@@ -426,6 +433,7 @@ impl Terminal {
                         lineedit::Key::Interrupt => TermInput::Interrupt,
                         lineedit::Key::Escape => TermInput::Escape,
                         lineedit::Key::CycleMode => TermInput::CycleMode,
+                        lineedit::Key::ToggleExpand => return,
                         lineedit::Key::Rejected(note) => TermInput::Rejected(note),
                     });
                 };

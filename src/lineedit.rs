@@ -490,6 +490,8 @@ pub enum Key {
     Escape,
     /// Shift+Tab: cycle the agent mode (normal/plan/auto).
     CycleMode,
+    /// Ctrl-O: expand/collapse the latest tool call/result or thinking block.
+    ToggleExpand,
     /// Enter on an unknown `/command`: the line stays in the editor, unsent;
     /// this is why (see `commands::rejection`).
     Rejected(String),
@@ -804,6 +806,10 @@ impl LineReader {
                 0x04 if view.line.is_empty() => return Key::Eof,
                 0x05 => view.move_end(),
                 0x7f | 0x08 => view.backspace(),
+                0x0f => {
+                    drop(view);
+                    send(Key::ToggleExpand);
+                }
                 0x15 => view.clear_line(),
                 0x17 => view.erase_word(),
                 0x1b => {
@@ -1370,6 +1376,7 @@ mod tests {
             Key::Interrupt => "interrupt".into(),
             Key::Escape => "escape".into(),
             Key::CycleMode => "cycle-mode".into(),
+            Key::ToggleExpand => "toggle-expand".into(),
             Key::Rejected(note) => format!("rejected {note:?}"),
         }
     }
@@ -1382,11 +1389,12 @@ mod tests {
         {
             let view = &frame;
             view.lock().unwrap().mode = EditMode::Turn;
-            // Ctrl-C clears the line and interrupts; Esc is sent; an unbound
-            // control key (Ctrl-O) is ignored.
+            // Ctrl-C clears the line and interrupts; Esc is sent; Ctrl-O
+            // toggles expansion without touching the line; an unbound
+            // control key (Ctrl-G) is ignored.
             assert_eq!(
-                keys_sent(view, b"abc\x1b[99;5u\x1b[27u\x1b[111;5uok\r"),
-                ["interrupt", "escape", "-> line \"ok\\n\""]
+                keys_sent(view, b"abc\x1b[99;5u\x1b[27u\x1b[111;5u\x1b[103;5uok\r"),
+                ["interrupt", "escape", "toggle-expand", "-> line \"ok\\n\""]
             );
             // Ctrl-D on an empty line is end of input, as the legacy byte is.
             assert_eq!(keys_sent(view, b"\x1b[100;5u"), ["-> eof"]);
