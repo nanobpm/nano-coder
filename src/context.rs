@@ -453,257 +453,152 @@ fn is_error_line(line: &str) -> bool {
 
 /// Clip a tool result for the compaction transcript, keeping the head and tail
 /// as `clip` does but also pinning up to [`CLIP_ERROR_LINES`] error lines from
-/// the omitted middle, each with [`CLIP_ERROR_CONTEXT`] lines of context, in
-/// order and separated by `…`. Everything stays within the same `max_chars`
-/// budget: the pins share half of it, the head and tail split what is left,
-/// and every marker is charged against the budget too.
+/// the omitted middle, each with [`CLIP_ERROR_CONTEXT`] lines of context.
+///
+/// Structurally, the result is a *selection of whole lines* of the original
+/// text (in order, each rendered at most once) with every omitted run replaced
+/// by a gap marker — so a line can never be duplicated, and coverage is a
+/// property of the one selection rather than of separately computed ranges.
+/// Every line is admitted through a single charge against one `max_chars`
+/// budget (its exact characters, newline/CRLF included, plus any change in the
+/// number of gap markers), so the result can never exceed the budget.
+/// Admission order: a small head and tail floor, then error lines not already
+/// kept (whole; an oversized first one is budget-clipped), then their context,
+/// then the remaining allowance grows the head (2/3) and tail (1/3).
 fn clip_tool_result(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
         return text.to_string();
     }
-    let lines: Vec<&str> = text.lines().collect();
-    let error_lines: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| is_error_line(l)).map(|(i, _)| i).collect();
-    if error_lines.is_empty() {
-        return clip(text, max_chars);
-    }
-    // Layout the head and tail first (each charged its newline), so pin
-    // selection can exclude the errors they already retain and the pins can
-    // borrow whatever allowance they do not use. The head and tail split what
-    // the pin budget cannot use, so the pieces always sum to `max_chars`.
-    // The head/tail are laid out as a *line* prefix/suffix — never cut
-    // mid-line — so a pinned error can never duplicate a line the head or
-    // tail shows only in part. An error line that would be cut mid-line at
-    // the head/tail boundary is kept whole instead, but only while the
-    // head/tail stay within their own share: an oversized one is left to the
-    // pin path, which can borrow the head/tail allowance.
+    // Newline-inclusive slices: every offset/length is in the original text's
+    // own coordinates (a CRLF line is charged both bytes' characters).
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let bare = |i: usize| lines[i].trim_end_matches('\n').trim_end_matches('\r');
+    let error_lines: Vec<usize> = (0..lines.len()).filter(|&i| is_error_line(bare(i))).collect();
     let marker = format!("…[{} characters omitted; error lines pinned]…\n", total - max_chars);
     let marker_len = marker.chars().count();
-    let rest = max_chars.saturating_sub(marker_len + 3 + max_chars / 2);
-    let head_end_byte = {
-        let mut end = 0usize;
-        for line in text.split_inclusive('\n') {
-            if end + line.len() > rest * 2 / 3 {
-                break;
-            }
-            end += line.len();
-        }
-        if let Some(line) = text[end..].split_inclusive('\n').next()
-            && end + line.len() <= rest
-            && is_error_line(line.trim_end_matches('\n'))
-        {
-            end += line.len();
-        }
-        end
+    if error_lines.is_empty() || max_chars < marker_len + 64 {
+        return clip(text, max_chars);
+    }
+    const GAP: usize = 2; // "…\n" for every gap after the first
+    let n = lines.len();
+    let lens: Vec<usize> = lines.iter().map(|l| l.chars().count()).collect();
+    let mut kept = vec![false; n];
+    let mut clipped: Vec<Option<String>> = vec![None; n];
+    // Nothing kept: one gap, rendered as the full marker.
+    let mut used = marker_len;
+    // The exact cost of keeping line `i` at `len` characters.
+    let cost = |kept: &[bool], i: usize, len: usize| -> isize {
+        let left = i > 0 && !kept[i - 1];
+        let right = i + 1 < n && !kept[i + 1];
+        let gaps_delta = left as isize + right as isize - 1;
+        len as isize + gaps_delta * GAP as isize
     };
-    let tail_start_byte = {
-        let mut start = text.len();
-        let mut len = 0usize;
-        for line in text.split_inclusive('\n').rev() {
-            if len + line.len() > rest / 3 {
-                break;
-            }
-            len += line.len();
-            start -= line.len();
+    let try_keep = |kept: &mut Vec<bool>, used: &mut usize, i: usize| -> bool {
+        if kept[i] {
+            return true;
         }
-        if let Some(line) = text[..start].split_inclusive('\n').next_back()
-            && len + line.len() <= rest / 3 * 2
-            && is_error_line(line.trim_end_matches('\n'))
-        {
-            start -= line.len();
+        let c = cost(kept, i, lens[i]);
+        if (*used as isize + c) as usize > max_chars {
+            return false;
         }
-        start
+        *used = (*used as isize + c) as usize;
+        kept[i] = true;
+        true
     };
-    let mut head: String = text[..head_end_byte].to_string();
-    let mut tail: String = text[tail_start_byte..].to_string();
-    let head_len = head.chars().count();
-    let tail_len = tail.chars().count();
-    // A line is "covered" when it lies whole inside the head or tail range.
-    let covered = |start: usize, end: usize| end < head_end_byte || start >= tail_start_byte;
-    // Merge the ±context windows of the first CLIP_ERROR_LINES *uncovered*
-    // error lines: an error already retained by the head or tail needs no pin
-    // and must not consume the pin allowance (or duplicate in the output).
-    // A window never extends past the first *unselected* error line: anything
-    // rendered must be charged to the budget, and unselected errors are not.
-    let mut starts = Vec::with_capacity(lines.len());
-    let mut pos = 0usize;
-    for line in &lines {
-        starts.push(pos);
-        pos += line.len() + 1; // the stripped '\n'
+    // 1. Head and tail floors (whole lines), so both ends always show.
+    let floor = (max_chars - marker_len) / 6;
+    let mut head_end = 0; // first line index not in the head
+    while head_end < n && lens[..=head_end].iter().sum::<usize>() <= floor && try_keep(&mut kept, &mut used, head_end) {
+        head_end += 1;
     }
-    let uncovered: Vec<usize> = error_lines
-        .iter()
-        .copied()
-        .filter(|&i| !covered(starts[i], starts[i] + lines[i].len()))
-        .collect();
-    let selected: &[usize] = &uncovered[..uncovered.len().min(CLIP_ERROR_LINES)];
-    let first_unselected = uncovered.get(CLIP_ERROR_LINES).copied();
-    let mut merged: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-    for &i in selected {
-        let start = i.saturating_sub(CLIP_ERROR_CONTEXT);
-        let mut end = (i + CLIP_ERROR_CONTEXT).min(lines.len() - 1);
-        if let Some(limit) = first_unselected {
-            end = end.min(limit.saturating_sub(1));
-        }
-        match merged.last_mut() {
-            Some(last) if start <= last.1 + 1 => {
-                last.1 = last.1.max(end);
-                last.2.push(i);
-            }
-            _ => merged.push((start, end, vec![i])),
-        }
+    let mut tail_start = n; // first line index of the tail
+    while tail_start > head_end
+        && lens[tail_start - 1..].iter().sum::<usize>() <= floor
+        && try_keep(&mut kept, &mut used, tail_start - 1)
+    {
+        tail_start -= 1;
     }
-    // Pins share one cumulative budget (half of `max_chars`, separators
-    // included). Windows are accepted in order while they fit. A window that
-    // would overflow keeps its complete error lines while they fit and drops
-    // or budget-clips the context; only when even the first window's bare
-    // error lines cannot fit is a diagnostic ever cut mid-line (budgeted
-    // head-and-tail, so the cut keeps the line's end). A shrink is a success,
-    // never a reason to discard later windows.
-    let pin_budget = max_chars / 2;
-    let mut pinned = String::new();
-    let mut used = 0usize;
-    for (idx, (start, end, errs)) in merged.iter().enumerate() {
-        let sep = if idx > 0 { 2 } else { 0 }; // "…\n"
-        let Some(remaining) = pin_budget.checked_sub(used + sep) else { break };
-        let reserved: usize = errs.iter().map(|&i| lines[i].chars().count() + 1).sum();
-        let mut rendered = String::new();
-        if reserved > remaining {
-            // The window's complete error lines overflow the pin share: before
-            // cutting anything mid-line, borrow the allowance the head and
-            // tail have not used (they shrink to make room). A diagnostic is
-            // clipped only when it cannot fit within the overall budget.
-            let head_min = head_len.min(200);
-            let tail_min = tail_len.min(200);
-            let borrowable = (head_len - head_min) + (tail_len - tail_min);
-            if reserved <= remaining + borrowable {
-                let mut deficit = reserved - remaining;
-                let h = deficit.min(head_len - head_min);
-                head = head.chars().take(head_len - h).collect();
-                deficit -= h;
-                let t = deficit.min(tail_len - tail_min);
-                tail = tail.chars().skip(t).collect();
-                for &i in errs {
-                    rendered.push_str(lines[i]);
-                    rendered.push('\n');
-                }
-            } else if idx > 0 {
-                break; // later windows that cannot fit whole error lines stop here
-            } else {
-                // Even with the head/tail at their floors the first window's
-                // bare error lines overflow: keep complete lines while they
-                // fit, then budget-clip the first line that cannot fit whole
-                // so its head *and* tail survive.
-                let mut left = remaining;
-                let mut iter = errs.iter().peekable();
-                while let Some(&i) = iter.next() {
-                    let len = lines[i].chars().count() + 1;
-                    if len <= left {
-                        rendered.push_str(lines[i]);
-                        rendered.push('\n');
-                        left -= len;
-                    } else {
-                        // The marker line costs a character of the line's share.
-                        rendered.push_str(&clip(lines[i], left.saturating_sub(1)));
-                        rendered.push('\n');
-                        if iter.peek().is_some() {
-                            rendered.push_str("…\n");
-                        }
-                        break; // nothing left for the remaining lines
-                    }
-                }
-            }
-        } else {
-            let context_budget = remaining - reserved;
-            let context: Vec<&str> = lines[*start..=*end].iter().filter(|l| !is_error_line(l)).copied().collect();
-            let context_chars: usize = context.iter().map(|l| l.chars().count() + 1).sum();
-            if context_chars <= context_budget {
-                for line in &lines[*start..=*end] {
-                    rendered.push_str(line);
-                    rendered.push('\n');
-                }
-            } else {
-                // Context cannot fit whole: keep the bare error lines, but
-                // give a single oversized context line a budgeted excerpt
-                // when that leaves the error's diagnostics intact — the error
-                // line itself is never cut. Two or more context lines drop
-                // whole: per-line excerpts would cost a marker line each and
-                // leave room for no real content.
-                let excerpt = if context.len() == 1 && context_budget > 1 {
-                    let clipped = clip(context[0], context_budget - 1);
-                    // An excerpt whose tail re-truncates the error's
-                    // diagnostic (e.g. `…tail` right after the error line) is
-                    // worse than no excerpt.
-                    let truncates_error =
-                        errs.iter().any(|&i| *end > i && !is_error_line(lines[*end]) && clipped.contains(lines[*end]));
-                    if truncates_error { None } else { Some(clipped) }
-                } else {
-                    None
-                };
-                for line in &lines[*start..=*end] {
-                    if is_error_line(line) {
-                        rendered.push_str(line);
-                        rendered.push('\n');
-                    } else if let Some(c) = &excerpt {
-                        rendered.push_str(c);
-                        rendered.push('\n');
-                    } // else: the context line drops (its 1-char charge is slack)
-                }
+    // 2. Pin error lines not already kept, whole while they fit; only the very
+    //    first pin may be budget-clipped (keeping the line's head and end).
+    let mut pinned: Vec<usize> = Vec::new();
+    for &i in &error_lines {
+        if kept[i] {
+            continue; // already retained: no pin, no duplicate, no allowance spent
+        }
+        if pinned.len() == CLIP_ERROR_LINES {
+            break;
+        }
+        if try_keep(&mut kept, &mut used, i) {
+            pinned.push(i);
+            continue;
+        }
+        if pinned.is_empty() {
+            // Charge the clipped rendering (plus its newline) exactly.
+            let base = cost(&kept, i, 0);
+            let room = (max_chars as isize - used as isize - base - 1).max(0) as usize;
+            let c = format!("{}\n", clip(bare(i), room));
+            let c_len = c.chars().count();
+            if (used as isize + base + c_len as isize) as usize <= max_chars {
+                used = (used as isize + base + c_len as isize) as usize;
+                kept[i] = true;
+                clipped[i] = Some(c);
+                pinned.push(i);
             }
         }
-        if idx > 0 {
-            pinned.push_str("…\n");
-        }
-        used += sep + rendered.chars().count();
-        pinned.push_str(&rendered);
+        break; // a later error that cannot fit whole stops pinning
     }
-    // The head and tail may have shrunk to lend the pins their allowance; the
-    // unused remainder goes back to them (2/3 head, 1/3 tail, as `clip`),
-    // still whole lines only — except that a line the boundary cuts mid-line
-    // is kept whole when it is an error line and fits the head/tail share
-    // (cheaper than pinning it; an oversized one is left to the pin path).
-    let lent = (head_len - head.chars().count()) + (tail_len - tail.chars().count());
-    let spare = (rest + max_chars / 2).saturating_sub(used + lent);
-    if spare > 0 {
-        let want_head = spare * 2 / 3;
-        let want_tail = spare / 3;
-        if head.chars().count() < want_head {
-            let mut end = head_end_byte;
-            for line in text[head_end_byte..].split_inclusive('\n') {
-                if end + line.len() > want_head
-                    && !(end + line.len() <= spare && is_error_line(line.trim_end_matches('\n')))
-                {
-                    break;
-                }
-                end += line.len();
+    // 3. Context around each pin, whole lines only, while they fit. A context
+    //    line that is itself an unpinned error is not admitted.
+    for &i in &pinned {
+        let lo = i.saturating_sub(CLIP_ERROR_CONTEXT);
+        let hi = (i + CLIP_ERROR_CONTEXT).min(n - 1);
+        for j in lo..=hi {
+            if !kept[j] && !is_error_line(bare(j)) {
+                try_keep(&mut kept, &mut used, j);
             }
-            head = text[..end].to_string();
-        }
-        if tail.chars().count() < want_tail {
-            let mut start = tail_start_byte;
-            let mut len = tail.len();
-            for line in text[..tail_start_byte].split_inclusive('\n').rev() {
-                if len + line.len() > want_tail
-                    && !(len + line.len() <= spare && is_error_line(line.trim_end_matches('\n')))
-                {
-                    break;
-                }
-                len += line.len();
-                start -= line.len();
-            }
-            tail = text[start..].to_string();
         }
     }
-    // Assemble: head, marker, pins, separator, tail — every piece already
-    // charged against `max_chars`.
+    // 4. Grow the head (2/3 of what is left) then the tail, then the head again.
+    let spare = max_chars - used;
+    let head_target = used + spare * 2 / 3;
+    while head_end < n && !kept[head_end] {
+        if (used as isize + cost(&kept, head_end, lens[head_end])) as usize > head_target {
+            break;
+        }
+        try_keep(&mut kept, &mut used, head_end);
+        head_end += 1;
+    }
+    while head_end < n && kept[head_end] {
+        head_end += 1;
+    }
+    while tail_start > head_end && (kept[tail_start - 1] || try_keep(&mut kept, &mut used, tail_start - 1)) {
+        tail_start -= 1;
+    }
+    while head_end < tail_start && (kept[head_end] || try_keep(&mut kept, &mut used, head_end)) {
+        head_end += 1;
+    }
+    // Render: kept lines in order, the first gap as the full marker.
     let mut out = String::with_capacity(max_chars + 16);
-    out.push_str(&head);
-    out.push('\n');
-    out.push_str(&marker);
-    out.push_str(&pinned);
-    out.push('…');
-    out.push('\n');
-    out.push_str(&tail);
+    let mut first_gap = true;
+    let mut in_gap = false;
+    for i in 0..n {
+        if kept[i] {
+            in_gap = false;
+            match &clipped[i] {
+                Some(c) => out.push_str(c),
+                None => out.push_str(lines[i]),
+            }
+        } else if !in_gap {
+            in_gap = true;
+            if first_gap {
+                out.push_str(&marker);
+                first_gap = false;
+            } else {
+                out.push_str("…\n");
+            }
+        }
+    }
     debug_assert!(out.chars().count() <= max_chars, "clip budget exceeded");
     out
 }
@@ -972,8 +867,10 @@ mod tests {
         let text = render_transcript(std::slice::from_ref(&message), 1_000_000, false);
         let body = text.strip_prefix("TOOL result (bash):\n").unwrap();
         assert!(body.chars().count() <= 2_000, "budget exceeded: {} chars", body.chars().count());
-        // Pins are capped at CLIP_ERROR_LINES error lines (each with context).
-        assert!(body.matches("error: failure number").count() <= CLIP_ERROR_LINES);
+        // Pins are capped at CLIP_ERROR_LINES error lines (each with context);
+        // the head and tail (one padded error each per ~1,200 chars) may
+        // naturally hold a couple more.
+        assert!(body.matches("error: failure number").count() <= CLIP_ERROR_LINES + 4);
         // Directly: an error line in the omitted middle is pinned within budget.
         let buried = format!(
             "{}\ncompiling crate-a\nerror: boom\nnote: see above\n{}",
@@ -1306,6 +1203,76 @@ mod tests {
         let clipped = clip_tool_result(&content, 2_000);
         assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
         assert!(clipped.contains("TAIL-DIAGNOSTIC-AT-END"), "the line's end is lost:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_long_errors_at_both_ends_stay_within_budget() {
+        // Long errors at both boundaries plus a buried pin: head and tail
+        // growth share one allowance, so the budget holds.
+        let long = |tag: &str| format!("error: {tag} {}\n", "z".repeat(700));
+        let mut content = "intro\n".repeat(40);
+        content.push_str(&long("HEAD-END"));
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str("error: buried pin\n");
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str(&long("TAIL-START"));
+        content.push_str(&"outro\n".repeat(40));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: buried pin"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_handles_crlf_offsets() {
+        // CRLF lines: coverage must use the original coordinates, so a buried
+        // error is never mistaken for one the head already retains.
+        let mut content = "ordinary build output line\r\n".repeat(300);
+        content.push_str("error: crlf buried diagnostic\r\n");
+        content.push_str(&"more output after\r\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert_eq!(clipped.matches("error: crlf buried diagnostic").count(), 1, "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_head_errors_when_a_long_pin_needs_room() {
+        // An early diagnostic retained by the head must not vanish when a long
+        // middle error needs room, and no error is ever rendered twice.
+        let mut content = "intro\n".repeat(30);
+        content.push_str("error: early diagnostic\n");
+        content.push_str(&"pad line\n".repeat(400));
+        content.push_str(&format!("error: long middle {}\n", "m".repeat(1_300)));
+        content.push_str(&"pad line\n".repeat(400));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert_eq!(clipped.matches("error: early diagnostic").count(), 1, "{clipped}");
+        assert_eq!(clipped.matches("error: long middle").count(), 1, "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_never_duplicates_a_line_and_holds_the_budget() {
+        // Property sweep over adjacent long errors near the head/tail
+        // boundaries: every rendered error line is unique and the budget holds.
+        for budget in [300, 700, 2_000] {
+            for pad in [0, 5, 37, 120] {
+                for err_len in [10, 400, 900] {
+                    let mut content = "h\n".repeat(pad);
+                    for k in 0..4 {
+                        content.push_str(&format!("error: E{k} {}\n", "q".repeat(err_len)));
+                    }
+                    content.push_str(&"m\n".repeat(500));
+                    for k in 4..8 {
+                        content.push_str(&format!("error: E{k} {}\n", "q".repeat(err_len)));
+                    }
+                    content.push_str(&"t\n".repeat(pad));
+                    let clipped = clip_tool_result(&content, budget);
+                    assert!(clipped.chars().count() <= budget, "{budget}/{pad}/{err_len}: {}", clipped.chars().count());
+                    for k in 0..8 {
+                        assert!(clipped.matches(&format!("error: E{k} ")).count() <= 1, "dup E{k}:\n{clipped}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
