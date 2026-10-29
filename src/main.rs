@@ -338,6 +338,29 @@ impl DoublePress {
 /// gesture does not need.
 type DoubleEscape = lineedit::DoubleEscape;
 
+/// Wrap an idle terminal read so a background update hint is shown as soon
+/// as it lands, without abandoning the pending read. Shared by every idle
+/// wait (the prompt loop and the timer wait).
+async fn with_update_hints<F: std::future::Future>(
+    next: F,
+    checker: Option<Arc<update::Checker>>,
+    renderer: Arc<ui::Renderer>,
+) -> F::Output {
+    tokio::pin!(next);
+    let Some(checker) = checker else { return next.await };
+    loop {
+        tokio::select! {
+            biased;
+            event = &mut next => return event,
+            _ = checker.hint_ready() => {
+                if let Some(hint) = checker.take_hint() {
+                    renderer.note(&hint);
+                }
+            }
+        }
+    }
+}
+
 struct Terminal {
     want: std::sync::mpsc::Sender<()>,
     outstanding: bool,
@@ -2894,7 +2917,10 @@ async fn main() -> Result<()> {
                     // first. The wait is scoped so the future's borrows end
                     // before the agent/terminal are touched again.
                     let event = {
-                        let next = terminal.next(&agent);
+                        // Hint-aware like the prompt loop below, so an update
+                        // found during a long timer wait shows promptly.
+                        let hint_renderer = terminal.renderer.clone();
+                        let next = with_update_hints(terminal.next(&agent), update_checker.clone(), hint_renderer);
                         tokio::pin!(next);
                         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next).await.ok()
                     };
@@ -3043,22 +3069,7 @@ async fn main() -> Result<()> {
                 let deadline = [exit_press.deadline(), timer_deadline].into_iter().flatten().min();
                 // Show a background-check hint as soon as it lands while the
                 // prompt is idle, without abandoning the pending read.
-                let hint_checker = update_checker.clone();
-                let next = async move {
-                    tokio::pin!(next);
-                    let Some(checker) = hint_checker else { return next.await };
-                    loop {
-                        tokio::select! {
-                            biased;
-                            event = &mut next => return event,
-                            _ = checker.hint_ready() => {
-                                if let Some(hint) = checker.take_hint() {
-                                    hint_renderer.note(&hint);
-                                }
-                            }
-                        }
-                    }
-                };
+                let next = with_update_hints(next, update_checker.clone(), hint_renderer);
                 let event = if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
                         Ok(event) => event,

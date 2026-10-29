@@ -647,8 +647,13 @@ struct CompactionRecord {
     /// First and last log line folded into the summary.
     range: Option<(u64, u64)>,
     mode: CompactionMode,
-    /// The folded messages (the real pre-compaction turns), in order.
+    /// The newly folded messages (the real pre-compaction turns), in order.
+    /// When `extends` is set these append to the existing replay stash rather
+    /// than replacing it, so a repeated compaction never copies the
+    /// accumulated transcript.
     folded: Vec<Message>,
+    /// Whether `folded` extends the current `pre_compaction_transcript`.
+    extends: bool,
     /// Index, in the new (compacted) conversation, of the synthetic
     /// restatement of the active input when it was itself folded into the
     /// summary. `replay_history` skips it so the one submitted prompt is not
@@ -2879,19 +2884,18 @@ impl Agent {
         // Destructure once: the folded turns go to the replay stash, the range
         // and mode to the durable replace record, and the restated-input index
         // to the replay skip.
-        let (range, mode, folded_turns, restated) = match compaction {
-            Some(CompactionRecord { range, mode, folded, restated }) => (range, Some(mode), Some(folded), restated),
-            None => (None, None, None, None),
-        };
-        let (delta_folded, folded_base) = match (&folded_turns, &self.pre_compaction_transcript) {
-            (Some(turns), Some(prev))
-                if !prev.is_empty() && turns.len() >= prev.len() && turns[..prev.len()] == prev[..] =>
-            {
-                (Some(turns[prev.len()..].to_vec()), Some(prev.len()))
+        let (range, mode, folded_turns, extends, restated) = match compaction {
+            Some(CompactionRecord { range, mode, folded, extends, restated }) => {
+                (range, Some(mode), Some(folded), extends, restated)
             }
-            (Some(turns), _) => (Some(turns.clone()).filter(|f| !f.is_empty()), None),
-            (None, _) => (None, None),
+            None => (None, None, None, false, None),
         };
+        // A repeated compaction logs only its newly folded turns plus the
+        // prefix length they extend, so the log grows linearly.
+        let base_len = self.pre_compaction_transcript.as_ref().map_or(0, Vec::len);
+        let extends = extends && base_len > 0;
+        let folded_base = extends.then_some(base_len);
+        let delta_folded = folded_turns.as_ref().filter(|f| !f.is_empty() || extends).cloned();
         if let Some(log) = &mut self.session {
             log.append(&Record::Replace {
                 messages: messages.clone(),
@@ -2930,7 +2934,14 @@ impl Agent {
         // change, …) clears the stash so a later replay cannot resurrect the
         // previous conversation and skip the first new user turn as though it
         // were a synthetic summary.
-        self.pre_compaction_transcript = folded_turns.filter(|f| !f.is_empty());
+        self.pre_compaction_transcript = match folded_turns {
+            Some(new) if extends => {
+                let mut stash = self.pre_compaction_transcript.take().unwrap_or_default();
+                stash.extend(new);
+                Some(stash)
+            }
+            other => other.filter(|f| !f.is_empty()),
+        };
         // Track the restatement to skip alongside the stash; a cleared stash
         // (any non-compaction replacement) clears it too.
         self.pre_compaction_restated = self.pre_compaction_transcript.as_ref().and(restated);
@@ -4698,18 +4709,21 @@ impl Agent {
         // synthetic restatement a prior compaction appended (tracked by
         // `pre_compaction_restated`) is dropped from the stash too, so it never
         // carries forward as a replayed duplicate.
-        let summarized_msgs = match &self.pre_compaction_transcript {
-            Some(prev) => {
-                let mut turns = prev.clone();
-                for (offset, message) in summarized.iter().enumerate().skip(1) {
-                    if self.pre_compaction_restated == Some(body_start + offset) {
-                        continue;
-                    }
-                    turns.push(message.clone());
-                }
-                turns
-            }
-            None => summarized.to_vec(),
+        // Only the newly folded turns are carried: on a repeated compaction the
+        // first summarized message is the previous synthetic summary, whose
+        // real turns already live in the stash, and `replace_keeping_pending`
+        // extends that stash in place (no cumulative copy).
+        let extends_stash = self.pre_compaction_transcript.as_ref().is_some_and(|p| !p.is_empty());
+        let summarized_msgs: Vec<Message> = if extends_stash {
+            summarized
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(offset, _)| self.pre_compaction_restated != Some(body_start + offset))
+                .map(|(_, m)| m.clone())
+                .collect()
+        } else {
+            summarized.to_vec()
         };
 
         // The summary's output budget and the transcript's share of the window
@@ -4964,7 +4978,13 @@ impl Agent {
         self.replace_keeping_pending(
             messages,
             pending_position,
-            Some(CompactionRecord { range, mode, folded: summarized_msgs, restated: restated_index }),
+            Some(CompactionRecord {
+                range,
+                mode,
+                folded: summarized_msgs,
+                extends: extends_stash,
+                restated: restated_index,
+            }),
         )?;
         if let Some(instructions) = &mut self.instructions {
             instructions.forget_nested();
