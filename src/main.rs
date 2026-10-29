@@ -87,7 +87,12 @@ fn register_builtin_tools(agent: &mut Agent) {
         spill_digests: Some(agent.spill_digests_handle()),
         ..Default::default()
     };
-    agent.tools().register(bash::definition(), Box::new(move |args| Ok(json!(bash::run(&bash_config, &args)))));
+    agent.tools().register(
+        bash::definition(),
+        Box::new(move |args| {
+            bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+        }),
+    );
 
     // question tool: blocks until the turn loop answers (see question.rs).
     // Headless (ACP) sessions have no one to answer, so it errors instead.

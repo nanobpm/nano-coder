@@ -4193,9 +4193,12 @@ impl Agent {
                 // successful edit counts — a failed write changed nothing.
                 if ok && matches!(tool_call.name.as_str(), "write_file" | "edit_file") {
                     self.edits_since_check = true;
-                } else if dispatched && tool_call.name == "bash" {
-                    // Only a bash call that actually ran counts as a check (even
-                    // one that failed); a denied/malformed one never ran.
+                } else if dispatched && ok && tool_call.name == "bash" {
+                    // Only a bash call that actually started counts as a check
+                    // (even one that then exited non-zero). A denied/malformed
+                    // call, or one the handler rejected before starting the
+                    // command (invalid arguments, spawn failure), is a failed
+                    // tool call (`ok == false`) and never ran.
                     self.edits_since_check = false;
                 }
                 // A non-image binary file takes read_file's generic "looks
@@ -10443,6 +10446,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded() {
+        // The real bash handler rejects `bash({})` before starting any command;
+        // that call never ran, so it must not clear the unchecked edit.
+        for args in [json!({}), json!({"command": 1}), json!({"command": "true", "timeout_seconds": 0})] {
+            let dir = tempfile::tempdir().unwrap();
+            let batch = LLMResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit_file".into(),
+                        arguments: json!({"path": "a.rs"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: args.clone(),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "o1".into(),
+                        name: goal::TOOL_NAME.into(),
+                        arguments: json!({"status": "completed", "summary": "done"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+            let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+            let bash_config = crate::bash::BashConfig::default();
+            agent.tools().register(
+                crate::bash::definition(),
+                Box::new(move |args| {
+                    crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+                }),
+            );
+            agent.new_session().unwrap();
+            agent.run_turn(Some("m1"), "ship it").await.unwrap();
+            assert!(
+                tool_text(&agent, "b1").contains("bash argument")
+                    || tool_text(&agent, "b1").contains("timeout_seconds")
+            );
+            let text = tool_text(&agent, "o1");
+            assert!(text.contains(goal::VERIFY_REMINDER), "invalid bash {args} is no check: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn blocked_and_needs_input_are_never_intercepted() {
         for (status, prefix) in [("blocked", "Blocked: "), ("needs_input", "Question: ")] {
             let dir = tempfile::tempdir().unwrap();
@@ -11893,7 +11948,9 @@ mod tests {
         let bash_config = crate::bash::BashConfig { cancel: Some(agent.control().cancel_flag()), ..Default::default() };
         agent.tools().register(
             crate::bash::definition(),
-            Box::new(move |args| Ok(json!(crate::bash::run(&bash_config, &args)))),
+            Box::new(move |args| {
+                crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+            }),
         );
         agent.new_session().unwrap();
         let control = agent.control();

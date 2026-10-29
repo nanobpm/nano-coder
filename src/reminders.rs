@@ -60,7 +60,7 @@ pub struct ContentHashes<'a> {
     /// differ, so the fingerprint must fold these in to tell the calls apart.
     pub attachments: &'a [&'a str],
     /// The bounder-supplied identity of each capture it truncated and spilled
-    /// while producing this result (`bash::run_digest`,
+    /// while producing this result (`bash::run_checked`,
     /// `output::bound_and_spill_digest`, `history::read_digest`). Carrying the
     /// digest **and the exact marker path** out of band is what lets the
     /// fingerprint normalise exactly the genuine marker's volatile per-call
