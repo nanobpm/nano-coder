@@ -21,7 +21,7 @@ cargo install nano-coder             # or build from source
 - **Lifecycle Hooks**: 6 internal hook events for observing agent behavior, plus
   Claude Code–compatible external user hooks loaded from `.claude/settings.json`
 - **Configuration**: TOML-based config file at `~/.config/nano-coder/config.toml`
-- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/exit`
+- **Commands**: `/help`, `/version`, `/compact`, `/context`, `/verbosity`, `/settings`, `/tools`, `/skills`, `/queue`, `/restart`, `/update`, `/relaunch`, `/exit`
 - **Streaming output**: answers stream in, thinking shows collapsed, tool calls show inline
 - **Status line** as the bottom row of the terminal, plus manual and automatic context compaction
 - **Task plans**: `plan_*` tools keep a plan with notes outside the conversation, so long tasks survive compaction, resume and a change of worker
@@ -436,7 +436,66 @@ argument: a type-ahead list narrows as you type and Tab completes it.
 - `/trajectory` - Show this session's trajectory turn by turn: user input, thinking, answers, tool calls and results, tokens and timings. Each message row is labelled with its `#N` session-log ID, the same ID `history_read` and smart-compaction summaries use (compaction and crash-recovered input rows have no `#N`, as they aren't cited that way). When it doesn't fit on the screen it opens in your pager (`$PAGER`, default `less`) — but only at an idle prompt on a terminal: invoked mid-turn (while a turn runs) or with piped output it prints inline instead. `/trajectory --json` or `/trajectory --markdown` prints an export instead; `nano-coder --trajectory SESSION_ID [--json|--markdown]` does the same for any saved session
 - `/resume [ID|last]` - Switch to a saved session without restarting: the same picker as `--resume` (leaving out the session in use), or the session with that ID, or `last` (the most recent other session in this directory). Run it at the prompt, not during a turn
 - `/restart` - Start a fresh session (clean context) without exiting
+- `/update` - Install the latest release through the channel nano-coder was installed from (`npm install -g @nanobpm/nano-coder@latest` or `cargo install nano-coder`), with the installer's progress on the terminal; verifies the installed version afterwards and leaves the running session untouched on failure. On an install that is not managed by cargo or npm it prints the releases page and changes nothing. Run it at the prompt, not during a turn (see [Updates](#updates))
+- `/relaunch` - Restart the binary (re-resolved, so a just-installed update is picked up), resuming the current session — the transcript and scrollback carry over. Works whether or not an update was just installed. An unsent draft or queued messages are confirmed before being discarded. Run it at the prompt, not during a turn (see [Updates](#updates))
 - `/exit` - Exit the agent (prints the session's `--resume` command first, when session persistence is enabled)
+
+## Updates
+
+In an interactive terminal session, nano-coder checks in the background whether a newer
+release exists: once at startup (in a background task — the first prompt is never delayed)
+and then every hour. The last-check time and the latest-known version are persisted in
+`<platform data dir>/nano-coder/update-check.json`, so rapid restarts do not re-check
+inside the hour. When a newer version is found, a single non-modal hint per new version is
+shown at an idle prompt:
+
+> nano-coder 0.43.0 is available (you have 0.42.1) — /update to install it
+
+The check runs only in interactive TTY sessions — never in `-p`/headless, ACP or CI runs
+(automated runners use deliberately pinned versions) — and only when the binary is managed
+by a known install channel, detected once at startup from the executable's path:
+
+- **npm** (under a `node_modules/@nanobpm/` tree — both launcher states: the
+  platform-package binary and the self-replaced copy in `bin/`): the latest version comes
+  from `https://registry.npmjs.org/@nanobpm/nano-coder/latest`, and `/update` runs
+  `npm install -g @nanobpm/nano-coder@latest`.
+- **cargo** (in `$CARGO_HOME/bin`, default `~/.cargo/bin`): the latest version comes from
+  `https://crates.io/api/v1/crates/nano-coder`, and `/update` runs `cargo install
+  nano-coder` — which compiles from source and takes minutes, so the installer runs
+  attached to the terminal with its progress visible and Ctrl-C cancelling it, like a
+  long bash command.
+- **anything else** (standalone tarball, a dev build in `target/`, a distro package): no
+  background check and no self-modification. `/update` explains that the install is not
+  managed and points at the
+  [releases page](https://github.com/nanobpm/nano-coder/releases); a locally built binary
+  is never overwritten.
+
+`/update` runs only at an idle prompt. It suspends the frame UI while the installer owns
+the terminal, then verifies the result with `nano-coder --version`: on success it suggests
+`/relaunch`; on failure it shows the installer's exit status and leaves the running
+session untouched. If the channel's tool (`npm`/`cargo`) is not on `PATH`, `/update`
+prints the exact manual command instead. If you are already on the latest release (a fresh
+check, not the hourly cache), it says so.
+
+`/relaunch` restarts the harness without losing the session: it re-resolves the binary
+(so a just-installed update is picked up), restores the terminal modes, and replaces the
+process with the original arguments plus `--resume <current session>`. The session log,
+persisted timers and trust decisions live outside the process and carry over; ephemeral
+state — session-scoped permission grants and MCP connections — is re-established by the
+resume, as with any `--resume`. An unsent draft or queued messages are confirmed before
+being discarded. It also works with no update pending, as a "restart the harness, keep
+the session" verb (unlike `/restart`, which starts a fresh session with clean context).
+
+The check fails silently and quickly when the network is unavailable (a short timeout, no
+retries, no effect on turn latency). To opt out, either:
+
+```toml
+# ~/.config/nano-coder/config.toml
+check_updates = false
+```
+
+or set an environment variable — `NANO_CODER_NO_UPDATE_CHECK=1`, or the de-facto standard
+`NO_UPDATE_NOTIFIER=1`.
 
 ## Building and Running
 
@@ -524,6 +583,7 @@ reminders = true                        # append <system-reminder> notes to tool
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
 memory_expiry_days = 90                 # expire memories unused this long (0 = never)
+check_updates = true                    # hourly background release check, interactive sessions only (see Updates)
 
 [skills]                                # see Skills
 enabled = true

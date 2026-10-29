@@ -57,6 +57,7 @@ mod trajectory;
 mod trust;
 mod turn_commands;
 mod ui;
+mod update;
 mod vision;
 
 use agent::Agent;
@@ -341,6 +342,29 @@ impl DoublePress {
 /// `DoublePress` (Ctrl-C) has an extra deadline/disarm lifecycle, which the Esc
 /// gesture does not need.
 type DoubleEscape = lineedit::DoubleEscape;
+
+/// Wrap an idle terminal read so a background update hint is shown as soon
+/// as it lands, without abandoning the pending read. Shared by every idle
+/// wait (the prompt loop and the timer wait).
+async fn with_update_hints<F: std::future::Future>(
+    next: F,
+    checker: Option<Arc<update::Checker>>,
+    renderer: Arc<ui::Renderer>,
+) -> F::Output {
+    tokio::pin!(next);
+    let Some(checker) = checker else { return next.await };
+    loop {
+        tokio::select! {
+            biased;
+            event = &mut next => return event,
+            _ = checker.hint_ready() => {
+                if let Some(hint) = checker.take_hint() {
+                    renderer.note(&hint);
+                }
+            }
+        }
+    }
+}
 
 struct Terminal {
     want: std::sync::mpsc::Sender<()>,
@@ -1646,6 +1670,164 @@ fn resume_command(agent: &mut Agent, arg: &str, terminal: &mut Terminal) -> Resu
     Ok(())
 }
 
+/// `/update`: install the latest release through the channel this binary was
+/// installed from (`npm install -g` or `cargo install`), with the installer's
+/// progress attached to the terminal. Only at idle; on failure the running
+/// session is untouched.
+async fn update_command(terminal: &mut Terminal, checker: Option<&update::Checker>) -> Result<()> {
+    if terminal.outstanding {
+        terminal.renderer.print_block("/update runs the installer: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    // Never install from an automated run: piped input or output, or a CI
+    // runner, uses a deliberately pinned version (the same rule that gates
+    // the background check).
+    if !update_allowed(io::stdin().is_terminal(), io::stdout().is_terminal(), update::is_ci()) {
+        terminal.renderer.print_block(
+            "/update only runs in an interactive terminal outside CI; install the update with your package manager",
+        );
+        return Ok(());
+    }
+    let channel = checker.map(update::Checker::channel).unwrap_or_else(update::Channel::detect);
+    if channel == update::Channel::Other {
+        // Never touch a standalone/tarball/dev install; say where releases live.
+        let outcome = update::run_installer(channel, &update::launch_exe(), update::spawn_installer).await;
+        for line in outcome.lines() {
+            terminal.renderer.print_block(&line);
+        }
+        return Ok(());
+    }
+    // A fresh check, so an "already up to date" answer is not the hourly
+    // cache. When the background checker is disabled (`check_updates = false`
+    // or an opt-out env var) there is no shared checker, so build a transient
+    // one for this explicit command: without it `/update` would run the
+    // installer even when the running version is current. Failure is silent
+    // here too: the install below is the real test.
+    let transient;
+    let checker = match checker {
+        Some(checker) => checker,
+        None => {
+            transient = update::Checker::new(channel, update::default_state_path());
+            &transient
+        }
+    };
+    let latest = checker.force_check().await;
+    if let Some(latest) = latest.filter(|v| !update::is_newer(v, env!("CARGO_PKG_VERSION"))) {
+        terminal.renderer.print_block(&format!("nano-coder is up to date ({latest})"));
+        return Ok(());
+    }
+    // Hand the terminal to the installer the way the pager handoff does: the
+    // stdin reader yields, the frame UI releases the screen, and the terminal
+    // modes are restored so the installer sees a normal terminal (and Ctrl-C
+    // interrupts it like any long command). The frame is repainted afterwards
+    // on every path.
+    let gate = terminal.suspend_input();
+    let _picker_guard = terminal.picker_lock().lock_owned().await;
+    // No clear_screen() here: it drops the frame's transcript, and the
+    // repaint below must restore the session history on every path.
+    lineedit::restore_terminal();
+    let outcome = update::run_installer(channel, &update::launch_exe(), update::spawn_installer).await;
+    gate.release();
+    drop(_picker_guard);
+    terminal.renderer.frame_resize();
+    for line in outcome.lines() {
+        terminal.renderer.print_block(&line);
+    }
+    Ok(())
+}
+
+/// Whether `/update` may run the installer: only in an interactive terminal
+/// (both ends) outside CI.
+fn update_allowed(stdin_tty: bool, stdout_tty: bool, ci: bool) -> bool {
+    stdin_tty && stdout_tty && !ci
+}
+
+/// `/relaunch`: exec the binary again — re-resolved, so a just-installed
+/// update is picked up — with the original argv plus `--resume <current
+/// session>`, keeping the session's scrollback and transcript. Only at idle;
+/// an unsent draft or queued messages are confirmed before being discarded.
+async fn relaunch_command(agent: &mut Agent, terminal: &mut Terminal) -> Result<()> {
+    if terminal.outstanding {
+        terminal.renderer.print_block("/relaunch restarts nano-coder: run it at the prompt once the turn is over");
+        return Ok(());
+    }
+    // Warn and confirm before discarding an unsent draft or queued messages.
+    let draft = terminal.view.lock().unwrap().has_draft();
+    let queued = terminal.messages.len();
+    if draft || queued > 0 {
+        let what = match (draft, queued) {
+            (true, 0) => "your unsent draft".to_string(),
+            (false, n) => format!("{n} queued message(s)"),
+            (true, n) => format!("your unsent draft and {n} queued message(s)"),
+        };
+        let gate = terminal.suspend_input();
+        let _picker_guard = terminal.picker_lock().lock_owned().await;
+        let confirmed = tokio::task::spawn_blocking(move || {
+            dialoguer::Confirm::new()
+                .with_prompt(format!("Relaunching discards {what}. Relaunch now?"))
+                .default(false)
+                .interact_opt()
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        gate.release();
+        drop(_picker_guard);
+        terminal.renderer.frame_resize();
+        if !confirmed {
+            terminal.renderer.print_block("Relaunch cancelled");
+            return Ok(());
+        }
+        terminal.view.lock().unwrap().clear_input_if_any();
+    }
+    // The session must be on disk for `--resume` to replay it. With
+    // persistence off there is nothing to resume into, so a relaunch would
+    // silently start clean — refuse instead.
+    let Some(id) = agent.session_id().map(str::to_string).filter(|_| agent.session_path().is_some()) else {
+        terminal.renderer.print_block(
+            "This session isn't saved (persist_sessions = false), so a relaunch cannot resume it. \
+             Set persist_sessions = true, or use /restart for a fresh session.",
+        );
+        return Ok(());
+    };
+    // The session log is appended unbuffered (turn ends are synced), so
+    // nothing needs flushing; the new process reopens the file.
+    // The launch path, captured at startup: after an update replaced the
+    // binary, `current_exe()` names the unlinked old inode on Linux, while
+    // the launch path holds the new install.
+    let exe = update::launch_exe();
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv = update::relaunch_argv(&argv, &id);
+    terminal.renderer.print_block(&format!("Relaunching into session {id} (resume later with --resume {id})"));
+    // Restore the terminal modes (raw mode, bracketed paste, key reporting)
+    // before handing over; the new process re-enters them itself.
+    lineedit::restore_terminal();
+    herdr::release();
+    let err = exec(&exe, &argv);
+    // Only reached when the exec itself failed.
+    terminal.renderer.frame_resize();
+    terminal.renderer.print_block(&format!("Relaunch failed: could not exec {}: {err}", exe.display()));
+    Ok(())
+}
+
+/// Replace this process with `exe` running `argv` (same cwd and environment).
+#[cfg(unix)]
+fn exec(exe: &std::path::Path, argv: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(exe).args(argv).exec()
+}
+
+/// Windows has no `exec`: spawn the new process and exit with its status.
+#[cfg(not(unix))]
+fn exec(exe: &std::path::Path, argv: &[String]) -> std::io::Error {
+    match std::process::Command::new(exe).args(argv).status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+        Err(err) => err,
+    }
+}
+
 /// A copy of the agent's context stats with the live mode. A function, not an
 /// inline expression, so the stats lock is released before it returns.
 fn live_stats(agent: &Agent) -> context::ContextStats {
@@ -1653,7 +1835,13 @@ fn live_stats(agent: &Agent) -> context::ContextStats {
     context::ContextStats { mode: agent.mode(), ..stats }
 }
 
-async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal, wait_timers: bool) -> Result<bool> {
+async fn run_command(
+    agent: &mut Agent,
+    cmd: &str,
+    terminal: &mut Terminal,
+    wait_timers: bool,
+    update_checker: Option<&update::Checker>,
+) -> Result<bool> {
     // Split name from argument on ANY whitespace, the same rule `timing` and
     // `Snapshot::output` use, so a tab/newline-separated form (e.g.
     // `/trajectory\t--json`) dispatches identically to its space-separated twin
@@ -1888,6 +2076,14 @@ async fn run_command(agent: &mut Agent, cmd: &str, terminal: &mut Terminal, wait
             } else {
                 terminal.renderer.print_block(&format!("Session: {id}"));
             }
+            Ok(true)
+        }
+        "/update" => {
+            update_command(terminal, update_checker).await?;
+            Ok(true)
+        }
+        "/relaunch" => {
+            relaunch_command(agent, terminal).await?;
             Ok(true)
         }
         _ if name == "/thinking" && arg.is_empty() => {
@@ -2207,6 +2403,9 @@ fn parse_args_from<I: IntoIterator<Item = String>>(argv: I) -> Result<Args> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pin the launch path before anything (e.g. /update) can replace the
+    // binary underneath this process.
+    let _ = update::launch_exe();
     // Detect execution mode from command-line args
     let mut args = parse_args()?;
     // Before anything reads the config or data directories.
@@ -2512,6 +2711,30 @@ async fn main() -> Result<()> {
         } else {
             println!("{}\n", banner.join("\n"));
         }
+        // The hourly background update check: interactive TTY sessions only,
+        // never in headless/ACP/CI runs (automated runners pin versions on
+        // purpose), and only for a cargo/npm-managed install. It runs in a
+        // background task, so the first prompt is never delayed, and every
+        // failure is silent.
+        let update_checker = if interactive
+            && !args.acp
+            && agent.config().check_updates
+            && !update::disabled_by_env()
+            && !update::is_ci()
+        {
+            // An unmanaged install (`Channel::Other`) gets no checker at all:
+            // neither checks nor hints cached by a managed session.
+            match update::Channel::detect() {
+                update::Channel::Other => None,
+                channel => {
+                    let checker = Arc::new(update::Checker::new(channel, update::default_state_path()));
+                    checker.clone().spawn();
+                    Some(checker)
+                }
+            }
+        } else {
+            None
+        };
         let view = {
             let context = Arc::new(Mutex::new(lineedit::EditContext {
                 config: agent.config().clone(),
@@ -2618,6 +2841,14 @@ async fn main() -> Result<()> {
             };
             prompt(&terminal, separate);
             separate = false;
+            // A newer release found by the background check is hinted at here,
+            // at an idle prompt only — never mid-stream or mid-tool-call — and
+            // at most once per version.
+            if let Some(checker) = &update_checker
+                && let Some(hint) = checker.take_hint()
+            {
+                terminal.renderer.note(&hint);
+            }
             // Ready for input: tell Herdr, with the session to resume (re-read
             // each time so `/resume` and `/restart` are picked up).
             herdr::report(herdr::State::Idle, None, herdr_session(&agent, &herdr_extra));
@@ -2703,7 +2934,10 @@ async fn main() -> Result<()> {
                     // first. The wait is scoped so the future's borrows end
                     // before the agent/terminal are touched again.
                     let event = {
-                        let next = terminal.next(&agent);
+                        // Hint-aware like the prompt loop below, so an update
+                        // found during a long timer wait shows promptly.
+                        let hint_renderer = terminal.renderer.clone();
+                        let next = with_update_hints(terminal.next(&agent), update_checker.clone(), hint_renderer);
                         tokio::pin!(next);
                         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut next).await.ok()
                     };
@@ -2828,6 +3062,9 @@ async fn main() -> Result<()> {
                 {
                     break Prompt::Input(TermInput::Eof);
                 }
+                // Cloned before `terminal.next(&agent)` mutably borrows the
+                // terminal: the hint wrapper below needs an Arc of its own.
+                let hint_renderer = terminal.renderer.clone();
                 let next = terminal.next(&agent);
                 // Bound this wait on the soonest of two deadlines, recomputed
                 // each wakeup, so an event that doesn't break the loop (a
@@ -2847,6 +3084,9 @@ async fn main() -> Result<()> {
                     std::time::Instant::now() + wait.max(std::time::Duration::from_millis(200))
                 });
                 let deadline = [exit_press.deadline(), timer_deadline].into_iter().flatten().min();
+                // Show a background-check hint as soon as it lands while the
+                // prompt is idle, without abandoning the pending read.
+                let next = with_update_hints(next, update_checker.clone(), hint_renderer);
                 let event = if let Some(deadline) = deadline {
                     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), next).await {
                         Ok(event) => event,
@@ -2984,7 +3224,7 @@ async fn main() -> Result<()> {
                 terminal.renderer.frame_user_message(commands::unescape_prompt(&input).unwrap_or(&input));
             }
 
-            match run_command(&mut agent, &input, &mut terminal, args.wait_timers).await {
+            match run_command(&mut agent, &input, &mut terminal, args.wait_timers, update_checker.as_deref()).await {
                 Ok(continue_running) => {
                     running = continue_running;
                 }
@@ -3020,6 +3260,14 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_is_refused_outside_an_interactive_non_ci_terminal() {
+        assert!(super::update_allowed(true, true, false));
+        assert!(!super::update_allowed(false, true, false), "piped stdin");
+        assert!(!super::update_allowed(true, false, false), "piped stdout");
+        assert!(!super::update_allowed(true, true, true), "CI");
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 

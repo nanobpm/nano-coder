@@ -116,6 +116,11 @@ pub struct Config {
     pub claude_user_hooks: bool,
     /// nano's own hooks, in Claude's structure: event name -> matcher groups.
     pub hooks: crate::claude_hooks::NanoHooks,
+    /// Check hourly whether a newer release exists and hint at it (interactive
+    /// TTY sessions only; never in headless/ACP/CI runs). The
+    /// `NANO_CODER_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` env vars also turn
+    /// it off. See `update.rs`.
+    pub check_updates: bool,
 }
 
 /// Whether cross-session memory is available, and whether the model may write
@@ -196,6 +201,7 @@ impl Default for Config {
             disable_project_hooks: false,
             claude_user_hooks: true,
             hooks: crate::claude_hooks::NanoHooks::new(),
+            check_updates: true,
         }
     }
 }
