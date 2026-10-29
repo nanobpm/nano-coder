@@ -1139,6 +1139,9 @@ mod tests {
             mode: Some(CompactionMode::Smart),
             model: Some("copilot/gpt".into()),
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         });
         let traj = Trajectory::from_records(&recs);

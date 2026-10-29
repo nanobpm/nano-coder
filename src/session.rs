@@ -90,6 +90,24 @@ pub enum Record {
         /// #114). Absent when no continuation is in flight.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         continuation: Option<(String, usize)>,
+        /// Compaction only: the folded messages (the real pre-compaction
+        /// turns), so a resume or relaunch can rebuild the visible transcript
+        /// instead of showing the synthetic summary in their place. Omitted
+        /// from older logs; those resume with the summary, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded: Option<Vec<Message>>,
+        /// Compaction only: when set, `folded` holds only the *newly* folded
+        /// turns and extends the first `n` turns of the previous replace
+        /// record's folded stash, so repeated compactions do not re-persist
+        /// the whole cumulative history (which would grow the log
+        /// quadratically). Absent means `folded` is the complete stash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folded_base: Option<usize>,
+        /// Compaction only: index in `messages` of the synthetic restatement
+        /// of the folded active input, so the replay skips it (its original is
+        /// in `folded`). Meaningful only alongside `folded`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restated: Option<usize>,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
@@ -178,6 +196,15 @@ pub struct Restored {
     /// (or a history tool was already used) after the latest smart compaction,
     /// so a resume does not append it a second time.
     pub history_hint_consumed: bool,
+    /// The real pre-compaction turns persisted with the latest compaction's
+    /// `Replace` record, so a resumed (or relaunched) session replays them
+    /// instead of the synthetic summary. `None` for a log written before this
+    /// was persisted (or with no compaction): the compacted conversation is
+    /// replayed as-is, the pre-change behaviour.
+    pub folded: Option<Vec<Message>>,
+    /// Index in `conversation` of the synthetic restatement of the folded
+    /// active input; the replay skips it (its original is in `folded`).
+    pub restated: Option<usize>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -440,6 +467,11 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
     // Every direct message record seen so far, with its assigned `log_line`, so
     // a later `replace` from a legacy log can recover the IDs of retained messages.
     let mut originals: Vec<Message> = Vec::new();
+    // The most recent compaction's full folded stash. A delta record extends
+    // it even if a plain rebuild cleared `restored.folded` in between (the
+    // writer's in-memory stash survives such rebuilds too).
+    let mut last_stash: Vec<Message> = Vec::new();
+    let mut stash_active = false;
     // Record ordinals count only decodable records (the session header is
     // record 1), but a message's `log_line` is its PHYSICAL line number:
     // `history_read`/`history_search` enumerate physical lines and skip empty
@@ -505,7 +537,17 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 }
                 restored.completed.insert(input_id, response);
             }
-            Record::Replace { mut messages, pending_position, summarized, mode, continuation, .. } => {
+            Record::Replace {
+                mut messages,
+                pending_position,
+                summarized,
+                mode,
+                continuation,
+                folded,
+                folded_base,
+                restated,
+                ..
+            } => {
                 backfill_log_lines(&mut messages, &originals, summarized);
                 restored.conversation = messages;
                 restored.pending_input = match (restored.pending_input.take(), pending_position) {
@@ -529,6 +571,29 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 // The one-time hint re-arms with each compaction; only messages
                 // recorded after this replace can consume it.
                 restored.history_hint_consumed = false;
+                // The folded real turns (and the restated-input skip) ride with
+                // the record, so a resume rebuilds the visible transcript. A
+                // replace without them (a plain rebuild, or an older log)
+                // clears the stash: replaying must not resurrect turns a newer
+                // replacement folded away nor skip a real first turn.
+                // The cumulative stash lives in one owned vector, extended in
+                // place by each delta, and moves into `restored` once decoding
+                // finishes — no per-compaction deep copy of the transcript.
+                stash_active = match (folded, folded_base) {
+                    // A delta record: the previous stash's first `base` turns
+                    // plus the new turns.
+                    (Some(delta), Some(base)) if base.min(last_stash.len()) + delta.len() > 0 => {
+                        last_stash.truncate(base);
+                        last_stash.extend(delta);
+                        true
+                    }
+                    (Some(full), None) if !full.is_empty() => {
+                        last_stash = full;
+                        true
+                    }
+                    _ => false,
+                };
+                restored.restated = if stash_active { restated } else { None };
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
             Record::Timers { timers, .. } => restored.timers = Some(timers),
@@ -537,6 +602,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
         }
         index += 1;
     }
+    restored.folded = stash_active.then_some(last_stash);
     Ok(restored)
 }
 
@@ -716,6 +782,9 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -747,6 +816,9 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -772,6 +844,9 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -811,6 +886,9 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -883,6 +961,9 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Standard),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -903,6 +984,9 @@ mod tests {
             mode: Some(crate::config::CompactionMode::Smart),
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();
@@ -942,6 +1026,9 @@ mod tests {
             mode: None,
             model: None,
             continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
             recorded_at: now(),
         })
         .unwrap();

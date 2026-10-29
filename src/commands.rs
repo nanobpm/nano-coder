@@ -60,6 +60,16 @@ pub const COMMANDS: &[Command] = &[
     },
     Command { name: "/resume", args: "[ID|last]", description: "Switch to a saved session: pick one, or give its ID" },
     Command { name: "/restart", args: "", description: "Start a fresh session (clean context) without exiting" },
+    Command {
+        name: "/update",
+        args: "",
+        description: "Install the latest release through the channel nano-coder was installed from",
+    },
+    Command {
+        name: "/relaunch",
+        args: "",
+        description: "Restart the binary, resuming this session (picks up a just-installed update)",
+    },
     Command { name: "/exit", args: "", description: "Exit the agent" },
     Command { name: "/quit", args: "", description: "Exit the agent (alias for /exit)" },
 ];
