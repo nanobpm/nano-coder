@@ -404,15 +404,20 @@ pub fn output_cap_from_error(error: &str) -> Option<usize> {
 }
 
 fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    let total = text.chars().count();
+    if total <= max_chars {
         return text.to_string();
     }
-    let head: String = text.chars().take(max_chars * 2 / 3).collect();
+    // The omission marker is charged against the character allowance, so the
+    // result never exceeds `max_chars`.
+    let marker = format!("\n…[{} characters omitted]…\n", total - max_chars);
+    let budget = max_chars.saturating_sub(marker.chars().count());
+    let head: String = text.chars().take(budget * 2 / 3).collect();
     let tail: String = {
         let chars: Vec<char> = text.chars().collect();
-        chars[chars.len() - max_chars / 3..].iter().collect()
+        chars[chars.len() - budget / 3..].iter().collect()
     };
-    format!("{head}\n…[{} characters omitted]…\n{tail}", text.chars().count() - max_chars)
+    format!("{head}{marker}{tail}")
 }
 
 /// Maximum error lines pinned when clipping a tool result (issue #67).
@@ -443,8 +448,8 @@ fn is_error_line(line: &str) -> bool {
 /// as `clip` does but also pinning up to [`CLIP_ERROR_LINES`] error lines from
 /// the omitted middle, each with [`CLIP_ERROR_CONTEXT`] lines of context, in
 /// order and separated by `…`. Everything stays within the same `max_chars`
-/// budget: when the pins don't fit, the head shrinks to make room (the pins
-/// are the point), and as a last resort the pins themselves clip plain.
+/// budget: the pins share half of it, the head and tail split what is left,
+/// and every marker is charged against the budget too.
 fn clip_tool_result(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();
     if total <= max_chars {
@@ -455,13 +460,18 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
     if error_lines.is_empty() {
         return clip(text, max_chars);
     }
-    // Merge the ±context windows of the first CLIP_ERROR_LINES error lines,
-    // remembering which error lines each window pins so the last-resort clip
-    // below can never cut one.
+    // Merge the ±context windows of the first CLIP_ERROR_LINES error lines.
+    // A window never extends past the first *unselected* error line: anything
+    // rendered must be charged to the budget, and unselected errors are not.
+    let selected: &[usize] = &error_lines[..error_lines.len().min(CLIP_ERROR_LINES)];
+    let first_unselected = error_lines.get(CLIP_ERROR_LINES).copied();
     let mut merged: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-    for &i in error_lines.iter().take(CLIP_ERROR_LINES) {
+    for &i in selected {
         let start = i.saturating_sub(CLIP_ERROR_CONTEXT);
-        let end = (i + CLIP_ERROR_CONTEXT).min(lines.len() - 1);
+        let mut end = (i + CLIP_ERROR_CONTEXT).min(lines.len() - 1);
+        if let Some(limit) = first_unselected {
+            end = end.min(limit.saturating_sub(1));
+        }
         match merged.last_mut() {
             Some(last) if start <= last.1 + 1 => {
                 last.1 = last.1.max(end);
@@ -471,11 +481,12 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
         }
     }
     // Pins share one cumulative budget (half of `max_chars`, separators
-    // included). Windows are accepted in order while they fit; a window whose
-    // context would overflow shrinks to its error lines (or, with a single
-    // context line, clips that context) — a shrink is a success, not a reason
-    // to discard later windows. Error lines are never cut mid-line unless the
-    // very first window's bare error lines alone exceed the whole budget.
+    // included). Windows are accepted in order while they fit. A window that
+    // would overflow keeps its complete error lines while they fit and drops
+    // or budget-clips the context; only when even the first window's bare
+    // error lines cannot fit is a diagnostic ever cut mid-line (budgeted
+    // head-and-tail, so the cut keeps the line's end). A shrink is a success,
+    // never a reason to discard later windows.
     let pin_budget = max_chars / 2;
     let mut pinned = String::new();
     let mut used = 0usize;
@@ -488,11 +499,26 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
             if idx > 0 {
                 break; // later windows that cannot fit whole error lines stop here
             }
-            // Even the first window's bare error lines overflow: keep their heads.
-            let per = remaining / errs.len();
-            for &i in errs {
-                rendered.push_str(&lines[i].chars().take(per.saturating_sub(1)).collect::<String>());
-                rendered.push('\n');
+            // Even the first window's bare error lines overflow: keep complete
+            // lines while they fit, then budget-clip the first line that
+            // cannot fit whole so its head *and* tail survive.
+            let mut left = remaining;
+            let mut iter = errs.iter().peekable();
+            while let Some(&i) = iter.next() {
+                let len = lines[i].chars().count() + 1;
+                if len <= left {
+                    rendered.push_str(lines[i]);
+                    rendered.push('\n');
+                    left -= len;
+                } else {
+                    // The marker line costs a character of the line's share.
+                    rendered.push_str(&clip(lines[i], left.saturating_sub(1)));
+                    rendered.push('\n');
+                    if iter.peek().is_some() {
+                        rendered.push_str("…\n");
+                    }
+                    break; // nothing left for the remaining lines
+                }
             }
         } else {
             let context_budget = remaining - reserved;
@@ -503,24 +529,32 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
                     rendered.push_str(line);
                     rendered.push('\n');
                 }
-            } else if context.len() == 1 && context_budget > 1 {
-                // One oversized context line: clip the context, never the error.
-                let clipped = clip(context[0], context_budget - 1);
-                let clipped = if clipped.chars().count() < context_budget { Some(clipped) } else { None };
+            } else {
+                // Context cannot fit whole: keep the bare error lines, but
+                // give a single oversized context line a budgeted excerpt
+                // when that leaves the error's diagnostics intact — the error
+                // line itself is never cut. Two or more context lines drop
+                // whole: per-line excerpts would cost a marker line each and
+                // leave room for no real content.
+                let excerpt = if context.len() == 1 && context_budget > 1 {
+                    let clipped = clip(context[0], context_budget - 1);
+                    // An excerpt whose tail re-truncates the error's
+                    // diagnostic (e.g. `…tail` right after the error line) is
+                    // worse than no excerpt.
+                    let truncates_error =
+                        errs.iter().any(|&i| *end > i && !is_error_line(lines[*end]) && clipped.contains(lines[*end]));
+                    if truncates_error { None } else { Some(clipped) }
+                } else {
+                    None
+                };
                 for line in &lines[*start..=*end] {
                     if is_error_line(line) {
                         rendered.push_str(line);
                         rendered.push('\n');
-                    } else if let Some(c) = &clipped {
+                    } else if let Some(c) = &excerpt {
                         rendered.push_str(c);
                         rendered.push('\n');
-                    }
-                }
-            } else {
-                // Context cannot fit: keep the bare error lines.
-                for &i in errs {
-                    rendered.push_str(lines[i]);
-                    rendered.push('\n');
+                    } // else: the context line drops (its 1-char charge is slack)
                 }
             }
         }
@@ -547,8 +581,8 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
     out.push('…');
     out.push('\n');
     out.push_str(&tail);
-    // The budget is never exceeded, even for a pathological single-line pin.
-    if out.chars().count() > max_chars { clip(&out, max_chars) } else { out }
+    debug_assert!(out.chars().count() <= max_chars, "clip budget exceeded");
+    out
 }
 
 /// Shorten an oversized message in place (tool output kept head and tail).
@@ -959,6 +993,121 @@ mod tests {
         assert!(clipped.contains("error[E0308]: first failure here"), "{clipped}");
         assert!(clipped.contains("error[E0599]: second failure here"), "{clipped}");
         assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+    }
+
+    #[test]
+    fn clip_stays_within_budget_marker_included() {
+        // The omission marker is charged against the allowance: the result of
+        // `clip` never exceeds `max_chars`, even for a single oversized line.
+        for max in [40, 100, 2_000] {
+            let big = "x".repeat(10_000);
+            let clipped = clip(&big, max);
+            assert!(clipped.chars().count() <= max, "clip exceeded {max}: {}", clipped.chars().count());
+            assert!(clipped.contains("characters omitted"), "{clipped}");
+        }
+        // A multi-line text clips the same way.
+        let text = "line of build output\n".repeat(500);
+        assert!(clip(&text, 300).chars().count() <= 300);
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_a_budgeted_excerpt_of_a_context_line_at_the_budget_edge() {
+        // The original finding's shape: the single context line is at least
+        // `context_budget` long, so the excerpt necessarily clips. With the
+        // marker charged to the allowance the excerpt fits and is kept.
+        // (Small explicit budget: pin_budget = 100. The error is the first
+        // line, so the window is exactly [error, oversized-context] and the
+        // excerpt lands between the error and the window separator.)
+        let error = "error: boom happened here";
+        let content = format!(
+            "{error}\n{}\n{}",
+            "c".repeat(260),
+            "tail line of test output\n".repeat(40)
+        );
+        let clipped = clip_tool_result(&content, 200);
+        assert!(clipped.chars().count() <= 200, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains(error), "{clipped}");
+        // The pinned window holds the budgeted excerpt (marker and all).
+        let pinned = clipped.split_once("error lines pinned]…\n").expect("pin marker").1;
+        let window: Vec<&str> = pinned.split_once("\n…\n").map(|(w, _)| w).unwrap_or(pinned).lines().collect();
+        assert!(
+            window.iter().any(|l| l.contains("characters omitted]…")),
+            "context excerpt lost from the pinned window: {window:?}\nfull output:\n{clipped}"
+        );
+        assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
+    }
+
+
+    #[test]
+    fn clipped_tool_result_drops_multi_context_that_cannot_fit_but_keeps_the_error() {
+        // Two oversized context lines around the error: per-line excerpts would
+        // cost a marker line each, so the context drops whole — the error line
+        // is reserved and must survive, within budget.
+        let error = "error[E0308]: mismatched types";
+        let pad = "c".repeat(1_500);
+        let mut content = "head\n".repeat(600);
+        content.push_str(&format!("{pad}\n{error}\n{pad}\n"));
+        content.push_str(&"tail\n".repeat(600));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains(error), "{clipped}");
+        let window = clipped
+            .lines()
+            .skip_while(|l| !l.contains("error lines pinned"))
+            .skip(1)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_window_ends_before_the_first_unselected_error() {
+        // A matching line right after the 20th selected error must not ride
+        // along inside the last window uncharged: with a huge such line the
+        // budget must still hold, and that line must not be rendered.
+        let mut content = "head\n".repeat(300);
+        for i in 0..CLIP_ERROR_LINES {
+            content.push_str(&format!("error: selected failure {i}\n"));
+            content.push_str("ctx\n");
+        }
+        content.push_str(&format!("error: unselected huge {}\n", "u".repeat(5_000)));
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: selected failure 0"), "{clipped}");
+        assert!(!clipped.contains("uuuu"), "unselected error leaked into a window:\n{clipped}");
+        assert!(clipped.contains("error lines pinned"), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_complete_diagnostics_before_clipping() {
+        // Twenty adjacent 80-character errors form one window whose bare error
+        // lines overflow the pin budget: complete lines are kept while they
+        // fit instead of every diagnostic being cut to a sliver.
+        let mut content = "head\n".repeat(300);
+        for i in 0..20 {
+            content.push_str(&format!("error: adjacent failure {i:02} {}\n", "e".repeat(50)));
+        }
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("error: adjacent failure 00 "), "{clipped}");
+        let kept = (0..20).filter(|i| clipped.contains(&format!("error: adjacent failure {i:02} "))).count();
+        assert!(kept >= 10, "complete lines must be kept while they fit, kept {kept}:\n{clipped}");
+        // A kept line is complete, not a 49-character sliver.
+        assert!(clipped.contains(&format!("error: adjacent failure 00 {}", "e".repeat(50))), "{clipped}");
+    }
+
+    #[test]
+    fn clipped_tool_result_budget_clip_keeps_the_end_of_an_oversized_error_line() {
+        // A single error line longer than the whole pin budget: the budgeted
+        // head-and-tail clip keeps a diagnostic near the line's *end*.
+        let mut content = "head\n".repeat(300);
+        content.push_str(&format!("error: {} TAIL-DIAGNOSTIC-AT-END\n", "x".repeat(3_000)));
+        content.push_str(&"tail\n".repeat(300));
+        let clipped = clip_tool_result(&content, 2_000);
+        assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
+        assert!(clipped.contains("TAIL-DIAGNOSTIC-AT-END"), "the line's end is lost:\n{clipped}");
     }
 
     #[test]
