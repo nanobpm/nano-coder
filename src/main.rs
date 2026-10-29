@@ -87,7 +87,12 @@ fn register_builtin_tools(agent: &mut Agent) {
         spill_digests: Some(agent.spill_digests_handle()),
         ..Default::default()
     };
-    agent.tools().register(bash::definition(), Box::new(move |args| Ok(json!(bash::run(&bash_config, &args)))));
+    agent.tools().register(
+        bash::definition(),
+        Box::new(move |args| {
+            bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+        }),
+    );
 
     // question tool: blocks until the turn loop answers (see question.rs).
     // Headless (ACP) sessions have no one to answer, so it errors instead.
@@ -2345,6 +2350,10 @@ async fn main() -> Result<()> {
         // ACP has no idle loop to fire timers, so the timer tools are not
         // offered at all.
         agent.disable_timers();
+        // The ACP orchestrator runs its own verification before accepting a
+        // completed report, so the harness's verify-before-complete reminder is
+        // off here (it stays on in the terminal, where nothing else checks).
+        agent.config_mut().verify_before_complete = false;
         if let Some(id) = &args.resume {
             agent.load_session(id)?;
         }

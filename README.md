@@ -512,6 +512,7 @@ user_rules_dirs = ["~/.claude/rules"]
 instruction_imports_outside_project = false   # let project @imports / rule links leave the repo
 plan_tools = true                       # offer the plan_* tools (see Task Plans)
 outcome_tool = true                     # offer report_outcome (see Outcomes)
+verify_before_complete = true           # ask once for the check's evidence when completing after an unchecked edit (see Outcomes)
 reminders = true                        # append <system-reminder> notes to tool results
 memory = "on"                           # on | read_only | off — cross-session memory (see Memory)
 # memory_dir = "/path/to/memory"        # default: <platform data dir>/nano-coder/memory
@@ -1201,6 +1202,15 @@ stops after the call but before the turn ends, resuming the input finishes it wi
 recorded outcome without calling the model again. In the terminal the call shows as
 `✔ completed`, `■ blocked`, or `? needs input` followed by the summary. Set `outcome_tool = false` to leave the
 tool out.
+
+A `completed` report is expected to name its check: the `summary` description asks for what was done
+*and how it was checked* (the command run and its result). To back that up, `verify_before_complete`
+(on by default in the terminal) watches the turn: if the model edited a file (`write_file` / `edit_file`)
+after its last `bash` call and then reports `completed`, that one report is bounced with a reminder —
+"You changed files after your last check. Run the relevant tests/build, or report again if no check
+applies." The reminder fires at most once per turn, so a second `report_outcome` always goes through
+and the model is never trapped; `blocked` and `needs_input` are never intercepted. The ACP harness
+turns the flag off because the orchestrator runs its own verification there.
 
 `needs_input` is the structural "waiting on the user" signal: an orchestrator (or auto mode)
 can tell it apart from a clean `completed` without guessing from the text. For a richer,

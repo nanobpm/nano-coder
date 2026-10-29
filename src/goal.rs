@@ -14,6 +14,13 @@ use crate::tools::ToolDefinition;
 
 pub const TOOL_NAME: &str = "report_outcome";
 
+/// The one-per-turn reminder returned (as a tool error, so the turn does not
+/// end) when `report_outcome(completed)` arrives while files were edited after
+/// the last `bash` check. A second `report_outcome` in the same turn is let
+/// through regardless (max-fires = 1), so the model is never trapped.
+pub const VERIFY_REMINDER: &str = "You changed files after your last check. Run the relevant tests/build, \
+     or report again if no check applies.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -128,7 +135,7 @@ pub fn definition() -> ToolDefinition {
                 "status": { "type": "string", "enum": ["completed", "blocked", "needs_input"] },
                 "summary": {
                     "type": "string",
-                    "description": "Completed: what was done, with PR URLs or commits. Blocked: what was tried and what is needed to continue. NeedsInput: the question or decision you need from the user."
+                    "description": "Completed: what was done and how it was checked (the command run and its result). Blocked: what was tried and what is needed to continue. NeedsInput: the question or decision you need from the user."
                 }
             },
             "required": ["status", "summary"]

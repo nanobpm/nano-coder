@@ -814,6 +814,14 @@ pub struct Agent {
     spill_digests: Arc<std::sync::Mutex<Vec<output::Spill>>>,
     /// History-tool calls in the current turn.
     turn_history_calls: u32,
+    /// Whether a file-changing tool (`write_file` / `edit_file`) succeeded after
+    /// the last `bash` call this turn. Drives the one-per-turn
+    /// verify-before-complete reminder (see `goal::VERIFY_REMINDER`).
+    edits_since_check: bool,
+    /// Whether the verify-before-complete reminder already fired this turn
+    /// (max-fires = 1), so a second `report_outcome(completed)` always goes
+    /// through and the model is never trapped.
+    verify_reminder_fired: bool,
     /// Session-log size when the current turn began; the session-index update
     /// in `finish_turn` folds the input records committed since into the
     /// cached summary (from the log's tail) instead of rescanning the whole
@@ -959,6 +967,8 @@ impl Agent {
             spill_dir: Arc::new(RwLock::new(output::spill_dir())),
             spill_digests: Arc::new(std::sync::Mutex::new(Vec::new())),
             turn_history_calls: 0,
+            edits_since_check: false,
+            verify_reminder_fired: false,
             turn_log_offset: None,
             history_available: false,
             history_hint_pending: false,
@@ -3142,6 +3152,14 @@ impl Agent {
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // Verify-before-complete state (issue #68) is per *input*, not per
+        // `run_turn` call: a resumed input keeps its unchecked-edit flag and
+        // spent reminder, so a retry after a failure cannot forget an edit or
+        // re-fire the reminder. Only a new input starts clean.
+        if resuming.is_none() {
+            self.edits_since_check = false;
+            self.verify_reminder_fired = false;
+        }
         // Where a resumed turn's input sits, so after the replay shortcuts
         // below we can rebuild any in-flight output-limit continuation state
         // from the messages logged before the interrupt (issue #114).
@@ -4099,11 +4117,32 @@ impl Agent {
                     self.run_memory_tool(effective_call).map(Value::String)
                 } else if is_outcome_tool {
                     dispatched = true;
-                    Outcome::from_args(&effective_call.arguments).map(|outcome| {
-                        let text = format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
-                        reported = Some(outcome);
-                        Value::String(text)
-                    })
+                    match Outcome::from_args(&effective_call.arguments) {
+                        Err(e) => Err(e),
+                        Ok(outcome) => {
+                            // Verify-before-complete (issue #68): a `completed`
+                            // report that follows an edit with no later `bash`
+                            // check is bounced once per turn with a reminder, so
+                            // the model runs the relevant tests/build first. The
+                            // reminder fires at most once (max-fires = 1) — a
+                            // second `report_outcome` always goes through, so the
+                            // model is never trapped. `blocked` / `needs_input`
+                            // are never intercepted.
+                            if self.config.verify_before_complete
+                                && outcome.status == goal::Status::Completed
+                                && self.edits_since_check
+                                && !self.verify_reminder_fired
+                            {
+                                self.verify_reminder_fired = true;
+                                Err(anyhow::anyhow!(goal::VERIFY_REMINDER))
+                            } else {
+                                let text =
+                                    format!("Recorded outcome: {}. Your turn ends now.", outcome.status.as_str());
+                                reported = Some(outcome);
+                                Ok(Value::String(text))
+                            }
+                        }
+                    }
                 } else {
                     // Tool handlers are synchronous and may block (e.g. bash).
                     dispatched = true;
@@ -4148,6 +4187,20 @@ impl Agent {
                     },
                     other => other.to_string(),
                 };
+                // Verify-before-complete tracking (issue #68): a successful
+                // `write_file` / `edit_file` marks the tree as changed-since-last-
+                // check; a `bash` call is the check that clears it. Only a
+                // successful edit counts — a failed write changed nothing.
+                if ok && matches!(tool_call.name.as_str(), "write_file" | "edit_file") {
+                    self.edits_since_check = true;
+                } else if dispatched && ok && tool_call.name == "bash" {
+                    // Only a bash call that actually started counts as a check
+                    // (even one that then exited non-zero). A denied/malformed
+                    // call, or one the handler rejected before starting the
+                    // command (invalid arguments, spawn failure), is a failed
+                    // tool call (`ok == false`) and never ran.
+                    self.edits_since_check = false;
+                }
                 // A non-image binary file takes read_file's generic "looks
                 // like a binary file" error, which cannot name the model's
                 // image capability itself. Append that context here so the
@@ -10272,6 +10325,244 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
+    /// An agent with trivial `write_file`, `edit_file` and `bash` tools (the
+    /// names the verify-before-complete tracker keys on) and a scripted client.
+    /// The handlers succeed unconditionally; the tracker only reads the name and
+    /// the ok flag.
+    fn edit_agent(responses: Vec<LLMResponse>, dir: &std::path::Path) -> (Agent, Seen) {
+        let (agent, seen) = agent(responses, dir);
+        for name in ["write_file", "edit_file"] {
+            agent.tools().register(
+                ToolDefinition::new(name, name, json!({"type": "object"})),
+                Box::new(|_| Ok(json!("written"))),
+            );
+        }
+        agent
+            .tools()
+            .register(ToolDefinition::new("bash", "bash", json!({"type": "object"})), Box::new(|_| Ok(json!("ok"))));
+        (agent, seen)
+    }
+
+    /// The tool-result message text for the call `id` in this conversation.
+    fn tool_text(agent: &Agent, id: &str) -> String {
+        agent
+            .conversation()
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| panic!("no tool result for {id}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_unverified_edit_is_reminded_once_then_goes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then report completed (reminded), then report completed again
+        // (max-fires spent: goes through and ends the turn).
+        let batch1 = call("e1", "edit_file", json!({"path": "a.rs"}));
+        let batch2 = call("o1", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+        let batch3 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done, cargo test passes"}));
+        let (mut agent, _) = edit_agent(vec![batch1, batch2, batch3], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        // The first report was bounced with the reminder, as a tool error.
+        let first = tool_text(&agent, "o1");
+        assert!(first.contains(goal::VERIFY_REMINDER), "reminder shown once: {first}");
+        // The second report went through and ended the turn.
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+        assert_eq!(outcome.response, "done, cargo test passes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_a_check_is_not_reminded() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then a bash check, then report completed: no reminder.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "b1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "cargo test"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done, cargo test passes"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        // No further responses: another model call would panic, proving the turn ended.
+        let (mut agent, _) = edit_agent(vec![batch], dir.path());
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(!text.contains(goal::VERIFY_REMINDER), "a bash check clears the edit: {text}");
+        assert!(text.contains("Recorded outcome"), "accepted: {text}");
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_a_rejected_bash_is_still_reminded() {
+        let dir = tempfile::tempdir().unwrap();
+        // edit, then a malformed (never-run) bash, then completed: still reminded.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall::from_raw_arguments("b1".into(), "bash".into(), r#"{"command":"cargo te"#, None),
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+        let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(text.contains(goal::VERIFY_REMINDER), "a bash call that never ran is no check: {text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_after_an_edit_and_an_invalid_real_bash_is_still_reminded() {
+        // The real bash handler rejects `bash({})` before starting any command;
+        // that call never ran, so it must not clear the unchecked edit.
+        for args in [json!({}), json!({"command": 1}), json!({"command": "true", "timeout_seconds": 0})] {
+            let dir = tempfile::tempdir().unwrap();
+            let batch = LLMResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "edit_file".into(),
+                        arguments: json!({"path": "a.rs"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "b1".into(),
+                        name: "bash".into(),
+                        arguments: args.clone(),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "o1".into(),
+                        name: goal::TOOL_NAME.into(),
+                        arguments: json!({"status": "completed", "summary": "done"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            let batch2 = call("o2", goal::TOOL_NAME, json!({"status": "completed", "summary": "done"}));
+            let (mut agent, _) = edit_agent(vec![batch, batch2], dir.path());
+            let bash_config = crate::bash::BashConfig::default();
+            agent.tools().register(
+                crate::bash::definition(),
+                Box::new(move |args| {
+                    crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+                }),
+            );
+            agent.new_session().unwrap();
+            agent.run_turn(Some("m1"), "ship it").await.unwrap();
+            assert!(
+                tool_text(&agent, "b1").contains("bash argument")
+                    || tool_text(&agent, "b1").contains("timeout_seconds")
+            );
+            let text = tool_text(&agent, "o1");
+            assert!(text.contains(goal::VERIFY_REMINDER), "invalid bash {args} is no check: {text}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocked_and_needs_input_are_never_intercepted() {
+        for (status, prefix) in [("blocked", "Blocked: "), ("needs_input", "Question: ")] {
+            let dir = tempfile::tempdir().unwrap();
+            // An unverified edit, then a non-completed report: no reminder.
+            let batch = LLMResponse {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "e1".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path": "a.rs"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                    ToolCall {
+                        id: "o1".into(),
+                        name: goal::TOOL_NAME.into(),
+                        arguments: json!({"status": status, "summary": "no token"}),
+                        item_id: None,
+                        malformed_arguments: None,
+                    },
+                ],
+                ..Default::default()
+            };
+            let (mut agent, _) = edit_agent(vec![batch], dir.path());
+            agent.new_session().unwrap();
+            let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+            let text = tool_text(&agent, "o1");
+            assert!(!text.contains(goal::VERIFY_REMINDER), "{status} is never intercepted: {text}");
+            assert!(text.contains("Recorded outcome"), "{status} accepted: {text}");
+            assert!(outcome.response.starts_with(prefix), "{status} response: {}", outcome.response);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_before_complete_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unverified edit, then completed — but the flag is off, so no reminder.
+        let batch = LLMResponse {
+            tool_calls: vec![
+                ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "a.rs"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+                ToolCall {
+                    id: "o1".into(),
+                    name: goal::TOOL_NAME.into(),
+                    arguments: json!({"status": "completed", "summary": "done"}),
+                    item_id: None,
+                    malformed_arguments: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let (mut agent, _) = edit_agent(vec![batch], dir.path());
+        agent.config_mut().verify_before_complete = false;
+        agent.new_session().unwrap();
+        let outcome = agent.run_turn(Some("m1"), "ship it").await.unwrap();
+        let text = tool_text(&agent, "o1");
+        assert!(!text.contains(goal::VERIFY_REMINDER), "flag off: no reminder: {text}");
+        assert_eq!(outcome.outcome.map(|o| o.status), Some(goal::Status::Completed));
+    }
+
     /// Build an agent with custom permission `deny` rules (and no helper
     /// tools), for the PreToolUse-rewrite tests below.
     fn agent_with_deny(responses: Vec<LLMResponse>, dir: &std::path::Path, deny: Vec<String>) -> Agent {
@@ -11657,7 +11948,9 @@ mod tests {
         let bash_config = crate::bash::BashConfig { cancel: Some(agent.control().cancel_flag()), ..Default::default() };
         agent.tools().register(
             crate::bash::definition(),
-            Box::new(move |args| Ok(json!(crate::bash::run(&bash_config, &args)))),
+            Box::new(move |args| {
+                crate::bash::run_checked(&bash_config, &args).map(|text| json!(text)).map_err(anyhow::Error::msg)
+            }),
         );
         agent.new_session().unwrap();
         let control = agent.control();
