@@ -546,7 +546,7 @@ fn clip_tool_result(text: &str, max_chars: usize) -> String {
             }
         }
     }
-    if tail_start == n && n > head_end + 1 && floor > 8 && !is_error_line(bare(n - 1)) {
+    if tail_start == n && n > 1 && head_end < n && !kept[n - 1] && floor > 8 && !is_error_line(bare(n - 1)) {
         let i = n - 1;
         let base = cost(&kept, i, 0);
         let room = floor.min((max_chars as isize - used as isize - base).max(0) as usize);
@@ -1140,6 +1140,15 @@ mod tests {
         // Kept whole: no omission marker inside the error line.
         let line = clipped.lines().find(|l| l.contains(diagnostic)).unwrap();
         assert!(!line.contains("characters omitted"), "error line clipped mid-line:\n{line}");
+    }
+
+    #[test]
+    fn clipped_tool_result_keeps_tail_excerpt_when_all_preceding_lines_fit() {
+        let content = format!("cargo test\nerror: boom\n{}exit status: 101", "x".repeat(2500));
+        let clipped = clip_tool_result(&content, 2000);
+        assert!(clipped.chars().count() <= 2000, "{}", clipped.chars().count());
+        assert!(clipped.starts_with("cargo test\n"), "{clipped}");
+        assert!(clipped.contains("exit status: 101"), "{clipped}");
     }
 
     #[test]
