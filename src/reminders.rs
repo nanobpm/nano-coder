@@ -572,59 +572,242 @@ fn is_diagnostic_stage(stage: &str) -> bool {
     {
         return false;
     }
-    let mut tokens = stage.split_whitespace();
-    let cmd = match tokens.next() {
-        Some(cmd) => cmd,
-        None => return false,
+    // Tokenise the stage shell-style (quotes stripped, escapes honoured); an
+    // unparseable shape (unterminated quote, glob/brace/expansion characters
+    // we do not model) fails closed.
+    let Some(words) = shell_words(stage) else {
+        return false;
     };
-    if !DIAGNOSTIC_STAGES.contains(&cmd) {
+    let Some((cmd, args)) = words.split_first() else {
+        return false;
+    };
+    if !DIAGNOSTIC_STAGES.contains(&cmd.as_str()) {
         return false;
     }
     // Some read-only filters still carry a flag or positional that writes a
     // file or runs an arbitrary helper; those forms are not side-effect-free.
-    !stage_has_side_effect(cmd, tokens)
+    !stage_has_side_effect(cmd, args)
+}
+
+/// Option grammar of one diagnostic command, enough to tell a *writer* option
+/// from an argument value. Commands absent from `option_spec` have no
+/// file-writing or program-executing options, so any invocation is read-only.
+struct OptionSpec {
+    /// Short options that consume an argument — the rest of the cluster, or the
+    /// next word when the option ends the cluster (`-k2o` is `-k` with value
+    /// `2o`, *not* `-k2` plus `-o`).
+    short_with_arg: &'static str,
+    /// Short options whose argument is a *number* (`less -x4`, `-z4`, `-#1`).
+    /// Digits after one are consumed as its value and the cluster keeps going,
+    /// so a writer letter behind the number is still parsed as an option:
+    /// `less -x4o/tmp/log` is `-x4` + `-o/tmp/log` and writes a file.
+    short_numeric_arg: &'static str,
+    /// Short options that write a file / run a program.
+    short_writers: &'static str,
+    /// Long options that consume an argument when not given as `--opt=VALUE`.
+    long_with_arg: &'static [&'static str],
+    /// Long options that write a file / run a program. GNU getopt accepts any
+    /// unambiguous prefix, so a long option that is a prefix of one of these
+    /// counts as a writer (over-matching is the safe direction).
+    long_writers: &'static [&'static str],
+    /// Maximum number of positional operands before one becomes an output file
+    /// (`uniq IN OUT`); `None` means positionals are all inputs.
+    max_read_positionals: Option<usize>,
+}
+
+fn option_spec(cmd: &str) -> Option<OptionSpec> {
+    Some(match cmd {
+        // `sort -o FILE` / `--output=FILE` writes a file; `--compress-program`
+        // executes an arbitrary helper when temporary files are spilled.
+        "sort" => OptionSpec {
+            short_with_arg: "kotST",
+            short_numeric_arg: "",
+            short_writers: "o",
+            long_with_arg: &[
+                "--key",
+                "--field-separator",
+                "--buffer-size",
+                "--temporary-directory",
+                "--parallel",
+                "--batch-size",
+                "--files0-from",
+                "--sort",
+                "--random-source",
+            ],
+            long_writers: &["--output", "--compress-program"],
+            max_read_positionals: None,
+        },
+        // `less -o FILE` / `-O FILE` / `--log-file` / `--LOG-FILE` logs its input.
+        // `-x`, `-z` and `-#` take a *numeric* argument: digits after one are
+        // its value and the cluster continues, so `-x4oFILE` is `-x4` +
+        // `-oFILE` — the writer flag must still be seen.
+        "less" => OptionSpec {
+            short_with_arg: "bhjkoOpPtT",
+            short_numeric_arg: "xz#",
+            short_writers: "oO",
+            long_with_arg: &[],
+            long_writers: &["--log-file", "--LOG-FILE"],
+            max_read_positionals: None,
+        },
+        // `uniq [INPUT [OUTPUT]]`: a second positional is an output file.
+        // `--all-repeated` and `--group` take *optional* values, accepted only
+        // in the `--opt=VALUE` form — they never consume the next word, so they
+        // must not be in `long_with_arg` (otherwise `uniq --group - /tmp/out`
+        // would skip `-` and miscount the output operand as an input).
+        "uniq" => OptionSpec {
+            short_with_arg: "fsw",
+            short_numeric_arg: "",
+            short_writers: "",
+            long_with_arg: &["--skip-fields", "--skip-chars", "--check-chars"],
+            long_writers: &[],
+            max_read_positionals: Some(1),
+        },
+        _ => return None,
+    })
 }
 
 /// Whether an otherwise-diagnostic command invocation has a side effect — it
 /// writes to a file, or executes an arbitrary helper program — through a
 /// command-specific option or positional (so collapsing two such calls would
-/// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`, or
-/// `sort --compress-program=./a` vs `sort --compress-program=./b`).
-fn stage_has_side_effect<'a>(cmd: &str, mut args: impl Iterator<Item = &'a str>) -> bool {
-    match cmd {
-        // `sort -o FILE` / `-oFILE` / `--output=FILE` writes its result to a
-        // file — including when `o` is buried in a short-option cluster such as
-        // `sort -ro/tmp/a` (`-r` then `-o/tmp/a`). `sort --compress-program=PROG`
-        // executes an arbitrary helper when temporary files are spilled, so a
-        // changed helper is new side-effecting work even when the sorted output
-        // stays identical; reject it too. (`--compress-program` is long-only, so
-        // both `--compress-program=PROG` and `--compress-program PROG` present it
-        // as a token starting with that prefix.)
-        "sort" => args.any(|a| {
-            short_cluster_contains(a, 'o') || a.starts_with("--output") || a.starts_with("--compress-program")
-        }),
-        // `uniq [INPUT [OUTPUT]]`: a second positional argument is an output
-        // file. A bare `-` means stdin, so it counts as a positional (otherwise
-        // `uniq - OUT` would look like a single-positional read).
-        "uniq" => args.filter(|a| *a == "-" || !a.starts_with('-')).count() >= 2,
-        // `less -o FILE` / `-O FILE` / `--log-file=FILE` logs (or overwrites)
-        // its input to a file, so it is not read-only. `o`/`O` may sit inside a
-        // short-option cluster (e.g. `less -No/tmp/a`), not only at its start.
-        "less" => args
-            .any(|a| short_cluster_contains(a, 'o') || short_cluster_contains(a, 'O') || a.starts_with("--log-file")),
-        _ => false,
+/// hide distinct side effects, e.g. `sort -o /tmp/a` vs `sort -o /tmp/b`).
+/// Parses options getopt-style against `option_spec`, so a writer letter that is
+/// really part of another option's value (`sort -k2o`) is not misread, while a
+/// writer buried in a cluster (`sort -ro/tmp/a`) still is.
+fn stage_has_side_effect(cmd: &str, args: &[String]) -> bool {
+    let Some(spec) = option_spec(cmd) else {
+        return false;
+    };
+    let mut positionals = 0usize;
+    let mut i = 0;
+    let mut options_done = false;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if options_done || a == "-" || !a.starts_with('-') {
+            positionals += 1;
+            continue;
+        }
+        if a == "--" {
+            options_done = true;
+            continue;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, has_value) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            let name = format!("--{name}");
+            if spec.long_writers.iter().any(|w| w.starts_with(name.as_str())) {
+                return true;
+            }
+            if !has_value && spec.long_with_arg.iter().any(|w| w.starts_with(name.as_str())) {
+                i += 1;
+            }
+            continue;
+        }
+        // Short-option cluster: walk it until an argument-taking option
+        // consumes the remainder (or the next word).
+        let cluster = &a[1..];
+        let mut pos = 0;
+        while let Some(c) = cluster[pos..].chars().next() {
+            if spec.short_writers.contains(c) {
+                return true;
+            }
+            if spec.short_numeric_arg.contains(c) {
+                // Numeric-argument option (`less -x4oFILE`): digits are its
+                // value; the cluster continues behind them, so a writer
+                // letter there is still an option, not part of the value.
+                pos += c.len_utf8();
+                while cluster[pos..].chars().next().is_some_and(|d| d.is_ascii_digit()) {
+                    pos += 1;
+                }
+                if pos == cluster.len() {
+                    // The number ran to the end of the cluster; a value in the
+                    // next word is still just a number, never a writer flag.
+                    break;
+                }
+                continue;
+            }
+            if spec.short_with_arg.contains(c) {
+                if pos + c.len_utf8() == cluster.len() {
+                    i += 1;
+                }
+                break;
+            }
+            pos += c.len_utf8();
+        }
     }
+    spec.max_read_positionals.is_some_and(|max| positionals > max)
 }
 
-/// Whether a short-option cluster (`-abc…`, a single `-` carrying several flags)
-/// contains `opt`. GNU-style tools let an argument-taking flag like `-o` sit
-/// anywhere in the cluster and consume the rest as its value (`sort -ro/tmp/a`),
-/// so a plain `token.starts_with("-o")` misses it. Conservative on purpose: a
-/// `--long` option is not a short cluster, and any appearance of `opt` after the
-/// leading `-` counts — over-matching only keeps the full command (never a false
-/// hard stop), which is the safe direction for this detector.
-fn short_cluster_contains(token: &str, opt: char) -> bool {
-    token.starts_with('-') && !token.starts_with("--") && token[1..].contains(opt)
+/// Split one pipeline stage into shell words: separated on shell whitespace
+/// (space, tab, newline only — the default IFS; *not* CR, form feed or the wider Unicode whitespace
+/// set, which the shell treats as ordinary word characters), with
+/// single/double quotes removed and backslash escapes honoured. Returns `None`
+/// (fail closed) for shapes this helper does not model — an unterminated quote
+/// or trailing backslash, or any expansion/glob/grouping character outside
+/// single quotes (`$`, `` ` ``, `*`, `?`, `[`, `{`, `(`, `)`, `~`, `!`), whose
+/// runtime value could turn a word into a writer option.
+fn shell_words(stage: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = stage.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // Split only on characters the shell treats as word separators —
+            // not every `char::is_whitespace()`: a literal CR, form feed,
+            // vertical tab (or NEL, NBSP, …) is *not* IFS whitespace, so the shell keeps it
+            // inside the word (`sort -t<VT>` passes the VT as `-t`'s value).
+            // Dropping it here would merge `-t<VT>` into `-t`, making the
+            // option parser consume the next word as the separator value.
+            ' ' | '\t' | '\n' => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\\' => {
+                cur.push(chars.next()?);
+                in_word = true;
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => cur.push(c),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '$' | '`' => return None,
+                        '\\' => {
+                            let n = chars.next()?;
+                            if !matches!(n, '"' | '\\' | '$' | '`') {
+                                cur.push('\\');
+                            }
+                            cur.push(n);
+                        }
+                        c => cur.push(c),
+                    }
+                }
+            }
+            '$' | '`' | '*' | '?' | '[' | '{' | '(' | ')' | '~' | '!' | '<' | '>' | ';' | '&' | '|' => return None,
+            c => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    Some(words)
 }
 
 /// Split a shell command into top-level pipeline stages, quote- and
@@ -650,9 +833,17 @@ fn split_pipeline(command: &str) -> Option<Vec<&str>> {
             }
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
+            // Command substitution (`$( … )`, backticks) can hide a `|` that
+            // belongs to the inner command, and a here-doc body / newline can
+            // carry further commands: shapes we do not model, so refuse to
+            // split (fail closed — the caller keeps the whole command).
+            b'`' if !in_single => return None,
+            b'$' if !in_single && bytes.get(i + 1) == Some(&b'(') => return None,
+            b'<' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'<') => return None,
+            b'\n' if !in_single && !in_double => return None,
             b'|' if !in_single && !in_double => {
-                // `||` is logical OR, not a pipeline: refuse to split.
-                if bytes.get(i + 1) == Some(&b'|') {
+                // `||` is logical OR and `|&` also pipes stderr: refuse to split.
+                if matches!(bytes.get(i + 1), Some(b'|' | b'&')) {
                     return None;
                 }
                 stages.push(&command[start..i]);
@@ -661,6 +852,9 @@ fn split_pipeline(command: &str) -> Option<Vec<&str>> {
             _ => {}
         }
         i += 1;
+    }
+    if in_single || in_double {
+        return None;
     }
     stages.push(&command[start..]);
     Some(stages)
@@ -1800,5 +1994,88 @@ mod tests {
                 RepeatVerdict::None,
             );
         }
+    }
+
+    #[test]
+    fn option_values_are_not_misread_as_writer_flags() {
+        // `-k2o`: the `o` is part of `-k`'s value, not a separate `-o`.
+        assert_eq!(pipeline_key("cat f | sort -k2o"), "cat f");
+        assert_eq!(pipeline_key("cat f | sort -t o"), "cat f");
+        assert_eq!(pipeline_key("cat f | sort -k 2 -o /tmp/a"), "cat f | sort -k 2 -o /tmp/a");
+        // A writer after a cluster ending in an argument-taking flag still counts.
+        assert_ne!(pipeline_key("cat f | sort -rk2 -o/tmp/a"), pipeline_key("cat f | sort -rk2 -o/tmp/b"));
+        // Unambiguous long-option prefixes are writers too.
+        assert_eq!(pipeline_key("cat f | sort --out=/tmp/a"), "cat f | sort --out=/tmp/a");
+        assert_eq!(pipeline_key("cat f | less --log=/tmp/a"), "cat f | less --log=/tmp/a");
+        // `uniq` options with values do not count as positionals.
+        assert_eq!(pipeline_key("cat f | uniq -f 2"), "cat f");
+        assert_eq!(pipeline_key("cat f | uniq -f 2 - /tmp/out"), "cat f | uniq -f 2 - /tmp/out");
+        assert_eq!(pipeline_key("cat f | uniq -- -in -out"), "cat f | uniq -- -in -out");
+        // `uniq --all-repeated` / `--group` take optional values only as
+        // `--opt=VALUE`; bare, they must NOT swallow the next word — otherwise
+        // `uniq --group - /tmp/out` would miscount the output operand.
+        assert_eq!(pipeline_key("cat f | uniq --group - /tmp/out"), "cat f | uniq --group - /tmp/out");
+        assert_eq!(pipeline_key("cat f | uniq --all-repeated - /tmp/out"), "cat f | uniq --all-repeated - /tmp/out");
+        // The `=`-joined optional-value forms are still pure filters.
+        assert_eq!(pipeline_key("cat f | uniq --group=prepend"), "cat f");
+        assert_eq!(pipeline_key("cat f | uniq --all-repeated=separate"), "cat f");
+        // A literal vertical tab is not shell whitespace: the shell keeps it
+        // inside `-t<VT>` as the separator value, so `-o` must still be seen
+        // as the writer option it is.
+        assert_eq!(pipeline_key("cat f | sort -t\u{b} -o /tmp/out"), "cat f | sort -t\u{b} -o /tmp/out");
+        // Likewise CR and form feed are not default-IFS characters.
+        assert_eq!(pipeline_key("cat f | sort -t\r -o /tmp/out"), "cat f | sort -t\r -o /tmp/out");
+        assert_eq!(pipeline_key("cat f | sort -t\u{c} -o /tmp/out"), "cat f | sort -t\u{c} -o /tmp/out");
+        // Quoted writer flags are still writer flags.
+        assert_eq!(pipeline_key("cat f | sort '-o' /tmp/a"), "cat f | sort '-o' /tmp/a");
+        assert_eq!(pipeline_key("cat f | 'tee' /tmp/a"), "cat f | 'tee' /tmp/a");
+    }
+
+    #[test]
+    fn less_numeric_option_prefix_does_not_hide_a_writer_flag() {
+        // `less -x` takes a *numeric* argument, so `-x4o/tmp/log` is `-x4` +
+        // `-o/tmp/log`: the writer flag behind the number must still be seen,
+        // or the loop detector strips a file-writing stage and conflates
+        // distinct writes into a false repeat (issue #109).
+        assert_ne!(pipeline_key("printf x | less -x4o/tmp/a"), pipeline_key("printf x | less -x4o/tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -x4O/tmp/a"), pipeline_key("printf x | less -x4O/tmp/b"));
+        // Same cluster form through the other numeric options (`-z`, `-#`).
+        assert_ne!(pipeline_key("printf x | less -z4o/tmp/a"), pipeline_key("printf x | less -z4o/tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -#1o/tmp/a"), pipeline_key("printf x | less -#1o/tmp/b"));
+        // A numeric option alone — value inline or in the next word — is
+        // read-only, so the stage still strips.
+        assert_eq!(pipeline_key("printf x | less -x4"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -x 4"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -#1"), "printf x");
+        // A non-numeric tail after the digits is a new option, not the value:
+        // `less -x4N` is `-x4` + `-N` (read-only), while `less -x4No/tmp/a`
+        // still reaches the writer flag behind it.
+        assert_eq!(pipeline_key("printf x | less -x4N"), "printf x");
+        assert_ne!(pipeline_key("printf x | less -x4No/tmp/a"), pipeline_key("printf x | less -x4No/tmp/b"));
+        // A plain string-argument option still swallows the whole remainder:
+        // the `o` in `-pfoo` is part of `-p`'s prompt value, not `-o`.
+        assert_eq!(pipeline_key("printf x | less -pfoo"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -p foo"), "printf x");
+    }
+
+    #[test]
+    fn unmodelled_shell_shapes_fail_closed() {
+        // Command substitution hiding a pipe never splits.
+        assert_eq!(pipeline_key("echo $(cat a | wc -l)"), "echo $(cat a | wc -l)");
+        assert_eq!(pipeline_key("echo `cat a | wc -l`"), "echo `cat a | wc -l`");
+        // `|&`, here-docs, newlines and unterminated quotes never split.
+        assert_eq!(pipeline_key("make |& tee log"), "make |& tee log");
+        assert_eq!(pipeline_key("cat <<EOF | wc\nx\nEOF"), "cat <<EOF | wc\nx\nEOF");
+        assert_eq!(pipeline_key("cmd | grep 'x"), "cmd | grep 'x");
+        // Globs / expansions in a stage are not provably read-only.
+        assert_eq!(pipeline_key("cmd | sort $OPT"), "cmd | sort $OPT");
+        assert_eq!(pipeline_key("cmd | sort -*"), "cmd | sort -*");
+        // Writers that are not diagnostic tools keep the command.
+        for w in ["tee -a /tmp/a", "cp a b", "mv a b", "rsync a b", "xargs rm"] {
+            let c = format!("cmd | {w}");
+            assert_eq!(pipeline_key(&c), c);
+        }
+        // Plain quoted grep patterns are still diagnostic.
+        assert_eq!(pipeline_key("cmd | grep 'a b' | head -n 3"), "cmd");
     }
 }
