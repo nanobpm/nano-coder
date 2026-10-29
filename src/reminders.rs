@@ -597,6 +597,11 @@ struct OptionSpec {
     /// next word when the option ends the cluster (`-k2o` is `-k` with value
     /// `2o`, *not* `-k2` plus `-o`).
     short_with_arg: &'static str,
+    /// Short options whose argument is a *number* (`less -x4`, `-z4`, `-#1`).
+    /// Digits after one are consumed as its value and the cluster keeps going,
+    /// so a writer letter behind the number is still parsed as an option:
+    /// `less -x4o/tmp/log` is `-x4` + `-o/tmp/log` and writes a file.
+    short_numeric_arg: &'static str,
     /// Short options that write a file / run a program.
     short_writers: &'static str,
     /// Long options that consume an argument when not given as `--opt=VALUE`.
@@ -616,6 +621,7 @@ fn option_spec(cmd: &str) -> Option<OptionSpec> {
         // executes an arbitrary helper when temporary files are spilled.
         "sort" => OptionSpec {
             short_with_arg: "kotST",
+            short_numeric_arg: "",
             short_writers: "o",
             long_with_arg: &[
                 "--key",
@@ -632,8 +638,12 @@ fn option_spec(cmd: &str) -> Option<OptionSpec> {
             max_read_positionals: None,
         },
         // `less -o FILE` / `-O FILE` / `--log-file` / `--LOG-FILE` logs its input.
+        // `-x`, `-z` and `-#` take a *numeric* argument: digits after one are
+        // its value and the cluster continues, so `-x4oFILE` is `-x4` +
+        // `-oFILE` — the writer flag must still be seen.
         "less" => OptionSpec {
-            short_with_arg: "bhjkoOpPtTxyz#",
+            short_with_arg: "bhjkoOpPtT",
+            short_numeric_arg: "xz#",
             short_writers: "oO",
             long_with_arg: &[],
             long_writers: &["--log-file", "--LOG-FILE"],
@@ -646,6 +656,7 @@ fn option_spec(cmd: &str) -> Option<OptionSpec> {
         // would skip `-` and miscount the output operand as an input).
         "uniq" => OptionSpec {
             short_with_arg: "fsw",
+            short_numeric_arg: "",
             short_writers: "",
             long_with_arg: &["--skip-fields", "--skip-chars", "--check-chars"],
             long_writers: &[],
@@ -696,16 +707,34 @@ fn stage_has_side_effect(cmd: &str, args: &[String]) -> bool {
         }
         // Short-option cluster: walk it until an argument-taking option
         // consumes the remainder (or the next word).
-        for (pos, c) in a[1..].char_indices() {
+        let cluster = &a[1..];
+        let mut pos = 0;
+        while let Some(c) = cluster[pos..].chars().next() {
             if spec.short_writers.contains(c) {
                 return true;
             }
+            if spec.short_numeric_arg.contains(c) {
+                // Numeric-argument option (`less -x4oFILE`): digits are its
+                // value; the cluster continues behind them, so a writer
+                // letter there is still an option, not part of the value.
+                pos += c.len_utf8();
+                while cluster[pos..].chars().next().is_some_and(|d| d.is_ascii_digit()) {
+                    pos += 1;
+                }
+                if pos == cluster.len() {
+                    // The number ran to the end of the cluster; a value in the
+                    // next word is still just a number, never a writer flag.
+                    break;
+                }
+                continue;
+            }
             if spec.short_with_arg.contains(c) {
-                if pos + c.len_utf8() == a.len() - 1 {
+                if pos + c.len_utf8() == cluster.len() {
                     i += 1;
                 }
                 break;
             }
+            pos += c.len_utf8();
         }
     }
     spec.max_read_positionals.is_some_and(|max| positionals > max)
@@ -2000,6 +2029,33 @@ mod tests {
         // Quoted writer flags are still writer flags.
         assert_eq!(pipeline_key("cat f | sort '-o' /tmp/a"), "cat f | sort '-o' /tmp/a");
         assert_eq!(pipeline_key("cat f | 'tee' /tmp/a"), "cat f | 'tee' /tmp/a");
+    }
+
+    #[test]
+    fn less_numeric_option_prefix_does_not_hide_a_writer_flag() {
+        // `less -x` takes a *numeric* argument, so `-x4o/tmp/log` is `-x4` +
+        // `-o/tmp/log`: the writer flag behind the number must still be seen,
+        // or the loop detector strips a file-writing stage and conflates
+        // distinct writes into a false repeat (issue #109).
+        assert_ne!(pipeline_key("printf x | less -x4o/tmp/a"), pipeline_key("printf x | less -x4o/tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -x4O/tmp/a"), pipeline_key("printf x | less -x4O/tmp/b"));
+        // Same cluster form through the other numeric options (`-z`, `-#`).
+        assert_ne!(pipeline_key("printf x | less -z4o/tmp/a"), pipeline_key("printf x | less -z4o/tmp/b"));
+        assert_ne!(pipeline_key("printf x | less -#1o/tmp/a"), pipeline_key("printf x | less -#1o/tmp/b"));
+        // A numeric option alone — value inline or in the next word — is
+        // read-only, so the stage still strips.
+        assert_eq!(pipeline_key("printf x | less -x4"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -x 4"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -#1"), "printf x");
+        // A non-numeric tail after the digits is a new option, not the value:
+        // `less -x4N` is `-x4` + `-N` (read-only), while `less -x4No/tmp/a`
+        // still reaches the writer flag behind it.
+        assert_eq!(pipeline_key("printf x | less -x4N"), "printf x");
+        assert_ne!(pipeline_key("printf x | less -x4No/tmp/a"), pipeline_key("printf x | less -x4No/tmp/b"));
+        // A plain string-argument option still swallows the whole remainder:
+        // the `o` in `-pfoo` is part of `-p`'s prompt value, not `-o`.
+        assert_eq!(pipeline_key("printf x | less -pfoo"), "printf x");
+        assert_eq!(pipeline_key("printf x | less -p foo"), "printf x");
     }
 
     #[test]
