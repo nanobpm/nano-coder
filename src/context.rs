@@ -932,7 +932,8 @@ mod tests {
         // the pin budget, and the tail must survive (no plain-clip fallback).
         let mut content = "head line\n".repeat(300);
         for i in 0..20 {
-            content.push_str(&format!("ctx before {i}\nerror: separated failure {i} {}\nctx after {i}\n", "x".repeat(40)));
+            content
+                .push_str(&format!("ctx before {i}\nerror: separated failure {i} {}\nctx after {i}\n", "x".repeat(40)));
             content.push_str(&"plain padding\n".repeat(30));
         }
         content.push_str("FINAL TAIL MARKER\n");
@@ -1017,15 +1018,8 @@ mod tests {
         // The head still shows the log's opening warnings (that is plain
         // head/tail clipping), but the pinned window around the error must
         // hold no warning line.
-        let window = clipped
-            .lines()
-            .skip_while(|l| !l.contains("error[E0308]"))
-            .take(3)
-            .collect::<Vec<_>>();
-        assert!(
-            window.iter().all(|l| !l.contains("warning:")),
-            "warnings must not be pinned:\n{clipped}"
-        );
+        let window = clipped.lines().skip_while(|l| !l.contains("error[E0308]")).take(3).collect::<Vec<_>>();
+        assert!(window.iter().all(|l| !l.contains("warning:")), "warnings must not be pinned:\n{clipped}");
     }
 
     #[test]
@@ -1160,11 +1154,7 @@ mod tests {
         // line, so the window is exactly [error, oversized-context] and the
         // excerpt lands between the error and the window separator.)
         let error = "error: boom happened here";
-        let content = format!(
-            "{error}\n{}\n{}",
-            "c".repeat(260),
-            "tail line of test output\n".repeat(40)
-        );
+        let content = format!("{error}\n{}\n{}", "c".repeat(260), "tail line of test output\n".repeat(40));
         let clipped = clip_tool_result(&content, 200);
         assert!(clipped.chars().count() <= 200, "budget exceeded: {}", clipped.chars().count());
         assert!(clipped.contains(error), "{clipped}");
@@ -1184,7 +1174,6 @@ mod tests {
         assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
     }
 
-
     #[test]
     fn clipped_tool_result_drops_multi_context_that_cannot_fit_but_keeps_the_error() {
         // Two oversized context lines around the error: per-line excerpts would
@@ -1198,12 +1187,8 @@ mod tests {
         let clipped = clip_tool_result(&content, 2_000);
         assert!(clipped.chars().count() <= 2_000, "budget exceeded: {}", clipped.chars().count());
         assert!(clipped.contains(error), "{clipped}");
-        let window = clipped
-            .lines()
-            .skip_while(|l| !l.contains("error lines pinned"))
-            .skip(1)
-            .take(3)
-            .collect::<Vec<_>>();
+        let window =
+            clipped.lines().skip_while(|l| !l.contains("error lines pinned")).skip(1).take(3).collect::<Vec<_>>();
         assert!(window.iter().any(|l| l.contains(error)), "error line lost from the pinned window:\n{clipped}");
     }
 
