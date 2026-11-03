@@ -194,13 +194,16 @@ int printTrajectory(string id, bool json, bool markdown)
 }
 
 /// Print the plain ledger, or page it when both ends are a terminal and it
-/// doesn't fit on one screen.
-void showTrajectory(const ref imported!"nano.trajectory".Trajectory t)
+/// doesn't fit on one screen. In a session (`inSession`), page it whatever the
+/// length: printed, the ledger would stay in the transcript and the terminal
+/// scrollback, while the pager is a view dismissed with `q`.
+void showTrajectory(const ref imported!"nano.trajectory".Trajectory t, bool inSession = false)
 {
     static import nano.trajectory;
     auto text = t.toPlain;
     auto size = nano.trajectory.terminalSize(1);
-    bool pageable = isTerminal(0) && isTerminal(1) && size[0] && nano.trajectory.needsPager(text, size[0], size[1]);
+    bool pageable = isTerminal(0) && isTerminal(1)
+        && (inSession || (size[0] && nano.trajectory.needsPager(text, size[0], size[1])));
     if (pageable)
     {
         if (gFrame) gFrame.suspend();
@@ -2120,7 +2123,7 @@ int runMain(string[] args)
                     catch (Exception e) { writeln("Could not read the session log: ", e.msg); continue; }
                     if (arg == "--json") writeln(t.toJson);
                     else if (arg.length) writeln(t.toMarkdown);
-                    else showTrajectory(t);
+                    else showTrajectory(t, true);
                     continue;
                 }
                 case "/session":
