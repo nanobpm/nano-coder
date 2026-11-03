@@ -1365,8 +1365,9 @@ fn classify_steer_input(text: &str, steer: bool) -> SteerRoute {
     }
 }
 
-/// Whether `/trajectory` / `--trajectory` should open a pager: both ends are
-/// a terminal and the ledger doesn't fit on one screen.
+/// Whether `--trajectory` should open a pager: both ends are a terminal and
+/// the ledger doesn't fit on one screen. (In a session, `/trajectory` always
+/// pages on a terminal, so it doesn't stay in the scrollback.)
 fn trajectory_pageable(traj: &trajectory::Trajectory) -> bool {
     io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -1854,17 +1855,21 @@ async fn run_command(
             && terminal.renderer.is_frame()
             && io::stdin().is_terminal() =>
         {
-            // Page a trajectory that doesn't fit on screen. The pager owns the
-            // screen until it exits; force a full redraw so the frame
-            // renderer's next differential render isn't diffed against what
-            // the pager left (as /settings does). Typed during a turn, a stdin
-            // read is still pending and would race the pager for keys, so it
-            // prints instead (below), as it does for plain output.
+            // Show the trajectory in the pager even when it would fit on
+            // screen (unlike `--trajectory`, which pages only a long one):
+            // printed into the session, the ledger would stay in the
+            // transcript and the terminal's scrollback, while the pager is a
+            // view you dismiss with `q`. The pager owns the screen until it
+            // exits; force a full redraw so the frame renderer's next
+            // differential render isn't diffed against what the pager left
+            // (as /settings does). Typed during a turn, a stdin read is still
+            // pending and would race the pager for keys, so it prints instead
+            // (below), as it does for plain output.
             match turn_commands::Snapshot::capture(agent).load_trajectory() {
                 Err(note) => terminal.renderer.print_block(&note),
                 Ok(traj) => {
                     let text = traj.to_plain();
-                    if trajectory_pageable(&traj) {
+                    if io::stdout().is_terminal() {
                         let paged = trajectory::page(&text);
                         terminal.renderer.frame_resize();
                         if !paged {
