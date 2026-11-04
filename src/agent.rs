@@ -804,6 +804,9 @@ pub struct Agent {
     /// `Some` while those changes await the tool-result append, so they are
     /// persisted only once that result (holding the notes) is durable.
     recall_unpersisted: Option<memory::Recall>,
+    /// The spent-note count as of before the current tool call's recall,
+    /// restored with `recall_unpersisted` when the result append fails.
+    recall_notes_unpersisted: Option<usize>,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
@@ -1007,6 +1010,7 @@ impl Agent {
             recall: memory::Recall::default(),
             recall_turn_notes: 0,
             recall_unpersisted: None,
+            recall_notes_unpersisted: None,
             #[cfg(test)]
             timers_clock: None,
             #[cfg(test)]
@@ -2803,6 +2807,7 @@ impl Agent {
         self.control.publish_timers(&self.timers);
         self.recall = restored.recall.unwrap_or_default();
         self.recall_unpersisted = None;
+        self.recall_notes_unpersisted = None;
         // The previous session's installed index no longer describes the
         // prompt; the next request's prompt install sets it afresh.
         self.index_shown.clear();
@@ -3005,6 +3010,7 @@ impl Agent {
         // system message's index renders in full (`index_shown`, untouched
         // here), which are still in context.
         self.recall_unpersisted = None;
+        self.recall_notes_unpersisted = None;
         if !self.recall.is_empty() {
             self.recall = memory::Recall::default();
             self.recall_changed();
@@ -4526,9 +4532,18 @@ impl Agent {
                 // carrying their notes is durable: a failed append rolls them
                 // back, so a resume never treats unseen notes as seen.
                 let recall_before = self.recall_unpersisted.take();
+                let notes_before = self.recall_notes_unpersisted.take();
                 if let Err(err) = self.push(message) {
                     if let Some(before) = recall_before {
                         self.recall = before;
+                    }
+                    // The notes never entered the conversation: refund their
+                    // budget so a retry of this input may still attach them.
+                    if let Some(spent) = notes_before {
+                        self.recall_turn_notes = spent;
+                        if let Some(pending) = self.pending_input.as_mut() {
+                            pending.recall_notes = spent;
+                        }
                     }
                     return Err(err);
                 }
@@ -5258,6 +5273,7 @@ impl Agent {
             store.log_recall("fired", &note.id, tool, session.as_deref());
         }
         if !notes.is_empty() {
+            self.recall_notes_unpersisted.get_or_insert(self.recall_turn_notes);
             self.recall_turn_notes += notes.len();
             // Carry the spent budget on the pending input too, so a retry of
             // this (still in-flight) input resumes with it instead of
@@ -7621,16 +7637,10 @@ mod tests {
         let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
         assert_eq!(notes, 0, "the retried input re-arms no notes: {notes}");
         // A *new* input starts with a fresh budget.
-        let (mut fresh, _) = self::agent(vec![read_call("r3", path), text("next")], dir.path());
-        fresh.config.session_dir = Some(sessions.clone());
-        fresh.config.memory_dir = Some(dir.path().join("memory"));
-        for n in 0..4 {
-            fresh
-                .memory()
-                .unwrap()
-                .save(memory::Scope::User, &format!("fact {n} about omarchy.local {}", "x".repeat(200)), None, None)
-                .unwrap();
-        }
+        // Built like `agent`, so its store already points at the temporary
+        // memory directory holding the four memories saved above.
+        let mut fresh =
+            memory_agent(crate::config::MemoryMode::On, vec![read_call("r3", path), text("next")], dir.path());
         fresh.load_session("retry-budget").unwrap();
         fresh.send_input(Some("msg-2"), "again").await.unwrap();
         let notes: usize = tool_texts(&fresh).iter().map(|t| t.matches("📌").count()).sum();
