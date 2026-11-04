@@ -4094,9 +4094,16 @@ impl Agent {
                 // decision so observers can tell an allowed call from one the
                 // policy will deny (issue #92: `before_tool_call` fires before
                 // the permission check, so without this it couldn't).
-                let permission = match self.policy.check(&tool_call.name, &tool_call.arguments) {
-                    Ok(()) => "allow".to_string(),
-                    Err(reason) => format!("deny: {reason}"),
+                let permission = match self.policy.decide(&tool_call.name, &tool_call.arguments) {
+                    crate::permissions::Decision::Allow => "allow".to_string(),
+                    // An unverifiable shell loop (issue #164) is "ask" where
+                    // someone can answer, blocked where they cannot; report it
+                    // as a deny either way so a hook observer never mistakes
+                    // the pending prompt for an approval.
+                    crate::permissions::Decision::Ask(reason) => {
+                        format!("deny: {}", crate::permissions::blocked_message(&reason))
+                    }
+                    crate::permissions::Decision::Deny(message) => format!("deny: {message}"),
                 };
                 let ctx = HookContext::new(HookEvent::BeforeToolCall)
                     .with_data("tool_name", json!(&tool_call.name))
@@ -4117,7 +4124,10 @@ impl Agent {
                     let runnable = tool_call.raw_arguments_error(response.stop_reason.as_deref()).is_none()
                         && (self.control.mode() != crate::mode::AgentMode::Plan
                             || crate::mode::plan_allows(&tool_call.name))
-                        && self.policy.check(&tool_call.name, &tool_call.arguments).is_ok();
+                        && matches!(
+                            self.policy.decide(&tool_call.name, &tool_call.arguments),
+                            crate::permissions::Decision::Allow
+                        );
                     if runnable {
                         let outcome =
                             claude_hooks.run_pre_tool_use(&tool_call.name, &tool_call.arguments, &tool_call.id);
@@ -4195,6 +4205,34 @@ impl Agent {
                 // digest parsed out of the rendered — model-influenceable —
                 // text (issue #65).
                 let mut spill_digests: Vec<output::Spill> = Vec::new();
+                // The policy is consulted before dispatching to any handler, so deny
+                // rules and the pre-tool check also cover plan, skill and outcome tools.
+                // Re-check the *effective* (possibly hook-rewritten) arguments here:
+                // the earlier check ran on the original input, so without this a
+                // PreToolUse hook could rewrite a bash command or a file path past
+                // the user's allow/deny rules. A shell loop the policy cannot verify
+                // (issue #164) asks the user once — showing the whole loop — when
+                // someone can answer; the question is parked on the blocking pool so
+                // the turn loop keeps running and can render it.
+                let permission_deny: Option<String> = {
+                    match self.policy.decide(&effective_call.name, &effective_call.arguments) {
+                        crate::permissions::Decision::Allow => None,
+                        crate::permissions::Decision::Deny(message) => Some(message),
+                        crate::permissions::Decision::Ask(reason) => {
+                            let name = effective_call.name.clone();
+                            let args = effective_call.arguments.clone();
+                            let questions = self.questions.clone();
+                            let asked = tokio::task::spawn_blocking(move || {
+                                Agent::ask_permission(&questions, &name, &args, &reason)
+                            });
+                            match asked.await {
+                                Ok(Ok(())) => None,
+                                Ok(Err(message)) => Some(message),
+                                Err(_) => Some("the permission prompt was interrupted".to_string()),
+                            }
+                        }
+                    }
+                };
                 let result = if let Some(error) = tool_call.raw_arguments_error(response.stop_reason.as_deref()) {
                     // The argument JSON arrived malformed (usually a truncated
                     // stream). Don't run anything against garbage arguments and
@@ -4207,13 +4245,7 @@ impl Agent {
                     // Backstop for a mutating call already in flight when plan
                     // mode was switched on mid-turn.
                     Err(anyhow::anyhow!("{} is disabled in plan mode (read-only)", tool_call.name))
-                } else if let Err(reason) = self.policy.check(&effective_call.name, &effective_call.arguments) {
-                    // The policy is consulted before dispatching to any handler, so deny
-                    // rules and the pre-tool check also cover plan, skill and outcome tools.
-                    // Re-check the *effective* (possibly hook-rewritten) arguments here:
-                    // the earlier check ran on the original input, so without this a
-                    // PreToolUse hook could rewrite a bash command or a file path past
-                    // the user's allow/deny rules.
+                } else if let Some(reason) = permission_deny {
                     Err(anyhow::anyhow!(reason))
                 } else if let Some(reason) = pre_hook_deny {
                     // A PreToolUse hook denied the call (or failed closed).
@@ -5052,6 +5084,54 @@ impl Agent {
             truncated,
             mode,
         }))
+    }
+
+    /// Ask the user to approve a tool call the policy could not verify (an
+    /// unverifiable shell loop, issue #164). `Ok` approves this call once;
+    /// `Err` carries the message the model sees when the call stays blocked —
+    /// the user declined or dismissed the prompt, or no one can answer
+    /// (headless `-p`, ACP, a worker), in which case the block guidance is
+    /// returned unchanged. Runs on the blocking pool: it parks until the turn
+    /// loop answers.
+    fn ask_permission(
+        questions: &crate::question::QuestionBroker,
+        tool: &str,
+        args: &Value,
+        reason: &str,
+    ) -> Result<(), String> {
+        if !questions.is_interactive() {
+            return Err(crate::permissions::blocked_message(reason));
+        }
+        let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+        let question = crate::question::Question {
+            question: format!(
+                "nano-coder cannot verify this {tool} call automatically ({reason}). Run it?\n\n{command}"
+            ),
+            header: "Permission".to_string(),
+            options: vec![
+                crate::question::QuestionOption {
+                    label: "Run once".to_string(),
+                    description: "Run this call this one time".to_string(),
+                },
+                crate::question::QuestionOption {
+                    label: "Block".to_string(),
+                    description: "Do not run it; the model is told why".to_string(),
+                },
+            ],
+            custom: false,
+        };
+        match questions.ask_blocking(vec![question]) {
+            crate::question::QuestionAnswer::Answers(answers) if answers.first().is_some_and(|a| a == "Run once") => {
+                Ok(())
+            }
+            crate::question::QuestionAnswer::Answers(_) => {
+                Err(format!("The user declined to run this {tool} call ({reason}). Do not retry it unchanged."))
+            }
+            // Dismissed or auto-answered "away": treat as not approved.
+            _ => Err(format!(
+                "The user did not answer the approval prompt for this {tool} call ({reason}). Do not retry it unchanged."
+            )),
+        }
     }
 
     fn run_plan_tool(&mut self, call: &ToolCall) -> Result<Value> {
@@ -10756,6 +10836,84 @@ mod tests {
             .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
             .map(|m| m.content.clone())
             .unwrap_or_else(|| panic!("no tool result for {id}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_is_asked_once_interactively_and_runs_when_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        // A loop over a command substitution whose body is not provably
+        // read-only: the policy cannot verify it, so the user is asked.
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.questions().set_interactive(true);
+        // Answer the pending permission question with "Run once" from another
+        // task, as the interactive turn loop would.
+        let broker = agent.questions();
+        let answerer = tokio::spawn(async move {
+            let mut rx = broker.subscribe();
+            while rx.changed().await.is_ok() {
+                if broker.pending().is_some() {
+                    broker.resolve(crate::question::QuestionAnswer::Answers(vec!["Run once".to_string()]));
+                    return;
+                }
+            }
+        });
+        let outcome = agent.run_turn(Some("m1"), "run it").await.unwrap();
+        answerer.abort();
+        // Approved: the tool ran (its stub handler returns "ok").
+        assert_eq!(tool_text(&agent, "b1"), "ok");
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_is_blocked_when_the_user_declines() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.questions().set_interactive(true);
+        let broker = agent.questions();
+        let answerer = tokio::spawn(async move {
+            let mut rx = broker.subscribe();
+            while rx.changed().await.is_ok() {
+                if broker.pending().is_some() {
+                    broker.resolve(crate::question::QuestionAnswer::Answers(vec!["Block".to_string()]));
+                    return;
+                }
+            }
+        });
+        agent.run_turn(Some("m1"), "run it").await.unwrap();
+        answerer.abort();
+        let text = tool_text(&agent, "b1");
+        assert!(text.contains("declined"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_loop_is_blocked_headless_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = call("b1", "bash", json!({"command": "for f in $(git ls-files); do sed -i s/x/y/ \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        // Not interactive: no one can answer, so the call is blocked with the
+        // guidance message and no question is ever raised.
+        agent.run_turn(Some("m1"), "run it").await.unwrap();
+        let text = tool_text(&agent, "b1");
+        assert!(text.contains("Blocked by nano-coder permissions"), "{text}");
+        assert!(text.contains("not a known read-only command"), "{text}");
+        assert!(agent.questions().pending().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_literal_list_loop_runs_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        // A literal-list loop whose unrolled commands are allowed needs no
+        // approval, even where no one could answer.
+        let batch = call("b1", "bash", json!({"command": "for f in a.txt b.txt; do wc -l \"$f\"; done"}));
+        let (mut agent, _) = edit_agent(vec![batch, text("done")], dir.path());
+        agent.new_session().unwrap();
+        agent.run_turn(Some("m1"), "count").await.unwrap();
+        assert_eq!(tool_text(&agent, "b1"), "ok");
     }
 
     #[tokio::test(flavor = "multi_thread")]

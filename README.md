@@ -318,9 +318,11 @@ the [permission rules and sandbox](#permissions-and-sandbox) instead.
 
 ## Permissions and Sandbox
 
-nano-coder never stops to ask for approval (it runs headless in agent fleets). Every tool call
-is checked before it runs instead, and a blocked call returns an error telling the model to
-stop and ask the user rather than work around the block.
+Every tool call is checked before it runs, and a blocked call returns an error telling the
+model to stop and ask the user rather than work around the block. Headless runs (agent
+fleets, `-p`, ACP) never stop to ask for approval; an interactive session prompts once for
+the few calls that can be neither approved nor denied automatically (see **Shell loops**
+below).
 
 **Order of checks:** `deny` rules, then `allow` rules, then the built-in guards. Deny always
 wins. An allow rule approves a shell command only when *every* command in it matches, so
@@ -343,6 +345,23 @@ wins. An allow rule approves a shell command only when *every* command in it mat
 `bash -c '...'`, `eval`, `ssh host cmd`, `find -exec`, and here-documents fed to a shell. A command
 that cannot be parsed, or a script computed at run time (`bash -c "$CMD"`,
 `eval "$(curl ...)"`), is blocked.
+
+**Shell loops** (`for`/`select`/`while`/`until`) are checked by effect. A loop whose every
+condition and body command is provably read-only (`echo`, `grep`, `cat`, `wc`, ...) runs
+freely. A `for` loop over a *literal* word list (plain words, quoted strings, brace
+expansions — no globs, substitutions or unknown variables) is unrolled: each value is
+substituted for the loop variable and every resulting body command is checked exactly as if
+written out by hand, so `for q in "a b" "c d"; do gh search repos "$q"; done` is allowed
+wherever the two `gh` commands are, and an unrolled command that is denied or catastrophic
+is denied. The unroll is capped (64 iterations) and refuses a body that rebinds the loop
+variable or still expands something at run time after substitution; those fall through to
+the next rule. A loop that still cannot be verified — a non-literal list, or a static body
+command that is not a known read-only utility — is **asked** about once (showing the whole
+loop) in an interactive session, and blocked with the usual guidance where no one can answer
+(headless `-p`, ACP, a fleet worker). The hard blocks always stand: a command name computed
+at run time, `eval`/interpreters (`sh -c`, `python -c`, ...), path-qualified programs outside
+`/bin`/`/usr/bin`, assignments to `PATH`/`IFS` and other dangerous names, arithmetic-assignment
+tricks, and writes/redirections to computed targets.
 
 **Built-in guards** (`builtin_rules = true`) block:
 
