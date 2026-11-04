@@ -1098,8 +1098,31 @@ fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
     Some(herdr::Session { id: id.to_string(), resume })
 }
 
+/// How a question is shown above its picker: `(body, prompt)`. A plain,
+/// single-line question that fits stays inline as the picker prompt. Anything
+/// else (several lines, markdown, too wide) is rendered as markdown into a body
+/// printed above the picker, with a short prompt: dialoguer's prompt is one
+/// row, so a long or structured question would otherwise collapse into a
+/// single unreadable line. The text is sanitised first (escapes dropped, line
+/// feeds kept), so the model cannot smuggle terminal controls through it.
+fn question_prompt(question: &str, width: usize) -> (Option<String>, String) {
+    let text = sanitize_terminal_text(question.trim());
+    // Leave room for dialoguer's `? ` prefix and the `›` after the prompt.
+    let rendered = markdown::render(&text, width.saturating_sub(4).max(20));
+    if !rendered.contains('\n') && rendered == text {
+        return (None, text);
+    }
+    (Some(rendered), "Your answer".to_string())
+}
+
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
     use dialoguer::{Input, Select};
+    let width = status::stderr_terminal_size().map_or(80, |(_, cols)| cols as usize);
+    let (body, prompt) = question_prompt(&q.question, width);
+    if let Some(body) = body {
+        // Dialoguer draws on stderr; the body goes just above it.
+        eprintln!("\n{body}\n");
+    }
     let mut labels: Vec<String> = q
         .options
         .iter()
@@ -1118,8 +1141,7 @@ fn ask_one(q: &question::Question) -> Result<Option<String>> {
     } else {
         None
     };
-    let choice =
-        Select::new().with_prompt(sanitize_terminal_line(&q.question)).items(&labels).default(0).interact_opt()?;
+    let choice = Select::new().with_prompt(prompt).items(&labels).default(0).interact_opt()?;
     match choice {
         None => Ok(None),
         Some(i) if Some(i) == custom_index => {
@@ -3502,6 +3524,35 @@ mod tests {
         // A lone/unterminated ESC still drops only the ESC byte; trailing
         // printable text is preserved.
         assert_eq!(sanitize_terminal_line("a\x1bZb"), "aZb");
+    }
+
+    #[test]
+    fn a_plain_one_line_question_stays_the_picker_prompt() {
+        let (body, prompt) = question_prompt("Which database should I use?", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Which database should I use?");
+    }
+
+    #[test]
+    fn a_structured_question_is_rendered_as_markdown_above_the_picker() {
+        let q = "I found two options:\n\n- **Postgres**: already in `docker-compose.yml`\n- SQLite: simpler\n\nWhich should I use?";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("a multi-line question gets a body");
+        assert_eq!(prompt, "Your answer");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.len() >= 4, "line breaks kept: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Postgres") && !l.contains("**")), "markdown rendered: {body:?}");
+        assert!(lines.iter().any(|l| l.contains("Which should I use?")), "{body:?}");
+    }
+
+    #[test]
+    fn a_long_question_wraps_and_escapes_are_dropped() {
+        let q = format!("\x1b[2J{}", "word ".repeat(40));
+        let (body, prompt) = question_prompt(&q, 40);
+        let body = body.expect("too wide for one row");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.lines().count() > 1, "{body:?}");
+        assert!(!body.contains("\x1b[2J"), "escapes dropped: {body:?}");
     }
 
     #[test]
