@@ -1106,13 +1106,27 @@ fn herdr_session(agent: &Agent, extra: &[String]) -> Option<herdr::Session> {
 /// single unreadable line. The text is sanitised first (escapes dropped, line
 /// feeds kept), so the model cannot smuggle terminal controls through it.
 fn question_prompt(question: &str, width: usize) -> (Option<String>, String) {
-    let text = sanitize_terminal_text(question.trim());
+    // `trim_end` only: leading indentation is markdown-significant (an
+    // indented first line is a code block), so `trim()` would silently
+    // degrade a question that opens with indented code to paragraph text.
+    let text = sanitize_terminal_text(question.trim_end());
     // Leave room for dialoguer's `? ` prefix and the `›` after the prompt.
     let rendered = markdown::render(&text, width.saturating_sub(4).max(20));
-    if !rendered.contains('\n') && rendered == text {
+    // Inline only if the question genuinely fits one row: no line breaks,
+    // unchanged by markdown, and narrow enough for the prompt row itself
+    // (text + `? ` prefix + `› ` suffix). Measure terminal cells, not bytes,
+    // so wide glyphs count double. Without the width check an over-wide
+    // question stays inline on a narrow terminal and the picker wraps.
+    let fits = text_width(&text) <= width.saturating_sub(4);
+    if fits && !rendered.contains('\n') && rendered == text {
         return (None, text);
     }
     (Some(rendered), "Your answer".to_string())
+}
+
+/// Terminal-cell width of the widest line of `s` (unicode-aware).
+fn text_width(s: &str) -> usize {
+    s.lines().map(|line| line.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()).max().unwrap_or(0)
 }
 
 fn ask_one(q: &question::Question) -> Result<Option<String>> {
@@ -3531,6 +3545,38 @@ mod tests {
         let (body, prompt) = question_prompt("Which database should I use?", 80);
         assert_eq!(body, None);
         assert_eq!(prompt, "Which database should I use?");
+    }
+
+    #[test]
+    fn leading_indentation_is_preserved_for_markdown() {
+        // `trim()` would strip the first line's indent, degrading an indented
+        // code block to paragraph text; only trailing whitespace may go.
+        let q = "    indented\n    code";
+        let (body, prompt) = question_prompt(q, 80);
+        let body = body.expect("an indented code block renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        assert!(body.contains("indented"), "{body:?}");
+        assert!(body.contains("code"), "{body:?}");
+        // Trailing whitespace is still trimmed.
+        let (body, prompt) = question_prompt("Plain question?   \n", 80);
+        assert_eq!(body, None);
+        assert_eq!(prompt, "Plain question?");
+    }
+
+    #[test]
+    fn an_over_wide_question_leaves_the_inline_prompt_on_a_narrow_terminal() {
+        // 19 cells of question on an 18-column terminal must not stay inline:
+        // the picker prompt row would wrap.
+        let (body, prompt) = question_prompt("Which should I use?", 18);
+        assert!(body.is_some(), "over-wide question renders above the picker");
+        assert_eq!(prompt, "Your answer");
+        // Exactly at the limit (14 cells of text on an 18-col terminal) fits.
+        let (body, _) = question_prompt("fits exactly!?", 18);
+        assert_eq!(body, None);
+        // Wide glyphs count by terminal cells, not chars: 10 CJK chars = 20 cells.
+        let (body, prompt) = question_prompt("数据库用哪个比较好呢？", 19);
+        assert!(body.is_some(), "20 cells on a 19-col terminal is over-wide");
+        assert_eq!(prompt, "Your answer");
     }
 
     #[test]
