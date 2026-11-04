@@ -1143,6 +1143,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         });
         let traj = Trajectory::from_records(&recs);

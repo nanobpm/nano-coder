@@ -495,7 +495,18 @@ impl Store {
                 // can carry an escaped newline (`\n` in the JSON string) that
                 // deserialises into a real line break and would otherwise be
                 // interpolated verbatim into the model's tool result here.
-                line.push_str(&format!(" (evidence: {})", one_line(evidence)));
+                let rendered = one_line(evidence);
+                // `one_line` also *drops* everything past the first line break
+                // without marking it, and an unmarked hit is recorded as fully
+                // seen (`note_seen_in` looks for `…`), which would suppress its
+                // recall even though the dropped detail was never shown. Flag
+                // the truncation so the hit stays eligible for recall (Copilot
+                // finding, src/memory.rs).
+                if rendered == evidence.trim() {
+                    line.push_str(&format!(" (evidence: {rendered})"));
+                } else {
+                    line.push_str(&format!(" (evidence: {rendered}…)"));
+                }
             }
             lines.push(line);
         }
@@ -3111,6 +3122,33 @@ mod tests {
         for line in out.lines() {
             assert!(!line.contains("exfiltrate"), "injected content leaked: {out}");
         }
+    }
+
+    #[test]
+    fn search_marks_dropped_evidence_lines_as_incomplete() {
+        // `one_line` drops everything past the first line break of a
+        // hand-edited multi-line evidence without appending `…`. Unmarked, the
+        // hit would be recorded as fully seen (`note_seen_in` looks for the
+        // ellipsis) and its recall suppressed even though the dropped detail
+        // was never shown (Copilot finding, src/memory.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("memory"), None, 0);
+        let mut entry = store.save(Scope::User, "a fact with evidence", None, None).unwrap();
+        entry.evidence = Some("overview\nssh omarchy.local".to_string());
+        let path = store.path(Scope::User).unwrap();
+        write_all(&path, &[entry.clone()], &[]).unwrap();
+        let out = store.search("fact with evidence", None).unwrap();
+        assert!(out.contains("evidence: overview…"), "dropped lines are marked: {out}");
+        let mut recall = Recall::default();
+        recall.note_seen_in(&out);
+        assert!(!recall.seen.contains(&entry.id), "an incomplete hit is not marked seen");
+        // Single-line evidence renders whole, so its hit is still marked seen.
+        let single = store.save(Scope::User, "another fact", Some("ssh omarchy.local"), None).unwrap();
+        let out = store.search("another fact", None).unwrap();
+        assert!(out.contains("evidence: ssh omarchy.local)"), "complete evidence unmarked: {out}");
+        let mut recall = Recall::default();
+        recall.note_seen_in(&out);
+        assert!(recall.seen.contains(&single.id), "a fully shown hit is marked seen");
     }
 
     #[test]

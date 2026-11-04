@@ -2961,6 +2961,13 @@ impl Agent {
                 folded: delta_folded,
                 folded_base,
                 restated,
+                // Persist the surviving pending input's spent recall-note
+                // budget too: a crash between this record and the next recall
+                // record must not hand the resumed retry a fresh per-input
+                // budget (Copilot finding, src/agent.rs). Recorded even when
+                // `pending_position` is `None` — the decode then drops the
+                // pending input, and with it the budget.
+                pending_recall_notes: self.pending_input.as_ref().map_or(0, |p| p.recall_notes),
                 recorded_at: now,
             })?;
         }
@@ -3299,7 +3306,6 @@ impl Agent {
         }
         self.control.start_turn();
         self.reminders.start_turn();
-        self.recall_turn_notes = 0;
         // Consume the automatic-turn origin for this turn (an automatic timer
         // wakeup/nudge): the main user message pushed below is marked
         // `auto_initiated` so it bills as agent-initiated. Taken once here so it
@@ -3315,6 +3321,13 @@ impl Agent {
         // whole log.
         self.turn_log_offset = self.session.as_ref().map(|log| log.size());
         let resuming = self.pending_input.clone().filter(|pending| input_id == Some(pending.id.as_str()));
+        // The recall-note budget is per *input*, not per `run_turn` call — like
+        // the verify-before-complete state below: a retry of an interrupted
+        // prompt resumes its pending input, so it must resume the budget it
+        // already spent (carried on the pending input, persisted with it in a
+        // `Replace` record) rather than re-arm another two notes per retry
+        // (Copilot finding, src/agent.rs). Only a new input starts at zero.
+        self.recall_turn_notes = resuming.as_ref().map_or(0, |pending| pending.recall_notes);
         // Verify-before-complete state (issue #68) is per *input*, not per
         // `run_turn` call: a resumed input keeps its unchecked-edit flag and
         // spent reminder, so a retry after a failure cannot forget an edit or
@@ -3434,6 +3447,7 @@ impl Agent {
                             position: self.conversation.len(),
                             continuation: None,
                             continuation_base: None,
+                            recall_notes: 0,
                         });
                         if let Some(log) = &mut self.session {
                             log.append(&Record::Input {
@@ -3460,6 +3474,7 @@ impl Agent {
                     position: self.conversation.len(),
                     continuation: None,
                     continuation_base: None,
+                    recall_notes: 0,
                 });
                 if let Some(log) = &mut self.session {
                     log.append(&Record::Input {
@@ -5244,6 +5259,12 @@ impl Agent {
         }
         if !notes.is_empty() {
             self.recall_turn_notes += notes.len();
+            // Carry the spent budget on the pending input too, so a retry of
+            // this (still in-flight) input resumes with it instead of
+            // re-arming the per-input cap (Copilot finding, src/agent.rs).
+            if let Some(pending) = self.pending_input.as_mut() {
+                pending.recall_notes = self.recall_turn_notes;
+            }
             self.recall_unpersisted.get_or_insert(before);
         }
         notes.into_iter().map(|n| n.text).collect()
@@ -6717,6 +6738,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6758,6 +6780,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6792,6 +6815,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6832,6 +6856,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -6879,6 +6904,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: session::now(),
         })
         .unwrap();
@@ -7539,6 +7565,76 @@ mod tests {
         agent.send_message("look").await.unwrap();
         let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
         assert_eq!(notes, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_prompt_keeps_its_spent_recall_budget() {
+        // The two-notes cap is per *input*, not per `run_turn` call: a retry of
+        // an interrupted prompt resumes its pending input, so it resumes with
+        // the budget already spent rather than re-arming two more notes per
+        // retry (Copilot finding, src/agent.rs). The spent count rides with the
+        // pending input through the `Replace` record, so the cap holds across a
+        // session reload too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/x";
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut log = SessionLog::create(&sessions, "retry-budget").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        log.append(&Record::Input { id: "msg-1".into(), text: "look".into(), recorded_at: session::now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("look")))).unwrap();
+        // The interrupted turn had already attached both notes (two matching
+        // tool calls) when a compaction kept its input pending.
+        log.append(&Record::Replace {
+            messages: vec![
+                Message::system("sys"),
+                Message::user("summary"),
+                Message::user("look"), // restated pending input
+            ],
+            pending_position: Some(2),
+            summarized: Some((2, 6)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 2,
+            recorded_at: session::now(),
+        })
+        .unwrap();
+        drop(log);
+        // Four memories match the retry's tool calls; with the spent budget
+        // restored, none of them may attach a note.
+        let responses = vec![read_call("r1", path), read_call("r2", path), text("done")];
+        let mut agent = memory_agent(crate::config::MemoryMode::On, responses, dir.path());
+        for n in 0..4 {
+            agent
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("fact {n} about omarchy.local {}", "x".repeat(200)), None, None)
+                .unwrap();
+        }
+        agent.load_session("retry-budget").unwrap();
+        assert_eq!(agent.pending_input.as_ref().map(|p| p.recall_notes), Some(2), "the budget survives the log");
+        agent.send_input(Some("msg-1"), "look").await.unwrap();
+        let notes: usize = tool_texts(&agent).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 0, "the retried input re-arms no notes: {notes}");
+        // A *new* input starts with a fresh budget.
+        let (mut fresh, _) = self::agent(vec![read_call("r3", path), text("next")], dir.path());
+        fresh.config.session_dir = Some(sessions.clone());
+        fresh.config.memory_dir = Some(dir.path().join("memory"));
+        for n in 0..4 {
+            fresh
+                .memory()
+                .unwrap()
+                .save(memory::Scope::User, &format!("fact {n} about omarchy.local {}", "x".repeat(200)), None, None)
+                .unwrap();
+        }
+        fresh.load_session("retry-budget").unwrap();
+        fresh.send_input(Some("msg-2"), "again").await.unwrap();
+        let notes: usize = tool_texts(&fresh).iter().map(|t| t.matches("📌").count()).sum();
+        assert_eq!(notes, 2, "a new input gets the full budget: {notes}");
     }
 
     #[test]

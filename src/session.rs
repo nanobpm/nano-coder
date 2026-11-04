@@ -108,6 +108,15 @@ pub enum Record {
         /// in `folded`). Meaningful only alongside `folded`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         restated: Option<usize>,
+        /// Recall notes already attached for the surviving pending input (the
+        /// per-input cap is `RECALL_NOTES_PER_TURN`). Persisted whenever a
+        /// replacement keeps a pending input — not only mid-turn compaction —
+        /// so a crash between the replace and the next recall record does not
+        /// hand a resumed retry a fresh two-note budget (Copilot finding,
+        /// src/agent.rs). Absent in older logs (restores to 0, the pre-fix
+        /// behaviour).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        pending_recall_notes: usize,
         recorded_at: DateTime<FixedOffset>,
     },
     /// The task plan after a change; the latest one wins.
@@ -174,6 +183,12 @@ pub struct PendingInput {
     /// (persisted path, no compaction) means recovery replays from the input
     /// `position` with an empty snapshot.
     pub continuation_base: Option<usize>,
+    /// Recall notes already attached for this input (the per-input cap is
+    /// `RECALL_NOTES_PER_TURN`). Carried on the pending input — and persisted
+    /// with it in a `Replace` record — so retrying an interrupted prompt
+    /// resumes with the budget already spent rather than re-arming another two
+    /// notes per retry (Copilot finding, src/agent.rs). Zero for a new input.
+    pub recall_notes: usize,
 }
 
 /// State rebuilt from a session log.
@@ -215,8 +230,8 @@ pub struct Restored {
     pub restated: Option<usize>,
 }
 
-fn is_zero(n: &u32) -> bool {
-    *n == 0
+fn is_zero<N: PartialEq + Default>(n: &N) -> bool {
+    *n == N::default()
 }
 
 pub struct SessionLog {
@@ -510,6 +525,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                     position: restored.conversation.len(),
                     continuation: None,
                     continuation_base: None,
+                    recall_notes: 0,
                 });
             }
             Record::Message(mut message) => {
@@ -554,6 +570,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                 folded,
                 folded_base,
                 restated,
+                pending_recall_notes,
                 ..
             } => {
                 backfill_log_lines(&mut messages, &originals, summarized);
@@ -569,6 +586,7 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                         position,
                         continuation,
                         continuation_base: Some(restored.conversation.len()),
+                        recall_notes: pending_recall_notes,
                         ..pending
                     }),
                     _ => None,
@@ -601,6 +619,16 @@ fn decode(bytes: &[u8], expected_id: &str) -> Result<Restored> {
                     }
                     _ => false,
                 };
+                // The replacement drops the recalled memories' full text from
+                // context, so recall resets here, while decoding — not only in
+                // the empty `Recall` record the writer appends afterwards: a
+                // crash or failed append between the two would otherwise
+                // resume with `seen`/`fired` state whose notes have left the
+                // conversation, suppressing their recall for good (Copilot
+                // finding, src/session.rs). A `Recall` record logged after the
+                // replace still overrides this (an older log's trailing one
+                // only re-confirms the reset).
+                restored.recall = Some(crate::memory::Recall::default());
                 restored.restated = if stash_active { restated } else { None };
             }
             Record::Plan { plan, .. } => restored.plan = Some(plan),
@@ -773,7 +801,8 @@ mod tests {
                 text: "hi".into(),
                 position: 3,
                 continuation: None,
-                continuation_base: None
+                continuation_base: None,
+                recall_notes: 0
             })
         );
         assert!(SessionLog::create(dir.path(), "s1").is_err(), "create must not clobber");
@@ -794,6 +823,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -828,6 +858,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -856,6 +887,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -872,9 +904,74 @@ mod tests {
                 text: "go".into(),
                 position: 2,
                 continuation: None,
-                continuation_base: Some(3)
+                continuation_base: Some(3),
+                recall_notes: 0
             })
         );
+    }
+
+    #[test]
+    fn replace_clears_recall_state_while_decoding() {
+        // A crash (or a failed append) after the `Replace` record but before
+        // the empty `Recall` record that follows it must not resume with the
+        // pre-replacement `seen`/`fired` state: the replacement dropped the
+        // recalled notes from context, so the decode itself resets recall
+        // (Copilot finding, src/session.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s7").unwrap();
+        log.append(&Record::Message(Box::new(Message::system("sys")))).unwrap();
+        let mut recall = crate::memory::Recall::default();
+        recall.seen.insert("mem-1".to_string());
+        recall.fired.insert("mem-1".to_string());
+        log.append(&Record::Recall { recall, recorded_at: now() }).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary")],
+            pending_position: None,
+            summarized: Some((2, 2)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 0,
+            recorded_at: now(),
+        })
+        .unwrap();
+        // No trailing empty `Recall` record: the log ends mid-write, as a
+        // crash between the two appends would leave it.
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s7").unwrap();
+        assert_eq!(restored.recall, Some(crate::memory::Recall::default()), "the replace alone resets recall");
+    }
+
+    #[test]
+    fn replace_restores_the_pending_inputs_spent_recall_budget() {
+        // The recall-note budget is per input: a replacement that keeps the
+        // pending input persists how many notes it already attached, so a
+        // resumed retry cannot spend the per-input cap a second time (Copilot
+        // finding, src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "s8").unwrap();
+        log.append(&Record::Input { id: "in-1".into(), text: "go".into(), recorded_at: now() }).unwrap();
+        log.append(&Record::Message(Box::new(Message::user("go")))).unwrap();
+        log.append(&Record::Replace {
+            messages: vec![Message::system("sys"), Message::user("summary"), Message::user("go")],
+            pending_position: Some(2),
+            summarized: Some((2, 3)),
+            mode: Some(crate::config::CompactionMode::Standard),
+            model: None,
+            continuation: None,
+            folded: None,
+            folded_base: None,
+            restated: None,
+            pending_recall_notes: 2,
+            recorded_at: now(),
+        })
+        .unwrap();
+        drop(log);
+        let (_, restored) = SessionLog::open(dir.path(), "s8").unwrap();
+        assert_eq!(restored.pending_input.map(|p| p.recall_notes), Some(2));
     }
 
     #[test]
@@ -898,6 +995,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -973,6 +1071,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -996,6 +1095,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
@@ -1038,6 +1138,7 @@ mod tests {
             folded: None,
             folded_base: None,
             restated: None,
+            pending_recall_notes: 0,
             recorded_at: now(),
         })
         .unwrap();
