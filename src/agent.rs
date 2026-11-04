@@ -800,6 +800,10 @@ pub struct Agent {
     recall: memory::Recall,
     /// Recall notes attached so far this turn (capped per turn).
     recall_turn_notes: usize,
+    /// Recall state as of before the current tool call's recall changes;
+    /// `Some` while those changes await the tool-result append, so they are
+    /// persisted only once that result (holding the notes) is durable.
+    recall_unpersisted: Option<memory::Recall>,
     /// Tool results longer than this are cut, with the whole kept on disk.
     tool_output_limit: usize,
     /// Checked before every tool call (see `permissions.rs`).
@@ -995,6 +999,7 @@ impl Agent {
             timers: Timers::default(),
             recall: memory::Recall::default(),
             recall_turn_notes: 0,
+            recall_unpersisted: None,
             #[cfg(test)]
             timers_clock: None,
             #[cfg(test)]
@@ -2712,6 +2717,10 @@ impl Agent {
         self.compact_floor = 0;
         self.history_available = false;
         self.history_hint_pending = false;
+        // The fresh system prompt's memory index already shows short memories
+        // in full, so those count as seen rather than re-firing on a matching
+        // tool call (clipped or omitted entries stay eligible).
+        self.mark_index_rendered_seen();
         // A fresh session has no compaction behind it, so there is no
         // pre-compaction transcript for `replay_history` to restore.
         self.pre_compaction_transcript = None;
@@ -2785,6 +2794,11 @@ impl Agent {
         self.timers = restored.timers.unwrap_or_default();
         self.control.publish_timers(&self.timers);
         self.recall = restored.recall.unwrap_or_default();
+        // The resumed prompt's memory index again shows short memories in
+        // full; count those as seen so they do not re-fire (a memory saved
+        // after the last persisted recall state included).
+        self.recall_unpersisted = None;
+        self.mark_index_rendered_seen();
         self.pending_timer_steps = 0;
         // Reminders belong to the session being left (`/resume` mid-process).
         self.reminders = Reminders::new(self.config.outcome_tool);
@@ -2971,6 +2985,16 @@ impl Agent {
             _ => None,
         };
         self.calibration = None;
+        // Any replacement (compaction, a `/settings` system-prompt change, a
+        // rebuild) drops the recalled memories' full text from context, so
+        // every memory may be recalled again — except those the replacement's
+        // own memory index renders in full, which are still in context.
+        self.recall_unpersisted = None;
+        if !self.recall.is_empty() {
+            self.recall = memory::Recall::default();
+            self.recall_changed();
+        }
+        self.mark_index_rendered_seen();
         self.refresh_stats();
         Ok(())
     }
@@ -4475,7 +4499,19 @@ impl Agent {
                     Message::tool_error(&tool_call.id, &tool_call.name, &result_text)
                 }
                 .with_attachments(attachments);
-                self.push(message)?;
+                // Commit this call's recall changes only once the tool result
+                // carrying their notes is durable: a failed append rolls them
+                // back, so a resume never treats unseen notes as seen.
+                let recall_before = self.recall_unpersisted.take();
+                if let Err(err) = self.push(message) {
+                    if let Some(before) = recall_before {
+                        self.recall = before;
+                    }
+                    return Err(err);
+                }
+                if recall_before.is_some() {
+                    self.recall_changed();
+                }
                 self.emit(AgentEvent::ToolResult { call: tool_call, ok, output: &display_output });
             }
             self.refresh_stats();
@@ -4697,12 +4733,6 @@ impl Agent {
         let report = self.compact_with(trigger, mode, instructions).await?;
         if let Some(report) = &report {
             self.compact_floor = report.tokens_after;
-            // The compacted context no longer holds any recalled memory's full
-            // text, so every memory may be recalled again.
-            if !self.recall.is_empty() {
-                self.recall = memory::Recall::default();
-                self.recall_changed();
-            }
             if trigger != CompactTrigger::Manual {
                 crate::ui::log(&format!("[agent] auto-{report}"));
             }
@@ -5179,6 +5209,46 @@ impl Agent {
         }
     }
 
+    /// Mark as seen every memory the freshly installed system prompt's index
+    /// renders in full: its whole text and evidence are already in context, so
+    /// a matching tool call must not spend a recall note re-showing it (and
+    /// two such duplicates could exhaust the turn's note budget before an
+    /// omitted memory surfaces). Clipped or omitted entries stay eligible for
+    /// recall (Copilot finding, src/agent.rs).
+    fn mark_index_rendered_seen(&mut self) {
+        let rendered = match self.memory.as_ref() {
+            Some(store) => store.index_rendered(),
+            None => return,
+        };
+        if rendered.is_empty() {
+            return;
+        }
+        let before = self.recall.clone();
+        self.recall.seen.extend(rendered);
+        if self.recall != before {
+            self.recall_changed();
+        }
+    }
+
+    /// `mark_index_rendered_seen` for the memory-tool dispatch: the change is
+    /// staged into `recall_unpersisted` instead of persisted at once, so it
+    /// commits only when the tool result is durably appended (see the
+    /// tool-result append in `run_tool_calls`).
+    fn mark_index_rendered_seen_deferred(&mut self) {
+        let rendered = match self.memory.as_ref() {
+            Some(store) => store.index_rendered(),
+            None => return,
+        };
+        if rendered.is_empty() {
+            return;
+        }
+        let before = self.recall.clone();
+        self.recall.seen.extend(rendered);
+        if self.recall != before {
+            self.recall_unpersisted.get_or_insert(before);
+        }
+    }
+
     /// Recall memories whose anchors appear in this tool call (issue #166),
     /// returning the notes to attach to its result. Also marks memories whose
     /// full text a memory tool just returned as seen.
@@ -5187,17 +5257,15 @@ impl Agent {
             return Vec::new();
         };
         let session = self.session_id.clone();
-        let mut changed = false;
+        let before = self.recall.clone();
         if memory::is_memory_tool(tool) {
             if ok {
-                let before = self.recall.clone();
                 for id in self.recall.note_seen_in(result) {
                     store.log_recall("used", &id, tool, session.as_deref());
                 }
-                changed = before != self.recall;
-            }
-            if changed {
-                self.recall_changed();
+                if before != self.recall {
+                    self.recall_unpersisted.get_or_insert(before);
+                }
             }
             return Vec::new();
         }
@@ -5208,7 +5276,7 @@ impl Agent {
         }
         if !notes.is_empty() {
             self.recall_turn_notes += notes.len();
-            self.recall_changed();
+            self.recall_unpersisted.get_or_insert(before);
         }
         notes.into_iter().map(|n| n.text).collect()
     }
@@ -5372,6 +5440,16 @@ impl Agent {
         // at once rather than resurfacing on the next turn.
         if call.name == memory::FORGET_TOOL && result.is_ok() {
             self.refresh_memory_index();
+        }
+        // A save or forget changes which memories the index renders in full
+        // (the saved entry itself, plus neighbours the budget now keeps or
+        // drops): re-mark so a fully rendered memory never re-fires and a
+        // newly omitted one stays eligible. Deferred so the change persists
+        // only with this call's tool-result append; `note_seen_in` (in
+        // `recall_memories`) has already staged the saved id from its
+        // confirmation line, so extending `seen` again here is idempotent.
+        if matches!(call.name.as_str(), memory::SAVE_TOOL | memory::FORGET_TOOL) && result.is_ok() {
+            self.mark_index_rendered_seen_deferred();
         }
         result
     }
@@ -7356,13 +7434,101 @@ mod tests {
         assert!(agent.recall.seen.contains(&hint.id));
 
         agent.compact(None, None).await.unwrap().expect("compacted");
-        assert!(agent.recall.seen.is_empty(), "compaction resets recall");
+        // Compaction resets the recall state, but the rebuilt system prompt's
+        // index still renders this short hint in full, so it is immediately
+        // counted as seen again rather than re-firing.
+        assert!(agent.recall.seen.contains(&hint.id), "the index re-marks fully rendered memories");
+        assert!(agent.recall.fired.is_empty(), "compaction clears fired notes");
         agent.send_message("after compaction").await.unwrap();
         let third = tool_texts(&agent).pop().unwrap();
-        assert!(third.contains(&hint.id), "a hint reappears after compaction: {third}");
+        assert!(!third.contains(&hint.id), "a fully rendered hint stays seen after compaction: {third}");
 
         let stats = agent.memory().unwrap().recall_stats();
-        assert_eq!(stats.get(&hint.id).map(|s| s.0), Some(2));
+        assert_eq!(stats.get(&hint.id).map(|s| s.0), Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacing_the_conversation_resets_and_persists_recall() {
+        // A `/settings` system-prompt change replaces the conversation, so the
+        // recalled notes leave context: recall must reset, durably.
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![read_call("r1", path), text("one"), read_call("r2", path), text("two")];
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        agent.new_session().unwrap();
+        let hint = agent
+            .memory()
+            .unwrap()
+            .save(memory::Scope::User, "worker logs on omarchy.local live elsewhere", None, None)
+            .unwrap();
+        agent.send_message("look").await.unwrap();
+        assert!(agent.recall.seen.contains(&hint.id));
+        agent.set_system_prompt("new prompt").unwrap();
+        // The replacement resets the fired notes; the hint stays seen only
+        // because the new prompt's index still renders it in full.
+        assert!(agent.recall.fired.is_empty(), "a conversation replacement resets fired notes");
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        assert!(agent.recall.fired.is_empty(), "the reset is persisted");
+        agent.send_message("again").await.unwrap();
+        let again = tool_texts(&agent).pop().unwrap();
+        assert!(!again.contains(&hint.id), "a fully rendered hint stays seen: {again}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memories_rendered_in_full_by_the_index_do_not_refire() {
+        // The session-start index already shows a short memory's whole text
+        // and evidence, so a matching tool call must not spend a recall note
+        // re-showing it; a clipped memory (the index ellipsises it) stays
+        // eligible, and the seen set survives a resume (Copilot finding,
+        // src/agent.rs).
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/nonexistent/omarchy.local/worker.log";
+        let responses = vec![read_call("r1", path), text("one"), read_call("r2", path), text("two")];
+        let mut agent = memory_agent(crate::config::MemoryMode::ReadOnly, responses, dir.path());
+        // Save before the session starts so the session-start index install
+        // sees both entries.
+        let (short, long) = {
+            let store = agent.memory().unwrap();
+            let short = store
+                .save(memory::Scope::User, "worker logs on omarchy.local live under ~/.local/share", None, None)
+                .unwrap();
+            let long = store
+                .save_with(
+                    memory::Scope::User,
+                    &format!("worker.log detail: {}", "x".repeat(300)),
+                    None,
+                    None,
+                    None,
+                    Some(vec!["worker.log".into()]),
+                )
+                .unwrap();
+            (short, long)
+        };
+        agent.new_session().unwrap();
+        // The index renders the short entry in full and clips the long one…
+        let index = agent.memory().unwrap().index(false);
+        let short_line = index.lines().find(|l| l.contains(&short.id)).unwrap_or("");
+        let long_line = index.lines().find(|l| l.contains(&long.id)).unwrap_or("");
+        assert!(short_line.ends_with("live under ~/.local/share"), "{index}");
+        assert!(long_line.ends_with('…'), "{index}");
+        // …so the short one is already seen while the clipped one is not.
+        assert!(agent.recall.seen.contains(&short.id), "fully rendered counts as seen");
+        assert!(!agent.recall.seen.contains(&long.id), "a clipped entry stays eligible");
+
+        agent.send_message("look").await.unwrap();
+        let first = tool_texts(&agent).pop().unwrap();
+        assert!(!first.contains(&short.id), "no duplicate recall of a fully rendered memory: {first}");
+        assert!(first.contains(&long.id), "the clipped memory still fires: {first}");
+
+        // The seen set is persisted: a resume keeps it (and re-marks from the
+        // rebuilt index).
+        let id = agent.session_id().unwrap().to_string();
+        agent.load_session(&id).unwrap();
+        assert!(agent.recall.seen.contains(&short.id), "the seen set survives a resume");
+        agent.send_message("again").await.unwrap();
+        let second = tool_texts(&agent).pop().unwrap();
+        assert!(!second.contains(&short.id), "still no duplicate after resume: {second}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
