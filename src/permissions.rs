@@ -1260,13 +1260,26 @@ fn unroll_literal_loop(region: &[Simple], offset: usize, budget: &mut usize, pri
         {
             // skipped
         }
-        for word in words {
+        let mut ifs_here: Option<Vec<char>> = None;
+        let mut program_follows = false;
+        for word in words.by_ref() {
             if word.dynamic || word.glob || !ASSIGNMENT.is_match(&word.text) {
+                program_follows = true;
                 break;
             }
             if let Some(value) = word.text.strip_prefix("IFS=") {
-                ifs_owned = Some(value.chars().collect());
+                ifs_here = Some(value.chars().collect());
             }
+        }
+        if let Some(value) = ifs_here {
+            // `IFS=x true` binds IFS only for that one command; Bash restores it
+            // afterwards. Whether a prefix assignment persists depends on the
+            // program (special builtins in POSIX mode keep it), so decline to
+            // unroll rather than guess the effective IFS.
+            if program_follows {
+                return None;
+            }
+            ifs_owned = Some(value);
         }
     }
     let ifs: Option<&[char]> = ifs_owned.as_deref();
@@ -1283,6 +1296,14 @@ fn unroll_literal_loop(region: &[Simple], offset: usize, budget: &mut usize, pri
     // rebound `_` to `/etc`. The unroll models the header's binding only, not
     // these implicit per-command updates, so decline to unroll `_` at all.
     if variable.text == "_" {
+        return None;
+    }
+    // A prior declaration can give the variable attributes that transform the
+    // values the loop binds (`declare -u f` upper-cases, `-i` evaluates, `-n`
+    // makes it a nameref aliasing another variable). The unroll models a plain
+    // scalar only, so decline when any preceding declaration builtin names the
+    // variable or uses a computed argument that could.
+    if prior_declares(prior, &variable.text) {
         return None;
     }
     let keyword = header.words.get(offset + 2)?;
@@ -1411,6 +1432,26 @@ fn unroll_literal_loop(region: &[Simple], offset: usize, budget: &mut usize, pri
     Some(unrolled)
 }
 
+/// Whether any command in `prior` runs a declaration builtin (`declare`,
+/// `typeset`, `local`, `export`, `readonly`) whose arguments name `name` or are
+/// computed. Wrappers are seen through by scanning every word position.
+fn prior_declares(prior: &[Simple], name: &str) -> bool {
+    prior.iter().any(|cmd| {
+        let words = &cmd.words;
+        words.iter().enumerate().any(|(k, w)| {
+            !w.dynamic
+                && matches!(basename(&w.text), "declare" | "typeset" | "local" | "export" | "readonly")
+                && words[k + 1..].iter().any(|arg| {
+                    if arg.dynamic {
+                        return true;
+                    }
+                    let head = arg.text.split(['=', '[']).next().unwrap_or_default().trim_end_matches('+');
+                    head == name
+                })
+        })
+    })
+}
+
 /// Replace `$name` / `${name}` in `word` with `value`. `None` when the word
 /// uses the variable in another form (`${name:-x}`, `${#name}`, ...) or when
 /// word splitting or pathname expansion of an unquoted use would turn `value`
@@ -1437,8 +1478,13 @@ fn substitute_word(word: &Word, name: &str, value: &str, ifs_chars: Option<&[cha
             i += 2;
             continue;
         }
+        // The lexer records the real span of each bare `$name` expansion;
+        // quote flattening can glue literal text onto it (`"$d"etc` becomes
+        // `$detc` but expands `$d`), so trust the span over the flat text.
+        let span_is_name = word.expansion_spans.iter().any(|&(s, e)| s == i && e == i + 1 + name.len());
+        let span_known = word.expansion_spans.iter().any(|&(s, _)| s == i);
         if let Some(after) = rest.strip_prefix(name)
-            && !after.starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric())
+            && (span_is_name || (!span_known && !after.starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric())))
         {
             // A `$name` that was single-quoted is a literal character, not a
             // parameter expansion: leave it in place so the checked operand
@@ -2040,6 +2086,14 @@ fn check_readonly_loop_command(cmd: &Simple, kind: &str, phase: &str) -> Result<
         "sudo" | "doas" => program_index = skip_options(&cmd.words, i + 1, "ugCDhprtUTR", SUDO_LONG_WITH_VALUE),
         "stdbuf" => program_index = skip_options(&cmd.words, i + 1, "ioe", &[]),
         "setsid" | "caffeinate" => program_index = skip_options(&cmd.words, i + 1, "", &[]),
+        // Mirror every runner `expand()` unwraps, so the program it exposes
+        // (`nohup sh -c ...`) still faces the loop hard-block checks.
+        "nohup" | "unbuffer" | "busybox" => program_index = skip_options(&cmd.words, i + 1, "", &[]),
+        "coproc" => {
+            return Err(format!(
+                "cannot allow `{kind}` loop: {phase} command `{rendered}` starts a coprocess that cannot be inspected"
+            ));
+        }
         "ionice" => program_index = skip_options(&cmd.words, i + 1, "cnpt", &[]),
         "chrt" => {
             let mut j = skip_options(&cmd.words, i + 1, "", &[]);
@@ -3477,7 +3531,8 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
             let mut j = 0;
             // Options that consume a separate operand (the rest are flag-only or
             // take an attached value, e.g. `-t`, `-d:`).
-            const MAPFILE_VALUE_OPTS: &[&str] = &["-n", "-O", "-s", "-u", "--array-origin", "--line-count", "--skip"];
+            const MAPFILE_VALUE_OPTS: &[&str] =
+                &["-n", "-O", "-s", "-u", "-d", "-C", "-c", "--array-origin", "--line-count", "--skip"];
             while let Some(arg) = args.get(j) {
                 let text = arg.text.as_str();
                 if text == "--" {
@@ -3519,7 +3574,35 @@ fn collect_loop_body_writes(words: &[Word], out: &mut HashSet<String>) {
                 if arg.text.starts_with('-') && arg.text.len() > 1 {
                     continue;
                 }
+                // A computed destination (`unset "$d"`) cannot be resolved to
+                // one name: record every variable it mentions, so a destination
+                // built from the loop variable declines the unroll.
+                if arg.dynamic {
+                    for name in referenced_var_names(&arg.text) {
+                        insert_var_name(&name, out);
+                    }
+                    continue;
+                }
                 insert_var_name(&arg.text, out);
+            }
+        }
+        // Directory-changing builtins implicitly write `PWD` and `OLDPWD`.
+        "cd" | "pushd" | "popd" => {
+            out.insert("PWD".to_string());
+            out.insert("OLDPWD".to_string());
+        }
+        // `getopts OPTSTRING NAME [ARGS]` writes NAME, `OPTARG` and `OPTIND`.
+        "getopts" => {
+            out.insert("OPTARG".to_string());
+            out.insert("OPTIND".to_string());
+            if let Some(dest) = args.get(1) {
+                if dest.dynamic {
+                    for name in referenced_var_names(&dest.text) {
+                        insert_var_name(&name, out);
+                    }
+                } else {
+                    insert_var_name(&dest.text, out);
+                }
             }
         }
         // `env [-u NAME]... NAME=value ...` applies environment writes before
@@ -6892,5 +6975,71 @@ mod round5_regressions {
             let r = check(&Policy::default(), cmd);
             assert!(r.is_err(), "wrapped shell must hard-block in a loop: {cmd} -> {r:?}");
         }
+    }
+}
+
+/// Round-7 review of #164: each regression names the finding it closes.
+#[cfg(test)]
+mod round7_regressions {
+    use super::*;
+    use serde_json::json;
+
+    fn policy(deny: &[&str]) -> Policy {
+        let config = PermissionsConfig { deny: deny.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        Policy::new(&config, &SandboxConfig::default())
+    }
+    fn check(policy: &Policy, command: &str) -> Result<(), String> {
+        let cwd = std::path::Path::new("/work/project");
+        policy.check_in("bash", &json!({ "command": command }), cwd)
+    }
+    fn denied(command: &str) {
+        let r = check(&Policy::default(), command);
+        assert!(r.is_err(), "`{command}` must not be allowed, got {r:?}");
+    }
+
+    /// #4465689567: a command-prefix `IFS=x true` is temporary.
+    #[test]
+    fn prefix_ifs_assignment_declines_unroll() {
+        denied("IFS=x true; for d in 'safe /etc'; do rm -rf $d; done");
+    }
+
+    /// #4465689646 / #4465689706: prior attributes (`-u`, `-n`) transform bindings.
+    #[test]
+    fn prior_declaration_attributes_decline_unroll() {
+        let r = check(&policy(&["Bash(touch SECRET)"]), "declare -u f; for f in secret; do touch \"$f\"; done");
+        assert!(r.is_err(), "case-converting attribute must decline unroll, got {r:?}");
+        denied("declare -n d=target; for d in ./scratch; do target=/etc; rm -rf \"$d\"; done");
+    }
+
+    /// #4465689773: quote flattening must not hide the real `$d` boundary.
+    #[test]
+    fn quoted_expansion_boundary_is_preserved() {
+        denied("detc=./scratch; for d in /; do rm -rf \"$d\"etc; done");
+    }
+
+    /// #4465689853: `nohup` must be unwrapped like `expand()` does.
+    #[test]
+    fn nohup_wrapped_interpreter_is_blocked() {
+        denied("for f in a; do nohup sh -c 'echo hi'; done");
+    }
+
+    /// #4465689937 / #4465689990 / #4465690052 / #4465690118: implicit and
+    /// unmodeled variable writes.
+    #[test]
+    fn implicit_variable_writes_decline_unroll() {
+        denied("for PWD in /tmp/scratch; do cd /etc; rm -rf \"$PWD\"; done");
+        denied("for OPTARG in ./scratch; do getopts a: opt -a /etc; rm -rf \"$OPTARG\"; done");
+        denied("for d in ./scratch; do mapfile -d : -t d <<< /etc:; rm -rf \"$d\"; done");
+        denied("for d in d; do unset \"$d\"; rm -rf \"$d/etc\"; done");
+    }
+
+    /// #4465690184: escaped and ANSI-C dollars are literal too.
+    #[test]
+    fn escaped_dollar_is_literal() {
+        let p = policy(&["Bash(touch *$f)"]);
+        let r = check(&p, "other=.; for f in safe; do touch \"$other/\\$f\"; done");
+        assert!(r.is_err(), "escaped `$f` must stay literal, got {r:?}");
+        let w = &crate::shell::parse("echo \"\\$a\"$'\\x24b'$c").unwrap()[0].words[1];
+        assert_eq!(w.literal_dollars, vec![0, 2]);
     }
 }

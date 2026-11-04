@@ -43,6 +43,16 @@ pub struct Word {
     /// no single-quoted `$` (the common case), so it costs nothing for ordinary
     /// words.
     pub literal_dollars: Vec<usize>,
+    /// Byte offsets in `text` of every `$` that begins a real expansion
+    /// (parameter, command or arithmetic). Every other `$` in `text` is a
+    /// literal character, whichever lexer path produced it (single quotes,
+    /// backslash escapes, `$'...'` decoding); `word()` derives
+    /// `literal_dollars` from this set so no literal-`$` path can be missed.
+    pub expansion_dollars: Vec<usize>,
+    /// `(start, end)` byte spans of every bare `$name` expansion, so a
+    /// consumer can recover the real parameter name after quote flattening
+    /// (`"$d"etc` flattens to `$detc` but expands `$d`).
+    pub expansion_spans: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,6 +981,11 @@ impl Parser {
     /// `${arr[@]}`) can produce multiple arguments, which sets `word.splits`.
     fn dollar(&mut self, word: &mut Word, quoted: bool) -> Result<(), String> {
         self.pos += 1;
+        let at = word.text.len();
+        if matches!(self.peek(), Some(c) if c == '(' || c == '{' || c == '_' || c.is_ascii_alphanumeric() || "@*#?$!-".contains(c))
+        {
+            word.expansion_dollars.push(at);
+        }
         match self.peek() {
             Some('(') if self.peek_at(1) == Some('(') => {
                 self.pos += 2;
@@ -1032,6 +1047,7 @@ impl Parser {
                     word.text.push(self.chars[self.pos]);
                     self.pos += 1;
                 }
+                word.expansion_spans.push((at, word.text.len()));
                 word.dynamic = true;
                 if !quoted {
                     word.splits = true;
@@ -1105,6 +1121,7 @@ impl Parser {
                 Some('`') => {
                     self.pos += 1;
                     self.backtick()?;
+                    word.expansion_dollars.push(word.text.len());
                     word.text.push_str("$(...)");
                     word.dynamic = true;
                 }
@@ -1165,6 +1182,7 @@ impl Parser {
                 '`' => {
                     self.pos += 1;
                     self.backtick()?;
+                    word.expansion_dollars.push(word.text.len());
                     word.text.push_str("$(...)");
                     word.dynamic = true;
                     word.splits = true;
@@ -1297,6 +1315,10 @@ impl Parser {
                 }
             }
         }
+        // Every `$` not recorded as the start of a real expansion is a literal
+        // character, however the lexer produced it.
+        word.literal_dollars =
+            word.text.match_indices('$').map(|(i, _)| i).filter(|i| !word.expansion_dollars.contains(i)).collect();
         Ok(word)
     }
 }
